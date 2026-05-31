@@ -31,6 +31,7 @@ pub async fn handle_command(command: crate::MigrateCommands, config: &Config) ->
         crate::MigrateCommands::Status => show_schema_migration_status(config),
         crate::MigrateCommands::Verify => verify_schema_migrations(config),
         crate::MigrateCommands::DryRun => dry_run_schema_migrations(config),
+        crate::MigrateCommands::Plan { target_version } => plan_schema_migrations(config, &target_version),
         crate::MigrateCommands::Baseline => baseline_schema_migrations(config),
         crate::MigrateCommands::Openclaw { source, dry_run } => migrate_openclaw_memory(config, source, dry_run).await,
     }
@@ -81,6 +82,49 @@ fn dry_run_schema_migrations(config: &Config) -> Result<()> {
         for pending in &status.pending {
             println!("  {}  {}", pending.version, pending.name);
         }
+    }
+    Ok(())
+}
+
+fn plan_schema_migrations(config: &Config, target_version: &str) -> Result<()> {
+    let target_version = target_version.trim();
+    if target_version.is_empty() {
+        bail!("--target-version must not be empty");
+    }
+
+    let db_path = schema_migration::memory_db_path(config);
+    let conn = if db_path.exists() {
+        Some(
+            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .with_context(|| format!("open memory db read-only {}", db_path.display()))?,
+        )
+    } else {
+        None
+    };
+
+    let status = schema_migration::dry_run_sqlite(conn.as_ref())?;
+
+    // Only migrations at or below the target version are part of the plan.
+    let planned: Vec<&schema_migration::PendingMigration> = status
+        .pending
+        .iter()
+        .filter(|pending| pending.version <= target_version)
+        .collect();
+    let deferred = status.pending.len() - planned.len();
+
+    println!("Migration plan for {}", db_path.display());
+    println!("Target version: {target_version}");
+    if planned.is_empty() {
+        println!("No pending migrations at or below the target version.");
+    } else {
+        println!("Would apply ({}):", planned.len());
+        for pending in &planned {
+            println!("  {}  {}", pending.version, pending.name);
+        }
+        println!("This is a dry run. Run `prx migrate baseline` to record the baseline.");
+    }
+    if deferred > 0 {
+        println!("Deferred (above target): {deferred}");
     }
     Ok(())
 }

@@ -911,6 +911,13 @@ enum MigrateCommands {
     Verify,
     /// Preview pending schema migrations without writing
     DryRun,
+    /// Plan migrations up to a target version (dry-run diff, writes nothing)
+    Plan {
+        /// Target schema version to plan up to (inclusive). Pending migrations
+        /// with a version greater than this are excluded from the plan.
+        #[arg(long)]
+        target_version: String,
+    },
     /// Record the current schema as the migration baseline
     Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace

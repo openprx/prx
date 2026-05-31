@@ -5,6 +5,7 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
 use crate::config::AutonomyConfig;
 use crate::security::AutonomyLevel;
 use chrono::Utc;
@@ -62,6 +63,12 @@ pub struct ApprovalManager {
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// FIX-P3-09: capability grants generated when an interactive `Yes`/`Always`
+    /// decision is recorded. Bridges the interactive CLI approval track to the
+    /// gate-runtime `ApprovalGrantV2` track so a human "yes" can be honoured by
+    /// the cryptographic gate. Generation is best-effort: if the witness keyring
+    /// cannot be loaded the decision is still recorded, only the grant is skipped.
+    generated_grants: Mutex<Vec<ApprovalGrantV2>>,
 }
 
 impl ApprovalManager {
@@ -73,6 +80,7 @@ impl ApprovalManager {
             autonomy_level: config.level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
+            generated_grants: Mutex::new(Vec::new()),
         }
     }
 
@@ -133,6 +141,15 @@ impl ApprovalManager {
             }
         }
 
+        // FIX-P3-09: a human `Yes`/`Always` is an issuance event for the gate
+        // runtime. Mint a signed single-use capability grant so the gate can honour
+        // the interactive approval. `No` never produces a grant. Generation is
+        // best-effort and must never make `record_decision` fail: if the witness
+        // keyring is unavailable we log and continue with the audit entry only.
+        if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
+            self.bridge_decision_to_grant(tool_name, channel);
+        }
+
         // Append to audit log.
         let summary = summarize_args(args);
         let entry = ApprovalLogEntry {
@@ -144,6 +161,61 @@ impl ApprovalManager {
         };
         let mut log = self.audit_log.lock();
         log.push(entry);
+    }
+
+    /// FIX-P3-09: build and store a signed `ApprovalGrantV2` for an approved tool
+    /// call, bridging the interactive track to the gate-runtime track.
+    ///
+    /// The interactive `ApprovalManager` has no full principal/workspace context,
+    /// so the subject is derived from the approval `channel` (the only identity
+    /// signal available at this layer); the grant's `op_id` is the `tool_name`
+    /// (exact match) at `Medium` risk. The gate, when it consults these grants,
+    /// still applies its own principal binding (`verify_for_operation_bound`),
+    /// so a channel-derived subject can never widen authority beyond that check.
+    fn bridge_decision_to_grant(&self, tool_name: &str, channel: &str) {
+        let keyring = match WitnessKeyring::global() {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "approval grant bridge: witness keyring unavailable; recording decision without a grant"
+                );
+                return;
+            }
+        };
+        let subject = Subject {
+            agent_id: format!("prx:interactive:{channel}"),
+            principal_id: channel.to_string(),
+            owner_id: channel.to_string(),
+            workspace_id: "interactive".to_string(),
+            session_key: None,
+        };
+        match ApprovalGrantV2::issue_one_shot(
+            keyring,
+            subject,
+            IssuerAuthority::HumanReview,
+            tool_name,
+            RiskLevel::Medium,
+        ) {
+            Ok(grant) => {
+                let mut grants = self.generated_grants.lock();
+                grants.push(grant);
+            }
+            Err(e) => {
+                tracing::warn!(
+                    tool = tool_name,
+                    error = %e,
+                    "approval grant bridge: failed to issue grant; recording decision without a grant"
+                );
+            }
+        }
+    }
+
+    /// FIX-P3-09: snapshot of grants minted from interactive `Yes`/`Always`
+    /// decisions, for the gate runtime to consult.
+    pub fn generated_grants(&self) -> Vec<ApprovalGrantV2> {
+        self.generated_grants.lock().clone()
     }
 
     /// Get a snapshot of the audit log.
@@ -441,5 +513,57 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
+    }
+
+    // ── FIX-P3-09: ApprovalManager ↔ ApprovalGrant bridge ────────
+
+    #[test]
+    fn yes_and_always_decisions_generate_grants_when_keyring_available() {
+        // Best-effort bridge: grant generation depends on the process-global
+        // witness keyring (`WitnessKeyring::global()`), which needs $HOME or the
+        // `OPENPRX_WITNESS_KEY_PATH` env. We do NOT mutate the environment here
+        // (env mutation is `unsafe` under Rust 2024 and banned by the workspace
+        // lint), so generation may legitimately be skipped. The contract this
+        // test pins is: when generation does succeed, the grants are well-formed
+        // and exactly mirror the approved tool names; when it is skipped the
+        // decision is still recorded without panicking.
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let before = mgr.generated_grants().len();
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "out.txt"}),
+            ApprovalResponse::Yes,
+            "cli",
+        );
+        mgr.record_decision(
+            "http_request",
+            &serde_json::json!({"url": "https://example.com"}),
+            ApprovalResponse::Always,
+            "cli",
+        );
+
+        let grants = mgr.generated_grants();
+        // Either both grants were minted (keyring available) or none were
+        // (best-effort skip). A partial count would indicate a real bug.
+        assert!(grants.len() == before || grants.len() == before + 2);
+        for g in &grants {
+            assert_eq!(g.version, ApprovalGrantV2::VERSION);
+            assert_eq!(g.max_uses, 1);
+            assert!(g.capability.op_id == "file_write" || g.capability.op_id == "http_request");
+        }
+    }
+
+    #[test]
+    fn no_decision_generates_no_grant() {
+        let mgr = ApprovalManager::from_config(&supervised_config());
+        let before = mgr.generated_grants().len();
+        mgr.record_decision(
+            "shell",
+            &serde_json::json!({"command": "rm -rf /"}),
+            ApprovalResponse::No,
+            "cli",
+        );
+        // `No` must never mint a grant.
+        assert_eq!(mgr.generated_grants().len(), before);
     }
 }

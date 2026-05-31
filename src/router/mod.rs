@@ -252,14 +252,67 @@ impl RouterEngine {
             .map(|entry| entry.config.cost_per_million_tokens)
     }
 
+    /// Record an outcome for the routed request.
+    ///
+    /// This is the backward-compatible entry point: it attributes the outcome
+    /// to `model_id` with no fallback context (the planned model was the model
+    /// that actually served the request). Call [`record_outcome_detailed`] when
+    /// the execution path knows whether a fallback chain was exercised and which
+    /// model ultimately served the request.
+    ///
+    /// [`record_outcome_detailed`]: Self::record_outcome_detailed
     pub async fn record_outcome(&self, message: &str, model_id: &str, success: bool, latency_ms: u64) -> Result<()> {
-        let mut recent_successes = load_recent_successes(self.memory.as_ref(), &normalize_model_id(model_id)).await;
+        self.record_outcome_detailed(message, model_id, model_id, false, success, latency_ms)
+            .await
+    }
+
+    /// Record an outcome, distinguishing the planned model from the model that
+    /// actually served the request and whether a fallback chain was exercised.
+    ///
+    /// # Arguments
+    /// * `message` — the user message that produced this request.
+    /// * `planned_model` — the model the router originally selected.
+    /// * `actual_model` — the model that ultimately served the request. When the
+    ///   reliability layer fell back, this differs from `planned_model`; the ELO
+    ///   / success-rate learning signal MUST be attributed to the model that did
+    ///   the work, not the one that failed first.
+    /// * `fallback_chain_used` — `true` when a provider/model fallback (rather
+    ///   than the first candidate) produced the outcome. This lets the learning
+    ///   layer avoid over-penalizing a planned model whose fallback recovered.
+    /// * `success` — whether the request succeeded.
+    /// * `latency_ms` — observed end-to-end latency.
+    pub async fn record_outcome_detailed(
+        &self,
+        message: &str,
+        planned_model: &str,
+        actual_model: &str,
+        fallback_chain_used: bool,
+        success: bool,
+        latency_ms: u64,
+    ) -> Result<()> {
+        // Attribute the learning signal to the model that actually served the
+        // request. When a fallback recovered, `actual_model` is the served model
+        // and the planned model's failure is captured by the fallback flag.
+        let attributed_model = actual_model;
+        let mut recent_successes =
+            load_recent_successes(self.memory.as_ref(), &normalize_model_id(attributed_model)).await;
         let snapshot = {
             let mut models = self.models.write();
-            apply_outcome_update_locked(&mut models, model_id, success, latency_ms, &mut recent_successes)
+            apply_outcome_update_locked(
+                &mut models,
+                attributed_model,
+                success,
+                latency_ms,
+                &mut recent_successes,
+            )
         };
         let Some(snapshot) = snapshot else {
-            tracing::warn!(model = model_id, "Router outcome ignored for unknown model");
+            tracing::warn!(
+                planned_model,
+                actual_model,
+                fallback_chain_used,
+                "Router outcome ignored for unknown model"
+            );
             return Ok(());
         };
 
@@ -274,7 +327,14 @@ impl RouterEngine {
                 tracing::warn!("Router history record failed: {err}");
             }
         }
-        tracing::info!(model = model_id, success, latency_ms, "Router outcome recorded");
+        tracing::info!(
+            planned_model,
+            actual_model,
+            fallback_chain_used,
+            success,
+            latency_ms,
+            "Router outcome recorded"
+        );
         Ok(())
     }
 }

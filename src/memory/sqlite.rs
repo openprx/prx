@@ -166,9 +166,57 @@ pub(crate) fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()
         CREATE INDEX IF NOT EXISTS idx_approval_grant_events_grant
             ON approval_grant_events(grant_id, occurred_at);
         CREATE INDEX IF NOT EXISTS idx_approval_grant_events_type
-            ON approval_grant_events(event_type, occurred_at);",
+            ON approval_grant_events(event_type, occurred_at);
+
+        CREATE TABLE IF NOT EXISTS approval_grant_revocations (
+            grant_id     TEXT PRIMARY KEY,
+            revoked_at   TEXT NOT NULL,
+            reason       TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_approval_grant_revocations_revoked_at
+            ON approval_grant_revocations(revoked_at);",
     )?;
     Ok(())
+}
+
+/// FIX-P3-06: record an out-of-band revocation for `grant_id`.
+///
+/// Idempotent: a second revocation of the same grant overwrites the previous
+/// `revoked_at` / `reason` rather than failing on the primary-key conflict, so
+/// re-revoking is always safe. The signed grant payload is never mutated; the
+/// revocation lives only in this side-table and is consulted by
+/// [`is_approval_grant_revoked`].
+pub fn revoke_approval_grant(
+    conn: &Connection,
+    grant_id: &str,
+    revoked_at: &str,
+    reason: Option<&str>,
+) -> anyhow::Result<()> {
+    conn.execute(
+        "INSERT INTO approval_grant_revocations (grant_id, revoked_at, reason) \
+         VALUES (?1, ?2, ?3) \
+         ON CONFLICT(grant_id) DO UPDATE SET revoked_at = excluded.revoked_at, reason = excluded.reason",
+        params![grant_id, revoked_at, reason],
+    )?;
+    Ok(())
+}
+
+/// FIX-P3-06: report whether `grant_id` has an out-of-band revocation row.
+///
+/// The gate path (to be wired up under separate coordination — the gate
+/// verification currently lives outside this module's boundary) MUST treat a
+/// `true` result as fail-closed and deny the operation, in addition to the
+/// in-grant `revoked_at` check performed by
+/// [`crate::acl::approval_grant::ApprovalGrantV2::verify_for_operation`].
+pub fn is_approval_grant_revoked(conn: &Connection, grant_id: &str) -> anyhow::Result<bool> {
+    let found: Option<i64> = conn
+        .query_row(
+            "SELECT 1 FROM approval_grant_revocations WHERE grant_id = ?1",
+            params![grant_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(found.is_some())
 }
 const MAX_HYDRATED_SESSIONS: usize = 100;
 const SESSION_PREVIEW_CHARS: usize = 120;
@@ -1475,6 +1523,15 @@ impl SqliteMemory {
                 // dimensions)` (parity with Postgres). The legacy table is rebuilt
                 // in-place by `upgrade_embedding_cache_primary_key`.
                 "embedding_cache PRIMARY KEY (content_hash, provider, model, dimensions) + rebuild legacy single-key table",
+            ),
+            (
+                11,
+                "approval_grant_revocations",
+                // FIX-P3-06: out-of-band grant revocation ledger. A grant can be
+                // revoked without rewriting its signed payload by inserting a row
+                // here; the gate consults this table in addition to the in-grant
+                // `revoked_at` field. Created by `init_approval_grant_schema`.
+                "approval_grant_revocations(grant_id,revoked_at,reason) + idx_approval_grant_revocations_revoked_at",
             ),
         ]
     }

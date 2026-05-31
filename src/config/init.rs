@@ -119,7 +119,9 @@ impl Spec {
         if modules.memory {
             write_config_file(&target_dir.join("config.d/memory.toml"), &memory_template(self))?;
         }
-        if modules.channels {
+        // Server also ships a commented-out channels scaffold even though the
+        // module is disabled, so operators can opt-in without re-running init.
+        if modules.channels || self == Self::Server {
             write_config_file(&target_dir.join("config.d/channels.toml"), &channels_template(self))?;
         }
         if modules.network {
@@ -128,7 +130,9 @@ impl Spec {
         if modules.security {
             write_config_file(&target_dir.join("config.d/security.toml"), &security_template(self))?;
         }
-        if modules.scheduler {
+        // Server also ships a commented-out scheduler scaffold even though the
+        // module is disabled, so operators can opt-in without re-running init.
+        if modules.scheduler || self == Self::Server {
             write_config_file(&target_dir.join("config.d/scheduler.toml"), &scheduler_template(self))?;
         }
         if modules.agent {
@@ -629,11 +633,13 @@ auto_promote_user_messages = true
 auto_promote_assistant_messages = false
 min_chars = 30
 
-# Embedding configuration for semantic search
-# [memory.embedding]
-# provider = "openai"
-# model = "text-embedding-3-small"
-# dimension = 1536
+# Embedding configuration for semantic search.
+# Shown uncommented as a ready-to-edit example; adjust provider/model/dimension
+# to match your embedding backend before enabling semantic search.
+[memory.embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+dimension = 1536
 
 [storage]
 [storage.provider]
@@ -647,8 +653,30 @@ min_chars = 30
 
 fn channels_template(spec: Spec) -> String {
     match spec {
-        // channels is only enabled in full spec
-        Spec::Minimal | Spec::Server => String::new(),
+        // channels is not enabled in the minimal spec
+        Spec::Minimal => String::new(),
+
+        // Server ships a commented-out scaffold so operators can opt-in to a
+        // channel without re-running `prx init`. All entries stay commented:
+        // enabling `channels` in config.toml is required to activate them.
+        Spec::Server => r#"# Channels configuration (server)
+# Channels are disabled by default for server deployments.
+# To enable, set `channels = true` in config.toml [modules], then uncomment
+# and configure one of the platforms below.
+
+[channels_config]
+# [channels_config.telegram]
+# bot_token = ""
+# allowed_users = ["your_username"]
+# stream_mode = "edit"
+# mention_only = false
+
+# [channels_config.slack]
+# bot_token = ""
+# app_token = ""
+# allowed_users = []
+"#
+        .into(),
 
         Spec::Full => r#"# Channels configuration (full)
 # Connect PRX to messaging platforms: Telegram, Discord, Slack, etc.
@@ -824,8 +852,32 @@ max_size_mb = 100
 
 fn scheduler_template(spec: Spec) -> String {
     match spec {
-        // scheduler is only enabled in full spec
-        Spec::Minimal | Spec::Server => String::new(),
+        // scheduler is not enabled in the minimal spec
+        Spec::Minimal => String::new(),
+
+        // Server ships a commented-out scaffold so operators can opt-in to the
+        // scheduler without re-running `prx init`. Enabling `scheduler = true`
+        // in config.toml [modules] is required to activate it.
+        Spec::Server => r#"# Scheduler configuration (server)
+# Scheduler is disabled by default for server deployments.
+# To enable, set `scheduler = true` in config.toml [modules], then uncomment
+# and adjust the settings below.
+
+# [scheduler]
+# enabled = true
+# max_concurrent = 4
+
+# [cron]
+# [[cron.jobs]]
+# expression = "0 9 * * 1-5"
+# command = "Good morning briefing"
+# timezone = "UTC"
+
+# [heartbeat]
+# enabled = true
+# interval_minutes = 5
+"#
+        .into(),
 
         Spec::Full => r#"# Scheduler configuration (full)
 # Periodic tasks, cron jobs, heartbeat, and Xin engine
@@ -1430,6 +1482,65 @@ mod tests {
         assert!(content.contains("forbidden_paths = []"));
         assert!(content.contains("require_approval_for_medium_risk = false"));
         assert!(content.contains("block_high_risk_commands = false"));
+    }
+
+    #[test]
+    fn full_memory_template_uncomments_embedding_example() {
+        let content = memory_template(Spec::Full);
+        // The [memory.embedding] section must be an uncommented, ready-to-edit
+        // example, not a fully commented block.
+        assert!(
+            content.contains("\n[memory.embedding]\n"),
+            "full memory template must include uncommented [memory.embedding] section"
+        );
+        assert!(content.contains("provider = \"openai\""));
+        assert!(content.contains("model = \"text-embedding-3-small\""));
+        assert!(content.contains("dimension = 1536"));
+    }
+
+    #[test]
+    fn server_scheduler_template_is_commented_scaffold() {
+        let content = scheduler_template(Spec::Server);
+        assert!(!content.is_empty(), "server scheduler template must not be empty");
+        assert!(content.contains("Scheduler configuration (server)"));
+        // All actual table headers must stay commented so the disabled module
+        // does not get activated by the scaffold.
+        assert!(content.contains("# [scheduler]"));
+        assert!(content.contains("# [cron]"));
+        assert!(content.contains("# [heartbeat]"));
+        assert!(!content.contains("\n[scheduler]\n"));
+    }
+
+    #[test]
+    fn server_channels_template_is_commented_scaffold() {
+        let content = channels_template(Spec::Server);
+        assert!(!content.is_empty(), "server channels template must not be empty");
+        assert!(content.contains("Channels configuration (server)"));
+        assert!(content.contains("# [channels_config.telegram]"));
+        // No platform should be active by default.
+        assert!(!content.contains("\n[channels_config.telegram]\n"));
+    }
+
+    #[test]
+    fn server_generate_writes_scheduler_and_channels_scaffolds() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+
+        Spec::Server.generate(dir, false).expect("test: generate server");
+
+        // Server preset writes commented scaffolds for the disabled modules.
+        assert!(dir.join("config.d/scheduler.toml").exists());
+        assert!(dir.join("config.d/channels.toml").exists());
+
+        let scheduler = fs::read_to_string(dir.join("config.d/scheduler.toml")).expect("test: read scheduler");
+        assert!(scheduler.contains("# [scheduler]"));
+        let channels = fs::read_to_string(dir.join("config.d/channels.toml")).expect("test: read channels");
+        assert!(channels.contains("# [channels_config.telegram]"));
+
+        // The [modules] table must keep these modules disabled.
+        let config = fs::read_to_string(dir.join("config.toml")).expect("test: read config");
+        assert!(config.contains("scheduler = false"));
+        assert!(config.contains("channels = false"));
     }
 
     #[test]

@@ -842,6 +842,14 @@ impl PostgresMemory {
         // no-op; we therefore detect-then-add and tolerate the duplicate.
         Self::ensure_document_chunks_fk(client, schema_ident, qualified_document_chunks_table)?;
 
+        // FIX-P3-04: enable row-level security on `memories` so owner isolation is
+        // enforced at the database layer (defense-in-depth: even if the app-level
+        // ACL/post_filter is bypassed, the DB still scopes rows to the active
+        // owner). Best-effort — if RLS cannot be configured (insufficient role
+        // privileges) it degrades like pgvector init: logged and skipped, never
+        // breaking the backend.
+        Self::try_init_rls(client, qualified_table);
+
         // FIX-P0-25: record-and-verify versioned schema migrations. The DDL was
         // already executed by the idempotent batch above; this ledger records a
         // stable (version, name, checksum) per logical step so drift is detected
@@ -939,6 +947,11 @@ impl PostgresMemory {
                 15,
                 "owner_topic_indexes_and_chunk_fk",
                 "idx_document_chunks_task + idx_memory_links_owner + idx_memory_links_memory_event + idx_memory_links_message_event + idx_documents_source_event + idx_compaction_runs_summary_key + fk_document_chunks_document(ON DELETE CASCADE)",
+            ),
+            (
+                16,
+                "memories_row_level_security",
+                "memories ENABLE+FORCE ROW LEVEL SECURITY + POLICY memories_owner_isolation(USING/WITH CHECK: current_setting('prx.rls_bypass', true)='on' OR current_setting('prx.current_owner', true) IS NULL OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true))",
             ),
         ]
     }
@@ -1073,6 +1086,89 @@ impl PostgresMemory {
                 false
             }
         }
+    }
+
+    /// FIX-P3-04: enable row-level security on the `memories` table so owner
+    /// isolation is enforced inside PostgreSQL itself (defense-in-depth).
+    ///
+    /// Policy `memories_owner_isolation` admits a row when ANY holds:
+    /// - the system-bypass flag `prx.rls_bypass` is `'on'` (set per-query for the
+    ///   four canonical system principals so internal/router/system operations are
+    ///   never locked out);
+    /// - the owner session variable `prx.current_owner` is unset (NULL) — this
+    ///   keeps the many code paths that do not carry a principal working exactly as
+    ///   before, so RLS only tightens (never breaks) existing behaviour;
+    /// - the row's `owner_id` matches `prx.current_owner` (NULL-safe via
+    ///   `IS NOT DISTINCT FROM`, so a NULL-owner row matches a NULL setting).
+    ///
+    /// `FORCE ROW LEVEL SECURITY` is applied so the policy is honoured even when
+    /// the connection role owns the table (table owners otherwise bypass RLS).
+    ///
+    /// Best-effort: if the role lacks privileges to alter the table / create the
+    /// policy, the failure is logged and skipped — identical to pgvector init —
+    /// so deployments without superuser/table-owner rights still start cleanly.
+    ///
+    /// SAFETY: `qualified_table` is validated + quoted at construction via
+    /// `validate_identifier()` + `quote_identifier()`; no untrusted input is
+    /// interpolated into the DDL. Session-variable values are passed as bind
+    /// params in `apply_rls_context`.
+    fn try_init_rls(client: &mut Client, qualified_table: &str) {
+        // `CREATE POLICY` is not idempotent, so drop-then-create makes re-init
+        // safe. `ENABLE`/`FORCE` are idempotent. Run as a single batch so the
+        // policy is never left dropped if a later statement fails.
+        let init = format!(
+            "
+            ALTER TABLE {qualified_table} ENABLE ROW LEVEL SECURITY;
+            ALTER TABLE {qualified_table} FORCE ROW LEVEL SECURITY;
+            DROP POLICY IF EXISTS memories_owner_isolation ON {qualified_table};
+            CREATE POLICY memories_owner_isolation ON {qualified_table}
+                USING (
+                    current_setting('prx.rls_bypass', true) = 'on'
+                    OR current_setting('prx.current_owner', true) IS NULL
+                    OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true)
+                )
+                WITH CHECK (
+                    current_setting('prx.rls_bypass', true) = 'on'
+                    OR current_setting('prx.current_owner', true) IS NULL
+                    OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true)
+                );
+            "
+        );
+        if let Err(error) = client.batch_execute(&init) {
+            tracing::debug!(error = %error, "Postgres row-level security initialization skipped");
+        }
+    }
+
+    /// FIX-P3-04: push the RLS session context for `principal` onto `client`
+    /// before an owner-scoped query.
+    ///
+    /// - system principals get the bypass flag so internal/router/system actors
+    ///   are never restricted by the policy;
+    /// - everyone else binds their `owner_id` (or NULL when absent) into
+    ///   `prx.current_owner`, restricting visible rows to that owner.
+    ///
+    /// Because the backend reuses a single long-lived connection, the variables
+    /// must be (re)set on every owner-scoped query so a previous principal's
+    /// context never leaks into the next.
+    ///
+    /// `set_config(name, value, is_local => false)` is used instead of `SET`
+    /// because it accepts the value as a bind parameter, preserving the
+    /// parameterized-query rule (no string interpolation of values).
+    ///
+    /// Owner-scoped read paths capture only the system-bypass flag and the owner
+    /// id (not the whole principal) into their blocking task, so this takes those
+    /// two values directly.
+    fn apply_rls_context_raw(client: &mut Client, system: bool, owner_id: Option<&str>) -> Result<()> {
+        if system {
+            client.execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])?;
+            let cleared: Option<&str> = None;
+            client.execute("SELECT set_config('prx.current_owner', $1, false)", &[&cleared])?;
+        } else {
+            client.execute("SELECT set_config('prx.rls_bypass', 'off', false)", &[])?;
+            let owner: Option<&str> = owner_id.filter(|owner| !owner.trim().is_empty());
+            client.execute("SELECT set_config('prx.current_owner', $1, false)", &[&owner])?;
+        }
+        Ok(())
     }
 
     fn category_to_str(category: &MemoryCategory) -> String {
@@ -2263,6 +2359,17 @@ impl Memory for PostgresMemory {
         // starving the requested limit.
         let fetch_limit = limit.saturating_mul(3).max(limit);
 
+        // FIX-P3-04: capture the RLS context so the DB-layer owner policy is set
+        // before the read (defense-in-depth behind the SQL visibility scope).
+        // FIX-P3-04: the RLS owner mirrors the row `owner_id`, which writes set to
+        // the effective `sender_id` (see store_with_context_and_metadata). System
+        // principals (resolved via the ACL user_id) get the policy bypass.
+        let rls_system = super::principal::is_system_principal(&principal.user_id);
+        let rls_owner = sender_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
+
         let rows = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let stmt = format!(
                 "
@@ -2297,6 +2404,7 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = fetch_limit.max(1) as i64;
             let rows = client.with_client(|client| {
+                Self::apply_rls_context_raw(client, rls_system, rls_owner.as_deref())?;
                 Ok(client.query(
                     &stmt,
                     &[&query, &sid, &limit_i64, &channel, &chat_id, &raw_sender, &sender_id],
@@ -2563,6 +2671,7 @@ impl Memory for PostgresMemory {
                  LIMIT $2 OFFSET $3"
             );
             let rows = client.with_client(|client| {
+                Self::apply_rls_context_raw(client, system_allowed, owner_id.as_deref())?;
                 Ok(client.query(&stmt, &[&session_key, &limit, &offset, &system_allowed, &owner_id])?)
             })?;
             let mut turns: Vec<ConversationTurn> = rows

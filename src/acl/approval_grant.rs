@@ -433,6 +433,27 @@ impl ApprovalGrantV2 {
         self.revoked_at = Some(revoked_at);
         self.revocation_reason = Some(reason.into());
     }
+
+    /// FIX-P3-06: refresh a persisted grant's validity window by extending
+    /// `expires_at` to `now + ttl_secs`.
+    ///
+    /// `expires_at` is part of the canonically-signed payload, so the grant MUST
+    /// be re-signed with the same witness keyring after the bump; this is done in
+    /// one step here so callers cannot accidentally leave a refreshed grant with
+    /// a stale signature. `not_before` is left untouched (a refresh never makes a
+    /// not-yet-valid grant valid earlier) and a `ttl_secs` of zero is rejected so
+    /// `touch` can never shrink the window to an already-expired instant.
+    pub fn touch(&mut self, keyring: &WitnessKeyring, ttl_secs: i64, now: DateTime<Utc>) -> Result<()> {
+        if ttl_secs <= 0 {
+            bail!("approval grant touch requires a positive ttl_secs, got {ttl_secs}");
+        }
+        if self.is_revoked() {
+            bail!("cannot refresh a revoked approval grant");
+        }
+        self.expires_at = now + Duration::seconds(ttl_secs);
+        sign_grant(keyring, self)?;
+        Ok(())
+    }
 }
 
 fn op_id_matches(granted_op_id: &str, match_mode: &OpIdMatch, requested_op_id: &str) -> bool {
@@ -682,6 +703,41 @@ mod tests {
             .verify_for_operation_bound(&keyring, "file_write:write:abc", RiskLevel::Medium, Some(""), now)
             .expect_err("empty caller principal must be rejected");
         assert!(empty_caller.to_string().contains("caller principal"));
+        Ok(())
+    }
+
+    #[test]
+    fn approval_grant_touch_extends_expiry_and_resigns() -> Result<()> {
+        let keyring = WitnessKeyring::generate_for_tests()?;
+        let mut grant = ApprovalGrantV2::issue_one_shot(
+            &keyring,
+            test_subject(),
+            IssuerAuthority::HumanReview,
+            "file_write:write:abc",
+            RiskLevel::Medium,
+        )?;
+        let original_expiry = grant.expires_at;
+        let now = Utc::now();
+
+        // Refresh with a generous TTL; expiry must move forward and the new
+        // signature must still verify (touch re-signs the bumped payload).
+        grant.touch(&keyring, 3600, now)?;
+        assert!(grant.expires_at > original_expiry, "touch must extend expiry");
+        assert_eq!(grant.expires_at, now + Duration::seconds(3600));
+        verify_grant(&keyring, &grant)?;
+        grant.verify_for_operation(&keyring, "file_write:write:abc", RiskLevel::Medium, now)?;
+
+        // Non-positive TTL is rejected.
+        let bad = grant.touch(&keyring, 0, now).expect_err("zero ttl must fail");
+        assert!(bad.to_string().contains("positive ttl_secs"));
+
+        // A revoked grant cannot be refreshed.
+        grant.revoke("operator", now);
+        sign_grant(&keyring, &mut grant)?;
+        let revoked = grant
+            .touch(&keyring, 60, now)
+            .expect_err("revoked grant cannot be touched");
+        assert!(revoked.to_string().contains("revoked"));
         Ok(())
     }
 
