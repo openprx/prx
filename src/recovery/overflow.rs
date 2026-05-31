@@ -39,10 +39,15 @@ pub fn is_context_overflow_error(error: &anyhow::Error) -> bool {
         && (message.contains("window") || message.contains("length") || message.contains("token")))
         // OpenAI-style: "maximum context length is N tokens"
         || message.contains("maximum context")
+        // OpenAI error code, surfaced verbatim in some provider error strings.
+        || message.contains("context_length_exceeded")
         // Anthropic-style: "prompt is too long"
         || (message.contains("prompt") && message.contains("too long"))
         || message.contains("too many tokens")
         || message.contains("reduce the length")
+        // Provider phrasings that omit the word "context".
+        || message.contains("token limit")
+        || message.contains("max_tokens")
 }
 
 /// Compact a conversation history in place by dropping the oldest non-leading
@@ -134,6 +139,27 @@ mod tests {
         assert!(is_context_overflow_error(&err(
             "Please reduce the length of the messages"
         )));
+    }
+
+    #[test]
+    fn detector_is_superset_of_legacy_loop_phrasings() {
+        // FIX-P1-12: the agent tool loop historically used its own detector with
+        // these phrasings. The unified detector MUST catch every one of them so
+        // replacing the loop-local detector does not regress detection.
+        for phrasing in [
+            "context_length_exceeded",
+            "This model's maximum context length is 8192 tokens",
+            "token limit reached",
+            "too many tokens in request",
+            "context window exceeded",
+            "max_tokens is too large for this model",
+            "prompt is too long",
+        ] {
+            assert!(
+                is_context_overflow_error(&err(phrasing)),
+                "unified detector must catch legacy loop phrasing: {phrasing:?}"
+            );
+        }
     }
 
     #[test]

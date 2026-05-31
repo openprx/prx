@@ -545,18 +545,6 @@ status: {status}\n\
     )
 }
 
-/// Returns true when an LLM error indicates the request exceeded the context window.
-fn is_context_overflow_error(err: &anyhow::Error) -> bool {
-    let msg = err.to_string().to_lowercase();
-    msg.contains("context_length_exceeded")
-        || msg.contains("maximum context length")
-        || msg.contains("token limit")
-        || msg.contains("too many tokens")
-        || msg.contains("context window")
-        || msg.contains("max_tokens")
-        || msg.contains("prompt is too long")
-}
-
 /// Token-aware mid-turn trim: remove the oldest non-system messages one at a time
 /// until the estimated token count drops below max_tokens.
 fn trim_history_token_aware(history: &mut Vec<ChatMessage>, max_tokens: usize) {
@@ -3816,7 +3804,10 @@ pub(crate) async fn run_tool_call_loop(
         // P0-1: On context overflow, run compaction and retry (up to MAX_OVERFLOW_RETRIES).
         let (response_text, parsed_text, tool_calls, assistant_history_content, native_tool_calls) =
             match chat_processed {
-                Err(ref e) if is_context_overflow_error(e) && overflow_retries < MAX_OVERFLOW_RETRIES => {
+                Err(ref e)
+                    if crate::recovery::overflow::is_context_overflow_error(e)
+                        && overflow_retries < MAX_OVERFLOW_RETRIES =>
+                {
                     overflow_retries += 1;
                     tracing::warn!(
                         attempt = overflow_retries,
