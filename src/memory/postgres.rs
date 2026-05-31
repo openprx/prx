@@ -1327,6 +1327,9 @@ impl PostgresMemory {
             current_channel,
             current_chat_id,
             current_chat_type,
+            // FIX-P1-06: carry the raw sender anchor so build_sql_scope can match
+            // self-authored rows for anonymous principals.
+            raw_sender: context.raw_sender.clone().unwrap_or_default(),
             acl_enforced: true,
         }
     }
@@ -1422,6 +1425,8 @@ impl PostgresMemory {
             .map(ChatType::from_str)
             .unwrap_or(ChatType::Dm);
 
+        // FIX-P1-06: raw sender anchor shared by the fallback and resolved paths.
+        let raw_sender_anchor = context.raw_sender.clone().unwrap_or_default();
         let fallback = |user_id: String| Principal {
             user_id,
             role: Role::Anonymous,
@@ -1431,6 +1436,7 @@ impl PostgresMemory {
             current_channel: current_channel.clone(),
             current_chat_id: current_chat_id.clone(),
             current_chat_type: current_chat_type.clone(),
+            raw_sender: raw_sender_anchor.clone(),
             acl_enforced: true,
         };
 
@@ -1492,7 +1498,14 @@ impl PostgresMemory {
             return fallback(format!("anonymous:{channel}:{raw_sender}"));
         };
 
-        super::principal::principal_from_policy(user_id, policy, current_channel, current_chat_id, current_chat_type)
+        super::principal::principal_from_policy(
+            user_id,
+            policy,
+            current_channel,
+            current_chat_id,
+            current_chat_type,
+            raw_sender_anchor,
+        )
     }
 
     fn parse_category(value: &str) -> MemoryCategory {

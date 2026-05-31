@@ -64,6 +64,52 @@ pub const RUNTIME_APPROVAL_GRANT_ARG: &str = "_zc_approval_grant";
 /// under one `parking_lot::Mutex` so it is free of TOCTOU. Entries are lost on
 /// restart, which is safe: runtime grants expire within 60s, so a grant issued
 /// before a restart is already invalid afterwards.
+/// Maximum allowed re-entrancy depth for [`SideEffectGate`] authorizations
+/// (threat P3-10). A side effect that, while being authorized, triggers further
+/// gate-authorized side effects recurses on the calling thread; without a bound
+/// a crafted chain could exhaust the stack or evade per-call accounting.
+/// Authorizations nested deeper than this are denied. The limit is per-thread
+/// because each `authorize_*` call runs synchronously on the calling thread.
+const MAX_GATE_DEPTH: usize = 4;
+
+thread_local! {
+    /// Per-thread re-entrancy depth for active [`SideEffectGate`] authorizations.
+    /// Incremented on entry to an `authorize_*` call and decremented on exit via
+    /// [`GateDepthGuard`]; the guard restores the previous value on drop even if
+    /// the authorized operation panics, so the counter can never leak.
+    static GATE_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that increments the per-thread gate depth on construction and
+/// restores the previous value on drop. The guard MUST be bound to a variable
+/// for the duration of the authorization; the `#[must_use]` attribute makes
+/// dropping it immediately (which would leak an increment with no matching
+/// decrement) a compile-time lint.
+#[must_use = "GateDepthGuard must be held for the authorization scope; dropping it immediately leaks gate depth"]
+struct GateDepthGuard;
+
+impl GateDepthGuard {
+    /// Increment the per-thread gate depth and return the guard. Bind it to a
+    /// local (`let _guard = GateDepthGuard::enter();`) so the increment is
+    /// undone when the authorization scope ends. Read the resulting depth with
+    /// [`GateDepthGuard::current_depth`].
+    fn enter() -> Self {
+        GATE_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        Self
+    }
+
+    /// Current per-thread gate depth (number of active guards on this thread).
+    fn current_depth() -> usize {
+        GATE_DEPTH.with(std::cell::Cell::get)
+    }
+}
+
+impl Drop for GateDepthGuard {
+    fn drop(&mut self) {
+        GATE_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 static CONSUMED_V2_GRANTS: std::sync::LazyLock<Mutex<std::collections::HashMap<String, u32>>> =
     std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
@@ -91,6 +137,14 @@ fn try_consume_v2_grant(grant_id: &str, max_uses: u32) -> bool {
 pub struct ApprovalGrant {
     pub tool: String,
     pub operation_hash: Option<u64>,
+    /// P3-07: SHA-256 (256-bit) hex digest of the bound operation. Preferred
+    /// over the 64-bit `operation_hash` when present; the wider digest makes a
+    /// second-preimage (forging a different command that hashes the same)
+    /// computationally infeasible. `#[serde(default)]` + `skip_serializing_if`
+    /// so v1 grants persisted before this field existed still deserialize (d08
+    /// backward compatibility) and v1-only grants serialize unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation_hash_v2: Option<String>,
     pub actor: String,
     pub scope: Option<String>,
     pub expires_at_epoch_secs: Option<i64>,
@@ -116,6 +170,8 @@ impl ApprovalGrant {
         Self {
             tool: tool.into(),
             operation_hash: None,
+            // for_tool carries no operation binding at all; both digests stay None.
+            operation_hash_v2: None,
             actor: actor.into(),
             scope,
             expires_at_epoch_secs: None,
@@ -135,6 +191,8 @@ impl ApprovalGrant {
         let tool = tool.into();
         Self {
             operation_hash: Some(command_operation_hash(&tool, command)),
+            // P3-07: also bind the wide 256-bit digest; verification prefers it.
+            operation_hash_v2: Some(command_operation_hash_v2(&tool, command)),
             tool,
             actor: actor.into(),
             scope,
@@ -155,6 +213,8 @@ impl ApprovalGrant {
         let tool = tool.into();
         Self {
             operation_hash: Some(resource_operation_hash(&tool, operation)),
+            // P3-07: also bind the wide 256-bit digest; verification prefers it.
+            operation_hash_v2: Some(resource_operation_hash_v2(&tool, operation)),
             tool,
             actor: actor.into(),
             scope,
@@ -180,6 +240,9 @@ impl ApprovalGrant {
         Self {
             tool: tool.into(),
             operation_hash: None,
+            // v2 cryptographic grants carry their own op-id binding inside the
+            // signed ApprovalGrantV2; the v1 hash fields are unused for them.
+            operation_hash_v2: None,
             actor: actor.into(),
             scope: Some(grant.grant_id.clone()),
             expires_at_epoch_secs: Some(grant.expires_at.timestamp()),
@@ -241,6 +304,10 @@ impl ApprovalGrant {
         Some(grant)
     }
 
+    // P3-07: the v1/v2 digest fallback reads clearest as an explicit
+    // Option::map_or_else; clippy's `option_if_let_else` (nursery) loops on the
+    // nested `is_some_and` closure, so it is scoped-allowed here.
+    #[allow(clippy::option_if_let_else)]
     #[must_use]
     pub fn permits_command(&self, tool_name: &str, command: &str, risk: CommandRiskLevel, now_epoch_secs: i64) -> bool {
         if self.tool != tool_name {
@@ -256,13 +323,21 @@ impl ApprovalGrant {
             return false;
         }
         // Tightened default (d08 §0 / M1): an operation with no precise binding
-        // (`operation_hash == None`) is denied. Only an exact command-hash match
-        // is honoured on the legacy v1 path.
-        self.operation_hash
-            .map(|hash| hash == command_operation_hash(tool_name, command))
-            .unwrap_or(false)
+        // is denied. P3-07: prefer the 256-bit v2 digest when present; fall back
+        // to the 64-bit v1 digest for grants minted before v2 existed (d08
+        // compatibility). A grant with neither digest is unbound → denied.
+        match &self.operation_hash_v2 {
+            Some(expected_v2) => expected_v2.as_str() == command_operation_hash_v2(tool_name, command),
+            None => self
+                .operation_hash
+                .map(|hash| hash == command_operation_hash(tool_name, command))
+                .unwrap_or(false),
+        }
     }
 
+    // See `permits_command`: scoped-allow the nursery `option_if_let_else` that
+    // loops on the v1/v2 digest fallback's `is_some_and` closure.
+    #[allow(clippy::option_if_let_else)]
     #[must_use]
     pub fn permits_resource_operation(
         &self,
@@ -283,9 +358,14 @@ impl ApprovalGrant {
         {
             return false;
         }
-        self.operation_hash
-            .map(|hash| hash == resource_operation_hash(tool_name, operation))
-            .unwrap_or(false)
+        // P3-07: prefer the 256-bit v2 digest; fall back to v1 (see permits_command).
+        self.operation_hash_v2.as_ref().map_or_else(
+            || {
+                self.operation_hash
+                    .is_some_and(|hash| hash == resource_operation_hash(tool_name, operation))
+            },
+            |expected_v2| expected_v2.as_str() == resource_operation_hash_v2(tool_name, operation),
+        )
     }
 
     /// Authoritative v2 verification for the gate. Re-verifies the witness
@@ -400,9 +480,12 @@ impl ApprovalGrant {
         if self.expires_at_epoch_secs.is_some_and(|expires_at| expires_at <= now) {
             return "grant expired".to_string();
         }
-        if self.operation_hash.is_none() {
+        // P3-07: a v2 digest counts as a precise binding; only when BOTH digests
+        // are absent is the grant unbound. (`op_id` here is the resolved op/command.)
+        if self.operation_hash.is_none() && self.operation_hash_v2.is_none() {
             return "no precise operation binding (operation_hash=None)".to_string();
         }
+        let _ = op_id;
         "operation hash mismatch".to_string()
     }
 }
@@ -471,6 +554,15 @@ impl<'a> SideEffectGate<'a> {
         command: &str,
         grant: Option<&ApprovalGrant>,
     ) -> Result<CommandRiskLevel, String> {
+        // P3-10: bound gate re-entrancy depth. The guard restores the previous
+        // depth on every return path (including the deny below) because it is
+        // dropped at end of scope.
+        let _depth_guard = GateDepthGuard::enter();
+        if GateDepthGuard::current_depth() > MAX_GATE_DEPTH {
+            return Err(format!(
+                "side-effect gate re-entrancy depth exceeded (max {MAX_GATE_DEPTH})"
+            ));
+        }
         let now = chrono::Utc::now().timestamp();
         let command_risk = self.policy.command_risk_level(command);
         let runtime_approval_granted =
@@ -529,6 +621,13 @@ impl<'a> SideEffectGate<'a> {
         risk: ResourceRiskLevel,
         grant: Option<&ApprovalGrant>,
     ) -> Result<ResourceRiskLevel, String> {
+        // P3-10: bound gate re-entrancy depth (see authorize_command_execution).
+        let _depth_guard = GateDepthGuard::enter();
+        if GateDepthGuard::current_depth() > MAX_GATE_DEPTH {
+            return Err(format!(
+                "side-effect gate re-entrancy depth exceeded (max {MAX_GATE_DEPTH})"
+            ));
+        }
         let mut allowed = false;
         let mut approved = false;
         let result = (|| {
@@ -607,6 +706,33 @@ pub fn command_operation_hash(tool_name: &str, command: &str) -> u64 {
         *slot = *byte;
     }
     u64::from_be_bytes(first)
+}
+
+/// P3-07: full 256-bit SHA-256 hex digest binding `tool_name` + `command`.
+/// Domain-separated identically to [`command_operation_hash`] (`tool\0command`)
+/// so the v1 and v2 digests cover the same input; only the output width differs.
+#[must_use]
+pub fn command_operation_hash_v2(tool_name: &str, command: &str) -> String {
+    let mut hasher = sha2::Sha256::new();
+    sha2::Digest::update(&mut hasher, tool_name.as_bytes());
+    sha2::Digest::update(&mut hasher, b"\0");
+    sha2::Digest::update(&mut hasher, command.as_bytes());
+    let digest = sha2::Digest::finalize(hasher);
+    let mut hex = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        // Writing a byte to a String via fmt::Write is infallible; the Result is
+        // intentionally discarded because String's writer never errors.
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// P3-07: 256-bit SHA-256 hex digest for resource operations. Mirrors
+/// [`resource_operation_hash`] by delegating to [`command_operation_hash_v2`].
+#[must_use]
+pub fn resource_operation_hash_v2(tool_name: &str, operation_name: &str) -> String {
+    command_operation_hash_v2(tool_name, operation_name)
 }
 
 #[must_use]
@@ -1682,6 +1808,7 @@ mod tests {
         let tampered = ApprovalGrant {
             tool: "nodes".to_string(),
             operation_hash: None,
+            operation_hash_v2: None,
             actor: "test".to_string(),
             scope: Some(grant.grant_id.clone()),
             expires_at_epoch_secs: Some(grant.expires_at.timestamp()),
@@ -1901,6 +2028,111 @@ mod tests {
             .authorize_resource_operation("file_write", op, ResourceRiskLevel::Medium, Some(&grant))
             .unwrap_err();
         assert!(denied.contains("runtime approval grant"));
+    }
+
+    #[test]
+    fn p3_07_for_command_binds_256bit_v2_digest() {
+        // for_command now mints a 256-bit (SHA-256) v2 digest as well as the
+        // legacy 64-bit one.
+        let grant = ApprovalGrant::for_command("shell", "rm -rf /tmp/x", "policy", None);
+        let v2 = grant.operation_hash_v2.as_deref().expect("v2 digest must be present");
+        // SHA-256 hex is exactly 64 hex chars (256 bits).
+        assert_eq!(v2.len(), 64, "expected 256-bit hex digest, got {v2}");
+        assert!(v2.chars().all(|c| c.is_ascii_hexdigit()));
+        // v2 digest equals the standalone helper for the same input...
+        assert_eq!(v2, command_operation_hash_v2("shell", "rm -rf /tmp/x"));
+        // ...and differs for a different command (second-preimage binding).
+        assert_ne!(v2, command_operation_hash_v2("shell", "rm -rf /tmp/y"));
+    }
+
+    #[test]
+    fn p3_07_v2_digest_binds_command_and_rejects_mismatch() {
+        let now = Utc::now().timestamp();
+        let grant = ApprovalGrant::for_command("shell", "echo hi", "policy", None);
+        // The v2-bound grant authorizes the exact command it was minted for.
+        assert!(grant.permits_command("shell", "echo hi", CommandRiskLevel::Low, now));
+        // A different command (which would collide only on a 64-bit truncation
+        // attack) is rejected by the 256-bit binding.
+        assert!(!grant.permits_command("shell", "echo bye", CommandRiskLevel::Low, now));
+        // Wrong tool is rejected too.
+        assert!(!grant.permits_command("other", "echo hi", CommandRiskLevel::Low, now));
+    }
+
+    #[test]
+    fn p3_07_v1_only_grant_still_verifies_via_fallback() {
+        // Simulate a legacy grant persisted before v2 existed: it carries only
+        // the 64-bit digest. Verification must fall back to v1 and still bind.
+        let now = Utc::now().timestamp();
+        let mut legacy = ApprovalGrant::for_command("shell", "ls -la", "policy", None);
+        legacy.operation_hash_v2 = None; // pre-v2 on-disk shape
+        assert!(legacy.operation_hash.is_some(), "v1 digest preserved");
+        assert!(legacy.permits_command("shell", "ls -la", CommandRiskLevel::Low, now));
+        assert!(!legacy.permits_command("shell", "ls -l", CommandRiskLevel::Low, now));
+    }
+
+    #[test]
+    fn p3_07_v1_grant_json_without_v2_field_deserializes() {
+        // d08 backward compatibility: a serialized v1 grant that predates the
+        // operation_hash_v2 field must still deserialize (serde default = None).
+        let json = r#"{
+            "tool": "shell",
+            "operation_hash": 305419896,
+            "actor": "policy",
+            "scope": null,
+            "expires_at_epoch_secs": null
+        }"#;
+        let grant: ApprovalGrant = serde_json::from_str(json).expect("v1 grant deserializes");
+        assert_eq!(grant.operation_hash, Some(305_419_896));
+        assert_eq!(grant.operation_hash_v2, None);
+        // A v1-only grant also serializes without emitting the v2 field.
+        let out = serde_json::to_string(&grant).expect("serialize");
+        assert!(
+            !out.contains("operation_hash_v2"),
+            "v1 grant must not emit v2 field: {out}"
+        );
+    }
+
+    #[test]
+    fn p3_10_gate_denies_when_reentrancy_depth_exceeded() {
+        // Full autonomy so a benign command is otherwise authorized; the only
+        // reason to deny here must be the re-entrancy depth bound.
+        let mut autonomy = crate::config::AutonomyConfig::default();
+        autonomy.level = AutonomyLevel::Full;
+        let policy = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+
+        // `cargo test` reuses worker threads, and GATE_DEPTH is thread-local, so
+        // a previously-aborted test could have left a non-zero residual depth on
+        // this thread. Snapshot it and restore deterministically at the end so
+        // this test neither sees stale state nor leaks state into sibling tests.
+        let baseline = GateDepthGuard::current_depth();
+
+        // Hold MAX_GATE_DEPTH active depth guards on top of the baseline; the
+        // next gate call enters one level deeper and must be denied. The guards
+        // are dropped explicitly below (and on panic via RAII) so depth returns
+        // to `baseline`.
+        let mut guards = Vec::new();
+        for _ in 0..=(MAX_GATE_DEPTH - baseline.min(MAX_GATE_DEPTH)) {
+            guards.push(GateDepthGuard::enter());
+        }
+        let denied = SideEffectGate::new(&policy)
+            .authorize_command_execution("shell", "ls", None)
+            .unwrap_err();
+        assert!(denied.contains("re-entrancy depth"), "{denied}");
+        drop(guards);
+
+        // Back at `baseline` depth: a fresh authorization is accepted again,
+        // proving the guard restores state (the gate enters exactly one level).
+        assert_eq!(GateDepthGuard::current_depth(), baseline);
+        assert!(
+            SideEffectGate::new(&policy)
+                .authorize_command_execution("shell", "ls", None)
+                .is_ok()
+        );
+        assert_eq!(
+            GateDepthGuard::current_depth(),
+            baseline,
+            "gate authorization must not leak depth"
+        );
     }
 
     #[test]

@@ -450,6 +450,7 @@ mod tests {
             current_channel: "telegram".to_string(),
             current_chat_id: "chat-1".to_string(),
             current_chat_type: ChatType::Dm,
+            raw_sender: String::new(),
             acl_enforced: true,
         }
     }

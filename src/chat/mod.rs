@@ -2329,6 +2329,33 @@ pub async fn run(
                         "chat.stream_failed",
                     );
                 }
+                // FIX-P1-15 (#27): the success path below records a
+                // `ProviderExecutionOutcome` + control-ladder trace, but a
+                // failed turn (timeout / context-overflow-exhausted / provider
+                // error) used to `continue` without emitting any provider
+                // outcome, leaving the routing/provider timeline blind to
+                // failed turns. Record a `failed_for_decision` outcome here so
+                // the `decision_id` join still has a `provider.final_outcome` /
+                // control-ladder trace for the failed attempt. Cancellation is
+                // a user-driven abort, not a provider failure, so the
+                // `Cancelled` arm above intentionally records nothing.
+                let failure = anyhow::anyhow!("{err}");
+                let failed_outcome =
+                    ProviderExecutionOutcome::failed_for_decision(&route_decision, provider_started_at, &failure);
+                if let Err(e) =
+                    record_provider_outcome_events(&memory_fabric, route_scope.clone(), &failed_outcome).await
+                {
+                    tracing::warn!(error = %e, "Failed to append provider.final_outcome message event for failed turn");
+                }
+                let attempts_count = u8::try_from(failed_outcome.attempts.len()).unwrap_or(u8::MAX);
+                crate::runtime::control_ladder::append_provider_outcome_trace(
+                    std::path::Path::new(&config.workspace_dir),
+                    &failed_outcome.decision_id,
+                    &failed_outcome.final_provider,
+                    &failed_outcome.final_model,
+                    attempts_count,
+                    "all_failed",
+                );
             }
         }
 
@@ -4131,5 +4158,42 @@ mod s4_a_4 {
         });
         let (pending, _) = src.read_pending(0);
         assert_eq!(pending.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod wave8_routing_failure_trace_tests {
+    use crate::llm::route_decision::{ExecutionStatus, ProviderExecutionOutcome, RouteDecision};
+
+    /// Contract relied upon by the chat failure path (FIX-P1-15 / #27) and the
+    /// channels failure path (#21): a failed turn must produce a
+    /// `ProviderExecutionOutcome` that (a) carries the same `decision_id` as the
+    /// originating `RouteDecision` so the timeline join still works, (b) reports
+    /// an `AllFailed` execution status, and (c) records exactly one failed
+    /// attempt. Both failure paths build this outcome via `failed_for_decision`
+    /// before recording `provider.final_outcome` events.
+    #[test]
+    fn failed_for_decision_outcome_is_recordable_for_failed_turns() {
+        let decision = RouteDecision::single_candidate("test-provider", "test-model");
+        let started_at = chrono::Utc::now();
+        let error = anyhow::anyhow!("simulated provider timeout");
+
+        let outcome = ProviderExecutionOutcome::failed_for_decision(&decision, started_at, &error);
+
+        assert_eq!(
+            outcome.decision_id, decision.decision_id,
+            "failed outcome must preserve the route decision_id for timeline joins"
+        );
+        assert!(
+            matches!(outcome.status, ExecutionStatus::AllFailed { .. }),
+            "a failed turn must surface as ExecutionStatus::AllFailed"
+        );
+        assert_eq!(
+            outcome.attempts.len(),
+            1,
+            "failed_for_decision should record exactly one failed attempt"
+        );
+        assert_eq!(outcome.final_provider, "test-provider");
+        assert_eq!(outcome.final_model, "test-model");
     }
 }

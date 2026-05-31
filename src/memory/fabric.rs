@@ -1,12 +1,44 @@
 use crate::memory::{
-    Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEvent, MemoryEventInput, MemoryPrincipal,
-    MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
+    Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEvent, MemoryEventInput, MemoryLinkInput,
+    MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 pub fn fail_fast(backend: &str, method: &str) -> anyhow::Error {
     anyhow::anyhow!("memory backend {backend} does not implement fabric::{method} (fail_fast)")
+}
+
+/// FIX-P1-20: extract the `document_id` of every `[document_ingest_ref] ...
+/// [/document_ingest_ref]` block embedded in `content`.
+///
+/// The agent loop injects these markers when a large tool output is offloaded to
+/// the document store. A summary/semantic memory derived from such content is
+/// linked back to those documents via `memory_links`. Returns the distinct
+/// document ids in first-seen order; an empty vector when no marker is present.
+fn parse_document_ingest_refs(content: &str) -> Vec<String> {
+    const OPEN: &str = "[document_ingest_ref]";
+    const CLOSE: &str = "[/document_ingest_ref]";
+    let mut ids = Vec::new();
+    let mut remaining = content;
+    while let Some(start) = remaining.find(OPEN) {
+        let after_open = &remaining[start + OPEN.len()..];
+        let Some(end) = after_open.find(CLOSE) else {
+            break;
+        };
+        let block = &after_open[..end];
+        for line in block.lines() {
+            if let Some(value) = line.trim().strip_prefix("document_id:") {
+                let id = value.trim();
+                if !id.is_empty() && !ids.iter().any(|existing| existing == id) {
+                    ids.push(id.to_string());
+                }
+                break;
+            }
+        }
+        remaining = &after_open[end + CLOSE.len()..];
+    }
+    ids
 }
 
 pub fn fail_fast_result<T>(backend: &str, method: &str) -> anyhow::Result<T> {
@@ -338,6 +370,37 @@ impl MemoryFabric {
                 ),
             })
             .await?;
+
+        // FIX-P1-20: a promoted memory whose content carries one or more
+        // `[document_ingest_ref]` markers is derived from those source documents.
+        // Record the back-references in `memory_links` so the (previously dead)
+        // table captures provenance from the semantic-memory path. Linking is
+        // best-effort: a backend that does not implement `link_memory_source`
+        // (or a transient failure) must not fail the memory write.
+        for document_id in parse_document_ingest_refs(content) {
+            let link = self
+                .memory
+                .link_memory_source(MemoryLinkInput {
+                    link_id: None,
+                    workspace_id: self.workspace_id.clone(),
+                    owner_id: None,
+                    memory_key: Some(key.to_string()),
+                    memory_event_id: None,
+                    message_event_id: source_event_id.map(str::to_string),
+                    document_id: document_id.clone(),
+                    chunk_id: None,
+                    link_type: "derived_from".to_string(),
+                    payload_json: None,
+                })
+                .await;
+            if let Err(error) = link {
+                tracing::debug!(
+                    %document_id,
+                    key,
+                    "memory source link skipped (backend unsupported or transient): {error}"
+                );
+            }
+        }
         Ok(())
     }
 

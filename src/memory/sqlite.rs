@@ -437,7 +437,10 @@ impl SqliteMemory {
                 sender_id    TEXT,
                 raw_sender   TEXT,
                 topic_id     TEXT,
-                visibility   TEXT NOT NULL DEFAULT 'private',
+                -- FIX-P2-04: unify the `memories.visibility` default with Postgres
+                -- (`'workspace'`). Inserts always set visibility explicitly, so this
+                -- only affects rows created without an explicit value.
+                visibility   TEXT NOT NULL DEFAULT 'workspace',
                 sensitivity  TEXT NOT NULL DEFAULT 'normal',
                 risk_signals TEXT DEFAULT '[]',
                 policy_version INTEGER DEFAULT 1,
@@ -467,15 +470,19 @@ impl SqliteMemory {
                 VALUES (new.rowid, new.key, new.content);
             END;
 
-            -- Embedding cache with LRU eviction
+            -- Embedding cache with LRU eviction.
+            -- FIX-P0-26: the cache key is the composite (content_hash, provider,
+            -- model, dimensions) so the same content cached under different
+            -- providers/models/dimensions does not collide (parity with Postgres).
             CREATE TABLE IF NOT EXISTS embedding_cache (
-                content_hash TEXT PRIMARY KEY,
+                content_hash TEXT NOT NULL,
                 embedding    BLOB NOT NULL,
-                provider     TEXT,
-                model        TEXT,
-                dimensions   INTEGER,
+                provider     TEXT NOT NULL DEFAULT '',
+                model        TEXT NOT NULL DEFAULT '',
+                dimensions   INTEGER NOT NULL DEFAULT 0,
                 created_at   TEXT NOT NULL,
-                accessed_at  TEXT NOT NULL
+                accessed_at  TEXT NOT NULL,
+                PRIMARY KEY (content_hash, provider, model, dimensions)
             );
             CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
         )?;
@@ -966,7 +973,8 @@ impl SqliteMemory {
             ("topic_id", "ALTER TABLE memories ADD COLUMN topic_id TEXT"),
             (
                 "visibility",
-                "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'",
+                // FIX-P2-04: match the CREATE TABLE default and Postgres parity.
+                "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'workspace'",
             ),
             (
                 "sensitivity",
@@ -1077,6 +1085,13 @@ impl SqliteMemory {
                 }
             }
         }
+
+        // FIX-P0-26: upgrade a legacy single-column `embedding_cache` primary key
+        // (`content_hash`) to the composite `(content_hash, provider, model,
+        // dimensions)` so different providers/models/dimensions for the same
+        // content no longer collide. SQLite cannot alter a primary key in place,
+        // so the table is rebuilt when the legacy PK is detected.
+        Self::upgrade_embedding_cache_primary_key(&conn)?;
 
         let mut msg_column_stmt = conn.prepare("PRAGMA table_info(message_events)")?;
         let existing_msg_columns = msg_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
@@ -1257,8 +1272,80 @@ impl SqliteMemory {
              WHERE owner_id IS NULL;",
         )?;
 
+        // FIX-P2-04: normalize legacy rows whose `visibility` was left implicitly
+        // NULL or empty so the column always carries the unified 'workspace'
+        // default. Explicit values (including an intentional 'private') are left
+        // untouched — this never downgrades a stricter visibility.
+        conn.execute(
+            "UPDATE memories SET visibility = 'workspace' \
+             WHERE visibility IS NULL OR visibility = ''",
+            [],
+        )?;
+
         Self::run_memory_schema_migrations(conn)?;
 
+        Ok(())
+    }
+
+    /// FIX-P0-26: rebuild a legacy `embedding_cache` whose primary key is the
+    /// single `content_hash` column into one keyed by the composite
+    /// `(content_hash, provider, model, dimensions)`.
+    ///
+    /// Detection uses `PRAGMA table_info`: if exactly one column has a non-zero
+    /// `pk` ordinal the table predates the composite key and is rebuilt. The
+    /// rebuild coalesces legacy NULL provider/model/dimensions to the same
+    /// defaults the fresh schema uses and de-duplicates on the composite key,
+    /// keeping the most recently accessed row.
+    fn upgrade_embedding_cache_primary_key(conn: &Connection) -> anyhow::Result<()> {
+        let pk_columns: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('embedding_cache') WHERE pk > 0",
+            [],
+            |row| row.get(0),
+        )?;
+        // 0 ⇒ table missing (fresh CREATE handles it); >1 ⇒ already composite.
+        if pk_columns != 1 {
+            return Ok(());
+        }
+
+        // De-duplicate on the composite key first: legacy rows could differ only
+        // by NULL vs '' provider/model/dimensions that collapse to the same
+        // normalized key. `GROUP BY` keeps one row per composite key (the one with
+        // the most recent `accessed_at` via MAX), avoiding a UNIQUE violation that
+        // `INSERT OR REPLACE` does not reliably resolve inside `execute_batch`.
+        conn.execute_batch(
+            "CREATE TABLE embedding_cache_v2 (
+                content_hash TEXT NOT NULL,
+                embedding    BLOB NOT NULL,
+                provider     TEXT NOT NULL DEFAULT '',
+                model        TEXT NOT NULL DEFAULT '',
+                dimensions   INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL,
+                accessed_at  TEXT NOT NULL,
+                PRIMARY KEY (content_hash, provider, model, dimensions)
+            );
+            INSERT INTO embedding_cache_v2 (
+                content_hash, embedding, provider, model, dimensions, created_at, accessed_at
+            )
+            SELECT content_hash, embedding, norm_provider, norm_model, norm_dimensions,
+                   created_at, accessed_at
+            FROM (
+                SELECT content_hash, embedding,
+                       COALESCE(provider, '') AS norm_provider,
+                       COALESCE(model, '')    AS norm_model,
+                       COALESCE(dimensions, 0) AS norm_dimensions,
+                       created_at, accessed_at,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY content_hash, COALESCE(provider, ''),
+                                        COALESCE(model, ''), COALESCE(dimensions, 0)
+                           ORDER BY accessed_at DESC
+                       ) AS rn
+                FROM embedding_cache
+            )
+            WHERE rn = 1;
+            DROP TABLE embedding_cache;
+            ALTER TABLE embedding_cache_v2 RENAME TO embedding_cache;
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+        )?;
         Ok(())
     }
 
@@ -1370,6 +1457,24 @@ impl SqliteMemory {
                 8,
                 "memory_trash",
                 "memory_trash(id,trash_id,memory_key,content,category,reason,trashed_at,grace_until,restored_at) + idx_memory_trash_key + idx_memory_trash_grace",
+            ),
+            (
+                9,
+                "memories_visibility_default_workspace",
+                // FIX-P2-04: the `memories.visibility` column default is unified to
+                // 'workspace' (CREATE TABLE + ALTER) for parity with Postgres. The
+                // backfill below normalizes legacy rows whose visibility was left
+                // implicitly NULL/empty; it never downgrades an explicit value.
+                "memories.visibility default 'workspace' (parity with postgres) + backfill NULL/'' -> 'workspace'",
+            ),
+            (
+                10,
+                "embedding_cache_composite_primary_key",
+                // FIX-P0-26: embedding_cache primary key upgraded from single
+                // `content_hash` to composite `(content_hash, provider, model,
+                // dimensions)` (parity with Postgres). The legacy table is rebuilt
+                // in-place by `upgrade_embedding_cache_primary_key`.
+                "embedding_cache PRIMARY KEY (content_hash, provider, model, dimensions) + rebuild legacy single-key table",
             ),
         ]
     }
@@ -1770,6 +1875,7 @@ impl SqliteMemory {
                         .as_deref()
                         .map(ChatType::from_str)
                         .unwrap_or(ChatType::Dm),
+                    raw_sender: ctx.raw_sender.clone().unwrap_or_default(),
                     acl_enforced: true,
                 };
                 let principal = if ctx.channel.is_some() && ctx.raw_sender.is_some() {
@@ -2053,9 +2159,12 @@ impl SqliteMemory {
                 .query_row(params![hash_c, provider_c, model_c, dimensions], |row| row.get(0))
                 .ok();
             if let Some(bytes) = blob {
+                // FIX-P0-26: touch the exact composite-key row, not every row
+                // sharing this content_hash.
                 conn.execute(
-                    "UPDATE embedding_cache SET accessed_at = ?1 WHERE content_hash = ?2",
-                    params![now_c, hash_c],
+                    "UPDATE embedding_cache SET accessed_at = ?1 \
+                     WHERE content_hash = ?2 AND provider = ?3 AND model = ?4 AND dimensions = ?5",
+                    params![now_c, hash_c, provider_c, model_c, dimensions],
                 )?;
                 let embedding = vector::bytes_to_vec(&bytes);
                 if embedding.len() == usize::try_from(dimensions).unwrap_or(usize::MAX) {
@@ -2635,6 +2744,7 @@ impl Memory for SqliteMemory {
                     .as_deref()
                     .map(ChatType::from_str)
                     .unwrap_or(ChatType::Dm),
+                raw_sender: context.raw_sender.clone().unwrap_or_default(),
                 acl_enforced: true,
             };
             let principal = if context.channel.is_some() && context.raw_sender.is_some() {
@@ -2642,19 +2752,10 @@ impl Memory for SqliteMemory {
             } else {
                 fallback_principal
             };
-            let (scope_sql, scope_params) = if matches!(principal.role, Role::Anonymous) {
-                (
-                    "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) AND sensitivity != 'secret'"
-                        .to_string(),
-                    vec![
-                        Value::from(context.channel.clone().unwrap_or_default()),
-                        Value::from(context.chat_id.clone().unwrap_or_default()),
-                        Value::from(context.raw_sender.clone().unwrap_or_default()),
-                    ],
-                )
-            } else {
-                principal.build_sql_scope()
-            };
+            // FIX-P1-06: the Anonymous `(channel, chat_id, raw_sender)` triple is
+            // now produced by `build_sql_scope` itself, so all roles share the
+            // single scope builder (no hardcoded branch).
+            let (scope_sql, scope_params) = principal.build_sql_scope();
 
             let mut allowed_ids = std::collections::HashSet::new();
             if !entries.is_empty() {
@@ -2830,6 +2931,7 @@ impl Memory for SqliteMemory {
                     .as_deref()
                     .map(ChatType::from_str)
                     .unwrap_or(ChatType::Dm),
+                raw_sender: context.raw_sender.clone().unwrap_or_default(),
                 acl_enforced: true,
             };
             let principal = if context.channel.is_some() && context.raw_sender.is_some() {
@@ -2837,19 +2939,8 @@ impl Memory for SqliteMemory {
             } else {
                 fallback_principal
             };
-            let (scope_sql, scope_params) = if matches!(principal.role, Role::Anonymous) {
-                (
-                    "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) AND sensitivity != 'secret'"
-                        .to_string(),
-                    vec![
-                        Value::from(context.channel.clone().unwrap_or_default()),
-                        Value::from(context.chat_id.clone().unwrap_or_default()),
-                        Value::from(context.raw_sender.clone().unwrap_or_default()),
-                    ],
-                )
-            } else {
-                principal.build_sql_scope()
-            };
+            // FIX-P1-06: unified scope builder for all roles (see recall_with_context).
+            let (scope_sql, scope_params) = principal.build_sql_scope();
             let mut query_params = Vec::with_capacity(scope_params.len() + 1);
             query_params.push(Value::from(key.clone()));
             query_params.extend(scope_params);
@@ -5387,6 +5478,38 @@ mod tests {
         assert_eq!(run.source_message_count, 4);
         assert_eq!(run.summary_memory_key.as_deref(), Some("compaction_summary_1"));
         assert_eq!(run.fidelity_status, "accepted");
+    }
+
+    // FIX-P1-20: a semantic memory promoted through the fabric whose content
+    // carries a `[document_ingest_ref]` marker must record a back-reference into
+    // the (previously dead) `memory_links` table.
+    #[tokio::test]
+    async fn fabric_semantic_memory_records_memory_link_for_ingest_ref() {
+        let (tmp, mem) = temp_sqlite();
+        let conn = mem.conn.clone();
+        let fabric = crate::memory::fabric::MemoryFabric::new(Arc::new(mem), "workspace-a");
+
+        let content = "Promoted fact.\n\n[document_ingest_ref]\n\
+document_id: doc-prov-1\n\
+source: tool_output\n\
+[/document_ingest_ref]";
+        fabric
+            .record_semantic_memory("prov-key", content, MemoryCategory::Conversation, Some("chat:session"))
+            .await
+            .expect("test: record_semantic_memory should succeed");
+
+        let (document_id, link_type, memory_key): (String, String, Option<String>) = conn
+            .lock()
+            .query_row(
+                "SELECT document_id, link_type, memory_key FROM memory_links WHERE memory_key = 'prov-key'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("test: a memory_links row should exist");
+        assert_eq!(document_id, "doc-prov-1");
+        assert_eq!(link_type, "derived_from");
+        assert_eq!(memory_key.as_deref(), Some("prov-key"));
+        drop(tmp);
     }
 
     #[tokio::test]

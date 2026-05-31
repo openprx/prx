@@ -168,6 +168,7 @@ fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
         current_channel: ctx.channel.clone().unwrap_or_default(),
         current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
         current_chat_type: ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm),
+        raw_sender: ctx.raw_sender.clone().unwrap_or_default(),
         acl_enforced: true,
     }
 }
@@ -182,6 +183,7 @@ fn anonymous_principal() -> Principal {
         current_channel: String::new(),
         current_chat_id: String::new(),
         current_chat_type: ChatType::Dm,
+        raw_sender: String::new(),
         acl_enforced: true,
     }
 }

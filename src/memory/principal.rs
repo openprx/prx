@@ -224,6 +224,12 @@ pub struct Principal {
     pub current_channel: String,
     pub current_chat_id: String,
     pub current_chat_type: ChatType,
+    /// Raw channel-account anchor for the originating sender (FIX-P1-06).
+    ///
+    /// The Anonymous scope matches durable rows on the
+    /// `(channel, chat_id, raw_sender)` triple so an unbound sender can still
+    /// reach memories they themselves produced. Empty string means "no anchor".
+    pub raw_sender: String,
     pub acl_enforced: bool,
 }
 
@@ -235,9 +241,19 @@ impl Principal {
 
         match self.role {
             Role::Owner => ("1=1".to_string(), Vec::new()),
+            // FIX-P1-06: unify the Anonymous scope with the previously hardcoded
+            // SQLite recall/forget branches. An anonymous principal sees public
+            // rows plus rows it authored, matched on the
+            // `(channel, chat_id, raw_sender)` triple, excluding secrets.
             Role::Anonymous => (
-                "visibility = 'public' AND sensitivity = 'normal'".to_string(),
-                Vec::new(),
+                "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) \
+                 AND sensitivity != 'secret'"
+                    .to_string(),
+                vec![
+                    Value::from(self.current_channel.clone()),
+                    Value::from(self.current_chat_id.clone()),
+                    Value::from(self.raw_sender.clone()),
+                ],
             ),
             Role::Member | Role::Guest => {
                 let ceiling_ord = self.visibility_ceiling.ordinal();
@@ -361,12 +377,15 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
     let current_chat_id = ctx.chat_id.clone().unwrap_or_default();
     let current_chat_type = ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm);
 
+    let raw_sender_anchor = ctx.raw_sender.clone().unwrap_or_default();
+
     let Some(channel) = ctx.channel.as_deref() else {
         return Ok(anonymous_principal(
             "anonymous:unknown:unknown".to_string(),
             current_channel,
             current_chat_id,
             current_chat_type,
+            raw_sender_anchor,
         ));
     };
 
@@ -376,6 +395,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
             current_channel,
             current_chat_id,
             current_chat_type,
+            raw_sender_anchor,
         ));
     };
 
@@ -393,6 +413,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
             current_channel,
             current_chat_id,
             current_chat_type,
+            raw_sender_anchor,
         ));
     };
 
@@ -411,6 +432,7 @@ pub fn resolve_principal(conn: &Connection, ctx: &MemoryWriteContext) -> Result<
         current_channel,
         current_chat_id,
         current_chat_type,
+        raw_sender_anchor,
     ))
 }
 
@@ -427,6 +449,7 @@ pub fn principal_from_policy(
     current_channel: String,
     current_chat_id: String,
     current_chat_type: ChatType,
+    raw_sender: String,
 ) -> Principal {
     if let Some((role_raw, projects_raw, ceiling_raw, blocked_raw)) = policy {
         let role = Role::from_db(&role_raw);
@@ -443,6 +466,7 @@ pub fn principal_from_policy(
             current_channel,
             current_chat_id,
             current_chat_type,
+            raw_sender,
             acl_enforced,
         };
     }
@@ -456,6 +480,7 @@ pub fn principal_from_policy(
         current_channel,
         current_chat_id,
         current_chat_type,
+        raw_sender,
         acl_enforced: is_acl_enforced_for_role(&Role::Guest),
     }
 }
@@ -528,6 +553,7 @@ const fn anonymous_principal(
     current_channel: String,
     current_chat_id: String,
     current_chat_type: ChatType,
+    raw_sender: String,
 ) -> Principal {
     Principal {
         user_id,
@@ -538,6 +564,7 @@ const fn anonymous_principal(
         current_channel,
         current_chat_id,
         current_chat_type,
+        raw_sender,
         acl_enforced: is_acl_enforced_for_role(&Role::Anonymous),
     }
 }
@@ -735,6 +762,7 @@ mod tests {
             current_channel: "signal".into(),
             current_chat_id: "group:1".into(),
             current_chat_type: ChatType::Group,
+            raw_sender: "sender-1".into(),
             acl_enforced: true,
         };
         let ctx = MemoryWriteContext {
@@ -763,6 +791,7 @@ mod tests {
             current_channel: "signal".into(),
             current_chat_id: "chat-ak".into(),
             current_chat_type: ChatType::Dm,
+            raw_sender: "sender-ak".into(),
             acl_enforced: false,
         };
         let ctx = MemoryWriteContext {
@@ -801,6 +830,7 @@ mod tests {
             current_channel: "telegram".into(),
             current_chat_id: "chat-1".into(),
             current_chat_type: ChatType::Dm,
+            raw_sender: "sender-1".into(),
             acl_enforced,
         }
     }
@@ -814,11 +844,18 @@ mod tests {
     }
 
     #[test]
-    fn build_sql_scope_anonymous_is_public_normal_only() {
+    fn build_sql_scope_anonymous_includes_self_authored_triple() {
+        // FIX-P1-06: the Anonymous scope now matches public rows OR rows the
+        // sender authored on the (channel, chat_id, raw_sender) triple, and the
+        // three values are bound as parameters.
         let principal = base_principal(Role::Anonymous, Visibility::Private);
         let (scope, params) = principal.build_sql_scope();
-        assert_eq!(scope, "visibility = 'public' AND sensitivity = 'normal'");
-        assert!(params.is_empty());
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(params.len(), 3);
     }
 
     #[test]
@@ -905,6 +942,7 @@ mod tests {
             "signal".to_string(),
             "chat-1".to_string(),
             ChatType::Dm,
+            "sender-1".to_string(),
         );
         assert_eq!(principal.role, Role::Member);
         assert_eq!(principal.projects, vec!["alpha".to_string()]);
@@ -921,6 +959,7 @@ mod tests {
             "signal".to_string(),
             "chat-1".to_string(),
             ChatType::Dm,
+            "sender-1".to_string(),
         );
         assert_eq!(principal.role, Role::Guest);
         assert!(principal.blocked_patterns.is_empty());
