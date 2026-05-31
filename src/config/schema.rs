@@ -2997,9 +2997,8 @@ impl MemoryConfig {
         if let Some(url) = provider.strip_prefix("custom:") {
             // A custom embedding endpoint must be a well-formed http(s) URL.
             let url = url.trim();
-            let parsed = reqwest::Url::parse(url).map_err(|e| {
-                anyhow::anyhow!("memory.embedding_provider custom endpoint is not a valid URL: {e}")
-            })?;
+            let parsed = reqwest::Url::parse(url)
+                .map_err(|e| anyhow::anyhow!("memory.embedding_provider custom endpoint is not a valid URL: {e}"))?;
             if !matches!(parsed.scheme(), "http" | "https") {
                 anyhow::bail!(
                     "memory.embedding_provider custom endpoint must use http/https, got '{}'",
@@ -3013,14 +3012,10 @@ impl MemoryConfig {
         let embeddings_enabled = !provider.eq_ignore_ascii_case("none");
         if embeddings_enabled {
             if self.embedding_dimensions == 0 {
-                anyhow::bail!(
-                    "memory.embedding_dimensions must be greater than zero when embeddings are enabled"
-                );
+                anyhow::bail!("memory.embedding_dimensions must be greater than zero when embeddings are enabled");
             }
             if self.embedding_model.trim().is_empty() {
-                anyhow::bail!(
-                    "memory.embedding_model must not be empty when embeddings are enabled"
-                );
+                anyhow::bail!("memory.embedding_model must not be empty when embeddings are enabled");
             }
         }
         // An absurdly large dimension is almost certainly a misconfiguration.
@@ -3038,9 +3033,7 @@ impl MemoryConfig {
             }
         }
         if self.vector_weight == 0.0 && self.keyword_weight == 0.0 {
-            anyhow::bail!(
-                "memory.vector_weight and memory.keyword_weight must not both be zero"
-            );
+            anyhow::bail!("memory.vector_weight and memory.keyword_weight must not both be zero");
         }
 
         // 5. Minimum relevance score is a similarity threshold in [0.0, 1.0].
@@ -5448,8 +5441,7 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     // until this function returns (the guard is dropped after the rename and
     // permission fix-up complete). Reuses the existing, audited lock helper so
     // no new dependency or `unsafe` is introduced.
-    let _config_write_lock =
-        crate::self_system::evolution::safety_utils::acquire_file_lock(path).await?;
+    let _config_write_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(path).await?;
 
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("config.toml");
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
@@ -7935,10 +7927,7 @@ allowed_from = ["*"]
         while let Ok(Some(entry)) = entries.next_entry().await {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            assert!(
-                !name.contains(".tmp-"),
-                "leftover temp file lingered: {name}"
-            );
+            assert!(!name.contains(".tmp-"), "leftover temp file lingered: {name}");
         }
     }
 }

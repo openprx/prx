@@ -526,13 +526,13 @@ fn postgres_probe(db_url: &str) -> Vec<DiagItem> {
     }
 
     // pgvector extension presence + version.
-    match client.query_opt(
-        "SELECT extversion FROM pg_extension WHERE extname = 'vector'",
-        &[],
-    ) {
+    match client.query_opt("SELECT extversion FROM pg_extension WHERE extname = 'vector'", &[]) {
         Ok(Some(row)) => {
             let version: String = row.try_get(0).unwrap_or_else(|_| "unknown".to_string());
-            out.push(DiagItem::ok(cat, format!("pgvector extension installed (version {version})")));
+            out.push(DiagItem::ok(
+                cat,
+                format!("pgvector extension installed (version {version})"),
+            ));
         }
         Ok(None) => out.push(DiagItem::error(
             cat,
@@ -553,7 +553,10 @@ fn postgres_probe(db_url: &str) -> Vec<DiagItem> {
             cat,
             "schema parity: memories.owner_id missing or table not yet migrated",
         )),
-        Err(e) => out.push(DiagItem::warn(cat, format!("could not inspect information_schema: {e}"))),
+        Err(e) => out.push(DiagItem::warn(
+            cat,
+            format!("could not inspect information_schema: {e}"),
+        )),
     }
 
     out
@@ -577,10 +580,7 @@ async fn check_embedding_endpoint(config: &Config, items: &mut Vec<DiagItem>) {
         return;
     }
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-    {
+    let client = match reqwest::Client::builder().timeout(Duration::from_secs(2)).build() {
         Ok(client) => client,
         Err(e) => {
             items.push(DiagItem::warn(cat, format!("could not build HTTP probe client: {e}")));
@@ -602,9 +602,10 @@ async fn check_embedding_endpoint(config: &Config, items: &mut Vec<DiagItem>) {
     }
 
     match reachable {
-        Some(status) => {
-            items.push(DiagItem::ok(cat, format!("embedding endpoint reachable (HTTP {status})")))
-        }
+        Some(status) => items.push(DiagItem::ok(
+            cat,
+            format!("embedding endpoint reachable (HTTP {status})"),
+        )),
         None => items.push(DiagItem::warn(
             cat,
             format!("embedding endpoint unreachable within 2s: {url}"),

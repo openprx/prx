@@ -322,6 +322,10 @@ pub struct MemoryStoreMetadata {
     /// `source_event_id` so Project-visibility memories remain scope-resolvable
     /// (FIX-P0-23).
     pub topic_id: Option<String>,
+    /// Optional originating channel (e.g. discord/slack/cli). Persisted so that
+    /// anonymous principals can still resolve channel scope on later recall
+    /// (FIX-P1-08).
+    pub channel: Option<String>,
 }
 
 /// A private worker memory draft waiting for parent merge/reject.

@@ -120,6 +120,7 @@ pub(crate) struct DocumentIngestRuntime {
     session_key: Option<String>,
     agent_id: Option<String>,
     persona_id: Option<String>,
+    channel: Option<String>,
     visibility: MemoryVisibility,
 }
 
@@ -135,6 +136,7 @@ impl DocumentIngestRuntime {
             session_key: Some(envelope.session_key.clone()),
             agent_id: envelope.agent_id.clone(),
             persona_id: envelope.persona_id.clone(),
+            channel: envelope.channel.clone(),
             visibility: envelope.visibility.clone(),
         }
     }
@@ -161,6 +163,9 @@ impl DocumentIngestRuntime {
             session_key: Some(scope.chat_id.to_string()),
             agent_id: None,
             persona_id: None,
+            // Persist the originating channel so anonymous principals can
+            // resolve channel scope on later recall (FIX-P1-08).
+            channel: Some(scope.channel.to_string()),
             visibility: MemoryVisibility::Session,
         }
     }
@@ -720,7 +725,10 @@ async fn persist_compaction_audit(
         source_event_id: audit.source_message_event_id.clone(),
         source: Some("compaction_summary".to_string()),
         topic_id: None,
+        channel: audit.channel.clone(),
     };
+    // NOTE: `channel` is sourced from DocumentIngestRuntime so compaction
+    // summaries are recall-scoped to the originating channel (FIX-P1-08).
     if let Err(error) = audit
         .memory
         .store_with_metadata(

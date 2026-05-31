@@ -310,6 +310,7 @@ impl MemoryFabric {
                     source_event_id: source_event_id.map(str::to_string),
                     source: Some("semantic_promotion".to_string()),
                     topic_id: None,
+                    channel: None,
                 },
             )
             .await?;

@@ -1859,9 +1859,9 @@ impl SqliteMemory {
                         id, key, content, category, embedding, embedding_provider,
                         embedding_model, embedding_dimensions, created_at, updated_at,
                         session_id, workspace_id, owner_id, agent_id, persona_id,
-                        source_event_id, source
+                        source_event_id, source, channel, topic_id
                      )
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)
                      ON CONFLICT(key) DO UPDATE SET
                         content = excluded.content,
                         category = excluded.category,
@@ -1876,7 +1876,9 @@ impl SqliteMemory {
                         agent_id = excluded.agent_id,
                         persona_id = excluded.persona_id,
                         source_event_id = excluded.source_event_id,
-                        source = excluded.source",
+                        source = excluded.source,
+                        channel = excluded.channel,
+                        topic_id = excluded.topic_id",
                     params![
                         id,
                         &key,
@@ -1894,7 +1896,11 @@ impl SqliteMemory {
                         metadata.agent_id.clone(),
                         metadata.persona_id.clone(),
                         metadata.source_event_id.clone(),
-                        metadata.source.clone()
+                        metadata.source.clone(),
+                        // FIX-P1-08: persist the originating channel so anonymous
+                        // principals can resolve channel scope on later recall.
+                        metadata.channel.clone(),
+                        metadata.topic_id.clone(),
                     ],
                 )?;
             }
@@ -5400,6 +5406,7 @@ mod tests {
                 source_event_id: Some("event-123".to_string()),
                 source: Some("semantic_promotion".to_string()),
                 topic_id: None,
+                channel: None,
             },
         )
         .await
@@ -5438,6 +5445,47 @@ mod tests {
         assert_eq!(row.3.as_deref(), Some("persona-a"));
         assert_eq!(row.4.as_deref(), Some("event-123"));
         assert_eq!(row.5.as_deref(), Some("semantic_promotion"));
+    }
+
+    // FIX-P1-08: the metadata-only store path (used by compaction summaries,
+    // which carry no MemoryWriteContext) must persist the originating channel so
+    // anonymous principals can resolve channel scope on a later recall.
+    #[tokio::test]
+    async fn store_with_metadata_persists_channel_for_anonymous_recall() {
+        let (_tmp, mem) = temp_sqlite();
+
+        mem.store_with_metadata(
+            "compaction-key",
+            "compaction summary value",
+            MemoryCategory::Conversation,
+            Some("chat:session"),
+            MemoryStoreMetadata {
+                workspace_id: Some("workspace-a".to_string()),
+                owner_id: Some("owner-a".to_string()),
+                agent_id: None,
+                persona_id: None,
+                source_event_id: None,
+                source: Some("compaction_summary".to_string()),
+                topic_id: None,
+                channel: Some("telegram".to_string()),
+            },
+        )
+        .await
+        .expect("test: store_with_metadata should succeed");
+
+        let row_channel: Option<String> = mem
+            .conn
+            .lock()
+            .query_row("SELECT channel FROM memories WHERE key = 'compaction-key'", [], |row| {
+                row.get(0)
+            })
+            .expect("test: stored row should exist");
+
+        assert_eq!(
+            row_channel.as_deref(),
+            Some("telegram"),
+            "metadata.channel must be persisted to the channel column"
+        );
     }
 
     #[tokio::test]
