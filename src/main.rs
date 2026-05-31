@@ -240,6 +240,7 @@ mod onboard;
 #[cfg(feature = "wasm-plugins")]
 mod plugins;
 mod providers;
+mod recovery;
 #[cfg(feature = "llm-router")]
 mod router;
 mod runtime;

@@ -951,7 +951,11 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
         StreamError::Provider(msg) | StreamError::InvalidSse(msg) => msg.clone(),
         StreamError::Json(e) => e.to_string(),
         StreamError::Io(_) => return StreamFailureClass::Retryable,
-        StreamError::Http(_) => unreachable!("handled above"),
+        // `StreamError::Http` is fully classified by the status-code block above,
+        // which always returns before reaching this match. Should that invariant
+        // ever change, treat an unclassified HTTP failure as transient rather
+        // than panicking.
+        StreamError::Http(_) => return StreamFailureClass::Retryable,
     };
     let anyhow_err = anyhow::anyhow!("{message}");
 

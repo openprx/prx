@@ -1779,8 +1779,10 @@ fn hmac_hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        // `b >> 4` and `b & 0x0f` are both in `0..16`, always valid indices into
+        // the 16-byte `HEX` table; `.get().copied()` keeps the lookup panic-free.
+        out.push(HEX.get((b >> 4) as usize).copied().unwrap_or(b'0') as char);
+        out.push(HEX.get((b & 0x0f) as usize).copied().unwrap_or(b'0') as char);
     }
     out
 }
@@ -1822,7 +1824,9 @@ fn generate_session_secret() -> [u8; 32] {
     if rng.fill(&mut buf).is_err() {
         let now = capability_now_unix().to_le_bytes();
         for (i, b) in buf.iter_mut().enumerate() {
-            *b = now[i % now.len()];
+            // `i % now.len()` is always within `now` (non-empty fixed-size array);
+            // `.get().copied()` keeps the seed fill panic-free.
+            *b = now.get(i % now.len()).copied().unwrap_or(0);
         }
     }
     buf

@@ -231,8 +231,10 @@ fn capability_hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for &b in bytes {
-        out.push(HEX[(b >> 4) as usize] as char);
-        out.push(HEX[(b & 0x0f) as usize] as char);
+        // `b >> 4` and `b & 0x0f` are both in `0..16`, always valid indices into
+        // the 16-byte `HEX` table; `.get().copied()` keeps the lookup panic-free.
+        out.push(HEX.get((b >> 4) as usize).copied().unwrap_or(b'0') as char);
+        out.push(HEX.get((b & 0x0f) as usize).copied().unwrap_or(b'0') as char);
     }
     out
 }
@@ -281,7 +283,9 @@ fn generate_session_secret() -> [u8; 32] {
             .unwrap_or(0)
             .to_le_bytes();
         for (i, b) in buf.iter_mut().enumerate() {
-            *b = now[i % now.len()];
+            // `i % now.len()` is always within `now` (non-empty fixed-size array);
+            // `.get().copied()` keeps the seed fill panic-free.
+            *b = now.get(i % now.len()).copied().unwrap_or(0);
         }
     }
     buf
@@ -706,6 +710,7 @@ fn scrub_capability_env() {
     // the manifest's capability has been read and validated, and before any
     // worker threads that read the environment are spawned — so no concurrent
     // access can occur.
+    #[allow(unsafe_code)]
     unsafe {
         std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY");
         std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY");
@@ -1092,6 +1097,7 @@ mod tests {
 
     fn set_expiry_env(expiry: u64) {
         // SAFETY: tests hold `CAP_ENV_GUARD`, serializing all env mutation.
+        #[allow(unsafe_code)]
         unsafe {
             std::env::set_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY", expiry.to_string());
         }
@@ -1099,6 +1105,7 @@ mod tests {
 
     fn clear_expiry_env() {
         // SAFETY: tests hold `CAP_ENV_GUARD`, serializing all env mutation.
+        #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var("OPENPRX_SESSION_WORKER_CAPABILITY_EXPIRY");
         }
@@ -1194,7 +1201,7 @@ mod tests {
         let (manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
         set_expiry_env(expiry);
         // Env token differs from the manifest's sealed token.
-        let mut wrong = cap.clone();
+        let mut wrong = cap;
         wrong.push('x');
         let error = validate_worker_capability_with_env(&manifest, Some(&wrong)).unwrap_err();
         clear_expiry_env();
@@ -1218,6 +1225,10 @@ mod tests {
         assert!(error.to_string().contains("task override"));
     }
 
+    // The `CAP_ENV_GUARD` mutex intentionally stays locked across the awaited
+    // `run_manifest_with_capability_env` call so the capability env stays stable
+    // for the whole run; this single-threaded test never contends the guard.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn malicious_manifest_rejected_before_config_memory_or_worker_dir_creation() {
         let tmp = tempfile::TempDir::new().unwrap();
