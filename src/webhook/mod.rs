@@ -766,6 +766,18 @@ mod tests {
         }
     }
 
+    /// Build a webhook state whose [`SecurityPolicy`] runs under `ReadOnly`
+    /// autonomy, so the persist [`SideEffectGate`] must reject writes (FIX-P1-03).
+    fn setup_readonly_state(tmp: &TempDir, token: &str) -> WebhookState {
+        let mut state = setup_state(tmp, token);
+        let readonly = SecurityPolicy {
+            autonomy: crate::security::policy::AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        };
+        state.security = Arc::new(readonly);
+        state
+    }
+
     #[tokio::test]
     async fn token_auth_missing_rejected() {
         let tmp = TempDir::new().unwrap();
@@ -1005,6 +1017,89 @@ mod tests {
         let body2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(parsed["status"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn readonly_autonomy_blocks_persist_with_forbidden() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_readonly_state(&tmp, "secret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "project": "openpr",
+                    "external_id": "issue#readonly",
+                    "title": "Readonly blocked",
+                    "content": "must not persist",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        // Auth/signature/idempotency all pass; the SideEffectGate denies the
+        // write because autonomy is ReadOnly, so the handler returns 403.
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // And nothing was written to the topic store.
+        let conn = Connection::open(db_path).unwrap();
+        let topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#readonly'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_count, 0);
+    }
+
+    #[tokio::test]
+    async fn supervised_autonomy_allows_persist() {
+        // Sanity counterpart to the ReadOnly test: default (Supervised) policy
+        // permits a Low-risk persist, proving the gate is not over-blocking.
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(
+                json!({
+                    "source": "custom",
+                    "event_type": "issue.created",
+                    "project": "openpr",
+                    "external_id": "issue#supervised",
+                    "title": "Supervised allowed",
+                    "content": "persisted",
+                    "timestamp": Utc::now().to_rfc3339()
+                })
+                .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let conn = Connection::open(db_path).unwrap();
+        let topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#supervised'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_count, 1);
     }
 
     #[tokio::test]
