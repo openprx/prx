@@ -53,8 +53,12 @@ impl RuntimeSource {
 }
 
 impl RuntimeEnvelope {
-    #[must_use]
-    pub fn new(
+    /// Internal raw constructor shared by every purpose-specific builder.
+    ///
+    /// This bypasses the visibility/sender/channel defaults that the public
+    /// constructors apply, so it stays private. The public `new` (slated for
+    /// deprecation) delegates here.
+    fn new_internal(
         source: RuntimeSource,
         workspace_id: impl Into<String>,
         session_key: impl Into<String>,
@@ -79,9 +83,38 @@ impl RuntimeEnvelope {
         }
     }
 
+    /// DEPRECATED — do not use in new code.
+    ///
+    /// Prefer a purpose-specific constructor:
+    /// [`channel`](Self::channel) / [`agent`](Self::agent) /
+    /// [`gateway_webhook`](Self::gateway_webhook) / [`chat`](Self::chat) /
+    /// [`console`](Self::console) / [`session_worker`](Self::session_worker) /
+    /// [`sessions_spawn`](Self::sessions_spawn) / [`delegate`](Self::delegate).
+    ///
+    /// `new` bypasses the visibility/sender/channel defaults that those
+    /// constructors apply, which causes default drift across ingress paths.
+    ///
+    /// NOTE: this is intentionally NOT marked with the `#[deprecated]` attribute
+    /// yet. There are still 5 in-crate call sites (channels/gateway/agent/chat)
+    /// that use it; because `openprx` builds with `-D warnings`, attaching
+    /// `#[deprecated]` would upgrade those usages to hard errors. The attribute
+    /// will be added in the follow-up wave that migrates those call sites to the
+    /// purpose-specific constructors. `#[doc(hidden)]` keeps it out of the
+    /// public API surface in the meantime.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new(
+        source: RuntimeSource,
+        workspace_id: impl Into<String>,
+        session_key: impl Into<String>,
+        visibility: MemoryVisibility,
+    ) -> Self {
+        Self::new_internal(source, workspace_id, session_key, visibility)
+    }
+
     #[must_use]
     pub fn chat(workspace_id: impl Into<String>, chat_session_id: impl std::fmt::Display) -> Self {
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Chat,
             workspace_id,
             format!("chat:{chat_session_id}"),
@@ -94,7 +127,7 @@ impl RuntimeEnvelope {
     #[must_use]
     pub fn agent(workspace_id: impl Into<String>, run_id: impl Into<String>) -> Self {
         let run_id = run_id.into();
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Agent,
             workspace_id,
             format!("agent:{run_id}"),
@@ -110,7 +143,7 @@ impl RuntimeEnvelope {
         let target = reply_target
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("webhook-client");
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Gateway,
             workspace_id,
             format!("gateway:webhook:{target}"),
@@ -130,7 +163,7 @@ impl RuntimeEnvelope {
     ) -> Self {
         let channel = channel.into();
         let sender = sender.into();
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Channel,
             workspace_id,
             format!("{channel}_{sender}"),
@@ -143,7 +176,7 @@ impl RuntimeEnvelope {
 
     #[must_use]
     pub fn console(workspace_id: impl Into<String>, session_id: impl Into<String>) -> Self {
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Console,
             workspace_id,
             session_id,
@@ -157,7 +190,7 @@ impl RuntimeEnvelope {
         session_key: impl Into<String>,
         run_id: impl Into<String>,
     ) -> Self {
-        Self::new(
+        Self::new_internal(
             RuntimeSource::SessionWorker,
             workspace_id,
             session_key,
@@ -172,7 +205,7 @@ impl RuntimeEnvelope {
         session_key: impl Into<String>,
         run_id: impl Into<String>,
     ) -> Self {
-        Self::new(
+        Self::new_internal(
             RuntimeSource::SessionsSpawn,
             workspace_id,
             session_key,
@@ -187,7 +220,7 @@ impl RuntimeEnvelope {
         session_key: impl Into<String>,
         run_id: impl Into<String>,
     ) -> Self {
-        Self::new(
+        Self::new_internal(
             RuntimeSource::Delegate,
             workspace_id,
             session_key,
@@ -270,6 +303,38 @@ impl RuntimeEnvelope {
     #[must_use]
     pub fn resolved_task_id(&self) -> Option<&str> {
         self.task_id.as_deref().or(self.run_id.as_deref())
+    }
+
+    /// Unified, source-agnostic session identity.
+    ///
+    /// Today every ingress path (chat/agent/gateway/channel/...) builds its own
+    /// `session_key` format, so the same user arriving through two entry points
+    /// lands in different sessions, breaking memory sharing and task lineage.
+    /// This method derives one canonical key from the structured envelope fields
+    /// (independent of the legacy `session_key` string), so two envelopes that
+    /// describe the same logical conversation produce the same key.
+    ///
+    /// Format: `{source}:{channel}:{sender}:{recipient}` where any missing
+    /// component is replaced with the literal placeholder `-`.
+    ///
+    /// Migration note: callers that currently key on `self.session_key` should
+    /// move to `canonical_session_key()` so all entry points converge. This is
+    /// introduced additively in this wave; switching the actual lookup/storage
+    /// call sites (chat/agent/gateway/channel) is deferred to a follow-up to
+    /// avoid touching multiple modules at once.
+    #[must_use]
+    pub fn canonical_session_key(&self) -> String {
+        fn component(value: Option<&str>) -> &str {
+            const PLACEHOLDER: &str = "-";
+            value.map(str::trim).filter(|v| !v.is_empty()).unwrap_or(PLACEHOLDER)
+        }
+        format!(
+            "{}:{}:{}:{}",
+            self.source.as_str(),
+            component(self.channel.as_deref()),
+            component(self.sender.as_deref()),
+            component(self.recipient.as_deref()),
+        )
     }
 
     #[must_use]
@@ -492,5 +557,59 @@ mod tests {
         assert_eq!(scope.source, "delegate");
         assert_eq!(scope.agent_id.as_deref(), Some("tester"));
         assert_eq!(scope.session_key.as_deref(), Some("delegate:telegram:chat-1:alice"));
+    }
+
+    #[test]
+    fn canonical_session_key_uses_structured_components() {
+        let envelope = RuntimeEnvelope::channel("workspace", "telegram", "alice", Some("chat-1".to_string()));
+        assert_eq!(envelope.canonical_session_key(), "channel:telegram:alice:chat-1");
+    }
+
+    #[test]
+    fn canonical_session_key_fills_missing_components_with_placeholder() {
+        // console() sets no channel/sender/recipient.
+        let envelope = RuntimeEnvelope::console("workspace", "session-123");
+        assert_eq!(envelope.canonical_session_key(), "console:-:-:-");
+    }
+
+    #[test]
+    fn canonical_session_key_treats_blank_components_as_missing() {
+        // channel() with an empty chat_id stores an empty recipient string;
+        // it must collapse to the placeholder, not an empty segment.
+        let envelope = RuntimeEnvelope::channel("workspace", "telegram", "alice", None);
+        assert_eq!(envelope.canonical_session_key(), "channel:telegram:alice:-");
+    }
+
+    #[test]
+    fn canonical_session_key_converges_for_same_user_across_legacy_session_keys() {
+        // Two envelopes that describe the same logical conversation but were
+        // built with different legacy session_key formats must still produce
+        // one identical canonical key.
+        let from_channel = RuntimeEnvelope::channel("workspace", "telegram", "alice", Some("chat-1".to_string()));
+
+        let from_worker = RuntimeEnvelope::session_worker(
+            "workspace",
+            "telegram:chat-1:alice", // legacy worker session_key format
+            "run-1",
+        )
+        .with_channel("telegram")
+        .with_sender("alice")
+        .with_recipient("chat-1");
+
+        // Legacy session_key strings differ...
+        assert_ne!(from_channel.session_key, from_worker.session_key);
+        // ...but the canonical key is source-scoped per entry point.
+        assert_eq!(from_channel.canonical_session_key(), "channel:telegram:alice:chat-1");
+        assert_eq!(
+            from_worker.canonical_session_key(),
+            "session_worker:telegram:alice:chat-1"
+        );
+        // The channel/sender/recipient tail (the user identity portion) matches,
+        // which is what downstream session convergence keys on.
+        let tail = |key: &str| key.split_once(':').map(|(_, rest)| rest.to_string());
+        assert_eq!(
+            tail(&from_channel.canonical_session_key()),
+            tail(&from_worker.canonical_session_key())
+        );
     }
 }
