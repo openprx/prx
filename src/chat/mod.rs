@@ -19,6 +19,35 @@
 //! ae3a9af / ae47ddd + 本 commit (Commit 7 docs)。S4-B 计划:
 //! 删 chat_mirror 字段 + 所有 mirror 路径调用，参见任务文档附录 D
 //! (`/opt/worker/task/prx/prx-remaining-plan-2026-05-15.md`)。
+//!
+//! ## Presentation stack is by-design separate from the runtime mode abstraction (FIX-P1-27)
+//!
+//! Channels, the gateway, the session worker, and the agent CLI converge on a
+//! shared runtime ingress contract (see [`crate::runtime::envelope`]): one
+//! `RuntimeEnvelope` derives the session identity, memory principal, message
+//! scope, and task lineage for every mode. Layer D deliberately does **not**
+//! fold `chat`'s streaming presentation stack — the TUI/Redux/Reedline pipeline
+//! (Actor + reducer + `UiSnapshot`/`chat_mirror` render sources documented in
+//! §S4-A above) — into that abstraction, for two reasons:
+//!
+//! 1. **Orthogonality.** Presentation (how turns are rendered/streamed to a
+//!    terminal) is orthogonal to the runtime core (how turns are routed,
+//!    remembered, and executed). The TUI loop owns terminal lifecycle, key
+//!    handling, frame diffing, and draft rendering — concerns no other ingress
+//!    mode has. Channels and the gateway emit plain transport payloads; only
+//!    `chat` drives an interactive on-screen UI.
+//! 2. **Single-implementer trait smell.** A unified "mode runner" trait over the
+//!    presentation layer would have exactly one implementer (this module), so it
+//!    would be a dead abstraction: extra indirection with no second consumer and
+//!    no polymorphism to justify it. (There is intentionally no `ModeRunner`
+//!    trait in the codebase for this reason.)
+//!
+//! What `chat` **does** reuse is the unified agent-loop core — tools, memory,
+//! routing, security, hooks — via [`crate::agent::loop_::run_tool_call_loop`],
+//! [`crate::agent::loop_::build_context_with_shared_events_and_scope`], and the
+//! same `RuntimeEnvelope`-derived [`MemoryPrincipal`]/`MessageEventScope`
+//! (see [`chat_runtime_envelope`]). Only the presentation/streaming stack stays
+//! independent; the runtime semantics are shared with every other mode.
 // Chat module: println!/eprintln! are intentional user-facing output (banners, status, errors).
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
