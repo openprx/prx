@@ -740,10 +740,11 @@ impl SqliteMemory {
                 ON memory_events(workspace_id, event_type, id);
             CREATE INDEX IF NOT EXISTS idx_memory_events_session
                 ON memory_events(workspace_id, session_key, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_events_run
-                ON memory_events(workspace_id, run_id, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
-                ON memory_events(workspace_id, parent_run_id, id);
+            -- NOTE: idx_memory_events_run / idx_memory_events_parent_run are created
+            -- later (after the run_id/parent_run_id ALTER backfill below), because a
+            -- legacy `memory_events` table predating schema v7 lacks those columns and
+            -- a `CREATE INDEX ... ON memory_events(run_id)` here would fail with
+            -- `no such column: run_id` inside this single batch.
 
             CREATE TABLE IF NOT EXISTS memory_trash (
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -785,8 +786,11 @@ impl SqliteMemory {
                 ON memory_drafts(worker_run_id, id);
             CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
                 ON memory_drafts(status, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
-                ON memory_drafts(source_event_id);
+            -- NOTE: idx_memory_drafts_source_event is created later (after the
+            -- memory_drafts ALTER backfill below). A legacy `memory_drafts` table
+            -- predating the `source_event_id` column would make this inline
+            -- `CREATE INDEX ... ON memory_drafts(source_event_id)` fail with
+            -- `no such column: source_event_id` inside this single batch.
 
             CREATE TABLE IF NOT EXISTS documents (
                 id                      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1265,6 +1269,47 @@ impl SqliteMemory {
                 }
             }
         }
+
+        // Schema v7 (`memory_events_run_lineage`) added `run_id` / `parent_run_id`
+        // to `memory_events`. A legacy table created under v4 lacks these columns,
+        // and the checksum-anchor registry alone never alters an existing table, so
+        // the gateway hit `no such column: run_id` at runtime. Backfill the columns
+        // idempotently (mirrors the `memories` / `memory_drafts` blocks above), then
+        // create the lineage indexes — both must run *after* the ALTERs.
+        let mut event_column_stmt = conn.prepare("PRAGMA table_info(memory_events)")?;
+        let existing_event_columns = event_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut event_names = std::collections::HashSet::new();
+        for column in existing_event_columns {
+            event_names.insert(column?);
+        }
+        let missing_event_columns = [
+            ("run_id", "ALTER TABLE memory_events ADD COLUMN run_id TEXT"),
+            (
+                "parent_run_id",
+                "ALTER TABLE memory_events ADD COLUMN parent_run_id TEXT",
+            ),
+        ];
+        for (name, alter_sql) in missing_event_columns {
+            if !event_names.contains(name) {
+                match conn.execute_batch(alter_sql) {
+                    Ok(()) => {}
+                    Err(rusqlite::Error::SqliteFailure(err, Some(ref msg)))
+                        if msg.contains("duplicate column name") =>
+                    {
+                        tracing::debug!("Column memory_events.{name} already exists (concurrent migration): {err}");
+                    }
+                    Err(e) => {
+                        return Err(anyhow::anyhow!("Failed to add memory_events.{name}: {e}"));
+                    }
+                }
+            }
+        }
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_memory_events_run
+                 ON memory_events(workspace_id, run_id, id);
+             CREATE INDEX IF NOT EXISTS idx_memory_events_parent_run
+                 ON memory_events(workspace_id, parent_run_id, id);",
+        )?;
 
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id);
@@ -8157,6 +8202,132 @@ source: tool_output\n\
                 .expect("count");
             assert_eq!(count, SqliteMemory::memory_schema_migration_registry().len() as i64);
         }
+    }
+
+    /// Helper: read the column names of a table via PRAGMA table_info.
+    fn legacy_table_columns(conn: &Connection, table: &str) -> std::collections::HashSet<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("prepare table_info");
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("query table_info");
+        let mut names = std::collections::HashSet::new();
+        for c in cols {
+            names.insert(c.expect("col name"));
+        }
+        names
+    }
+
+    fn legacy_index_exists(conn: &Connection, index: &str) -> bool {
+        conn.query_row(
+            "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            [index],
+            |_| Ok(()),
+        )
+        .optional()
+        .expect("query index")
+        .is_some()
+    }
+
+    /// Regression guard for the deployment bug: a legacy `memory_events` table
+    /// created before schema v7 lacked `run_id` / `parent_run_id`, and the
+    /// checksum-anchor registry alone never altered it — so the gateway hit
+    /// `no such column: run_id` at runtime. `init_schema` must idempotently add
+    /// the columns and their lineage indexes to such a legacy table. The same
+    /// applies to a pre-`source_event_id` `memory_drafts` table.
+    #[test]
+    fn legacy_memory_events_gets_run_lineage_columns_on_init() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("legacy.db");
+        let conn = Connection::open(&db_path).unwrap();
+
+        // Simulate the pre-v7 `memory_events` table: no run_id / parent_run_id,
+        // and therefore none of the lineage indexes.
+        conn.execute_batch(
+            "CREATE TABLE memory_events (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_id      TEXT NOT NULL UNIQUE,
+                workspace_id  TEXT NOT NULL,
+                event_type    TEXT NOT NULL,
+                subject_table TEXT NOT NULL,
+                subject_id    TEXT NOT NULL,
+                session_key   TEXT,
+                agent_id      TEXT,
+                persona_id    TEXT,
+                visibility    TEXT NOT NULL DEFAULT 'workspace',
+                payload_json  TEXT,
+                created_at    TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        // Simulate a very old `memory_drafts` lacking `source_event_id` (and the
+        // other v-bumped columns) to prove the inline index no longer trips.
+        conn.execute_batch(
+            "CREATE TABLE memory_drafts (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                draft_id      TEXT NOT NULL UNIQUE,
+                workspace_id  TEXT NOT NULL,
+                worker_run_id TEXT NOT NULL,
+                session_key   TEXT,
+                key           TEXT NOT NULL,
+                content       TEXT NOT NULL,
+                category      TEXT NOT NULL,
+                status        TEXT NOT NULL DEFAULT 'pending',
+                created_at    TEXT NOT NULL,
+                updated_at    TEXT NOT NULL
+            );",
+        )
+        .unwrap();
+
+        let before = legacy_table_columns(&conn, "memory_events");
+        assert!(!before.contains("run_id"), "precondition: legacy table lacks run_id");
+        assert!(
+            !before.contains("parent_run_id"),
+            "precondition: legacy table lacks parent_run_id"
+        );
+
+        // First init must not error (the original bug aborted here) and must add
+        // the missing columns + lineage indexes.
+        SqliteMemory::init_schema(&conn).expect("init_schema upgrades legacy memory_events");
+
+        let after = legacy_table_columns(&conn, "memory_events");
+        assert!(after.contains("run_id"), "run_id column must be added");
+        assert!(after.contains("parent_run_id"), "parent_run_id column must be added");
+        assert!(
+            legacy_index_exists(&conn, "idx_memory_events_run"),
+            "idx_memory_events_run must be created"
+        );
+        assert!(
+            legacy_index_exists(&conn, "idx_memory_events_parent_run"),
+            "idx_memory_events_parent_run must be created"
+        );
+
+        let drafts = legacy_table_columns(&conn, "memory_drafts");
+        assert!(
+            drafts.contains("source_event_id"),
+            "memory_drafts.source_event_id must be backfilled"
+        );
+        assert!(
+            legacy_index_exists(&conn, "idx_memory_drafts_source_event"),
+            "idx_memory_drafts_source_event must be created after the ALTER"
+        );
+
+        // Idempotency: re-running init_schema on the now-upgraded DB must not error
+        // (duplicate-column / existing-index paths are all handled).
+        SqliteMemory::init_schema(&conn).expect("init_schema is idempotent on re-run");
+
+        // And a query that selects the previously-missing column must now succeed,
+        // mirroring the gateway path that originally failed.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE run_id IS NULL AND parent_run_id IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query run_id must not fail with `no such column`");
+        assert_eq!(count, 0, "empty legacy table has no rows");
     }
 
     #[tokio::test]

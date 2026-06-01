@@ -562,15 +562,10 @@ impl PostgresMemory {
                 updated_at TIMESTAMPTZ NOT NULL
             );
 
-            CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
-                ON {qualified_drafts_table}(worker_run_id, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_drafts_owner
-                ON {qualified_drafts_table}(workspace_id, owner_id, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
-                ON {qualified_drafts_table}(status, id);
-            CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
-                ON {qualified_drafts_table}(source_event_id);
-
+            -- Backfill legacy columns BEFORE creating indexes that reference them:
+            -- a legacy drafts table predating `source_event_id` would make the
+            -- `idx_memory_drafts_source_event` index below fail (`column ...
+            -- does not exist`) and abort this whole batch.
             ALTER TABLE {qualified_drafts_table}
                 ADD COLUMN IF NOT EXISTS owner_id TEXT;
             ALTER TABLE {qualified_drafts_table}
@@ -585,6 +580,15 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'workspace';
             ALTER TABLE {qualified_drafts_table}
                 ADD COLUMN IF NOT EXISTS payload_json TEXT;
+
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_worker_run
+                ON {qualified_drafts_table}(worker_run_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_owner
+                ON {qualified_drafts_table}(workspace_id, owner_id, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_status
+                ON {qualified_drafts_table}(status, id);
+            CREATE INDEX IF NOT EXISTS idx_memory_drafts_source_event
+                ON {qualified_drafts_table}(source_event_id);
 
             CREATE TABLE IF NOT EXISTS {qualified_documents_table} (
                 id BIGSERIAL PRIMARY KEY,
