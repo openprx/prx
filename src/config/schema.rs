@@ -1851,9 +1851,19 @@ pub struct McpServerRuntimeConfig {
     #[serde(default)]
     pub jwt_audience: Option<String>,
     /// Inline JWKS document (RFC 7517 JSON) used to resolve signing keys by
-    /// `kid`. Takes precedence over `jwt_public_key_pem` when both are set.
+    /// `kid`. Takes precedence over `jwt_jwks_uri` and `jwt_public_key_pem`.
     #[serde(default)]
     pub jwt_jwks: Option<String>,
+    /// Remote JWKS endpoint (HTTPS URL) whose document is fetched and cached to
+    /// resolve signing keys by `kid`. Used when no inline `jwt_jwks` is set.
+    /// Fetching is fail-closed: a network failure with no still-valid cached
+    /// copy rejects the token rather than accepting it.
+    #[serde(default)]
+    pub jwt_jwks_uri: Option<String>,
+    /// Cache lifetime (seconds) for a fetched remote JWKS document. After this
+    /// the document is refreshed on the next verification. Defaults to 300s.
+    #[serde(default = "default_mcp_jwks_cache_ttl_secs")]
+    pub jwt_jwks_cache_ttl_secs: u64,
     /// PEM-encoded public key (RSA/EC/Ed) used when no JWKS is configured.
     #[serde(default)]
     pub jwt_public_key_pem: Option<String>,
@@ -1865,6 +1875,10 @@ pub struct McpServerRuntimeConfig {
 
 fn default_mcp_jwt_algorithms() -> Vec<String> {
     vec!["RS256".to_string()]
+}
+
+const fn default_mcp_jwks_cache_ttl_secs() -> u64 {
+    300
 }
 
 fn default_mcp_server_bind() -> String {
@@ -1909,6 +1923,8 @@ impl Default for McpServerRuntimeConfig {
             jwt_issuer: None,
             jwt_audience: None,
             jwt_jwks: None,
+            jwt_jwks_uri: None,
+            jwt_jwks_cache_ttl_secs: default_mcp_jwks_cache_ttl_secs(),
             jwt_public_key_pem: None,
             jwt_algorithms: default_mcp_jwt_algorithms(),
         }

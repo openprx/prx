@@ -13,14 +13,16 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD as BASE64_URL};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header, jwk::JwkSet};
+use parking_lot::RwLock;
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
@@ -227,6 +229,18 @@ pub async fn mcp_tools_call(
     let config = state.config.lock().clone();
     if !(config.modules.mcp_server && config.mcp_server.enabled) {
         return Err(json_error(StatusCode::FORBIDDEN, "mcp server tool calls are disabled"));
+    }
+
+    // When a remote JWKS endpoint is configured, refresh its cache off the
+    // async runtime before the synchronous identity-derivation path verifies
+    // any bearer JWT. This keeps `derive_external_agent_identity` free of
+    // network I/O while preserving fail-closed semantics.
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer "))
+    {
+        prewarm_remote_jwks(&config.mcp_server).await;
     }
 
     let identity = derive_external_agent_identity(&headers, &config).ok_or_else(|| {
@@ -470,6 +484,12 @@ enum BearerJwtError {
     UnknownKid,
     KeyMaterial(String),
     InvalidJwks,
+    /// The configured remote JWKS endpoint could not be fetched and no still
+    /// valid cached copy exists. Fail-closed: the token is rejected.
+    JwksUnavailable,
+    /// The configured `jwt_jwks_uri` does not use HTTPS. Non-HTTPS endpoints
+    /// are rejected unconditionally to prevent MITM key injection.
+    InsecureJwksUri,
     Verification(String),
     MissingSubject,
 }
@@ -488,6 +508,11 @@ impl std::fmt::Display for BearerJwtError {
             Self::UnknownKid => write!(f, "token kid does not match any configured jwk"),
             Self::KeyMaterial(reason) => write!(f, "signing key material is invalid: {reason}"),
             Self::InvalidJwks => write!(f, "configured jwks document is not valid json"),
+            Self::JwksUnavailable => write!(f, "remote jwks endpoint is unavailable and no valid cache exists"),
+            Self::InsecureJwksUri => write!(
+                f,
+                "jwt_jwks_uri must use https:// (non-https endpoints are rejected to prevent MITM)"
+            ),
             Self::Verification(reason) => write!(f, "jwt verification failed: {reason}"),
             Self::MissingSubject => write!(f, "verified jwt has no sub claim"),
         }
@@ -568,6 +593,12 @@ fn verify_bearer_jwt(
 
 /// Resolve the signing key from a configured JWKS document (matched by `kid`)
 /// or, failing that, a configured PEM public key.
+///
+/// Precedence: inline `jwt_jwks` > remote `jwt_jwks_uri` (cached) > PEM. Any
+/// JWKS path requires the token to carry a `kid`. The remote path is
+/// fail-closed: if the cache is empty/expired and a refresh is required, the
+/// caller must have pre-warmed the cache via [`prewarm_remote_jwks`]; an
+/// unreachable endpoint without a still-valid cache rejects the token.
 fn resolve_decoding_key(
     config: &crate::config::McpServerRuntimeConfig,
     kid: Option<&str>,
@@ -575,6 +606,16 @@ fn resolve_decoding_key(
     if let Some(jwks_raw) = config.jwt_jwks.as_deref().filter(|v| !v.trim().is_empty()) {
         let jwks: JwkSet = serde_json::from_str(jwks_raw).map_err(|_| BearerJwtError::InvalidJwks)?;
         let kid = kid.ok_or(BearerJwtError::MissingKid)?;
+        let jwk = jwks.find(kid).ok_or(BearerJwtError::UnknownKid)?;
+        return DecodingKey::from_jwk(jwk).map_err(|e| BearerJwtError::KeyMaterial(e.to_string()));
+    }
+    if let Some(raw_uri) = config.jwt_jwks_uri.as_deref().filter(|v| !v.trim().is_empty()) {
+        // normalize_jwks_uri trims whitespace AND enforces https-only (fail-closed).
+        // The normalised value is used as the cache key so write (prewarm) and
+        // read (here) always address the same entry regardless of whitespace.
+        let uri = normalize_jwks_uri(raw_uri)?;
+        let kid = kid.ok_or(BearerJwtError::MissingKid)?;
+        let jwks = cached_remote_jwks(uri, config.jwt_jwks_cache_ttl_secs).ok_or(BearerJwtError::JwksUnavailable)?;
         let jwk = jwks.find(kid).ok_or(BearerJwtError::UnknownKid)?;
         return DecodingKey::from_jwk(jwk).map_err(|e| BearerJwtError::KeyMaterial(e.to_string()));
     }
@@ -587,6 +628,143 @@ fn resolve_decoding_key(
             .map_err(|e| BearerJwtError::KeyMaterial(e.to_string()));
     }
     Err(BearerJwtError::NotConfigured)
+}
+
+/// Normalise a raw `jwt_jwks_uri` value:
+///
+/// 1. Strip leading/trailing whitespace so the caller never has to worry about
+///    accidental whitespace in config values.
+/// 2. Enforce that the scheme is `https` (case-insensitive). Any other scheme
+///    is a configuration error and is returned as `Err(InsecureJwksUri)`.
+///
+/// The returned string is the canonical key used for both writing and reading
+/// the [`REMOTE_JWKS_CACHE`], ensuring cache write/read are always consistent.
+fn normalize_jwks_uri(raw: &str) -> Result<&str, BearerJwtError> {
+    let trimmed = raw.trim();
+    // Require the scheme portion to be exactly "https" (case-insensitive).
+    // We compare the first 8 bytes to avoid a heap allocation from a full URL
+    // parse; a 7-byte "http://" prefix that is NOT "https://" is always insecure.
+    let scheme_end = trimmed.find("://").unwrap_or(0);
+    let scheme = &trimmed[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("https") {
+        return Err(BearerJwtError::InsecureJwksUri);
+    }
+    Ok(trimmed)
+}
+
+/// Maximum time to wait for a remote JWKS fetch before giving up (fail-closed).
+const JWKS_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// A fetched remote JWKS document together with the instant it was retrieved.
+#[derive(Clone)]
+struct CachedJwks {
+    jwks: Arc<JwkSet>,
+    fetched_at: Instant,
+}
+
+impl CachedJwks {
+    fn is_fresh(&self, ttl: Duration) -> bool {
+        self.fetched_at.elapsed() < ttl
+    }
+}
+
+/// Process-global cache of remote JWKS documents, keyed by endpoint URI. Reads
+/// are lock-light; refreshes happen on the async pre-warm path so the
+/// synchronous verification path never performs network I/O.
+static REMOTE_JWKS_CACHE: LazyLock<RwLock<HashMap<String, CachedJwks>>> = LazyLock::new(|| RwLock::new(HashMap::new()));
+
+/// Return the cached JWKS for `uri` if a fresh (within `ttl_secs`) copy exists.
+///
+/// Synchronous and never performs network I/O — refreshing is the job of
+/// [`prewarm_remote_jwks`]. Returns `None` when no entry exists or the cached
+/// copy is stale, which the verification path translates into a fail-closed
+/// rejection.
+fn cached_remote_jwks(uri: &str, ttl_secs: u64) -> Option<Arc<JwkSet>> {
+    let ttl = Duration::from_secs(ttl_secs.max(1));
+    let guard = REMOTE_JWKS_CACHE.read();
+    let entry = guard.get(uri)?;
+    if entry.is_fresh(ttl) {
+        Some(Arc::clone(&entry.jwks))
+    } else {
+        None
+    }
+}
+
+/// Ensure the remote JWKS cache for `config` holds a fresh document before the
+/// synchronous verification path runs. No-op unless a remote `jwt_jwks_uri` is
+/// configured and no inline `jwt_jwks` overrides it.
+///
+/// Runs the blocking HTTP fetch on a blocking thread so the async runtime is
+/// never stalled. On fetch failure the existing cache entry (if any) is left in
+/// place — a still-fresh entry keeps working, a stale/absent one results in a
+/// fail-closed rejection at verification time.
+async fn prewarm_remote_jwks(config: &crate::config::McpServerRuntimeConfig) {
+    if config.jwt_jwks.as_deref().is_some_and(|v| !v.trim().is_empty()) {
+        // Inline JWKS wins; no remote fetch needed.
+        return;
+    }
+    let raw_uri = match config.jwt_jwks_uri.as_deref().filter(|v| !v.trim().is_empty()) {
+        Some(v) => v,
+        None => return,
+    };
+    // Enforce HTTPS-only before issuing any network request (fail-closed).
+    // normalize_jwks_uri also trims whitespace so the returned slice is the
+    // canonical cache key — identical to what resolve_decoding_key uses.
+    let uri = match normalize_jwks_uri(raw_uri) {
+        Ok(u) => u.to_string(),
+        Err(_) => {
+            tracing::warn!(
+                uri = %raw_uri.trim(),
+                "jwt_jwks_uri does not use https:// — remote JWKS fetch refused (fail-closed)"
+            );
+            return;
+        }
+    };
+    let ttl = Duration::from_secs(config.jwt_jwks_cache_ttl_secs.max(1));
+
+    // Fast path: a fresh entry already satisfies this request.
+    if REMOTE_JWKS_CACHE.read().get(&uri).is_some_and(|e| e.is_fresh(ttl)) {
+        return;
+    }
+
+    let fetch_uri = uri.clone();
+    let fetched = tokio::task::spawn_blocking(move || fetch_remote_jwks(&fetch_uri)).await;
+    match fetched {
+        Ok(Ok(jwks)) => {
+            REMOTE_JWKS_CACHE.write().insert(
+                uri,
+                CachedJwks {
+                    jwks: Arc::new(jwks),
+                    fetched_at: Instant::now(),
+                },
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "remote jwks refresh failed; relying on existing cache (fail-closed if stale)");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "remote jwks fetch task failed to join");
+        }
+    }
+}
+
+/// Blocking fetch + parse of a remote JWKS document. Runs only inside
+/// `spawn_blocking`. Uses the rustls-backed blocking reqwest client with a
+/// bounded timeout so a hung endpoint cannot stall a worker thread indefinitely.
+fn fetch_remote_jwks(uri: &str) -> Result<JwkSet, anyhow::Error> {
+    use anyhow::Context as _;
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(JWKS_FETCH_TIMEOUT_SECS))
+        .build()
+        .context("failed to build jwks http client")?;
+    let response = client
+        .get(uri)
+        .send()
+        .context("jwks endpoint request failed")?
+        .error_for_status()
+        .context("jwks endpoint returned an error status")?;
+    let body = response.text().context("failed to read jwks response body")?;
+    serde_json::from_str::<JwkSet>(&body).context("jwks endpoint returned invalid json")
 }
 
 /// Validate that an inbound A2A peer's asserted issuer is on the configured
@@ -1431,6 +1609,133 @@ qwIDAQAB\n\
         assert!(matches!(err, BearerJwtError::UnknownKid));
     }
 
+    fn test_remote_jwks_doc() -> String {
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","use":"sig","kid":"remote-1","alg":"RS256","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
+        )
+    }
+
+    fn seed_remote_jwks_cache(uri: &str, fetched_at: Instant) {
+        let jwks: JwkSet = serde_json::from_str(&test_remote_jwks_doc()).expect("test: parse jwks");
+        REMOTE_JWKS_CACHE.write().insert(
+            uri.to_string(),
+            CachedJwks {
+                jwks: Arc::new(jwks),
+                fetched_at,
+            },
+        );
+    }
+
+    fn remote_jwks_config(uri: &str) -> crate::config::McpServerRuntimeConfig {
+        crate::config::McpServerRuntimeConfig {
+            jwt_issuer: Some("https://issuer.example".to_string()),
+            jwt_audience: Some("prx-mcp".to_string()),
+            jwt_jwks_uri: Some(uri.to_string()),
+            jwt_jwks_cache_ttl_secs: 300,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remote_jwks_fresh_cache_verifies_token() {
+        let uri = "https://issuer.example/.well-known/jwks-fresh.json";
+        seed_remote_jwks_cache(uri, Instant::now());
+        let config = remote_jwks_config(uri);
+        let token = sign_rs256(
+            &TestClaims {
+                iss: "https://issuer.example".to_string(),
+                sub: "agent-remote".to_string(),
+                aud: Some("prx-mcp".to_string()),
+                exp: future_exp(),
+            },
+            Some("remote-1"),
+        );
+        let claims = verify_bearer_jwt(&token, &config).expect("test: remote jwks verify");
+        assert_eq!(claims.subject, "agent-remote");
+    }
+
+    #[test]
+    fn remote_jwks_missing_cache_fails_closed() {
+        // No cache entry seeded -> the remote endpoint is treated as unavailable
+        // and the token MUST be rejected rather than accepted.
+        let uri = "https://issuer.example/.well-known/jwks-absent.json";
+        REMOTE_JWKS_CACHE.write().remove(uri);
+        let config = remote_jwks_config(uri);
+        let token = sign_rs256(
+            &TestClaims {
+                iss: "https://issuer.example".to_string(),
+                sub: "agent-remote".to_string(),
+                aud: Some("prx-mcp".to_string()),
+                exp: future_exp(),
+            },
+            Some("remote-1"),
+        );
+        let err = verify_bearer_jwt(&token, &config).expect_err("test: missing remote jwks");
+        assert!(matches!(err, BearerJwtError::JwksUnavailable));
+    }
+
+    #[test]
+    fn remote_jwks_expired_cache_fails_closed() {
+        // A cache entry older than the TTL is treated as stale: fail-closed.
+        let uri = "https://issuer.example/.well-known/jwks-stale.json";
+        let stale_at = Instant::now()
+            .checked_sub(Duration::from_secs(10_000))
+            .expect("test: stale instant");
+        seed_remote_jwks_cache(uri, stale_at);
+        let mut config = remote_jwks_config(uri);
+        config.jwt_jwks_cache_ttl_secs = 1;
+        let token = sign_rs256(
+            &TestClaims {
+                iss: "https://issuer.example".to_string(),
+                sub: "agent-remote".to_string(),
+                aud: Some("prx-mcp".to_string()),
+                exp: future_exp(),
+            },
+            Some("remote-1"),
+        );
+        let err = verify_bearer_jwt(&token, &config).expect_err("test: stale remote jwks");
+        assert!(matches!(err, BearerJwtError::JwksUnavailable));
+    }
+
+    #[test]
+    fn remote_jwks_requires_kid() {
+        let uri = "https://issuer.example/.well-known/jwks-nokid.json";
+        seed_remote_jwks_cache(uri, Instant::now());
+        let config = remote_jwks_config(uri);
+        let token = sign_rs256(
+            &TestClaims {
+                iss: "https://issuer.example".to_string(),
+                sub: "agent-remote".to_string(),
+                aud: Some("prx-mcp".to_string()),
+                exp: future_exp(),
+            },
+            None,
+        );
+        let err = verify_bearer_jwt(&token, &config).expect_err("test: remote jwks needs kid");
+        assert!(matches!(err, BearerJwtError::MissingKid));
+    }
+
+    #[test]
+    fn inline_jwks_takes_precedence_over_remote_uri() {
+        // When both inline and remote are set, the inline document is used and
+        // the (deliberately absent) remote cache is never consulted.
+        let uri = "https://issuer.example/.well-known/jwks-precedence.json";
+        REMOTE_JWKS_CACHE.write().remove(uri);
+        let mut config = remote_jwks_config(uri);
+        config.jwt_jwks = Some(test_remote_jwks_doc());
+        let token = sign_rs256(
+            &TestClaims {
+                iss: "https://issuer.example".to_string(),
+                sub: "agent-inline".to_string(),
+                aud: Some("prx-mcp".to_string()),
+                exp: future_exp(),
+            },
+            Some("remote-1"),
+        );
+        let claims = verify_bearer_jwt(&token, &config).expect("test: inline precedence");
+        assert_eq!(claims.subject, "agent-inline");
+    }
+
     #[test]
     fn a2a_peer_issuer_allow_list_enforced() {
         let mut config = crate::config::A2aConfig::default();
@@ -1749,5 +2054,99 @@ f/+LwM1E2HpwH8ZFVfFQr0acepQEMs9gkymArUuqdWObmM5v2xAw1WY8rH6UX6Cm\n\
         // Non-strict: rogue SVID fails, but header-asserted id is still honored.
         let identity = derive_external_agent_identity(&headers, &config).expect("test: fallback identity");
         assert_eq!(identity.external_subject, "spiffe://trusted.example/agent/worker");
+    }
+
+    // ── JWKS URI security tests ───────────────────────────────────────────────
+
+    /// `normalize_jwks_uri` must reject any non-https scheme immediately so
+    /// that `resolve_decoding_key` propagates `InsecureJwksUri` and the token
+    /// is denied without any network I/O (fail-closed).
+    #[test]
+    fn http_jwks_uri_is_rejected_by_normalize() {
+        // Plain http — MITM risk.
+        assert!(matches!(
+            normalize_jwks_uri("http://example.com/.well-known/jwks.json"),
+            Err(BearerJwtError::InsecureJwksUri)
+        ));
+        // Leading whitespace + http — whitespace must not bypass the check.
+        assert!(matches!(
+            normalize_jwks_uri("  http://example.com/jwks.json  "),
+            Err(BearerJwtError::InsecureJwksUri)
+        ));
+        // No scheme at all.
+        assert!(matches!(
+            normalize_jwks_uri("example.com/jwks.json"),
+            Err(BearerJwtError::InsecureJwksUri)
+        ));
+        // Loopback http.
+        assert!(matches!(
+            normalize_jwks_uri("http://127.0.0.1/jwks.json"),
+            Err(BearerJwtError::InsecureJwksUri)
+        ));
+    }
+
+    /// `normalize_jwks_uri` must accept a valid https URI and return the
+    /// trimmed slice as the canonical cache key.
+    #[test]
+    fn https_jwks_uri_is_accepted_and_trimmed() {
+        let raw = "  https://auth.example.com/.well-known/jwks.json  ";
+        let result = normalize_jwks_uri(raw).expect("test: https uri should be accepted");
+        assert_eq!(result, "https://auth.example.com/.well-known/jwks.json");
+
+        // Upper-case HTTPS scheme must also be accepted (case-insensitive).
+        let upper = "HTTPS://auth.example.com/jwks.json";
+        let result2 = normalize_jwks_uri(upper).expect("test: upper-case HTTPS");
+        assert_eq!(result2, upper);
+    }
+
+    /// `resolve_decoding_key` must return `InsecureJwksUri` (not attempt a
+    /// network fetch) when `jwt_jwks_uri` is configured with an http:// URI,
+    /// even without a pre-warmed cache.
+    #[test]
+    fn resolve_decoding_key_rejects_http_jwks_uri() {
+        let mut mcp_cfg = crate::config::McpServerRuntimeConfig::default();
+        mcp_cfg.jwt_jwks_uri = Some("http://evil-mitm.example.com/jwks.json".to_string());
+        mcp_cfg.jwt_issuer = Some("https://auth.example.com".to_string());
+        // The cache is empty; resolution must fail-closed with InsecureJwksUri,
+        // never with JwksUnavailable (which would imply a fetch was attempted).
+        // DecodingKey doesn't implement Debug so we cannot use expect_err;
+        // use a match guard instead.
+        let result = resolve_decoding_key(&mcp_cfg, Some("key1"));
+        match result {
+            Err(BearerJwtError::InsecureJwksUri) => { /* expected */ }
+            Err(other) => panic!("expected InsecureJwksUri, got: {other}"),
+            Ok(_) => panic!("expected error but resolve_decoding_key succeeded"),
+        }
+    }
+
+    /// Cache key consistency: the canonical (trimmed) URI written by
+    /// `prewarm_remote_jwks` must equal the key used by `cached_remote_jwks`
+    /// inside `resolve_decoding_key`. If both normalise via `normalize_jwks_uri`
+    /// there is never a mismatch regardless of whitespace in the config.
+    #[test]
+    fn cached_remote_jwks_key_is_trimmed_uri() {
+        // Directly seed the cache with a trimmed key (simulating a successful
+        // pre-warm) and then verify that a lookup with a whitespace-padded URI
+        // still finds the entry because resolve_decoding_key trims first.
+        let canonical = "https://auth.example.com/.well-known/jwks.json";
+        let jwks_json = r#"{"keys":[]}"#;
+        let jwks: JwkSet = serde_json::from_str(jwks_json).expect("test: parse empty jwks");
+        REMOTE_JWKS_CACHE.write().insert(
+            canonical.to_string(),
+            CachedJwks {
+                jwks: Arc::new(jwks),
+                fetched_at: std::time::Instant::now(),
+            },
+        );
+        // A config value with surrounding whitespace must still hit the cache.
+        let padded = format!("  {canonical}  ");
+        let result = cached_remote_jwks(
+            normalize_jwks_uri(&padded).expect("test: padded https uri normalises ok"),
+            300,
+        );
+        assert!(
+            result.is_some(),
+            "cache lookup must succeed when using the normalised (trimmed) key"
+        );
     }
 }
