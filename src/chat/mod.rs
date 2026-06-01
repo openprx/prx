@@ -2103,6 +2103,20 @@ pub async fn run(
                         tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
                     }
                     // driver 路径 RecordAssistantTurn 已由 dispatcher.rs send（fixB B5）
+                    // BUG-06 / BUG-08 round-2 fix: the real TUI drives turns through
+                    // this ReduxDriver branch, which `continue`s at the end of the
+                    // block and therefore NEVER reaches the legacy tool-loop
+                    // `chat_session.add_*_turn` at the bottom of the loop body. The
+                    // round-1 fix populated only that legacy path, so interactive
+                    // `/export` / `/cost` (which read `ctx.chat_session.turns`) still
+                    // saw an empty session. Mirror the live turn into the in-memory
+                    // `chat_session` here as well, sanitizing for persistence to match
+                    // the legacy path. The reducer remains the single *persistence*
+                    // source (it dispatched RecordAssistantTurn + Effect::SaveSession),
+                    // so this only backs the slash commands and never double-writes.
+                    chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
+                    chat_session
+                        .add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
                     let _ = final_text;
                 }
                 Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {

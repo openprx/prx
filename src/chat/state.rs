@@ -710,14 +710,28 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_foldable_card_toggled(&mut self) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
+        let mut toggled = false;
         for line in self.ui.conversation_lines.iter_mut().rev() {
             match line {
                 ConversationLine::Reasoning { folded, .. } | ConversationLine::ToolResult { folded, .. } => {
                     *folded = !*folded;
+                    toggled = true;
                     break;
                 }
                 _ => {}
             }
+        }
+        // BUG-01 round-2 fix: conversation history lives in the host terminal's
+        // append-only scrollback (flushed once via `insert_before`); flipping
+        // `folded` on a card that has already scrolled into history does NOT
+        // repaint it, so Tab/Ctrl+R appeared dead (the card stayed "▸" forever).
+        // Bumping `conversation_generation` makes `run_tui_unified_loop` reset
+        // `last_pushed_idx` and re-emit every conversation line with the new fold
+        // state — the same mechanism `/clear` (HistoryCleared) already uses — so
+        // the expanded card actually becomes visible. Only bump when a card was
+        // toggled to avoid spurious full re-emits on no-op key presses.
+        if toggled {
+            self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         }
         vec![Effect::RequestRedraw]
     }
@@ -726,11 +740,18 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_tool_card_fold_toggled(&mut self) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
+        let mut toggled = false;
         for line in self.ui.conversation_lines.iter_mut().rev() {
             if let ConversationLine::ToolResult { folded, .. } = line {
                 *folded = !*folded;
+                toggled = true;
                 break;
             }
+        }
+        // BUG-01 round-2 fix: re-emit scrollback so the new fold state is visible
+        // (see `reduce_foldable_card_toggled` for the full rationale).
+        if toggled {
+            self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         }
         vec![Effect::RequestRedraw]
     }
@@ -745,11 +766,18 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_reasoning_fold_toggled(&mut self) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
+        let mut toggled = false;
         for line in self.ui.conversation_lines.iter_mut().rev() {
             if let ConversationLine::Reasoning { folded, .. } = line {
                 *folded = !*folded;
+                toggled = true;
                 break;
             }
+        }
+        // BUG-01 round-2 fix: re-emit scrollback so the new fold state is visible
+        // (see `reduce_foldable_card_toggled` for the full rationale).
+        if toggled {
+            self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         }
         vec![Effect::RequestRedraw]
     }
@@ -2206,6 +2234,60 @@ mod tests {
                 }
                 other => panic!("expected Reasoning card in snapshot, got {other:?}"),
             }
+        }
+
+        /// BUG-01 round-2: the visible conversation lives in append-only host
+        /// scrollback (flushed once via `insert_before`). Round-1 flipped `folded`
+        /// but never told the unified loop to re-emit, so the already-printed card
+        /// stayed "▸" forever. A fold toggle must therefore bump
+        /// `conversation_generation` — the signal `run_tui_unified_loop` uses to
+        /// reset `last_pushed_idx` and re-emit every line with the new fold state.
+        #[test]
+        fn test_fold_toggle_bumps_conversation_generation() {
+            use crate::chat::tui::ConversationLine;
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::Reasoning {
+                content: "thoughts".to_string(),
+                char_count: 8,
+                folded: true,
+            });
+            let gen_before = state.ui.conversation_generation;
+
+            // Tab (foldable toggle) must bump the generation so scrollback re-emits.
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert_eq!(
+                state.ui.conversation_generation,
+                gen_before + 1,
+                "Tab fold toggle must bump conversation_generation to force scrollback re-emit"
+            );
+
+            // Ctrl+R (reasoning-specific toggle) must bump again.
+            let gen_after_tab = state.ui.conversation_generation;
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )));
+            assert_eq!(
+                state.ui.conversation_generation,
+                gen_after_tab + 1,
+                "Ctrl+R fold toggle must also bump conversation_generation"
+            );
+        }
+
+        /// BUG-01 round-2: a fold toggle with NO foldable card present must NOT
+        /// bump the generation (avoids spurious full-conversation re-emits / a
+        /// scrollback flood on stray Tab presses in a fresh session).
+        #[test]
+        fn test_fold_toggle_no_card_does_not_bump_generation() {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            let gen_before = state.ui.conversation_generation;
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert_eq!(
+                state.ui.conversation_generation, gen_before,
+                "Tab with no foldable card must not bump generation"
+            );
         }
 
         // ─── Step 2 集成测试（P1-1 PTY 覆盖空洞补全）──────────────────────────

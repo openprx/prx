@@ -554,4 +554,106 @@ mod mode_tests {
         assert!(text.contains("Test tool description"));
         assert_system_message_added(text, "Available tools (1):");
     }
+
+    /// BUG-08 round-2: `/export md` must contain the actual conversation bodies,
+    /// not just the header. Build a session with real turns (mirroring what the
+    /// ReduxDriver `Completed` arm now populates) and assert the exported
+    /// Markdown carries every user/assistant message body.
+    #[test]
+    fn export_md_includes_all_turn_bodies() {
+        let mut session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        session.add_user_turn("EXPORT_USER_MSG_ALPHA");
+        session.add_assistant_turn("EXPORT_ASSISTANT_MSG_BETA", Vec::new());
+        session.add_user_turn("EXPORT_USER_MSG_GAMMA");
+        session.add_assistant_turn("EXPORT_ASSISTANT_MSG_DELTA", Vec::new());
+
+        let path = super::export_session(&session, "md").expect("test: export should succeed");
+        let body = std::fs::read_to_string(&path).expect("test: exported file should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        // Every turn body present (not just the Provider/Model/Date header).
+        assert!(body.contains("EXPORT_USER_MSG_ALPHA"), "user turn 1 missing: {body}");
+        assert!(body.contains("EXPORT_ASSISTANT_MSG_BETA"), "assistant turn 1 missing");
+        assert!(body.contains("EXPORT_USER_MSG_GAMMA"), "user turn 2 missing");
+        assert!(body.contains("EXPORT_ASSISTANT_MSG_DELTA"), "assistant turn 2 missing");
+        assert!(body.contains("**You**"), "user role label missing");
+        assert!(body.contains("**PRX**"), "assistant role label missing");
+        // Header present and file is materially larger than the empty-session case.
+        assert!(body.contains("kimi2.6"), "model header missing");
+        assert!(body.len() > 200, "export looks truncated/empty: {} bytes", body.len());
+    }
+
+    /// BUG-08 round-2: JSON export round-trips every turn body.
+    #[test]
+    fn export_json_includes_all_turn_bodies() {
+        let mut session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        session.add_user_turn("JSON_USER_EPSILON");
+        session.add_assistant_turn("JSON_ASSISTANT_ZETA", Vec::new());
+
+        let path = super::export_session(&session, "json").expect("test: json export should succeed");
+        let body = std::fs::read_to_string(&path).expect("test: exported json should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(body.contains("JSON_USER_EPSILON"));
+        assert!(body.contains("JSON_ASSISTANT_ZETA"));
+        let parsed = crate::chat::session::ChatSession::from_json(&body).expect("test: json must re-parse");
+        assert_eq!(parsed.turn_count(), 2);
+    }
+
+    /// BUG-06 round-2: `/cost` must read the live in-memory turns. With a
+    /// populated session the estimate reports the real turn count and non-zero
+    /// chars/tokens (the empty-session regression reported Turns:0 forever).
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_cost_reports_nonzero_for_populated_session() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        session.add_user_turn("a fairly long user question that should produce a measurable char count");
+        session.add_assistant_turn(
+            "an equally substantial assistant reply with plenty of characters",
+            Vec::new(),
+        );
+        let ctx = CommandContext {
+            model_name: "kimi2.6",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/cost", &ctx).await);
+
+        assert!(text.contains("Turns:        2"), "cost should report 2 turns: {text}");
+        assert!(!text.contains("Total chars:  0"), "cost chars must be non-zero: {text}");
+        assert!(
+            !text.contains("Est. tokens:  ~0"),
+            "cost tokens must be non-zero: {text}"
+        );
+    }
+
+    /// BUG-06 round-2: empty session still reports zero (guards against the cost
+    /// estimator reading some unrelated non-empty source — the count must track
+    /// the real conversation).
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_cost_reports_zero_for_empty_session() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        let ctx = CommandContext {
+            model_name: "kimi2.6",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/cost", &ctx).await);
+
+        assert!(
+            text.contains("Turns:        0"),
+            "empty session cost must be 0 turns: {text}"
+        );
+    }
 }

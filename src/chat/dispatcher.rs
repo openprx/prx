@@ -1098,6 +1098,11 @@ async fn drive_start_turn_stream(
     let mut overflow_retries: u8 = 0;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
     let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // BUG-03: count how many times each unrecoverable tool-failure signature has
+    // been seen this turn. When the model re-issues the *same* permanently-blocked
+    // call (permission denied / not allowed / rejected …) the count climbs; once it
+    // recurs we stop the turn early instead of spinning to `max_tool_iterations`.
+    let mut unrecoverable_seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
     let stream_tool_specs: Vec<crate::tools::ToolSpec> = tools_registry.as_ref().map_or_else(Vec::new, |registry| {
         registry.iter().flat_map(|tool| tool.specs()).collect()
     });
@@ -1230,6 +1235,9 @@ async fn drive_start_turn_stream(
                 });
 
                 // 2) 顺序执行每个 tool call.
+                // BUG-03: signature of an unrecoverable failure that recurred this
+                // pass — set to stop the turn after history is fully populated.
+                let mut repeated_unrecoverable: Option<String> = None;
                 for call in calls {
                     if executed_tool_ids.contains(&call.id) {
                         tracing::debug!(
@@ -1238,6 +1246,7 @@ async fn drive_start_turn_stream(
                         );
                         continue;
                     }
+                    let call_name = call.name.clone();
                     let outcome = execute_single_tool_call(
                         registry,
                         &call,
@@ -1251,11 +1260,43 @@ async fn drive_start_turn_stream(
                     )
                     .await;
                     match outcome {
-                        ToolExecOutcome::Done => {
+                        ToolExecOutcome::Done { unrecoverable } => {
                             executed_tool_ids.insert(call.id.clone());
+                            if let Some(sig) = unrecoverable {
+                                let count = unrecoverable_seen.entry(sig.clone()).or_insert(0);
+                                *count = count.saturating_add(1);
+                                if *count >= 2 {
+                                    // The model already saw this exact block and
+                                    // re-issued the identical call — further LLM
+                                    // round-trips will not change the outcome.
+                                    tracing::info!(
+                                        tool = %call_name,
+                                        occurrences = *count,
+                                        "drive_start_turn_stream: repeated unrecoverable tool failure — stopping turn early (BUG-03)"
+                                    );
+                                    repeated_unrecoverable = Some(call_name.clone());
+                                }
+                            }
                         }
                         ToolExecOutcome::Cancelled | ToolExecOutcome::SenderClosed => return,
                     }
+                }
+                // BUG-03: if a permanently-blocked call was retried, fail the turn
+                // now with an actionable message rather than letting the LLM spin
+                // until `max_tool_iterations`. history already carries every tool
+                // result so the failure context is intact for any follow-up turn.
+                if let Some(tool_name) = repeated_unrecoverable {
+                    let action = Action::StreamFailed {
+                        draft_id: draft_id.clone(),
+                        err: format!(
+                            "stopped after a repeated unrecoverable tool failure ('{tool_name}' is blocked by policy/permissions); not retrying further"
+                        ),
+                        retryable: false,
+                    };
+                    if let Err(e) = action_tx.send(action).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on unrecoverable-stop");
+                    }
+                    return;
                 }
                 // 继续下一轮 LLM 调用. iter_text 已经写入 assistant message, 不计入最终 accumulated.
             }
@@ -1281,13 +1322,68 @@ async fn drive_start_turn_stream(
 }
 
 /// **S3 T3-1**: 单轮工具执行的结果分类.
+#[derive(Debug)]
 enum ToolExecOutcome {
     /// 工具正常完成（含 success / fail / reject — 都已发 ToolFinished + 回填 history）.
-    Done,
+    ///
+    /// BUG-03: when the failure is *unrecoverable* (permission denied / command
+    /// not allowed / path not allowed — the model retrying the identical call
+    /// can never succeed), `unrecoverable` carries a stable signature so the
+    /// driver loop can detect a repeated blocked action and stop the turn early
+    /// instead of burning all `max_tool_iterations` on a futile retry spin.
+    Done { unrecoverable: Option<String> },
     /// 用户 cancel — 调用方应立即从 driver 返回.
     Cancelled,
     /// action_tx 关闭，driver 应静默退出.
     SenderClosed,
+}
+
+/// BUG-03: classify whether a tool error is **unrecoverable** — i.e. retrying
+/// the identical call can never succeed because a security policy / sandbox /
+/// OS permission permanently blocks it. The Redux driver uses this to short-
+/// circuit the "LLM keeps re-issuing the same blocked tool call until
+/// max-iterations" spin observed in chat-demo (BUG-03).
+///
+/// Matching is case-insensitive substring against the human-readable error /
+/// output. Transient failures (timeouts, network, "file not found", parse
+/// errors the model can fix) are intentionally NOT matched — those remain
+/// retryable so the model can self-correct.
+fn is_unrecoverable_tool_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    const SIGNATURES: &[&str] = &[
+        "permission denied",
+        "command not allowed",
+        "command is not allowed",
+        "not allowed",
+        "path not allowed",
+        "path is not allowed",
+        "not permitted",
+        "operation not permitted",
+        "access denied",
+        "blocked by security policy",
+        "security policy",
+        "denied by policy",
+        "forbidden by policy",
+        "read-only file system",
+        "user rejected tool approval",
+        "approval system not available",
+    ];
+    SIGNATURES.iter().any(|sig| lower.contains(sig))
+}
+
+/// BUG-03: build the stable signature used to detect a *repeated* unrecoverable
+/// tool failure. Keyed by tool name + a normalized slice of the error so that
+/// the same blocked action recurring across iterations collapses to one key,
+/// while a *different* blocked call (e.g. a different denied path) does not
+/// falsely trip the early-stop on its first occurrence.
+fn unrecoverable_signature(tool_name: &str, error_text: &str) -> String {
+    let normalized: String = error_text
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| !c.is_ascii_digit())
+        .take(160)
+        .collect();
+    format!("{tool_name}::{normalized}")
 }
 
 /// BUG-09: classify whether a tool mutates state and must be intercepted in
@@ -1378,7 +1474,8 @@ async fn execute_single_tool_call(
             tracing::debug!(error = %e, "StartTurn: action_tx closed on plan-mode-intercept");
             return ToolExecOutcome::SenderClosed;
         }
-        return ToolExecOutcome::Done;
+        // Plan-mode interception reports simulated success — fully recoverable.
+        return ToolExecOutcome::Done { unrecoverable: None };
     }
 
     // 1) Approval — supervised mode 走 oneshot 等响应.
@@ -1425,14 +1522,17 @@ async fn execute_single_tool_call(
                         name: call.name.clone(),
                         success: false,
                         duration_ms: 0,
-                        result: Some(err_msg),
+                        result: Some(err_msg.clone()),
                     })
                     .await
                 {
                     tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected");
                     return ToolExecOutcome::SenderClosed;
                 }
-                return ToolExecOutcome::Done;
+                // BUG-03: a rejected approval will reject again on identical retry.
+                return ToolExecOutcome::Done {
+                    unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
+                };
             }
         } else {
             tracing::error!(
@@ -1452,14 +1552,17 @@ async fn execute_single_tool_call(
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
-                    result: Some(err_msg),
+                    result: Some(err_msg.clone()),
                 })
                 .await
             {
                 tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected-fail-closed");
                 return ToolExecOutcome::SenderClosed;
             }
-            return ToolExecOutcome::Done;
+            // BUG-03: fail-closed rejection is permanent for this session.
+            return ToolExecOutcome::Done {
+                unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
+            };
         }
     }
 
@@ -1494,7 +1597,8 @@ async fn execute_single_tool_call(
                     result: Some(err_msg),
                 })
                 .await;
-            return ToolExecOutcome::Done;
+            // Recoverable: the model can re-emit corrected JSON.
+            return ToolExecOutcome::Done { unrecoverable: None };
         }
     };
 
@@ -1515,10 +1619,13 @@ async fn execute_single_tool_call(
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
-                    result: Some(err_msg),
+                    result: Some(err_msg.clone()),
                 })
                 .await;
-            return ToolExecOutcome::Done;
+            // BUG-03: a nonexistent tool will never exist on retry of the same name.
+            return ToolExecOutcome::Done {
+                unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
+            };
         }
     };
 
@@ -1576,6 +1683,14 @@ async fn execute_single_tool_call(
         }
     };
     history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+    // BUG-03: a real tool failure whose message names a permanent block
+    // (permission denied / command not allowed / path not allowed …) is
+    // unrecoverable — surface a signature so the driver can stop a retry spin.
+    let unrecoverable = if !ok_flag && is_unrecoverable_tool_error(&summary) {
+        Some(unrecoverable_signature(&call.name, &summary))
+    } else {
+        None
+    };
     let _ = action_tx
         .send(Action::ToolFinished {
             name: call.name.clone(),
@@ -1584,7 +1699,7 @@ async fn execute_single_tool_call(
             result: Some(summary),
         })
         .await;
-    ToolExecOutcome::Done
+    ToolExecOutcome::Done { unrecoverable }
 }
 
 /// **S3 T3-1**: 单轮 stream 调用 + 网络瞬时故障 exponential backoff retry.
@@ -5030,6 +5145,161 @@ mod real_mode_tests {
         );
     }
 
+    /// BUG-03 round-2: when a tool fails *unrecoverably* (permission denied) and
+    /// the model re-issues the identical blocked call, the driver must STOP early
+    /// instead of spinning all `max_tool_iterations` (the chat-demo defect where
+    /// a blocked shell command burned 9 LLM round-trips before erroring out).
+    ///
+    /// Provider always emits the same `noop` tool call; the tool always returns
+    /// "permission denied". With `max_tool_iterations = 10`, the fix must emit
+    /// `StreamFailed` with the *unrecoverable* message after the signature recurs
+    /// (≈ iteration 2) and crucially must NOT count the noop tool more than a
+    /// couple of times — proving it did not spin to the iteration ceiling.
+    #[tokio::test]
+    async fn driver_stops_early_on_repeated_unrecoverable_tool_failure() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct DeniedTool {
+            exec_count: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl crate::tools::Tool for DeniedTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "shell"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object"})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.exec_count.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("permission denied: command not allowed in sandbox".to_string()),
+                })
+            }
+        }
+
+        // A realistic model re-issues a *new* tool_call id on each retry (the
+        // driver's id-based idempotency skip only suppresses literal duplicate
+        // ids within one assistant turn). Use a counter so each blocked attempt
+        // is a fresh execution — that is what makes the retry actually re-run and
+        // lets the unrecoverable signature recur.
+        struct AlwaysDeniedCallProvider {
+            seq: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for AlwaysDeniedCallProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.seq.fetch_add(1, AtomicOrdering::SeqCst);
+                let calls = vec![ToolCallChunk::new(
+                    format!("blocked-{n}"),
+                    "shell",
+                    r#"{"cmd":"rm -rf /"}"#,
+                    0,
+                )];
+                stream::iter(vec![
+                    Ok(StreamChunk::tool_call_chunk(calls)),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let exec_count = Arc::new(AtomicUsize::new(0));
+        deps.provider = Arc::new(AlwaysDeniedCallProvider {
+            seq: Arc::new(AtomicUsize::new(0)),
+        });
+        deps.tools_registry = Some(Arc::new(vec![Box::new(DeniedTool {
+            exec_count: Arc::clone(&exec_count),
+        }) as Box<dyn crate::tools::Tool>]));
+        // Generous ceiling: if the early-stop is broken this would spin to 10.
+        deps.max_tool_iterations = 10;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-unrecoverable".to_string(),
+                history: Vec::new(),
+                cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+            })
+            .await;
+
+        let mut got_failed = false;
+        let mut failed_err = String::new();
+        for _ in 0..32 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver should respond per action within 2s")
+                .expect("action must arrive");
+            if let Action::StreamFailed { err, retryable, .. } = &action {
+                assert!(!retryable, "unrecoverable stop is permanent");
+                failed_err = err.clone();
+                got_failed = true;
+                break;
+            }
+        }
+        assert!(
+            got_failed,
+            "driver must emit StreamFailed on repeated unrecoverable failure"
+        );
+        assert!(
+            failed_err.contains("unrecoverable") && failed_err.contains("shell"),
+            "must stop with the unrecoverable message naming the blocked tool, not max-iter (got: {failed_err})"
+        );
+        assert!(
+            !failed_err.contains("max tool iterations"),
+            "must NOT have spun to max_tool_iterations (got: {failed_err})"
+        );
+        // The blocked tool must have run only a small number of times (the first
+        // failure plus the one retry that trips the early-stop) — definitely far
+        // below the iteration ceiling of 10.
+        let runs = exec_count.load(AtomicOrdering::SeqCst);
+        assert!(
+            (1..=3).contains(&runs),
+            "blocked tool should run ~twice before early-stop, not spin to the ceiling (ran {runs} times)"
+        );
+    }
+
     /// P1-2: driver 路径下 turn 中 cancel — drive_start_turn_stream 内 select! 选 cancel 分支.
     ///
     /// 验证 cancel_token cancel 后, drive_start_turn_stream 发 StreamCancelled,
@@ -6276,7 +6546,7 @@ mod real_mode_tests {
         )
         .await;
 
-        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
         assert!(
             !executed.load(AtomicOrdering::SeqCst),
             "tool requiring approval must not execute without router"
@@ -6405,7 +6675,7 @@ mod real_mode_tests {
         )
         .await;
 
-        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
         assert!(executed.load(AtomicOrdering::SeqCst));
         resolver.await.expect("resolver task should complete");
         let tool_message = history.last().expect("tool result history expected");
@@ -7105,7 +7375,7 @@ mod s4_a_3 {
         )
         .await;
 
-        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
         assert!(
             !executed.load(AtomicOrdering::SeqCst),
             "plan mode MUST NOT execute the write tool"
@@ -7180,7 +7450,15 @@ mod s4_a_3 {
         )
         .await;
 
-        assert!(matches!(outcome, ToolExecOutcome::Done));
+        // BUG-03: a "Path not allowed" failure is unrecoverable — the outcome
+        // must carry a signature so the driver can stop a retry spin.
+        match outcome {
+            ToolExecOutcome::Done { unrecoverable } => {
+                let sig = unrecoverable.expect("path-not-allowed failure must be flagged unrecoverable");
+                assert!(sig.starts_with("file_write::"), "signature keyed by tool name: {sig}");
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
         let tool_msg = history.last().expect("tool result pushed to history");
         let payload: serde_json::Value = serde_json::from_str(&tool_msg.content).expect("tool payload is JSON");
         assert_eq!(payload.get("success"), Some(&serde_json::json!(false)));
@@ -7189,5 +7467,107 @@ mod s4_a_3 {
             content.contains("Path not allowed") && content.contains("/etc/passwd"),
             "failed tool must surface its error reason in `content`, got: {content}"
         );
+    }
+
+    /// BUG-03: a recoverable tool failure (one the model can fix, e.g. a missing
+    /// file) must NOT be flagged unrecoverable, so the agent retains the chance
+    /// to self-correct rather than stopping prematurely.
+    #[tokio::test]
+    async fn recoverable_tool_failure_is_not_flagged_unrecoverable() {
+        struct FlakyTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for FlakyTool {
+            fn name(&self) -> &str {
+                "file_read"
+            }
+            fn description(&self) -> &str {
+                "read"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("file not found: /tmp/typo.txt".into()),
+                })
+            }
+        }
+
+        let registry = Arc::new(vec![Box::new(FlakyTool) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-flaky".into(),
+            name: "file_read".into(),
+            args: "{}".into(),
+        };
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
+        let mut history = Vec::new();
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-flaky",
+            None,
+            None,
+            &mut history,
+            crate::agent::loop_::ChatMode::Edit,
+        )
+        .await;
+
+        match outcome {
+            ToolExecOutcome::Done { unrecoverable } => {
+                assert!(
+                    unrecoverable.is_none(),
+                    "'file not found' must stay retryable, got {unrecoverable:?}"
+                );
+            }
+            other => panic!("expected Done, got {other:?}"),
+        }
+    }
+
+    /// BUG-03: detector classifies permanent blocks vs. retryable failures.
+    #[test]
+    fn unrecoverable_error_detector_classifies_correctly() {
+        // Permanent / policy / permission failures → unrecoverable.
+        for s in [
+            "permission denied",
+            "Permission Denied while writing",
+            "command not allowed: rm",
+            "this command is not allowed",
+            "Path not allowed by security policy: /etc/passwd",
+            "operation not permitted",
+            "Access Denied",
+            "Read-only file system",
+            "User rejected tool approval",
+        ] {
+            assert!(is_unrecoverable_tool_error(s), "should be unrecoverable: {s}");
+        }
+        // Retryable / fixable failures → NOT unrecoverable.
+        for s in [
+            "file not found: /tmp/x",
+            "connection timed out",
+            "tool args JSON parse error: expected value",
+            "rate limited, try again",
+            "no such file or directory",
+        ] {
+            assert!(!is_unrecoverable_tool_error(s), "should be recoverable: {s}");
+        }
+    }
+
+    /// BUG-03: the same blocked call collapses to one signature across retries
+    /// (digits stripped so e.g. a PID/line-number difference does not split it),
+    /// while a *different* tool yields a distinct signature.
+    #[test]
+    fn unrecoverable_signature_collapses_repeats_but_separates_tools() {
+        let a = unrecoverable_signature("shell", "permission denied (errno 13)");
+        let b = unrecoverable_signature("shell", "permission denied (errno 13)");
+        let c = unrecoverable_signature("shell", "permission denied (errno 99)");
+        let d = unrecoverable_signature("file_write", "permission denied (errno 13)");
+        assert_eq!(a, b, "identical failures must share a signature");
+        assert_eq!(a, c, "digit-only differences must collapse to one signature");
+        assert_ne!(a, d, "different tools must have distinct signatures");
     }
 }
