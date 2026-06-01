@@ -1659,6 +1659,31 @@ fn create_provider_with_url_and_options(
     }
 }
 
+/// FIX-P2-14: collect extra rotation API keys for the primary provider.
+///
+/// Returns trimmed, non-empty keys from `reliability.api_keys`, skipping any
+/// that duplicate the primary credential or each other (the primary key is
+/// always tried first via the primary provider instance). Used to build
+/// additional provider instances for round-robin rotation on rate-limit.
+fn extra_api_keys<'a>(reliability: &'a crate::config::ReliabilityConfig, primary_key: Option<&str>) -> Vec<&'a str> {
+    let primary = primary_key.map(str::trim).filter(|k| !k.is_empty());
+    let mut seen: Vec<&str> = Vec::new();
+    for key in &reliability.api_keys {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if Some(trimmed) == primary {
+            continue;
+        }
+        if seen.contains(&trimmed) {
+            continue;
+        }
+        seen.push(trimmed);
+    }
+    seen
+}
+
 /// Create provider chain with retry and fallback behavior.
 pub fn create_resilient_provider(
     primary_name: &str,
@@ -1701,7 +1726,35 @@ pub fn create_resilient_provider_with_options(
         };
 
         match creation_result {
-            Ok(provider) => providers.push((provider_name.clone(), provider)),
+            Ok(provider) => {
+                providers.push((provider_name.clone(), provider));
+                // FIX-P2-14: round-robin extra API keys. After the primary
+                // provider (built with the primary credential) is registered,
+                // append one additional provider instance per extra key in
+                // `reliability.api_keys`. They reuse the primary provider's name
+                // so model-prefix matching still applies, and slot into the
+                // ReliableProvider failover chain immediately after the primary —
+                // so a rate-limited (429) primary key rotates to the next key
+                // before falling through to unrelated fallback providers.
+                if provider_name == primary_name {
+                    for extra_key in extra_api_keys(reliability, api_key) {
+                        let rotated = if is_openai_codex_alias(primary_name) {
+                            create_provider_with_options(primary_name, Some(extra_key), options)
+                        } else {
+                            create_provider_with_url_and_options(primary_name, Some(extra_key), api_url, options)
+                        };
+                        match rotated {
+                            Ok(rotated_provider) => providers.push((primary_name.to_string(), rotated_provider)),
+                            Err(error) => {
+                                tracing::warn!(
+                                    provider = primary_name,
+                                    "Ignoring extra api_keys[] rotation credential that failed to initialize: {error}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 let reason = format!("failed to initialize: {error}");
                 if provider_name == primary_name {
@@ -3654,5 +3707,59 @@ mod tests {
         let input = "failed: github_pat_11AABBC_xyzzy789";
         let result = scrub_secret_patterns(input);
         assert_eq!(result, "failed: [REDACTED]");
+    }
+
+    // ── FIX-P2-14: extra api_keys rotation ──
+
+    fn reliability_with_keys(keys: Vec<String>) -> crate::config::ReliabilityConfig {
+        crate::config::ReliabilityConfig {
+            api_keys: keys,
+            ..crate::config::ReliabilityConfig::default()
+        }
+    }
+
+    #[test]
+    fn extra_api_keys_filters_empty_dupes_and_primary() {
+        let reliability = reliability_with_keys(vec![
+            "  ".into(),         // empty after trim → skipped
+            "sk-primary".into(), // equals primary → skipped
+            " sk-two ".into(),   // trimmed and kept
+            "sk-two".into(),     // duplicate of the above → skipped
+            "sk-three".into(),
+        ]);
+        let extras = extra_api_keys(&reliability, Some("sk-primary"));
+        assert_eq!(extras, vec!["sk-two", "sk-three"]);
+    }
+
+    #[test]
+    fn extra_api_keys_handles_no_primary() {
+        let reliability = reliability_with_keys(vec!["sk-a".into(), "sk-a".into(), "sk-b".into()]);
+        let extras = extra_api_keys(&reliability, None);
+        assert_eq!(extras, vec!["sk-a", "sk-b"]);
+    }
+
+    #[test]
+    fn extra_api_keys_empty_when_unset() {
+        let reliability = crate::config::ReliabilityConfig::default();
+        assert!(extra_api_keys(&reliability, Some("sk-primary")).is_empty());
+    }
+
+    #[test]
+    fn resilient_provider_builds_rotation_instances_for_extra_keys() {
+        // With two distinct extra keys, the primary provider chain should
+        // include the primary instance plus one instance per distinct extra key.
+        // We assert construction succeeds (the rotation instances are built from
+        // the same provider factory as the primary).
+        let reliability = reliability_with_keys(vec![
+            "openai-extra-1".into(),
+            "openai-extra-2".into(),
+            "openai-extra-2".into(),
+        ]);
+        let provider = create_resilient_provider("openai", Some("openai-primary"), None, &reliability);
+        assert!(
+            provider.is_ok(),
+            "resilient provider with rotation keys should build: {:?}",
+            provider.err()
+        );
     }
 }

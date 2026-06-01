@@ -4833,7 +4833,8 @@ impl Memory for SqliteMemory {
                 let mut stmt = conn.prepare(
                     "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                             c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
-                            c.token_estimate, c.created_at, bm25(document_chunks_fts) AS score
+                            c.token_estimate, c.created_at, bm25(document_chunks_fts) AS score,
+                            d.source_kind AS source_kind
                      FROM document_chunks_fts f
                      JOIN document_chunks c ON c.rowid = f.rowid
                      JOIN documents d ON d.document_id = c.document_id
@@ -4849,7 +4850,12 @@ impl Memory for SqliteMemory {
                 let rows = stmt.query_map(params![fts_query, principal.workspace_id, owner_id, limit], |row| {
                     let chunk = Self::document_chunk_from_row(row)?;
                     let score: f32 = row.get(14)?;
-                    Ok(DocumentSearchResult { chunk, score })
+                    let source_kind: Option<String> = row.get(15)?;
+                    Ok(DocumentSearchResult {
+                        chunk,
+                        score,
+                        source_kind,
+                    })
                 })?;
                 for row in rows {
                     let result = row?;
@@ -4862,7 +4868,7 @@ impl Memory for SqliteMemory {
                 let mut stmt = conn.prepare(
                     "SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                             c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
-                            c.token_estimate, c.created_at, c.embedding
+                            c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind
                      FROM document_chunks c
                      JOIN documents d ON d.document_id = c.document_id
                      WHERE c.embedding IS NOT NULL
@@ -4886,12 +4892,13 @@ impl Memory for SqliteMemory {
                     |row| {
                         let chunk = Self::document_chunk_from_row(row)?;
                         let embedding_blob: Vec<u8> = row.get(14)?;
-                        Ok((chunk, embedding_blob))
+                        let source_kind: Option<String> = row.get(15)?;
+                        Ok((chunk, embedding_blob, source_kind))
                     },
                 )?;
                 let mut vector_results = Vec::new();
                 for row in rows {
-                    let (chunk, embedding_blob) = row?;
+                    let (chunk, embedding_blob, source_kind) = row?;
                     if seen.contains(&chunk.chunk_id) {
                         continue;
                     }
@@ -4907,7 +4914,11 @@ impl Memory for SqliteMemory {
                     }
                     let score = vector::cosine_similarity(&query_embedding, &embedding);
                     if score > 0.0 {
-                        vector_results.push(DocumentSearchResult { chunk, score });
+                        vector_results.push(DocumentSearchResult {
+                            chunk,
+                            score,
+                            source_kind,
+                        });
                     }
                 }
                 vector_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));

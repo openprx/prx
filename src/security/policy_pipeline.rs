@@ -3,6 +3,32 @@
 //! Multi-layer policy evaluation for tool calls. Layers are evaluated in order from
 //! broadest (Global) through Group to most specific (Tool). The most specific matching
 //! policy wins. Each decision is fully explainable via `PolicyDecision`.
+//!
+//! ## FIX-P3-08 — profile / agent layers intentionally deferred
+//!
+//! An earlier design sketch proposed additional `Profile` and `Agent` policy
+//! layers between Group and Tool. Those layers are deliberately **not
+//! implemented / deferred** for now, and there is no no-op enum variant for them
+//! (zero dead code):
+//!
+//! * **What this pipeline actually authorizes.** Tool authorization here is
+//!   driven entirely by the `[security.tool_policy]` config via the
+//!   Global → Group → Tool layers; the most specific matching layer wins.
+//!   Runtime context (sender / channel / chat_type) does **not** influence the
+//!   outcome of [`PolicyPipeline::evaluate`] — it is carried only for logging /
+//!   correlation. Coarser sender/channel/chat_type gating of tool execution is
+//!   handled separately by the tool-policy matching in `security::policy`.
+//! * **What is *not* covered here.** This pipeline does not provide a
+//!   profile- or agent-scoped tool-authorization tier. The ACL/principal model
+//!   (`identity_bindings` / `user_policies`) governs **memory access**, not
+//!   per-tool authorization for every tool, so it is *not* a drop-in substitute
+//!   for a profile/agent tool-policy layer. No claim is made that the
+//!   profile/agent dimension is already fully covered elsewhere.
+//!
+//! If per-profile or per-agent tool gating is required in the future, it can be
+//! added as an explicit layer here (or by extending the principal model).
+//! `EvalContext` already carries `channel` / `chat_type` / `sender`, so such a
+//! decision could be wired in without reshaping the public API.
 
 use crate::config::schema::ToolPolicyConfig;
 use std::collections::HashMap;
