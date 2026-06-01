@@ -311,7 +311,11 @@ impl Agent {
     pub fn from_config(config: &Config) -> Result<Self> {
         let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
         let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+        let security = Arc::new(
+            SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+                .with_audit_config(config.security.audit.clone()),
+        );
 
         let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
             &config.memory,

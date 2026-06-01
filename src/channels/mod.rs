@@ -3707,7 +3707,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: thread the real `security.audit` config so the side-effect gate
+    // audit trail honours it (e.g. `enabled=false` ⇒ no per-message fsync).
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(

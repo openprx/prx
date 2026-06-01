@@ -366,7 +366,11 @@ fn authorize_gateway_resource_mutation(
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let config = state.config.lock().clone();
-    SideEffectGate::new(&SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir))
+    // FIX-P1-31: thread `security.audit` so the gate audit path honours
+    // `enabled=false` (no per-decision fsync on this gateway mutation route).
+    let policy = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+        .with_audit_config(config.security.audit.clone());
+    SideEffectGate::new(&policy)
         .authorize_resource_operation("gateway", operation_name, risk, None)
         .map(|_| ())
         .map_err(|error| (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": error}))))
@@ -484,7 +488,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
     )?);
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -1031,7 +1039,10 @@ async fn run_gateway_chat_with_multimodal(
         fabric_ctx.channel.clone(),
         fabric_ctx.sender.clone(),
         fabric_ctx.recipient.clone(),
-        MemoryVisibility::Workspace,
+        // FIX-P1-04: webhook-driven gateway turns are session-scoped by default.
+        // Persisting them as workspace-visible would leak per-session conversation
+        // content to the whole workspace; Session keeps it bound to this session.
+        MemoryVisibility::Session,
     )
     .with_run_id(run_id);
     let base_scope = runtime_envelope.message_scope();

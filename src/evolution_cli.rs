@@ -290,7 +290,20 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     let writer_for_engine = writer.clone();
 
     let selected_layer = map_layer(layer);
-    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir);
+    // FIX-P0-40: the manual `prx evolution trigger` path is a production entry
+    // point that drives the same engines (config/strategy/prompt writes +
+    // `append_evolution`) as the daemon scheduler. It MUST pass every commit
+    // through the same `SideEffectGate`; otherwise a manual trigger fully bypasses
+    // the autonomy gate the daemon enforces. Build the runtime security policy from
+    // config exactly like `daemon::build_evolution_scheduler` (honouring
+    // `security.audit`, FIX-P1-31) and install it on the pipeline so the engine is
+    // never reached on a deny decision.
+    let security_policy = Arc::new(
+        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
+    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir)
+        .with_security_policy(security_policy);
 
     let report = match selected_layer {
         EvolutionLayer::Memory => {
@@ -330,6 +343,24 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
         other => anyhow::bail!("manual trigger only supports L1/L2/L3, got: {other:?}"),
     };
 
+    // FIX-P0-40: the side-effect gate may have denied this commit (e.g. Supervised
+    // autonomy with `require_approval_for_medium_risk` and no runtime grant). The
+    // one-shot CLI has no interactive approval manager to issue a grant, so the
+    // only correct behaviour is to surface the denial clearly and exit non-zero —
+    // never silently report a "completed" trigger that actually applied nothing.
+    let gate_denied = report.gate_denied;
+    let gate_detail = report
+        .gate_rejections
+        .iter()
+        .find(|rejection| rejection.reason == "side_effect_gate_denied")
+        .map(|rejection| rejection.details.clone());
+    // Render the configured autonomy level as its config-file string (lowercase
+    // serde) so the remediation hint matches what the user would type in config.
+    let autonomy_level = serde_json::to_value(config.autonomy.level)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "supervised".to_string());
+
     let payload = TriggerOutput {
         config_path: cfg_path.display().to_string(),
         layer: selected_layer,
@@ -337,7 +368,12 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     };
 
     if as_json {
+        // Emit the full report first so programmatic callers can read
+        // `gate_denied`/`gate_rejections`, then signal failure via a non-zero exit.
         println!("{}", serde_json::to_string_pretty(&payload)?);
+        if gate_denied {
+            return Err(gate_denied_error(&autonomy_level));
+        }
         return Ok(());
     }
 
@@ -352,7 +388,37 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
         println!("errors : {}", payload.report.errors.join(" | "));
     }
 
+    if gate_denied {
+        println!();
+        println!("status : BLOCKED by autonomy side-effect gate");
+        if let Some(detail) = &gate_detail {
+            println!("reason : {detail}");
+        }
+        println!("note   : no change was applied — the evolution engine never ran and nothing was written to disk.");
+        println!("         Current autonomy level is `{autonomy_level}`, which gates self-modifications.");
+        println!("how to allow:");
+        println!("         - Raise the autonomy level to `full` in config ([autonomy] level = \"full\"),");
+        println!(
+            "           or disable approval-for-medium-risk ([autonomy] require_approval_for_medium_risk = false),"
+        );
+        println!("           then re-run `prx evolution trigger`.");
+        println!("         - The daemon scheduler applies the same gate; this denial is by design (fail-closed).");
+        return Err(gate_denied_error(&autonomy_level));
+    }
+
     Ok(())
+}
+
+/// FIX-P0-40: build the error returned when the side-effect gate denied a manual
+/// evolution trigger. Surfacing an `Err` from the command handler gives the
+/// process a non-zero exit code so scripts and callers can detect that no
+/// self-modification was applied, instead of treating a denied trigger as success.
+fn gate_denied_error(autonomy_level: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "evolution trigger blocked by autonomy side-effect gate (autonomy level `{autonomy_level}`); \
+         no change was applied. Raise autonomy to `full` or set \
+         `require_approval_for_medium_risk = false` to allow manual evolution."
+    )
 }
 
 const fn map_layer(layer: Option<EvolutionLayerArg>) -> EvolutionLayer {
@@ -494,4 +560,182 @@ const fn bool_flag(v: bool) -> &'static str {
 
 fn debug_value<T: Debug>(v: &T) -> String {
     format!("{v:?}").to_ascii_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::self_system::evolution::DecisionLog;
+    use crate::self_system::evolution::record::{
+        Actor, AnnotationSource, DecisionType, MemoryAction, Outcome, TaskType,
+    };
+    use chrono::Duration as ChronoDuration;
+    use tempfile::TempDir;
+
+    /// Build a minimal `Config` whose workspace points into `tmp`. The default
+    /// autonomy level is `Supervised` with `require_approval_for_medium_risk`,
+    /// which is exactly the policy that must DENY a manual evolution trigger.
+    fn supervised_config(tmp: &TempDir) -> Config {
+        let config = Config {
+            workspace_dir: tmp.path().join("workspace"),
+            config_path: tmp.path().join("config.toml"),
+            ..Config::default()
+        };
+        std::fs::create_dir_all(&config.workspace_dir).expect("test: create workspace dir");
+        config
+    }
+
+    /// Seed decision + memory-access logs into the same storage root the manual
+    /// trigger resolves, so the analyzer deterministically produces a candidate
+    /// and the pipeline actually reaches the side-effect gate.
+    async fn seed_candidate_inputs(storage_root: &Path, now: DateTime<Utc>) {
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.to_path_buf()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .expect("test: build writer"),
+        );
+        for offset in 0..3 {
+            let ts = (now - ChronoDuration::days(offset)).to_rfc3339();
+            writer
+                .append_decision(&DecisionLog {
+                    timestamp: ts.clone(),
+                    experiment_id: "exp-seed".to_string(),
+                    trace_id: "trace-seed".to_string(),
+                    decision_type: DecisionType::ToolSelection,
+                    task_type: TaskType::ToolCall,
+                    risk_level: 1,
+                    actor: Actor::Agent,
+                    input_context: "ctx".to_string(),
+                    action_taken: "act".to_string(),
+                    outcome: Outcome::Failure,
+                    tokens_used: 1,
+                    latency_ms: 1,
+                    user_correction: Some("please do X instead".to_string()),
+                    config_snapshot_hash: "cfg".to_string(),
+                })
+                .await
+                .expect("test: append decision");
+            writer
+                .append_memory_access(&MemoryAccessLog {
+                    timestamp: ts,
+                    experiment_id: "exp-seed".to_string(),
+                    trace_id: "trace-seed".to_string(),
+                    action: MemoryAction::Read,
+                    memory_id: "m1".to_string(),
+                    task_context: "ctx".to_string(),
+                    task_type: TaskType::ToolCall,
+                    actor: Actor::Agent,
+                    was_useful: Some(false),
+                    useful_annotation_source: Some(AnnotationSource::AutoEvaluator),
+                    annotation_confidence: Some(0.8),
+                    tokens_consumed: 1,
+                })
+                .await
+                .expect("test: append memory access");
+        }
+        writer.flush().await.expect("test: flush writer");
+    }
+
+    /// Count evolution JSONL lines written under `storage_root/evolution/*`.
+    /// FIX-P0-40: a denied manual trigger must leave this at zero.
+    async fn evolution_log_lines(storage_root: &Path) -> usize {
+        let evo_root = storage_root.join("evolution");
+        let mut lines = 0usize;
+        for tier in ["hot", "warm", "cold"] {
+            let tier_dir = evo_root.join(tier);
+            if let Ok(mut rd) = fs::read_dir(&tier_dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    if entry.path().extension().and_then(|v| v.to_str()) == Some("jsonl") {
+                        let raw = fs::read_to_string(entry.path()).await.unwrap_or_default();
+                        lines += raw.lines().filter(|line| !line.trim().is_empty()).count();
+                    }
+                }
+            }
+        }
+        lines
+    }
+
+    /// FIX-P0-40 (manual path, hard acceptance): `prx evolution trigger` under the
+    /// default Supervised autonomy must be DENIED by the side-effect gate, return a
+    /// non-zero (Err) result, and never append an evolution log to disk. This
+    /// proves the manual entry point is gated identically to the daemon scheduler
+    /// and cannot bypass the autonomy gate.
+    #[tokio::test]
+    async fn manual_trigger_supervised_is_denied_and_writes_nothing() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let config = supervised_config(&tmp);
+
+        // The manual trigger resolves storage as workspace_dir/<runtime.storage_dir>
+        // (default "self/evolution"). Seed inputs there so a candidate is produced.
+        let storage_root = config.workspace_dir.join("self/evolution");
+        let now = Utc::now();
+        seed_candidate_inputs(&storage_root, now).await;
+
+        // Pre-compute digests so the three-day trend yields a candidate.
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .expect("test: writer"),
+        );
+        let analyzer = EvolutionAnalyzer::new(writer, storage_root.join("analysis"));
+        for offset in (0..3).rev() {
+            let _ = analyzer.generate_daily_digest(now - ChronoDuration::days(offset)).await;
+        }
+
+        // Sanity: default autonomy is Supervised (the gating policy under test).
+        assert_eq!(
+            config.autonomy.level,
+            crate::security::AutonomyLevel::Supervised,
+            "test relies on default Supervised autonomy"
+        );
+
+        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L1)).await;
+
+        // The manual trigger must fail (non-zero exit) because the gate denied it.
+        let err = result.expect_err("supervised manual trigger must be denied by the side-effect gate");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("side-effect gate") || msg.contains("blocked"),
+            "deny error must explain the gate blocked the trigger: {msg}"
+        );
+
+        // Fail-closed: no evolution log line may have been written.
+        assert_eq!(
+            evolution_log_lines(&storage_root).await,
+            0,
+            "a denied manual trigger must not append any evolution log line"
+        );
+    }
+
+    /// FIX-P0-40: with the gate disabled (autonomy `Full`), the same manual
+    /// trigger is allowed to proceed (it returns Ok), proving the deny in the test
+    /// above is caused by the gate and not by a setup error that fails every path.
+    #[tokio::test]
+    async fn manual_trigger_full_autonomy_is_allowed() {
+        let tmp = TempDir::new().expect("test: tempdir");
+        let mut config = supervised_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+
+        let storage_root = config.workspace_dir.join("self/evolution");
+        let now = Utc::now();
+        seed_candidate_inputs(&storage_root, now).await;
+
+        let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L1)).await;
+
+        // Full autonomy does not gate medium-risk commits, so the trigger runs to
+        // completion (Ok) regardless of whether a candidate was ultimately applied.
+        assert!(
+            result.is_ok(),
+            "Full autonomy must not be blocked by the side-effect gate: {:?}",
+            result.err()
+        );
+    }
 }

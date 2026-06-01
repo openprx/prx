@@ -50,6 +50,11 @@ pub struct PipelineRunReport {
     pub evolution_log: Option<EvolutionLog>,
     pub shadow_mode: bool,
     pub rolled_back: bool,
+    /// FIX-P0-40: `true` when the side-effect gate denied this layer's commit and
+    /// the engine was therefore never executed (no config/strategy/prompt write,
+    /// no `append_evolution`). Lets the scheduler/daemon distinguish "completed"
+    /// from "skipped by gate" instead of treating a denial as a silent success.
+    pub gate_denied: bool,
     pub errors: Vec<String>,
 }
 
@@ -127,10 +132,16 @@ impl EvolutionPipeline {
 
     /// FIX-P0-40: enforce the side-effect gate for an evolution commit.
     ///
-    /// The operation id encodes the layer and experiment so the audit trail
-    /// records exactly which self-modification was authorized. When no policy is
-    /// installed this is a no-op (preserving legacy behaviour).
-    fn authorize_commit(&self, layer: &EvolutionLayer, experiment_id: &str) -> Result<()> {
+    /// Called *before* the layer engine executes, because the engines perform
+    /// their target-file write and `append_evolution` inside `run_cycle`; gating
+    /// afterwards would let those writes escape. The operation id encodes the
+    /// layer and experiment so the audit trail records exactly which
+    /// self-modification was authorized. When no policy is installed this is a
+    /// no-op (preserving legacy behaviour). On denial the gate's rejection reason
+    /// is returned as `Err(reason)` so the caller can record a structured
+    /// [`GateRejection`], skip the engine entirely (fail-closed), and continue the
+    /// scheduler tick instead of aborting on an error.
+    fn authorize_commit(&self, layer: &EvolutionLayer, experiment_id: &str) -> Result<(), String> {
         let Some(policy) = self.security_policy.as_ref() else {
             return Ok(());
         };
@@ -138,8 +149,7 @@ impl EvolutionPipeline {
         let operation = format!("evolution:{layer_name}:{experiment_id}");
         SideEffectGate::new(policy.as_ref())
             .authorize_resource_operation("evolution", &operation, ResourceRiskLevel::Medium, None)
-            .map_err(|reason| anyhow::anyhow!("evolution commit blocked by side-effect gate: {reason}"))?;
-        Ok(())
+            .map(|_| ())
     }
 
     /// Execute one pipeline pass for a specific layer and trigger source.
@@ -153,6 +163,16 @@ impl EvolutionPipeline {
         let experiment_id = generate_experiment_id();
         let mut errors = Vec::new();
 
+        // FIX-P0-40 (LOW): `generate_daily_digest` persists a daily digest to the
+        // analysis directory *before* the side-effect gate runs. This is
+        // intentional and deliberately NOT gated: the digest is a read-only
+        // analysis/statistics artifact (aggregated success rate, token averages,
+        // metric-shift alerts computed from already-recorded decision/memory logs).
+        // It is the *input* the pipeline reads to decide whether an evolution
+        // should happen — not an evolution self-modification. It never writes
+        // config/strategy/prompt files and never calls `append_evolution`, so it is
+        // outside the autonomy gate's scope and cannot be abused to apply a
+        // self-modification. Only the engine commit below is gated.
         let digest = self.analyzer.generate_daily_digest(now).await?;
         let trend = match self.analyzer.generate_three_day_trend(now.date_naive()).await {
             Ok(item) => item,
@@ -200,6 +220,7 @@ impl EvolutionPipeline {
                 evolution_log: None,
                 shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
                 rolled_back: false,
+                gate_denied: false,
                 errors,
             });
         }
@@ -218,9 +239,45 @@ impl EvolutionPipeline {
                 evolution_log: None,
                 shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
                 rolled_back: false,
+                gate_denied: false,
                 errors,
             });
         };
+
+        // FIX-P0-40 (fail-closed): authorize the self-modification through the
+        // side-effect gate *before* the engine runs. The layer engines write their
+        // target file (config/strategy/prompt) and `append_evolution` *inside*
+        // `run_engine_cycle`, so gating after the engine would let those writes
+        // escape. Denying here means the engine is never invoked and no write of
+        // any kind occurs — the only correct interpretation of "fail-closed".
+        if let Err(reason) = self.authorize_commit(&layer, &experiment_id) {
+            tracing::warn!(
+                layer = ?layer,
+                experiment_id = %experiment_id,
+                reason = %reason,
+                "evolution commit blocked by side-effect gate; engine skipped, no write performed"
+            );
+            gate_rejections.push(GateRejection {
+                reason: "side_effect_gate_denied".to_string(),
+                details: reason,
+            });
+            return Ok(PipelineRunReport {
+                experiment_id,
+                layer,
+                trigger,
+                digest,
+                trend,
+                selected_candidate: Some(selected_candidate),
+                gate_rejections,
+                judge_result: None,
+                evolution_log: None,
+                shadow_mode: self.shared_config.load_full().runtime.mode.is_proposal_only(),
+                rolled_back: false,
+                gate_denied: true,
+                errors,
+            });
+        }
+
         let cycle_result = run_engine_cycle(engine, experiment_id.clone(), vec![selected_candidate.clone()]).await?;
 
         let mut evolution_log = cycle_result.evolution_log.clone().unwrap_or_else(|| {
@@ -263,12 +320,10 @@ impl EvolutionPipeline {
             });
         }
 
-        // FIX-P0-40: gate the real mutation point. The evolution log is the
-        // committed record of a self-modification; it must pass the side-effect
-        // gate before being persisted. A denial aborts the commit (fail-closed)
-        // and surfaces the reason to the caller / scheduler.
-        self.authorize_commit(&layer, &experiment_id)?;
-
+        // FIX-P0-40: the side-effect gate has already authorized this commit
+        // *before* the engine ran (see the fail-closed check above). The engine's
+        // own writes and this pipeline-level audit append therefore only happen on
+        // an allow decision; a denial returned early and never reached here.
         self.writer.append_evolution(&evolution_log).await?;
         if let Err(err) = self.backfill_results(now).await {
             tracing::warn!(error = %err, "failed to backfill evolution results");
@@ -286,6 +341,7 @@ impl EvolutionPipeline {
             evolution_log: Some(evolution_log),
             shadow_mode: cycle_result.shadow_mode,
             rolled_back,
+            gate_denied: false,
             errors,
         })
     }
@@ -663,6 +719,183 @@ mod tests {
         }
     }
 
+    /// FIX-P0-40 fail-closed spy: an engine that records whether it was invoked
+    /// and writes a sentinel file the instant its `run_cycle` runs. Used to prove
+    /// that a side-effect gate denial prevents the engine (and therefore every
+    /// engine-internal write: config/strategy/prompt file + append_evolution)
+    /// from ever executing.
+    struct WriteSpyEngine {
+        invoked: Arc<std::sync::atomic::AtomicBool>,
+        sentinel_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl EvolutionEngine for WriteSpyEngine {
+        fn name(&self) -> &'static str {
+            "write_spy"
+        }
+
+        fn layer(&self) -> EvolutionLayer {
+            EvolutionLayer::Memory
+        }
+
+        async fn run_cycle(&mut self, input: EngineCycleInput) -> Result<CycleResult> {
+            // Mark invocation and emulate an engine that writes to disk during its
+            // cycle (exactly the behaviour the gate must prevent on denial).
+            self.invoked.store(true, std::sync::atomic::Ordering::SeqCst);
+            fs::write(&self.sentinel_path, b"engine wrote this").await?;
+            let mut engine = MockEngine;
+            engine.run_cycle(input).await
+        }
+    }
+
+    /// FIX-P0-40 (hard acceptance): under a Supervised policy with no runtime
+    /// grant, the side-effect gate must DENY the evolution commit *before* the
+    /// engine runs. Verifies the engine is never invoked, no sentinel file is
+    /// written, no evolution JSONL is appended, and the report flags `gate_denied`.
+    #[tokio::test]
+    async fn gate_denied_blocks_engine_and_all_writes() {
+        let dir = tempdir().unwrap();
+        let storage_root = dir.path().join("logs");
+        let writer = Arc::new(
+            AsyncJsonlWriter::new(
+                JsonlStoragePaths::new(storage_root.clone()),
+                JsonlRetentionPolicy::default(),
+                1,
+            )
+            .await
+            .unwrap(),
+        );
+
+        // Seed analyzer inputs so a candidate is produced and the pipeline reaches
+        // the gate (otherwise it would early-return before authorize_commit).
+        let now = Utc::now();
+        for offset in 0..3 {
+            let ts = (now - chrono::Duration::days(offset)).to_rfc3339();
+            writer
+                .append_decision(&crate::self_system::evolution::record::DecisionLog {
+                    timestamp: ts.clone(),
+                    experiment_id: "exp-seed".to_string(),
+                    trace_id: "trace-seed".to_string(),
+                    decision_type: DecisionType::ToolSelection,
+                    task_type: TaskType::ToolCall,
+                    risk_level: 1,
+                    actor: Actor::Agent,
+                    input_context: "ctx".to_string(),
+                    action_taken: "act".to_string(),
+                    outcome: Outcome::Failure,
+                    tokens_used: 1,
+                    latency_ms: 1,
+                    user_correction: Some("please do X instead".to_string()),
+                    config_snapshot_hash: "cfg".to_string(),
+                })
+                .await
+                .unwrap();
+            writer
+                .append_memory_access(&crate::self_system::evolution::record::MemoryAccessLog {
+                    timestamp: ts,
+                    experiment_id: "exp-seed".to_string(),
+                    trace_id: "trace-seed".to_string(),
+                    action: MemoryAction::Read,
+                    memory_id: "m1".to_string(),
+                    task_context: "ctx".to_string(),
+                    task_type: TaskType::ToolCall,
+                    actor: Actor::Agent,
+                    was_useful: Some(false),
+                    useful_annotation_source: Some(AnnotationSource::AutoEvaluator),
+                    annotation_confidence: Some(0.8),
+                    tokens_consumed: 1,
+                })
+                .await
+                .unwrap();
+        }
+        writer.flush().await.unwrap();
+
+        let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), dir.path().join("analysis")));
+        let mut cfg = EvolutionConfig::default();
+        cfg.runtime.mode = EvolutionMode::Auto;
+        cfg.runtime.storage_dir = storage_root.to_string_lossy().to_string();
+        let shared = new_shared_evolution_config(cfg);
+
+        for offset in (0..3).rev() {
+            let _ = analyzer
+                .generate_daily_digest(now - chrono::Duration::days(offset))
+                .await;
+        }
+
+        // Supervised + require_approval_for_medium_risk (the default) denies a
+        // Medium-risk evolution commit when no runtime grant is present.
+        let policy = Arc::new(SecurityPolicy {
+            workspace_dir: dir.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let pipeline =
+            EvolutionPipeline::new(shared, analyzer, writer.clone(), dir.path()).with_security_policy(policy);
+
+        let invoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sentinel_path = dir.path().join("engine_sentinel.txt");
+        let mut engine = WriteSpyEngine {
+            invoked: Arc::clone(&invoked),
+            sentinel_path: sentinel_path.clone(),
+        };
+
+        let report = pipeline
+            .run_for_layer(EvolutionTrigger::CronTick, EvolutionLayer::Memory, &mut engine, now)
+            .await
+            .unwrap();
+
+        // The seeded analyzer inputs (a declining task with user corrections over
+        // three days) deterministically produce a candidate that passes the
+        // evolution gate, so the pipeline reaches the side-effect gate. Assert it
+        // so a regression in candidate generation can never silently turn this
+        // fail-closed test into a no-op.
+        assert!(
+            report.selected_candidate.is_some(),
+            "test setup must produce a candidate so the side-effect gate is actually exercised"
+        );
+
+        // Hard acceptance criteria for FIX-P0-40 fail-closed behaviour:
+        assert!(report.gate_denied, "report must flag gate_denied on a deny decision");
+        assert!(
+            report.evolution_log.is_none(),
+            "no evolution_log may be committed on deny"
+        );
+        assert!(
+            !invoked.load(std::sync::atomic::Ordering::SeqCst),
+            "engine run_cycle MUST NOT run when the gate denies the commit"
+        );
+        assert!(
+            !sentinel_path.exists(),
+            "engine must not write any file when the gate denies the commit"
+        );
+        // No evolution JSONL was appended by the pipeline either.
+        let evo_root = storage_root.join("evolution");
+        let mut appended = false;
+        for tier in ["hot", "warm", "cold"] {
+            let tier_dir = evo_root.join(tier);
+            if let Ok(mut rd) = fs::read_dir(&tier_dir).await {
+                while let Ok(Some(entry)) = rd.next_entry().await {
+                    if entry.path().extension().and_then(|v| v.to_str()) == Some("jsonl") {
+                        let raw = fs::read_to_string(entry.path()).await.unwrap_or_default();
+                        if !raw.trim().is_empty() {
+                            appended = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(!appended, "no evolution log line may be appended on a gate deny");
+
+        // Structured gate rejection is recorded for observability.
+        assert!(
+            report
+                .gate_rejections
+                .iter()
+                .any(|rejection| rejection.reason == "side_effect_gate_denied"),
+            "a structured side_effect_gate_denied rejection must be recorded"
+        );
+    }
+
     #[tokio::test]
     async fn pipeline_selects_top_candidate_and_propagates_experiment_id() {
         let dir = tempdir().unwrap();
@@ -820,10 +1053,15 @@ mod tests {
         // Medium-risk evolution commit with no runtime grant is denied.
         let policy = Arc::new(SecurityPolicy::default());
         let pipeline = gated_pipeline(dir.path(), policy).await;
-        let err = pipeline
+        let reason = pipeline
             .authorize_commit(&EvolutionLayer::Prompt, "exp-blocked")
             .expect_err("supervised policy must block ungranted evolution commit");
-        assert!(err.to_string().contains("side-effect gate"), "{err}");
+        // The raw gate deny reason is surfaced so the caller can record it as a
+        // structured GateRejection detail.
+        assert!(
+            reason.contains("requires runtime approval grant"),
+            "unexpected deny reason: {reason}"
+        );
     }
 
     #[tokio::test]

@@ -207,10 +207,11 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                         })?;
                     // FIX-P1-03: pass the security policy so the standalone webhook
                     // server gates topic-store persistence on autonomy (ReadOnly = no write).
-                    let webhook_security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
-                        &cfg.autonomy,
-                        &cfg.workspace_dir,
-                    ));
+                    let webhook_security = std::sync::Arc::new(
+                        crate::security::SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir)
+                            // FIX-P1-31: honour the configured `security.audit` block.
+                            .with_audit_config(cfg.security.audit.clone()),
+                    );
                     crate::webhook::run(
                         &cfg.webhook.bind,
                         token,
@@ -474,11 +475,17 @@ async fn run_evolution_scheduler_worker(config: Config) -> Result<()> {
         match scheduler.run_scheduled(Utc::now()).await {
             Ok(summary) => {
                 if summary.digest_ran || summary.cycle_ran {
+                    // FIX-P0-40: report how many layers were skipped by the
+                    // side-effect gate so a "completed" tick that applied nothing
+                    // (because autonomy denied every self-modification) is not
+                    // silently indistinguishable from one that applied changes.
+                    let gate_denied = summary.layer_reports.iter().filter(|report| report.gate_denied).count();
                     tracing::info!(
                         target: "self_system",
                         digest_ran = summary.digest_ran,
                         cycle_ran = summary.cycle_ran,
                         layer_reports = summary.layer_reports.len(),
+                        gate_denied,
                         "evolution scheduler tick completed"
                     );
                 }
@@ -516,7 +523,27 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
         .await?,
     );
     let analyzer = Arc::new(EvolutionAnalyzer::new(writer.clone(), storage_root.join("analysis")));
-    let pipeline = EvolutionPipeline::new(shared.clone(), analyzer.clone(), writer.clone(), &config.workspace_dir);
+
+    // FIX-P1-10: the production scheduler judges evolution cycles with a real
+    // LLM-backed `ModelJudge` (falling back to the deterministic mock only when
+    // no provider can be initialized) instead of always using `MockJudgeModel`.
+    let judge_model = build_evolution_judge_model(config);
+    // FIX-P0-40: the autonomous evolution pipeline must pass every commit through
+    // the same `SideEffectGate` as tool execution. Build the runtime security
+    // policy from config (honouring `security.audit`, FIX-P1-31) and install it on
+    // the pipeline so an evolution self-modification is gated by autonomy.
+    let security_policy = Arc::new(
+        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
+    let pipeline = EvolutionPipeline::with_judge_model(
+        shared.clone(),
+        analyzer.clone(),
+        writer.clone(),
+        &config.workspace_dir,
+        judge_model,
+    )
+    .with_security_policy(security_policy);
 
     let memory_engine = Box::new(
         MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
@@ -543,6 +570,70 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     );
 
     Ok((scheduler, u64::from(config.self_system.evolution_interval_hours.max(1))))
+}
+
+/// Health component name reporting whether evolution judging runs on a real
+/// LLM judge or has degraded to the deterministic mock judge (FIX-P1-10).
+const EVOLUTION_JUDGE_COMPONENT: &str = "evolution_judge";
+
+/// FIX-P1-10: build the scoring model used to judge evolution cycles.
+///
+/// The production path prefers a real LLM-backed [`ModelJudge`] driven by the
+/// configured default provider. Constructing a provider can fail (missing
+/// credentials, unavailable backend); in that case we fall back to the
+/// deterministic [`MockJudgeModel`] so a credential gap degrades judging quality
+/// rather than disabling the evolution scheduler entirely.
+///
+/// The degradation is made observable rather than silent: it is logged at WARN
+/// with an explicit "DEGRADED mock mode" message and recorded on the
+/// [`EVOLUTION_JUDGE_COMPONENT`] health component (error when degraded, ok when a
+/// real judge is wired) so the daemon health surface reflects it.
+fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::evolution::judge::JudgeScoringModel> {
+    use crate::self_system::evolution::judge::{MockJudgeModel, ModelJudge};
+
+    let provider_name = config
+        .default_provider
+        .clone()
+        .unwrap_or_else(|| "openrouter".to_string());
+    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
+        auth_profile_override: None,
+        openprx_dir: config.config_path.parent().map(PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
+    };
+
+    match crate::providers::create_resilient_provider_with_options(
+        &provider_name,
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &provider_runtime_options,
+    ) {
+        Ok(provider) => {
+            let provider: Arc<dyn crate::providers::traits::Provider> = Arc::from(provider);
+            crate::health::mark_component_ok(EVOLUTION_JUDGE_COMPONENT);
+            Arc::new(ModelJudge::new(provider))
+        }
+        Err(error) => {
+            crate::health::mark_component_error(
+                EVOLUTION_JUDGE_COMPONENT,
+                format!("provider '{provider_name}' unavailable: {error}"),
+            );
+            tracing::warn!(
+                target: "self_system",
+                provider = %provider_name,
+                error = %error,
+                judge_degraded = true,
+                "evolution judging running in DEGRADED mock mode: provider unavailable, \
+                 quality scores are deterministic placeholders, not real LLM judgments"
+            );
+            Arc::new(MockJudgeModel)
+        }
+    }
 }
 
 async fn load_evolution_config(config: &Config) -> Result<(EvolutionConfig, PathBuf)> {

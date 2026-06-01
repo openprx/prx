@@ -430,7 +430,11 @@ fn validate_worker_cli_overrides(
 async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
     let mut config = Config::load_or_init_with_config_dir(explicit_config_dir).await?;
     config.workspace_dir = manifest.workspace_dir.clone();
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &manifest.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
 
     let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
         auth_profile_override: None,

@@ -4398,7 +4398,11 @@ pub async fn run(
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
@@ -5006,7 +5010,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
         &config.memory,
         &config.embedding_routes,

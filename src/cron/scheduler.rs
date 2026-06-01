@@ -24,7 +24,11 @@ pub async fn run(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 
@@ -70,7 +74,9 @@ pub async fn execute_job_now_with_runtime_approval_for_tool(
     tool_name: &str,
     approval_grant: Option<ApprovalGrant>,
 ) -> (bool, String) {
-    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+        .with_audit_config(config.security.audit.clone());
     execute_job_with_retry(config, &security, job, tool_name, approval_grant.as_ref()).await
 }
 
