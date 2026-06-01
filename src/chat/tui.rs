@@ -1374,7 +1374,14 @@ pub fn estimate_message_height(width: u16, line: &ConversationLine, ascii: bool)
     let safe_width = width.max(1);
     let mut sink: Vec<Line<'_>> = Vec::new();
     render_conversation_line(&mut sink, line, ascii);
-    let wrapped = wrapped_rows_for_lines(&sink, safe_width);
+    // `render_message_for_insert` paints this `sink` with ratatui's
+    // word-aware wrapping (`Wrap { trim: false }`). The char-count
+    // `wrapped_rows_for_lines` is only an approximation and can UNDER-count
+    // (a word that does not fit is pushed to the next row), which would make
+    // `insert_before` reserve too few rows and clip the tail of the message
+    // in scrollback (chat-demo defect #1). Measure the exact wrapped height
+    // so finalized messages are never truncated.
+    let wrapped = measure_wrapped_rows(&sink, safe_width);
     wrapped.max(estimate_line_height(line)).max(1)
 }
 
@@ -1622,15 +1629,36 @@ fn render_streaming_preview<V: BottomChromeView + ?Sized>(frame: &mut Frame, are
     let Some(draft) = state.streaming() else {
         return;
     };
-    let transient = ConversationLine::StreamingAssistant {
-        content: draft.accumulated.clone(),
-    };
-    let mut sink: Vec<Line<'_>> = Vec::new();
-    render_conversation_line(&mut sink, &transient, state.ascii_fallback());
+    let ascii = state.ascii_fallback();
 
-    // If the streaming body wraps beyond `area.height`, scroll the
-    // Paragraph so the trailing rows (newest tokens) are visible.
-    let total_rows: u16 = wrapped_rows_for_lines(&sink, area.width);
+    // Build the preview body directly (no trailing blank separator): the
+    // separator that `render_conversation_line` appends after a finalised
+    // message would waste one of the few preview rows and, once we scroll
+    // to the bottom, push the newest tokens off-screen.
+    let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
+    let mut body_lines: Vec<&str> = draft.accumulated.lines().collect();
+    if draft.accumulated.is_empty() || draft.accumulated.ends_with('\n') {
+        // `str::lines` drops a trailing empty segment; keep the cursor on a
+        // fresh row when the buffer ends on a newline (or is still empty).
+        body_lines.push("");
+    }
+    let last_idx = body_lines.len().saturating_sub(1);
+    let mut sink: Vec<Line<'_>> = Vec::with_capacity(body_lines.len());
+    for (i, text_line) in body_lines.iter().enumerate() {
+        if i == last_idx {
+            sink.push(Line::from(format!("{text_line}{cursor}")));
+        } else {
+            sink.push(Line::from((*text_line).to_string()));
+        }
+    }
+
+    // The Paragraph below renders with ratatui's word-aware wrapping
+    // (`Wrap { trim: false }`). The char-count `wrapped_rows_for_lines`
+    // estimate over-counts versus that word-wrap, so using it for the
+    // scroll offset over-scrolls and clips the newest tokens. Measure the
+    // real wrapped height via ratatui itself so the scroll keeps the
+    // trailing rows visible.
+    let total_rows: u16 = measure_wrapped_rows(&sink, area.width);
     let scroll: u16 = total_rows.saturating_sub(area.height);
 
     let widget = Paragraph::new(Text::from(sink))
@@ -1638,6 +1666,59 @@ fn render_streaming_preview<V: BottomChromeView + ?Sized>(frame: &mut Frame, are
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     frame.render_widget(widget, area);
+}
+
+/// Count the exact number of rows ratatui's word-wrapping
+/// (`Wrap { trim: false }`) needs to render `lines` at `width`.
+///
+/// [`wrapped_rows_for_lines`] divides display width by terminal width and
+/// is therefore only an *upper bound* — ratatui breaks at word boundaries,
+/// so the real row count is usually smaller. The streaming preview scroll
+/// must use the real count (not the upper bound), otherwise it scrolls past
+/// the newest tokens. We obtain the ground truth by rendering into an
+/// off-screen scratch [`Buffer`] sized to the safe upper bound (so nothing
+/// is clipped) and reading back the populated height.
+fn measure_wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
+    let w = width.max(1);
+    // Word-wrapping (`trim: false`) can produce MORE rows than the
+    // char-count estimate: breaking before a word that does not fit pushes
+    // it to the next row, wasting trailing columns. A guaranteed upper bound
+    // is therefore the char estimate PLUS one extra row per source line (the
+    // worst case is each line losing up to a full row to word boundaries),
+    // with a small constant margin so the scratch buffer never clips.
+    let char_rows = usize::from(wrapped_rows_for_lines(lines, w));
+    let cap = u16::try_from(char_rows.saturating_add(lines.len()).saturating_add(2))
+        .unwrap_or(u16::MAX)
+        .max(1);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: w,
+        height: cap,
+    };
+    let mut buf = Buffer::empty(area);
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .render(area, &mut buf);
+    // The highest row index that received any non-space cell is the last
+    // visible content row; rows below it are unused padding from the upper
+    // bound. `+1` converts the index into a row count.
+    let mut used: u16 = 0;
+    for y in 0..cap {
+        let mut populated = false;
+        for x in 0..w {
+            if let Some(cell) = buf.cell((x, y)) {
+                if !cell.symbol().trim().is_empty() {
+                    populated = true;
+                    break;
+                }
+            }
+        }
+        if populated {
+            used = y.saturating_add(1);
+        }
+    }
+    used.max(1)
 }
 
 /// Render a single conversation line into the ratatui `lines` buffer.
@@ -3671,6 +3752,93 @@ mod tests {
         );
         // Floor of 2 rows: content row + trailing blank separator.
         assert!(wide >= 2, "user message always needs at least content + blank");
+    }
+
+    #[test]
+    fn measure_wrapped_rows_matches_ratatui_wordwrap() {
+        // `measure_wrapped_rows` must return the EXACT number of rows
+        // ratatui's word-wrapping produces (not the char-count upper bound
+        // from `wrapped_rows_for_lines`). The streaming-preview scroll math
+        // depends on this: an over-count scrolls past the newest tokens and
+        // leaves the visible body truncated (chat-demo defect #1).
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let samples = [
+            "I am a lightweight AI assistant built with Rust that can help you run terminal commands, read and write files, and manage projects.",
+            "你好，我是一个用 Rust 构建的轻量级 AI 助手，能帮你执行终端命令、读写文件、管理项目。",
+            "short",
+            "a b c d e f g h i j k l m n o p q r s t u v w x y z one two three",
+        ];
+        for s in samples {
+            let lines = vec![Line::from(s.to_string())];
+            for width in [20u16, 40, 80, 191] {
+                let measured = measure_wrapped_rows(&lines, width);
+                // Ground truth: render at a generous height and read back the
+                // last populated row.
+                let area = Rect {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height: 64,
+                };
+                let mut buf = Buffer::empty(area);
+                Paragraph::new(Text::from(lines.clone()))
+                    .wrap(Wrap { trim: false })
+                    .render(area, &mut buf);
+                let mut actual = 0u16;
+                for y in 0..area.height {
+                    for x in 0..width {
+                        if let Some(c) = buf.cell((x, y)) {
+                            if !c.symbol().trim().is_empty() {
+                                actual = y + 1;
+                                break;
+                            }
+                        }
+                    }
+                }
+                let actual = actual.max(1);
+                assert_eq!(
+                    measured, actual,
+                    "measure_wrapped_rows({width}) on {s:?}: got {measured}, ratatui rendered {actual}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_preview_scroll_keeps_tail_visible() {
+        // Regression for chat-demo defect #1: a streaming body longer than
+        // the preview window must scroll so the LAST rows (newest tokens)
+        // are the ones rendered. We assert the scroll offset derived from
+        // `measure_wrapped_rows` lands the tail inside the window.
+        let body: String = (0..30).map(|i| format!("line number {i}\n")).collect();
+        let cursor = "\u{258C}";
+        let mut body_lines: Vec<&str> = body.lines().collect();
+        if body.ends_with('\n') {
+            body_lines.push("");
+        }
+        let last_idx = body_lines.len().saturating_sub(1);
+        let mut sink: Vec<Line<'_>> = Vec::new();
+        for (i, t) in body_lines.iter().enumerate() {
+            if i == last_idx {
+                sink.push(Line::from(format!("{t}{cursor}")));
+            } else {
+                sink.push(Line::from((*t).to_string()));
+            }
+        }
+        let width = 80u16;
+        let window = STREAMING_VISIBLE_ROWS;
+        let total = measure_wrapped_rows(&sink, width);
+        assert!(total > window, "test setup: body must overflow the window");
+        let scroll = total.saturating_sub(window);
+        // After scrolling, the visible window [scroll, scroll+window) must
+        // include the final content row (total-1, since the trailing cursor
+        // row is the newest output).
+        let last_content_row = total.saturating_sub(1);
+        assert!(
+            (scroll..scroll.saturating_add(window)).contains(&last_content_row),
+            "scroll {scroll} + window {window} must cover last row {last_content_row} of {total}"
+        );
     }
 
     #[test]
