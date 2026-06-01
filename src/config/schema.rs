@@ -4724,6 +4724,26 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Opt-in extra directories to trust for shell tool command execution.
+    ///
+    /// By default the shell tool runs with a hardened PATH
+    /// (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`) and the Landlock backend
+    /// only grants execute access to system paths — this deliberately blocks
+    /// binaries under user-writable directories (CWE-426 untrusted search path).
+    ///
+    /// Listing a directory here is an EXPLICIT trust decision: each entry is
+    /// (a) appended to the shell tool's PATH and (b) added to the Landlock
+    /// read+execute allow-list, so toolchains like `~/.cargo/bin`, `~/.local/bin`,
+    /// or `~/.bun/bin` become usable from the shell tool. Both effects are applied
+    /// together — a PATH entry without the matching sandbox grant would be useless
+    /// (the kernel would still deny exec).
+    ///
+    /// `~` is expanded to the user's home directory. Only list directories you
+    /// trust; entries here weaken the default sandbox for exactly those paths.
+    /// Leaving this empty preserves the hardened default behavior unchanged.
+    #[serde(default)]
+    pub extra_path_dirs: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -4732,6 +4752,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         }
     }
 }

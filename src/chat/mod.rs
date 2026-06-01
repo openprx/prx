@@ -327,6 +327,53 @@ mod fallback_chat_output_tests {
     }
 }
 
+#[cfg(test)]
+mod compact_command_tests {
+    //! Bug #1: `/compact` manual compaction reuses `compact_chat_history`. These
+    //! tests pin the routine the slash command drives so the user-visible turn /
+    //! token delta is meaningful.
+    use super::*;
+
+    fn long_user(seq: usize) -> ChatMessage {
+        // Each turn is well above COMPACT_CONTENT_CHARS so truncation + drop both fire.
+        ChatMessage::user(format!("turn-{seq}-{}", "x".repeat(COMPACT_CONTENT_CHARS * 2)))
+    }
+
+    #[test]
+    fn compact_drops_old_turns_beyond_keep_window() {
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..(COMPACT_KEEP_MESSAGES + 6) {
+            history.push(long_user(i));
+        }
+        let turns_before = history.len() - 1;
+        let tokens_before = estimate_chat_history_tokens(&history);
+
+        compact_chat_history(&mut history);
+
+        let turns_after = history.len() - 1;
+        let tokens_after = estimate_chat_history_tokens(&history);
+
+        // System prompt always preserved at index 0.
+        assert_eq!(history.first().map(|m| m.role.as_str()), Some("system"));
+        // Manual /compact must actually shrink an over-long history.
+        assert!(turns_after < turns_before, "compact should drop old turns");
+        assert!(tokens_after < tokens_before, "compact should reduce token estimate");
+        // Never exceeds the keep window after compaction.
+        assert!(turns_after <= COMPACT_KEEP_MESSAGES, "must respect keep window");
+    }
+
+    #[test]
+    fn compact_is_noop_for_short_history() {
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+        let before = estimate_chat_history_tokens(&history);
+        compact_chat_history(&mut history);
+        let after = estimate_chat_history_tokens(&history);
+        // A 1-turn history is already compact — nothing to drop.
+        assert_eq!(history.len(), 2);
+        assert_eq!(before, after);
+    }
+}
+
 /// Chat 输入路径的运行模式.
 ///
 /// v0.4.1 清理后，terminal TUI 只支持 reducer/driver 单路由。旧的 Off/Both/Redux
@@ -1184,6 +1231,12 @@ pub async fn run(
     #[cfg(feature = "terminal-tui")]
     let model_slot = effect_executor.model_handle();
 
+    // Bug #3: provider 热替换 slot 句柄（同 model_slot 思路）。spawn 前 clone 出来，
+    // `/provider <name>` 时把重建出的新 provider 句柄 set 进去，使后续 turn 的
+    // Redux driver（drive_start_turn_stream）读到新 provider。shadow 模式无 deps → None。
+    #[cfg(feature = "terminal-tui")]
+    let provider_slot = effect_executor.provider_handle();
+
     // Step 5a-4: TurnCompletionSignal — Redux driver 切闸路径用此 signal 在
     // chat::run 主循环里 await turn 完成。dispatcher task 消费 terminal action
     // (StreamCompleted/Failed/Cancelled) 后 notify_waiters，唤醒等待。
@@ -1456,12 +1509,30 @@ pub async fn run(
     // fabric 事件 / snapshot）。初值与启动期解析出的 `model_name` 一致。
     let mut current_model_owned: String = model_name.to_string();
 
+    // Bug #3: 当前生效的 provider 名（owned，可变）。`/provider <name>` 在线切换时
+    // 改写此值；每轮循环顶部借为 `provider_name: &str`，覆盖后续 turn 的 provider 使用点
+    // （system prompt / fabric 事件 / snapshot / legacy run_tool_call_loop）。初值与启动期
+    // 解析出的 `provider_name` 一致。
+    let mut current_provider_owned: String = provider_name.to_string();
+    // Bug #3: 启动期 primary provider 名（owned，不可变）。`/provider` 切换时据此
+    // 判断是否切回原 primary（决定是否复用 `config.api_key`/`config.api_url`）。
+    let original_provider_name: String = provider_name.to_string();
+    // Bug #3: provider 句柄（legacy 路径 run_tool_call_loop 直接 `provider.as_ref()`）。
+    // `/provider <name>` 时用新 provider 重建并替换此 Arc，同步 set 进 provider_slot（Redux 路径）。
+    let mut provider = provider;
+
     // ── Main message loop ────────────────────────────────────────
     while let Some(msg) = tokio::select! {
         msg = input_rx.recv() => msg,
         _ = shutdown.cancelled() => None,
     } {
         let user_input = msg.content.clone();
+
+        // Bug #3: 本轮生效的 provider 名（借自可变 owned 值）。`/provider <name>`
+        // 拦截会改写 `current_provider_owned` + `provider` Arc，下一轮迭代此 shadow
+        // 即指向新 provider 名，覆盖后续所有 `provider_name` 使用点（含 `/model`
+        // 校验 / system prompt / fabric / legacy run_tool_call_loop）。
+        let provider_name: &str = current_provider_owned.as_str();
 
         // Step 5b 双写：每条用户输入入 dispatcher（shadow 观察 reducer）。
         // InputSubmitted 仅记 UI/LogTrace；RecordUserTurn 真写 history + session.turns，
@@ -1559,6 +1630,107 @@ pub async fn run(
                 }
                 Err(e) => {
                     emit_chat_output(&format!("Cannot switch to '{new_model}': {e}"));
+                }
+            }
+            continue;
+        }
+
+        // Bug #3: `/provider <name> [model]` — 会话内热切换 provider。
+        //
+        // 与 `/model` 同样在 commands::dispatch 之前拦截，因为生效需要在主循环侧
+        // 重建 provider 实例并改写多处运行时状态：
+        //   (a) 用新 provider 的 auth/base/protocol 重建 `Arc<dyn Provider>`，替换
+        //       legacy `run_tool_call_loop` 直接持有的 `provider` 句柄；
+        //   (b) `set()` 进 `provider_slot`（Redux driver 子任务下一 turn 读到新 provider）；
+        //   (c) 改写 `current_provider_owned`（影响后续 turn 的 system prompt / 事件 /
+        //       snapshot），并校验当前 model 对新 provider 有效（无效则要求随命令带上
+        //       一个兼容 model：`/provider <name> <model>`）。
+        // 凭据解析：切到非启动 primary 的 provider 时传 `api_key=None`/`api_url=None`，
+        // 让 provider 自行从 auth profile / 环境解析其凭据（沿用启动期 `config.api_key`
+        // 只对原 primary 有意义）；切回原 primary 时复用 `config.api_key`/`config.api_url`。
+        if let Some(raw) = user_input.strip_prefix("/provider ") {
+            let mut parts = raw.split_whitespace();
+            // Own the parsed tokens up front so we can freely reassign the runtime
+            // provider/model state below without lingering borrows.
+            let new_provider = parts.next().unwrap_or_default().to_string();
+            let requested_model = parts.next().map(str::to_string);
+            if new_provider.is_empty() {
+                emit_chat_output("Usage: /provider <name> [model]");
+                continue;
+            }
+            // 决定切换后生效的 model：优先用命令显式给的；否则沿用当前 model（若兼容）。
+            let candidate_model = requested_model.unwrap_or_else(|| current_model_owned.clone());
+            if let Err(e) = providers::validate_provider_model(&new_provider, &candidate_model) {
+                emit_chat_output(&format!(
+                    "Cannot switch to provider '{new_provider}': model '{candidate_model}' is incompatible ({e}). \
+Retry with a compatible model: /provider {new_provider} <model>"
+                ));
+                continue;
+            }
+            // 切到非原 primary 的 provider 时，不沿用 primary 的显式凭据/URL，让新 provider
+            // 自行解析（避免把 A provider 的 key 错喂给 B provider）。
+            let is_original_primary = new_provider.eq_ignore_ascii_case(original_provider_name.as_str());
+            let switch_api_key = if is_original_primary {
+                config.api_key.as_deref()
+            } else {
+                None
+            };
+            let switch_api_url = if is_original_primary {
+                config.api_url.as_deref()
+            } else {
+                None
+            };
+            match providers::create_routed_provider_with_options(
+                &new_provider,
+                switch_api_key,
+                switch_api_url,
+                &config.reliability,
+                &config.model_routes,
+                &candidate_model,
+                &provider_runtime_options,
+            ) {
+                Ok(built) => {
+                    let new_provider_arc: Arc<dyn Provider> = Arc::from(built);
+                    // (a) legacy 路径句柄
+                    provider = Arc::clone(&new_provider_arc);
+                    // (b) Redux driver slot
+                    #[cfg(feature = "terminal-tui")]
+                    if let Some(slot) = provider_slot.as_ref() {
+                        slot.set(Arc::clone(&new_provider_arc));
+                    }
+                    // (c) 运行时 provider / model 名
+                    let model_changed = candidate_model != current_model_owned;
+                    if model_changed {
+                        current_model_owned = candidate_model.clone();
+                        #[cfg(feature = "terminal-tui")]
+                        if let Some(slot) = model_slot.as_ref() {
+                            slot.set(Arc::from(candidate_model.as_str()));
+                        }
+                    }
+                    current_provider_owned = new_provider.clone();
+                    // (d) session 账本：dispatch ProviderChanged，reducer 更新
+                    // session.provider（必要时连带 session.model），使 status bar /
+                    // UI snapshot 实时反映新 provider。三处（legacy provider 句柄、
+                    // Redux provider_slot、session 账本）由此保持一致。换 provider 时
+                    // model 若同时变了，一并放进同一个 action（无需单独 ModelChanged）。
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::ProviderChanged {
+                            provider: new_provider.clone(),
+                            model: model_changed.then(|| candidate_model.clone()),
+                        },
+                        "chat.provider_changed",
+                    );
+                    let model_note = if model_changed {
+                        format!(" (model set to {candidate_model})")
+                    } else {
+                        String::new()
+                    };
+                    emit_chat_output(&format!(
+                        "Switched provider to {new_provider}{model_note}. Applies from the next turn."
+                    ));
+                }
+                Err(e) => {
+                    emit_chat_output(&format!("Cannot switch to provider '{new_provider}': {e}"));
                 }
             }
             continue;
@@ -1667,6 +1839,41 @@ pub async fn run(
             {
                 print_fallback_chat_output(&msg);
             }
+            continue;
+        }
+
+        // Bug #1: `/compact` — manually compact the live LLM context history.
+        //
+        // Intercepted here (like `/clear` / `/model`) because it must mutate the
+        // real `history` Vec that feeds `run_tool_call_loop`; `commands::dispatch`
+        // only carries immutable borrows. Reuses the same `compact_chat_history`
+        // routine the context-overflow safeguard runs automatically, so manual and
+        // automatic compaction stay byte-for-byte identical. Reports the turn /
+        // token delta so the user can see the effect on the context window.
+        if matches!(user_input.as_str(), "/compact") {
+            let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+            let turns_before = history.len().saturating_sub(system_count);
+            let tokens_before = estimate_chat_history_tokens(&history);
+            compact_chat_history(&mut history);
+            let turns_after = history.len().saturating_sub(system_count);
+            let tokens_after = estimate_chat_history_tokens(&history);
+
+            // Keep the Redux UI mirror in sync (manual trigger reason).
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::HistoryCompacted {
+                    reason: crate::chat::action::CompactReason::Manual,
+                },
+                "chat.history_compacted_manual",
+            );
+
+            let msg = if turns_before == turns_after && tokens_before == tokens_after {
+                format!("Context already compact: {turns_after} turns / ~{tokens_after} tokens (nothing to drop).")
+            } else {
+                format!(
+                    "Compacted context: {turns_before} → {turns_after} turns, ~{tokens_before} → ~{tokens_after} tokens."
+                )
+            };
+            emit_chat_output(&msg);
             continue;
         }
 

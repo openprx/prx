@@ -612,6 +612,7 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         },
         ..Default::default()
     };
@@ -629,6 +630,7 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         },
         ..Default::default()
     };

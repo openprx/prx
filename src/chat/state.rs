@@ -507,6 +507,17 @@ impl ChatState {
                 self.session.model = Arc::from(model.as_str());
                 vec![Effect::RequestRedraw]
             }
+            Action::ProviderChanged { provider, model } => {
+                // Bug #3: /provider <name> [model] 在线切换。更新 session.provider 让
+                // status bar / snapshot 立刻反映新 provider；若同时换了 model 也一并写
+                // session.model。后续 LLM turn 真切 provider 实例由主循环写 ProviderSlot
+                // 热替换 slot 完成（reducer 不持有 provider，只负责 UI/session 账本）。
+                self.session.provider = Arc::from(provider.as_str());
+                if let Some(model) = model {
+                    self.session.model = Arc::from(model.as_str());
+                }
+                vec![Effect::RequestRedraw]
+            }
             Action::HistoryCleared => self.reduce_history_cleared(),
             Action::HistoryClearedWithNotice { notice } => self.reduce_history_cleared_with_notice(notice),
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
@@ -1779,6 +1790,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::ModeChanged(_) => false,
         // BUG-07: 模型切换写 session.model，status bar 显示该字段 → dirty.
         Action::ModelChanged { .. } => true,
+        // Bug #3: provider 切换写 session.provider（status bar 显示该字段）→ dirty.
+        Action::ProviderChanged { .. } => true,
 
         // 流式 / 工具事件：全部写 stream.draft 或 conversation_lines → dirty
         Action::TurnStarted { .. }
@@ -4200,6 +4213,54 @@ mod tests {
             {
                 let snap = state.build_ui_snapshot(1);
                 assert_eq!(&*snap.model, "anthropic/claude-sonnet-4", "snapshot.model 反映新 model");
+            }
+        }
+
+        /// Bug #3: `ProviderChanged` reducer 更新 `session.provider`，使 status bar
+        /// `state.provider()`（取自 snapshot.provider ← session.provider）立刻反映新
+        /// provider。`model: None` 时不动 session.model。
+        #[test]
+        fn redux_provider_changed_updates_session_provider_only() {
+            let mut state = s();
+            assert_eq!(&*state.session.provider, "openai", "初始 provider");
+            assert_eq!(&*state.session.model, "gpt-4o-mini", "初始 model");
+
+            let effects = state.reduce(Action::ProviderChanged {
+                provider: "openrouter".to_string(),
+                model: None,
+            });
+            assert_eq!(&*state.session.provider, "openrouter", "provider 已切换");
+            assert_eq!(&*state.session.model, "gpt-4o-mini", "model: None 时 model 不变");
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::RequestRedraw)),
+                "ProviderChanged 应请求重绘以刷新 status bar"
+            );
+
+            #[cfg(feature = "terminal-tui")]
+            {
+                let snap = state.build_ui_snapshot(1);
+                assert_eq!(&*snap.provider, "openrouter", "snapshot.provider 反映新 provider");
+            }
+        }
+
+        /// Bug #3: `ProviderChanged` 携带 `model: Some(..)` 时同时同步 session.model
+        /// （切 provider 时显式带了兼容 model 参数的情形）。
+        #[test]
+        fn redux_provider_changed_with_model_updates_both() {
+            let mut state = s();
+            let effects = state.reduce(Action::ProviderChanged {
+                provider: "anthropic".to_string(),
+                model: Some("claude-sonnet-4".to_string()),
+            });
+            assert_eq!(&*state.session.provider, "anthropic", "provider 已切换");
+            assert_eq!(&*state.session.model, "claude-sonnet-4", "model 一并切换");
+            assert!(effects.iter().any(|e| matches!(e, Effect::RequestRedraw)));
+
+            #[cfg(feature = "terminal-tui")]
+            {
+                let snap = state.build_ui_snapshot(1);
+                assert_eq!(&*snap.provider, "anthropic");
+                assert_eq!(&*snap.model, "claude-sonnet-4");
             }
         }
 

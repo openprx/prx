@@ -68,6 +68,14 @@ pub enum Action {
     /// 后续 LLM turn 的 model 由主循环把新值写入 `EffectDeps` 的热替换 slot
     /// （同 provider 换 model）。仅记账 + RequestRedraw，不产生其他副作用。
     ModelChanged { model: String },
+    /// Provider 在线切换（/provider <name> [model]）— Bug #3.
+    ///
+    /// reducer 更新 `session.provider`（必要时连带 `session.model`），让 status bar
+    /// 与会话快照立刻反映新 provider；真正影响后续 LLM turn 的 provider 实例由主循环
+    /// 重建并写入 `ProviderSlot` 热替换 slot 完成（reducer 不持有 provider 实例，故只
+    /// 负责 UI / session 账本）。`model` 为 `Some` 时表示切换同时改了 model（命令带了
+    /// 兼容 model 参数或当前 model 已变），reducer 一并同步 `session.model`。
+    ProviderChanged { provider: String, model: Option<String> },
     /// 清除历史（/clear /new）
     HistoryCleared,
     /// 清除历史并在同一 UI snapshot 中追加用户可见回执。
@@ -227,6 +235,7 @@ impl Action {
             Self::SlashCommandIssued { .. } => "SlashCommandIssued",
             Self::ModeChanged(_) => "ModeChanged",
             Self::ModelChanged { .. } => "ModelChanged",
+            Self::ProviderChanged { .. } => "ProviderChanged",
             Self::HistoryCleared => "HistoryCleared",
             Self::HistoryClearedWithNotice { .. } => "HistoryClearedWithNotice",
             Self::TurnStarted { .. } => "TurnStarted",

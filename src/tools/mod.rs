@@ -282,21 +282,32 @@ pub fn all_tools_with_runtime_ext(
     // Wrap Arc<Config> into a SharedConfig (ArcSwap) for tools that support hot-reload.
     let shared_config: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from(config.clone()));
 
+    // Bug #2 + Bug #3: resolve the opt-in trusted toolchain dirs EXACTLY ONCE and
+    // hand the very same Vec to both consumers — the Landlock sandbox allow-list
+    // and the shell tool's PATH. A single resolution means a config edit can never
+    // land a path in one but not the other (no time-of-check/time-of-use drift).
+    let shell_extra_path_dirs = crate::security::resolve_extra_path_dirs(&root_config.security.sandbox.extra_path_dirs);
+
     // Create a sandbox from the security configuration for shell command isolation.
     // Pass the workspace so the Landlock backend grants it read/write access —
-    // this keeps the shell tool and file_write on a single shared host FS view.
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
-        crate::security::create_sandbox_with_workspace(&root_config.security, Some(workspace_dir));
+    // this keeps the shell tool and file_write on a single shared host FS view —
+    // and the already-resolved extra dirs so the sandbox allow-list matches PATH.
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox_with_workspace_and_dirs(
+        &root_config.security,
+        Some(workspace_dir),
+        &shell_extra_path_dirs,
+    );
 
     let modules = &root_config.modules;
 
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::new(
+        Arc::new(ShellTool::with_extra_path_dirs(
             security.clone(),
             runtime,
             sandbox,
             config.memory.acl_enabled,
+            shell_extra_path_dirs,
         )),
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),

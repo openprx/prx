@@ -463,6 +463,41 @@ impl From<&str> for ModelSlot {
     }
 }
 
+// ─── ProviderSlot (Bug #3: 在线切换 provider) ────────────────────────────────────
+
+/// 热替换的 provider 句柄.
+///
+/// Bug #3: `/provider <name>` 需要在 chat::run 主循环侧重建 provider，而真正读
+/// provider 的 `drive_start_turn_stream` 运行在 spawn 出去的 dispatcher 子任务里
+/// （跨 spawn 边界，`EffectDeps` 已被 move 进 `EffectExecutor`）。与 [`ModelSlot`]
+/// 同构：用 `Arc<RwLock<Arc<dyn Provider>>>` 提供 interior mutability。主循环重建出
+/// 新 provider 后调用 [`Self::set`] 原子替换，子任务每个 turn 起始调用
+/// [`Self::current`] 读到最新句柄。读发生频率为每 turn 一次，RwLock 开销可忽略。
+///
+/// 注意：`provider` 本身被 `Arc` 包裹，clone 仅 Arc bump；替换整个 provider（而非
+/// 仅换 model）是因为不同 provider 的 auth/base-url/protocol 完全不同，必须重建实例。
+#[derive(Clone)]
+pub struct ProviderSlot(Arc<parking_lot::RwLock<Arc<dyn Provider>>>);
+
+impl ProviderSlot {
+    /// 用初始 provider 句柄构造。
+    #[must_use]
+    pub fn new(provider: Arc<dyn Provider>) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(provider)))
+    }
+
+    /// 读当前 provider 句柄。返回 owned `Arc`（clone 仅 Arc bump）供跨 await 持有。
+    #[must_use]
+    pub fn current(&self) -> Arc<dyn Provider> {
+        Arc::clone(&self.0.read())
+    }
+
+    /// 替换 provider 句柄。后续 turn 起始 `current()` 即读到新值。
+    pub fn set(&self, provider: Arc<dyn Provider>) {
+        *self.0.write() = provider;
+    }
+}
+
 // ─── EffectDeps ────────────────────────────────────────────────────────────────
 
 /// EffectExecutor 真业务执行所需依赖.
@@ -535,6 +570,11 @@ pub struct EffectExecutor {
     /// P0-2: 可后注入的 redraw_tx 句柄。spawn 后由 chat::run 填入真实 sender。
     /// real 模式下两者共享同一个 Arc，允许在 dispatcher task 运行期注入。
     redraw_slot: Arc<ParkingMutex<Option<mpsc::Sender<()>>>>,
+    /// Bug #3: real 模式下的 provider 热替换 slot（初值 = `deps.provider`）。
+    /// `chat::run` 通过 `provider_handle()` 取出后在 `/provider <name>` 时 `set()`
+    /// 新句柄，使后续 turn 的 `drive_start_turn_stream` 读到新 provider。
+    /// shadow 模式为 `None`。
+    provider_slot: Option<ProviderSlot>,
 }
 
 impl EffectExecutor {
@@ -546,6 +586,7 @@ impl EffectExecutor {
             shadow_mode: true,
             deps: None,
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
+            provider_slot: None,
         }
     }
 
@@ -553,10 +594,12 @@ impl EffectExecutor {
     #[allow(dead_code)]
     #[must_use]
     pub fn new_with_deps(deps: EffectDeps) -> Self {
+        let provider_slot = Some(ProviderSlot::new(Arc::clone(&deps.provider)));
         Self {
             shadow_mode: false,
             deps: Some(deps),
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
+            provider_slot,
         }
     }
 
@@ -580,6 +623,16 @@ impl EffectExecutor {
     #[must_use]
     pub fn model_handle(&self) -> Option<ModelSlot> {
         self.deps.as_ref().map(|d| d.model.clone())
+    }
+
+    /// Bug #3: 返回 provider 热替换 slot（real 模式独有）.
+    ///
+    /// `chat::run` 用此句柄在 `/provider <name>` 时原子替换 provider 句柄，使后续
+    /// turn 的 `drive_start_turn_stream` 用新 provider 发起请求。shadow 模式返回 None。
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn provider_handle(&self) -> Option<ProviderSlot> {
+        self.provider_slot.clone()
     }
 
     /// **S3 T3-1**: 返回 deps 中的 approval router（real 模式独有）.
@@ -672,7 +725,14 @@ impl EffectExecutor {
                 // 显式 spawn `Effect::StartTurn { ... }` 时生效（如单测 / 5a-3 接线后的
                 // ratatui 路径）。chat::run 主循环仍由 `run_tool_call_loop` 主导（旧路径），
                 // 双写抑制由 `dual_write_guard` 在 reducer 持久化 effect 时已经守住。
-                let provider = Arc::clone(&deps.provider);
+                // Bug #3: prefer the hot-swappable provider slot (updated by
+                // `/provider <name>`); fall back to the construction-time provider
+                // when no slot is present (e.g. shadow construction edge cases).
+                let provider = self
+                    .provider_slot
+                    .as_ref()
+                    .map(ProviderSlot::current)
+                    .unwrap_or_else(|| Arc::clone(&deps.provider));
                 let action_tx = deps.action_tx.clone();
                 let guard_scope = deps.dual_write_guard.enter_scope();
                 // Codex P1 fix：从 deps 拿真实 model + temperature 传给 stream API.
@@ -2379,6 +2439,7 @@ impl StreamChunkCoalescer {
 mod tests {
     use super::*;
     use crate::chat::action::Action;
+    use crate::providers::router::MockEnvProvider;
 
     // ── BUG-07: ModelSlot hot-swap ─────────────────────────────────────
     #[test]
@@ -2400,6 +2461,29 @@ mod tests {
         // real-deps executor returns Some(slot); shadow returns None.
         let shadow = EffectExecutor::new_shadow();
         assert!(shadow.model_handle().is_none(), "shadow has no model slot");
+    }
+
+    // ── Bug #3: ProviderSlot hot-swap ──────────────────────────────────
+    #[test]
+    fn provider_slot_current_reflects_set() {
+        let a: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+        let b: Arc<dyn Provider> = Arc::new(MockEnvProvider::from_env());
+        let slot = ProviderSlot::new(Arc::clone(&a));
+        assert!(Arc::ptr_eq(&slot.current(), &a), "initial provider is observable");
+        // A clone shares the same inner cell (cross-spawn-boundary handle).
+        let handle = slot.clone();
+        handle.set(Arc::clone(&b));
+        assert!(
+            Arc::ptr_eq(&slot.current(), &b),
+            "set via clone is visible through the original handle"
+        );
+    }
+
+    #[test]
+    fn provider_handle_exposes_deps_slot_only_in_real_mode() {
+        // shadow has no provider slot; real-deps construction exposes one.
+        let shadow = EffectExecutor::new_shadow();
+        assert!(shadow.provider_handle().is_none(), "shadow has no provider slot");
     }
 
     #[tokio::test]
