@@ -280,7 +280,10 @@ pub fn all_tools_with_runtime_ext(
     let shared_config: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from(config.clone()));
 
     // Create a sandbox from the security configuration for shell command isolation.
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox(&root_config.security);
+    // Pass the workspace so the Landlock backend grants it read/write access —
+    // this keeps the shell tool and file_write on a single shared host FS view.
+    let sandbox: Arc<dyn crate::security::traits::Sandbox> =
+        crate::security::create_sandbox_with_workspace(&root_config.security, Some(workspace_dir));
 
     let modules = &root_config.modules;
 

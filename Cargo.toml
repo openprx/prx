@@ -220,7 +220,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["channel-matrix", "llm-router", "wasm-plugins"]
+default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")

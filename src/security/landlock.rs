@@ -69,6 +69,7 @@ impl LandlockSandbox {
                     | AccessFs::RemoveDir
                     | AccessFs::RemoveFile
                     | AccessFs::MakeChar
+                    | AccessFs::MakeDir
                     | AccessFs::MakeSock
                     | AccessFs::MakeFifo
                     | AccessFs::MakeBlock
@@ -78,23 +79,36 @@ impl LandlockSandbox {
             .and_then(|ruleset| ruleset.create())
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
-        // Allow workspace directory (read/write)
+        // Allow the workspace directory full filesystem operations. The
+        // workspace is the agent's writable scratch area: shell commands must be
+        // able to CREATE files/dirs and REMOVE them (e.g. `echo > f`, `mkdir`,
+        // `rm`, `git` which writes a whole tree), not merely read/overwrite
+        // existing files. Granting only Read/Write/ReadDir (the previous
+        // behaviour) left `file_write` working but `shell` unable to create any
+        // new file inside the workspace — half of BUG-02's FS breakage.
+        let workspace_access = AccessFs::Execute
+            | AccessFs::ReadFile
+            | AccessFs::WriteFile
+            | AccessFs::ReadDir
+            | AccessFs::RemoveDir
+            | AccessFs::RemoveFile
+            | AccessFs::MakeDir
+            | AccessFs::MakeReg
+            | AccessFs::MakeSym;
         if let Some(workspace) = workspace_dir {
             if workspace.exists() {
                 let workspace_fd = PathFd::new(workspace).map_err(|e| std::io::Error::other(e.to_string()))?;
                 ruleset = ruleset
-                    .add_rule(PathBeneath::new(
-                        workspace_fd,
-                        AccessFs::Execute | AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::ReadDir,
-                    ))
+                    .add_rule(PathBeneath::new(workspace_fd, workspace_access))
                     .map_err(|e| std::io::Error::other(e.to_string()))?;
             }
         }
 
-        // Allow /tmp for general operations
+        // Allow /tmp for general operations (same create/remove rights as the
+        // workspace so temp scratch files behave like a real shell session).
         let tmp_fd = PathFd::new(Path::new("/tmp")).map_err(|e| std::io::Error::other(e.to_string()))?;
         ruleset = ruleset
-            .add_rule(PathBeneath::new(tmp_fd, AccessFs::ReadFile | AccessFs::WriteFile))
+            .add_rule(PathBeneath::new(tmp_fd, workspace_access))
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Allow system executable and library paths for command startup.
@@ -269,6 +283,69 @@ mod tests {
 
         let contents = std::fs::read_to_string(cargo_toml).unwrap();
         assert!(contents.contains("[package]"));
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn landlock_workspace_is_writable_and_shared_with_host() {
+        // BUG-02: under Landlock the shell child must be able to write INSIDE the
+        // workspace (so files are visible to file_read/file_write on the same
+        // host FS), while writes OUTSIDE the workspace are denied. This proves
+        // the FS-unification guarantee the deployment relies on.
+        let tmp = std::env::temp_dir().join(format!("openprx_landlock_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("test: create workspace");
+
+        let Ok(sandbox) = LandlockSandbox::with_workspace(Some(tmp.clone())) else {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return; // kernel without Landlock — skip
+        };
+
+        let sh = if std::path::Path::new("/bin/sh").exists() {
+            "/bin/sh"
+        } else {
+            "/usr/bin/sh"
+        };
+
+        // Write inside the workspace → must succeed, and the host (parent, not
+        // sandboxed) must see the file afterward.
+        let inside = tmp.join("from_shell.txt");
+        let mut ok_cmd = std::process::Command::new(sh);
+        ok_cmd.arg("-c").arg(format!("echo SHARED > {}", inside.display()));
+        sandbox.wrap_command(&mut ok_cmd).unwrap();
+        let ok = ok_cmd.output().unwrap();
+        assert!(
+            ok.status.success(),
+            "shell must be able to write inside the workspace; stderr={}",
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        let host_view = std::fs::read_to_string(&inside).unwrap_or_default();
+        assert!(
+            host_view.contains("SHARED"),
+            "host (file_read) must see the file the sandboxed shell created"
+        );
+
+        // Write outside the workspace (a fresh path outside /tmp grant) → denied.
+        let outside = std::env::temp_dir().join(format!("openprx_landlock_escape_{}", std::process::id()));
+        let _ = std::fs::remove_file(&outside);
+        // Note: /tmp itself is granted RW by build_ruleset, so to prove denial we
+        // target /etc which is never granted.
+        let etc_target = "/etc/openprx_landlock_should_be_denied";
+        let mut deny_cmd = std::process::Command::new(sh);
+        deny_cmd.arg("-c").arg(format!("echo NOPE > {etc_target}"));
+        sandbox.wrap_command(&mut deny_cmd).unwrap();
+        let denied = deny_cmd.status().unwrap();
+        assert!(
+            !denied.success(),
+            "writing outside the workspace (/etc) must be denied by Landlock"
+        );
+        assert!(
+            !std::path::Path::new(etc_target).exists(),
+            "denied write must not have created the file"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::remove_file(&outside);
     }
 
     // ── §1.1 Landlock stub tests ──────────────────────────────

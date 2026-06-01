@@ -1457,6 +1457,7 @@ pub async fn run(
         }
 
         // Route any user-visible slash-command output into the right sink:
+        // (defined before the bang handler so `!cmd` can emit its output).
         // ratatui mirror on the TUI path (so it survives raw-mode `\n`
         // mangling), plain stdout otherwise. Returns immediately for plain
         // mode so the legacy `--plain` / piped path is unchanged.
@@ -1479,6 +1480,51 @@ pub async fn run(
                 print_fallback_chat_output(text);
             }
         };
+
+        // BUG-04: `!cmd` bang mode — run the rest of the line directly as a
+        // shell command (matching the footer hint "! for bash") instead of
+        // sending it to the LLM. Output is shown inline; the LLM is not
+        // involved. A bare `!` is ignored. The shell tool already applies the
+        // sandbox + workspace cwd, so bang commands share the same host FS view
+        // as file_write (see BUG-02).
+        if let Some(bang_cmd) = user_input.strip_prefix('!') {
+            let bang_cmd = bang_cmd.trim();
+            if bang_cmd.is_empty() {
+                emit_chat_output("Usage: !<shell command>  (runs directly in the workspace)");
+                continue;
+            }
+            let shell_tool = tools_registry.iter().find(|t| t.supports_name("shell"));
+            match shell_tool {
+                Some(tool) => {
+                    let args = serde_json::json!({ "command": bang_cmd });
+                    match tool.execute_named("shell", args).await {
+                        Ok(result) => {
+                            let mut out = String::new();
+                            if !result.output.is_empty() {
+                                out.push_str(&result.output);
+                            }
+                            if let Some(err) = result.error.as_ref().filter(|e| !e.is_empty()) {
+                                if !out.is_empty() {
+                                    out.push('\n');
+                                }
+                                out.push_str(err);
+                            }
+                            if out.is_empty() {
+                                out = if result.success {
+                                    "(no output)".to_string()
+                                } else {
+                                    "(command failed with no output)".to_string()
+                                };
+                            }
+                            emit_chat_output(&out);
+                        }
+                        Err(e) => emit_chat_output(&format!("Shell error: {e}")),
+                    }
+                }
+                None => emit_chat_output("Shell tool is not available in this session."),
+            }
+            continue;
+        }
 
         // Handle /clear separately (needs mutable history)
         if matches!(user_input.as_str(), "/clear" | "/new") {
@@ -2522,16 +2568,16 @@ pub async fn run(
         // 这关闭了 S2-D/E 阶段保留的最后一处双写残留。
         let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
         let sanitized_response = sanitize::sanitize_for_persistence(&response);
-        #[cfg(feature = "terminal-tui")]
-        let legacy_session_writes_enabled = !reducer_driver_turn_active;
-        #[cfg(not(feature = "terminal-tui"))]
-        let legacy_session_writes_enabled = true;
-        if legacy_session_writes_enabled {
-            chat_session.add_user_turn(&sanitized_input);
-            chat_session.add_assistant_turn(&sanitized_response, Vec::new());
-        } else {
-            tracing::debug!("Pure mode: skip legacy chat_session.add_*_turn (reducer owns persistence)");
-        }
+        // BUG-06 / BUG-08 fix: always keep the in-memory `chat_session.turns`
+        // populated so interactive `/cost` and `/export` (which read
+        // `ctx.chat_session.turns`) reflect the live conversation. In Pure mode
+        // the reducer owns *persistence* (its `build_session_snapshot` +
+        // `Effect::SaveSession`), and the legacy `save_session(&chat_session)`
+        // below is independently suppressed by `dual_write_guard`. Populating the
+        // in-memory turns therefore does NOT cause double-persistence — it only
+        // backs the slash commands that read from `chat_session`.
+        chat_session.add_user_turn(&sanitized_input);
+        chat_session.add_assistant_turn(&sanitized_response, Vec::new());
 
         // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
         // Redux reducer 的 SaveSession effect 已在 execute_real 中置位 guard，

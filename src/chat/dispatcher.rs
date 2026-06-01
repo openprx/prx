@@ -600,6 +600,7 @@ impl EffectExecutor {
                 draft_id,
                 history,
                 cancel,
+                chat_mode,
             } => {
                 // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
                 // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
@@ -650,6 +651,7 @@ impl EffectExecutor {
                         max_tool_iterations,
                         approval_router,
                         approval_manager,
+                        chat_mode,
                     )
                     .await;
                 });
@@ -1077,6 +1079,7 @@ async fn drive_start_turn_stream(
     max_tool_iterations: usize,
     approval_router: Option<Arc<ApprovalRouter>>,
     approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    chat_mode: crate::agent::loop_::ChatMode,
 ) {
     // 默认 / 上限：与 `agent::loop_::DEFAULT_MAX_TOOL_ITERATIONS` 概念对齐，
     // 但 driver 内部独立维护防止意外 0 走入死循环。
@@ -1244,6 +1247,7 @@ async fn drive_start_turn_stream(
                         approval_router.as_ref(),
                         approval_manager.as_ref(),
                         &mut history,
+                        chat_mode,
                     )
                     .await;
                     match outcome {
@@ -1286,6 +1290,51 @@ enum ToolExecOutcome {
     SenderClosed,
 }
 
+/// BUG-09: classify whether a tool mutates state and must be intercepted in
+/// plan mode. Mirrors `agent::loop_::is_write_tool`'s read-tool allowlist so the
+/// Redux driver path enforces the exact same read-only contract as the legacy
+/// `run_tool_call_loop`. Unknown tools are conservatively treated as writes.
+fn is_plan_intercepted_write_tool(name: &str) -> bool {
+    !matches!(
+        name,
+        "file_read"
+            | "grep"
+            | "web_search"
+            | "web_search_tool"
+            | "web_fetch"
+            | "memory_recall"
+            | "memory_search"
+            | "memory_get"
+            | "document_search"
+            | "document_get_chunk"
+            | "cron_list"
+            | "cron_runs"
+            | "sessions_list"
+            | "sessions_history"
+            | "session_status"
+            | "agents_list"
+            | "image_info"
+            | "hardware_board_info"
+            | "hardware_memory_map"
+            | "hardware_memory_read"
+    )
+}
+
+/// BUG-09: short, bounded preview of the raw tool arguments for the synthesized
+/// "[plan mode] would call X with …" message. Keeps the line readable even when
+/// arguments are large (file contents, shell scripts).
+fn plan_preview_args(raw_args: &str) -> String {
+    const MAX: usize = 160;
+    if raw_args.len() <= MAX {
+        return raw_args.to_string();
+    }
+    let mut cut = MAX;
+    while cut > 0 && !raw_args.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &raw_args[..cut])
+}
+
 /// **S3 T3-1**: 执行单个工具调用（含 approval 检查）+ 写回 history + 发 Tool* Action.
 ///
 /// 抽出独立函数原因：driver 主循环里嵌套层级太多，且 approval 路径有 oneshot await，
@@ -1300,7 +1349,38 @@ async fn execute_single_tool_call(
     approval_router: Option<&Arc<ApprovalRouter>>,
     approval_manager: Option<&Arc<crate::approval::ApprovalManager>>,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
+    chat_mode: crate::agent::loop_::ChatMode,
 ) -> ToolExecOutcome {
+    // 0) BUG-09: plan mode is read-only. Intercept write/shell/git tools BEFORE
+    // approval or execution and feed back a simulated "[plan mode] would call X"
+    // result so the model can keep reasoning without any real side effect
+    // touching the filesystem. This mirrors the legacy `run_tool_call_loop`
+    // interception (agent::loop_::execute_one_tool) for the Redux driver path,
+    // which previously executed write tools for real even in plan mode.
+    if chat_mode.intercepts_writes() && is_plan_intercepted_write_tool(&call.name) {
+        let preview = plan_preview_args(&call.args);
+        let simulated = format!("[plan mode] would call {} with {preview}", call.name);
+        let tool_payload = serde_json::json!({
+            "tool_call_id": call.id,
+            "content": simulated,
+            "success": true,
+        });
+        history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+        if let Err(e) = action_tx
+            .send(Action::ToolFinished {
+                name: call.name.clone(),
+                success: true,
+                duration_ms: 0,
+                result: Some(simulated),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed on plan-mode-intercept");
+            return ToolExecOutcome::SenderClosed;
+        }
+        return ToolExecOutcome::Done;
+    }
+
     // 1) Approval — supervised mode 走 oneshot 等响应.
     let needs_approval = approval_manager.is_some_and(|mgr| mgr.needs_approval(&call.name));
     if needs_approval {
@@ -1458,9 +1538,23 @@ async fn execute_single_tool_call(
 
     let (tool_payload, ok_flag, summary) = match exec_result {
         Ok(tool_result) => {
+            // BUG-05: when a tool fails (e.g. file_write rejected by the path
+            // security policy) the human-readable reason lives in `error`, and
+            // `output` is usually empty. The LLM keys off `content`, so an empty
+            // `content` made the model believe the call "returned nothing /
+            // looked fine". Surface the error reason in `content` (not just the
+            // side `error` field) so the rejection is unambiguous to the model.
+            let content = if tool_result.success || !tool_result.output.is_empty() {
+                tool_result.output.clone()
+            } else {
+                tool_result
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "tool failed with no output".to_string())
+            };
             let payload = serde_json::json!({
                 "tool_call_id": call.id,
-                "content": tool_result.output,
+                "content": content,
                 "success": tool_result.success,
                 "error": tool_result.error,
             });
@@ -2730,6 +2824,7 @@ mod integration_tests {
                 draft_id: "shadow-d".to_string(),
                 history: Vec::new(),
                 cancel: token.clone(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             },
             Effect::CancelToken(token),
         ];
@@ -3150,6 +3245,7 @@ mod real_mode_tests {
                 draft_id: "draft-fixB-B5".to_string(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -3395,6 +3491,7 @@ mod real_mode_tests {
                 draft_id: "draft-real".to_string(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
         // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
@@ -3456,6 +3553,7 @@ mod real_mode_tests {
                 draft_id: "draft-cancelled".to_string(),
                 history: Vec::new(),
                 cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -3541,6 +3639,7 @@ mod real_mode_tests {
                 draft_id: "draft-stream".to_string(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -3670,6 +3769,7 @@ mod real_mode_tests {
                 draft_id: "draft-fail".to_string(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -3761,6 +3861,7 @@ mod real_mode_tests {
                 draft_id: "draft-mid-cancel".to_string(),
                 history: Vec::new(),
                 cancel: cancel.clone(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -4479,6 +4580,7 @@ mod real_mode_tests {
                 draft_id: "draft-params".to_string(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -4604,6 +4706,7 @@ mod real_mode_tests {
                 draft_id: "draft-no-registry".to_string(),
                 history: Vec::new(),
                 cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -4755,6 +4858,7 @@ mod real_mode_tests {
                 draft_id: "draft-tool-happy".to_string(),
                 history: Vec::new(),
                 cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -4900,6 +5004,7 @@ mod real_mode_tests {
                 draft_id: "draft-max-iter".to_string(),
                 history: Vec::new(),
                 cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -4993,6 +5098,7 @@ mod real_mode_tests {
                 draft_id: "draft-cancel-mid".to_string(),
                 history: Vec::new(),
                 cancel: cancel.clone(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -5372,6 +5478,7 @@ mod real_mode_tests {
                 draft_id: "draft-t31-streaming".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -5508,6 +5615,7 @@ mod real_mode_tests {
                 draft_id: "draft-reasoning-tool-history".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -5622,6 +5730,7 @@ mod real_mode_tests {
                     content: "hello".into(),
                 }],
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -5712,6 +5821,7 @@ mod real_mode_tests {
                     content: "x".repeat(1000),
                 }],
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -5880,6 +5990,7 @@ mod real_mode_tests {
                 draft_id: "draft-approval".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -6064,6 +6175,7 @@ mod real_mode_tests {
                 draft_id: "draft-reject".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -6160,6 +6272,7 @@ mod real_mode_tests {
             None,
             Some(&approval_manager),
             &mut history,
+            crate::agent::loop_::ChatMode::Edit,
         )
         .await;
 
@@ -6288,6 +6401,7 @@ mod real_mode_tests {
             Some(&approval_router),
             Some(&approval_manager),
             &mut history,
+            crate::agent::loop_::ChatMode::Edit,
         )
         .await;
 
@@ -6413,6 +6527,7 @@ mod real_mode_tests {
                 draft_id: "draft-flaky".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -6506,6 +6621,7 @@ mod real_mode_tests {
                 draft_id: "draft-net-fail".into(),
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
             })
             .await;
 
@@ -6901,6 +7017,177 @@ mod s4_a_3 {
             stats.actions_seen >= 5,
             "应至少处理 5 个 actions, got {}",
             stats.actions_seen
+        );
+    }
+
+    // ── BUG-09 / BUG-05 driver-path coverage ──────────────────────────────
+
+    #[test]
+    fn plan_intercept_classifies_read_vs_write_tools() {
+        // Read-only tools must NOT be intercepted in plan mode.
+        for read in ["file_read", "grep", "web_fetch", "memory_recall", "sessions_list"] {
+            assert!(
+                !is_plan_intercepted_write_tool(read),
+                "{read} is read-only and must run in plan mode"
+            );
+        }
+        // Mutating + unknown tools MUST be intercepted.
+        for write in ["file_write", "shell", "git_operations", "some_unknown_mcp_tool"] {
+            assert!(
+                is_plan_intercepted_write_tool(write),
+                "{write} mutates state (or is unknown) and must be simulated in plan mode"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_preview_args_is_bounded_and_utf8_safe() {
+        assert_eq!(plan_preview_args("short"), "short");
+        let long = "a".repeat(500);
+        let preview = plan_preview_args(&long);
+        assert!(preview.chars().count() <= 161, "preview must be bounded");
+        assert!(preview.ends_with('…'));
+        // Must not panic on a multibyte boundary.
+        let multibyte = "界".repeat(200);
+        let _ = plan_preview_args(&multibyte);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_simulates_write_tool_without_executing() {
+        use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+
+        struct RecordingWrite {
+            executed: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for RecordingWrite {
+            fn name(&self) -> &str {
+                "file_write"
+            }
+            fn description(&self) -> &str {
+                "write"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                self.executed.store(true, AtomicOrdering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "REALLY WROTE".into(),
+                    error: None,
+                })
+            }
+        }
+
+        let executed = Arc::new(AtomicBool::new(false));
+        let registry = Arc::new(vec![Box::new(RecordingWrite {
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-w".into(),
+            name: "file_write".into(),
+            args: r#"{"path":"a.txt","content":"x"}"#.into(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let mut history = Vec::new();
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-plan",
+            None,
+            None,
+            &mut history,
+            crate::agent::loop_::ChatMode::Plan,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done));
+        assert!(
+            !executed.load(AtomicOrdering::SeqCst),
+            "plan mode MUST NOT execute the write tool"
+        );
+        // history tool message must carry the simulated marker, not the real output.
+        let tool_msg = history.last().expect("tool result pushed to history");
+        assert!(
+            tool_msg.content.contains("[plan mode] would call file_write"),
+            "history must carry simulated result, got: {}",
+            tool_msg.content
+        );
+        assert!(
+            !tool_msg.content.contains("REALLY WROTE"),
+            "real tool output must never appear in plan mode"
+        );
+        // A ToolFinished(success=true) with the simulated text must be emitted.
+        let mut saw_finished = false;
+        while let Ok(action) = action_rx.try_recv() {
+            if let Action::ToolFinished { name, result, .. } = action {
+                assert_eq!(name, "file_write");
+                assert!(result.unwrap_or_default().contains("[plan mode]"));
+                saw_finished = true;
+            }
+        }
+        assert!(saw_finished, "must emit ToolFinished for the simulated call");
+    }
+
+    #[tokio::test]
+    async fn failed_tool_with_empty_output_surfaces_error_in_content() {
+        // BUG-05: a tool that fails with empty output must put its error reason
+        // into `content` so the LLM sees the rejection (not an empty result).
+        struct RejectingTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for RejectingTool {
+            fn name(&self) -> &str {
+                "file_write"
+            }
+            fn description(&self) -> &str {
+                "write"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some("Path not allowed by security policy: /etc/passwd".into()),
+                })
+            }
+        }
+
+        let registry = Arc::new(vec![Box::new(RejectingTool) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-rej".into(),
+            name: "file_write".into(),
+            args: "{}".into(),
+        };
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
+        let mut history = Vec::new();
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-rej",
+            None,
+            None,
+            &mut history,
+            crate::agent::loop_::ChatMode::Edit,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done));
+        let tool_msg = history.last().expect("tool result pushed to history");
+        let payload: serde_json::Value = serde_json::from_str(&tool_msg.content).expect("tool payload is JSON");
+        assert_eq!(payload.get("success"), Some(&serde_json::json!(false)));
+        let content = payload.get("content").and_then(|c| c.as_str()).unwrap_or_default();
+        assert!(
+            content.contains("Path not allowed") && content.contains("/etc/passwd"),
+            "failed tool must surface its error reason in `content`, got: {content}"
         );
     }
 }

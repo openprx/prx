@@ -347,6 +347,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_write_rejected_path_carries_descriptive_reason() {
+        // BUG-05: a rejected write must return a non-empty, descriptive error
+        // (the offending path + policy reason). The dispatcher surfaces this
+        // reason to the LLM; if it were empty the model would think the call
+        // "returned nothing / looked fine".
+        let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
+        let result = tool
+            .execute(json!({"path": "/etc/passwd", "content": "x"}))
+            .await
+            .unwrap();
+        assert!(!result.success, "writing /etc/passwd must be rejected");
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(!err.is_empty(), "rejection reason must not be empty");
+        assert!(
+            err.contains("not allowed") && err.contains("/etc/passwd"),
+            "error must name the policy + the offending path, got: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn file_write_missing_path_param() {
         let tool = FileWriteTool::new(test_security(std::env::temp_dir()));
         let result = tool.execute(json!({"content": "data"})).await;

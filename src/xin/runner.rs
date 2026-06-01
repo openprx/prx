@@ -633,7 +633,7 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
     // ShellTool path (tools/shell.rs). The Sandbox trait mutates the inner
     // std::process::Command, reached here via tokio's `as_std_mut`. A fail-closed
     // backend (UnavailableSandbox) blocks execution rather than running unsandboxed.
-    let sandbox = crate::security::create_sandbox(&config.security);
+    let sandbox = crate::security::create_sandbox_with_workspace(&config.security, Some(&config.workspace_dir));
     if let Err(e) = sandbox.wrap_command(command.as_std_mut()) {
         return (
             false,

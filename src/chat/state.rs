@@ -81,6 +81,11 @@ pub enum Effect {
         draft_id: String,
         history: Vec<ChatMessage>,
         cancel: CancellationToken,
+        /// BUG-09: the interactive chat mode in effect for this turn. The driver
+        /// (`drive_start_turn_stream`) uses it to intercept write/shell/git
+        /// tools when in [`ChatMode::Plan`] and feed back a simulated
+        /// "[plan mode] would call X" result instead of executing them.
+        chat_mode: ChatMode,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -574,9 +579,12 @@ impl ChatState {
     fn reduce_key_pressed(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) -> Vec<Effect> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
-        // Tab → 折叠/展开最近 ToolResult 卡片
+        // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
+        // BUG-01: 旧实现只切 ToolResult，导致 thinking/Reasoning 卡按 Tab 永不展开
+        // （折叠提示却写着 "press Tab to expand"）。与 tui::toggle_last_foldable_card
+        // 的统一语义对齐。
         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
-            return self.reduce_tool_card_fold_toggled();
+            return self.reduce_foldable_card_toggled();
         }
         // Ctrl+R → 折叠/展开 Reasoning 卡片
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
@@ -694,6 +702,26 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// 处理 Tab — 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult）。
+    ///
+    /// BUG-01: 取 `conversation_lines` 中**最靠后**的 Reasoning 或 ToolResult，
+    /// 翻转其 `folded`。与 `tui::TuiState::toggle_last_foldable_card` 同语义，
+    /// 保证 Pure(reducer/snapshot) 路径下 Tab 能展开 thinking 卡片。
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_foldable_card_toggled(&mut self) -> Vec<Effect> {
+        use crate::chat::tui::ConversationLine;
+        for line in self.ui.conversation_lines.iter_mut().rev() {
+            match line {
+                ConversationLine::Reasoning { folded, .. } | ConversationLine::ToolResult { folded, .. } => {
+                    *folded = !*folded;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        vec![Effect::RequestRedraw]
+    }
+
     /// 处理 Tab — 折叠/展开最近 ToolResult.
     #[cfg(feature = "terminal-tui")]
     fn reduce_tool_card_fold_toggled(&mut self) -> Vec<Effect> {
@@ -808,6 +836,9 @@ impl ChatState {
         });
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
+        // BUG-09: capture the current chat mode so the driver can enforce plan
+        // mode's read-only contract on write/shell/git tools.
+        let chat_mode = self.session.mode;
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -817,6 +848,7 @@ impl ChatState {
                 draft_id,
                 history,
                 cancel,
+                chat_mode,
             },
             Effect::RequestRedraw,
         ]
@@ -836,6 +868,9 @@ impl ChatState {
         });
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
+        // BUG-09: capture the current chat mode so the driver can enforce plan
+        // mode's read-only contract on write/shell/git tools.
+        let chat_mode = self.session.mode;
         vec![
             Effect::LogTrace {
                 level: tracing::Level::INFO,
@@ -845,6 +880,7 @@ impl ChatState {
                 draft_id,
                 history,
                 cancel,
+                chat_mode,
             },
             Effect::RequestRedraw,
         ]
@@ -2108,6 +2144,68 @@ mod tests {
             let mut state = s();
             let effects = state.reduce(Action::ReasoningFoldToggled);
             assert!(has_request_redraw(&effects));
+        }
+
+        /// BUG-01: Tab must expand the most recent Reasoning ("thinking") card,
+        /// not only ToolResult cards. Previously Tab ignored Reasoning entirely,
+        /// so thinking cards stayed folded ("▸") forever despite the
+        /// "press Tab to expand" hint.
+        #[test]
+        fn test_tab_toggles_reasoning_card_fold() {
+            use crate::chat::tui::ConversationLine;
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::Reasoning {
+                content: "deep thoughts".to_string(),
+                char_count: 12,
+                folded: true,
+            });
+            // Tab → expand.
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert!(has_request_redraw(&effects));
+            match state.ui.conversation_lines.last() {
+                Some(ConversationLine::Reasoning { folded, .. }) => {
+                    assert!(!folded, "Tab must expand the reasoning card");
+                }
+                other => panic!("expected Reasoning card, got {other:?}"),
+            }
+            // Tab again → collapse.
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            match state.ui.conversation_lines.last() {
+                Some(ConversationLine::Reasoning { folded, .. }) => {
+                    assert!(folded, "second Tab must collapse the reasoning card");
+                }
+                other => panic!("expected Reasoning card, got {other:?}"),
+            }
+        }
+
+        /// BUG-01: a fold toggle (KeyPressed Tab) must mark the reduce dirty so
+        /// `build_ui_snapshot` rebuilds with the new folded state (the Pure-mode
+        /// renderer reads the snapshot, not the live state). Guards against the
+        /// stale `cached_lines_arc` regression.
+        #[test]
+        fn test_fold_toggle_marks_snapshot_dirty_and_rebuilds() {
+            use crate::chat::tui::ConversationLine;
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::Reasoning {
+                content: "x".to_string(),
+                char_count: 1,
+                folded: true,
+            });
+            // Prime the snapshot cache.
+            let _ = state.build_ui_snapshot(1);
+            // Toggle via tracked reduce — must report dirty and clear the cache.
+            let (_effects, dirty) =
+                state.reduce_tracked(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+            assert!(dirty, "fold toggle must mark snapshot dirty");
+            let snap = state.build_ui_snapshot(2);
+            match snap.conversation_lines.last() {
+                Some(ConversationLine::Reasoning { folded, .. }) => {
+                    assert!(!folded, "rebuilt snapshot must reflect the expanded card");
+                }
+                other => panic!("expected Reasoning card in snapshot, got {other:?}"),
+            }
         }
 
         // ─── Step 2 集成测试（P1-1 PTY 覆盖空洞补全）──────────────────────────

@@ -34,7 +34,7 @@ pub mod policy_pipeline;
 pub mod secrets;
 pub mod traits;
 
-pub use detect::create_sandbox;
+pub use detect::create_sandbox_with_workspace;
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 pub use policy_pipeline::{EvalContext, PolicyPipeline};
 pub use secrets::SecretStore;
