@@ -418,6 +418,51 @@ impl Drop for DualWriteGuardScope {
     }
 }
 
+// ─── ModelSlot (BUG-07: 在线切换 model) ────────────────────────────────────────
+
+/// 热替换的 model 名句柄。
+///
+/// BUG-07: `/model <name>` 需要在 chat::run 主循环侧更新 model，而真正读 model 的
+/// `drive_start_turn_stream` 运行在 spawn 出去的 dispatcher 子任务里（跨 spawn 边界，
+/// `EffectDeps` 已被 move 进 `EffectExecutor`）。用 `Arc<RwLock<Arc<str>>>` 提供
+/// interior mutability：主循环调用 [`Self::set`] 替换，子任务每个 turn 起始调用
+/// [`Self::current`] 读到最新值（同 provider 换 model 场景，provider 自身按 per-call
+/// model 调用，无需重建）。读发生频率为每 turn 一次，RwLock 开销可忽略，且天然
+/// Send + Sync 不引入额外约束。
+#[derive(Clone)]
+pub struct ModelSlot(Arc<parking_lot::RwLock<Arc<str>>>);
+
+impl ModelSlot {
+    /// 用初始 model 名构造。
+    #[must_use]
+    pub fn new(model: Arc<str>) -> Self {
+        Self(Arc::new(parking_lot::RwLock::new(model)))
+    }
+
+    /// 读当前 model 名。返回 owned `Arc<str>`（clone 仅 Arc bump）供跨 await 持有。
+    #[must_use]
+    pub fn current(&self) -> Arc<str> {
+        Arc::clone(&self.0.read())
+    }
+
+    /// 替换 model 名。后续 turn 起始 `current()` 即读到新值。
+    pub fn set(&self, model: Arc<str>) {
+        *self.0.write() = model;
+    }
+}
+
+impl From<Arc<str>> for ModelSlot {
+    fn from(model: Arc<str>) -> Self {
+        Self::new(model)
+    }
+}
+
+impl From<&str> for ModelSlot {
+    fn from(model: &str) -> Self {
+        Self::new(Arc::from(model))
+    }
+}
+
 // ─── EffectDeps ────────────────────────────────────────────────────────────────
 
 /// EffectExecutor 真业务执行所需依赖.
@@ -448,7 +493,7 @@ pub struct EffectDeps {
     /// Step 5a-4 (Codex P1)：当前 LLM model name，drive_start_turn_stream 用此
     /// 调 `provider.stream_chat_with_history(_, model, _, _)`。原本 hard-coded
     /// 为空串导致真实 provider (OpenAI/Anthropic) 拒绝；mock provider 测试不暴露此问题.
-    pub model: Arc<str>,
+    pub model: ModelSlot,
     /// 当前 temperature（默认从 CLI 参数注入；与 model 配对传给 stream API）.
     pub temperature: f64,
     /// **5a-6**: tool registry — driver 执行 tool_call 时按名查找并调用。`None`
@@ -525,6 +570,16 @@ impl EffectExecutor {
     #[must_use]
     pub fn redraw_handle(&self) -> Arc<ParkingMutex<Option<mpsc::Sender<()>>>> {
         Arc::clone(&self.redraw_slot)
+    }
+
+    /// BUG-07: 返回 deps 中的 model 热替换 slot（real 模式独有）.
+    ///
+    /// `chat::run` 用此句柄在 `/model <name>` 时原子替换 model 名，使后续 turn
+    /// 的 `drive_start_turn_stream` 读到新值。shadow 模式无 deps 返回 None。
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn model_handle(&self) -> Option<ModelSlot> {
+        self.deps.as_ref().map(|d| d.model.clone())
     }
 
     /// **S3 T3-1**: 返回 deps 中的 approval router（real 模式独有）.
@@ -621,7 +676,9 @@ impl EffectExecutor {
                 let action_tx = deps.action_tx.clone();
                 let guard_scope = deps.dual_write_guard.enter_scope();
                 // Codex P1 fix：从 deps 拿真实 model + temperature 传给 stream API.
-                let model = deps.model.to_string();
+                // BUG-07: 每个 turn 起始读 ModelSlot 当前值，/model <name> 切换后
+                // 后续 turn 自动用新 model（同 provider 换 model）。
+                let model = deps.model.current().to_string();
                 let temperature = deps.temperature;
                 // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
@@ -2323,6 +2380,28 @@ mod tests {
     use super::*;
     use crate::chat::action::Action;
 
+    // ── BUG-07: ModelSlot hot-swap ─────────────────────────────────────
+    #[test]
+    fn model_slot_current_reflects_set() {
+        let slot = ModelSlot::from("anthropic/claude-sonnet-4");
+        assert_eq!(&*slot.current(), "anthropic/claude-sonnet-4");
+        // A clone shares the same inner cell (cross-spawn-boundary handle).
+        let handle = slot.clone();
+        handle.set(Arc::from("openai/gpt-4o"));
+        assert_eq!(
+            &*slot.current(),
+            "openai/gpt-4o",
+            "set via handle is visible through original"
+        );
+    }
+
+    #[test]
+    fn model_handle_exposes_deps_slot() {
+        // real-deps executor returns Some(slot); shadow returns None.
+        let shadow = EffectExecutor::new_shadow();
+        assert!(shadow.model_handle().is_none(), "shadow has no model slot");
+    }
+
     #[tokio::test]
     async fn dispatcher_try_send_ok() {
         let (dispatcher, mut rx) = ChatDispatcher::new();
@@ -3117,7 +3196,7 @@ mod real_mode_tests {
             dual_write_guard,
             redraw_tx: Some(redraw_tx),
             shutdown,
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
@@ -3505,7 +3584,7 @@ mod real_mode_tests {
                 dual_write_guard: RuntimeDualWriteGuard::new(),
                 redraw_tx: Some(redraw_tx),
                 shutdown: shutdown.clone(),
-                model: Arc::from("test-model"),
+                model: ModelSlot::from("test-model"),
                 temperature: 0.0,
                 tools_registry: None,
                 max_tool_iterations: 0,
@@ -3571,7 +3650,7 @@ mod real_mode_tests {
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             shutdown: shutdown.clone(),
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
@@ -4199,7 +4278,7 @@ mod real_mode_tests {
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             shutdown,
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
@@ -4346,7 +4425,7 @@ mod real_mode_tests {
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             shutdown,
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
@@ -4497,7 +4576,7 @@ mod real_mode_tests {
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: None, // 模拟构造时 redraw_tx 尚不存在
             shutdown: shutdown.clone(),
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
@@ -4686,7 +4765,7 @@ mod real_mode_tests {
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = provider.clone();
         // 注入非默认 model / temperature 让 capture 能区分.
-        deps.model = Arc::from("gpt-test-99");
+        deps.model.set(Arc::from("gpt-test-99"));
         deps.temperature = 0.42;
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -6988,7 +7067,7 @@ mod real_mode_tests {
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             shutdown,
-            model: Arc::from("test-model"),
+            model: ModelSlot::from("test-model"),
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,

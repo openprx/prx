@@ -32,6 +32,7 @@ pub mod delegate;
 pub mod document_get_chunk;
 pub mod document_search;
 pub mod error_hints;
+pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
 pub mod gateway;
@@ -84,6 +85,7 @@ pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_search::DocumentSearchTool;
+pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
 pub use gateway::GatewayTool;
@@ -182,7 +184,8 @@ pub fn default_tools_with_runtime(
     vec![
         Box::new(ShellTool::new(security.clone(), runtime, sandbox, false)),
         Box::new(FileReadTool::new(security.clone(), false)),
-        Box::new(FileWriteTool::new(security)),
+        Box::new(FileWriteTool::new(security.clone())),
+        Box::new(FileEditTool::new(security)),
     ]
 }
 
@@ -297,6 +300,7 @@ pub fn all_tools_with_runtime_ext(
         )),
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
+        Arc::new(FileEditTool::new(security.clone())),
         Arc::new(CanvasTool::new(security.clone())),
         Arc::new(ScheduleTool::new(
             security.clone(),
@@ -565,10 +569,10 @@ mod tests {
     }
 
     #[test]
-    fn default_tools_has_three() {
+    fn default_tools_has_expected_count() {
         let security = Arc::new(SecurityPolicy::default());
         let tools = default_tools(security);
-        assert_eq!(tools.len(), 3);
+        assert_eq!(tools.len(), 4);
     }
 
     #[test]
@@ -694,6 +698,7 @@ mod tests {
         assert!(names.contains(&"shell"));
         assert!(names.contains(&"file_read"));
         assert!(names.contains(&"file_write"));
+        assert!(names.contains(&"file_edit"));
     }
 
     #[test]

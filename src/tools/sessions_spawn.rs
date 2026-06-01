@@ -566,6 +566,10 @@ impl Tool for SessionsSpawnTool {
                     "type": "string",
                     "description": "Optional model override for the sub-agent. Defaults to the gateway model."
                 },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional provider override for the sub-agent (e.g. 'openrouter', 'ollama'). Defaults to the agent config provider, then the gateway provider."
+                },
                 "agent": {
                     "type": "string",
                     "description": format!(
@@ -685,6 +689,11 @@ impl Tool for SessionsSpawnTool {
 
         let model_override = args
             .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        let provider_override = args
+            .get("provider")
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -831,11 +840,13 @@ impl Tool for SessionsSpawnTool {
             None => self.default_recipient.read().await.clone(),
         };
 
-        let resolved_provider_name = selected_agent
-            .as_ref()
-            .map(|(_, cfg)| cfg.provider.trim().to_string())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| self.provider_name.clone());
+        let resolved_provider_name = provider_override.unwrap_or_else(|| {
+            selected_agent
+                .as_ref()
+                .map(|(_, cfg)| cfg.provider.trim().to_string())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| self.provider_name.clone())
+        });
         let resolved_model = model_override.unwrap_or_else(|| {
             selected_agent
                 .as_ref()
@@ -1098,7 +1109,10 @@ impl Tool for SessionsSpawnTool {
         let model = resolved_model;
         let temperature = resolved_temperature;
         let max_iterations = resolved_max_iterations;
-        let provider = if selected_agent.is_some() && provider_name != self.provider_name {
+        // Rebuild the provider object whenever the resolved provider differs
+        // from the gateway provider. This covers a named agent provider AND an
+        // inline `provider` override (BUG-12) even without a named agent.
+        let provider = if provider_name != self.provider_name {
             match providers::create_provider_with_options(
                 &provider_name,
                 resolved_api_key.as_deref(),
@@ -2600,6 +2614,7 @@ mod tests {
         assert!(schema["properties"]["run_id"].is_object());
         assert!(schema["properties"]["message"].is_object());
         assert!(schema["properties"]["model"].is_object());
+        assert!(schema["properties"]["provider"].is_object());
         assert!(schema["properties"]["agent"].is_object());
         assert!(schema["properties"]["timeout_seconds"].is_object());
         assert!(schema["properties"]["mode"].is_object());
@@ -2609,6 +2624,31 @@ mod tests {
         let enum_strs: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
         assert!(enum_strs.contains(&"history"));
         assert!(enum_strs.contains(&"steer"));
+    }
+
+    /// BUG-12: an inline `provider` override (no named agent) must drive a
+    /// provider rebuild. Using an invalid provider name proves the override is
+    /// consumed: provider creation fails naming the inline override, not the
+    /// gateway provider ("test-provider").
+    #[tokio::test]
+    async fn inline_provider_override_drives_provider_rebuild() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+
+        let result = tool
+            .execute(with_spawn_grant(json!({
+                "task": "do work",
+                "provider": "totally-invalid-provider"
+            })))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("totally-invalid-provider"),
+            "error should name the inline provider override: {err}"
+        );
     }
 
     #[tokio::test]

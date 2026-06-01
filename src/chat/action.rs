@@ -62,6 +62,12 @@ pub enum Action {
     SlashCommandIssued { cmd: String, args: String },
     /// 模式切换（/plan /edit /auto）
     ModeChanged(ChatMode),
+    /// 模型在线切换（/model <name>）— BUG-07.
+    ///
+    /// reducer 更新 `session.model`，让 status bar 立刻反映新 model；真正影响
+    /// 后续 LLM turn 的 model 由主循环把新值写入 `EffectDeps` 的热替换 slot
+    /// （同 provider 换 model）。仅记账 + RequestRedraw，不产生其他副作用。
+    ModelChanged { model: String },
     /// 清除历史（/clear /new）
     HistoryCleared,
     /// 清除历史并在同一 UI snapshot 中追加用户可见回执。
@@ -220,6 +226,7 @@ impl Action {
             Self::InputCancelled => "InputCancelled",
             Self::SlashCommandIssued { .. } => "SlashCommandIssued",
             Self::ModeChanged(_) => "ModeChanged",
+            Self::ModelChanged { .. } => "ModelChanged",
             Self::HistoryCleared => "HistoryCleared",
             Self::HistoryClearedWithNotice { .. } => "HistoryClearedWithNotice",
             Self::TurnStarted { .. } => "TurnStarted",

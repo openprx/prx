@@ -1849,17 +1849,47 @@ fn render_tool_result<'a>(
     let (bullet, hook) = tool_card_glyphs(ascii);
     let bullet_color = tool_bullet_color(status);
 
-    // Header: `● Tool(args_preview)` — bullet colored by status, name+args in
-    // default foreground.
-    let preview = if args_preview.is_empty() {
-        tool_name.to_string()
+    // BUG-11: sub-agent tools get an enriched header that surfaces the child
+    // agent's identity (agent/model) and the delegated task summary, so nested
+    // delegation is visible from the parent TUI even without observer streaming.
+    let subagent_meta = if is_subagent_tool(tool_name) {
+        let meta = extract_subagent_meta(args_full, result);
+        if meta.is_empty() { None } else { Some(meta) }
     } else {
-        format!("{tool_name}({args_preview})")
+        None
     };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
-        Span::raw(preview),
-    ]));
+
+    if let Some(meta) = subagent_meta.as_ref() {
+        // Header: `🤖 delegate[agent/model] · <task>` (or ASCII `[bot]`). The
+        // robot glyph + bracketed identity reads as "this card is a sub-agent".
+        let robot = if ascii { "[bot]" } else { "\u{1F916}" }; // 🤖
+        let tag = subagent_identity_tag(meta);
+        let mut header_spans = vec![
+            Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
+            Span::raw(format!("{robot} {tool_name}[")),
+            Span::styled(tag, Style::default().fg(Color::Cyan)),
+            Span::raw("]"),
+        ];
+        if let Some(task) = meta.task.as_deref() {
+            header_spans.push(Span::styled(
+                format!(" \u{00B7} {task}"),
+                Style::default().fg(Color::DarkGray),
+            ));
+        }
+        lines.push(Line::from(header_spans));
+    } else {
+        // Header: `● Tool(args_preview)` — bullet colored by status, name+args in
+        // default foreground.
+        let preview = if args_preview.is_empty() {
+            tool_name.to_string()
+        } else {
+            format!("{tool_name}({args_preview})")
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
+            Span::raw(preview),
+        ]));
+    }
 
     // No follow-on row while still running — just the header is shown so the
     // user sees an in-flight indicator. (The status bar / footer carry the
@@ -2024,6 +2054,141 @@ const fn tool_bullet_color(status: ToolStatus) -> Color {
         ToolStatus::Running => Color::Yellow,
         ToolStatus::Done => Color::Green,
         ToolStatus::Error => Color::Red,
+    }
+}
+
+// ── BUG-11: sub-agent visibility ────────────────────────────────────────────
+//
+// The delegate / sessions_spawn / subagents family of tools each spawn a *child*
+// agent that runs its own LLM turns and tool calls. Without observer streaming
+// (NoopObserver lives behind the tools boundary), the TUI only sees the parent
+// tool card spin and then a flat text result. To make the nested activity
+// visible at the chat layer we special-case these cards: we parse the
+// sub-agent's identity (agent name + model) and the delegated task summary out
+// of the tool *args* (always present) and the tool *result* (when finished),
+// then render a distinct `🤖 delegate[agent/model] · <task>` header plus a meta
+// follow-on line. This is the "tool card surfaces sub-agent meta" visibility
+// layer; true real-time nested streaming requires wiring an observer through
+// the tools boundary and is tracked separately.
+
+/// Names of the tools that spawn / drive a sub-agent. A card for any of these
+/// gets the enriched sub-agent treatment in [`render_tool_result`].
+const SUBAGENT_TOOL_NAMES: [&str; 5] = ["delegate", "sessions_spawn", "subagents", "session_worker", "nodes"];
+
+/// True when `tool_name` belongs to the sub-agent tool family.
+fn is_subagent_tool(tool_name: &str) -> bool {
+    SUBAGENT_TOOL_NAMES.contains(&tool_name)
+}
+
+/// Sub-agent metadata extracted from a tool card for the BUG-11 visibility
+/// header. Every field is optional because args may be malformed JSON and the
+/// result is absent while the tool is still running.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SubagentMeta {
+    /// Target agent name (e.g. `researcher`). From args `agent`, or parsed from
+    /// the `[Agent '...' (...)]` result banner.
+    agent: Option<String>,
+    /// Model the sub-agent ran on (e.g. `kimi-2.6`). From args `model`, or the
+    /// `provider/model` portion of the result banner.
+    model: Option<String>,
+    /// Short one-line summary of the delegated task (args `prompt` / `task`).
+    task: Option<String>,
+}
+
+impl SubagentMeta {
+    /// True when no useful field could be extracted — caller falls back to the
+    /// generic tool card so we never render an empty `🤖 [/]` header.
+    const fn is_empty(&self) -> bool {
+        self.agent.is_none() && self.model.is_none() && self.task.is_none()
+    }
+}
+
+/// Collapse whitespace (incl. newlines) and clip to `max` chars with an ellipsis
+/// so a multi-line prompt renders as a single tidy summary cell.
+fn one_line_summary(raw: &str, max: usize) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        let head: String = collapsed.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
+}
+
+/// Parse the `[Agent 'name' (provider/model)]` banner that delegate prepends to
+/// its successful output. Returns `(agent, model)` with either side optional.
+fn parse_agent_banner(result: &str) -> (Option<String>, Option<String>) {
+    let first = result.lines().next().unwrap_or("");
+    let Some(rest) = first.strip_prefix("[Agent ") else {
+        return (None, None);
+    };
+    let rest = rest.strip_suffix(']').unwrap_or(rest);
+    // rest now looks like: 'name' (provider/model)
+    let agent = rest
+        .split_once('\'')
+        .and_then(|(_, after)| after.split_once('\''))
+        .map(|(name, _)| name.trim().to_string())
+        .filter(|s| !s.is_empty());
+    // Pull the `provider/model` inside the parentheses; keep only the model side.
+    let model = rest
+        .split_once('(')
+        .and_then(|(_, after)| after.split_once(')'))
+        .map(|(inner, _)| inner.trim())
+        .map(|pm| pm.rsplit('/').next().unwrap_or(pm).trim().to_string())
+        .filter(|s| !s.is_empty());
+    (agent, model)
+}
+
+/// Extract sub-agent metadata from a tool card. Prefers explicit args fields,
+/// then falls back to parsing the delegate result banner. Never panics on bad
+/// JSON — a parse failure simply yields fewer fields.
+fn extract_subagent_meta(args_full: &str, result: Option<&str>) -> SubagentMeta {
+    let mut meta = SubagentMeta::default();
+
+    if let Ok(serde_json::Value::Object(map)) = serde_json::from_str::<serde_json::Value>(args_full) {
+        let str_field = |key: &str| {
+            map.get(key)
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+        };
+        meta.agent = str_field("agent");
+        meta.model = str_field("model");
+        // delegate uses `prompt`; sessions_spawn uses `task`.
+        meta.task = str_field("prompt").or_else(|| str_field("task"));
+        if meta.task.is_none() {
+            // subagents drives an existing run via an action verb (kill/steer/list).
+            meta.task = str_field("action").or_else(|| str_field("operation"));
+        }
+    }
+
+    // Fill gaps from the result banner (carries provider/model the LLM may not
+    // have echoed back in args, and the resolved agent name).
+    if let Some(res) = result {
+        let (banner_agent, banner_model) = parse_agent_banner(res);
+        if meta.agent.is_none() {
+            meta.agent = banner_agent;
+        }
+        if meta.model.is_none() {
+            meta.model = banner_model;
+        }
+    }
+
+    if let Some(task) = meta.task.take() {
+        meta.task = Some(one_line_summary(&task, 60));
+    }
+    meta
+}
+
+/// Compose the `agent/model` identity tag shown in brackets after the tool
+/// name. Falls back to a single side, or `?` when neither is known.
+fn subagent_identity_tag(meta: &SubagentMeta) -> String {
+    match (meta.agent.as_deref(), meta.model.as_deref()) {
+        (Some(a), Some(m)) => format!("{a}/{m}"),
+        (Some(a), None) => a.to_string(),
+        (None, Some(m)) => m.to_string(),
+        (None, None) => "?".to_string(),
     }
 }
 
@@ -2268,6 +2433,132 @@ mod tests {
         assert_eq!(state.turn_count, 1, "only user messages bump turn_count");
         state.push_user_message("again");
         assert_eq!(state.turn_count, 2);
+    }
+
+    // ── BUG-11: sub-agent tool-card visibility ─────────────────────────
+
+    #[test]
+    fn subagent_tool_names_recognized() {
+        for name in ["delegate", "sessions_spawn", "subagents", "session_worker", "nodes"] {
+            assert!(is_subagent_tool(name), "{name} should be a sub-agent tool");
+        }
+        for name in ["shell", "file_write", "web_search", ""] {
+            assert!(!is_subagent_tool(name), "{name} should NOT be a sub-agent tool");
+        }
+    }
+
+    #[test]
+    fn extract_meta_from_delegate_args() {
+        // delegate args carry agent + model + prompt directly.
+        let args = r#"{"agent":"researcher","model":"kimi-2.6","prompt":"summarize the codebase architecture"}"#;
+        let meta = extract_subagent_meta(args, None);
+        assert_eq!(meta.agent.as_deref(), Some("researcher"));
+        assert_eq!(meta.model.as_deref(), Some("kimi-2.6"));
+        assert_eq!(meta.task.as_deref(), Some("summarize the codebase architecture"));
+        assert!(!meta.is_empty());
+    }
+
+    #[test]
+    fn extract_meta_fills_model_from_result_banner() {
+        // When args omit model, the delegate result banner supplies provider/model.
+        let args = r#"{"agent":"coder","prompt":"write a fib fn"}"#;
+        let result = "[Agent 'coder' (openrouter/anthropic/claude-sonnet-4)]\nfn fib(n: u64) -> u64 { ... }";
+        let meta = extract_subagent_meta(args, Some(result));
+        assert_eq!(meta.agent.as_deref(), Some("coder"));
+        // model side of `provider/model` keeps the trailing segment.
+        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn extract_meta_from_sessions_spawn_task_field() {
+        // sessions_spawn uses `task` rather than `prompt`.
+        let args = r#"{"agent":"worker","task":"run the test suite and report failures"}"#;
+        let meta = extract_subagent_meta(args, None);
+        assert_eq!(meta.agent.as_deref(), Some("worker"));
+        assert_eq!(meta.task.as_deref(), Some("run the test suite and report failures"));
+    }
+
+    #[test]
+    fn extract_meta_bad_json_is_empty() {
+        // Malformed args must never panic and yield no fields (caller falls back).
+        let meta = extract_subagent_meta("not json at all", None);
+        assert!(meta.is_empty(), "bad JSON → empty meta");
+    }
+
+    #[test]
+    fn identity_tag_prefers_agent_slash_model() {
+        let meta = SubagentMeta {
+            agent: Some("researcher".into()),
+            model: Some("kimi-2.6".into()),
+            task: None,
+        };
+        assert_eq!(subagent_identity_tag(&meta), "researcher/kimi-2.6");
+        let only_model = SubagentMeta {
+            agent: None,
+            model: Some("gpt-4o".into()),
+            task: None,
+        };
+        assert_eq!(subagent_identity_tag(&only_model), "gpt-4o");
+        assert_eq!(subagent_identity_tag(&SubagentMeta::default()), "?");
+    }
+
+    #[test]
+    fn one_line_summary_collapses_and_clips() {
+        let raw = "line one\n  line   two\tand more words here to overflow the limit clearly";
+        let out = one_line_summary(raw, 20);
+        assert!(!out.contains('\n'), "newlines collapsed");
+        assert!(out.chars().count() <= 20, "clipped to max");
+        assert!(out.ends_with('…'), "overflow gets ellipsis");
+    }
+
+    #[test]
+    fn render_delegate_card_shows_robot_and_identity() {
+        // The rendered sub-agent card must surface the robot glyph, the
+        // agent/model identity tag, and the task summary so nested delegation
+        // is visible from the parent TUI.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let args = r#"{"agent":"researcher","model":"kimi-2.6","prompt":"investigate the bug"}"#;
+        render_tool_result(
+            &mut lines,
+            "delegate",
+            "agent: researcher",
+            args,
+            Some("[Agent 'researcher' (openrouter/kimi-2.6)]\nFound the root cause."),
+            ToolStatus::Done,
+            Some(1200),
+            true, // folded
+            true, // ascii — deterministic, no unicode glyphs
+        );
+        let header = lines.first().map(line_to_plain).expect("test: header line present");
+        assert!(header.contains("[bot]"), "ascii robot marker present: {header}");
+        assert!(header.contains("delegate["), "tool name + bracket: {header}");
+        assert!(header.contains("researcher/kimi-2.6"), "identity tag: {header}");
+        assert!(header.contains("investigate the bug"), "task summary: {header}");
+    }
+
+    #[test]
+    fn render_non_subagent_card_unchanged() {
+        // A normal tool keeps the classic `Tool(args)` header — no robot.
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        render_tool_result(
+            &mut lines,
+            "shell",
+            "ls /tmp",
+            r#"{"command":"ls /tmp"}"#,
+            Some("file_a\nfile_b"),
+            ToolStatus::Done,
+            Some(34),
+            true,
+            true,
+        );
+        let header = lines.first().map(line_to_plain).expect("test: header line present");
+        assert!(header.contains("shell(ls /tmp)"), "classic header: {header}");
+        assert!(!header.contains("[bot]"), "no robot for normal tools: {header}");
+    }
+
+    /// Flatten a rendered `Line` into plain text for assertions.
+    fn line_to_plain(line: &Line<'_>) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
 
     // ── P3-5: streaming-draft API tests ────────────────────────────────

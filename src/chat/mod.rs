@@ -1126,7 +1126,7 @@ pub async fn run(
             dual_write_guard: dual_write_guard.clone(),
             redraw_tx: None,
             shutdown: shutdown.clone(),
-            model: Arc::from(model_name),
+            model: dispatcher::ModelSlot::new(Arc::from(model_name)),
             temperature,
             tools_registry: Some(Arc::clone(&tools_registry)),
             max_tool_iterations: config.agent.max_tool_iterations,
@@ -1144,6 +1144,12 @@ pub async fn run(
     // 前复制出来，spawn 后仍可通过此 Arc 填入真实 sender，让 RequestRedraw 真执行。
     #[cfg(feature = "terminal-tui")]
     let executor_redraw_slot = effect_executor.redraw_handle();
+
+    // BUG-07: 提前取出 model 热替换 slot 句柄（同 redraw_slot 的思路：spawn 前 clone
+    // 出来，spawn 后仍可通过此句柄在 `/model <name>` 时替换 model，使后续 turn 的
+    // drive_start_turn_stream 读到新值）。shadow 模式无 deps → None。
+    #[cfg(feature = "terminal-tui")]
+    let model_slot = effect_executor.model_handle();
 
     // Step 5a-4: TurnCompletionSignal — Redux driver 切闸路径用此 signal 在
     // chat::run 主循环里 await turn 完成。dispatcher task 消费 terminal action
@@ -1412,6 +1418,11 @@ pub async fn run(
         }
     }
 
+    // BUG-07: 当前生效的 model 名（owned，可变）。`/model <name>` 在线切换时改写
+    // 此值；每轮循环顶部把它借为 `model_name: &str` 供后续 turn 使用（system prompt /
+    // fabric 事件 / snapshot）。初值与启动期解析出的 `model_name` 一致。
+    let mut current_model_owned: String = model_name.to_string();
+
     // ── Main message loop ────────────────────────────────────────
     while let Some(msg) = tokio::select! {
         msg = input_rx.recv() => msg,
@@ -1480,6 +1491,50 @@ pub async fn run(
                 print_fallback_chat_output(text);
             }
         };
+
+        // BUG-07: `/model <name>` 在线切换 model（同 provider 换 model）。
+        //
+        // 在 commands::dispatch 之前拦截，因为真正生效需要 (a) 改写主循环
+        // `current_model_owned`（影响后续 turn 的 system prompt / 事件记录），
+        // (b) 写 EffectDeps 的热替换 slot（影响 dispatcher 子任务下一 turn 实际请求
+        // 的 model），(c) dispatch ModelChanged 让 reducer 更新 session.model →
+        // status bar 立即反映。bare `/model`（无参）仍交给 dispatch 显示当前 model。
+        if let Some(raw) = user_input.strip_prefix("/model ") {
+            let new_model = raw.trim();
+            if new_model.is_empty() {
+                emit_chat_output("Usage: /model <name>");
+                continue;
+            }
+            match providers::validate_provider_model(provider_name, new_model) {
+                Ok(()) => {
+                    current_model_owned = new_model.to_string();
+                    #[cfg(feature = "terminal-tui")]
+                    if let Some(slot) = model_slot.as_ref() {
+                        slot.set(Arc::from(new_model));
+                    }
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::ModelChanged {
+                            model: new_model.to_string(),
+                        },
+                        "chat.model_changed",
+                    );
+                    // emit_chat_output already nudges the renderer (try_send on
+                    // the TUI redraw channel) so the status bar repaints.
+                    emit_chat_output(&format!(
+                        "Switched model to {new_model} (provider {provider_name}). Applies from the next turn."
+                    ));
+                }
+                Err(e) => {
+                    emit_chat_output(&format!("Cannot switch to '{new_model}': {e}"));
+                }
+            }
+            continue;
+        }
+
+        // BUG-07: 本轮生效的 model 名（借自可变 owned 值）。`/model` 拦截已在上方
+        // 处理并 `continue`，故此处 shadow 后的 `model_name` 一定是最新值，覆盖
+        // 后续所有 `model_name` 使用点（system prompt / fabric / snapshot）。
+        let model_name: &str = current_model_owned.as_str();
 
         // BUG-04: `!cmd` bang mode — run the rest of the line directly as a
         // shell command (matching the footer hint "! for bash") instead of

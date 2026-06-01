@@ -300,6 +300,14 @@ impl Tool for DelegateTool {
                 "context": {
                     "type": "string",
                     "description": "Optional context to prepend (e.g. relevant code, prior findings)"
+                },
+                "model": {
+                    "type": "string",
+                    "description": "Optional model override. Defaults to the named agent's configured model."
+                },
+                "provider": {
+                    "type": "string",
+                    "description": "Optional provider override (e.g. 'openrouter', 'ollama'). Defaults to the named agent's configured provider."
                 }
             },
             "required": ["agent", "prompt"]
@@ -341,6 +349,22 @@ impl Tool for DelegateTool {
             .and_then(|v| v.as_str())
             .map(str::trim)
             .unwrap_or("");
+
+        // Inline overrides (BUG-10): caller may pin provider/model per call.
+        // Priority: inline arg > named agent config > (no global default here;
+        // the named agent config always supplies a concrete provider/model).
+        let provider_override = args
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let model_override = args
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         // Look up agent config
         let agent_config = match self.agents.get(agent_name) {
@@ -384,6 +408,13 @@ impl Tool for DelegateTool {
             });
         }
 
+        // Resolve effective provider/model: inline override > agent config.
+        // When omitted, fall back to the agent config (backward compatible).
+        let effective_provider = provider_override
+            .clone()
+            .unwrap_or_else(|| agent_config.provider.clone());
+        let effective_model = model_override.clone().unwrap_or_else(|| agent_config.model.clone());
+
         // Create provider for this agent
         let provider_credential_owned = agent_config
             .api_key
@@ -393,7 +424,7 @@ impl Tool for DelegateTool {
         let provider_credential = provider_credential_owned.as_ref().map(String::as_str);
 
         let provider: Box<dyn Provider> = match providers::create_provider_with_options(
-            &agent_config.provider,
+            &effective_provider,
             provider_credential,
             &self.provider_runtime_options,
         ) {
@@ -403,8 +434,7 @@ impl Tool for DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Failed to create provider '{}' for agent '{agent_name}': {e}",
-                        agent_config.provider
+                        "Failed to create provider '{effective_provider}' for agent '{agent_name}': {e}"
                     )),
                 });
             }
@@ -438,8 +468,8 @@ impl Tool for DelegateTool {
                     Some(
                         json!({
                             "agent": agent_name,
-                            "provider": agent_config.provider,
-                            "model": agent_config.model,
+                            "provider": effective_provider,
+                            "model": effective_model,
                             "agentic": agent_config.agentic,
                             "has_context": !context.is_empty()
                         })
@@ -456,8 +486,8 @@ impl Tool for DelegateTool {
                 "delegate.task.started",
                 json!({
                     "agent": agent_name,
-                    "provider": agent_config.provider,
-                    "model": agent_config.model,
+                    "provider": effective_provider,
+                    "model": effective_model,
                     "agentic": agent_config.agentic,
                     "has_context": !context.is_empty(),
                     "owner_id": scope.as_ref().and_then(|scope| scope.owner_id.clone()),
@@ -475,6 +505,8 @@ impl Tool for DelegateTool {
                 .execute_agentic(
                     agent_name,
                     agent_config,
+                    &effective_provider,
+                    &effective_model,
                     &*provider,
                     &full_prompt,
                     temperature,
@@ -487,7 +519,9 @@ impl Tool for DelegateTool {
                     fabric,
                     event_scope,
                     agent_name,
-                    agent_config,
+                    &effective_provider,
+                    &effective_model,
+                    agent_config.agentic,
                     scope.as_ref(),
                     &result,
                     false,
@@ -503,7 +537,7 @@ impl Tool for DelegateTool {
             provider.chat_with_system(
                 agent_config.system_prompt.as_deref(),
                 &full_prompt,
-                &agent_config.model,
+                &effective_model,
                 temperature,
             ),
         )
@@ -523,7 +557,9 @@ impl Tool for DelegateTool {
                         fabric,
                         event_scope,
                         agent_name,
-                        agent_config,
+                        &effective_provider,
+                        &effective_model,
+                        agent_config.agentic,
                         scope.as_ref(),
                         &Ok(tool_result.clone()),
                         true,
@@ -545,8 +581,8 @@ impl Tool for DelegateTool {
                     success: true,
                     output: format!(
                         "[Agent '{agent_name}' ({provider}/{model})]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
+                        provider = effective_provider,
+                        model = effective_model
                     ),
                     error: None,
                 };
@@ -556,7 +592,9 @@ impl Tool for DelegateTool {
                         fabric,
                         event_scope,
                         agent_name,
-                        agent_config,
+                        &effective_provider,
+                        &effective_model,
+                        agent_config.agentic,
                         scope.as_ref(),
                         &Ok(tool_result.clone()),
                         false,
@@ -577,7 +615,9 @@ impl Tool for DelegateTool {
                         fabric,
                         event_scope,
                         agent_name,
-                        agent_config,
+                        &effective_provider,
+                        &effective_model,
+                        agent_config.agentic,
                         scope.as_ref(),
                         &Ok(tool_result.clone()),
                         false,
@@ -645,11 +685,14 @@ async fn record_delegate_task_event(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_delegate_terminal_task_event(
     fabric: &MemoryFabric,
     scope: MessageEventScope,
     agent_name: &str,
-    agent_config: &DelegateAgentConfig,
+    provider: &str,
+    model: &str,
+    agentic: bool,
     delegate_scope: Option<&DelegateScope>,
     result: &anyhow::Result<ToolResult>,
     timeout: bool,
@@ -678,9 +721,9 @@ async fn record_delegate_terminal_task_event(
             "error": error,
             "output_preview": output_preview,
             "agent": agent_name,
-            "provider": agent_config.provider,
-            "model": agent_config.model,
-            "agentic": agent_config.agentic,
+            "provider": provider,
+            "model": model,
+            "agentic": agentic,
             "owner_id": delegate_scope.and_then(|scope| scope.owner_id.clone()),
             "topic_id": delegate_scope.and_then(|scope| scope.topic_id.clone()),
             "parent_task_id": delegate_scope.and_then(|scope| scope.task_id.clone()),
@@ -691,10 +734,13 @@ async fn record_delegate_terminal_task_event(
 }
 
 impl DelegateTool {
+    #[allow(clippy::too_many_arguments)]
     async fn execute_agentic(
         &self,
         agent_name: &str,
         agent_config: &DelegateAgentConfig,
+        effective_provider: &str,
+        effective_model: &str,
         provider: &dyn Provider,
         full_prompt: &str,
         temperature: f64,
@@ -765,8 +811,8 @@ impl DelegateTool {
                 &sub_tools,
                 &noop_observer,
                 &hooks,
-                &agent_config.provider,
-                &agent_config.model,
+                effective_provider,
+                effective_model,
                 temperature,
                 true,
                 None,
@@ -814,8 +860,8 @@ impl DelegateTool {
                     success: true,
                     output: format!(
                         "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
-                        provider = agent_config.provider,
-                        model = agent_config.model
+                        provider = effective_provider,
+                        model = effective_model
                     ),
                     error: None,
                 })
@@ -1552,7 +1598,16 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1571,7 +1626,16 @@ mod tests {
 
         let provider = OneToolThenFinalProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1587,7 +1651,16 @@ mod tests {
 
         let provider = InfiniteToolCallProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
             .await
             .unwrap();
 
@@ -1609,11 +1682,124 @@ mod tests {
 
         let provider = FailingProvider;
         let result = tool
-            .execute_agentic("agentic", &config, &provider, "run", 0.2, None)
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
             .await
             .unwrap();
 
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("provider boom"));
+    }
+
+    fn single_agent(name: &str, provider: &str, model: &str) -> HashMap<String, DelegateAgentConfig> {
+        let mut agents = HashMap::new();
+        agents.insert(
+            name.to_string(),
+            DelegateAgentConfig {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: false,
+                allowed_tools: Vec::new(),
+                max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        );
+        agents
+    }
+
+    #[test]
+    fn schema_exposes_inline_model_and_provider() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["model"].is_object());
+        assert!(schema["properties"]["provider"].is_object());
+        // Inline overrides must remain optional for backward compatibility.
+        let required = schema["required"].as_array().unwrap();
+        assert!(!required.contains(&json!("model")));
+        assert!(!required.contains(&json!("provider")));
+    }
+
+    #[tokio::test]
+    async fn delegate_inline_model_overrides_agent_config() {
+        // Agent config model is "config-model"; inline override pins "pinned-model".
+        let tool = DelegateTool::new(single_agent("tester", "mock", "config-model"), None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "hello",
+                "model": "pinned-model"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "mock provider should succeed: {:?}", result.error);
+        // The formatted output records the effective (overridden) model.
+        assert!(
+            result.output.contains("pinned-model"),
+            "output should reflect inline model: {}",
+            result.output
+        );
+        assert!(
+            !result.output.contains("config-model"),
+            "inline model must replace config model: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_inline_provider_overrides_agent_config() {
+        // Agent config provider is valid ("mock"); inline override forces an
+        // invalid provider so we can observe that the override path is taken
+        // (provider creation fails naming the override, not the config value).
+        let tool = DelegateTool::new(single_agent("tester", "mock", "m"), None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "hello",
+                "provider": "totally-invalid-provider"
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.as_deref().unwrap_or("");
+        assert!(
+            err.contains("totally-invalid-provider"),
+            "error should name the inline provider override: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delegate_without_inline_uses_agent_config() {
+        // No inline model/provider → backward-compatible: agent config wins.
+        let tool = DelegateTool::new(single_agent("tester", "mock", "config-model"), None, test_security());
+        let result = tool
+            .execute(json!({
+                "agent": "tester",
+                "prompt": "hello"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "mock provider should succeed: {:?}", result.error);
+        assert!(
+            result.output.contains("mock/config-model"),
+            "output should reflect agent config provider/model: {}",
+            result.output
+        );
     }
 }

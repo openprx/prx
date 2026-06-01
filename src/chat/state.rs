@@ -500,6 +500,13 @@ impl ChatState {
                 self.session.mode = mode;
                 vec![Effect::RequestRedraw]
             }
+            Action::ModelChanged { model } => {
+                // BUG-07: /model <name> 在线切换。更新 session.model 让 status bar
+                // 立刻显示新 model；后续 LLM turn 真切 model 由主循环写 EffectDeps
+                // 热替换 slot 完成（reducer 不持有 provider，故只负责 UI 账本）。
+                self.session.model = Arc::from(model.as_str());
+                vec![Effect::RequestRedraw]
+            }
             Action::HistoryCleared => self.reduce_history_cleared(),
             Action::HistoryClearedWithNotice { notice } => self.reduce_history_cleared_with_notice(notice),
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
@@ -1770,6 +1777,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SlashCommandIssued { .. } => false,
         // 模式切换：仅写 session.mode，UI 不显示模式（status bar 没 mode 字段）
         Action::ModeChanged(_) => false,
+        // BUG-07: 模型切换写 session.model，status bar 显示该字段 → dirty.
+        Action::ModelChanged { .. } => true,
 
         // 流式 / 工具事件：全部写 stream.draft 或 conversation_lines → dirty
         Action::TurnStarted { .. }
@@ -4167,6 +4176,31 @@ mod tests {
             let _ = state.reduce(Action::ModeChanged(ChatMode::Edit));
             legacy.set_mode(ChatMode::Edit);
             assert_eq!(state.session.mode, legacy.mode, "Edit 模式应一致");
+        }
+
+        /// BUG-07: `ModelChanged` reducer 更新 `session.model`，使 status bar 立刻
+        /// 反映新 model，且新值进入 UI snapshot（snapshot.model 取 session.model）。
+        #[test]
+        fn redux_model_changed_updates_session_and_snapshot() {
+            let mut state = s();
+            assert_eq!(&*state.session.model, "gpt-4o-mini", "初始 model");
+
+            let effects = state.reduce(Action::ModelChanged {
+                model: "anthropic/claude-sonnet-4".to_string(),
+            });
+            assert_eq!(&*state.session.model, "anthropic/claude-sonnet-4", "model 已切换");
+            assert!(
+                effects.iter().any(|e| matches!(e, Effect::RequestRedraw)),
+                "ModelChanged 应请求重绘以刷新 status bar"
+            );
+
+            // snapshot.model 取自 session.model；build_ui_snapshot 仅在 terminal-tui
+            // feature 下存在，故 snapshot 断言对该 feature 收口。
+            #[cfg(feature = "terminal-tui")]
+            {
+                let snap = state.build_ui_snapshot(1);
+                assert_eq!(&*snap.model, "anthropic/claude-sonnet-4", "snapshot.model 反映新 model");
+            }
         }
 
         /// T3-3-d-byte-parity: reducer `session.history` 与 legacy `ChatSession.turns`

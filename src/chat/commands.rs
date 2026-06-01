@@ -93,8 +93,12 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
         "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
         _ if input.starts_with("/model ") => {
+            // BUG-07: `/model <name>` is intercepted in the chat run loop (it
+            // needs to mutate the live model slot + main-loop state), so this
+            // arm is normally unreachable. Kept as a correct fallback for any
+            // caller that routes through `dispatch` directly (e.g. tests).
             let new_model = input["/model ".len()..].trim();
-            CommandResult::HandledWithOutput(format!("Model switching requires restarting: prx chat -m {new_model}"))
+            CommandResult::HandledWithOutput(format!("Switching model to {new_model}…"))
         }
         _ if input.starts_with("/provider ") => {
             let new_provider = input["/provider ".len()..].trim();
@@ -154,7 +158,7 @@ pub fn format_clear_feedback(cleared: u32) -> String {
 }
 
 fn format_model_feedback(model_name: &str) -> String {
-    format!("Current model: {model_name}\nAvailable: restart with `prx chat -m <model>` to switch models")
+    format!("Current model: {model_name}\nSwitch live with `/model <name>` (same provider).")
 }
 
 fn format_tools_feedback(tools_registry: &[Box<dyn Tool>]) -> String {
@@ -529,7 +533,8 @@ mod mode_tests {
         let text = command_output(super::dispatch("/model", &ctx).await);
 
         assert!(text.contains("Current model: kimi-code"));
-        assert!(text.contains("Available:"));
+        // BUG-07: bare `/model` now advertises the live-switch command.
+        assert!(text.contains("/model <name>"));
         assert_system_message_added(text, "Current model: kimi-code");
     }
 
