@@ -4522,56 +4522,51 @@ pub async fn run(
     model_override: Option<String>,
     temperature: f64,
 ) -> Result<String> {
-    // ── Wire up agnostic subsystems ──────────────────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
+    // The CLI agent entry is always a full interactive/single-shot run with no
+    // memory-only early-exit (unlike chat's `--list-sessions`), so it always
+    // needs memory + tools: use `Interactive`. The bootstrap wires
+    // observer → security(+audit) → memory → runtime → tools in the hard-ordered
+    // sequence, replacing the former hand-wired block (behaviour-equivalent).
+    let ctx = crate::runtime::bootstrap::RuntimeBootstrap::build(
+        config,
+        crate::runtime::bootstrap::BootstrapProfile::Interactive,
+    )
+    .await?;
+
+    // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
+    // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so all the
+    // `config.xxx` accesses below are unchanged.
+    let config = Arc::clone(&ctx.config);
+
+    let observer = Arc::clone(&ctx.observer);
+    // hooks are not part of AppContext — keep the local construction unchanged.
     let hooks = HookManager::new(config.workspace_dir.clone());
-    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    // security is consumed only by tool construction, which now happens inside the
+    // bootstrap; it is not re-bound here on purpose (no downstream use in `run`).
+    // The local runtime adapter is likewise built and consumed inside the
+    // bootstrap, so it is no longer constructed here.
 
     // ── Memory (the brain) ────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
-        &config.memory,
-        &config.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-        &config.identity_bindings,
-        &config.user_policies,
-    )?);
-    tracing::info!(backend = mem.name(), "Memory initialized");
+    // The Interactive profile always builds memory, so it is Some here; take it
+    // explicitly without panicking (iron rules 1/6).
+    let mem: Arc<dyn Memory> = ctx
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for the agent CLI"))?;
     let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
     let agent_run_id = Uuid::new_v4().to_string();
     let mut fabric_turn_seq: u64 = 0;
 
     // ── Tools ────────────────────────────────────────────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    let tools_registry = tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    );
+    // The Interactive profile built the tool registry inside the bootstrap
+    // (security + runtime + memory all ready) using the identical
+    // `all_tools_with_runtime` call with the same arguments; take it explicitly.
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
+        .tools
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
