@@ -80,7 +80,6 @@ use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::ResourceRiskLevel;
 use crate::tools::{self, Tool};
@@ -3873,10 +3872,10 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     // FIX-P1-31: thread the real `security.audit` config so the side-effect gate
     // audit trail honours it (e.g. `enabled=false` ⇒ no per-message fsync).
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    // BUG-D1-01 class: route through the single `build_security_policy` helper so
+    // no mode can forget `with_audit_config`. Wiring is verbatim-identical to the
+    // former local construction (gateway uses the same helper).
+    let security = crate::runtime::bootstrap::build_security_policy(&config);
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
