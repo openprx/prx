@@ -97,7 +97,11 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             } else {
                 info!("🚀 Starting OpenPRX Gateway on {host}:{port}");
             }
-            gateway::run_gateway(&host, port, config).await
+            // Direct `prx gateway` CLI path: no daemon-owned hot-reload watcher
+            // exists, so pass `None` and let run_gateway build its own SharedConfig
+            // fallback (only the in-gateway ConfigReloadTool / API reload can update
+            // it; file-watch hot-reload is daemon-only).
+            gateway::run_gateway(&host, port, config, None).await
         }
 
         Commands::Daemon { port, host } => {

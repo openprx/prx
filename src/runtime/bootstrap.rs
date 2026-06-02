@@ -521,21 +521,19 @@ mod tests {
     ///   - `agent/agent.rs`, `agent/loop_.rs`: agent builder / `process_message` paths,
     ///     not yet converged (later D-series).
     ///   - `cron/scheduler.rs`: cron job path, not yet converged.
-    ///   - `gateway/mod.rs:372`, `gateway/api/mod.rs`, `gateway/api/config.rs`,
-    ///     `gateway/api/sessions.rs`: D2 territory (per-authorization gateway audit
-    ///     policy); D1 did not touch these. NOTE `gateway/mod.rs` also has its
-    ///     *converged* site that routes through `build_security_policy` — that does
-    ///     not contain a hand-written `.with_audit_config(` token, so it is not
-    ///     counted here.
+    ///
+    /// D2 (2026-06-02): the four gateway authorization sites — `gateway/mod.rs`
+    /// (`authorize_gateway_resource_mutation`), `gateway/api/mod.rs`
+    /// (`authorize_resource_mutation_for_config`), `gateway/api/config.rs`
+    /// (`post_config_reload`) and `gateway/api/sessions.rs` (console runtime turn) —
+    /// were all converged onto `build_security_policy` and so were REMOVED from this
+    /// whitelist. They no longer hand-write the audit-config wiring, which keeps the
+    /// gate tight (`gate_whitelist_entries_are_all_live`).
     const HANDWIRED_AUDIT_WHITELIST: &[&str] = &[
         "session_worker/runner.rs",
         "agent/agent.rs",
         "agent/loop_.rs",
         "cron/scheduler.rs",
-        "gateway/mod.rs",
-        "gateway/api/mod.rs",
-        "gateway/api/config.rs",
-        "gateway/api/sessions.rs",
     ];
 
     /// Recursively collect every `.rs` file under `dir`.

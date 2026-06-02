@@ -25,9 +25,9 @@ use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider, ProviderCapabilityError};
 use crate::runtime;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::SideEffectGate;
 use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::security::policy::ResourceRiskLevel;
-use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::tools::{self, McpTool, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
@@ -365,11 +365,13 @@ fn authorize_gateway_resource_mutation(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let config = state.config.lock().clone();
-    // FIX-P1-31: thread `security.audit` so the gate audit path honours
-    // `enabled=false` (no per-decision fsync on this gateway mutation route).
-    let policy = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-        .with_audit_config(config.security.audit.clone());
+    // D2: authorization reads the hot SharedConfig (D) snapshot, NOT the cached
+    // `state.config` Mutex (C), so a config reload (autonomy / security.audit change)
+    // takes effect at this decision point without a restart. Logic is otherwise
+    // identical to the prior C-based path: same `build_security_policy` construction
+    // (FIX-P1-31 audit-config wiring preserved), same gate, same allow/deny result.
+    let config = state.shared_config.load_full();
+    let policy = crate::runtime::bootstrap::build_security_policy(&config);
     SideEffectGate::new(&policy)
         .authorize_resource_operation("gateway", operation_name, risk, None)
         .map(|_| ())
@@ -383,8 +385,21 @@ fn gateway_channel_webhook_operation(channel: &str, action: &str) -> String {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
+    /// Cached config (C) — a NON-authoritative, NON-authorization snapshot.
+    ///
+    /// D2 invariant: **no security / authorization decision may read `config`.**
+    /// All allow/deny gating reads [`shared_config`](Self::shared_config) (D) via
+    /// `load_full()` so config reloads take effect without a restart. `config` is
+    /// kept only for display/persist paths (serving the current config to the Web
+    /// Console, resolving `workspace_dir` for upload paths, persisting paired
+    /// tokens, etc.). Every config mutation route still dual-writes C **and** D
+    /// (holding this Mutex while it `.store()`s D) so the two stay consistent for
+    /// those non-security consumers; see `api/config.rs`.
     pub config: Arc<Mutex<Config>>,
-    /// ArcSwap-backed config for hot-reload tools (P1.5 / P3-1).
+    /// ArcSwap-backed hot config (D) — the SINGLE source of truth for every gateway
+    /// authorization decision (P1.5 / P3-1, D2). Updated by the daemon file-watch
+    /// hot-reload manager, the `ConfigReloadTool`, and the `/api/config/reload`
+    /// route; read lock-free via `load_full()` at each authz point.
     pub shared_config: crate::config::SharedConfig,
     pub provider: Arc<dyn Provider>,
     pub model: String,
@@ -441,8 +456,21 @@ pub struct AppState {
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
+///
+/// `shared_config` is the single SharedConfig snapshot the gateway uses for ALL
+/// authorization decisions (D2). When the gateway runs under the daemon, the
+/// daemon owns this handle and also wires it to the file-watch hot-reload manager,
+/// so config.toml edits become visible at every gateway authz point. When invoked
+/// directly via `prx gateway` (no daemon), `None` is passed and the gateway builds
+/// its own fallback handle — in that mode only the in-gateway ConfigReloadTool / the
+/// `/api/config/reload` route can update it (no file watcher).
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    shared_config: Option<crate::config::SharedConfig>,
+) -> Result<()> {
     let start_time = Instant::now();
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind {
@@ -452,6 +480,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
+    // C: cached config for display/persist only (see `AppState::config`). It is
+    // NOT read by any authorization path (those read `shared_config`, D). On the
+    // reload-only paths (daemon file-watch + ConfigReloadTool / `/api/config/reload`)
+    // C intentionally lags D: only the explicit `/api/config` POST/PUT routes
+    // dual-write C+D. The lag is display-only and never affects allow/deny.
     let config_state = Arc::new(Mutex::new(config.clone()));
 
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
@@ -490,8 +523,20 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     // Built via the shared `build_security_policy` helper so this site cannot drift
-    // from (or forget) `with_audit_config` — the wiring is byte-for-byte identical to
-    // the former local `SecurityPolicy::from_config(...).with_audit_config(...)`.
+    // from (or forget) the audit-config wiring — byte-for-byte identical to the
+    // former local from_config + audit-config construction.
+    //
+    // D2 SCOPE / restart-only boundary: this `security` is a STARTUP snapshot baked
+    // into every tool instance constructed below (each tool carries its own
+    // `SideEffectGate`). It is therefore **restart-only** — a config reload does NOT
+    // re-arm the security gate already embedded in a live tool. Tool-execution
+    // authorization is per the user-ruled restart-only scope and is intentionally NOT
+    // hot in this increment. What IS hot (reads the SharedConfig D at decision time):
+    // gateway resource-mutation routes (`authorize_gateway_resource_mutation`), the
+    // `/api/*` config-mutation gates (`authorize_resource_mutation`), per-session /
+    // console runtime-turn policies, and the `/api/config/reload` route's own gate.
+    // The cron / webhook / evolution supervisors likewise use a restart-only security
+    // snapshot (their hot-reload is out of this increment's scope).
     let security = crate::runtime::bootstrap::build_security_policy(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -607,10 +652,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         None
     };
 
-    // Register config_reload tool backed by an ArcSwap-wrapped config snapshot.
-    // The gateway still uses `config_state` (Mutex) for internal mutable state;
-    // this separate SharedConfig is solely for the hot-reload tool.
-    let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
+    // D2: the SharedConfig (D) is the single source of truth for all gateway
+    // authorization decisions. Use the daemon-injected handle when present (so the
+    // daemon's file-watch hot-reload is observed here); otherwise build a fallback
+    // for the standalone `prx gateway` path. The ConfigReloadTool and the
+    // `/api/config/reload` route both `.store()` into THIS handle, and every authz
+    // helper reads from it, so a reload is immediately visible to allow/deny.
+    let shared_config_for_reload =
+        shared_config.unwrap_or_else(|| Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())));
     tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
         Arc::clone(&shared_config_for_reload),
         security.clone(),
@@ -972,7 +1021,7 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.pairing).await {
+            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.shared_config, &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -1007,19 +1056,32 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(config: Arc<Mutex<Config>>, pairing: &PairingGuard) -> Result<()> {
+async fn persist_pairing_tokens(
+    config: Arc<Mutex<Config>>,
+    shared_config: &crate::config::SharedConfig,
+    pairing: &PairingGuard,
+) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    // This is needed because parking_lot's guard is not Send so we clone the inner
-    // this should be removed once async mutexes are used everywhere
-    let mut updated_cfg = { config.lock().clone() };
+    // D2 (correctness): base the persisted config on the hot SharedConfig (D)
+    // snapshot, NOT the cached C Mutex. C lags D on the reload-only paths; if we
+    // cloned a stale C, saved it, and re-stored it, we would write hot-reloaded
+    // fields back to their old values on disk AND clobber D. Cloning the D snapshot
+    // guarantees we only add the pairing tokens on top of the current authoritative
+    // config.
+    let mut updated_cfg = (*shared_config.load_full()).clone();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg
         .save()
         .await
         .context("Failed to persist paired tokens to config.toml")?;
 
-    // Keep shared runtime config in sync with persisted tokens.
-    *config.lock() = updated_cfg;
+    // Publish to D and re-sync C to it (hold the Mutex across the `.store()` so the
+    // two stores stay observably consistent), preserving the C == D invariant.
+    {
+        let mut guard = config.lock();
+        *guard = updated_cfg.clone();
+        shared_config.store(Arc::new(updated_cfg));
+    }
     Ok(())
 }
 
@@ -2005,6 +2067,84 @@ mod tests {
         assert_clone::<AppState>();
     }
 
+    /// Build a minimal `AppState` whose cached C and hot D both start from `config`,
+    /// for exercising the gateway authorization helpers in isolation.
+    fn authz_test_state(config: Config) -> AppState {
+        AppState {
+            config: Arc::new(Mutex::new(config.clone())),
+            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            provider: Arc::new(MockProvider::default()),
+            model: "test-model".into(),
+            temperature: 0.0,
+            mem: Arc::new(MockMemory),
+            auto_save: false,
+            tools_registry: Arc::new(vec![]),
+            mcp_tool: None,
+            hooks: Arc::new(HookManager::new(std::env::temp_dir())),
+            webhook_token_hash: None,
+            webhook_signing_secret: None,
+            pairing: Arc::new(PairingGuard::new(false, &[])),
+            trust_forwarded_headers: false,
+            rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            whatsapp: None,
+            signal: None,
+            whatsapp_app_secret: None,
+            linq: None,
+            linq_signing_secret: None,
+            nextcloud_talk: None,
+            nextcloud_talk_webhook_secret: None,
+            observer: Arc::new(crate::observability::NoopObserver),
+            start_time: Instant::now(),
+            gateway_port: 0,
+            logs_broadcast_tx: broadcast::channel(16).0,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_middleware: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_hook_executor: None,
+            #[cfg(feature = "wasm-plugins")]
+            wasm_cron_manager: None,
+            #[cfg(feature = "wasm-plugins")]
+            event_bus: None,
+        }
+    }
+
+    /// D2 / T1 (core mutation point): `authorize_gateway_resource_mutation` reads the
+    /// hot SharedConfig (D). Publishing a ReadOnly config to D ONLY (C left stale)
+    /// flips a previously-allowed core gateway mutation to denied — no restart, and
+    /// proving the decision no longer depends on C.
+    #[test]
+    fn gateway_core_authz_reads_hot_shared_config_after_reload() {
+        use crate::security::policy::ResourceRiskLevel;
+
+        let state = authz_test_state(Config::default());
+        assert!(
+            authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low).is_ok(),
+            "default (Supervised) autonomy should allow a low-risk core gateway mutation"
+        );
+
+        let read_only = Config {
+            autonomy: crate::config::AutonomyConfig {
+                level: crate::security::policy::AutonomyLevel::ReadOnly,
+                ..crate::config::AutonomyConfig::default()
+            },
+            ..Config::default()
+        };
+        // Publish to D only; C stays at the permissive default on purpose.
+        state.shared_config.store(Arc::new(read_only));
+
+        let denied = authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low)
+            .expect_err("ReadOnly published to D must deny the core gateway mutation");
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+        // C is unchanged — the deny came purely from reading D.
+        assert_eq!(
+            state.config.lock().autonomy.level,
+            crate::security::policy::AutonomyLevel::default()
+        );
+    }
+
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
@@ -2275,35 +2415,85 @@ mod tests {
         assert_eq!(normalize_max_keys(1, 10_000), 1);
     }
 
+    /// D2 / 修3 regression: `persist_pairing_tokens` must base the persisted/published
+    /// config on the HOT SharedConfig (D) snapshot, NOT the cached C Mutex. On the
+    /// reload-only paths C lags D; if persist cloned a stale C, saved it, and re-stored
+    /// it, every field a prior hot-reload changed would be silently reverted on disk AND
+    /// in D — only the pairing token would survive.
+    ///
+    /// Hardening (Codex review): we seed C with a STALE value and D with a DIFFERENT HOT
+    /// value of an observable, round-tripping field (`default_temperature`: C=0.0 stale,
+    /// D=0.42 hot — simulating a reload C has not yet observed), then assert the hot value
+    /// SURVIVES persistence. If the base were C, the saved file (and D) would revert to
+    /// 0.0; this assertion fails in that case, so the test genuinely guards the merge base.
     #[tokio::test]
-    async fn persist_pairing_tokens_writes_config_tokens() {
+    async fn persist_pairing_tokens_uses_hot_config_base_and_writes_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let config_path = temp.path().join("config.toml");
         let workspace_path = temp.path().join("workspace");
 
-        let mut config = Config::default();
-        config.config_path = config_path.clone();
-        config.workspace_dir = workspace_path;
-        config.save().await.unwrap();
+        // C (cached Mutex): STALE base with the old, pre-reload temperature.
+        let mut cached_config = Config::default();
+        cached_config.config_path = config_path.clone();
+        cached_config.workspace_dir = workspace_path.clone();
+        cached_config.default_temperature = 0.0;
+        // Persist this stale config to disk first, mirroring a real running daemon whose
+        // on-disk file predates the hot reload.
+        cached_config.save().await.unwrap();
+
+        // D (hot SharedConfig): the HOT base with a DIFFERENT temperature, as if a prior
+        // `config_reload` published 0.42 into D while C still holds the old 0.0.
+        let mut hot_config = Config::default();
+        hot_config.config_path = config_path.clone();
+        hot_config.workspace_dir = workspace_path;
+        hot_config.default_temperature = 0.42;
 
         let guard = PairingGuard::new(true, &[]);
         let code = guard.pairing_code().unwrap();
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let shared_config = Arc::new(Mutex::new(config));
-        persist_pairing_tokens(shared_config.clone(), &guard).await.unwrap();
+        let cached = Arc::new(Mutex::new(cached_config));
+        let shared: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from_pointee(hot_config));
+        persist_pairing_tokens(cached.clone(), &shared, &guard).await.unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
+
+        // (a) The HOT field from D survived: the persisted file keeps 0.42, NOT the stale
+        // 0.0 from C. A regression that used C as the base would write 0.0 here.
+        assert!(
+            (parsed.default_temperature - 0.42).abs() < 1e-9,
+            "persist base must be D: hot default_temperature must survive on disk, got {}",
+            parsed.default_temperature
+        );
+
+        // (b) The pairing token was written.
         assert_eq!(parsed.gateway.paired_tokens.len(), 1);
         let persisted = &parsed.gateway.paired_tokens[0];
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
 
-        let in_memory = shared_config.lock();
+        // (c) C == D after persist (sync invariant restored), and both carry the HOT
+        // temperature and the new token — not the stale C value.
+        let in_memory = cached.lock();
+        assert!(
+            (in_memory.default_temperature - 0.42).abs() < 1e-9,
+            "C must be re-synced to the hot value 0.42, got {}",
+            in_memory.default_temperature
+        );
         assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
         assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
+        drop(in_memory);
+
+        let hot = shared.load_full();
+        assert!(
+            (hot.default_temperature - 0.42).abs() < 1e-9,
+            "D must retain the hot value 0.42 after persist, got {}",
+            hot.default_temperature
+        );
+        assert_eq!(hot.gateway.paired_tokens.len(), 1);
+        assert_eq!(&hot.gateway.paired_tokens[0], persisted);
     }
 
     #[test]

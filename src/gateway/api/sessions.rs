@@ -7,8 +7,8 @@ use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
+use crate::security::PolicyPipeline;
 use crate::security::policy::ResourceRiskLevel;
-use crate::security::{PolicyPipeline, SecurityPolicy};
 use axum::{
     Json,
     body::Body,
@@ -210,7 +210,13 @@ async fn run_console_runtime_turn(
     previous_turns: Vec<crate::memory::ConversationTurn>,
     source_message_event_id: Option<String>,
 ) -> anyhow::Result<String> {
-    let config_snapshot = state.config.lock().clone();
+    // D2: this runtime turn rebuilds a `SecurityPolicy` (below) that gates tool
+    // side-effects for the turn, so the config snapshot it derives from MUST be the
+    // hot SharedConfig (D), not the cached `state.config` Mutex (C). Reading D here
+    // makes a reloaded autonomy / security.audit take effect for console-driven
+    // turns without a restart; all non-security fields used for the prompt come from
+    // the same snapshot, so the turn stays internally consistent.
+    let config_snapshot = (*state.shared_config.load_full()).clone();
     let provider_label = config_snapshot
         .default_provider
         .as_deref()
@@ -258,13 +264,17 @@ async fn run_console_runtime_turn(
     }));
     history.push(ChatMessage::user(enriched_message));
 
-    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir)
-        .with_audit_config(config_snapshot.security.audit.clone());
+    // D2 / FIX-P1-31: build via the shared `build_security_policy` helper so this
+    // per-turn gateway authz site cannot drift from (or forget) the audit-config
+    // wiring — construction is byte-for-byte identical to the former local
+    // `from_config(&autonomy, &workspace_dir)` + audit-config of `security.audit`.
+    // `config_snapshot` is already the hot SharedConfig (D) snapshot (see above), so
+    // a reloaded autonomy / security.audit gates this console turn without a restart.
+    let security = crate::runtime::bootstrap::build_security_policy(&config_snapshot);
     let policy_pipeline = PolicyPipeline::from_config(&config_snapshot);
     let scope_owner_id = envelope.resolved_owner_id();
     let scope_ctx = ScopeContext {
-        policy: &security,
+        policy: security.as_ref(),
         sender: envelope.sender.as_deref().unwrap_or("console-user"),
         channel: envelope.channel.as_deref().unwrap_or("console"),
         chat_type: "private",
@@ -1022,5 +1032,192 @@ mod tests {
         );
         assert_eq!(history.last().map(|m| m.role.as_str()), Some("user"));
         assert!(history.last().is_some_and(|m| m.content.contains("current question")));
+    }
+
+    /// D2 / T1: gateway authorization reads the hot SharedConfig (D), so a config
+    /// reload that lowers autonomy to ReadOnly flips a previously-allowed mutation
+    /// to denied — WITHOUT any restart and WITHOUT touching the cached `state.config`
+    /// (C). This is the load-bearing behavior of the hot-reload-takes-effect fix.
+    #[test]
+    fn authz_reads_hot_shared_config_after_reload() {
+        use crate::security::policy::{AutonomyLevel, ResourceRiskLevel};
+
+        // Start in the default (Supervised) autonomy: a low-risk gateway mutation is
+        // allowed.
+        let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+        let state = test_app_state(Config::default(), provider);
+        assert!(
+            crate::gateway::api::authorize_resource_mutation(
+                &state,
+                "gateway_api:config:update",
+                ResourceRiskLevel::Low,
+            )
+            .is_ok(),
+            "default (Supervised) autonomy should allow a low-risk mutation"
+        );
+
+        // Hot-reload: publish a ReadOnly config into D only. C is intentionally left
+        // stale to prove authorization no longer depends on it.
+        let read_only = Config {
+            autonomy: crate::config::AutonomyConfig {
+                level: AutonomyLevel::ReadOnly,
+                ..crate::config::AutonomyConfig::default()
+            },
+            ..Config::default()
+        };
+        state.shared_config.store(Arc::new(read_only));
+
+        // Same call, same risk — now denied because the authz path reads D.
+        let denied = crate::gateway::api::authorize_resource_mutation(
+            &state,
+            "gateway_api:config:update",
+            ResourceRiskLevel::Low,
+        )
+        .expect_err("ReadOnly autonomy published to SharedConfig must deny the mutation");
+        assert_eq!(denied.0, axum::http::StatusCode::FORBIDDEN);
+        assert!(
+            denied
+                .1
+                .0
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .contains("read-only mode"),
+            "denial reason should reflect read-only autonomy"
+        );
+    }
+
+    /// D2 /修3 regression: `post_config` merges the incoming delta onto the hot
+    /// SharedConfig (D), NOT the cached C Mutex. We seed D with a hot field value that
+    /// differs from C, POST an unrelated delta, and assert the hot field SURVIVES — if
+    /// the merge had used stale C as its base it would silently revert the hot field.
+    #[tokio::test]
+    async fn post_config_merge_base_is_hot_shared_config_not_stale_cache() {
+        use super::super::config::post_config;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+
+        // C (cached) base: default temperature, valid config path on disk.
+        let mut cached = Config::default();
+        cached.config_path = config_path.clone();
+        cached.workspace_dir = workspace.clone();
+        cached.default_temperature = 0.0;
+
+        let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+        let state = test_app_state(cached, provider);
+
+        // D (hot) holds a DIFFERENT default_temperature — simulating a prior hot
+        // reload that C has not yet observed.
+        let mut hot = Config::default();
+        hot.config_path = config_path.clone();
+        hot.workspace_dir = workspace;
+        hot.default_temperature = 0.42;
+        state.shared_config.store(Arc::new(hot));
+
+        // POST a delta that does NOT touch default_temperature.
+        let resp = post_config(
+            axum::extract::State(state.clone()),
+            axum::Json(serde_json::json!({ "auto_save": true })),
+        )
+        .await;
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+
+        // The hot value from D survived the merge (would be 0.0 if C were the base).
+        let after = state.shared_config.load_full();
+        assert!(
+            (after.default_temperature - 0.42).abs() < 1e-9,
+            "merge base must be D: hot default_temperature should be preserved, got {}",
+            after.default_temperature
+        );
+        // C is re-synced to D (C == D invariant restored).
+        assert!((state.config.lock().default_temperature - 0.42).abs() < 1e-9);
+    }
+
+    /// D2 / 修1: the `/api/config/reload` route builds its OWN authorization gate from
+    /// the hot SharedConfig (D). Publishing ReadOnly to D causes the reload's gate to
+    /// deny, proving reload authz reads D and not the stale C Mutex.
+    ///
+    /// This test is hardened against the "500 could be IO, not authz" ambiguity in two
+    /// independent ways (Codex review hardening):
+    ///   (a) the D config_path points at a REAL, loadable `config.toml` on disk, so the
+    ///       `ConfigReloadTool` load step (`Config::load_from_path`) CANNOT fail — any
+    ///       500 therefore can only come from the read-only authorization gate; and
+    ///   (b) we assert the surfaced error body carries the gate's signature string
+    ///       (`"read-only mode"`, produced by `SideEffectGate::authorize_resource_operation`
+    ///       under `AutonomyLevel::ReadOnly`), not a `"Failed to load merged config"` /
+    ///       `"Config path is not set"` IO message; and
+    ///   (c) a positive control: with the SAME on-disk path but D = Supervised, the very
+    ///       same request SUCCEEDS (200). The only thing that changed between the two runs
+    ///       is the autonomy level in D, so the difference is proven to come from authz,
+    ///       not from config loading.
+    #[tokio::test]
+    async fn config_reload_route_authz_reads_hot_shared_config() {
+        use super::super::config::post_config_reload;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        // Write a REAL, valid config.toml so the reload's load step cannot fail. With a
+        // loadable path, a 500 can only originate from the authorization gate.
+        std::fs::create_dir_all(&workspace).expect("create workspace dir");
+        std::fs::write(&config_path, "default_temperature = 0.3\n").expect("write config.toml");
+
+        let mut base = Config::default();
+        base.config_path = config_path.clone();
+        base.workspace_dir = workspace.clone();
+
+        // --- Positive control: D = Supervised, SAME on-disk path → reload SUCCEEDS. ---
+        // Proves the config_path is genuinely loadable and the only variable across the
+        // two assertions below is the autonomy level published to D.
+        let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+        let allow_state = test_app_state(base.clone(), provider);
+        let mut supervised = Config::default();
+        supervised.config_path = config_path.clone();
+        supervised.workspace_dir = workspace.clone();
+        supervised.autonomy.level = crate::security::policy::AutonomyLevel::Supervised;
+        allow_state.shared_config.store(Arc::new(supervised));
+
+        let allow_resp = post_config_reload(axum::extract::State(allow_state)).await;
+        assert_eq!(
+            allow_resp.status(),
+            axum::http::StatusCode::OK,
+            "Supervised autonomy with a valid config_path must allow the reload (positive control)"
+        );
+
+        // --- Denial: D = ReadOnly, SAME on-disk path → reload BLOCKED by the gate. ---
+        let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
+        let state = test_app_state(base, provider);
+        // Publish ReadOnly to D only; C stays permissive (default Supervised).
+        let mut read_only = Config::default();
+        read_only.config_path = config_path;
+        read_only.workspace_dir = workspace;
+        read_only.autonomy.level = crate::security::policy::AutonomyLevel::ReadOnly;
+        state.shared_config.store(Arc::new(read_only));
+
+        let resp = post_config_reload(axum::extract::State(state)).await;
+        // ReadOnly gate denial surfaces as INTERNAL_SERVER_ERROR carrying the gate error.
+        assert_eq!(resp.status(), axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+
+        // Inspect the error BODY: it must be the authorization-gate signature, NOT an IO
+        // failure. This distinguishes "blocked by read-only authz" from "failed to load
+        // config", which is the whole point of the D2/修1 fix.
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("read reload error body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("error body is JSON");
+        let error_text = json
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            error_text.contains("read-only mode"),
+            "reload denial must come from the read-only authorization gate, got: {error_text}"
+        );
+        assert!(
+            !error_text.contains("Failed to load merged config") && !error_text.contains("Config path is not set"),
+            "denial must NOT be an IO/load failure, got: {error_text}"
+        );
     }
 }

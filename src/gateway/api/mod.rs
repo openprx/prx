@@ -25,7 +25,11 @@ pub(super) fn authorize_resource_mutation(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    let config = state.config.lock().clone();
+    // D2: authorization reads the hot SharedConfig (D) snapshot, not the cached
+    // `state.config` Mutex (C), so config reloads (autonomy / security.audit) take
+    // effect here without restart. `authorize_resource_mutation_for_config` builds
+    // the exact same policy as before — only the config source changed (C → D).
+    let config = state.shared_config.load_full();
     authorize_resource_mutation_for_config(&config, operation_name, risk)
 }
 
@@ -34,10 +38,12 @@ pub(super) fn authorize_resource_mutation_for_config(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    // FIX-P1-31: thread `security.audit` so the gate audit path honours
-    // `enabled=false` on this config-mutation route.
-    let policy = crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-        .with_audit_config(config.security.audit.clone());
+    // D2 / FIX-P1-31: build via the shared `build_security_policy` helper so this
+    // gateway authz site cannot drift from (or forget) the audit-config wiring — the
+    // construction is byte-for-byte identical to the former local
+    // `from_config(&autonomy, &workspace_dir)` + audit-config of `security.audit`, and
+    // it stays on the same audit-wiring baseline as bootstrap (BUG-D1-01 class).
+    let policy = crate::runtime::bootstrap::build_security_policy(config);
     crate::security::SideEffectGate::new(&policy)
         .authorize_resource_operation("gateway_api", operation_name, risk, None)
         .map(|_| ())

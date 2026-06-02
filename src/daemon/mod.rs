@@ -24,10 +24,13 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     let max_backoff = config.reliability.channel_max_backoff_secs.max(initial_backoff);
 
     // Activate hot-reload watcher so config.toml changes take effect without restart.
+    // D2: the watcher and the gateway must observe the SAME SharedConfig snapshot so
+    // file-driven reloads are visible at every gateway authorization point. Build one
+    // handle here, hand it to the watcher AND to the gateway supervisor below.
+    let shared_config = new_shared(config.clone());
     let _hot_reload = {
         let config_path = config.config_path.clone();
-        let shared = new_shared(config.clone());
-        HotReloadManager::spawn(config_path, shared)
+        HotReloadManager::spawn(config_path, Arc::clone(&shared_config))
     };
 
     crate::health::mark_component_ok("daemon");
@@ -50,6 +53,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     {
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
+        let gateway_shared = Arc::clone(&shared_config);
         handles.push(spawn_component_supervisor(
             "gateway",
             initial_backoff,
@@ -57,7 +61,8 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
             move || {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
-                async move { crate::gateway::run_gateway(&host, port, cfg).await }
+                let shared = Arc::clone(&gateway_shared);
+                async move { crate::gateway::run_gateway(&host, port, cfg, Some(shared)).await }
             },
         ));
     }

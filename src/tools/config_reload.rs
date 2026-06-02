@@ -15,7 +15,16 @@
 //!   - `api_key`, `api_url`, `default_provider`, `default_model`
 //!   - `channels_config` (Signal, WhatsApp, Telegram, etc.)
 //!   - `memory`, `storage` backends
-//!   - `autonomy` / security policy
+//!   - already-instantiated tools / channel ACLs (the `SecurityPolicy` baked into a
+//!     live tool's `SideEffectGate` at startup is not re-armed by a reload)
+//!
+//! D2 update: `autonomy` and `security.audit` ARE hot for **gateway authorization
+//! decisions** — the gateway re-reads the SharedConfig (D) at each decision point, so
+//! a reload that changes autonomy / audit takes effect for gateway resource-mutation
+//! routes, `/api/*` config gates, per-session/console runtime turns, and this reload
+//! route's own gate WITHOUT a restart. Only the security gates already embedded in
+//! long-lived tool/channel instances (and the cron/webhook/evolution supervisors)
+//! remain restart-only.
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
@@ -54,8 +63,10 @@ impl Tool for ConfigReloadTool {
     fn description(&self) -> &str {
         "Reload merged configuration (config.toml + enabled config.d files) without restarting the daemon. \
          Hot-reloads: temperature, agent settings (max iterations/history, concurrency, priority), \
-         heartbeat, cron, and web_search settings. \
-         Provider, model, channels, memory, and security require a full restart."
+         heartbeat, cron, and web_search settings. Autonomy and security.audit changes also take effect \
+         immediately for gateway authorization decisions (resource-mutation routes, config API gates, \
+         per-session runtime turns). Provider, model, channels, and memory backends, plus the security \
+         gates already baked into live tool/channel instances, still require a full restart."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

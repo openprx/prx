@@ -14,12 +14,13 @@ use tracing::warn;
 /// POST /api/config/reload — hot-reload configuration from config.toml (authenticated).
 pub async fn post_config_reload(State(state): State<AppState>) -> Response {
     use crate::tools::Tool as _;
-    let config_snapshot = state.config.lock().clone();
-    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        crate::security::SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir)
-            .with_audit_config(config_snapshot.security.audit.clone()),
-    );
+    // D2: the reload's OWN authorization gate must read the hot SharedConfig (D)
+    // snapshot, not the cached `state.config` Mutex (C). Otherwise a prior reload
+    // that tightened autonomy / `security.audit` would not constrain the next
+    // reload's authz. Build via the shared `build_security_policy` helper so this
+    // site cannot drift from the audit-wiring baseline (BUG-D1-01 class).
+    let config_snapshot = state.shared_config.load_full();
+    let security = crate::runtime::bootstrap::build_security_policy(&config_snapshot);
     let tool = crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.shared_config), security);
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => (
@@ -81,9 +82,18 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
             .into_response();
     }
 
-    // 1. Serialize current config to JSON, merge incoming on top
-    let config = state.config.lock().clone();
-    let mut current_value = match serde_json::to_value(&config) {
+    // 1. Serialize current config to JSON, merge incoming on top.
+    //
+    // D2 (correctness): the merge BASE is the hot SharedConfig (D) snapshot, NOT the
+    // cached `state.config` Mutex (C). On the reload-only paths C intentionally lags
+    // D (only this route + `put_config_file` dual-write C); if we merged the incoming
+    // delta onto a stale C, any field a prior hot-reload changed would be silently
+    // overwritten back to its old value on the next partial POST. Basing the merge on
+    // D guarantees we layer the delta onto the current authoritative config. Step 6
+    // then re-establishes C == D so the non-security display/persist consumers stay
+    // consistent.
+    let config = state.shared_config.load_full();
+    let mut current_value = match serde_json::to_value(config.as_ref()) {
         Ok(v) => v,
         Err(e) => {
             warn!("Failed to serialize current config: {e}");
@@ -140,7 +150,11 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
             .into_response();
     }
 
-    // 6. Update in-memory config (hold Mutex while updating both stores atomically)
+    // 6. Update in-memory config. D2: D is the authoritative base, so write D AND
+    // re-sync C to it (hold the Mutex while we `.store()` D) — this both publishes the
+    // new config to every authz point and restores the C == D invariant for the
+    // display/persist consumers. Holding the Mutex across the `.store()` keeps the two
+    // stores observably consistent to any concurrent reader of C.
     {
         let mut guard = state.config.lock();
         *guard = merged_config.clone();
@@ -211,7 +225,13 @@ pub async fn put_config_file(
     Path(filename): Path<String>,
     Json(payload): Json<UpdateConfigFileRequest>,
 ) -> Response {
-    let current = state.config.lock().clone();
+    // D2: read the path fields from the hot SharedConfig (D), not the cached C Mutex.
+    // This route does not use `current` as a write-back base (the persisted content is
+    // the request payload, and the published config is re-loaded fresh from disk into
+    // `refreshed` below), so there is no stale-C overwrite risk here. We still source
+    // `config_path` / `workspace_dir` from D so every write path uniformly reads the
+    // authoritative snapshot (these fields are restart-only, so C and D agree on them).
+    let current = state.shared_config.load_full();
     if let Err(error) = super::authorize_resource_mutation(
         &state,
         "gateway_api:config:file_update",
@@ -282,7 +302,7 @@ pub async fn put_config_file(
             .into_response();
     }
 
-    let refreshed = match crate::config::Config::load_from_path(&current.config_path, current.workspace_dir) {
+    let refreshed = match crate::config::Config::load_from_path(&current.config_path, current.workspace_dir.clone()) {
         Ok(config) => config,
         Err(error) => {
             warn!("Saved file but merged config is invalid: {error}");
