@@ -201,6 +201,23 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "prx.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["prx", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["prx", "restart"];
 
+/// D2-2: one coherent "security generation".
+///
+/// The security policy and the tool policy pipeline are derived from the same
+/// `[security]` config section and must always be applied together. Bundling
+/// them in a single struct behind one `ArcSwap` guarantees that a reader either
+/// sees the whole old generation or the whole new generation — never a mix of
+/// "new security + old pipeline" (or vice versa). The whole generation is built
+/// up front and swapped in atomically (all-or-nothing) by
+/// `maybe_apply_runtime_config_update`.
+#[derive(Clone)]
+struct SecurityGen {
+    /// Security policy consulted by the channel side-effect gates and scope.
+    security: Arc<crate::security::SecurityPolicy>,
+    /// Tool policy pipeline (P3-1) passed as `ScopeContext.policy_pipeline`.
+    pipeline: Arc<crate::security::PolicyPipeline>,
+}
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -232,10 +249,20 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
-    /// Security policy used for scope-based tool access control.
-    security: Arc<crate::security::SecurityPolicy>,
-    /// Tool policy pipeline (P3-1): multi-layer allow/deny for tool calls.
-    tool_policy_pipeline: Arc<crate::security::PolicyPipeline>,
+    /// Security generation: the security policy + tool policy pipeline that the
+    /// channel's own side-effect gates (inbound/autosave/outbound/scope) consult.
+    ///
+    /// D2-2: hot-reloadable. Both the policy and the pipeline live inside a single
+    /// [`SecurityGen`] behind ONE `ArcSwap`, so a reader can never observe a
+    /// "new security + old pipeline" cross-generation mix. The rebuild (`store`)
+    /// happens only at the end of the stamp-change branch of
+    /// `maybe_apply_runtime_config_update`, after every fallible construction has
+    /// succeeded (all-or-nothing apply). Per-message paths `load_full()` exactly
+    /// once at the top of `process_channel_message` and reuse that single snapshot
+    /// for the whole message, so one message always sees one coherent generation.
+    /// The `Arc` wrapper is shared across all dispatch worker tasks (JoinSet);
+    /// `ArcSwap` load/store is lock-free.
+    security: Arc<arc_swap::ArcSwap<SecurityGen>>,
     agent_compaction: crate::config::AgentCompactionConfig,
     tool_tiering: crate::config::ToolTieringConfig,
     signal_inbound_policy: Option<InboundPolicyConfig>,
@@ -889,9 +916,12 @@ async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
     Some(ConfigFileStamp { fingerprint })
 }
 
-fn load_runtime_defaults_from_config_file(path: &Path, workspace_dir: &Path) -> Result<ChannelRuntimeDefaults> {
-    let parsed = Config::load_from_path(path, workspace_dir.to_path_buf())?;
-    Ok(runtime_defaults_from_config(&parsed))
+/// D2-2: load the full on-disk `Config` so the stamp-change branch can rebuild
+/// both the channel runtime defaults *and* the security policy / tool policy
+/// pipeline from a single coherent parse. Returns the parsed `Config` so the
+/// caller can derive everything it needs without re-reading the file.
+fn load_full_config_from_file(path: &Path, workspace_dir: &Path) -> Result<Config> {
+    Config::load_from_path(path, workspace_dir.to_path_buf())
 }
 
 async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
@@ -912,7 +942,43 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
         }
     }
 
-    let next_defaults = load_runtime_defaults_from_config_file(&config_path, ctx.workspace_dir.as_path())?;
+    // ── stamp-change branch ────────────────────────────────────────────────
+    // Reached only when the on-disk config fingerprint differs from the last
+    // applied stamp (the equality short-circuit above returns early otherwise).
+    // D2-2: this is the ONLY place the security generation (policy + pipeline) is
+    // rebuilt. Per-message paths merely `load_full()` the current snapshot — they
+    // never rebuild — so the expensive parse+construct cost is paid once per real
+    // config change, not per message.
+    //
+    // ── All-or-nothing apply (necessary security property) ──────────────────
+    // Every fallible step (config parse, provider construction) runs BEFORE any
+    // observable state is mutated. We construct the new security generation,
+    // provider, and defaults entirely up front; only after all of them succeed do
+    // we `store()` the security generation, swap the provider cache, and commit
+    // the stamp — all at the very end of this function. If any fallible step
+    // returns `Err`, we early-return with `?` having stored NOTHING: the old
+    // security generation, provider cache, and stamp all remain in force, so a
+    // reload is never partially applied (no "security hot-swapped but defaults /
+    // provider / stamp not committed" window).
+    //
+    // Load the full Config once so defaults, security policy, and tool policy
+    // pipeline all derive from the same coherent parse.
+    let next_config = load_full_config_from_file(&config_path, ctx.workspace_dir.as_path())?;
+    let next_defaults = runtime_defaults_from_config(&next_config);
+
+    // D2-2: build the new security generation up front (no store yet). The
+    // security policy is built via the shared bootstrap helper so the channel
+    // gates (inbound/autosave/outbound/scope) honour autonomy/workspace/audit
+    // changes; allow/deny logic is identical to startup construction. The tool
+    // policy pipeline is derived from [security.tool_policy] in the SAME parse so
+    // the two stay a single coherent generation.
+    let next_gen = SecurityGen {
+        security: crate::runtime::bootstrap::build_security_policy(&next_config),
+        pipeline: Arc::new(crate::security::PolicyPipeline::from_config(&next_config)),
+    };
+
+    // Fallible: provider construction. If this errors we early-return having
+    // stored nothing — the old security generation / provider / stamp survive.
     let next_default_provider = providers::create_resilient_provider_with_options(
         &next_defaults.default_provider,
         next_defaults.api_key.as_deref(),
@@ -922,12 +988,21 @@ async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Resul
     )?;
     let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
 
+    // warmup() is best-effort and non-fatal (logged, not propagated), so it is
+    // intentionally allowed to run before the commit — a failed warmup does not
+    // invalidate the constructed generation.
     if let Err(err) = next_default_provider.warmup().await {
         tracing::warn!(
             provider = %next_defaults.default_provider,
             "Provider warmup failed after config reload: {err}"
         );
     }
+
+    // ── Commit point (all fallible steps succeeded) ─────────────────────────
+    // From here on nothing can fail, so the apply is atomic in effect: the
+    // security generation, provider cache, and stamp are all committed together.
+    // D2-2: store the new security generation in a single atomic swap.
+    ctx.security.store(Arc::new(next_gen));
 
     {
         let mut cache = ctx.provider_cache.lock();
@@ -2276,6 +2351,15 @@ async fn process_channel_message(
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
         tracing::warn!("Failed to apply runtime config update: {err}");
     }
+    // D2-2: load the current security generation ONCE, immediately after the
+    // (possibly applied) config reload, and reuse this single snapshot for the
+    // entire message — inbound, autosave, outbound, and the scope/tool-call loop.
+    // This guarantees "one message = one coherent security generation": no path
+    // can observe a "new security + old pipeline" mix, and a hot-reload that lands
+    // mid-message can never split the message across two generations (outbound and
+    // scope run after the agent loop but still use this fixed start-of-message
+    // snapshot). The next message will pick up the new generation.
+    let security_gen = ctx.security.load_full();
     if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
         return;
     }
@@ -2335,7 +2419,10 @@ async fn process_channel_message(
     // abort before the first history mutation; Supervised/Full keep normal
     // traffic flowing untouched (Low risk + grant=None is allowed there).
     let inbound_op = format!("channel:{}:inbound:{}", msg.channel, msg.sender);
-    if let Err(reason) = SideEffectGate::new(ctx.security.as_ref()).authorize_resource_operation(
+    // D2-2: use the per-message security generation captured at the top of this
+    // function; rebuild only happens in the stamp-change branch of
+    // maybe_apply_runtime_config_update, never here.
+    if let Err(reason) = SideEffectGate::new(security_gen.security.as_ref()).authorize_resource_operation(
         "channel",
         &inbound_op,
         ResourceRiskLevel::Low,
@@ -2368,7 +2455,9 @@ async fn process_channel_message(
     // Persisting a memory entry is a distinct autonomous side effect, so it gets
     // its own op-id. Low/read-style: denies only under ReadOnly (or exhausted
     // budget); a deny skips the autosave and logs, never aborting the turn.
-    let autosave_allowed = SideEffectGate::new(ctx.security.as_ref())
+    // D2-2: reuse the per-message security generation so inbound+autosave for one
+    // message see one coherent policy view (no re-poll happens between them).
+    let autosave_allowed = SideEffectGate::new(security_gen.security.as_ref())
         .authorize_resource_operation(
             "channel",
             &format!("channel:{}:autosave", msg.channel),
@@ -2566,7 +2655,10 @@ async fn process_channel_message(
     // ReadOnly (or exhausted budget). A deny skips the LLM call and all reply
     // sends entirely and logs; Supervised/Full proceed normally.
     let outbound_op = format!("channel:{}:outbound", msg.channel);
-    if let Err(reason) = SideEffectGate::new(ctx.security.as_ref()).authorize_resource_operation(
+    // D2-2: reuse the per-message security generation. Outbound runs after the
+    // agent loop, but deliberately uses the start-of-message snapshot so the whole
+    // message stays within a single coherent generation.
+    if let Err(reason) = SideEffectGate::new(security_gen.security.as_ref()).authorize_resource_operation(
         "channel",
         &outbound_op,
         ResourceRiskLevel::Low,
@@ -2708,8 +2800,15 @@ async fn process_channel_message(
     // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
     let chat_type = infer_chat_type_from_message(&msg);
     let scope_owner_id = runtime_envelope.resolved_owner_id();
+    // D2-2: borrow the per-message security generation for the whole tool-call
+    // loop. ScopeContext takes `security_gen.security` and `security_gen.pipeline`
+    // from the SAME generation, so the scope authorization and the policy pipeline
+    // evaluation are guaranteed consistent (never "new policy + old pipeline").
+    // `security_gen` lives until the end of process_channel_message, covering the
+    // entire loop. Rebuild only happens in the stamp-change branch of
+    // maybe_apply_runtime_config_update.
     let scope_ctx = ScopeContext {
-        policy: &ctx.security,
+        policy: security_gen.security.as_ref(),
         sender: &msg.sender,
         channel: &msg.channel,
         chat_type,
@@ -2718,7 +2817,7 @@ async fn process_channel_message(
         topic_id: runtime_envelope.topic_id.as_deref(),
         task_id: runtime_envelope.resolved_task_id(),
         source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
-        policy_pipeline: Some(&ctx.tool_policy_pipeline),
+        policy_pipeline: Some(security_gen.pipeline.as_ref()),
     };
 
     let mut context_overflow_retries = 0usize;
@@ -3875,6 +3974,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
     // BUG-D1-01 class: route through the single `build_security_policy` helper so
     // no mode can forget `with_audit_config`. Wiring is verbatim-identical to the
     // former local construction (gateway uses the same helper).
+    //
+    // D2-2 boundary: this startup `Arc<SecurityPolicy>` is the snapshot captured by
+    // channel-aware tools (message_send/tts/sessions_spawn/sessions_send/subagents/
+    // gateway via `security.clone()` below). Those tools remain **restart-only** in
+    // this increment — they keep this fixed snapshot and do NOT observe config
+    // hot-reload, matching the gateway D2-1 boundary. Only the channel's own gates
+    // (inbound/autosave/outbound/scope) are made hot, via the `ArcSwap`-wrapped copy
+    // stored in `ctx.security`, which `maybe_apply_runtime_config_update` swaps on a
+    // config stamp change.
     let security = crate::runtime::bootstrap::build_security_policy(&config);
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
@@ -4575,8 +4683,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
-        security: Arc::clone(&security),
-        tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::from_config(&config)),
+        // D2-2: wrap the startup security generation (policy + pipeline) in a single
+        // ArcSwap so the stamp-change branch of maybe_apply_runtime_config_update can
+        // hot-swap it atomically for the channel gates. Both halves come from the
+        // same startup `config` parse, so they form one coherent generation.
+        // Channel-aware tools (message_send/tts/sessions_*) keep their own restart-
+        // only `security` snapshot (captured above), matching the gateway D2-1
+        // boundary — this increment only makes the channel's own gates hot.
+        security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+            security: Arc::clone(&security),
+            pipeline: Arc::new(crate::security::PolicyPipeline::from_config(&config)),
+        })),
         agent_compaction: config.agent.compaction.clone(),
         tool_tiering: config.tool_tiering.clone(),
         signal_inbound_policy,
@@ -4768,10 +4885,12 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -4835,10 +4954,12 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -5206,10 +5327,12 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(tmp.path().to_path_buf()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
@@ -5885,10 +6008,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -5961,10 +6086,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6037,10 +6164,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6115,10 +6244,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6192,10 +6323,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6275,10 +6408,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6386,10 +6521,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6470,10 +6607,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6571,10 +6710,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6642,7 +6783,8 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .expect("write fragment");
 
-        let defaults = load_runtime_defaults_from_config_file(&config_path, temp.path()).expect("load merged defaults");
+        let merged = load_full_config_from_file(&config_path, temp.path()).expect("load merged config");
+        let defaults = runtime_defaults_from_config(&merged);
         assert_eq!(defaults.default_provider, "openrouter");
         assert_eq!(defaults.model, "fragment-model");
         assert!((defaults.temperature - 0.42).abs() < f64::EPSILON);
@@ -6695,10 +6837,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6772,10 +6916,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -6974,13 +7120,15 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy {
-                autonomy,
-                ..crate::security::SecurityPolicy::default()
-            }),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy {
+                    autonomy,
+                    ..crate::security::SecurityPolicy::default()
+                }),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         })
     }
@@ -7038,6 +7186,360 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
             "Supervised autonomy must allow the inbound conversation-turn persistence (normal flow not broken)"
+        );
+    }
+
+    // ── D2-2: channels security hot-reload ──────────────────────────────────
+
+    /// Exercise the exact gate calls the four channel authorization points make
+    /// (inbound/autosave/outbound/scope all funnel through
+    /// `SideEffectGate::new(snapshot.as_ref()).authorize_resource_operation`).
+    fn channel_gate_allows(policy: &crate::security::SecurityPolicy) -> bool {
+        SideEffectGate::new(policy)
+            .authorize_resource_operation("channel", "channel:test:inbound", ResourceRiskLevel::Low, None)
+            .is_ok()
+            && SideEffectGate::new(policy)
+                .authorize_resource_operation("channel", "channel:test:outbound", ResourceRiskLevel::Low, None)
+                .is_ok()
+    }
+
+    /// Build a coherent `SecurityGen` from an explicit autonomy + tool-policy
+    /// config, mirroring exactly what the stamp-change branch constructs.
+    fn make_gen(
+        autonomy: crate::security::AutonomyLevel,
+        tool_policy: crate::config::ToolPolicyConfig,
+    ) -> Arc<SecurityGen> {
+        Arc::new(SecurityGen {
+            security: Arc::new(crate::security::SecurityPolicy {
+                autonomy,
+                ..crate::security::SecurityPolicy::default()
+            }),
+            pipeline: Arc::new(crate::security::PolicyPipeline::new(tool_policy)),
+        })
+    }
+
+    /// Minimal channel runtime context whose config reload path points at
+    /// `openprx_dir/config.toml`, seeded with `start_gen` as the live security
+    /// generation. Used to drive `maybe_apply_runtime_config_update` end-to-end.
+    fn reload_test_ctx(openprx_dir: &std::path::Path, start_gen: Arc<SecurityGen>) -> Arc<ChannelRuntimeContext> {
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("openrouter".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("startup-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 5,
+            read_only_tool_concurrency_window: 2,
+            read_only_tool_timeout_secs: 30,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions {
+                openprx_dir: Some(openprx_dir.to_path_buf()),
+                ..providers::ProviderRuntimeOptions::default()
+            },
+            workspace_dir: Arc::new(openprx_dir.to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
+            skill_rag_ctx: None,
+        })
+    }
+
+    /// T2-a: the channel's own gate observes a security hot-swap. Start
+    /// Supervised (gate allows), then store a ReadOnly generation into the same
+    /// `ArcSwap` and confirm the snapshot read at the authorization point now
+    /// denies — without rebuilding the context.
+    #[test]
+    fn t2a_channels_gate_hot_updates_on_security_store() {
+        let security: Arc<arc_swap::ArcSwap<SecurityGen>> = Arc::new(arc_swap::ArcSwap::new(make_gen(
+            crate::security::AutonomyLevel::Supervised,
+            crate::config::ToolPolicyConfig::default(),
+        )));
+
+        // Before reload: Supervised → low-risk inbound/outbound allowed.
+        let before = security.load_full();
+        assert!(
+            channel_gate_allows(before.security.as_ref()),
+            "Supervised snapshot must allow low-risk channel gates"
+        );
+
+        // Hot-swap to ReadOnly (what the stamp-change branch does via store()).
+        security.store(make_gen(
+            crate::security::AutonomyLevel::ReadOnly,
+            crate::config::ToolPolicyConfig::default(),
+        ));
+
+        // After reload: the snapshot read at the gate now denies.
+        let after = security.load_full();
+        assert!(
+            !channel_gate_allows(after.security.as_ref()),
+            "after storing a ReadOnly generation the channel gate snapshot must deny (hot update took effect)"
+        );
+    }
+
+    /// T2-b: rebuild happens only on a `store` (i.e. only in the stamp-change
+    /// branch). When no store occurs, repeated `load_full()` returns the *same*
+    /// `Arc` (pointer-identical), proving per-message reads never rebuild; after
+    /// a `store` the pointer changes and carries the new generation.
+    #[test]
+    fn t2b_load_full_is_stable_until_store() {
+        let security: Arc<arc_swap::ArcSwap<SecurityGen>> = Arc::new(arc_swap::ArcSwap::new(make_gen(
+            crate::security::AutonomyLevel::Supervised,
+            crate::config::ToolPolicyConfig::default(),
+        )));
+
+        let a = security.load_full();
+        let b = security.load_full();
+        assert!(
+            Arc::ptr_eq(&a, &b),
+            "without a store, successive load_full() snapshots must be the same Arc (no per-read rebuild)"
+        );
+
+        // The stamp-change branch path: store a freshly built generation.
+        security.store(make_gen(
+            crate::security::AutonomyLevel::ReadOnly,
+            crate::config::ToolPolicyConfig::default(),
+        ));
+
+        let c = security.load_full();
+        assert!(
+            !Arc::ptr_eq(&a, &c),
+            "after store(), load_full() must observe the new Arc (the rebuilt generation)"
+        );
+        assert_eq!(
+            c.security.autonomy,
+            crate::security::AutonomyLevel::ReadOnly,
+            "the stored snapshot must carry the rebuilt ReadOnly policy"
+        );
+    }
+
+    /// Write a `config.toml` that produces a buildable provider (explicit api_key
+    /// makes the primary provider available offline) plus the given `[autonomy]`
+    /// level and optional `[security.tool_policy]` default.
+    fn write_reload_config(dir: &std::path::Path, level: &str, tool_policy_default: &str) {
+        let toml = format!(
+            "default_provider = \"openrouter\"\n\
+             default_model = \"openrouter/auto\"\n\
+             default_temperature = 0.7\n\
+             api_key = \"sk-test-reload-key\"\n\
+             \n\
+             [autonomy]\n\
+             level = \"{level}\"\n\
+             workspace_only = true\n\
+             allowed_commands = []\n\
+             forbidden_paths = []\n\
+             max_actions_per_hour = 100\n\
+             max_cost_per_day_cents = 1000\n\
+             \n\
+             [security.tool_policy]\n\
+             default = \"{tool_policy_default}\"\n"
+        );
+        std::fs::write(dir.join("config.toml"), toml).expect("write config.toml");
+    }
+
+    /// T2-reload: drive `maybe_apply_runtime_config_update` end-to-end so it hits
+    /// the stamp-change branch, and assert the live `SecurityGen` is rebuilt —
+    /// both the security autonomy AND the tool policy pipeline change together.
+    #[tokio::test]
+    async fn t2_reload_rebuilds_security_generation() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        // Start the live generation at Supervised + allow-by-default pipeline.
+        let ctx = reload_test_ctx(
+            temp.path(),
+            make_gen(
+                crate::security::AutonomyLevel::Supervised,
+                crate::config::ToolPolicyConfig::default(),
+            ),
+        );
+        // On-disk config changes autonomy to readonly and tool policy to deny.
+        write_reload_config(temp.path(), "readonly", "deny");
+
+        maybe_apply_runtime_config_update(ctx.as_ref())
+            .await
+            .expect("reload should succeed with a buildable provider config");
+
+        let live = ctx.security.load_full();
+        assert_eq!(
+            live.security.autonomy,
+            crate::security::AutonomyLevel::ReadOnly,
+            "reload must rebuild security with the new read_only autonomy"
+        );
+        // Pipeline rebuilt in lockstep: deny-by-default now blocks an arbitrary tool.
+        let eval_ctx = crate::security::EvalContext {
+            channel: "telegram".to_string(),
+            chat_type: "direct".to_string(),
+            sender: "alice".to_string(),
+        };
+        assert!(
+            !live.pipeline.evaluate("memory_recall", &eval_ctx).allowed,
+            "reload must rebuild the tool policy pipeline (now deny-by-default) in the same generation"
+        );
+    }
+
+    /// T2-partial-apply: a reload whose fallible provider construction FAILS must
+    /// leave the live `SecurityGen` and the applied stamp untouched — proving the
+    /// all-or-nothing property (failure → store nothing → old generation kept).
+    /// We trigger the failure by naming an unknown primary provider, which makes
+    /// `create_resilient_provider_with_options` bail before the commit point.
+    #[tokio::test]
+    async fn t2_partial_apply_failure_keeps_old_generation() {
+        let temp = tempfile::TempDir::new().expect("temp dir");
+        let start_gen = make_gen(
+            crate::security::AutonomyLevel::Supervised,
+            crate::config::ToolPolicyConfig::default(),
+        );
+        let ctx = reload_test_ctx(temp.path(), Arc::clone(&start_gen));
+
+        // Config flips autonomy to read_only BUT names a provider that cannot be
+        // constructed — the security generation would change *if* store ran before
+        // the provider build (the pre-fix partial-apply bug), so this asserts the
+        // store is correctly deferred until after the provider build succeeds.
+        let toml = "default_provider = \"definitely-not-a-real-provider-xyz\"\n\
+                    default_temperature = 0.7\n\
+                    api_key = \"sk-test\"\n\
+                    \n\
+                    [autonomy]\n\
+                    level = \"readonly\"\n\
+                    workspace_only = true\n\
+                    allowed_commands = []\n\
+                    forbidden_paths = []\n\
+                    max_actions_per_hour = 100\n\
+                    max_cost_per_day_cents = 1000\n";
+        std::fs::write(temp.path().join("config.toml"), toml).expect("write config.toml");
+
+        let result = maybe_apply_runtime_config_update(ctx.as_ref()).await;
+        assert!(
+            result.is_err(),
+            "reload with an unbuildable provider must return Err (fallible step failed)"
+        );
+
+        // The live generation must be byte-for-byte the original one: same Arc,
+        // same autonomy. Nothing was stored.
+        let live = ctx.security.load_full();
+        assert!(
+            Arc::ptr_eq(&live, &start_gen),
+            "failed reload must not store any new generation (old Arc preserved — all-or-nothing)"
+        );
+        assert_eq!(
+            live.security.autonomy,
+            crate::security::AutonomyLevel::Supervised,
+            "failed reload must keep the old Supervised autonomy (no partial apply)"
+        );
+
+        // The stamp must NOT have been committed either, so a subsequent retry
+        // still treats the config as unapplied.
+        let config_path = temp.path().join("config.toml");
+        let store = runtime_config_store().lock();
+        let committed = store.get(&config_path).and_then(|s| s.last_applied_stamp.clone());
+        assert!(
+            committed.is_none(),
+            "failed reload must not commit the stamp (no partial apply)"
+        );
+    }
+
+    /// T2-scope-deny: storing a generation built from a config with
+    /// `[autonomy.scopes] default = "deny"` flips scope authorization
+    /// (`is_tool_allowed`, what `scope_or_pipeline_denial` consults) to deny.
+    #[test]
+    fn t2_scope_authorization_denies_after_store() {
+        // Build a real SecurityPolicy from a deny-by-default scope config so the
+        // scope path used by the tool-call loop reflects the new generation.
+        let mut autonomy = crate::config::AutonomyConfig::default();
+        autonomy.scopes.default = "deny".to_string();
+        let denying = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+
+        let security: Arc<arc_swap::ArcSwap<SecurityGen>> = Arc::new(arc_swap::ArcSwap::new(make_gen(
+            crate::security::AutonomyLevel::Supervised,
+            crate::config::ToolPolicyConfig::default(),
+        )));
+        // Before: default Supervised generation allows the tool in scope.
+        assert!(
+            security
+                .load_full()
+                .security
+                .is_tool_allowed("memory_recall", "alice", "telegram", "direct"),
+            "default scope must allow the tool before the deny generation is stored"
+        );
+
+        security.store(Arc::new(SecurityGen {
+            security: Arc::new(denying),
+            pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+        }));
+
+        assert!(
+            !security
+                .load_full()
+                .security
+                .is_tool_allowed("memory_recall", "alice", "telegram", "direct"),
+            "after storing a deny-by-default scope generation, scope authorization must deny"
+        );
+    }
+
+    /// T2-pipeline-deny: storing a generation whose pipeline is deny-by-default
+    /// flips `PolicyPipeline::evaluate` (the second half of
+    /// `scope_or_pipeline_denial`) to deny — and the pipeline rides in the SAME
+    /// `SecurityGen` as the security policy, so it can never lag a generation.
+    #[test]
+    fn t2_pipeline_evaluation_denies_after_store() {
+        let strict = crate::config::ToolPolicyConfig {
+            default: "deny".to_string(),
+            ..crate::config::ToolPolicyConfig::default()
+        };
+        let security: Arc<arc_swap::ArcSwap<SecurityGen>> = Arc::new(arc_swap::ArcSwap::new(make_gen(
+            crate::security::AutonomyLevel::Supervised,
+            crate::config::ToolPolicyConfig::default(),
+        )));
+        let eval_ctx = crate::security::EvalContext {
+            channel: "telegram".to_string(),
+            chat_type: "direct".to_string(),
+            sender: "alice".to_string(),
+        };
+        // Before: allow-by-default pipeline permits the tool.
+        assert!(
+            security
+                .load_full()
+                .pipeline
+                .evaluate("memory_recall", &eval_ctx)
+                .allowed,
+            "default pipeline must allow before the strict generation is stored"
+        );
+
+        security.store(make_gen(crate::security::AutonomyLevel::Supervised, strict));
+
+        let live = security.load_full();
+        assert!(
+            !live.pipeline.evaluate("memory_recall", &eval_ctx).allowed,
+            "after storing a deny-by-default pipeline generation, pipeline evaluation must deny"
+        );
+        // The security half came from the SAME stored generation (coherent gen).
+        assert_eq!(
+            live.security.autonomy,
+            crate::security::AutonomyLevel::Supervised,
+            "security and pipeline travel together in one SecurityGen"
         );
     }
 
@@ -7156,10 +7658,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -7254,10 +7758,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -7365,10 +7871,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -7459,10 +7967,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -7951,10 +8461,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -8051,10 +8563,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
@@ -8147,10 +8661,12 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(crate::security::SecurityPolicy::default()),
-            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
-                crate::config::ToolPolicyConfig::default(),
-            )),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy::default()),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
             skill_rag_ctx: None,
         });
 
