@@ -419,6 +419,250 @@ mod tests {
         assert!(ctx.tools.is_some(), "Worker must build tools");
     }
 
+    // --- golden-trace construction-order invariants (Codex condition #2) ---------
+    //
+    // `RuntimeBootstrap::build` is a single linear function: the resources are
+    // constructed in source order observer → security → memory → runtime → router →
+    // tools (see steps 1..6 above). That ordering is *enforced by the Rust type
+    // system*, not just by convention: `tools` (step 6) takes `&security` and the
+    // already-built `memory`/`runtime` as inputs to `all_tools_with_runtime`, and
+    // `router` (step 5) borrows `memory`. A future edit that moved `tools`/`router`
+    // construction before `security`/`memory` simply would not compile, because the
+    // bindings it consumes would not yet be in scope. We cannot inject a runtime
+    // "trace" of construction order without restructuring `build` (and adding cost
+    // to the hot path), so the golden-trace guarantee is split between:
+    //   (a) the type-level dependency above (compile-time, free), and
+    //   (b) the behavioural invariants asserted below — the observable shape of the
+    //       core for each profile, which is what a re-ordering / regression would
+    //       perturb. Together with the source-scan gate (`gate_*` tests) this is the
+    //       "main-mode construction path changed → a test fires" tripwire.
+
+    /// Golden-trace: for every tools-bearing profile, a successful `build` *implies*
+    /// security and memory were ready before tools. `all_tools_with_runtime` consumes
+    /// `&security` and a cloned `memory` `Arc`, so `tools.is_some()` cannot hold
+    /// unless both predecessors existed at the tool-construction point. Asserting the
+    /// joint post-condition locks the "security & memory precede tools" ordering as an
+    /// observable invariant across all four full profiles.
+    #[tokio::test]
+    async fn golden_trace_security_and_memory_precede_tools() {
+        for profile in [
+            BootstrapProfile::Interactive,
+            BootstrapProfile::Server,
+            BootstrapProfile::Channel,
+            BootstrapProfile::Worker,
+        ] {
+            let tmp = tempfile::tempdir().expect("test: create temp dir");
+            let config = test_config(tmp.path());
+            let ctx = RuntimeBootstrap::build(config, profile)
+                .await
+                .unwrap_or_else(|e| panic!("test: build {profile:?} must succeed: {e}"));
+
+            // tools present => its hard predecessors (security, memory) were ready
+            // first; this is the ordering constraint, observed at the output.
+            assert!(
+                ctx.tools.is_some(),
+                "{profile:?}: tools-bearing profile must build tools"
+            );
+            assert!(
+                ctx.memory.is_some(),
+                "{profile:?}: memory must be ready before tools (ordering invariant)"
+            );
+            // security is unconditional and always carries the audit block.
+            assert_eq!(
+                ctx.security.workspace_dir,
+                tmp.path(),
+                "{profile:?}: security must be bound to the config workspace"
+            );
+        }
+    }
+
+    /// Golden-trace: `build` never panics, even when an optional subsystem is absent
+    /// — the lightweight profiles (no memory / no tools / no router) must still
+    /// return `Ok` rather than tripping an internal `unwrap`/`expect`. This guards
+    /// the early-exit ordering (Minimal/MemoryOnly stop before runtime/router/tools)
+    /// against a future change that assumes a dependency is always present.
+    #[tokio::test]
+    async fn golden_trace_build_never_panics_on_missing_optional_deps() {
+        for profile in [BootstrapProfile::Minimal, BootstrapProfile::MemoryOnly] {
+            let tmp = tempfile::tempdir().expect("test: create temp dir");
+            let config = test_config(tmp.path());
+            // Must be Ok (not a panic) despite memory/tools/router being skipped.
+            let ctx = RuntimeBootstrap::build(config, profile)
+                .await
+                .unwrap_or_else(|e| panic!("test: lightweight build {profile:?} must succeed: {e}"));
+            assert!(
+                ctx.tools.is_none(),
+                "{profile:?}: lightweight profile must not build tools"
+            );
+        }
+    }
+
+    // --- static source gate: lock the audit-wiring convergence (Codex condition #2) -
+    //
+    // BUG-D1-01 class: someone re-introduces a hand-written
+    // `SecurityPolicy::from_config(...).with_audit_config(...)` at a main-mode entry
+    // and forgets the audit block. D1 collapsed those into `build_security_policy`.
+    // This gate scans `src/` and asserts that the *production* (non-`#[cfg(test)]`)
+    // hand-written `.with_audit_config(` call sites are exactly the known baseline —
+    // any new one fails the test until it is either routed through
+    // `build_security_policy` or explicitly added to the whitelist below with a
+    // reason.
+
+    /// Files (relative to the crate `src/`) that are *allowed* to hand-write
+    /// `.with_audit_config(` in production code, each with the reason it is not (yet)
+    /// routed through `build_security_policy`. `bootstrap.rs` itself is excluded from
+    /// the scan entirely (it is the canonical convergence point / helper).
+    ///
+    /// Baseline established 2026-06-01 after D1 collapsed chat/daemon/gateway-core
+    /// onto `build_security_policy`. Reasons:
+    ///   - `session_worker/runner.rs`: manifest-driven divergent core
+    ///     (`manifest.workspace_dir`-bound security); intentionally NOT routed through
+    ///     `RuntimeBootstrap` under the D1 behavior-unchanged guardrail (see module note).
+    ///   - `agent/agent.rs`, `agent/loop_.rs`: agent builder / `process_message` paths,
+    ///     not yet converged (later D-series).
+    ///   - `cron/scheduler.rs`: cron job path, not yet converged.
+    ///   - `gateway/mod.rs:372`, `gateway/api/mod.rs`, `gateway/api/config.rs`,
+    ///     `gateway/api/sessions.rs`: D2 territory (per-authorization gateway audit
+    ///     policy); D1 did not touch these. NOTE `gateway/mod.rs` also has its
+    ///     *converged* site that routes through `build_security_policy` — that does
+    ///     not contain a hand-written `.with_audit_config(` token, so it is not
+    ///     counted here.
+    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &[
+        "session_worker/runner.rs",
+        "agent/agent.rs",
+        "agent/loop_.rs",
+        "cron/scheduler.rs",
+        "gateway/mod.rs",
+        "gateway/api/mod.rs",
+        "gateway/api/config.rs",
+        "gateway/api/sessions.rs",
+    ];
+
+    /// Recursively collect every `.rs` file under `dir`.
+    fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("test: read_dir {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("test: dir entry");
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+
+    /// Count `.with_audit_config(` occurrences in `src`, ignoring lines inside any
+    /// `#[cfg(test)]` module. The stripper is line-based: when it sees a
+    /// `#[cfg(test)]` attribute it skips to the matching closing brace of the block
+    /// that follows (a `mod tests { ... }` / `fn ... { ... }`), tracking brace depth.
+    /// This is intentionally conservative — it is the same shape used by the test
+    /// modules in this codebase (`#[cfg(test)]\nmod tests {`).
+    fn count_production_handwired_audit(src: &str) -> usize {
+        let mut count = 0usize;
+        let mut lines = src.lines();
+        while let Some(line) = lines.next() {
+            if line.trim_start().starts_with("#[cfg(test)]") {
+                // Skip until the brace opened by the following item is closed.
+                // Advance to the first line containing an opening brace, then balance.
+                let mut depth: i32 = 0;
+                let mut started = false;
+                // Consume the attribute's target item line-by-line.
+                for next in lines.by_ref() {
+                    for ch in next.chars() {
+                        if ch == '{' {
+                            depth += 1;
+                            started = true;
+                        } else if ch == '}' {
+                            depth -= 1;
+                        }
+                    }
+                    if started && depth <= 0 {
+                        break;
+                    }
+                }
+                continue;
+            }
+            if line.contains(".with_audit_config(") {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    #[test]
+    fn gate_no_unwhitelisted_handwired_audit_wiring() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src_dir, &mut files);
+        assert!(
+            !files.is_empty(),
+            "test: src scan found no .rs files under {}",
+            src_dir.display()
+        );
+
+        // The canonical convergence point — excluded from the scan entirely.
+        let bootstrap_rel = Path::new("runtime").join("bootstrap.rs");
+
+        let mut offenders: Vec<String> = Vec::new();
+        for file in &files {
+            let rel = file.strip_prefix(&src_dir).expect("test: file under src_dir");
+            if rel == bootstrap_rel {
+                continue; // helper / convergence point owns the only sanctioned site
+            }
+            let contents = std::fs::read_to_string(file).expect("test: read source file for scan");
+            let n = count_production_handwired_audit(&contents);
+            if n == 0 {
+                continue;
+            }
+            // Normalize to forward slashes so the whitelist is platform-stable.
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            if !HANDWIRED_AUDIT_WHITELIST.contains(&rel_str.as_str()) {
+                offenders.push(format!("{rel_str} ({n} site(s))"));
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "Found {} new hand-written `.with_audit_config(` site(s) outside the \
+             whitelist: [{}]. These bypass `build_security_policy` and risk dropping \
+             the audit block (cf. BUG-D1-01). Route the construction through \
+             `crate::runtime::bootstrap::build_security_policy(config)`, or — if this \
+             is a deliberate divergent path — add the file to \
+             HANDWIRED_AUDIT_WHITELIST with a documented reason.",
+            offenders.len(),
+            offenders.join(", "),
+        );
+    }
+
+    /// Pins the *exact* whitelisted set to the verified baseline so the whitelist
+    /// cannot silently grow stale: every whitelisted file must still exist and still
+    /// contain at least one production `.with_audit_config(`. If a path was converged
+    /// (site removed) this fails, prompting the whitelist to shrink — keeping the
+    /// gate tight rather than letting stale exemptions accumulate.
+    #[test]
+    fn gate_whitelist_entries_are_all_live() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut stale: Vec<&str> = Vec::new();
+        for &rel in HANDWIRED_AUDIT_WHITELIST {
+            let path = src_dir.join(rel);
+            let still_handwired = std::fs::read_to_string(&path)
+                .map(|c| count_production_handwired_audit(&c) > 0)
+                .unwrap_or(false);
+            if !still_handwired {
+                stale.push(rel);
+            }
+        }
+        assert!(
+            stale.is_empty(),
+            "Whitelisted file(s) no longer contain a production `.with_audit_config(` \
+             site: [{}]. They appear to have been converged onto \
+             `build_security_policy` — remove them from HANDWIRED_AUDIT_WHITELIST to \
+             keep the audit-wiring gate tight.",
+            stale.join(", "),
+        );
+    }
+
     /// security is always constructed by `build` and carries the audit config
     /// from the source `Config` (the central wiring D1 collapses 17 sites into).
     #[tokio::test]
