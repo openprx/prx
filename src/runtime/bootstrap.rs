@@ -23,6 +23,29 @@
 //! yet reached by any wired mode — the `Minimal`/`Server`/`Channel`/`Worker`
 //! profiles, the `workspace_dir` and `router` fields — keep a targeted
 //! `#[allow(dead_code)]` until their owning mode adopts `AppContext`.
+//!
+//! NOTE (D1 step 2, session_worker divergence): `session_worker::run_validated_manifest`
+//! is deliberately **NOT** wired through `RuntimeBootstrap`. Its core resources are
+//! manifest-driven and behaviorally distinct from this generic core (survey §1.7 / F5):
+//!
+//! - `security` binds `manifest.workspace_dir` (which overrides `config.workspace_dir`),
+//!   not `config.workspace_dir` as this module does.
+//! - `observer` is a local `NoopObserver`, not `create_observer(&config.observability)`.
+//! - `memory` is a `SqliteMemory` with `NoopEmbedding` wired directly to
+//!   `manifest.memory_db_path` (`new_with_path_and_acl`), not the backend-selected,
+//!   embedding-routed, identity/policy-bound `create_memory_with_storage_and_routes_with_acl`.
+//! - `tools` are the manifest's `select_tools_for_worker(...)` subset over
+//!   `manifest.workspace_dir`, not the full `all_tools_with_runtime` set over
+//!   `config.workspace_dir`.
+//!
+//! Routing the worker through `AppContext` cannot reproduce any of these without
+//! changing observable behavior (workspace root, observer type, memory backend +
+//! embedder + ACL semantics, tool set). Under the D1 "behavior-unchanged > unification"
+//! guardrail the worker therefore keeps its dedicated construction path. The
+//! `BootstrapProfile::Worker` variant is retained as a *reserved* placeholder (its
+//! generic full build is exercised only by the unit test below); it is intentionally
+//! not constructed by `session_worker`, which is the authoritative source of truth
+//! for a sub-process IPC manifest.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -102,10 +125,15 @@ pub enum BootstrapProfile {
     /// channels: full.
     #[allow(dead_code)]
     Channel,
-    /// session_worker: full. NOTE — the real worker uses
-    /// `manifest.workspace_dir` + `NoopObserver` + a directly-wired
-    /// `SqliteMemory` (survey F5). This profile builds the generic full set for
-    /// now; that specialization lands in the wiring step.
+    /// Reserved placeholder — **not** used by `session_worker`. The real worker
+    /// (`session_worker::run_validated_manifest`) keeps a dedicated, manifest-driven
+    /// path: `manifest.workspace_dir`-bound security, a local `NoopObserver`, a
+    /// directly-wired `SqliteMemory` over `manifest.memory_db_path`, and a
+    /// `select_tools_for_worker` subset (survey §1.7 / F5). Those cannot be
+    /// reproduced by this generic full build without changing observable behavior,
+    /// so the worker is intentionally excluded from `RuntimeBootstrap` under the D1
+    /// behavior-unchanged guardrail (see the module-level note). This variant
+    /// remains only as a reserved profile, exercised by the unit test below.
     #[allow(dead_code)]
     Worker,
 }
