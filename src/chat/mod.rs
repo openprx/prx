@@ -87,13 +87,11 @@ use crate::memory::{
     self, CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata,
     MemoryVisibility, MessageEventScope,
 };
-use crate::observability::{self, Observer, ObserverEvent};
+use crate::observability::ObserverEvent;
 use crate::providers::{self, ChatMessage, Provider};
-use crate::runtime;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::PolicyPipeline;
-use crate::security::SecurityPolicy;
-use crate::tools::{self, Tool};
+use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use sha2::Digest;
@@ -942,63 +940,55 @@ pub async fn run(
     // panic hook is strengthened ahead of time so P3-3 can plug in without
     // any scaffolding changes — see `TerminalGuard` above.
 
-    // ── Wire up subsystems (same as agent::run) ──────────────────
-    let base_observer = observability::create_observer(&config.observability);
-    let observer: Arc<dyn Observer> = Arc::from(base_observer);
+    // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
+    // `list_sessions` is a CLI flag known before any subsystem is built, so we
+    // pick the profile once: `MemoryOnly` early-exits after memory (no tools),
+    // `Interactive` builds the full memory + tools set. Either way memory is
+    // built exactly once — no duplicate construction. The bootstrap wires
+    // observer → security(+audit) → memory → runtime → tools in the hard-ordered
+    // sequence, replacing the former hand-wired block (behaviour-equivalent).
+    let profile = if list_sessions {
+        crate::runtime::bootstrap::BootstrapProfile::MemoryOnly
+    } else {
+        crate::runtime::bootstrap::BootstrapProfile::Interactive
+    };
+    let ctx = crate::runtime::bootstrap::RuntimeBootstrap::build(config, profile).await?;
+
+    // `build` took ownership of `config`; reclaim a shared `Arc<Config>` for the
+    // rest of this function. `Arc<Config>` deref-coerces to `&Config`, so almost
+    // all `config.xxx` accesses below are unchanged.
+    let config = Arc::clone(&ctx.config);
+
+    let observer = Arc::clone(&ctx.observer);
+    let security = Arc::clone(&ctx.security);
+    // hooks are not part of AppContext — keep the local construction unchanged.
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
-    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
 
     // ── Memory ───────────────────────────────────────────────────
-    let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
-        &config.memory,
-        &config.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-        &config.identity_bindings,
-        &config.user_policies,
-    )?);
-    info!(backend = mem.name(), "Memory initialized");
+    // Both MemoryOnly and Interactive profiles build memory, so it is always
+    // Some here; take it explicitly without panicking (iron rules 1/6).
+    let mem: Arc<dyn Memory> = ctx
+        .memory
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for chat"))?;
     let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
 
     // ── List sessions (early return) ─────────────────────────────
+    // Early-exit before tools/provider/TUI are needed (MemoryOnly profile never
+    // built them), preserving the original `--list-sessions` semantics.
     if list_sessions {
         return list_saved_sessions(mem.as_ref()).await;
     }
 
     // ── Tools ────────────────────────────────────────────────────
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
-        (
-            config.composio.api_key.as_deref(),
-            Some(config.composio.entity_id.as_str()),
-        )
-    } else {
-        (None, None)
-    };
-    // 5a-6: tools_registry 用 `Arc<Vec<Box<dyn Tool>>>` 共享，让 Redux driver
-    // (Effect::StartTurn → drive_start_turn_stream 子任务) 与 legacy `run_tool_call_loop`
-    // (借用 &tools_registry) 共用同一份 registry，无需重新构造。Arc clone 仅 +1 引用，
-    // 不触发深拷贝；legacy 借用通过 &*tools_registry 解引用拿到 &Vec.
-    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools::all_tools_with_runtime(
-        Arc::new(config.clone()),
-        &security,
-        runtime,
-        mem.clone(),
-        composio_key,
-        composio_entity_id,
-        &config.browser,
-        &config.http_request,
-        &config.workspace_dir,
-        &config.agents,
-        config.api_key.as_deref(),
-        &config,
-    ));
+    // The Interactive profile built the tool registry inside the bootstrap
+    // (security + runtime + memory all ready); take it explicitly. The bootstrap
+    // uses the identical `all_tools_with_runtime` call with the same arguments.
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
+        .tools
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for chat"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override

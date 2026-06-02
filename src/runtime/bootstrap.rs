@@ -16,10 +16,13 @@
 //!   `llm-router` feature is on and the profile needs it) router strictly after
 //!   memory (`agent/agent.rs:446` asserts memory must precede the router).
 //!
-//! NOTE (D1 step 2): this module is not yet wired into any mode entry point.
-//! Wiring happens in the next commit on this branch. The `#[allow(dead_code)]`
-//! attributes below are an explicit, documented transitional state — remove each
-//! one after the corresponding mode entry adopts `AppContext` in D1 step 2.
+//! NOTE (D1 step 2): the first mode wiring (chat::run) now consumes this module
+//! via `RuntimeBootstrap::build` with `BootstrapProfile::{MemoryOnly,Interactive}`.
+//! The `AppContext` core fields (config/observer/security/memory/tools) and those
+//! two profiles are therefore live and carry no `#[allow(dead_code)]`. Items not
+//! yet reached by any wired mode — the `Minimal`/`Server`/`Channel`/`Worker`
+//! profiles, the `workspace_dir` and `router` fields — keep a targeted
+//! `#[allow(dead_code)]` until their owning mode adopts `AppContext`.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -41,8 +44,6 @@ use crate::router::RouterEngine;
 /// Hot-swappable resources (`provider` / `model`) and config hot-reload are
 /// deliberately **not** here — they live in the slot layer (dev-plan §2.2) and
 /// are built by each mode. Only the read-only core lives in `AppContext`.
-// D1 step 2 接入各模式入口后移除此 allow
-#[allow(dead_code)]
 pub struct AppContext {
     /// Read-only config snapshot. Hot-reload travels through the slot layer (D2),
     /// not through this field.
@@ -55,6 +56,9 @@ pub struct AppContext {
     pub security: Arc<SecurityPolicy>,
     /// Workspace root as `Arc<Path>` (iron rule 7: no `PathBuf` clone, no
     /// intermediate `String`).
+    // Not yet consumed by a wired mode (chat reads `config.workspace_dir`);
+    // removed when a mode adopts this field.
+    #[allow(dead_code)]
     pub workspace_dir: Arc<Path>,
     /// Memory backend. `None` under `Minimal` (no memory built) — keeps the
     /// `status`/`doctor` etc. early-exit paths free of new failure surface (F4).
@@ -66,7 +70,10 @@ pub struct AppContext {
     /// Heuristic LLM router. Only built for profiles that need it and only when
     /// the `llm-router` feature is enabled; always constructed after memory
     /// (`agent/agent.rs:446` invariant).
+    // Not yet consumed by a wired mode (chat does not use the router); removed
+    // when a server/channel/worker mode adopts this field.
     #[cfg(feature = "llm-router")]
+    #[allow(dead_code)]
     pub router: Option<Arc<RouterEngine>>,
 }
 
@@ -76,24 +83,30 @@ pub struct AppContext {
 /// `Minimal` and `MemoryOnly` exist specifically to preserve the two early-exit
 /// paths (survey F4): `status`/`doctor` build only the core, and chat
 /// `--list-sessions` builds memory but not tools/provider/router.
-// D1 step 2 接入各模式入口后移除此 allow
-#[allow(dead_code)]
+///
+/// `MemoryOnly` and `Interactive` are live (consumed by `chat::run`). The
+/// remaining variants are not yet reached by a wired mode and carry a targeted
+/// `#[allow(dead_code)]` removed when their owning mode adopts `AppContext`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootstrapProfile {
     /// `status` / `doctor` / `models` / `providers`: only config/observer/security.
+    #[allow(dead_code)]
     Minimal,
     /// chat `--list-sessions` early-exit: + memory, no tools/router.
     MemoryOnly,
     /// chat (interactive): full memory + tools, no router.
     Interactive,
     /// gateway / daemon: full.
+    #[allow(dead_code)]
     Server,
     /// channels: full.
+    #[allow(dead_code)]
     Channel,
     /// session_worker: full. NOTE — the real worker uses
     /// `manifest.workspace_dir` + `NoopObserver` + a directly-wired
     /// `SqliteMemory` (survey F5). This profile builds the generic full set for
     /// now; that specialization lands in the wiring step.
+    #[allow(dead_code)]
     Worker,
 }
 
@@ -120,8 +133,6 @@ impl BootstrapProfile {
 
 /// Single construction entry point: all modes obtain their `Arc<AppContext>`
 /// from here.
-// D1 step 2 接入各模式入口后移除此 allow
-#[allow(dead_code)]
 pub struct RuntimeBootstrap;
 
 impl RuntimeBootstrap {
@@ -129,8 +140,6 @@ impl RuntimeBootstrap {
     /// hard-ordered sequence (survey §2). Every fallible step propagates via `?`
     /// (iron rules 1/6: no `unwrap`/`expect`/`panic`; fail-fast on subsystem
     /// construction errors).
-    // D1 step 2 接入各模式入口后移除此 allow
-    #[allow(dead_code)]
     pub async fn build(config: Config, profile: BootstrapProfile) -> Result<Arc<AppContext>> {
         // Wrap config once so all downstream users share the same allocation
         // (iron rule 7: Arc over deep copy). Arc<Config> deref-coerces to &Config
