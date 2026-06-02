@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod control_ladder;
 pub mod docker;
 pub mod envelope;
