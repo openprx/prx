@@ -489,10 +489,10 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     )?);
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    // Built via the shared `build_security_policy` helper so this site cannot drift
+    // from (or forget) `with_audit_config` — the wiring is byte-for-byte identical to
+    // the former local `SecurityPolicy::from_config(...).with_audit_config(...)`.
+    let security = crate::runtime::bootstrap::build_security_policy(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (

@@ -24,6 +24,13 @@
 //! profiles, the `workspace_dir` and `router` fields — keep a targeted
 //! `#[allow(dead_code)]` until their owning mode adopts `AppContext`.
 //!
+//! The gateway does **not** route its core through `RuntimeBootstrap` (its
+//! observer/memory/tools diverge from the generic core, and the OTel-backed
+//! `create_observer` has a global init side effect whose timing must stay put,
+//! survey F7/F8). It instead shares only the genuinely error-prone bit — the
+//! audit-bearing `SecurityPolicy` — via the free `build_security_policy` helper
+//! below, keeping its observer/memory/tools/config wiring byte-for-byte as before.
+//!
 //! NOTE (D1 step 2, session_worker divergence): `session_worker::run_validated_manifest`
 //! is deliberately **NOT** wired through `RuntimeBootstrap`. Its core resources are
 //! manifest-driven and behaviorally distinct from this generic core (survey §1.7 / F5):
@@ -159,6 +166,23 @@ impl BootstrapProfile {
     }
 }
 
+/// Single-source construction of a `SecurityPolicy` that always carries the
+/// configured `security.audit` block.
+///
+/// This is the one place any run mode should obtain its primary `SecurityPolicy`
+/// from: it collapses the 17 hand-wired
+/// `SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+///  .with_audit_config(config.security.audit.clone())` call sites into a single
+/// helper, so no path can forget `with_audit_config` (the BUG-D1-01 class of
+/// omission). `RuntimeBootstrap::build` and the gateway both route through it;
+/// the wiring is identical to the former local construction at each site.
+pub(crate) fn build_security_policy(config: &Config) -> Arc<SecurityPolicy> {
+    Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    )
+}
+
 /// Single construction entry point: all modes obtain their `Arc<AppContext>`
 /// from here.
 pub struct RuntimeBootstrap;
@@ -179,10 +203,7 @@ impl RuntimeBootstrap {
 
         // 2. security (with audit) — single source of truth; always carries the
         //    configured `security.audit` block (dev-plan §2.1, collapses 17 sites).
-        let security = Arc::new(
-            SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-                .with_audit_config(config.security.audit.clone()),
-        );
+        let security = build_security_policy(&config);
 
         // workspace_dir as Arc<Path>: borrow the config path, no String detour.
         let workspace_dir: Arc<Path> = Arc::from(config.workspace_dir.as_path());
