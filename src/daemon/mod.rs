@@ -207,11 +207,7 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                         })?;
                     // FIX-P1-03: pass the security policy so the standalone webhook
                     // server gates topic-store persistence on autonomy (ReadOnly = no write).
-                    let webhook_security = std::sync::Arc::new(
-                        crate::security::SecurityPolicy::from_config(&cfg.autonomy, &cfg.workspace_dir)
-                            // FIX-P1-31: honour the configured `security.audit` block.
-                            .with_audit_config(cfg.security.audit.clone()),
-                    );
+                    let webhook_security = crate::runtime::bootstrap::build_security_policy(&cfg);
                     crate::webhook::run(
                         &cfg.webhook.bind,
                         token,
@@ -532,10 +528,7 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     // the same `SideEffectGate` as tool execution. Build the runtime security
     // policy from config (honouring `security.audit`, FIX-P1-31) and install it on
     // the pipeline so an evolution self-modification is gated by autonomy.
-    let security_policy = Arc::new(
-        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    let security_policy = crate::runtime::bootstrap::build_security_policy(config);
     let pipeline = EvolutionPipeline::with_judge_model(
         shared.clone(),
         analyzer.clone(),

@@ -25,10 +25,7 @@ pub async fn run(config: Config) -> Result<()> {
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-    let security = Arc::new(
-        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    let security = crate::runtime::bootstrap::build_security_policy(&config);
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
 

@@ -298,10 +298,7 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     // config exactly like `daemon::build_evolution_scheduler` (honouring
     // `security.audit`, FIX-P1-31) and install it on the pipeline so the engine is
     // never reached on a deny decision.
-    let security_policy = Arc::new(
-        crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-            .with_audit_config(config.security.audit.clone()),
-    );
+    let security_policy = crate::runtime::bootstrap::build_security_policy(config);
     let pipeline = EvolutionPipeline::new(shared.clone(), analyzer, writer, &config.workspace_dir)
         .with_security_policy(security_policy);
 

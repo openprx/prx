@@ -1,7 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use crate::config::Config;
-use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
 
 mod postgres;
@@ -126,7 +125,10 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             };
 
             if let Some(ref cmd) = command {
-                let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+                // BUG-D1-01: route through the shared helper so the command
+                // allow-list check on `cron update` honours `security.audit`
+                // (audit log) consistently with every other gate path.
+                let security = crate::runtime::bootstrap::build_security_policy(config);
                 if !security.is_command_allowed(cmd) {
                     bail!("Command blocked by security policy: {cmd}");
                 }
@@ -331,6 +333,7 @@ fn parse_delay(input: &str) -> Result<chrono::Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::security::SecurityPolicy;
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
