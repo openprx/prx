@@ -125,12 +125,21 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             };
 
             if let Some(ref cmd) = command {
-                // BUG-D1-01: route through the shared helper so the command
-                // allow-list check on `cron update` honours `security.audit`
-                // (audit log) consistently with every other gate path.
+                // BUG-D1-01: route the authorization decision through the
+                // audit-writing `SideEffectGate` (not the bare boolean
+                // `is_command_allowed`) so that `cron update` records both
+                // allow and deny decisions to `security.audit`, consistently
+                // with the `cron_update` tool, the cron scheduler, and every
+                // other side-effect gate path. CLI cron update is a
+                // non-interactive path: no approval grant is presented
+                // (`grant = None`) and the gate never prompts — it returns a
+                // plain `Result`, so an ungranted/blocked command yields an
+                // `Err` that we surface as the original blocking error.
                 let security = crate::runtime::bootstrap::build_security_policy(config);
-                if !security.is_command_allowed(cmd) {
-                    bail!("Command blocked by security policy: {cmd}");
+                if let Err(reason) =
+                    crate::security::SideEffectGate::new(&security).authorize_command_execution("cron_update", cmd, None)
+                {
+                    bail!("Command blocked by security policy: {reason}");
                 }
             }
 
