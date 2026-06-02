@@ -133,6 +133,11 @@ impl Tool for DocumentGetChunkTool {
         let selected_result = DocumentSearchResult {
             chunk: chunk.clone(),
             score: 1.0,
+            // Direct chunk fetch by id (not a search): the owning document's
+            // source_kind is not resolved here. The explicit get-chunk tool is an
+            // intentional provenance lookup, not the agent recall path, so leaving
+            // this `None` is correct.
+            source_kind: None,
         };
         let selected = vec![document_result_to_context_item(&selected_result)];
         let trace_id = append_document_tool_retrieval_trace(

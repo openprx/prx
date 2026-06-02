@@ -473,7 +473,26 @@ Examples:
   prx agent                              # interactive session
   prx agent -m \"Summarize today's logs\"  # single message
   prx agent -p anthropic --model claude-sonnet-4-20250514")]
+    /// Run the agent once with a single message, or interactively.
+    #[command(long_about = "\
+Run the agent on a single message and print the reply, or omit the message \
+to enter interactive mode.
+
+The message may be given either as a positional argument (UNIX-style) or with \
+-m/--message; they are equivalent and mutually exclusive.
+
+Examples:
+  prx agent 'What is 2+2?'              # positional message (UNIX-style)
+  prx agent -m 'What is 2+2?'           # same, via -m/--message
+  prx agent                             # interactive mode
+  prx agent -p anthropic 'summarize x'  # pick a provider")]
     Agent {
+        /// Single message as a positional argument (UNIX-style, equivalent to -m).
+        ///
+        /// Mutually exclusive with `-m/--message`.
+        #[arg(value_name = "MESSAGE", conflicts_with = "message")]
+        message_pos: Option<String>,
+
         /// Single message mode (don't enter interactive mode)
         #[arg(short, long)]
         message: Option<String>,
@@ -1331,13 +1350,20 @@ async fn async_main() -> Result<()> {
         Commands::Go { .. } => anyhow::bail!("BUG: Go command should have been handled earlier"),
 
         Commands::Agent {
+            message_pos,
             message,
             provider,
             model,
             temperature,
-        } => agent::run(config, message, provider, model, temperature)
-            .await
-            .map(|_| ()),
+        } => {
+            // Accept the message either positionally (`prx agent 'msg'`, UNIX-style)
+            // or via -m/--message. clap's `conflicts_with` guarantees at most one is
+            // set, so `.or()` simply picks whichever was provided.
+            let message = message.or(message_pos);
+            agent::run(config, message, provider, model, temperature)
+                .await
+                .map(|_| ())
+        }
 
         Commands::Chat {
             provider,
@@ -2496,6 +2522,44 @@ mod tests {
             }
             other => panic!("expected onboard command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn agent_accepts_positional_message() {
+        // Bug #4: `prx agent 'msg'` (UNIX-style positional) must parse, equivalent
+        // to `-m 'msg'`.
+        let cli = Cli::try_parse_from(["prx", "agent", "What is 2+2?"]).expect("positional agent message should parse");
+        match cli.command {
+            Commands::Agent {
+                message_pos, message, ..
+            } => {
+                assert_eq!(message_pos.as_deref(), Some("What is 2+2?"));
+                assert_eq!(message, None);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_accepts_dash_m_message() {
+        // The existing `-m` form must keep working.
+        let cli = Cli::try_parse_from(["prx", "agent", "-m", "hello there"]).expect("-m agent message should parse");
+        match cli.command {
+            Commands::Agent {
+                message_pos, message, ..
+            } => {
+                assert_eq!(message.as_deref(), Some("hello there"));
+                assert_eq!(message_pos, None);
+            }
+            other => panic!("expected agent command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn agent_rejects_both_positional_and_dash_m() {
+        // Providing both forms is a usage error (conflicts_with).
+        let result = Cli::try_parse_from(["prx", "agent", "positional", "-m", "flag"]);
+        assert!(result.is_err(), "positional message and -m must be mutually exclusive");
     }
 
     #[test]

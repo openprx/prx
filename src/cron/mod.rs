@@ -4,6 +4,7 @@ use crate::config::Config;
 use crate::security::SecurityPolicy;
 use anyhow::{Result, bail};
 
+mod postgres;
 mod schedule;
 mod store;
 mod types;

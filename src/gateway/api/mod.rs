@@ -34,13 +34,14 @@ pub(super) fn authorize_resource_mutation_for_config(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    crate::security::SideEffectGate::new(&crate::security::SecurityPolicy::from_config(
-        &config.autonomy,
-        &config.workspace_dir,
-    ))
-    .authorize_resource_operation("gateway_api", operation_name, risk, None)
-    .map(|_| ())
-    .map_err(|error| (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": error}))))
+    // FIX-P1-31: thread `security.audit` so the gate audit path honours
+    // `enabled=false` on this config-mutation route.
+    let policy = crate::security::SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+        .with_audit_config(config.security.audit.clone());
+    crate::security::SideEffectGate::new(&policy)
+        .authorize_resource_operation("gateway_api", operation_name, risk, None)
+        .map(|_| ())
+        .map_err(|error| (StatusCode::FORBIDDEN, Json(serde_json::json!({"error": error}))))
 }
 
 pub fn router(state: AppState) -> Router<AppState> {

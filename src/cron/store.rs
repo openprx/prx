@@ -2,20 +2,20 @@
 
 //! Cron job persistence.
 //!
-//! FIX-P2-05 (F2-PG) — backend-limited by design: cron scheduling state
-//! (`cron_jobs` / `cron_runs` / `cron_job_events`) is stored exclusively in the
-//! local SQLite database via [`with_connection`]. The cron subsystem is a
-//! single-instance local daemon scheduler: jobs fire on the host that owns the
-//! SQLite file and there is no multi-instance coordination layer that would
-//! consume a Postgres mirror. The module is intentionally function-based with no
-//! `Memory`-style backend trait, so a `PostgresCronStore` mirror would be
-//! unreachable from any dispatch path and would violate the zero-dead-code rule.
+//! FIX-P2-05 (F2-PG) — dual-backend. Cron scheduling state (`cron_jobs` /
+//! `cron_runs` / `cron_job_events`) is persisted in either local SQLite (the
+//! default, via [`with_connection`]) or PostgreSQL. The public free functions in
+//! this module are thin dispatchers: when the workspace storage provider
+//! resolves to `postgres` with a `db_url` (mirroring the memory backend's
+//! `[storage.provider.config]`), they route to [`crate::cron::postgres::PostgresCronStore`];
+//! otherwise they use the embedded SQLite path. Because the Postgres backend is
+//! reachable from configuration it is not dead code.
 //!
-//! Shared, cross-instance lifecycle visibility is instead achieved by mirroring
-//! cron lifecycle events into the shared `memory_events` fabric (FIX-P0-16/17,
-//! `cron.job.*`), which DOES have a Postgres backend. If true multi-instance
-//! cron scheduling is required later, introduce a `CronStore` trait first, then
-//! add a Postgres implementation behind it.
+//! The Postgres backend gives multi-instance deployments durable, shared cron
+//! state: the atomic `claim_job` guard prevents two scheduler instances polling
+//! the same database from double-executing a job. Cron lifecycle events are
+//! still mirrored into the shared `memory_events` fabric (FIX-P0-16/17,
+//! `cron.job.*`) for cross-instance observability.
 
 use crate::config::Config;
 use crate::cron::{
@@ -29,6 +29,12 @@ use uuid::Uuid;
 
 const MAX_CRON_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_OUTPUT_MARKER: &str = "\n...[truncated]";
+
+/// Resolve the Postgres cron backend when configured, else `None` (SQLite path).
+/// Centralizes backend selection so each public dispatcher is a one-line guard.
+fn pg_store(config: &Config) -> Result<Option<crate::cron::postgres::PostgresCronStore>> {
+    crate::cron::postgres::resolve(config)
+}
 
 #[cfg(test)]
 pub fn add_job(config: &Config, expression: &str, command: &str) -> Result<CronJob> {
@@ -68,6 +74,16 @@ pub fn add_shell_job_with_lineage_and_approval_grant(
     approval_grant_json: Option<String>,
     lineage: CronJobLineage,
 ) -> Result<CronJob> {
+    if let Some(store) = pg_store(config)? {
+        return store.add_shell_job_with_lineage_and_approval_grant(
+            &workspace_id(config),
+            name,
+            schedule,
+            command,
+            approval_grant_json,
+            lineage,
+        );
+    }
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -169,6 +185,19 @@ pub fn add_agent_job_with_lineage(
     delete_after_run: bool,
     lineage: CronJobLineage,
 ) -> Result<CronJob> {
+    if let Some(store) = pg_store(config)? {
+        return store.add_agent_job_with_lineage(
+            &workspace_id(config),
+            name,
+            schedule,
+            prompt,
+            session_target,
+            model,
+            delivery,
+            delete_after_run,
+            lineage,
+        );
+    }
     let now = Utc::now();
     validate_schedule(&schedule, now)?;
     let next_run = next_run_for_schedule(&schedule, now)?;
@@ -239,6 +268,9 @@ pub fn add_agent_job_with_lineage(
 }
 
 pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
+    if let Some(store) = pg_store(config)? {
+        return store.list_jobs();
+    }
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -259,6 +291,9 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
 }
 
 pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
+    if let Some(store) = pg_store(config)? {
+        return store.get_job(job_id);
+    }
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
@@ -278,6 +313,11 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
 }
 
 pub fn remove_job(config: &Config, id: &str) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        store.remove_job(&workspace_id(config), id)?;
+        println!("✅ Removed cron job {id}");
+        return Ok(());
+    }
     let changed = with_connection(config, |conn| {
         if let Some(lineage) = load_job_lineage(conn, id)? {
             insert_job_event(
@@ -308,6 +348,9 @@ pub fn remove_job(config: &Config, id: &str) -> Result<()> {
 /// the job from a non-running state to `running`. This prevents duplicate
 /// execution when multiple scheduler instances poll the same database.
 pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
+    if let Some(store) = pg_store(config)? {
+        return store.claim_job(&workspace_id(config), job_id);
+    }
     with_connection(config, |conn| {
         let changed = conn.execute(
             "UPDATE cron_jobs SET last_status = 'running'
@@ -332,6 +375,9 @@ pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
 }
 
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
+    if let Some(store) = pg_store(config)? {
+        return store.due_jobs(now, config.scheduler.max_tasks);
+    }
     let lim = i64::try_from(config.scheduler.max_tasks.max(1)).context("Scheduler max_tasks overflows i64")?;
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
@@ -356,6 +402,9 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
 }
 
 pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
+    if let Some(store) = pg_store(config)? {
+        return store.update_job(&workspace_id(config), job_id, patch);
+    }
     let mut job = get_job(config, job_id)?;
     let was_enabled = job.enabled;
     let approval_grant_json = patch.approval_grant_json.clone();
@@ -463,6 +512,9 @@ pub fn record_last_run(
     success: bool,
     output: &str,
 ) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.record_last_run(&workspace_id(config), job_id, finished_at, success, output);
+    }
     let status = if success { "ok" } else { "error" };
     let bounded_output = truncate_cron_output(output);
     with_connection(config, |conn| {
@@ -496,6 +548,9 @@ pub fn record_last_run(
 }
 
 pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, output: &str) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.reschedule_after_run(&workspace_id(config), job, success, output);
+    }
     let now = Utc::now();
     let next_run = next_run_for_schedule(&job.schedule, now)?;
     let status = if success { "ok" } else { "error" };
@@ -540,6 +595,18 @@ pub fn record_run(
     output: Option<&str>,
     duration_ms: i64,
 ) -> Result<()> {
+    if let Some(store) = pg_store(config)? {
+        return store.record_run(
+            &workspace_id(config),
+            job_id,
+            started_at,
+            finished_at,
+            status,
+            output,
+            duration_ms,
+            config.cron.max_run_history,
+        );
+    }
     let bounded_output = output.map(truncate_cron_output);
     with_connection(config, |conn| {
         // Wrap INSERT + pruning DELETE in an explicit transaction so that
@@ -599,7 +666,7 @@ pub fn record_run(
     })
 }
 
-fn truncate_cron_output(output: &str) -> String {
+pub(crate) fn truncate_cron_output(output: &str) -> String {
     if output.len() <= MAX_CRON_OUTPUT_BYTES {
         return output.to_string();
     }
@@ -619,6 +686,9 @@ fn truncate_cron_output(output: &str) -> String {
 }
 
 pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<CronRun>> {
+    if let Some(store) = pg_store(config)? {
+        return store.list_runs(job_id, limit);
+    }
     with_connection(config, |conn| {
         let lim = i64::try_from(limit.max(1)).context("Run history limit overflow")?;
         let mut stmt = conn.prepare(
@@ -650,6 +720,9 @@ pub fn list_runs(config: &Config, job_id: &str, limit: usize) -> Result<Vec<Cron
 }
 
 pub fn list_job_events(config: &Config, job_id: &str) -> Result<Vec<CronJobEvent>> {
+    if let Some(store) = pg_store(config)? {
+        return store.list_job_events(job_id);
+    }
     with_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id, event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id,
@@ -775,16 +848,42 @@ fn insert_job_event(
         ],
     )
     .context("Failed to insert cron job event")?;
-    if let Err(error) = mirror_cron_job_event(workspace_id, job_id, &lineage, event_type, status, payload_json) {
+    if let Err(error) = mirror_cron_job_event(
+        workspace_id,
+        job_id,
+        MirrorLineage {
+            owner_id: lineage.owner_id.as_deref(),
+            topic_id: lineage.topic_id.as_deref(),
+            parent_task_id: lineage.parent_task_id.as_deref(),
+            source_message_event_id: lineage.source_message_event_id.as_deref(),
+            status: lineage.status.as_deref(),
+        },
+        event_type,
+        status,
+        payload_json,
+    ) {
         tracing::warn!(job_id = %job_id, event_type, "failed to mirror cron job event into memory_events: {error}");
     }
     Ok(())
 }
 
-fn mirror_cron_job_event(
+/// Lineage fields used to enrich a mirrored cron event. Backend-agnostic
+/// (borrowed `&str`s) so both SQLite and Postgres stores can share the mirror.
+pub(crate) struct MirrorLineage<'a> {
+    pub owner_id: Option<&'a str>,
+    pub topic_id: Option<&'a str>,
+    pub parent_task_id: Option<&'a str>,
+    pub source_message_event_id: Option<&'a str>,
+    pub status: Option<&'a str>,
+}
+
+/// Mirror a cron lifecycle event into the shared `memory_events` fabric. This is
+/// workspace-file-based (writes `brain.db` under `workspace_id`) and therefore
+/// backend-agnostic: the Postgres cron store reuses it for parity with SQLite.
+pub(crate) fn mirror_cron_job_event(
     workspace_id: &str,
     job_id: &str,
-    lineage: &JobLineage,
+    lineage: MirrorLineage<'_>,
     event_type: &str,
     status: Option<&str>,
     payload_json: Option<&str>,
@@ -793,16 +892,19 @@ fn mirror_cron_job_event(
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| value.as_object().cloned())
         .unwrap_or_default();
-    payload.insert("owner_id".to_string(), lineage.owner_id.clone().into());
-    payload.insert("topic_id".to_string(), lineage.topic_id.clone().into());
-    payload.insert("parent_task_id".to_string(), lineage.parent_task_id.clone().into());
+    payload.insert("owner_id".to_string(), lineage.owner_id.map(str::to_string).into());
+    payload.insert("topic_id".to_string(), lineage.topic_id.map(str::to_string).into());
+    payload.insert(
+        "parent_task_id".to_string(),
+        lineage.parent_task_id.map(str::to_string).into(),
+    );
     payload.insert(
         "source_message_event_id".to_string(),
-        lineage.source_message_event_id.clone().into(),
+        lineage.source_message_event_id.map(str::to_string).into(),
     );
     payload.insert(
         "status".to_string(),
-        status.map(str::to_string).or_else(|| lineage.status.clone()).into(),
+        status.or(lineage.status).map(str::to_string).into(),
     );
     payload.insert("task_id".to_string(), job_id.to_string().into());
     if !payload.contains_key("task") {
@@ -843,7 +945,7 @@ fn map_job_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJobEvent> 
     })
 }
 
-fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Schedule> {
+pub(crate) fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Schedule> {
     if let Some(raw) = schedule_raw {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
@@ -862,7 +964,7 @@ fn decode_schedule(schedule_raw: Option<&str>, expression: &str) -> Result<Sched
     })
 }
 
-fn decode_delivery(delivery_raw: Option<&str>) -> Result<DeliveryConfig> {
+pub(crate) fn decode_delivery(delivery_raw: Option<&str>) -> Result<DeliveryConfig> {
     if let Some(raw) = delivery_raw {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {

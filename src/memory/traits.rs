@@ -429,6 +429,12 @@ pub struct DocumentChunkRecord {
 pub struct DocumentSearchResult {
     pub chunk: DocumentChunkRecord,
     pub score: f32,
+    /// `source_kind` of the owning document (e.g. `"tool_output"`,
+    /// `"untrusted_external"`). FIX-P2-02: carried up from the `documents` row so
+    /// the recall→context path can hard-filter untrusted external copies before
+    /// they are injected as trusted agent context. `None` when the backend cannot
+    /// resolve it (e.g. backends without a documents table).
+    pub source_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

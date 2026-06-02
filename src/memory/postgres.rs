@@ -21,6 +21,21 @@ use uuid::Uuid;
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
 
+/// FIX-P2-03: safety cap on the BYTEA-fallback (no-pgvector) candidate scan.
+///
+/// When pgvector is unavailable we cannot `ORDER BY` vector distance in SQL, so
+/// candidates must be re-ranked in-process by cosine similarity. The original
+/// code fetched *every* matching row (unbounded scan = DoS risk on large
+/// tables); the fix bounds the scan. This is a **pure safety valve** to prevent
+/// an unbounded scan — NOT a relevance proxy. It is deliberately much larger
+/// than the typical `4 * limit` candidate pool the pgvector path uses, so the
+/// in-process cosine re-rank still sees enough genuinely-similar rows and we do
+/// not silently drop "older but more similar" records by truncating on
+/// recency. This is the known, documented degradation tradeoff of running
+/// without pgvector. Candidates are bounded *after* the scope/owner/session
+/// `WHERE` filter, so a narrow scope keeps the scan small regardless.
+const POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP: i64 = 4_096;
+
 fn message_event_type_for(role: &str, content: &str) -> Option<String> {
     if role != "event" {
         return None;
@@ -2264,6 +2279,19 @@ impl Memory for PostgresMemory {
                         }
                     }
                 } else {
+                    // FIX-P2-03: BYTEA fallback (no pgvector). SQL *cannot* order
+                    // by vector distance here, so we fetch a bounded candidate set
+                    // and re-rank it in-process by cosine similarity below. The
+                    // LIMIT is a pure safety valve against an unbounded full-table
+                    // scan (DoS), NOT a relevance filter — it is deliberately set far
+                    // larger than the pgvector path's `4 * limit` so the in-process
+                    // re-rank still sees enough genuinely-similar rows and we do not
+                    // truncate "older but more similar" records on recency. The cap
+                    // applies *after* the scope/owner/session WHERE filter. Ordering
+                    // by id keeps the (cap-only) truncation deterministic without
+                    // masquerading recency as similarity. This is the documented
+                    // degradation tradeoff of running without pgvector.
+                    let candidate_limit = POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP;
                     let vector_stmt = format!(
                         "
                         SELECT id, key, content, category, created_at, session_id,
@@ -2276,12 +2304,20 @@ impl Memory for PostgresMemory {
                           AND embedding_model = $2
                           AND embedding_dimensions = $3
                           AND ($4::TEXT IS NULL OR session_id = $4)
+                        ORDER BY id
+                        LIMIT $5
                         "
                     );
                     let vector_rows = client.with_client(|client| {
                         Ok(client.query(
                             &vector_stmt,
-                            &[&embedding_provider, &embedding_model, &embedding_dimensions_i64, &sid],
+                            &[
+                                &embedding_provider,
+                                &embedding_model,
+                                &embedding_dimensions_i64,
+                                &sid,
+                                &candidate_limit,
+                            ],
                         )?)
                     })?;
                     for row in &vector_rows {
@@ -3957,7 +3993,8 @@ impl Memory for PostgresMemory {
                 SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                        c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                        c.token_estimate, c.created_at,
-                       ts_rank_cd(to_tsvector('simple', c.content), plainto_tsquery('simple', $1)) AS score
+                       ts_rank_cd(to_tsvector('simple', c.content), plainto_tsquery('simple', $1)) AS score,
+                       d.source_kind AS source_kind
                 FROM {qualified_document_chunks_table} c
                 JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                 WHERE c.workspace_id = $2
@@ -3982,7 +4019,12 @@ impl Memory for PostgresMemory {
                 let mut result = {
                     let chunk = Self::row_to_document_chunk(row)?;
                     let score: f32 = row.try_get::<_, f32>(14).unwrap_or(0.0);
-                    DocumentSearchResult { chunk, score }
+                    let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
+                    DocumentSearchResult {
+                        chunk,
+                        score,
+                        source_kind,
+                    }
                 };
                 result.score *= keyword_weight;
                 by_chunk.insert(result.chunk.chunk_id.clone(), result);
@@ -3996,7 +4038,8 @@ impl Memory for PostgresMemory {
                             SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                                    c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
                                    c.token_estimate, c.created_at,
-                                   (1.0 - (c.embedding_vector <=> $1::vector))::REAL AS score
+                                   (1.0 - (c.embedding_vector <=> $1::vector))::REAL AS score,
+                                   d.source_kind AS source_kind
                             FROM {qualified_document_chunks_table} c
                             JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                             WHERE c.embedding_vector IS NOT NULL
@@ -4033,20 +4076,34 @@ impl Memory for PostgresMemory {
                                 continue;
                             }
                             let chunk = Self::row_to_document_chunk(row)?;
+                            let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
                             by_chunk
                                 .entry(chunk.chunk_id.clone())
                                 .and_modify(|existing| {
                                     existing.score += score;
                                 })
-                                .or_insert(DocumentSearchResult { chunk, score });
+                                .or_insert(DocumentSearchResult {
+                                    chunk,
+                                    score,
+                                    source_kind,
+                                });
                         }
                     }
                 } else {
+                    // FIX-P2-03: BYTEA document-chunk fallback (no pgvector). As with
+                    // the memory-entry fallback above, SQL cannot order by vector
+                    // distance, so candidates are bounded by a pure anti-DoS safety
+                    // cap (after the workspace/visibility/owner WHERE filter) and
+                    // re-ranked in-process by cosine similarity. The cap is not a
+                    // relevance filter; `ORDER BY c.id` keeps the (cap-only)
+                    // truncation deterministic without faking similarity. Known
+                    // degradation tradeoff of running without pgvector.
+                    let candidate_limit = POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP;
                     let vector_stmt = format!(
                         "
                         SELECT c.id, c.chunk_id, c.document_id, c.workspace_id, c.owner_id, c.topic_id, c.task_id,
                                c.chunk_index, c.heading, c.content, c.content_sha256, c.source_anchor,
-                               c.token_estimate, c.created_at, c.embedding
+                               c.token_estimate, c.created_at, c.embedding, d.source_kind AS source_kind
                         FROM {qualified_document_chunks_table} c
                         JOIN {qualified_documents_table} d ON d.document_id = c.document_id
                         WHERE c.embedding IS NOT NULL
@@ -4058,6 +4115,8 @@ impl Memory for PostgresMemory {
                               d.visibility IN ('global', 'workspace')
                               OR ($5::TEXT IS NOT NULL AND c.owner_id = $5)
                           )
+                        ORDER BY c.id
+                        LIMIT $6
                         "
                     );
                     let rows = client.with_client(|client| {
@@ -4069,6 +4128,7 @@ impl Memory for PostgresMemory {
                                 &embedding_dimensions_i64,
                                 &principal.workspace_id,
                                 &owner_id,
+                                &candidate_limit,
                             ],
                         )?)
                     })?;
@@ -4089,12 +4149,17 @@ impl Memory for PostgresMemory {
                             continue;
                         }
                         let chunk = Self::row_to_document_chunk(row)?;
+                        let source_kind: Option<String> = row.try_get::<_, Option<String>>(15).unwrap_or(None);
                         by_chunk
                             .entry(chunk.chunk_id.clone())
                             .and_modify(|existing| {
                                 existing.score += score;
                             })
-                            .or_insert(DocumentSearchResult { chunk, score });
+                            .or_insert(DocumentSearchResult {
+                                chunk,
+                                score,
+                                source_kind,
+                            });
                     }
                 }
             }

@@ -258,7 +258,9 @@ async fn run_console_runtime_turn(
     }));
     history.push(ChatMessage::user(enriched_message));
 
-    let security = SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir);
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir)
+        .with_audit_config(config_snapshot.security.audit.clone());
     let policy_pipeline = PolicyPipeline::from_config(&config_snapshot);
     let scope_owner_id = envelope.resolved_owner_id();
     let scope_ctx = ScopeContext {

@@ -24,6 +24,11 @@ pub struct ShellTool {
     runtime: Arc<dyn RuntimeAdapter>,
     sandbox: Arc<dyn Sandbox>,
     acl_enabled: bool,
+    /// Bug #2: opt-in extra directories appended to the hardened shell PATH.
+    /// Empty by default (hardened PATH unchanged). When non-empty these MUST be
+    /// the same resolved dirs granted execute access by the sandbox backend, or
+    /// the kernel will deny the binaries the extended PATH points at.
+    extra_path_dirs: Vec<std::path::PathBuf>,
 }
 
 impl ShellTool {
@@ -33,12 +38,55 @@ impl ShellTool {
         sandbox: Arc<dyn Sandbox>,
         acl_enabled: bool,
     ) -> Self {
+        Self::with_extra_path_dirs(security, runtime, sandbox, acl_enabled, Vec::new())
+    }
+
+    /// Construct a shell tool with opt-in extra PATH directories (Bug #2).
+    ///
+    /// `extra_path_dirs` should be the already-resolved (tilde-expanded, existing)
+    /// directories from `[security.sandbox] extra_path_dirs`, identical to the set
+    /// granted execute access by the Landlock sandbox so PATH and the sandbox stay
+    /// in lockstep.
+    pub fn with_extra_path_dirs(
+        security: Arc<SecurityPolicy>,
+        runtime: Arc<dyn RuntimeAdapter>,
+        sandbox: Arc<dyn Sandbox>,
+        acl_enabled: bool,
+        extra_path_dirs: Vec<std::path::PathBuf>,
+    ) -> Self {
         Self {
             security,
             runtime,
             sandbox,
             acl_enabled,
+            extra_path_dirs,
         }
+    }
+
+    /// Build the PATH value for shell execution: the hardened system default,
+    /// optionally extended with the operator-trusted `extra_path_dirs` (Bug #2).
+    ///
+    /// When no extra dirs are configured this returns exactly the historic
+    /// hardened default, preserving the secure baseline.
+    fn build_shell_path(&self) -> String {
+        let base = if cfg!(target_os = "windows") {
+            r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
+        } else {
+            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        };
+        if self.extra_path_dirs.is_empty() {
+            return base.to_string();
+        }
+        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
+        // Extra (trusted) dirs go FIRST so a user toolchain (e.g. ~/.cargo/bin)
+        // is preferred, matching how an interactive shell prepends them.
+        let mut path = String::new();
+        for dir in &self.extra_path_dirs {
+            path.push_str(&dir.to_string_lossy());
+            path.push(sep);
+        }
+        path.push_str(base);
+        path
     }
 
     fn references_protected_memory_path(command: &str) -> bool {
@@ -145,13 +193,12 @@ impl Tool for ShellTool {
                 cmd.env(var, val);
             }
         }
-        // Override PATH with a safe default to prevent execution of binaries from
-        // untrusted directories.  The inherited PATH may include user-writable dirs.
-        if cfg!(target_os = "windows") {
-            cmd.env("PATH", r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem");
-        } else {
-            cmd.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
-        }
+        // Override PATH with a hardened default to prevent execution of binaries
+        // from untrusted directories. The inherited PATH may include user-writable
+        // dirs. When the operator has opted into `extra_path_dirs`, those (and only
+        // those) trusted directories are prepended — and the sandbox grants matching
+        // execute access — so toolchains like ~/.cargo/bin become usable (Bug #2).
+        cmd.env("PATH", self.build_shell_path());
 
         // Apply sandbox isolation before execution.
         // The Sandbox trait operates on std::process::Command, so we use
@@ -599,6 +646,53 @@ mod tests {
             .expect("test: should execute");
         assert!(result.success);
         assert_eq!(result.output.trim(), "unset", "API keys should not be in child env");
+    }
+
+    // -- Bug #2: opt-in extra_path_dirs PATH extension --
+
+    #[test]
+    fn build_shell_path_is_hardened_default_when_no_extra_dirs() {
+        // Default (no opt-in dirs) MUST equal the historic hardened PATH, byte for
+        // byte — proves the secure baseline is unchanged.
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
+        let path = tool.build_shell_path();
+        if cfg!(target_os = "windows") {
+            assert_eq!(path, r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem");
+        } else {
+            assert_eq!(path, "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+            assert!(!path.contains(".cargo"), "default PATH must not contain user dirs");
+        }
+    }
+
+    #[test]
+    fn build_shell_path_prepends_configured_extra_dirs() {
+        // Opt-in dirs must appear in PATH (prepended), and the hardened default
+        // must still be present after them.
+        let extra = vec![std::path::PathBuf::from("/home/dev/.cargo/bin")];
+        let tool = ShellTool::with_extra_path_dirs(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+            extra,
+        );
+        let path = tool.build_shell_path();
+        assert!(
+            path.contains("/home/dev/.cargo/bin"),
+            "extra dir must be in PATH: {path}"
+        );
+        if !cfg!(target_os = "windows") {
+            assert!(path.contains("/usr/bin"), "hardened default must remain: {path}");
+            // Extra dir is prepended (higher precedence than system paths).
+            let cargo_idx = path.find("/home/dev/.cargo/bin").unwrap_or(usize::MAX);
+            let usr_idx = path.find("/usr/bin").unwrap_or(0);
+            assert!(cargo_idx < usr_idx, "extra dir should precede system dirs: {path}");
+        }
     }
 
     #[tokio::test]

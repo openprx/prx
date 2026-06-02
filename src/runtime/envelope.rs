@@ -404,11 +404,27 @@ impl RuntimeEnvelope {
     /// Format: `{source}:{channel}:{sender}:{recipient}` where any missing
     /// component is replaced with the literal placeholder `-`.
     ///
-    /// Migration note: callers that currently key on `self.session_key` should
-    /// move to `canonical_session_key()` so all entry points converge. This is
-    /// introduced additively in this wave; switching the actual lookup/storage
-    /// call sites (chat/agent/gateway/channel) is deferred to a follow-up to
-    /// avoid touching multiple modules at once.
+    /// Migration note (FIX-P1-25b / FIX-P1-02): callers that key on an ad-hoc
+    /// `session_key` format should derive their key through this method so all
+    /// entry points converge on one deterministic shape.
+    ///
+    /// The `channel` ingress is the first call site to adopt it: its in-memory
+    /// route/history maps and conversation-turn persistence now write under the
+    /// canonical key, while every read takes the **union of the canonical and
+    /// legacy histories** (read-merge, never move) so turns stored under the old
+    /// `{channel}_{sender}` key stay visible rather than orphaned. Because the
+    /// legacy key has no recipient component, its history is shared (read-only)
+    /// across every recipient of the same sender (see `channels::ConversationKey`
+    /// and `channels::merged_history`).
+    ///
+    /// The `chat`/`agent`/`gateway` durable `session_key`s are intentionally
+    /// left on their legacy formats for now: those keys are the primary
+    /// `message_events` persistence identity, and swapping them outright would
+    /// dark existing shared-event recall. They already derive a consistent
+    /// canonical identity through this method (each builder sets
+    /// source/channel/sender/recipient), so the cross-mode convergence is
+    /// verified at the derivation layer; a recipient-aware durable-key migration
+    /// is deferred to a dedicated wave.
     #[must_use]
     pub fn canonical_session_key(&self) -> String {
         fn component(value: Option<&str>) -> &str {
@@ -698,5 +714,43 @@ mod tests {
             tail(&from_channel.canonical_session_key()),
             tail(&from_worker.canonical_session_key())
         );
+    }
+
+    #[test]
+    fn canonical_session_key_is_deterministic_across_the_four_runtime_modes() {
+        // FIX-P1-25b / FIX-P1-02: chat/agent/gateway/channel each derive their
+        // session identity through the one canonical method, so a given mode +
+        // routing identity always yields the same canonical key (no per-call-site
+        // drift). The source prefix differs by design (it scopes the entry
+        // point); the channel/sender/recipient tail is the shared user identity.
+
+        // chat (terminal): fixed terminal channel + local-user sender.
+        let chat = RuntimeEnvelope::chat_terminal("ws", "chat:42", MemoryVisibility::Workspace)
+            .with_recipient("openrouter/gpt");
+        assert_eq!(chat.canonical_session_key(), "chat:terminal:local-user:openrouter/gpt");
+
+        // agent (CLI): fixed cli channel + local-user sender.
+        let agent = RuntimeEnvelope::agent("ws", "run-7");
+        assert_eq!(agent.canonical_session_key(), "agent:cli:local-user:-");
+
+        // gateway: routing identity supplied verbatim by the caller.
+        let gateway = RuntimeEnvelope::gateway(
+            "ws",
+            "gw-session-1",
+            "webchat",
+            "user-9",
+            "agent-bot",
+            MemoryVisibility::Session,
+        );
+        assert_eq!(gateway.canonical_session_key(), "gateway:webchat:user-9:agent-bot");
+
+        // channel: derives from channel/sender/chat_id, matching the key the
+        // channels ingress builds for its ConversationKey.
+        let channel = RuntimeEnvelope::channel("ws", "telegram", "alice", Some("chat-1".to_string()));
+        assert_eq!(channel.canonical_session_key(), "channel:telegram:alice:chat-1");
+
+        // Re-deriving from a fresh builder with the same inputs is stable.
+        let channel_again = RuntimeEnvelope::channel("ws", "telegram", "alice", Some("chat-1".to_string()));
+        assert_eq!(channel.canonical_session_key(), channel_again.canonical_session_key());
     }
 }

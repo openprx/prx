@@ -22,6 +22,10 @@ use std::os::unix::process::CommandExt;
 #[derive(Debug)]
 pub struct LandlockSandbox {
     workspace_dir: Option<std::path::PathBuf>,
+    /// Bug #2: opt-in trusted toolchain directories granted read+execute access.
+    /// Empty by default (only system paths are executable). Kept in lockstep with
+    /// the shell tool's `extra_path_dirs` PATH extension.
+    extra_exec_dirs: Vec<std::path::PathBuf>,
 }
 
 #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
@@ -33,13 +37,29 @@ impl LandlockSandbox {
 
     /// Create a Landlock sandbox with a specific workspace directory
     pub fn with_workspace(workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
+        Self::with_workspace_and_exec_dirs(workspace_dir, Vec::new())
+    }
+
+    /// Create a Landlock sandbox with a workspace and opt-in trusted exec dirs.
+    ///
+    /// `extra_exec_dirs` (Bug #2) are granted read+execute so the shell tool can
+    /// run binaries from operator-trusted toolchains (e.g. `~/.cargo/bin`). These
+    /// MUST mirror the shell tool's `extra_path_dirs` PATH extension, otherwise the
+    /// PATH would point at binaries the kernel still refuses to exec.
+    pub fn with_workspace_and_exec_dirs(
+        workspace_dir: Option<std::path::PathBuf>,
+        extra_exec_dirs: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
         // Test if Landlock is available by trying to create a minimal ruleset
         let test_ruleset = Ruleset::default()
             .handle_access(AccessFs::ReadFile | AccessFs::WriteFile)
             .and_then(|ruleset| ruleset.create());
 
         match test_ruleset {
-            Ok(_) => Ok(Self { workspace_dir }),
+            Ok(_) => Ok(Self {
+                workspace_dir,
+                extra_exec_dirs,
+            }),
             Err(e) => {
                 tracing::debug!("Landlock not available: {}", e);
                 Err(std::io::Error::new(
@@ -59,7 +79,10 @@ impl LandlockSandbox {
     ///
     /// The returned ruleset is later consumed by `restrict_self()` in the
     /// forked child through `Command::pre_exec`.
-    fn build_ruleset(workspace_dir: Option<&Path>) -> std::io::Result<RulesetCreated> {
+    fn build_ruleset(
+        workspace_dir: Option<&Path>,
+        extra_exec_dirs: &[std::path::PathBuf],
+    ) -> std::io::Result<RulesetCreated> {
         let mut ruleset = Ruleset::default()
             .handle_access(
                 AccessFs::Execute
@@ -126,6 +149,25 @@ impl LandlockSandbox {
                 .map_err(|e| std::io::Error::other(e.to_string()))?;
         }
 
+        // Bug #2: opt-in trusted toolchain directories. Granted read+execute (read
+        // dir/file so dynamic loaders and wrapper scripts resolve) but NOT write —
+        // these are search-path dirs, not scratch space. Mirrors the shell tool's
+        // `extra_path_dirs` PATH extension so the two never drift. Empty by default,
+        // preserving the hardened system-only baseline.
+        for dir in extra_exec_dirs {
+            if !dir.exists() {
+                tracing::warn!(dir = %dir.display(), "extra_exec_dirs entry missing, skipping Landlock grant");
+                continue;
+            }
+            let fd = PathFd::new(dir).map_err(|e| std::io::Error::other(e.to_string()))?;
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(
+                    fd,
+                    AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
+                ))
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+
         Ok(ruleset)
     }
 
@@ -145,7 +187,10 @@ impl LandlockSandbox {
 impl Sandbox for LandlockSandbox {
     #[allow(unsafe_code)]
     fn wrap_command(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
-        let mut ruleset = Some(Self::build_ruleset(self.workspace_dir.as_deref())?);
+        let mut ruleset = Some(Self::build_ruleset(
+            self.workspace_dir.as_deref(),
+            &self.extra_exec_dirs,
+        )?);
         // SAFETY: `pre_exec` runs in the forked child immediately before exec.
         // The closure only consumes the prebuilt Landlock ruleset and performs
         // the kernel restriction call, leaving the daemon parent unrestricted.
@@ -191,6 +236,16 @@ impl LandlockSandbox {
     }
 
     pub fn with_workspace(_workspace_dir: Option<std::path::PathBuf>) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "Landlock is only supported on Linux",
+        ))
+    }
+
+    pub fn with_workspace_and_exec_dirs(
+        _workspace_dir: Option<std::path::PathBuf>,
+        _extra_exec_dirs: Vec<std::path::PathBuf>,
+    ) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "Landlock is only supported on Linux",
@@ -346,6 +401,72 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&tmp);
         let _ = std::fs::remove_file(&outside);
+    }
+
+    #[cfg(all(feature = "sandbox-landlock", target_os = "linux"))]
+    #[test]
+    fn landlock_extra_exec_dir_is_executable_only_when_granted() {
+        // Bug #2: a script placed in an opt-in dir must run when that dir is in
+        // extra_exec_dirs, and be denied (exec) when it is not — proving PATH and
+        // the sandbox grant must travel together.
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        // The toolchain dir MUST live outside /tmp (build_ruleset always grants
+        // /tmp read+execute), otherwise the "denied without grant" case wouldn't
+        // hold. Use a unique dir under $HOME, which Landlock never grants unless we
+        // add it to extra_exec_dirs.
+        let Some(home) = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf()) else {
+            return; // no home dir — cannot place a dir outside the granted set
+        };
+        let toolchain = home.join(format!(".openprx_ll_tool_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&toolchain);
+        if std::fs::create_dir_all(&toolchain).is_err() {
+            return; // home not writable in this environment — skip
+        }
+        let script = toolchain.join("mytool");
+        {
+            let mut f = std::fs::File::create(&script).expect("test: create script");
+            writeln!(f, "#!/bin/sh\necho TOOL_RAN").expect("test: write script");
+        }
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("test: chmod");
+
+        // Workspace dir (granted RW); kept separate from the toolchain dir.
+        let ws = std::env::temp_dir().join(format!("openprx_ll_ws_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).expect("test: create ws");
+
+        // Without the grant: exec of the toolchain script must be denied.
+        let Ok(no_grant) = LandlockSandbox::with_workspace_and_exec_dirs(Some(ws.clone()), Vec::new()) else {
+            let _ = std::fs::remove_dir_all(&toolchain);
+            let _ = std::fs::remove_dir_all(&ws);
+            return; // kernel without Landlock — skip
+        };
+        let mut denied = std::process::Command::new(&script);
+        no_grant.wrap_command(&mut denied).expect("test: wrap");
+        // Landlock denies exec at the kernel level: `output()` may return Err
+        // (exec syscall blocked) OR a non-success status. Either proves denial.
+        let denied_ok = match denied.output() {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        };
+        assert!(!denied_ok, "exec from un-granted toolchain dir must be denied");
+
+        // With the grant: the same script must run.
+        let granted = LandlockSandbox::with_workspace_and_exec_dirs(Some(ws.clone()), vec![toolchain.clone()])
+            .expect("test: granted sandbox");
+        let mut allowed = std::process::Command::new(&script);
+        granted.wrap_command(&mut allowed).expect("test: wrap granted");
+        let allowed_out = allowed.output().expect("test: run granted");
+        assert!(
+            allowed_out.status.success(),
+            "exec from granted toolchain dir must succeed; stderr={}",
+            String::from_utf8_lossy(&allowed_out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&allowed_out.stdout).contains("TOOL_RAN"));
+
+        let _ = std::fs::remove_dir_all(&toolchain);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 
     // ── §1.1 Landlock stub tests ──────────────────────────────

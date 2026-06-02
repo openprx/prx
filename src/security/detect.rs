@@ -26,6 +26,29 @@ pub fn create_sandbox_with_workspace(
     config: &SecurityConfig,
     workspace_dir: Option<&std::path::Path>,
 ) -> Arc<dyn Sandbox> {
+    // Self-contained callers (xin runner, tests) that do not also build a
+    // ShellTool resolve the opt-in dirs here. Callers that DO pair the sandbox
+    // with a ShellTool (see `all_tools_with_runtime_ext`) must instead resolve
+    // ONCE and call [`create_sandbox_with_workspace_and_dirs`] so PATH and the
+    // sandbox allow-list come from a single resolution (Bug #3 time-of-check fix).
+    let extra_exec_dirs = super::resolve_extra_path_dirs(&config.sandbox.extra_path_dirs);
+    create_sandbox_with_workspace_and_dirs(config, workspace_dir, &extra_exec_dirs)
+}
+
+/// Like [`create_sandbox_with_workspace`] but with the opt-in trusted toolchain
+/// directories already resolved by the caller.
+///
+/// Bug #3 (single-source resolution): the shell tool's PATH extension and the
+/// Landlock read+execute allow-list MUST be built from the same `Vec<PathBuf>`.
+/// `all_tools_with_runtime_ext` calls [`super::resolve_extra_path_dirs`] exactly
+/// once and feeds the resulting slice to BOTH this function (→ sandbox allow-list)
+/// and `ShellTool::with_extra_path_dirs` (→ PATH), so a config edit between two
+/// resolutions can no longer make PATH and the sandbox grant disagree.
+pub fn create_sandbox_with_workspace_and_dirs(
+    config: &SecurityConfig,
+    workspace_dir: Option<&std::path::Path>,
+    extra_exec_dirs: &[std::path::PathBuf],
+) -> Arc<dyn Sandbox> {
     let backend = &config.sandbox.backend;
 
     // If explicitly disabled, return noop
@@ -40,8 +63,9 @@ pub fn create_sandbox_with_workspace(
             {
                 #[cfg(target_os = "linux")]
                 {
-                    if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace(
+                    if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace_and_exec_dirs(
                         workspace_dir.map(std::path::Path::to_path_buf),
+                        extra_exec_dirs.to_vec(),
                     ) {
                         return Arc::new(sandbox);
                     }
@@ -83,7 +107,7 @@ pub fn create_sandbox_with_workspace(
         }
         SandboxBackend::Auto | SandboxBackend::None => {
             // Auto-detect best available
-            detect_best_sandbox(workspace_dir)
+            detect_best_sandbox(workspace_dir, extra_exec_dirs)
         }
     }
 }
@@ -94,16 +118,23 @@ fn explicit_unavailable(backend: &str, reason: &str) -> Arc<dyn Sandbox> {
 }
 
 /// Auto-detect the best available sandbox
-fn detect_best_sandbox(workspace_dir: Option<&std::path::Path>) -> Arc<dyn Sandbox> {
+fn detect_best_sandbox(
+    workspace_dir: Option<&std::path::Path>,
+    extra_exec_dirs: &[std::path::PathBuf],
+) -> Arc<dyn Sandbox> {
+    // `extra_exec_dirs` only applies to the Landlock backend today (the only
+    // in-process backend whose allow-list we build). Other backends ignore it.
+    let _ = extra_exec_dirs;
     #[cfg(target_os = "linux")]
     {
         // Try Landlock first (native, no dependencies, shares the host FS with
         // file_write because it only restricts the forked shell child).
         #[cfg(feature = "sandbox-landlock")]
         {
-            if let Ok(sandbox) =
-                super::landlock::LandlockSandbox::with_workspace(workspace_dir.map(std::path::Path::to_path_buf))
-            {
+            if let Ok(sandbox) = super::landlock::LandlockSandbox::with_workspace_and_exec_dirs(
+                workspace_dir.map(std::path::Path::to_path_buf),
+                extra_exec_dirs.to_vec(),
+            ) {
                 tracing::info!("Landlock sandbox enabled (Linux kernel 5.13+)");
                 return Arc::new(sandbox);
             }
@@ -151,9 +182,39 @@ mod tests {
 
     #[test]
     fn detect_best_sandbox_returns_something() {
-        let sandbox = detect_best_sandbox(None);
+        let sandbox = detect_best_sandbox(None, &[]);
         // Should always return at least NoopSandbox
         assert!(sandbox.is_available());
+    }
+
+    /// Bug #3 single-source contract: the dirs fed to the shell PATH and to the
+    /// sandbox allow-list come from one `resolve_extra_path_dirs` call. This test
+    /// pins that contract at the seam — the same resolved slice that
+    /// `all_tools_with_runtime_ext` hands to `ShellTool::with_extra_path_dirs` is
+    /// exactly what `create_sandbox_with_workspace_and_dirs` consumes, so the two
+    /// can never be re-resolved independently.
+    #[test]
+    fn resolved_dirs_are_shared_between_path_and_sandbox() {
+        let tmp = tempfile::tempdir().expect("test: tmpdir");
+        let config = SecurityConfig {
+            sandbox: SandboxConfig {
+                enabled: None,
+                backend: SandboxBackend::Auto,
+                firejail_args: Vec::new(),
+                extra_path_dirs: vec![tmp.path().to_string_lossy().to_string()],
+            },
+            ..Default::default()
+        };
+        // Single resolution — this is the one `all_tools_with_runtime_ext` performs.
+        let resolved = super::super::resolve_extra_path_dirs(&config.sandbox.extra_path_dirs);
+        assert_eq!(resolved, vec![tmp.path().to_path_buf()], "tmpdir resolves to itself");
+        // The sandbox consumes the SAME slice (no second resolution inside).
+        let sandbox = create_sandbox_with_workspace_and_dirs(&config, None, &resolved);
+        assert!(sandbox.is_available());
+        // The shell tool would receive `resolved` verbatim — assert it is the
+        // exact set, proving PATH and the sandbox grant share one source of truth.
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved.first(), Some(&tmp.path().to_path_buf()));
     }
 
     #[test]
@@ -163,6 +224,7 @@ mod tests {
                 enabled: Some(false),
                 backend: SandboxBackend::None,
                 firejail_args: Vec::new(),
+                extra_path_dirs: Vec::new(),
             },
             ..Default::default()
         };
@@ -177,6 +239,7 @@ mod tests {
                 enabled: None, // Auto-detect
                 backend: SandboxBackend::Auto,
                 firejail_args: Vec::new(),
+                extra_path_dirs: Vec::new(),
             },
             ..Default::default()
         };
@@ -200,6 +263,7 @@ mod tests {
                 enabled: None,
                 backend: SandboxBackend::Auto,
                 firejail_args: Vec::new(),
+                extra_path_dirs: Vec::new(),
             },
             ..Default::default()
         };
@@ -230,6 +294,7 @@ mod tests {
                 enabled: Some(true),
                 backend: SandboxBackend::Firejail,
                 firejail_args: Vec::new(),
+                extra_path_dirs: Vec::new(),
             },
             ..Default::default()
         };

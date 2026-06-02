@@ -630,8 +630,63 @@ fn warn_open_policy_allowlist_alignment(
     }
 }
 
-fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
-    format!("{}_{}", msg.channel, msg.sender)
+/// Per-sender conversation key, carrying both the unified canonical key and the
+/// legacy `{channel}_{sender}` key for backward-compatible storage continuity.
+///
+/// FIX-P1-25b / FIX-P1-02: the canonical key is derived through
+/// [`RuntimeEnvelope::canonical_session_key`], the single source-agnostic
+/// derivation shared with chat/agent/gateway, so all ingress paths key on one
+/// deterministic format instead of each mode inventing its own.
+///
+/// ## Read-merge (union) over the legacy key, never move
+///
+/// The channel ingress historically persisted conversation turns (and hydrated
+/// the in-memory history map on startup) under the `legacy` key
+/// (`{channel}_{sender}`). The canonical key adds a `recipient` component
+/// (`channel:{channel}:{sender}:{recipient}`), so a single legacy key can map to
+/// *several* canonical keys — one per recipient the sender talked to.
+///
+/// Two consequences forbid a "move the legacy entry to the canonical key"
+/// strategy:
+///
+/// 1. **History read window.** Once any new turn is written under the canonical
+///    key, a move only ever fires when the canonical entry is absent; after the
+///    first canonical write the legacy turns would be silently skipped on read,
+///    dropping all pre-cutover history.
+/// 2. **Recipient dimension mismatch.** The legacy key is inherently
+///    sender-scoped (it has no recipient). Moving it into one canonical
+///    (recipient-specific) key both misattributes the data to a single
+///    recipient and orphans it for every other recipient of the same sender.
+///
+/// Instead, writes go to the canonical key only, and every *read* path takes the
+/// **union of the canonical and legacy histories** (see [`merged_history`]):
+/// legacy data is treated as read-only pre-history that is visible to *every*
+/// canonical conversation of the same sender. Because the legacy data genuinely
+/// predates the recipient distinction, surfacing it to each recipient is the
+/// faithful behaviour — no turn is lost, none is misrouted, and the legacy key
+/// is never written, moved, or deleted from durable storage.
+struct ConversationKey {
+    canonical: String,
+    legacy: String,
+}
+
+impl ConversationKey {
+    fn from_message(msg: &traits::ChannelMessage) -> Self {
+        // The recipient component mirrors RuntimeEnvelope::channel's recipient
+        // (the chat_id / reply_target), so a channel turn and its envelope agree
+        // on the canonical key.
+        let canonical = RuntimeEnvelope::channel(
+            String::new(),
+            msg.channel.clone(),
+            msg.sender.clone(),
+            Some(msg.reply_target.clone()),
+        )
+        .canonical_session_key();
+        Self {
+            canonical,
+            legacy: format!("{}_{}", msg.channel, msg.sender),
+        }
+    }
 }
 
 fn channel_message_visibility(msg: &traits::ChannelMessage) -> MemoryVisibility {
@@ -914,41 +969,130 @@ fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection
     }
 }
 
-fn get_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str) -> ChannelRouteSelection {
-    ctx.route_overrides
-        .lock()
-        .get(sender_key)
+/// Read-only union of the canonical and legacy histories for `key`.
+///
+/// FIX-P1-25b (read-merge, not move): the legacy `{channel}_{sender}` history
+/// predates the canonical recipient dimension, so it is surfaced as shared
+/// pre-history for any canonical conversation of the same sender. Legacy turns
+/// are ordered first (they are older — written before the canonical cutover),
+/// then canonical turns. The result is truncated to the same
+/// `MAX_CHANNEL_HISTORY` window used for single-key reads.
+///
+/// ## No deduplication — pure concatenation
+///
+/// The legacy and canonical keys partition the timeline: legacy turns were
+/// written *before* the canonical cutover, canonical turns *after* it. Each
+/// physical conversation turn is persisted under exactly one of the two keys, so
+/// reading the union never surfaces the same physical turn twice. A
+/// content/role-based dedup would therefore only ever remove *genuinely
+/// repeated* messages within a single conversation (e.g. a user who deliberately
+/// sends the same text twice in a row), corrupting the history the model sees.
+/// We must not do that — the merge is a plain ordered concatenation
+/// (legacy ++ canonical), preserving each store's own insertion order.
+///
+/// The legacy map entry is never moved, mutated, or removed here; it stays a
+/// read-only fallback.
+fn merged_history(
+    map: &std::collections::HashMap<String, Vec<ChatMessage>>,
+    key: &ConversationKey,
+) -> Vec<ChatMessage> {
+    let legacy_turns = if key.legacy == key.canonical {
+        None
+    } else {
+        map.get(&key.legacy)
+    };
+    let canonical_turns = map.get(&key.canonical);
+
+    let capacity = legacy_turns.map_or(0, Vec::len) + canonical_turns.map_or(0, Vec::len);
+    if capacity == 0 {
+        return Vec::new();
+    }
+
+    // Pure ordered concatenation: legacy pre-history first, then canonical turns,
+    // each in its own insertion order. No dedup (see doc comment) — repeated
+    // messages within a conversation are real history and must be preserved.
+    let mut merged: Vec<ChatMessage> = Vec::with_capacity(capacity);
+    merged.extend(legacy_turns.into_iter().flatten().cloned());
+    merged.extend(canonical_turns.into_iter().flatten().cloned());
+
+    // Apply the same retention window single-key reads enforce, keeping the most
+    // recent turns when the union exceeds the cap.
+    if merged.len() > MAX_CHANNEL_HISTORY {
+        let drop = merged.len() - MAX_CHANNEL_HISTORY;
+        merged.drain(0..drop);
+    }
+    merged
+}
+
+fn get_route_selection(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> ChannelRouteSelection {
+    let routes = ctx.route_overrides.lock();
+    // Read-merge for the single-value route map: prefer the canonical override,
+    // fall back to the legacy (sender-scoped) override as read-only pre-history
+    // so a route preference set before the canonical cutover still applies to
+    // every recipient of that sender. The legacy entry is never moved or removed.
+    routes
+        .get(&key.canonical)
+        .or_else(|| {
+            if key.legacy == key.canonical {
+                None
+            } else {
+                routes.get(&key.legacy)
+            }
+        })
         .cloned()
         .unwrap_or_else(|| default_route_selection(ctx))
 }
 
-fn set_route_selection(ctx: &ChannelRuntimeContext, sender_key: &str, next: ChannelRouteSelection) {
+fn set_route_selection(ctx: &ChannelRuntimeContext, key: &ConversationKey, next: ChannelRouteSelection) {
     let default_route = default_route_selection(ctx);
     let mut routes = ctx.route_overrides.lock();
     if next == default_route {
-        routes.remove(sender_key);
+        routes.remove(&key.canonical);
     } else {
-        routes.insert(sender_key.to_string(), next);
+        routes.insert(key.canonical.clone(), next);
     }
 }
 
-fn clear_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) {
-    ctx.conversation_histories.lock().remove(sender_key);
+fn clear_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) {
+    // Clear ONLY the current (canonical) session. The legacy
+    // `{channel}_{sender}` entry is the *immutable, cross-recipient shared*
+    // pre-cutover history: removing it here would silently wipe the pre-history
+    // of every *other* recipient of the same sender (legacy has no recipient
+    // dimension), which violates the "legacy is read-only, never moved/deleted"
+    // invariant. So clear (e.g. triggered by /model or /models) drops the
+    // canonical conversation only; the legacy pre-history is left intact and will
+    // naturally age out of the merged read window as new canonical turns fill it.
+    ctx.conversation_histories.lock().remove(&key.canonical);
 }
 
-fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool {
+fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> bool {
     let mut histories = ctx.conversation_histories.lock();
 
-    let Some(turns) = histories.get_mut(sender_key) else {
+    // Compact ONLY the canonical session, never the legacy entry. Legacy is the
+    // immutable, cross-recipient shared pre-cutover history; mutating or dropping
+    // it here would corrupt the pre-history of every other recipient of the same
+    // sender. Legacy is also already bounded (it was capped at MAX_CHANNEL_HISTORY
+    // when written, ≤ 50 turns), and `merged_history` re-applies that window
+    // across the union on every read — so the merged length the model sees stays
+    // bounded (≤ legacy_cap + compacted_canonical, then truncated to the window)
+    // without compaction needing to touch legacy at all. This is an in-memory
+    // cache operation only: durable rows are untouched and re-hydrate on restart.
+    let Some(canonical_turns) = histories.get(&key.canonical) else {
         return false;
     };
-
-    if turns.is_empty() {
+    if canonical_turns.is_empty() {
         return false;
     }
 
-    let keep_from = turns.len().saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
-    let mut compacted = normalize_cached_channel_turns(turns.get(keep_from..).map(|s| s.to_vec()).unwrap_or_default());
+    let keep_from = canonical_turns
+        .len()
+        .saturating_sub(CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+    let mut compacted = normalize_cached_channel_turns(
+        canonical_turns
+            .get(keep_from..)
+            .map(<[ChatMessage]>::to_vec)
+            .unwrap_or_default(),
+    );
 
     for turn in &mut compacted {
         if turn.content.chars().count() > CHANNEL_HISTORY_COMPACT_CONTENT_CHARS {
@@ -963,18 +1107,20 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, sender_key: &str) -> bool
         compacted.remove(0);
     }
 
+    // Write the compacted result back under the canonical key only; the legacy
+    // entry is never removed or rewritten.
     if compacted.is_empty() {
-        turns.clear();
+        histories.remove(&key.canonical);
         return false;
     }
 
-    *turns = compacted;
+    histories.insert(key.canonical.clone(), compacted);
     true
 }
 
 async fn append_sender_turn(
     ctx: &ChannelRuntimeContext,
-    sender_key: &str,
+    key: &ConversationKey,
     channel: &str,
     sender: &str,
     recipient: Option<&str>,
@@ -986,17 +1132,27 @@ async fn append_sender_turn(
     let role = turn.role.clone();
     let content = turn.content.clone();
     {
+        // Writes always go to the canonical entry only; the legacy entry is left
+        // untouched as a read-only fallback that the read paths (`merged_history`)
+        // union in. The per-key cap stays at MAX_CHANNEL_HISTORY here; the merged
+        // read view re-applies the same cap across the union.
         let mut histories = ctx.conversation_histories.lock();
-        let turns = histories.entry(sender_key.to_string()).or_default();
+        let turns = histories.entry(key.canonical.clone()).or_default();
         turns.push(turn);
         while turns.len() > MAX_CHANNEL_HISTORY {
             turns.remove(0);
         }
     }
 
+    // The message-event envelope keeps the legacy session_key: message_events are
+    // a separate persistence namespace whose shared-event recall is keyed on the
+    // existing identity, so it is left untouched here. The canonical key governs
+    // the conversation-turn cache (above) and its persistence (below); legacy
+    // conversation-turn rows stay readable via the merged-read fallback, so no
+    // turn is lost.
     let envelope = RuntimeEnvelope::channel_with_session(
         ctx.workspace_dir.as_path().to_string_lossy().to_string(),
-        sender_key.to_string(),
+        key.legacy.clone(),
         channel.to_string(),
         sender.to_string(),
         recipient.unwrap_or(sender).to_string(),
@@ -1007,7 +1163,7 @@ async fn append_sender_turn(
     if let Err(error) = ctx
         .memory
         .append_conversation_turn(
-            sender_key,
+            &key.canonical,
             channel,
             sender,
             &role,
@@ -1019,7 +1175,7 @@ async fn append_sender_turn(
         .await
     {
         tracing::warn!(
-            session_key = sender_key,
+            session_key = key.canonical,
             channel,
             sender,
             "Failed to persist channel conversation turn: {error}"
@@ -1052,7 +1208,7 @@ async fn append_sender_turn(
         Ok(event) => Some(event),
         Err(error) => {
             tracing::warn!(
-                session_key = sender_key,
+                session_key = key.canonical,
                 channel,
                 sender,
                 role,
@@ -1081,6 +1237,15 @@ async fn load_persisted_histories(
         .await
     {
         Ok(histories) => {
+            // Hydrate every persisted session under its own stored key — legacy
+            // `{channel}_{sender}` rows land under the legacy key, post-cutover
+            // canonical rows under the canonical key. The read paths
+            // (`merged_history`) union the two on access (FIX-P1-25b read-merge),
+            // so a session that was migrated and then ran once (turns split across
+            // both keys) reads back the full ordered union after a restart. We do
+            // not merge here, because the in-memory map is keyed per stored key and
+            // `ConversationKey` derivation (which pairs a canonical key with its
+            // legacy key) happens per inbound message, not at hydration time.
             let mut hydrated: HashMap<String, Vec<ChatMessage>> = HashMap::new();
             for (session_key, turns) in histories {
                 let turns = turns
@@ -1255,7 +1420,7 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    let sender_key = ConversationKey::from_message(msg);
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
@@ -2119,7 +2284,7 @@ async fn process_channel_message(
         return;
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = ConversationKey::from_message(&msg);
     let message_visibility = channel_message_visibility(&msg);
     let route = get_route_selection(ctx.as_ref(), &history_key);
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
@@ -2370,12 +2535,10 @@ async fn process_channel_message(
     };
     let system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
     let rebuild_history = || {
-        let prior_turns_raw = ctx
-            .conversation_histories
-            .lock()
-            .get(&history_key)
-            .cloned()
-            .unwrap_or_default();
+        // Read the canonical ∪ legacy union (FIX-P1-25b read-merge) so pre-cutover
+        // turns stored under the legacy key remain visible alongside new canonical
+        // turns; `merged_history` concatenates (legacy first) and truncates to the window.
+        let prior_turns_raw = merged_history(&ctx.conversation_histories.lock(), &history_key);
         let mut prior_turns = normalize_cached_channel_turns(prior_turns_raw);
 
         if let Some(last_turn) = prior_turns.last_mut() {
@@ -2615,12 +2778,13 @@ async fn process_channel_message(
 
                 if is_context_window_overflow_error(&e) {
                     let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                    let compacted_chars = ctx
-                        .conversation_histories
-                        .lock()
-                        .get(&history_key)
-                        .map(|turns| turns.iter().map(|t| t.content.chars().count()).sum::<usize>())
-                        .unwrap_or(0);
+                    // Report the merged-view char count; compaction folds legacy
+                    // into canonical, but reading the union keeps the figure honest
+                    // regardless of which keys remain populated.
+                    let compacted_chars = merged_history(&ctx.conversation_histories.lock(), &history_key)
+                        .iter()
+                        .map(|t| t.content.chars().count())
+                        .sum::<usize>();
                     eprintln!(
                         "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
                         started_at.elapsed().as_millis(),
@@ -3707,7 +3871,12 @@ pub async fn start_channels(config: Config) -> Result<()> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: thread the real `security.audit` config so the side-effect gate
+    // audit trail honours it (e.g. `enabled=false` ⇒ no per-message fsync).
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
@@ -4555,9 +4724,12 @@ mod tests {
     #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
-        let sender = "telegram_u1".to_string();
+        let sender = ConversationKey {
+            canonical: "channel:telegram:u1:chat-1".to_string(),
+            legacy: "telegram_u1".to_string(),
+        };
         histories.insert(
-            sender.clone(),
+            sender.canonical.clone(),
             (0..20)
                 .map(|idx| {
                     let content = format!("msg-{idx}-{}", "x".repeat(700));
@@ -4617,7 +4789,7 @@ mod tests {
         assert!(compact_sender_history(&ctx, &sender));
 
         let histories = ctx.conversation_histories.lock();
-        let kept = histories.get(&sender).expect("sender history should remain");
+        let kept = histories.get(&sender.canonical).expect("sender history should remain");
         assert!(!kept.is_empty());
         assert!(kept.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
         assert!(kept.iter().all(|turn| {
@@ -4631,6 +4803,376 @@ mod tests {
             "total chars {} exceeds budget {}",
             total_chars,
             CHANNEL_HISTORY_COMPACT_TOTAL_CHARS
+        );
+    }
+
+    /// Build a minimal `ChannelRuntimeContext` whose conversation history map is
+    /// seeded with `histories`, for exercising compact/clear in isolation.
+    fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
+        ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 5,
+            read_only_tool_concurrency_window: 2,
+            read_only_tool_timeout_secs: 30,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(crate::security::SecurityPolicy::default()),
+            tool_policy_pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                crate::config::ToolPolicyConfig::default(),
+            )),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            skill_rag_ctx: None,
+        }
+    }
+
+    #[test]
+    fn compact_sender_history_never_removes_shared_legacy() {
+        // FIX-P1-25b bug 2: compaction must operate on the canonical session only.
+        // The legacy entry is the immutable, cross-recipient shared pre-history;
+        // compacting one recipient's session must not delete or mutate it, so the
+        // sender's other recipients still read the legacy pre-history afterwards.
+        let legacy = "telegram_alice".to_string();
+        let key_a = ConversationKey {
+            canonical: "channel:telegram:alice:chat-a".to_string(),
+            legacy: legacy.clone(),
+        };
+        let key_b = ConversationKey {
+            canonical: "channel:telegram:alice:chat-b".to_string(),
+            legacy: legacy.clone(),
+        };
+
+        let mut histories = HashMap::new();
+        histories.insert(legacy.clone(), vec![ChatMessage::user("legacy-prehistory")]);
+        // A canonical session long enough to actually compact.
+        histories.insert(
+            key_a.canonical.clone(),
+            (0..20)
+                .map(|idx| ChatMessage::user(format!("a-{idx}")))
+                .collect::<Vec<_>>(),
+        );
+        let ctx = ctx_with_histories(histories);
+
+        assert!(compact_sender_history(&ctx, &key_a));
+
+        let histories = ctx.conversation_histories.lock();
+        // Legacy untouched.
+        assert_eq!(
+            histories
+                .get(&legacy)
+                .map(|t| t.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()),
+            Some(vec!["legacy-prehistory"]),
+            "compaction must not delete or mutate the shared legacy entry"
+        );
+        // Recipient A's canonical was compacted.
+        let kept_a = histories.get(&key_a.canonical).expect("canonical A remains");
+        assert!(kept_a.len() <= CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES);
+        drop(histories);
+
+        // Recipient B (same sender) still reads the legacy pre-history via merge.
+        let merged_b = merged_history(&ctx.conversation_histories.lock(), &key_b);
+        assert_eq!(
+            merged_b.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["legacy-prehistory"],
+            "other recipient still sees shared legacy after compaction of recipient A"
+        );
+    }
+
+    #[test]
+    fn clear_sender_history_clears_canonical_only_preserving_shared_legacy() {
+        // FIX-P1-25b bug 2: clear (e.g. /model, /models) clears the CURRENT
+        // canonical session only. The legacy pre-history is immutable and shared
+        // across recipients, so it must survive — both for the cleared recipient
+        // (as historical pre-context) and for the sender's other recipients.
+        let legacy = "telegram_alice".to_string();
+        let key_a = ConversationKey {
+            canonical: "channel:telegram:alice:chat-a".to_string(),
+            legacy: legacy.clone(),
+        };
+        let key_b = ConversationKey {
+            canonical: "channel:telegram:alice:chat-b".to_string(),
+            legacy: legacy.clone(),
+        };
+
+        let mut histories = HashMap::new();
+        histories.insert(legacy.clone(), vec![ChatMessage::user("legacy-prehistory")]);
+        histories.insert(key_a.canonical.clone(), vec![ChatMessage::assistant("a-turn")]);
+        histories.insert(key_b.canonical.clone(), vec![ChatMessage::assistant("b-turn")]);
+        let ctx = ctx_with_histories(histories);
+
+        clear_sender_history(&ctx, &key_a);
+
+        let histories = ctx.conversation_histories.lock();
+        // Canonical A is cleared; legacy and canonical B are untouched.
+        assert!(
+            histories.get(&key_a.canonical).is_none(),
+            "cleared recipient's canonical gone"
+        );
+        assert_eq!(
+            histories
+                .get(&legacy)
+                .map(|t| t.iter().map(|m| m.content.as_str()).collect::<Vec<_>>()),
+            Some(vec!["legacy-prehistory"]),
+            "clear must not delete the shared legacy entry"
+        );
+        assert!(
+            histories.get(&key_b.canonical).is_some(),
+            "other recipient's canonical untouched"
+        );
+        drop(histories);
+
+        // Cleared recipient A: canonical empty but legacy pre-history still visible.
+        let merged_a = merged_history(&ctx.conversation_histories.lock(), &key_a);
+        assert_eq!(
+            merged_a.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["legacy-prehistory"],
+            "cleared recipient still sees immutable legacy pre-history"
+        );
+        // Other recipient B: legacy pre-history + its own canonical turn.
+        let merged_b = merged_history(&ctx.conversation_histories.lock(), &key_b);
+        assert_eq!(
+            merged_b.iter().map(|m| m.content.as_str()).collect::<Vec<_>>(),
+            vec!["legacy-prehistory", "b-turn"],
+            "other recipient retains legacy pre-history and own canonical turn"
+        );
+    }
+
+    #[test]
+    fn merged_history_unions_legacy_prehistory_with_canonical_turns_in_order() {
+        // FIX-P1-25b bug 1 (read-merge, not move): a session that was migrated
+        // and then ran once stores old turns under the legacy key and new turns
+        // under the canonical key. The read path must surface the ordered union
+        // (legacy first, then canonical), not just the canonical slice.
+        let key = ConversationKey {
+            canonical: "channel:telegram:u1:chat-1".to_string(),
+            legacy: "telegram_u1".to_string(),
+        };
+        let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        map.insert(
+            key.legacy.clone(),
+            vec![ChatMessage::user("old-question"), ChatMessage::assistant("old-answer")],
+        );
+        map.insert(
+            key.canonical.clone(),
+            vec![ChatMessage::user("new-question"), ChatMessage::assistant("new-answer")],
+        );
+
+        let merged = merged_history(&map, &key);
+        let rendered: Vec<&str> = merged.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            rendered,
+            vec!["old-question", "old-answer", "new-question", "new-answer"],
+            "merged read must include legacy pre-history then canonical turns, in order"
+        );
+        // Read-merge must not mutate the underlying map (no move/delete of legacy).
+        assert_eq!(map.get(&key.legacy).map(Vec::len), Some(2));
+        assert_eq!(map.get(&key.canonical).map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn merged_history_preserves_real_repeats_and_truncates_to_window() {
+        let key = ConversationKey {
+            canonical: "channel:telegram:u1:chat-1".to_string(),
+            legacy: "telegram_u1".to_string(),
+        };
+        // Real, intentional repeats within a conversation (e.g. the user sends the
+        // same text twice in a row) MUST be preserved. legacy and canonical keys
+        // partition the timeline (each physical turn lives under exactly one key),
+        // so there is no cross-store duplication to collapse — and a content-based
+        // dedup would wrongly delete these genuine repeats. Pure concatenation.
+        let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        map.insert(
+            key.legacy.clone(),
+            // Two identical legacy turns + a distinct one.
+            vec![
+                ChatMessage::user("ping"),
+                ChatMessage::user("ping"),
+                ChatMessage::assistant("pong"),
+            ],
+        );
+        map.insert(
+            key.canonical.clone(),
+            // The same "ping" content again post-cutover plus a repeated canonical turn.
+            vec![
+                ChatMessage::user("ping"),
+                ChatMessage::assistant("ok"),
+                ChatMessage::assistant("ok"),
+            ],
+        );
+        let merged = merged_history(&map, &key);
+        let rendered: Vec<&str> = merged.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            rendered,
+            vec!["ping", "ping", "pong", "ping", "ok", "ok"],
+            "all turns preserved in order; no dedup of genuine repeats across or within stores"
+        );
+
+        // Window truncation keeps the most recent turns across the union.
+        let mut big: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        big.insert(
+            key.legacy.clone(),
+            (0..MAX_CHANNEL_HISTORY)
+                .map(|i| ChatMessage::user(format!("legacy-{i}")))
+                .collect(),
+        );
+        big.insert(
+            key.canonical.clone(),
+            (0..MAX_CHANNEL_HISTORY)
+                .map(|i| ChatMessage::user(format!("canonical-{i}")))
+                .collect(),
+        );
+        let merged = merged_history(&big, &key);
+        assert_eq!(merged.len(), MAX_CHANNEL_HISTORY);
+        // The newest canonical turn survives; the oldest legacy turn is dropped.
+        assert_eq!(
+            merged.last().map(|m| m.content.as_str()),
+            Some(format!("canonical-{}", MAX_CHANNEL_HISTORY - 1).as_str())
+        );
+        assert!(merged.iter().all(|m| m.content != "legacy-0"));
+    }
+
+    #[test]
+    fn merged_history_shares_legacy_prehistory_across_recipients() {
+        // FIX-P1-25b bug 2 (recipient dimension): the legacy key is sender-scoped
+        // (no recipient), so the same sender's two canonical conversations (one per
+        // recipient) both read the legacy pre-history, while their new canonical
+        // turns stay separate (no cross-talk).
+        let mut map: HashMap<String, Vec<ChatMessage>> = HashMap::new();
+        let legacy = "telegram_alice".to_string();
+        map.insert(legacy.clone(), vec![ChatMessage::user("legacy-shared-by-alice")]);
+        let key_a = ConversationKey {
+            canonical: "channel:telegram:alice:chat-a".to_string(),
+            legacy: legacy.clone(),
+        };
+        let key_b = ConversationKey {
+            canonical: "channel:telegram:alice:chat-b".to_string(),
+            legacy,
+        };
+        map.insert(key_a.canonical.clone(), vec![ChatMessage::assistant("reply-in-a")]);
+        map.insert(key_b.canonical.clone(), vec![ChatMessage::assistant("reply-in-b")]);
+
+        let merged_a = merged_history(&map, &key_a);
+        let merged_b = merged_history(&map, &key_b);
+        let rendered_a: Vec<&str> = merged_a.iter().map(|m| m.content.as_str()).collect();
+        let rendered_b: Vec<&str> = merged_b.iter().map(|m| m.content.as_str()).collect();
+
+        assert_eq!(rendered_a, vec!["legacy-shared-by-alice", "reply-in-a"]);
+        assert_eq!(rendered_b, vec!["legacy-shared-by-alice", "reply-in-b"]);
+        // No cross-talk: recipient A never sees recipient B's canonical turn.
+        assert!(!rendered_a.contains(&"reply-in-b"));
+        assert!(!rendered_b.contains(&"reply-in-a"));
+    }
+
+    #[tokio::test]
+    async fn load_persisted_histories_rehydrates_legacy_and_canonical_for_merge() {
+        // FIX-P1-25b bug 1 end-to-end: persist old turns under the legacy key and
+        // new turns under the canonical key (the "migrated then ran once" state),
+        // then restart-hydrate. The hydrated map must keep both keys so a merged
+        // read returns the full ordered union — proving no read window is lost
+        // across a restart.
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+
+        let key = ConversationKey {
+            canonical: "channel:telegram:u1:chat-1".to_string(),
+            legacy: "telegram_u1".to_string(),
+        };
+
+        // Pre-cutover turns persisted under the legacy session_key.
+        memory
+            .append_conversation_turn(
+                &key.legacy,
+                "telegram",
+                "u1",
+                "user",
+                "old-question",
+                Some("2026-05-20T00:00:00Z"),
+                Some("m1"),
+                Some("system:legacy"),
+            )
+            .await
+            .unwrap();
+        memory
+            .append_conversation_turn(
+                &key.legacy,
+                "telegram",
+                "u1",
+                "assistant",
+                "old-answer",
+                Some("2026-05-20T00:00:01Z"),
+                Some("m2"),
+                Some("system:legacy"),
+            )
+            .await
+            .unwrap();
+        // Post-cutover turns persisted under the canonical session_key.
+        memory
+            .append_conversation_turn(
+                &key.canonical,
+                "telegram",
+                "u1",
+                "user",
+                "new-question",
+                Some("2026-05-21T00:00:00Z"),
+                Some("m3"),
+                Some("system:canonical"),
+            )
+            .await
+            .unwrap();
+        memory
+            .append_conversation_turn(
+                &key.canonical,
+                "telegram",
+                "u1",
+                "assistant",
+                "new-answer",
+                Some("2026-05-21T00:00:01Z"),
+                Some("m4"),
+                Some("system:canonical"),
+            )
+            .await
+            .unwrap();
+
+        let hydrated = load_persisted_histories(tmp.path(), memory.as_ref()).await;
+        // Both keys must survive hydration (no merge-at-load), so the per-message
+        // ConversationKey can union them on read.
+        assert!(hydrated.contains_key(&key.legacy), "legacy session must hydrate");
+        assert!(hydrated.contains_key(&key.canonical), "canonical session must hydrate");
+
+        let merged = merged_history(&hydrated, &key);
+        let rendered: Vec<&str> = merged.iter().map(|m| m.content.as_str()).collect();
+        assert_eq!(
+            rendered,
+            vec!["old-question", "old-answer", "new-question", "new-answer"],
+            "post-restart merged read must include legacy pre-history + canonical turns in order"
         );
     }
 
@@ -4684,7 +5226,10 @@ mod tests {
 
         let _ = append_sender_turn(
             &ctx,
-            "telegram_sender-1",
+            &ConversationKey {
+                canonical: "channel:telegram:sender-1:sender-1".to_string(),
+                legacy: "telegram_sender-1".to_string(),
+            },
             "telegram",
             "sender-1",
             Some("sender-1"),
@@ -5758,13 +6303,19 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(sent.len(), 1);
         assert!(sent[0].contains("Provider switched to `openrouter`"));
 
-        let route_key = "telegram_alice";
-        let route = runtime_ctx
-            .route_overrides
-            .lock()
-            .get(route_key)
+        // The route override is written under the canonical key (FIX-P1-25b);
+        // the legacy key is left untouched (read-merge writes canonical only), so
+        // it must not appear here since this session never had a legacy override.
+        let routes = runtime_ctx.route_overrides.lock();
+        assert!(
+            routes.get("telegram_alice").is_none(),
+            "writes go to the canonical key only; no legacy route key is created"
+        );
+        let route = routes
+            .get("channel:telegram:alice:chat-1")
             .cloned()
-            .expect("route should be stored for sender");
+            .expect("route should be stored for sender under canonical key");
+        drop(routes);
         assert_eq!(route.provider, "openrouter");
         assert_eq!(route.model, "default-model");
 
@@ -7534,7 +8085,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let histories = runtime_ctx.conversation_histories.lock();
         let turns = histories
-            .get("test-channel_alice")
+            .get("channel:test-channel:alice:chat-ctx")
             .expect("history should be stored for sender");
         assert_eq!(turns[0].role, "user");
         assert_eq!(turns[0].content, "hello");

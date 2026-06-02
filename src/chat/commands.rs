@@ -57,10 +57,11 @@ const HELP_TEXT: &str = "Available commands:
   /help              Show this help message
   /clear /new        Clear conversation history
   /model [name]      Show or switch model
-  /provider [name]   Show or switch provider
+  /provider [name [model]]  Show or hot-switch provider
   /tools             List available tools
   /memory <query>    Search memory
   /cost              Show token usage estimate
+  /compact           Compact conversation context (free up window)
   /export [md|json]  Export conversation
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
@@ -101,10 +102,15 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             CommandResult::HandledWithOutput(format!("Switching model to {new_model}…"))
         }
         _ if input.starts_with("/provider ") => {
-            let new_provider = input["/provider ".len()..].trim();
-            CommandResult::HandledWithOutput(format!(
-                "Provider switching requires restarting: prx chat -p {new_provider}"
-            ))
+            // Bug #3: `/provider <name> [model]` is intercepted in the chat run loop
+            // (it must rebuild the provider instance + mutate the live provider/model
+            // slots), so this arm is normally unreachable. Kept as a correct fallback
+            // for any caller that routes through `dispatch` directly (e.g. tests).
+            let new_provider = input["/provider ".len()..]
+                .split_whitespace()
+                .next()
+                .unwrap_or_default();
+            CommandResult::HandledWithOutput(format!("Switching provider to {new_provider}…"))
         }
         _ if input.starts_with("/memory ") => {
             let query = input["/memory ".len()..].trim();
@@ -536,6 +542,35 @@ mod mode_tests {
         // BUG-07: bare `/model` now advertises the live-switch command.
         assert!(text.contains("/model <name>"));
         assert_system_message_added(text, "Current model: kimi-code");
+    }
+
+    /// Bug #3: the `dispatch` fallback for `/provider <name>` must no longer tell
+    /// the user to restart (hot-switch is now wired in the chat run loop). It
+    /// reports an in-session switch instead.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_provider_switch_does_not_require_restart() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new("kimi-code", "kimi-code");
+        let ctx = CommandContext {
+            model_name: "kimi-code",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/provider openrouter", &ctx).await);
+
+        assert!(
+            !text.to_lowercase().contains("restart"),
+            "provider switch must not ask the user to restart: {text}"
+        );
+        assert!(
+            text.contains("openrouter"),
+            "feedback should name the target provider: {text}"
+        );
     }
 
     #[cfg(feature = "terminal-tui")]

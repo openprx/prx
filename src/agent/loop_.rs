@@ -501,6 +501,113 @@ async fn persist_tool_output_document(
     }
 }
 
+/// FIX-P2-02: tools whose output is *externally controlled, untrusted* content
+/// (remote web pages, arbitrary HTTP responses, on-disk files). Their results
+/// are ingested verbatim as read-only, untrusted document copies so the exact
+/// fetched bytes are preserved and cannot later be silently rewritten in history
+/// and re-presented to the model as trusted context.
+const UNTRUSTED_EXTERNAL_CONTENT_TOOLS: &[&str] = &["web_fetch", "http_request", "file_read"];
+
+/// FIX-P2-02: `source_kind` tag stamped on the read-only untrusted external copies
+/// persisted by [`persist_untrusted_external_copy`]. Document search results whose
+/// owning document carries this `source_kind` are hard-filtered out of the agent's
+/// trusted recall context (see [`drop_untrusted_external_results`]) so that
+/// attacker-controlled fetched content can never be silently re-injected into the
+/// prompt as if it were trusted memory. The copies remain in the store for
+/// provenance/audit and are still reachable via explicit document tools.
+const UNTRUSTED_EXTERNAL_SOURCE_KIND: &str = "untrusted_external";
+
+/// FIX-P2-02: remove untrusted external content copies from a document search
+/// result set before it is assembled into trusted agent context.
+///
+/// Untrusted external copies (`source_kind == "untrusted_external"`) are ingested
+/// only as a tamper-evident provenance record of exactly what was fetched; they
+/// must never be recalled and re-injected as trusted context, otherwise the
+/// ingest would *amplify* the prompt-injection surface it was meant to contain.
+/// Results whose `source_kind` is `None` (backends that cannot resolve it) or any
+/// other value are retained unchanged.
+fn drop_untrusted_external_results(results: &mut Vec<DocumentSearchResult>) {
+    results.retain(|result| result.source_kind.as_deref() != Some(UNTRUSTED_EXTERNAL_SOURCE_KIND));
+}
+
+/// FIX-P2-02: persist a read-only, untrusted copy of externally-sourced tool
+/// output (web_fetch / http_request / file_read) into the document store.
+///
+/// Unlike [`persist_tool_output_document`] (which only fires for *oversized*
+/// outputs and stores a generic `tool_output` document at the runtime
+/// visibility), this captures the **verbatim** content of every successful
+/// external fetch — regardless of size — at `MemoryVisibility::Private` and tags
+/// it as untrusted in metadata. The copy is never mutated after ingest, giving a
+/// tamper-evident reference for the originally retrieved bytes. Backends without
+/// durable document ingest (NoneMemory / MarkdownMemory) skip silently; ingest
+/// failures are logged and never surfaced as a tool error (best-effort sink).
+async fn persist_untrusted_external_copy(runtime: Option<&DocumentIngestRuntime>, tool_name: &str, content: &str) {
+    if !UNTRUSTED_EXTERNAL_CONTENT_TOOLS.contains(&tool_name) {
+        return;
+    }
+    if content.trim().is_empty() {
+        return;
+    }
+    let Some(runtime) = runtime else {
+        return;
+    };
+    if !runtime.memory.supports_document_ingest() {
+        tracing::debug!(
+            tool = %tool_name,
+            backend = runtime.memory.name(),
+            "memory backend does not support document ingest; skipping untrusted external copy"
+        );
+        return;
+    }
+    let (base_id, sha256) = tool_output_document_id(tool_name, content);
+    // Namespace the document id so the untrusted copy never collides with the
+    // oversized `tool_output` document for the same content.
+    let document_id = format!("untrusted:{base_id}");
+    let metadata_json = serde_json::json!({
+        "tool": tool_name,
+        "content_sha256": sha256,
+        "bytes": content.len(),
+        "trust": "untrusted",
+        "read_only": true,
+    })
+    .to_string();
+    let input = DocumentIngestInput {
+        document_id: Some(document_id.clone()),
+        workspace_id: runtime.workspace_id.clone(),
+        owner_id: runtime.owner_id.clone(),
+        topic_id: runtime.topic_id.clone(),
+        task_id: runtime.task_id.clone(),
+        source_message_event_id: runtime.source_message_event_id.clone(),
+        source_kind: UNTRUSTED_EXTERNAL_SOURCE_KIND.to_string(),
+        source_uri: Some(format!("untrusted:{tool_name}")),
+        title: Some(format!("Untrusted external content: {tool_name}")),
+        content: content.to_string(),
+        mime_type: Some("text/plain".to_string()),
+        // Most restrictive scope: untrusted external copies are private and are
+        // not re-injected as trusted shared context.
+        visibility: MemoryVisibility::Private,
+        metadata_json: Some(metadata_json),
+    };
+    match runtime.memory.ingest_document(input).await {
+        Ok(document) => {
+            tracing::info!(
+                document_id = %document.document_id,
+                tool = %tool_name,
+                chunks = document.chunk_count,
+                "Persisted read-only untrusted external content copy"
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                document_id = %document_id,
+                tool = %tool_name,
+                error = %error,
+                "Failed to persist untrusted external content copy (non-fatal)"
+            );
+        }
+    }
+}
+
 /// Compact a large tool result before inserting it into LLM history.
 ///
 /// This is the Phase-0 document-ingest spike: the full document backend is not
@@ -1719,10 +1826,15 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
         })
         .await
         .unwrap_or_default();
-    let document_results = mem
+    let mut document_results = mem
         .search_document_chunks(&principal, user_msg, 5)
         .await
         .unwrap_or_default();
+    // FIX-P2-02: hard-filter untrusted external content copies (web_fetch /
+    // http_request / file_read ingests) out of the trusted recall context before
+    // it is assembled into the prompt. These copies are retained in the store for
+    // provenance/audit only and must never be re-injected as trusted memory.
+    drop_untrusted_external_results(&mut document_results);
     let (document_context, selected_document_items, dropped_document_items) =
         build_document_context_trace_payload(&document_results);
     append_document_retrieval_trace(
@@ -4230,6 +4342,11 @@ pub(crate) async fn run_tool_call_loop(
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
 
+        // FIX-P2-02: persistence (untrusted external copy + oversized tool_output
+        // document) happens exactly once per tool result, in this loop, for every
+        // mode. The native-history branch below reuses the document status captured
+        // here instead of persisting a second time.
+        let mut document_statuses: Vec<&'static str> = Vec::with_capacity(individual_results.len());
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
             let success = !result.starts_with("Error");
             hooks
@@ -4272,6 +4389,12 @@ pub(crate) async fn run_tool_call_loop(
                 }
             };
 
+            // FIX-P2-02: keep a verbatim, read-only, untrusted copy of successful
+            // external content fetches (web_fetch / http_request / file_read).
+            if success {
+                persist_untrusted_external_copy(document_ingest.as_ref(), &call.name, result).await;
+            }
+
             // P0-8: Keep history bounded and persist oversized outputs in the
             // document layer when a runtime document sink is available.
             let document_status = persist_tool_output_document(
@@ -4282,6 +4405,9 @@ pub(crate) async fn run_tool_call_loop(
             )
             .await
             .unwrap_or("pending_document_backend");
+            // FIX-P2-02: record the status so the native-history branch can reuse
+            // it without persisting the same document a second time.
+            document_statuses.push(document_status);
             let truncated_result = compact_tool_result_for_history_with_status(
                 &call.name,
                 result,
@@ -4303,15 +4429,18 @@ pub(crate) async fn run_tool_call_loop(
         if native_tool_calls.is_empty() {
             history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
         } else {
-            for (native_call, result) in native_tool_calls.iter().zip(individual_results.iter()) {
-                let document_status = persist_tool_output_document(
-                    document_ingest.as_ref(),
-                    &native_call.name,
-                    result,
-                    MAX_TOOL_RESULT_INLINE_CHARS,
-                )
-                .await
-                .unwrap_or("pending_document_backend");
+            for (index, (native_call, result)) in native_tool_calls.iter().zip(individual_results.iter()).enumerate() {
+                // FIX-P2-02: persistence (untrusted external copy + oversized
+                // tool_output document) already ran exactly once in the loop above,
+                // which iterates the same `individual_results` in order. Reuse the
+                // captured document status here instead of persisting a second time
+                // (the previous duplicate write doubled I/O and storage for native
+                // mode). Fall back defensively if the status vector is shorter than
+                // expected (positional mismatch should not happen in practice).
+                let document_status = document_statuses
+                    .get(index)
+                    .copied()
+                    .unwrap_or("pending_document_backend");
                 let truncated_result = compact_tool_result_for_history_with_status(
                     &native_call.name,
                     result,
@@ -4398,7 +4527,11 @@ pub async fn run(
     let observer: Arc<dyn Observer> = Arc::from(base_observer);
     let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
@@ -5006,7 +5139,11 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
+            .with_audit_config(config.security.audit.clone()),
+    );
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
         &config.memory,
         &config.embedding_routes,
@@ -5246,7 +5383,8 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
     use crate::memory::{
-        DocumentIngestInput, Memory, MemoryCategory, MemoryVisibility, MessageEventInput, SqliteMemory,
+        DocumentIngestInput, DocumentRecord, Memory, MemoryCategory, MemoryEntry, MemoryVisibility, MessageEventInput,
+        SqliteMemory,
     };
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
@@ -5375,6 +5513,129 @@ mod tests {
         }
     }
 
+    /// FIX-P2-02: a provider that advertises native tool calling and returns
+    /// structured `tool_calls` from a script, so `run_tool_call_loop` takes the
+    /// native-history branch. Used to verify tool-output persistence is not
+    /// duplicated in native mode.
+    struct NativeScriptedProvider {
+        responses: Arc<Mutex<VecDeque<ChatResponse>>>,
+    }
+
+    impl NativeScriptedProvider {
+        fn new(responses: Vec<ChatResponse>) -> Self {
+            Self {
+                responses: Arc::new(Mutex::new(responses.into())),
+            }
+        }
+    }
+
+    /// FIX-P2-02: a thin `Memory` decorator that counts `ingest_document` calls
+    /// by document-id prefix and delegates everything else to an inner backend.
+    /// Used to prove the native-mode tool loop persists each tool result (the
+    /// untrusted external copy *and* the oversized `tool_output` document) exactly
+    /// once — a duplicate write is otherwise invisible because ingest is an
+    /// idempotent UPSERT keyed on a deterministic, content-addressed id.
+    struct CountingIngestMemory {
+        inner: Arc<dyn Memory>,
+        untrusted_copy_ingests: Arc<AtomicUsize>,
+        tool_output_ingests: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Memory for CountingIngestMemory {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+        fn supports_document_ingest(&self) -> bool {
+            self.inner.supports_document_ingest()
+        }
+        async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+            let id = input.document_id.clone().unwrap_or_default();
+            if id.starts_with("untrusted:") {
+                self.untrusted_copy_ingests.fetch_add(1, Ordering::SeqCst);
+            } else if id.starts_with("tool-output:") {
+                self.tool_output_ingests.fetch_add(1, Ordering::SeqCst);
+            }
+            self.inner.ingest_document(input).await
+        }
+        async fn search_document_chunks(
+            &self,
+            principal: &MemoryPrincipal,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DocumentSearchResult>> {
+            self.inner.search_document_chunks(principal, query, limit).await
+        }
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.store(key, content, category, session_id).await
+        }
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.recall(query, limit, session_id).await
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            self.inner.get(key).await
+        }
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.list(category, session_id).await
+        }
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.forget(key).await
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+    }
+
+    #[async_trait]
+    impl Provider for NativeScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system should not be used in native scripted provider tests");
+        }
+
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let mut responses = self.responses.lock().expect("responses lock should be valid");
+            responses
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("native scripted provider exhausted responses"))
+        }
+    }
+
     struct SystemSummaryProvider {
         response: String,
     }
@@ -5486,6 +5747,156 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    /// FIX-P2-02: large-output tool with a configurable name so a test can use the
+    /// `web_fetch` name (an untrusted-external-content tool) while still producing
+    /// oversized output that also triggers the `tool_output` document path.
+    struct NamedLargeOutputTool {
+        name: String,
+        output: String,
+    }
+
+    #[async_trait]
+    impl Tool for NamedLargeOutputTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn description(&self) -> &str {
+            "Returns a large output under a configurable tool name for dedup tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: self.output.clone(),
+                error: None,
+            })
+        }
+    }
+
+    /// FIX-P2-02: in native mode the same tool result must be persisted exactly
+    /// once. Previously the generic loop *and* the native-history branch each
+    /// persisted both the untrusted external copy and the oversized tool_output
+    /// document, doubling I/O and storage. This drives a native-mode `web_fetch`
+    /// call with oversized output and asserts a single copy of each.
+    #[tokio::test]
+    async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
+        let large_output = format!(
+            "{}\n{}",
+            "needle native dedup marker",
+            "large native payload ".repeat(600)
+        );
+        assert!(large_output.len() > MAX_TOOL_RESULT_INLINE_CHARS);
+
+        let provider = NativeScriptedProvider::new(vec![
+            ChatResponse {
+                text: None,
+                tool_calls: vec![ToolCall {
+                    id: "call-1".to_string(),
+                    name: "web_fetch".to_string(),
+                    arguments: "{}".to_string(),
+                }],
+                reasoning_content: None,
+            },
+            ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+        ]);
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(NamedLargeOutputTool {
+            name: "web_fetch".to_string(),
+            output: large_output.clone(),
+        })];
+        let tmp = TempDir::new().unwrap();
+        let inner: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let untrusted_copy_ingests = Arc::new(AtomicUsize::new(0));
+        let tool_output_ingests = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(CountingIngestMemory {
+            inner: Arc::clone(&inner),
+            untrusted_copy_ingests: Arc::clone(&untrusted_copy_ingests),
+            tool_output_ingests: Arc::clone(&tool_output_ingests),
+        });
+        let envelope = RuntimeEnvelope::agent(tmp.path().to_string_lossy().to_string(), "run-native-dedup")
+            .with_recipient("cli:local-user");
+        let document_ingest = DocumentIngestRuntime::from_envelope(Arc::clone(&memory), &envelope);
+        let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool call")];
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &NoopObserver,
+            &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(document_ingest),
+            ChatMode::default(),
+        )
+        .await
+        .expect("native dedup tool loop should complete");
+        assert_eq!(result, "done");
+
+        // Persistence uses deterministic, content-addressed document ids, so a
+        // duplicate write is an idempotent UPSERT — invisible at the document
+        // level. The counting decorator records every `ingest_document` call, so
+        // the previously-buggy native branch (which persisted both the untrusted
+        // copy and the oversized tool_output document a second time) would show a
+        // count of 2 here. Each must be exactly 1.
+        assert_eq!(
+            untrusted_copy_ingests.load(Ordering::SeqCst),
+            1,
+            "untrusted external copy must be persisted exactly once in native mode (no duplicate write)"
+        );
+        assert_eq!(
+            tool_output_ingests.load(Ordering::SeqCst),
+            1,
+            "oversized tool_output document must be persisted exactly once in native mode (no duplicate write)"
+        );
+
+        // Sanity: the untrusted copy is in the store and correctly tagged, while
+        // the recall hard-filter would still exclude it from trusted context.
+        let mut chunks = inner
+            .search_document_chunks(&envelope.memory_principal(), "needle native dedup marker", 50)
+            .await
+            .unwrap();
+        assert!(
+            chunks
+                .iter()
+                .any(|r| r.source_kind.as_deref() == Some("untrusted_external")),
+            "untrusted external copy should be present in the store for provenance"
+        );
+        drop_untrusted_external_results(&mut chunks);
+        assert!(
+            chunks
+                .iter()
+                .all(|r| r.source_kind.as_deref() != Some("untrusted_external")),
+            "recall hard-filter must drop the untrusted external copy"
+        );
     }
 
     #[test]
@@ -8238,5 +8649,170 @@ Let me check the result."#;
             ChatMessage::user("[Post-compaction context refresh] noise"),
         ];
         assert_eq!(latest_user_query(&history), Some("real question one"));
+    }
+
+    // ── FIX-P2-02: untrusted external content read-only copies ──
+
+    /// Build a DocumentIngestRuntime over `memory` scoped to the given
+    /// channel/sender so its owner_id matches a search principal built the same
+    /// way (needed for Private-visibility document retrieval).
+    fn untrusted_test_runtime(memory: Arc<dyn Memory>) -> DocumentIngestRuntime {
+        let workspace_id = "workspace-untrusted".to_string();
+        let owner_id = OwnerPrincipal::new(
+            workspace_id.clone(),
+            "terminal",
+            "local-user",
+            "chat-1".to_string(),
+            vec![Role::Anonymous],
+        )
+        .owner_id;
+        DocumentIngestRuntime {
+            memory,
+            workspace_id,
+            owner_id: Some(owner_id),
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+            session_key: Some("chat-1".to_string()),
+            agent_id: None,
+            persona_id: None,
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            visibility: MemoryVisibility::Workspace,
+        }
+    }
+
+    fn untrusted_search_principal() -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: "workspace-untrusted".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat-1".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_untrusted_external_copy_ingests_web_fetch_verbatim() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let runtime = untrusted_test_runtime(Arc::clone(&memory));
+
+        let content = "untrusted remote page about vector retrieval anchors";
+        persist_untrusted_external_copy(Some(&runtime), "web_fetch", content).await;
+
+        let results = memory
+            .search_document_chunks(&untrusted_search_principal(), "vector retrieval anchors", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "untrusted web_fetch copy should be retrievable");
+        let chunk = &results[0].chunk;
+        assert!(chunk.document_id.starts_with("untrusted:tool-output:web_fetch:"));
+        assert!(chunk.content.contains("untrusted remote page"));
+    }
+
+    #[tokio::test]
+    async fn persist_untrusted_external_copy_skips_non_external_tool() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let runtime = untrusted_test_runtime(Arc::clone(&memory));
+
+        // `shell` is not an external-content tool — no copy should be persisted.
+        persist_untrusted_external_copy(Some(&runtime), "shell", "ls -la output here").await;
+
+        let results = memory
+            .search_document_chunks(&untrusted_search_principal(), "output here", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty(), "non-external tool output must not be ingested");
+    }
+
+    #[tokio::test]
+    async fn persist_untrusted_external_copy_skips_empty_and_missing_runtime() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let runtime = untrusted_test_runtime(Arc::clone(&memory));
+
+        // Empty content is skipped.
+        persist_untrusted_external_copy(Some(&runtime), "file_read", "   ").await;
+        // No runtime → no-op (must not panic).
+        persist_untrusted_external_copy(None, "http_request", "some body").await;
+
+        let results = memory
+            .search_document_chunks(&untrusted_search_principal(), "some body", 10)
+            .await
+            .unwrap();
+        assert!(results.is_empty());
+    }
+
+    /// FIX-P2-02: the search result for an untrusted external copy must carry the
+    /// `untrusted_external` source_kind so the recall filter can identify it.
+    #[tokio::test]
+    async fn search_result_tags_untrusted_external_source_kind() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let runtime = untrusted_test_runtime(Arc::clone(&memory));
+
+        persist_untrusted_external_copy(Some(&runtime), "web_fetch", "untrusted poison context payload").await;
+
+        let results = memory
+            .search_document_chunks(&untrusted_search_principal(), "poison context payload", 10)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source_kind.as_deref(), Some("untrusted_external"));
+    }
+
+    /// FIX-P2-02: the recall hard-filter removes untrusted external copies but
+    /// keeps ordinary documents, so attacker-controlled fetched content is never
+    /// re-injected as trusted context while genuine memory still recalls.
+    #[tokio::test]
+    async fn drop_untrusted_external_results_filters_untrusted_only() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let runtime = untrusted_test_runtime(Arc::clone(&memory));
+
+        // 1. An untrusted external copy (web_fetch) — must be filtered out.
+        persist_untrusted_external_copy(Some(&runtime), "web_fetch", "shared marker token untrusted half").await;
+
+        // 2. A normal, trusted document with the same query-matching token.
+        memory
+            .ingest_document(DocumentIngestInput {
+                document_id: Some("trusted-doc-1".to_string()),
+                workspace_id: "workspace-untrusted".to_string(),
+                owner_id: runtime.owner_id.clone(),
+                topic_id: None,
+                task_id: None,
+                source_message_event_id: None,
+                source_kind: "user_note".to_string(),
+                source_uri: None,
+                title: Some("trusted note".to_string()),
+                content: "shared marker token trusted half".to_string(),
+                mime_type: Some("text/plain".to_string()),
+                visibility: MemoryVisibility::Workspace,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+
+        let mut results = memory
+            .search_document_chunks(&untrusted_search_principal(), "shared marker token", 10)
+            .await
+            .unwrap();
+        // Both copies are stored and retrievable at the store level.
+        assert_eq!(results.len(), 2, "both trusted and untrusted copies are in the store");
+
+        // After the recall hard-filter, only the trusted document remains.
+        drop_untrusted_external_results(&mut results);
+        assert_eq!(
+            results.len(),
+            1,
+            "untrusted external copy must be filtered out of recall"
+        );
+        assert_eq!(results[0].source_kind.as_deref(), Some("user_note"));
+        assert!(results[0].chunk.content.contains("trusted half"));
+        assert!(!results[0].chunk.content.contains("untrusted half"));
     }
 }

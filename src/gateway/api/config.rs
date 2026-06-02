@@ -15,10 +15,11 @@ use tracing::warn;
 pub async fn post_config_reload(State(state): State<AppState>) -> Response {
     use crate::tools::Tool as _;
     let config_snapshot = state.config.lock().clone();
-    let security = Arc::new(crate::security::SecurityPolicy::from_config(
-        &config_snapshot.autonomy,
-        &config_snapshot.workspace_dir,
-    ));
+    // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
+    let security = Arc::new(
+        crate::security::SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir)
+            .with_audit_config(config_snapshot.security.audit.clone()),
+    );
     let tool = crate::tools::ConfigReloadTool::with_security(Arc::clone(&state.shared_config), security);
     match tool.execute(serde_json::json!({})).await {
         Ok(result) if result.success => (

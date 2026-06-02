@@ -115,7 +115,18 @@ impl EvolutionScheduler {
                     if self.circuit_breaker.can_mutate_layer(layer.clone()) {
                         match self.run_layer(layer.clone(), now).await {
                             Ok(report) => {
-                                if report.rolled_back {
+                                // FIX-P0-40: a gate denial is neither a success nor a
+                                // failure of the evolution itself — the engine never
+                                // ran. Surface it explicitly so the daemon/operator
+                                // does not read "no error" as "evolution applied".
+                                if report.gate_denied {
+                                    tracing::warn!(
+                                        target: "self_system",
+                                        layer = ?report.layer,
+                                        experiment_id = %report.experiment_id,
+                                        "evolution layer skipped by side-effect gate (autonomy denied self-modification)"
+                                    );
+                                } else if report.rolled_back {
                                     self.circuit_breaker.record_failure(now);
                                 } else {
                                     self.circuit_breaker.record_success();
@@ -149,6 +160,7 @@ impl EvolutionScheduler {
                                     evolution_log: None,
                                     shadow_mode: mode.is_draft_like(),
                                     rolled_back: false,
+                                    gate_denied: false,
                                     errors: vec![err.to_string()],
                                 });
                             }

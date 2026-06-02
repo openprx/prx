@@ -138,7 +138,13 @@ impl AuditEvent {
 /// Audit logger
 pub struct AuditLogger {
     log_path: PathBuf,
-    config: AuditConfig,
+    /// FIX-P1-31 (alloc): the logger only ever reads `enabled` and `max_size_mb`
+    /// from the audit config (both `Copy`); `log_path` is consumed once in `new`.
+    /// Storing just these `Copy` scalars lets `new` borrow `&AuditConfig` instead
+    /// of owning a clone, removing the per-decision `String` allocation that the
+    /// side-effect gate audit hook previously paid on every authorized decision.
+    enabled: bool,
+    max_size_mb: u32,
     _buffer: Mutex<Vec<AuditEvent>>,
 }
 
@@ -177,8 +183,11 @@ pub struct SideEffectDecisionLog<'a> {
 }
 
 impl AuditLogger {
-    /// Create a new audit logger
-    pub fn new(config: AuditConfig, openprx_dir: PathBuf) -> Result<Self> {
+    /// Create a new audit logger.
+    ///
+    /// Borrows the config (no clone): only the `Copy` scalars `enabled` and
+    /// `max_size_mb` are retained, plus the resolved `log_path`.
+    pub fn new(config: &AuditConfig, openprx_dir: PathBuf) -> Result<Self> {
         let configured = std::path::Path::new(&config.log_path);
         let log_path = if configured.is_absolute() {
             tracing::error!(
@@ -203,14 +212,15 @@ impl AuditLogger {
         };
         Ok(Self {
             log_path,
-            config,
+            enabled: config.enabled,
+            max_size_mb: config.max_size_mb,
             _buffer: Mutex::new(Vec::new()),
         })
     }
 
     /// Log an event
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
-        if !self.config.enabled {
+        if !self.enabled {
             return Ok(());
         }
 
@@ -300,7 +310,7 @@ impl AuditLogger {
     fn rotate_if_needed(&self) -> Result<()> {
         if let Ok(metadata) = std::fs::metadata(&self.log_path) {
             let current_size_mb = metadata.len() / (1024 * 1024);
-            if current_size_mb >= u64::from(self.config.max_size_mb) {
+            if current_size_mb >= u64::from(self.max_size_mb) {
                 self.rotate()?;
             }
         }
@@ -325,12 +335,25 @@ impl AuditLogger {
 ///
 /// Default/unit policies often use `.` as workspace; skip those to avoid writing
 /// audit.log into the repo during tests. Runtime policies built from config have
-/// an explicit workspace and are logged with the default audit configuration.
-pub fn record_side_effect_decision_best_effort(workspace_dir: &Path, entry: SideEffectDecisionLog<'_>) {
+/// an explicit workspace.
+///
+/// FIX-P1-31: the caller threads the real `security.audit` configuration through
+/// `config` (previously this hard-coded `AuditConfig::default()`, so user config
+/// was ignored). When `config.enabled` is false this returns immediately without
+/// constructing a logger, writing a line, or issuing an `fsync` — disabling
+/// audit now genuinely removes the per-decision sync cost on the gate path.
+pub fn record_side_effect_decision_best_effort(
+    workspace_dir: &Path,
+    config: &AuditConfig,
+    entry: SideEffectDecisionLog<'_>,
+) {
+    if !config.enabled {
+        return;
+    }
     if workspace_dir.as_os_str().is_empty() || workspace_dir == Path::new(".") {
         return;
     }
-    let Ok(logger) = AuditLogger::new(AuditConfig::default(), workspace_dir.to_path_buf()) else {
+    let Ok(logger) = AuditLogger::new(config, workspace_dir.to_path_buf()) else {
         return;
     };
     if let Err(error) = logger.log_side_effect_decision(entry) {
@@ -424,7 +447,7 @@ mod tests {
     #[test]
     fn audit_side_effect_decision_uses_tool_gate_event_type() -> Result<()> {
         let tmp = TempDir::new()?;
-        let logger = AuditLogger::new(AuditConfig::default(), tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&AuditConfig::default(), tmp.path().to_path_buf())?;
 
         logger.log_side_effect_decision(SideEffectDecisionLog {
             tool_name: "file_write",
@@ -448,7 +471,7 @@ mod tests {
         // EU AI Act Art.12: every gate decision audit entry must carry the
         // subject (principal_id), operation, decision, deny reason, and grant_id.
         let tmp = TempDir::new()?;
-        let logger = AuditLogger::new(AuditConfig::default(), tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&AuditConfig::default(), tmp.path().to_path_buf())?;
 
         logger.log_side_effect_decision(SideEffectDecisionLog {
             tool_name: "file_write",
@@ -481,7 +504,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&config, tmp.path().to_path_buf())?;
         let event = AuditEvent::new(AuditEventType::CommandExecution);
 
         logger.log(&event)?;
@@ -501,7 +524,7 @@ mod tests {
             max_size_mb: 10,
             ..Default::default()
         };
-        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&config, tmp.path().to_path_buf())?;
         let event = AuditEvent::new(AuditEventType::CommandExecution)
             .with_actor("cli".to_string(), None, None)
             .with_action("ls".to_string(), "low".to_string(), false, true);
@@ -527,7 +550,7 @@ mod tests {
             max_size_mb: 10,
             ..Default::default()
         };
-        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&config, tmp.path().to_path_buf())?;
 
         logger.log_command_event(CommandExecutionLog {
             channel: "telegram",
@@ -562,7 +585,7 @@ mod tests {
             max_size_mb: 0, // Force rotation on first write
             ..Default::default()
         };
-        let logger = AuditLogger::new(config, tmp.path().to_path_buf())?;
+        let logger = AuditLogger::new(&config, tmp.path().to_path_buf())?;
 
         // Write initial content that triggers rotation
         let log_path = tmp.path().join("audit.log");

@@ -600,6 +600,7 @@ impl<'a> SideEffectGate<'a> {
             .or_else(|| result.as_ref().err().map(String::as_str));
         crate::security::audit::record_side_effect_decision_best_effort(
             &self.policy.workspace_dir,
+            &self.policy.audit_config,
             crate::security::audit::SideEffectDecisionLog {
                 tool_name,
                 operation_name: command,
@@ -679,6 +680,7 @@ impl<'a> SideEffectGate<'a> {
             .or_else(|| result.as_ref().err().map(String::as_str));
         crate::security::audit::record_side_effect_decision_best_effort(
             &self.policy.workspace_dir,
+            &self.policy.audit_config,
             crate::security::audit::SideEffectDecisionLog {
                 tool_name,
                 operation_name,
@@ -802,6 +804,12 @@ pub struct SecurityPolicy {
     pub scope_rules: Vec<crate::config::ScopeRule>,
     /// Default action when no scope rule matches: true = allow, false = deny.
     pub scope_default_allow: bool,
+    /// FIX-P1-31: audit configuration governing the side-effect gate's audit
+    /// trail. When `enabled=false` the gate's best-effort audit hook writes
+    /// nothing and performs no `fsync`, so a user who disables `security.audit`
+    /// actually pays no audit cost. Defaults to [`AuditConfig::default`]
+    /// (`enabled=true`) to preserve the historical always-on behaviour.
+    pub audit_config: crate::config::AuditConfig,
 }
 
 impl Default for SecurityPolicy {
@@ -854,6 +862,7 @@ impl Default for SecurityPolicy {
             tracker: ActionTracker::new(),
             scope_rules: Vec::new(),
             scope_default_allow: true,
+            audit_config: crate::config::AuditConfig::default(),
         }
     }
 }
@@ -1491,7 +1500,20 @@ impl SecurityPolicy {
             tracker: ActionTracker::new(),
             scope_rules: autonomy_config.scopes.rules.clone(),
             scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
+            // Default audit config; callers that have the real `security.audit`
+            // block attach it via [`Self::with_audit_config`] so the gate audit
+            // path honours `enabled`/`log_path`/`max_size_mb`.
+            audit_config: crate::config::AuditConfig::default(),
         }
+    }
+
+    /// FIX-P1-31: attach the user-configured `security.audit` block so the
+    /// side-effect gate's audit trail respects it (notably `enabled=false`,
+    /// which then skips both the write and the synchronous `fsync`).
+    #[must_use]
+    pub fn with_audit_config(mut self, audit_config: crate::config::AuditConfig) -> Self {
+        self.audit_config = audit_config;
+        self
     }
 
     /// Check whether a specific tool is allowed for the given request context.
@@ -2243,6 +2265,57 @@ mod tests {
             .and_then(|e| e.result.as_ref())
             .and_then(|r| r.error.clone())
             .expect("test: deny reason recorded")
+    }
+
+    #[test]
+    fn gate_with_audit_disabled_writes_no_audit_log() {
+        // FIX-P1-31: a policy carrying `security.audit.enabled=false` must skip the
+        // gate audit write (and its synchronous fsync) entirely.
+        let tmp = tempfile::TempDir::new().expect("test: temp workspace");
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        }
+        .with_audit_config(crate::config::AuditConfig {
+            enabled: false,
+            ..crate::config::AuditConfig::default()
+        });
+
+        // Deny path (no grant for medium risk under supervised) — would normally
+        // write a tool_gate audit event; with audit disabled it must not.
+        let gate = SideEffectGate::new(&policy);
+        let _ = gate.authorize_resource_operation("file_write", "file_write:write:x", ResourceRiskLevel::Medium, None);
+
+        assert!(
+            !tmp.path().join("audit.log").exists(),
+            "audit.log must not be created when security.audit.enabled=false"
+        );
+    }
+
+    #[test]
+    fn gate_with_audit_enabled_writes_audit_log() {
+        // Sanity counterpart: explicit enabled=true config still writes.
+        let tmp = tempfile::TempDir::new().expect("test: temp workspace");
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        }
+        .with_audit_config(crate::config::AuditConfig {
+            enabled: true,
+            ..crate::config::AuditConfig::default()
+        });
+
+        let gate = SideEffectGate::new(&policy);
+        let _ = gate.authorize_resource_operation("file_write", "file_write:write:x", ResourceRiskLevel::Medium, None);
+
+        assert!(
+            tmp.path().join("audit.log").exists(),
+            "audit.log must be created when security.audit.enabled=true"
+        );
     }
 
     #[test]
