@@ -665,6 +665,7 @@ fn channels_template(spec: Spec) -> String {
 # and configure one of the platforms below.
 
 [channels_config]
+cli = true                          # enable the interactive CLI channel
 # [channels_config.telegram]
 # bot_token = ""
 # allowed_users = ["your_username"]
@@ -682,6 +683,7 @@ fn channels_template(spec: Spec) -> String {
 # Connect PRX to messaging platforms: Telegram, Discord, Slack, etc.
 
 [channels_config]
+cli = true                          # enable the interactive CLI channel
 # Uncomment and configure the channels you need:
 
 # [channels_config.telegram]
@@ -741,8 +743,7 @@ port = 3120
 require_pairing = false
 
 [tunnel]
-enabled = false
-# provider = "cloudflared"
+provider = "none"                  # none | cloudflare | tailscale | ngrok | custom
 # domain = ""
 
 [proxy]
@@ -761,8 +762,7 @@ require_pairing = false
 
 # Tunnel for exposing gateway to the internet
 [tunnel]
-enabled = false
-# provider = "cloudflared"        # cloudflared | ngrok | localtunnel
+provider = "none"                  # none | cloudflare | tailscale | ngrok | custom
 # domain = ""                      # custom domain if supported
 # auth_token = ""                  # tunnel provider auth token
 
@@ -791,6 +791,7 @@ workspace_only = true
 max_actions_per_hour = 100
 max_cost_per_day_cents = 500
 allowed_commands = ["git", "ls", "cat", "grep", "find", "head", "tail", "wc"]
+forbidden_paths = []                   # no extra path denylist
 
 [secrets]
 encrypt = true
@@ -925,7 +926,7 @@ max_tool_iterations = 10
 max_history_messages = 50
 
 [agent.compaction]
-mode = "sliding_window"
+mode = "safeguard"                     # off | safeguard | aggressive
 max_context_tokens = 100000
 
 [sessions_spawn]
@@ -947,7 +948,7 @@ max_history_messages = 50
 
 # Context compaction to manage long conversations
 [agent.compaction]
-mode = "sliding_window"               # sliding_window | summarize | none
+mode = "safeguard"                    # off | safeguard | aggressive
 max_context_tokens = 100000
 
 # Session spawning for parallel task execution
@@ -1384,6 +1385,30 @@ mod tests {
             "observability.toml",
         ] {
             assert!(dir.join("config.d").join(name).exists(), "missing config.d/{name}");
+        }
+    }
+
+    #[test]
+    fn generated_templates_load_as_valid_config() {
+        // BUG-D1-03: the generated server/full templates must be loadable
+        // out-of-the-box. Regression guard against illegal enum values / missing
+        // required fields (compaction mode, autonomy.forbidden_paths,
+        // tunnel.provider). Loads through the real merge + deserialize + validate
+        // path so it exercises exactly what `prx info` would.
+        for spec in [Spec::Minimal, Spec::Server, Spec::Full] {
+            let tmp = tempfile::tempdir().expect("test: create tempdir");
+            let dir = tmp.path();
+            spec.generate(dir, false)
+                .unwrap_or_else(|e| panic!("test: generate {}: {e}", spec.name()));
+
+            let config_path = dir.join("config.toml");
+            let workspace_dir = dir.join("workspace");
+            crate::config::Config::load_from_path(&config_path, workspace_dir).unwrap_or_else(|e| {
+                panic!(
+                    "test: generated `{}` template must load as a valid Config: {e:#}",
+                    spec.name()
+                )
+            });
         }
     }
 
