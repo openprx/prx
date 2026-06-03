@@ -233,74 +233,142 @@ pub struct Principal {
     pub acl_enforced: bool,
 }
 
+/// Dialect-agnostic scope parameter value.
+///
+/// D11: the single-source scope predicate (`build_scope_predicate`) emits a
+/// SQL template plus an ordered list of these values. Every backend renderer
+/// (`build_sql_scope` for SQLite `?`, `build_sql_scope_pg` for Postgres `$N`)
+/// binds them through parameterized queries only — never string-interpolated
+/// into SQL (iron rule 9). All current scope binds are plain text columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeParam {
+    Text(String),
+}
+
+/// Placeholder marker used inside a `ScopePredicate::template`.
+///
+/// Each occurrence corresponds positionally to one entry in
+/// `ScopePredicate::params`. Backend renderers replace these markers with their
+/// dialect-specific placeholder (`?` for SQLite, `$N` for Postgres). The marker
+/// must never collide with literal SQL text; `{}` is safe here because the
+/// canonical predicate contains no `format!`-style braces in its literals.
+const SCOPE_BIND_MARKER: &str = "{}";
+
+/// Dialect-agnostic scope predicate: the single source of truth for the
+/// memory-visibility truth table shared by every backend.
+///
+/// The `template` is a WHERE-clause fragment whose bind points are marked with
+/// [`SCOPE_BIND_MARKER`]; `params` lists the bound values in template order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopePredicate {
+    pub template: String,
+    pub params: Vec<ScopeParam>,
+}
+
 impl Principal {
-    pub fn build_sql_scope(&self) -> (String, Vec<Value>) {
+    /// Single-source scope truth table (D11).
+    ///
+    /// Produces a dialect-agnostic [`ScopePredicate`] from `role` /
+    /// `visibility_ceiling`. Both the SQLite and Postgres backends render from
+    /// this one function, so the visibility truth table can no longer drift
+    /// between backends. Bind points use [`SCOPE_BIND_MARKER`]; the literal SQL
+    /// is portable (plain scalar comparisons plus one standard sub-query, no
+    /// dialect-specific functions).
+    pub fn build_scope_predicate(&self) -> ScopePredicate {
+        let m = SCOPE_BIND_MARKER;
+
         if !self.acl_enforced {
-            return ("1=1".to_string(), Vec::new());
+            return ScopePredicate {
+                template: "1=1".to_string(),
+                params: Vec::new(),
+            };
         }
 
         match self.role {
-            Role::Owner => ("1=1".to_string(), Vec::new()),
+            Role::Owner => ScopePredicate {
+                template: "1=1".to_string(),
+                params: Vec::new(),
+            },
             // FIX-P1-06: unify the Anonymous scope with the previously hardcoded
             // SQLite recall/forget branches. An anonymous principal sees public
             // rows plus rows it authored, matched on the
             // `(channel, chat_id, raw_sender)` triple, excluding secrets.
-            Role::Anonymous => (
-                "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) \
-                 AND sensitivity != 'secret'"
-                    .to_string(),
-                vec![
-                    Value::from(self.current_channel.clone()),
-                    Value::from(self.current_chat_id.clone()),
-                    Value::from(self.raw_sender.clone()),
+            Role::Anonymous => ScopePredicate {
+                template: format!(
+                    "(visibility = 'public' OR (channel = {m} AND chat_id = {m} AND raw_sender = {m})) \
+                     AND sensitivity != 'secret'"
+                ),
+                params: vec![
+                    ScopeParam::Text(self.current_channel.clone()),
+                    ScopeParam::Text(self.current_chat_id.clone()),
+                    ScopeParam::Text(self.raw_sender.clone()),
                 ],
-            ),
+            },
             Role::Member | Role::Guest => {
                 let ceiling_ord = self.visibility_ceiling.ordinal();
                 let mut conditions = vec!["visibility = 'public'".to_string()];
                 let mut params = Vec::new();
 
                 if ceiling_ord >= Visibility::Private.ordinal() {
-                    conditions.push(
-                        "(visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?)".to_string(),
-                    );
-                    params.push(Value::from(self.current_channel.clone()));
-                    params.push(Value::from(self.current_chat_id.clone()));
+                    conditions.push(format!(
+                        "(visibility = 'private' AND chat_type = 'dm' AND channel = {m} AND chat_id = {m})"
+                    ));
+                    params.push(ScopeParam::Text(self.current_channel.clone()));
+                    params.push(ScopeParam::Text(self.current_chat_id.clone()));
                 }
 
                 if ceiling_ord >= Visibility::User.ordinal() {
-                    conditions.push("(visibility = 'user' AND sender_id = ?)".to_string());
-                    params.push(Value::from(self.user_id.clone()));
+                    conditions.push(format!("(visibility = 'user' AND sender_id = {m})"));
+                    params.push(ScopeParam::Text(self.user_id.clone()));
                 }
 
                 if ceiling_ord >= Visibility::Group.ordinal() {
-                    conditions.push(
-                        "(visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)".to_string(),
-                    );
-                    params.push(Value::from(self.current_channel.clone()));
-                    params.push(Value::from(self.current_chat_id.clone()));
+                    conditions.push(format!(
+                        "(visibility = 'group' AND chat_type = 'group' AND channel = {m} AND chat_id = {m})"
+                    ));
+                    params.push(ScopeParam::Text(self.current_channel.clone()));
+                    params.push(ScopeParam::Text(self.current_chat_id.clone()));
                 }
 
                 if ceiling_ord >= Visibility::Project.ordinal() && !self.projects.is_empty() {
-                    let placeholders = (0..self.projects.len()).map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders = (0..self.projects.len()).map(|_| m).collect::<Vec<_>>().join(",");
                     conditions.push(format!(
                         "(visibility = 'project' AND topic_id IN (\
                             SELECT t.id FROM topics t \
                             INNER JOIN topic_participants tp ON tp.topic_id = t.id \
                             WHERE t.project IN ({placeholders}) \
-                            AND tp.user_id = ?\
+                            AND tp.user_id = {m}\
                         ))"
                     ));
-                    params.extend(self.projects.iter().cloned().map(Value::from));
-                    params.push(Value::from(self.user_id.clone()));
+                    params.extend(self.projects.iter().cloned().map(ScopeParam::Text));
+                    params.push(ScopeParam::Text(self.user_id.clone()));
                 }
 
-                (
-                    format!("({}) AND sensitivity != 'secret'", conditions.join(" OR ")),
+                ScopePredicate {
+                    template: format!("({}) AND sensitivity != 'secret'", conditions.join(" OR ")),
                     params,
-                )
+                }
             }
         }
+    }
+
+    /// SQLite renderer (`?` placeholders). Thin wrapper over
+    /// [`build_scope_predicate`](Self::build_scope_predicate): each
+    /// [`SCOPE_BIND_MARKER`] becomes a `?`, each [`ScopeParam`] becomes a
+    /// `rusqlite` [`Value`]. Behavior is byte-for-byte identical to the prior
+    /// hand-written implementation (locked by the `golden_build_sql_scope_*`
+    /// tests).
+    pub fn build_sql_scope(&self) -> (String, Vec<Value>) {
+        let predicate = self.build_scope_predicate();
+        let sql = predicate.template.replace(SCOPE_BIND_MARKER, "?");
+        let params = predicate
+            .params
+            .into_iter()
+            .map(|param| match param {
+                ScopeParam::Text(text) => Value::from(text),
+            })
+            .collect();
+        (sql, params)
     }
 }
 
@@ -1034,6 +1102,66 @@ AND tp.user_id = ?\
              AND sensitivity != 'secret'"
         );
         assert_eq!(texts(&params), vec!["telegram", "chat-1", "u1", "telegram", "chat-1"]);
+    }
+
+    // ----------------------------------------------------------------------
+    // D11 A1: dialect-agnostic predicate invariants. The number of bind
+    // markers in the template must always equal the number of params, and the
+    // SQLite renderer must reproduce the predicate's markers as `?`.
+    // ----------------------------------------------------------------------
+
+    fn marker_count(template: &str) -> usize {
+        template.matches(SCOPE_BIND_MARKER).count()
+    }
+
+    #[test]
+    fn scope_predicate_marker_count_matches_param_count_all_branches() {
+        let cases = [
+            base_principal(Role::Owner, Visibility::Public),
+            base_principal(Role::Anonymous, Visibility::Private),
+            base_principal(Role::Guest, Visibility::Private),
+            base_principal(Role::Member, Visibility::User),
+            base_principal(Role::Member, Visibility::Group),
+            base_principal(Role::Member, Visibility::Project),
+        ];
+        for principal in cases {
+            let predicate = principal.build_scope_predicate();
+            assert_eq!(
+                marker_count(&predicate.template),
+                predicate.params.len(),
+                "marker/param mismatch for role {:?} ceiling {:?}",
+                principal.role,
+                principal.visibility_ceiling
+            );
+        }
+    }
+
+    #[test]
+    fn scope_predicate_sqlite_renders_markers_as_question_marks() {
+        // The SQLite renderer must leave no bind markers behind and must emit
+        // exactly one `?` per param.
+        let principal = base_principal(Role::Member, Visibility::Project);
+        let predicate = principal.build_scope_predicate();
+        let (sql, params) = principal.build_sql_scope();
+        assert!(
+            !sql.contains(SCOPE_BIND_MARKER),
+            "template marker leaked into SQLite SQL"
+        );
+        assert_eq!(sql.matches('?').count(), predicate.params.len());
+        assert_eq!(params.len(), predicate.params.len());
+    }
+
+    #[test]
+    fn scope_predicate_owner_and_acl_disabled_are_unconditional() {
+        let owner = base_principal(Role::Owner, Visibility::Public).build_scope_predicate();
+        assert_eq!(owner.template, "1=1");
+        assert!(owner.params.is_empty());
+
+        let mut member = base_principal(Role::Member, Visibility::Public);
+        member.acl_enforced = false;
+        let disabled = member.build_scope_predicate();
+        assert_eq!(disabled.template, "1=1");
+        assert!(disabled.params.is_empty());
     }
 
     #[test]
