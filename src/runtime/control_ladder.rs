@@ -413,11 +413,21 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
     let feature_enabled = cfg!(feature = "llm-router");
     let requested = config.causal_tree.enabled;
     let enabled = feature_enabled && requested;
+    // Honest semantics: this trace is built from `&Config` only — it has no access
+    // to the runtime `AppContext`, and `loop_::run` never calls `build_trace`. So
+    // it can only declare the *config intent*, not prove that CTE is actually
+    // attached and running. The previous `status = "configured"` over-claimed a
+    // runtime attachment that this layer cannot observe. We therefore report
+    // `config_declared` and point at the real runtime evidence: the observer's
+    // `CteRun` events emitted by `CausalTreeEngine::run` (only fired when the
+    // AgentLoop profile attached CTE and a turn actually ran the pipeline). The two
+    // are complementary — config declaration here, runtime proof in the event
+    // stream — neither pretends to be the other.
     ControlLayerTrace {
         level: 2,
         name: "causal_tree".to_string(),
         enabled,
-        status: if enabled { "configured" } else { "fallback" }.to_string(),
+        status: if enabled { "config_declared" } else { "fallback" }.to_string(),
         reason: if enabled {
             Some("causal_tree_enabled".to_string())
         } else if !feature_enabled {
@@ -428,6 +438,12 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
         detail: json!({
             "config_enabled": requested,
             "feature_enabled": feature_enabled,
+            // Make the evidence boundary explicit: this layer is a config snapshot,
+            // not a runtime-attached proof. Runtime attachment/run is evidenced by
+            // observer `CteRun` events, not by this trace.
+            "attachment": "config_snapshot",
+            "runtime_evidence": "observer:CteRun",
+            "experimental": true,
             "max_branches": config.causal_tree.policy.max_branches,
             "default_side_effect_mode": config.causal_tree.policy.default_side_effect_mode,
         }),
@@ -552,6 +568,37 @@ mod tests {
             Some("scheduler_module_disabled")
         );
         assert_eq!(layer(&trace, "task_pool").status, "configured");
+    }
+
+    /// When CTE is enabled (and the feature is compiled in), the layer reports the
+    /// honest `config_declared` status plus an explicit evidence boundary
+    /// (`attachment = config_snapshot`, `runtime_evidence = observer:CteRun`) — it
+    /// must not over-claim a runtime attachment it cannot observe.
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn causal_tree_layer_declares_config_snapshot_when_enabled() {
+        let mut config = Config::default();
+        config.causal_tree.enabled = true;
+
+        let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", None);
+        let cte = layer(&trace, "causal_tree");
+
+        assert_eq!(
+            cte.status, "config_declared",
+            "must declare config intent, not 'configured'"
+        );
+        assert!(cte.enabled);
+        assert_eq!(
+            cte.detail.get("attachment").and_then(Value::as_str),
+            Some("config_snapshot"),
+            "attachment evidence boundary must be explicit"
+        );
+        assert_eq!(
+            cte.detail.get("runtime_evidence").and_then(Value::as_str),
+            Some("observer:CteRun"),
+            "runtime proof is the observer CteRun event stream"
+        );
+        assert_eq!(cte.detail.get("experimental").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

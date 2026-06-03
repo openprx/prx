@@ -963,7 +963,9 @@ process_memory_strategy = "shared_fabric"
 enabled = false
 # evolution_enabled = false
 
-# Causal tree for structured reasoning
+# Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs
+# speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)
+# before each turn. Default off; runtime evidence appears as observer CteRun events.
 [causal_tree]
 enabled = false
 
