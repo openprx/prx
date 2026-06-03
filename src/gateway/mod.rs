@@ -3545,7 +3545,7 @@ mod tests {
             webhook.recipient.clone(),
             MemoryVisibility::Session,
         )
-        .with_legacy_session_key(webhook.session_key.clone());
+        .with_legacy_session_key(webhook.session_key);
         assert_eq!(
             envelope.message_scope().session_key.as_deref(),
             Some(canonical.as_str())

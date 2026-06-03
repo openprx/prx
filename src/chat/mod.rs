@@ -4037,8 +4037,14 @@ mod session_runtime_binding_tests {
 
         assert_eq!(events.len(), 2);
         // The durable session_key truly changed to canonical (not just recipient).
-        assert_eq!(events[0].session_key.as_deref(), Some(canonical_key.as_str()));
-        assert_ne!(events[0].session_key.as_deref(), Some(session_key.as_str()));
+        assert_eq!(
+            events.first().and_then(|e| e.session_key.as_deref()),
+            Some(canonical_key.as_str())
+        );
+        assert_ne!(
+            events.first().and_then(|e| e.session_key.as_deref()),
+            Some(session_key.as_str())
+        );
         let user_recorded = events.first();
         let assistant_recorded = events.get(1);
         assert_eq!(user_recorded.map(|event| event.source.as_str()), Some("chat"));
