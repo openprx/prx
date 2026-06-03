@@ -1273,6 +1273,7 @@ fn authorize_channel_outbound(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn append_sender_turn(
     ctx: &ChannelRuntimeContext,
     key: &ConversationKey,
@@ -1283,6 +1284,11 @@ async fn append_sender_turn(
     visibility: MemoryVisibility,
     timestamp: Option<&str>,
     message_id: Option<&str>,
+    // D8-1: the per-turn run_id, generated at the turn entry (before the inbound
+    // append). Threaded onto the channel_with_session envelope so the user and
+    // assistant message events recorded for this turn carry the same run_id
+    // (latent provenance, EU AI Act Art.12).
+    run_id: &str,
 ) -> Option<crate::memory::MessageEvent> {
     let role = turn.role.clone();
     let content = turn.content.clone();
@@ -1312,7 +1318,8 @@ async fn append_sender_turn(
         sender.to_string(),
         recipient.unwrap_or(sender).to_string(),
         visibility,
-    );
+    )
+    .with_run_id(run_id);
     let owner_id = envelope.resolved_owner_id();
 
     if let Err(error) = ctx
@@ -2540,6 +2547,13 @@ async fn process_channel_message(
         return;
     }
 
+    // D8-1: one run_id per channel turn, generated at the turn entry (right after
+    // the inbound gate, before any persistence). It is threaded through every
+    // append_sender_turn call for this turn and reused for the per-turn context
+    // envelope below, so the inbound user event and the outbound assistant event
+    // share a single run_id (per-turn provenance, not per-session).
+    let turn_run_id = uuid::Uuid::new_v4().to_string();
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
     let inbound_event = append_sender_turn(
@@ -2552,6 +2566,7 @@ async fn process_channel_message(
         message_visibility.clone(),
         inbound_timestamp.as_deref(),
         Some(msg.id.as_str()),
+        &turn_run_id,
     )
     .await;
 
@@ -2647,6 +2662,7 @@ async fn process_channel_message(
                 message_visibility.clone(),
                 None,
                 None,
+                &turn_run_id,
             )
             .await;
             println!(
@@ -2668,12 +2684,16 @@ async fn process_channel_message(
 
     // Shared events are refreshed each turn so other entrypoints (chat/gateway)
     // can be observed by channel turns without waiting for a session boundary.
+    // D8-1: reuse the same per-turn run_id as the message-event envelope so the
+    // whole turn (inbound user event, context/recall, outbound assistant event)
+    // shares one run_id.
     let mut runtime_envelope = RuntimeEnvelope::channel(
         ctx.workspace_dir.as_path().to_string_lossy().to_string(),
         msg.channel.clone(),
         msg.sender.clone(),
         Some(msg.reply_target.clone()),
-    );
+    )
+    .with_run_id(turn_run_id.clone());
     if let Some(event) = &inbound_event {
         runtime_envelope = runtime_envelope.with_source_message_event_id(event.event_id.clone());
     }
@@ -3070,6 +3090,7 @@ async fn process_channel_message(
                 message_visibility,
                 None,
                 None,
+                &turn_run_id,
             )
             .await;
             println!(
@@ -5471,6 +5492,7 @@ mod tests {
             MemoryVisibility::Workspace,
             Some("2026-05-21T00:00:00Z"),
             Some("msg-1"),
+            "turn-run-id-1",
         )
         .await;
 
@@ -5499,6 +5521,9 @@ mod tests {
         assert_eq!(events[0].session_key.as_deref(), Some("telegram_sender-1"));
         assert_eq!(events[0].role, "user");
         assert_eq!(events[0].content, "hello from telegram");
+        // D8-1: the per-turn run_id threaded through append_sender_turn lands on
+        // the recorded channel message event (non-empty, exact value).
+        assert_eq!(events[0].run_id.as_deref(), Some("turn-run-id-1"));
     }
 
     #[test]
@@ -7477,6 +7502,109 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             memory.store_calls.load(Ordering::SeqCst) >= 1,
             "autosave allow must perform the autosave memory write"
+        );
+    }
+
+    /// D8-1 (E2E): a full channel turn must stamp the per-turn run_id on both the
+    /// inbound user message event and the outbound assistant message event, and
+    /// the two must share the same non-empty run_id (per-turn provenance). No
+    /// parent_run_id is set (no spawn lineage in this turn).
+    #[tokio::test]
+    async fn process_channel_message_stamps_per_turn_run_id_on_message_events() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+        let ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::clone(&memory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            hooks: Arc::new(HookManager::new(tmp.path().to_path_buf())),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            memory_event_recording: MemoryEventRecording::default(),
+            max_tool_iterations: 5,
+            read_only_tool_concurrency_window: 2,
+            read_only_tool_timeout_secs: 30,
+            priority_scheduling_enabled: false,
+            low_priority_tools: Vec::new(),
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(tmp.path().to_path_buf()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            agent_compaction: crate::config::AgentCompactionConfig::default(),
+            tool_tiering: crate::config::ToolTieringConfig::default(),
+            signal_inbound_policy: None,
+            whatsapp_inbound_policy: None,
+            bot_names: vec!["prx".to_string()],
+            bot_uuids: vec![],
+            mention_only_by_channel: HashMap::new(),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
+                security: Arc::new(crate::security::SecurityPolicy {
+                    autonomy: crate::security::AutonomyLevel::Supervised,
+                    ..crate::security::SecurityPolicy::default()
+                }),
+                pipeline: Arc::new(crate::security::PolicyPipeline::new(
+                    crate::config::ToolPolicyConfig::default(),
+                )),
+            })),
+            skill_rag_ctx: None,
+            test_inbound_authorizer: None,
+        });
+
+        process_channel_message(ctx, gate_test_message(), CancellationToken::new()).await;
+
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: Some("test-channel".to_string()),
+                    sender: None,
+                    owner_id: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+
+        let user_event = events
+            .iter()
+            .find(|e| e.role == "user")
+            .expect("user message event recorded");
+        let assistant_event = events
+            .iter()
+            .find(|e| e.role == "assistant")
+            .expect("assistant message event recorded");
+
+        let user_run_id = user_event.run_id.as_deref().expect("user event must carry a run_id");
+        assert!(!user_run_id.is_empty(), "user run_id must be non-empty");
+        assert_eq!(
+            assistant_event.run_id.as_deref(),
+            Some(user_run_id),
+            "user and assistant events of one turn must share the same run_id"
+        );
+        assert!(
+            user_event.parent_run_id.is_none() && assistant_event.parent_run_id.is_none(),
+            "a turn with no spawn lineage must not set parent_run_id"
         );
     }
 
