@@ -4557,7 +4557,8 @@ pub async fn run(
         .ok_or_else(|| anyhow::anyhow!("bootstrap did not build a memory backend for the agent CLI"))?;
     let memory_fabric = MemoryFabric::new(mem.clone(), config.workspace_dir.to_string_lossy())
         .with_event_recording(config.memory.event_recording_config());
-    let agent_run_id = Uuid::new_v4().to_string();
+    // D8-3: run_id is per-turn (generated inside each turn branch as `turn_run_id`),
+    // no longer a single per-run id held here.
     let mut fabric_turn_seq: u64 = 0;
 
     // ── Tools ────────────────────────────────────────────────────
@@ -4711,8 +4712,11 @@ pub async fn run(
         // `stdin().read_line()`, which `tokio::select!` cannot poll.
         let single_shot = async {
             fabric_turn_seq += 1;
+            // D8-3: one run_id per turn (was per-run). Generated at the turn entry
+            // and used for both the message-event envelope and the user op-id.
+            let turn_run_id = Uuid::new_v4().to_string();
             let runtime_envelope =
-                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
+                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
                     .with_recipient("cli:local-user");
             let fabric_scope = runtime_envelope
                 .message_scope()
@@ -4721,7 +4725,7 @@ pub async fn run(
                 .record_inbound_user_message(
                     fabric_scope.clone(),
                     msg.clone(),
-                    Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
+                    Some(format!("agent:{turn_run_id}:{fabric_turn_seq}:user")),
                     None,
                 )
                 .await
@@ -4948,8 +4952,11 @@ pub async fn run(
             }
 
             fabric_turn_seq += 1;
+            // D8-3: one run_id per turn (was per-run). Generated at the turn entry
+            // and used for both the message-event envelope and the user op-id.
+            let turn_run_id = Uuid::new_v4().to_string();
             let runtime_envelope =
-                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
+                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
                     .with_recipient("cli:local-user");
             let fabric_scope = runtime_envelope
                 .message_scope()
@@ -4958,7 +4965,7 @@ pub async fn run(
                 .record_inbound_user_message(
                     fabric_scope.clone(),
                     user_input.clone(),
-                    Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
+                    Some(format!("agent:{turn_run_id}:{fabric_turn_seq}:user")),
                     None,
                 )
                 .await
