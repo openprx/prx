@@ -577,12 +577,15 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         agent_config.agent.max_tool_iterations = AGENT_MAX_TOOL_ITERATIONS;
     }
 
+    // Background xin runner: no cooperative shutdown signal of its own; the
+    // runner drives this synchronously. See never_cancelled_shutdown docs.
     match crate::agent::run(
         agent_config,
         Some(prompt),
         None,
         config.default_model.clone(),
         config.default_temperature,
+        crate::runtime::shutdown::never_cancelled_shutdown(),
     )
     .await
     {

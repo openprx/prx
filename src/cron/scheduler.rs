@@ -198,12 +198,15 @@ async fn run_agent_job(config: &Config, security: &SecurityPolicy, job: &CronJob
 
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
+            // Background cron job: no cooperative shutdown signal of its own;
+            // the scheduler drops/aborts the task. See never_cancelled_shutdown.
             crate::agent::run(
                 cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,
                 config.default_temperature,
+                crate::runtime::shutdown::never_cancelled_shutdown(),
             )
             .await
         }

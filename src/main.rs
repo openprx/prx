@@ -1323,12 +1323,16 @@ async fn async_main() -> Result<()> {
         config.config_path = tmpdir.path().join("config.toml");
 
         if let Some(msg) = message {
+            // D5/D9 step 2: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
             let result = agent::run(
                 config,
                 Some(msg.clone()),
                 None, // provider already set in config
                 None, // model already set in config
                 0.7,
+                shutdown,
             )
             .await;
             // Keep tmpdir alive until agent finishes, then drop

@@ -4521,6 +4521,7 @@ pub async fn run(
     provider_override: Option<String>,
     model_override: Option<String>,
     temperature: f64,
+    shutdown: CancellationToken,
 ) -> Result<String> {
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
     // The CLI agent entry is always a full interactive/single-shot run with no
@@ -4702,141 +4703,158 @@ pub async fn run(
     let mut final_output = String::new();
 
     if let Some(msg) = message {
-        fabric_turn_seq += 1;
-        let runtime_envelope = RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
-            .with_recipient("cli:local-user");
-        let fabric_scope = runtime_envelope
-            .message_scope()
-            .with_recipient(format!("{provider_name}/{model_name}"));
-        let agent_user_event = match memory_fabric
-            .record_inbound_user_message(
-                fabric_scope.clone(),
-                msg.clone(),
-                Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
-                None,
-            )
-            .await
-        {
-            Ok(event) => Some(event),
-            Err(error) => {
-                tracing::warn!(error = %error, "Failed to append agent user message event");
-                None
-            }
-        };
-
-        let selected_skills = select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
-        let system_prompt = build_runtime_system_prompt(
-            &config,
-            model_name,
-            &tool_descs,
-            &selected_skills,
-            native_tools,
-            &tools_registry,
-        );
-
-        // Auto-save user message to memory (skip short/trivial messages)
-        if config.memory.should_auto_promote_user_message(&msg) {
-            let user_key = autosave_memory_key("user_msg");
-            let _ = memory_fabric
-                .record_semantic_memory_from_event(
-                    &user_key,
-                    &msg,
-                    MemoryCategory::Conversation,
-                    None,
-                    agent_user_event.as_ref().map(|event| event.event_id.as_str()),
-                    None,
+        // ── Single-shot mode (D5/D9 step 2) ──────────────────────────
+        // A single non-interactive turn: race the work against the external
+        // shutdown token so a root cancel (e.g. ctrl_c wired by dispatch in A6)
+        // aborts the in-flight turn instead of waiting it out. The interactive
+        // branch below cannot do this because it blocks on synchronous
+        // `stdin().read_line()`, which `tokio::select!` cannot poll.
+        let single_shot = async {
+            fabric_turn_seq += 1;
+            let runtime_envelope =
+                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), agent_run_id.clone())
+                    .with_recipient("cli:local-user");
+            let fabric_scope = runtime_envelope
+                .message_scope()
+                .with_recipient(format!("{provider_name}/{model_name}"));
+            let agent_user_event = match memory_fabric
+                .record_inbound_user_message(
+                    fabric_scope.clone(),
+                    msg.clone(),
+                    Some(format!("agent:{agent_run_id}:{fabric_turn_seq}:user")),
                     None,
                 )
-                .await;
-        }
+                .await
+            {
+                Ok(event) => Some(event),
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to append agent user message event");
+                    None
+                }
+            };
 
-        // Inject memory context into user message
-        let document_ingest = Some(
-            DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
-                .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
-        );
-        let semantic_scope = runtime_envelope.memory_write_context("private");
-        let mem_context = build_context_with_shared_events_and_scope(
-            mem.as_ref(),
-            runtime_envelope.memory_principal(),
-            &msg,
-            config.memory.min_relevance_score,
-            Some(&semantic_scope),
-        )
-        .await;
-        let context = mem_context.preamble.clone();
-        let enriched = if context.is_empty() {
-            msg.clone()
-        } else {
-            format!("{context}{msg}")
-        };
+            let selected_skills = select_prompt_skills(&msg, &skills, &config, skill_embedder.as_ref()).await;
+            let system_prompt = build_runtime_system_prompt(
+                &config,
+                model_name,
+                &tool_descs,
+                &selected_skills,
+                native_tools,
+                &tools_registry,
+            );
 
-        let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
+            // Auto-save user message to memory (skip short/trivial messages)
+            if config.memory.should_auto_promote_user_message(&msg) {
+                let user_key = autosave_memory_key("user_msg");
+                let _ = memory_fabric
+                    .record_semantic_memory_from_event(
+                        &user_key,
+                        &msg,
+                        MemoryCategory::Conversation,
+                        None,
+                        agent_user_event.as_ref().map(|event| event.event_id.as_str()),
+                        None,
+                        None,
+                    )
+                    .await;
+            }
 
-        let response = run_tool_call_loop(
-            provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            &hooks,
-            provider_name,
-            model_name,
-            temperature,
-            false,
-            Some(&approval_manager),
-            "cli",
-            &config.multimodal,
-            config.agent.max_tool_iterations,
-            config.agent.parallel_tools,
-            config.agent.read_only_tool_concurrency_window,
-            config.agent.read_only_tool_timeout_secs,
-            config.agent.priority_scheduling_enabled,
-            config.agent.low_priority_tools.clone(),
-            ToolConcurrencyGovernanceConfig {
-                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-            },
-            Some(&config.agent.compaction),
-            None,
-            None,
-            None,
-            None,
-            Some(&config.tool_tiering),
-            document_ingest,
-            ChatMode::default(),
-        )
-        .await?;
-        if let Err(error) = memory_fabric
-            .record_assistant_message(
-                fabric_scope
-                    .clone()
-                    .with_sender(format!("{provider_name}/{model_name}"))
-                    .with_recipient("local-user"),
-                response.clone(),
-            )
-            .await
-        {
-            tracing::warn!(error = %error, "Failed to append agent assistant message event");
-        }
-        increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
-        final_output = response.clone();
-        println!("{response}");
-        observer.record_event(&ObserverEvent::TurnComplete);
-        hooks
-            .emit(
-                HookEvent::TurnComplete,
-                serde_json::json!({
-                    "mode": "single",
-                    "response_chars": response.chars().count(),
-                }),
+            // Inject memory context into user message
+            let document_ingest = Some(
+                DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
+                    .with_source_message_event_id(agent_user_event.as_ref().map(|event| event.event_id.clone())),
+            );
+            let semantic_scope = runtime_envelope.memory_write_context("private");
+            let mem_context = build_context_with_shared_events_and_scope(
+                mem.as_ref(),
+                runtime_envelope.memory_principal(),
+                &msg,
+                config.memory.min_relevance_score,
+                Some(&semantic_scope),
             )
             .await;
+            let context = mem_context.preamble.clone();
+            let enriched = if context.is_empty() {
+                msg.clone()
+            } else {
+                format!("{context}{msg}")
+            };
+
+            let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
+
+            let response = run_tool_call_loop(
+                provider.as_ref(),
+                &mut history,
+                &tools_registry,
+                observer.as_ref(),
+                &hooks,
+                provider_name,
+                model_name,
+                temperature,
+                false,
+                Some(&approval_manager),
+                "cli",
+                &config.multimodal,
+                config.agent.max_tool_iterations,
+                config.agent.parallel_tools,
+                config.agent.read_only_tool_concurrency_window,
+                config.agent.read_only_tool_timeout_secs,
+                config.agent.priority_scheduling_enabled,
+                config.agent.low_priority_tools.clone(),
+                ToolConcurrencyGovernanceConfig {
+                    kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                    rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                    rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                    rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                    auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                    rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
+                    rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                    rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
+                },
+                Some(&config.agent.compaction),
+                None,
+                None,
+                None,
+                None,
+                Some(&config.tool_tiering),
+                document_ingest,
+                ChatMode::default(),
+            )
+            .await?;
+            if let Err(error) = memory_fabric
+                .record_assistant_message(
+                    fabric_scope
+                        .clone()
+                        .with_sender(format!("{provider_name}/{model_name}"))
+                        .with_recipient("local-user"),
+                    response.clone(),
+                )
+                .await
+            {
+                tracing::warn!(error = %error, "Failed to append agent assistant message event");
+            }
+            increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
+            final_output = response.clone();
+            println!("{response}");
+            observer.record_event(&ObserverEvent::TurnComplete);
+            hooks
+                .emit(
+                    HookEvent::TurnComplete,
+                    serde_json::json!({
+                        "mode": "single",
+                        "response_chars": response.chars().count(),
+                    }),
+                )
+                .await;
+            Ok::<(), anyhow::Error>(())
+        };
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                anyhow::bail!("agent single-shot run cancelled by shutdown signal");
+            }
+            result = single_shot => result?,
+        }
     } else {
         println!("🦀 OpenPRX Interactive Mode");
         println!("Type /help for commands.\n");

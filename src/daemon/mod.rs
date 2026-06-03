@@ -429,7 +429,18 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
         for prompt in prompts {
             let temp = config.default_temperature;
-            if let Err(e) = crate::agent::run(config.clone(), Some(prompt), None, None, temp).await {
+            // Background heartbeat: no cooperative shutdown signal of its own;
+            // the supervisor aborts the task. See never_cancelled_shutdown docs.
+            if let Err(e) = crate::agent::run(
+                config.clone(),
+                Some(prompt),
+                None,
+                None,
+                temp,
+                crate::runtime::shutdown::never_cancelled_shutdown(),
+            )
+            .await
+            {
                 crate::health::mark_component_error("heartbeat", e.to_string());
                 tracing::warn!("Heartbeat task failed: {e}");
             } else {

@@ -75,7 +75,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             // or via -m/--message. clap's `conflicts_with` guarantees at most one is
             // set, so `.or()` simply picks whichever was provided.
             let message = message.or(message_pos);
-            agent::run(config, message, provider, model, temperature)
+            // D5/D9 step 2: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            agent::run(config, message, provider, model, temperature, shutdown)
                 .await
                 .map(|_| ())
         }

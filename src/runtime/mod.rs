@@ -3,6 +3,7 @@ pub mod control_ladder;
 pub mod docker;
 pub mod envelope;
 pub mod native;
+pub(crate) mod shutdown;
 pub mod traits;
 
 pub use docker::DockerRuntime;
