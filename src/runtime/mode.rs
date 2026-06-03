@@ -87,7 +87,22 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             plain,
             session,
             list_sessions,
-        } => chat::run(config, provider, model, temperature, plain, session, list_sessions).await,
+        } => {
+            // D5/D9 step 1: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            chat::run(
+                config,
+                provider,
+                model,
+                temperature,
+                plain,
+                session,
+                list_sessions,
+                shutdown,
+            )
+            .await
+        }
 
         Commands::Gateway { port, host } => {
             let port = port.unwrap_or(config.gateway.port);

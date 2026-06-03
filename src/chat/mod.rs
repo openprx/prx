@@ -915,6 +915,7 @@ pub async fn run(
     plain_mode: bool,
     session_id: Option<String>,
     list_sessions: bool,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     // ── P3-1: Redirect tracing to ~/.openprx/chat.log ────────────────────
     // Held for the rest of this function. On failure (no HOME, log dir
@@ -1148,9 +1149,10 @@ pub async fn run(
     // ── Graceful shutdown signal ─────────────────────────────────
     // Instead of std::process::exit(), all signal handlers use this token to
     // break the main loop gracefully, allowing final session save + teardown.
-    // Created up here (earlier than before) so the TUI input task can also
-    // observe shutdown and exit its blocking poll cleanly.
-    let shutdown = CancellationToken::new();
+    // The token is now supplied by the caller (D5/D9 step 1): dispatch owns the
+    // root shutdown token and passes it down. The internal ctrl_c single/double
+    // handlers below cancel this same external token, so chat remains the sole
+    // owner of ctrl_c semantics while the caller can also request shutdown.
 
     // ── Step 5a-1: Redux dispatcher (shadow / real-deps mode) ────
     //

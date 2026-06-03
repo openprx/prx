@@ -1336,12 +1336,16 @@ async fn async_main() -> Result<()> {
             return result.map(|_| ());
         }
 
+        // D5/D9 step 1: placeholder shutdown token (never cancelled at this
+        // stage). The real root token + signal wiring lands in A6.
+        let shutdown = tokio_util::sync::CancellationToken::new();
         let result = chat::run(
             config, None, // provider already set in config
             None, // model already set in config
             0.7, false, // plain mode off
             None,  // no session resume
             false, // don't list sessions
+            shutdown,
         )
         .await;
         // Keep tmpdir alive until chat finishes, then drop
