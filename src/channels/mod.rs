@@ -1424,7 +1424,14 @@ async fn load_persisted_histories(
             hydrated
         }
         Err(error) => {
-            tracing::warn!("Failed to hydrate channel histories from persistent store: {error}");
+            // Startup hydration is best-effort: a failure must not block channel
+            // startup. The durable conversation_turns rows are untouched and will
+            // re-hydrate on the next start; emit a structured warn so operators can
+            // locate the cause instead of silently running on an empty cache.
+            tracing::warn!(
+                error = %error,
+                "channel history hydration from persistent store failed; starting with empty in-memory cache (durable rows intact, will re-hydrate next start)"
+            );
             HashMap::new()
         }
     }
