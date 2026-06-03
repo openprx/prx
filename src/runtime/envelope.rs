@@ -10,6 +10,12 @@ pub struct RuntimeEnvelope {
     pub source: RuntimeSource,
     pub workspace_id: String,
     pub session_key: String,
+    /// Pre-cutover (legacy) durable `session_key` for D4 read-merge.
+    ///
+    /// When `session_key` holds a migrated canonical value, this carries the
+    /// old legacy key so recall reads both as a union (read-merge, never move).
+    /// `None` preserves single-key behaviour. Always read-only.
+    pub legacy_session_key: Option<String>,
     pub owner_id: Option<String>,
     pub topic_id: Option<String>,
     pub task_id: Option<String>,
@@ -68,6 +74,7 @@ impl RuntimeEnvelope {
             source,
             workspace_id: workspace_id.into(),
             session_key: session_key.into(),
+            legacy_session_key: None,
             owner_id: None,
             topic_id: None,
             task_id: None,
@@ -142,6 +149,40 @@ impl RuntimeEnvelope {
         Self::new_internal(RuntimeSource::Chat, workspace_id, session_key, visibility)
             .with_channel("terminal")
             .with_sender("local-user")
+    }
+
+    /// Stable durable-canonical `session_key` for a chat session (D4 / D7).
+    ///
+    /// The recipient component is derived from the immutable `chat_session.id`
+    /// (NOT `{provider}/{model}`, which would split one logical conversation
+    /// across model switches), so the canonical key is stable for the lifetime
+    /// of the session. The format matches [`Self::canonical_session_key`] for a
+    /// `terminal` channel / `local-user` sender:
+    /// `chat:terminal:local-user:{chat_session_id}`.
+    #[must_use]
+    pub fn chat_canonical_session_key(chat_session_id: &str) -> String {
+        format!("chat:terminal:local-user:{chat_session_id}")
+    }
+
+    /// `Chat` envelope with a stable durable-canonical `session_key` plus the
+    /// legacy `chat:{id}` key carried for read-merge (D4 C6).
+    ///
+    /// Both the write scope ([`Self::message_scope`]) and the read principal
+    /// ([`Self::memory_principal`]) derive their durable `session_key` from this
+    /// one envelope, so they are guaranteed identical (asserted in C2 tests).
+    #[must_use]
+    pub fn chat_canonical(
+        workspace_id: impl Into<String>,
+        chat_session_id: &str,
+        visibility: MemoryVisibility,
+    ) -> Self {
+        let canonical = Self::chat_canonical_session_key(chat_session_id);
+        let legacy = format!("chat:{chat_session_id}");
+        Self::new_internal(RuntimeSource::Chat, workspace_id, canonical, visibility)
+            .with_channel("terminal")
+            .with_sender("local-user")
+            .with_recipient(chat_session_id.to_string())
+            .with_legacy_session_key(legacy)
     }
 
     #[must_use]
@@ -358,6 +399,18 @@ impl RuntimeEnvelope {
         self
     }
 
+    /// Carry the pre-cutover (legacy) durable `session_key` for D4 read-merge.
+    ///
+    /// Empty/whitespace values are ignored (no legacy key). The legacy key flows
+    /// into [`Self::memory_principal`] so `session`-visibility recall reads both
+    /// the canonical and legacy histories as a union.
+    #[must_use]
+    pub fn with_legacy_session_key(mut self, legacy_session_key: impl Into<String>) -> Self {
+        let legacy = legacy_session_key.into();
+        self.legacy_session_key = if legacy.trim().is_empty() { None } else { Some(legacy) };
+        self
+    }
+
     #[must_use]
     pub fn with_owner_id(mut self, owner_id: impl Into<String>) -> Self {
         self.owner_id = Some(owner_id.into());
@@ -483,9 +536,9 @@ impl RuntimeEnvelope {
             channel: self.channel.clone(),
             sender: self.sender.clone(),
             owner_id: Some(self.resolved_owner_id()),
-            // D4: no legacy key derived at the envelope layer yet (C2 wires the
-            // per-source derivation). `None` preserves single-key recall.
-            legacy_session_key: None,
+            // D4: carry the pre-cutover legacy key so `session`-visibility recall
+            // read-merges canonical + legacy. `None` preserves single-key recall.
+            legacy_session_key: self.legacy_session_key.clone(),
         }
     }
 
@@ -788,5 +841,68 @@ mod tests {
         // Re-deriving from a fresh builder with the same inputs is stable.
         let channel_again = RuntimeEnvelope::channel("ws", "telegram", "alice", Some("chat-1".to_string()));
         assert_eq!(channel.canonical_session_key(), channel_again.canonical_session_key());
+    }
+
+    // ---- D4 C2: legacy-key derivation + stable chat canonical identity ----
+
+    #[test]
+    fn chat_canonical_session_key_derives_from_stable_session_id() {
+        // Stable across model/provider switches: derived purely from session id.
+        let key = RuntimeEnvelope::chat_canonical_session_key("sess-123");
+        assert_eq!(key, "chat:terminal:local-user:sess-123");
+    }
+
+    #[test]
+    fn chat_canonical_envelope_write_and_read_durable_key_are_strictly_equal() {
+        // C2 core assertion: the write scope and read principal derive their
+        // durable session_key from one envelope, so they are identical and equal
+        // to the stable canonical (NOT the legacy `chat:{id}`).
+        let envelope = RuntimeEnvelope::chat_canonical("workspace", "sess-abc", MemoryVisibility::Workspace);
+        let canonical = "chat:terminal:local-user:sess-abc";
+
+        let scope = envelope.message_scope();
+        let principal = envelope.memory_principal();
+        // Write durable key == read durable key == stable canonical.
+        assert_eq!(scope.session_key.as_deref(), Some(canonical));
+        assert_eq!(principal.session_key.as_deref(), Some(canonical));
+        assert_eq!(scope.session_key, principal.session_key);
+        // Legacy key carried for read-merge, distinct from canonical.
+        assert_eq!(principal.legacy_session_key.as_deref(), Some("chat:sess-abc"));
+        assert_eq!(envelope.canonical_session_key(), canonical);
+        // The candidate set unions canonical + legacy.
+        assert_eq!(
+            principal.session_key_candidates(),
+            vec![
+                "chat:terminal:local-user:sess-abc".to_string(),
+                "chat:sess-abc".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn with_legacy_session_key_ignores_blank_and_flows_into_principal() {
+        let blank = RuntimeEnvelope::chat("workspace", "id-1").with_legacy_session_key("   ");
+        assert_eq!(blank.legacy_session_key, None);
+        assert_eq!(blank.memory_principal().legacy_session_key, None);
+
+        let set = RuntimeEnvelope::chat("workspace", "id-1").with_legacy_session_key("chat:old");
+        assert_eq!(set.legacy_session_key.as_deref(), Some("chat:old"));
+        assert_eq!(set.memory_principal().legacy_session_key.as_deref(), Some("chat:old"));
+    }
+
+    #[test]
+    fn non_chat_envelopes_carry_no_legacy_key_by_default() {
+        // Single-key behaviour preserved for sources that have not migrated.
+        let agent = RuntimeEnvelope::agent("ws", "run-7");
+        assert_eq!(agent.memory_principal().legacy_session_key, None);
+        let gateway = RuntimeEnvelope::gateway(
+            "ws",
+            "gw-1",
+            "webchat",
+            "user-9",
+            "agent-bot",
+            MemoryVisibility::Session,
+        );
+        assert_eq!(gateway.memory_principal().legacy_session_key, None);
     }
 }
