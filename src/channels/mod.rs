@@ -2651,6 +2651,24 @@ async fn process_channel_message(
         SignalVisionPreflightOutcome::NotRequired => None,
         SignalVisionPreflightOutcome::Ready { context } => Some(context),
         SignalVisionPreflightOutcome::Fallback => {
+            // D6/DEV-05: the Signal vision fallback emits an assistant reply just
+            // like the normal agent loop, so it MUST pass the same outbound gate
+            // before persisting or sending. Without this, a deny (ReadOnly or an
+            // exhausted action budget already consumed by inbound/autosave) would
+            // still leak a reply, breaking the "outbound deny ⇒ no reply" guarantee.
+            // Operation naming matches the normal path (`channel:{channel}:outbound`,
+            // owned by `InboundGate`). Deny semantics are identical to the normal
+            // outbound deny below: the inbound user turn (already persisted above)
+            // stays, but no assistant turn is persisted and nothing is sent.
+            if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel)
+            {
+                tracing::warn!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "channel outbound (vision fallback) blocked by InboundGate: {reason}"
+                );
+                return;
+            }
             let fallback = SIGNAL_IMAGE_UNCERTAINTY_FALLBACK.to_string();
             let _ = append_sender_turn(
                 ctx.as_ref(),
@@ -5747,6 +5765,42 @@ mod tests {
         }
     }
 
+    /// Recording channel registered under the `signal` name, so the Signal
+    /// vision-fallback path (which resolves `target_channel` by `msg.channel`)
+    /// can observe whether the fallback reply was actually sent. Mirrors
+    /// `RecordingChannel` but reports `name() == "signal"`.
+    #[derive(Default)]
+    struct SignalRecordingChannel {
+        sent_messages: tokio::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for SignalRecordingChannel {
+        fn name(&self) -> &str {
+            "signal"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages
+                .lock()
+                .await
+                .push(format!("{}:{}", message.recipient, message.content));
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn start_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
     struct SlowProvider {
         delay: Duration,
     }
@@ -7464,6 +7518,103 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             channel_impl.sent_messages.lock().await.is_empty(),
             "outbound must be suppressed once the action budget is exhausted"
+        );
+    }
+
+    /// Test seam: deny only the `:outbound` operation, allowing inbound + autosave.
+    /// Used to drive the Signal vision-fallback outbound-deny path independently of
+    /// the action budget, so the fallback gate's deny semantics are asserted in
+    /// isolation (the real policy cannot express a per-operation deny).
+    struct OutboundOnlyDeny;
+
+    impl crate::security::inbound_gate::InboundAuthorizer for OutboundOnlyDeny {
+        fn authorize(&self, _tool_name: &str, operation_name: &str, _risk: ResourceRiskLevel) -> Result<(), String> {
+            if operation_name.contains(":outbound") {
+                Err(format!("test deny: {operation_name}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// A Signal image message that forces the vision preflight into the
+    /// `Fallback` branch: `channel == "signal"` plus a `vision_required=true`
+    /// marker makes `is_signal_image_message` true, and the test `DummyProvider`
+    /// reports `supports_vision() == false`, so the preflight short-circuits to
+    /// `Fallback` before any network call.
+    fn signal_vision_fallback_message() -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: "gate-msg-vision".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-gate".to_string(),
+            content: "[signal-meta vision_required=true]".to_string(),
+            channel: "signal".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            mentioned_uuids: vec![],
+        }
+    }
+
+    /// Build a gate test context wired to a `SignalRecordingChannel` (registered
+    /// under the `signal` name) instead of the default `RecordingChannel`, so the
+    /// Signal vision-fallback path can resolve its `target_channel`.
+    fn signal_gate_ctx_with(
+        opts: GateTestOpts,
+        memory: Arc<CountingMemory>,
+        channel: Arc<SignalRecordingChannel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        let channel_dyn: Arc<dyn Channel> = channel;
+        gate_test_ctx_with(opts, memory, channel_dyn)
+    }
+
+    /// DEV-05 (vision-fallback outbound deny): the Signal vision fallback emits an
+    /// assistant reply, so it must pass the same outbound gate as the normal path.
+    /// With outbound denied (op-selective seam), the fallback must NOT send a reply
+    /// — yet the inbound user turn (gated + persisted before the fallback branch)
+    /// must remain. This closes the matrix gap Codex flagged: previously the
+    /// fallback short-circuited a reply ahead of the outbound gate.
+    #[tokio::test]
+    async fn process_channel_message_vision_fallback_outbound_denied() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(SignalRecordingChannel::default());
+        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        opts.test_inbound_authorizer = Some(Arc::new(OutboundOnlyDeny));
+        let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
+
+        process_channel_message(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.append_calls.load(Ordering::SeqCst) >= 1,
+            "outbound deny must not abort the turn: the inbound user turn still persists"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "outbound deny must suppress the Signal vision fallback reply"
+        );
+    }
+
+    /// DEV-05 (positive control): with outbound allowed (Supervised, no op-selective
+    /// deny) the Signal vision fallback DOES send its reply. This guards the deny
+    /// test above from passing vacuously — proving the fallback send path is
+    /// actually reachable for this message and only the gate suppresses it.
+    #[tokio::test]
+    async fn process_channel_message_vision_fallback_outbound_allowed_sends() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(SignalRecordingChannel::default());
+        let opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        let ctx = signal_gate_ctx_with(opts, Arc::clone(&memory), Arc::clone(&channel_impl));
+
+        process_channel_message(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "Signal vision fallback must send exactly one reply when outbound is allowed"
+        );
+        assert!(
+            sent[0].contains(SIGNAL_IMAGE_UNCERTAINTY_FALLBACK),
+            "the sent reply must be the vision uncertainty fallback text"
         );
     }
 

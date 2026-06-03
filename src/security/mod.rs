@@ -25,7 +25,6 @@ pub mod detect;
 pub mod docker;
 #[cfg(target_os = "linux")]
 pub mod firejail;
-#[cfg(feature = "sandbox-landlock")]
 pub mod inbound_gate;
 pub mod landlock;
 pub mod op_id;
