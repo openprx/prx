@@ -1802,6 +1802,14 @@ pub(crate) async fn build_agent_context_with_semantic_scope(
     semantic_scope: Option<&MemoryWriteContext>,
 ) -> AgentContextBundle {
     let semantic = build_context_with_scope(mem, user_msg, min_relevance_score, semantic_scope).await;
+    // D4 C3: the agent recall path read-merges canonical + legacy session keys
+    // through `MemoryPrincipal::session_key_candidates` (wired into
+    // `list_conversation_turns` and `load_recent_session_context`). The agent
+    // write side deliberately keeps its per-turn `agent:{turn_run_id}` boundary
+    // (no canonical collapse): since the CLI agent has no stable cross-turn
+    // session id, the principal carries no `legacy_session_key`, so the candidate
+    // set degrades to the single canonical key and recall behaviour is unchanged
+    // while unrelated runs stay isolated.
     let current_session_turns = match principal.session_key.as_deref() {
         Some(session_key) => mem
             .list_conversation_turns(&principal, session_key, 12, 0)
@@ -7822,6 +7830,90 @@ ls -la
         assert!(!bundle.recalled_memory_ids.is_empty());
         assert!(bundle.preamble().contains("[Recent shared workspace events]"));
         assert!(bundle.preamble().contains("[Memory context]"));
+    }
+
+    // D4 C3: agent keeps its per-turn run boundary on the write side; recall
+    // read-merges only when an explicit legacy key is supplied, otherwise stays
+    // isolated per run (single-key degradation).
+    #[tokio::test]
+    async fn d4_agent_recall_keeps_run_boundary_and_read_merges_only_with_legacy_key() {
+        let tmp = TempDir::new().unwrap();
+        let mem = SqliteMemory::new(tmp.path()).unwrap();
+
+        // Two unrelated agent runs, each with its own per-turn run boundary.
+        mem.append_conversation_turn(
+            "agent:run-A",
+            "cli",
+            "local-user",
+            "user",
+            "history from run A",
+            Some("2026-03-05T00:00:00Z"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "agent:run-B",
+            "cli",
+            "local-user",
+            "user",
+            "history from run B",
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Run B with NO legacy key: must see only its own turn (run boundary
+        // preserved, unrelated run A NOT pulled in).
+        let isolated = build_agent_context(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: tmp.path().to_string_lossy().to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("agent:run-B".to_string()),
+                channel: Some("cli".to_string()),
+                sender: Some("local-user".to_string()),
+                owner_id: None,
+                legacy_session_key: None,
+            },
+            "anything",
+            0.0,
+        )
+        .await;
+        assert!(isolated.current_session_context.contains("history from run B"));
+        assert!(
+            !isolated.current_session_context.contains("history from run A"),
+            "run boundary must isolate unrelated runs: {}",
+            isolated.current_session_context
+        );
+
+        // Resume run B but explicitly read-merge legacy run A history: both visible.
+        let merged = build_agent_context(
+            &mem,
+            MemoryPrincipal {
+                workspace_id: tmp.path().to_string_lossy().to_string(),
+                agent_id: None,
+                persona_id: None,
+                session_key: Some("agent:run-B".to_string()),
+                channel: Some("cli".to_string()),
+                sender: Some("local-user".to_string()),
+                owner_id: None,
+                legacy_session_key: Some("agent:run-A".to_string()),
+            },
+            "anything",
+            0.0,
+        )
+        .await;
+        assert!(merged.current_session_context.contains("history from run B"));
+        assert!(
+            merged.current_session_context.contains("history from run A"),
+            "explicit legacy key must read-merge: {}",
+            merged.current_session_context
+        );
     }
 
     #[tokio::test]
