@@ -1087,7 +1087,11 @@ pub async fn run(
         None => session::ChatSession::new(provider_name, model_name),
     };
     bind_session_to_runtime_provider_model(&mut chat_session, provider_name, model_name);
-    let chat_run_id = uuid::Uuid::new_v4().to_string();
+    // D8-2: run_id is per-turn, not per-session. It is generated inside the turn
+    // loop (see `turn_run_id` below) so each user/assistant exchange gets a fresh
+    // run_id. The session identity is carried by `chat_session_key`, never by
+    // run_id, and turns deliberately set no parent_run_id (that field is reserved
+    // for the spawn execution lineage, not for relating turns within a session).
     let chat_session_key = format!("chat:{}", chat_session.id);
     let mut fabric_turn_seq: u64 = 0;
 
@@ -1911,11 +1915,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         fabric_turn_seq += 1;
+        // D8-2: one run_id per turn, generated at the turn entry and reused by
+        // every run_id consumer within this loop iteration (user event, route
+        // scope, assistant event). No parent_run_id is set (turns are not a spawn
+        // lineage; session relation is via chat_session_key).
+        let turn_run_id = uuid::Uuid::new_v4().to_string();
         let chat_user_event = match record_chat_user_message_event(
             &memory_fabric,
             &chat_session,
             &chat_session_key,
-            &chat_run_id,
+            &turn_run_id,
             provider_name,
             model_name,
             fabric_turn_seq,
@@ -2218,7 +2227,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             "chat",
             Some(runtime_envelope.resolved_owner_id()),
             Some(chat_session_key.clone()),
-            Some(chat_run_id.clone()),
+            Some(turn_run_id.clone()),
             Some("local-user".to_string()),
             Some(format!(
                 "{}/{}",
@@ -2380,7 +2389,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     if let Err(e) = record_chat_assistant_message_event(
                         &memory_fabric,
                         &chat_session_key,
-                        &chat_run_id,
+                        &turn_run_id,
                         provider_name,
                         model_name,
                         &recorded_response,
@@ -2756,7 +2765,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         if let Err(e) = record_chat_assistant_message_event(
             &memory_fabric,
             &chat_session_key,
-            &chat_run_id,
+            &turn_run_id,
             provider_name,
             model_name,
             &response,
@@ -3759,6 +3768,76 @@ mod legacy_chat_compaction_audit_tests {
             )
             .unwrap();
         assert_eq!(stored_summary_count, 1);
+    }
+
+    /// D8-2: chat run_id is per-turn. Two turns within one session must produce
+    /// two distinct, non-empty run_ids on their message events, and neither turn
+    /// may set parent_run_id (session relation lives in the session key, not the
+    /// run lineage).
+    #[tokio::test]
+    async fn chat_per_turn_run_ids_are_distinct_and_have_no_parent() {
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn crate::memory::Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(mem, "workspace-d8".to_string()).with_event_recording(
+            crate::memory::MemoryEventRecording {
+                enabled: true,
+                record_user_messages: true,
+                record_assistant_messages: true,
+                ..crate::memory::MemoryEventRecording::default()
+            },
+        );
+        let session = session::ChatSession::new("test-provider", "test-model");
+        let session_key = format!("chat:{}", session.id);
+
+        // Two turns, each with its own freshly generated run_id (mirroring the
+        // per-turn generation at the turn-loop entry).
+        let turn1_run_id = uuid::Uuid::new_v4().to_string();
+        let user1 = record_chat_user_message_event(
+            &fabric,
+            &session,
+            &session_key,
+            &turn1_run_id,
+            "test-provider",
+            "test-model",
+            1,
+            "first turn",
+        )
+        .await
+        .unwrap();
+        let asst1 = record_chat_assistant_message_event(
+            &fabric,
+            &session_key,
+            &turn1_run_id,
+            "test-provider",
+            "test-model",
+            "first reply",
+        )
+        .await
+        .unwrap();
+
+        let turn2_run_id = uuid::Uuid::new_v4().to_string();
+        let user2 = record_chat_user_message_event(
+            &fabric,
+            &session,
+            &session_key,
+            &turn2_run_id,
+            "test-provider",
+            "test-model",
+            2,
+            "second turn",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(user1.run_id.as_deref(), Some(turn1_run_id.as_str()));
+        assert_eq!(asst1.run_id.as_deref(), Some(turn1_run_id.as_str()));
+        assert_eq!(user2.run_id.as_deref(), Some(turn2_run_id.as_str()));
+        assert_ne!(turn1_run_id, turn2_run_id, "each turn must get a distinct run_id");
+        assert!(!turn1_run_id.is_empty() && !turn2_run_id.is_empty());
+        assert!(
+            user1.parent_run_id.is_none() && asst1.parent_run_id.is_none() && user2.parent_run_id.is_none(),
+            "chat turns must not set parent_run_id (session relation is via session_key)"
+        );
     }
 }
 
