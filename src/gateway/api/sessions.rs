@@ -134,6 +134,18 @@ fn console_runtime_envelope(state: &AppState, session_id: &str, channel: &str, s
     console_runtime_envelope_for_workspace(workspace_id, session_id, channel, sender)
 }
 
+/// Build the console runtime envelope for a session.
+///
+/// D4 C5 — console keeps its external session_id on the legacy basis. The console
+/// `session_id` is a user-visible, external contract value: it is the path
+/// parameter (`GET/POST /sessions/{session_id}/...`) and the id returned by the
+/// session list. Unlike the gateway *fabric* path (C4), the console durable
+/// `session_key` is therefore deliberately NOT canonicalized — doing so would
+/// change the path/list id and break the frontend. The envelope passes the raw
+/// `session_id` straight through as the durable key (no recipient component) and
+/// carries no `legacy_session_key`, so console persistence and recall stay on the
+/// single external id. Internal recall could read-merge in the future by setting
+/// a legacy key on the principal, but the external id format never changes.
 fn console_runtime_envelope_for_workspace(
     workspace_id: impl Into<String>,
     session_id: &str,
@@ -859,6 +871,30 @@ mod tests {
         assert_eq!(scope.session_key.as_deref(), Some("signal_alice"));
         assert_eq!(scope.channel.as_deref(), Some("signal"));
         assert_eq!(scope.sender.as_deref(), Some("alice"));
+    }
+
+    // D4 C5: the console external session_id is NOT canonicalized. The durable
+    // session_key stays the raw external id (path/list contract value), and no
+    // legacy_session_key is carried (console persistence/recall stay single-key on
+    // the external id). This guards against accidentally migrating the console
+    // durable key the way the gateway *fabric* path was migrated in C4.
+    #[test]
+    fn d4_console_session_id_is_kept_legacy_not_canonicalized() {
+        let session_id = "signal_alice";
+        let envelope = console_runtime_envelope_for_workspace("workspace", session_id, "signal", "alice");
+
+        // Durable write key == external id (no recipient-aware canonical).
+        assert_eq!(envelope.session_key, session_id);
+        assert_eq!(envelope.message_scope().session_key.as_deref(), Some(session_id));
+        // No legacy key carried -> single-key recall on the external id.
+        let principal = envelope.memory_principal();
+        assert_eq!(principal.session_key.as_deref(), Some(session_id));
+        assert_eq!(principal.legacy_session_key, None);
+        assert_eq!(principal.session_key_candidates(), vec![session_id.to_string()]);
+        // The canonical derivation differs from the external id; C5 deliberately
+        // does NOT adopt it for the durable key (would break the path/list id).
+        assert_ne!(envelope.canonical_session_key(), session_id);
+        assert_eq!(envelope.canonical_session_key(), "console:signal:alice:-");
     }
 
     #[derive(Default)]
