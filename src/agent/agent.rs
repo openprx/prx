@@ -5,8 +5,6 @@ use crate::agent::dispatcher::{
 };
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-#[cfg(feature = "llm-router")]
-use crate::causal_tree::CausalTreeEngine;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
@@ -57,10 +55,6 @@ pub struct Agent {
     model_routes: Vec<crate::config::ModelRouteConfig>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
-    #[cfg(feature = "llm-router")]
-    cte: Option<CausalTreeEngine>,
-    #[cfg(feature = "llm-router")]
-    cte_session_id: String,
 }
 
 pub struct AgentBuilder {
@@ -88,8 +82,6 @@ pub struct AgentBuilder {
     model_routes: Option<Vec<crate::config::ModelRouteConfig>>,
     #[cfg(feature = "llm-router")]
     router: Option<RouterEngine>,
-    #[cfg(feature = "llm-router")]
-    cte: Option<CausalTreeEngine>,
 }
 
 impl AgentBuilder {
@@ -119,8 +111,6 @@ impl AgentBuilder {
             model_routes: None,
             #[cfg(feature = "llm-router")]
             router: None,
-            #[cfg(feature = "llm-router")]
-            cte: None,
         }
     }
 
@@ -236,12 +226,6 @@ impl AgentBuilder {
         self
     }
 
-    #[cfg(feature = "llm-router")]
-    pub fn cte(mut self, cte: CausalTreeEngine) -> Self {
-        self.cte = Some(cte);
-        self
-    }
-
     pub fn build(self) -> Result<Agent> {
         let tools = self.tools.ok_or_else(|| anyhow::anyhow!("tools are required"))?;
         let workspace_dir = self.workspace_dir.unwrap_or_else(|| std::path::PathBuf::from("."));
@@ -281,10 +265,6 @@ impl AgentBuilder {
             model_routes: self.model_routes.unwrap_or_default(),
             #[cfg(feature = "llm-router")]
             router: self.router,
-            #[cfg(feature = "llm-router")]
-            cte: self.cte,
-            #[cfg(feature = "llm-router")]
-            cte_session_id: Uuid::new_v4().to_string(),
         })
     }
 }
@@ -385,7 +365,6 @@ impl Agent {
             config.router.validate()?;
         }
 
-        let cte_observer = observer.clone();
         #[cfg(feature = "llm-router")]
         let mut builder = Self::builder()
             .provider(provider)
@@ -448,22 +427,6 @@ impl Agent {
                 Some(router_embedder),
             ))?;
             builder = builder.router(router);
-        }
-
-        #[cfg(feature = "llm-router")]
-        if config.causal_tree.enabled {
-            let cte = CausalTreeEngine::new(
-                Arc::new(crate::causal_tree::expander::DefaultTreeExpander::new()),
-                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
-                Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
-                Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
-                Arc::new(crate::causal_tree::feedback::SelfSystemFeedbackWriter::new(
-                    &config.workspace_dir,
-                )),
-                cte_observer.clone(),
-                config.causal_tree.clone(),
-            );
-            builder = builder.cte(cte);
         }
 
         let agent = builder.build()?;
@@ -866,10 +829,9 @@ impl Agent {
             reason = classify_result.reason.as_str(),
             "Task routing classified incoming message"
         );
-        // #26: run_id must be per-turn, not per-Agent. The cte_session_id is a
-        // lifelong session identifier and cannot locate a single turn; generate a
-        // fresh turn_id here so the control-ladder trace and memory events for this
-        // turn share one correlation id (EU AI Act Art.12 traceability).
+        // #26: run_id must be per-turn, not per-Agent. Generate a fresh turn_id
+        // here so the control-ladder trace and memory events for this turn share
+        // one correlation id (EU AI Act Art.12 traceability).
         let turn_id = uuid::Uuid::new_v4().to_string();
         let control_ladder_run_id = Some(turn_id.clone());
         let mut control_ladder_trace = self.control_ladder.build_trace("agent.turn", control_ladder_run_id);
@@ -901,63 +863,12 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        // --- CTE: speculative branch prediction (before model selection) ---
-        #[cfg(feature = "llm-router")]
-        let cte_result = if let Some(cte) = &self.cte {
-            if cte.is_enabled() {
-                let causal_state = crate::causal_tree::snapshot::build_causal_state(
-                    &self.cte_session_id,
-                    user_message,
-                    &classify_result,
-                    &self.history,
-                    cte.config().policy.default_side_effect_mode,
-                    &cte.config().policy,
-                );
-                match cte.run(&causal_state).await {
-                    Ok((decision, branch)) => {
-                        tracing::info!(
-                            chosen = %decision.chosen_branch_id,
-                            label = ?branch.label,
-                            session_id = %self.cte_session_id,
-                            "CTE selected branch"
-                        );
-                        control_ladder_trace.mark_active(
-                            "causal_tree",
-                            "branch_selected",
-                            serde_json::json!({
-                                "chosen_branch_id": decision.chosen_branch_id,
-                                "label": format!("{:?}", branch.label),
-                            }),
-                        );
-                        Some((decision, branch))
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            session_id = %self.cte_session_id,
-                            "CTE pipeline failed, falling back to router-direct: {e}"
-                        );
-                        control_ladder_trace.mark_fallback(
-                            "causal_tree",
-                            "cte_pipeline_failed",
-                            serde_json::json!({
-                                "error": e.to_string(),
-                                "fallback": "router_direct",
-                            }),
-                        );
-                        None
-                    }
-                }
-            } else {
-                control_ladder_trace.mark_skipped(
-                    "causal_tree",
-                    "engine_disabled",
-                    serde_json::json!({"fallback": "router_direct"}),
-                );
-                None
-            }
-        } else {
-            None
-        };
+        // NOTE: CTE (speculative branch prediction) is no longer assembled or
+        // consumed on this legacy `Agent` path. It was parasitically wired here
+        // (a path the live binary never executes — see agent/mod.rs `pub use
+        // loop_::run`). CTE now attaches to the active agent loop via the
+        // `AgentLoop` bootstrap profile and runs in `loop_::run`. The legacy
+        // `Agent` shell itself is slated for removal under A8.
 
         #[allow(unused_mut)]
         let mut effective_model = {
@@ -1046,47 +957,8 @@ impl Agent {
             super::classifier::TaskIntent::Delegate => self.config.max_tool_iterations.max(1),
         };
 
-        // --- CTE: consume branch prediction ---
-        #[cfg(feature = "llm-router")]
-        if let Some((ref _decision, ref cte_branch)) = cte_result {
-            match cte_branch.label {
-                crate::causal_tree::BranchLabel::AskApproval => {
-                    // High-risk action detected — request user confirmation.
-                    let preview: String = user_message.chars().take(200).collect();
-                    let ellipsis = if user_message.chars().count() > 200 { "..." } else { "" };
-                    let approval_msg = format!(
-                        "This request may involve high-risk actions. \
-                         Please confirm you'd like to proceed, or rephrase your request.\n\n> {preview}{ellipsis}"
-                    );
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(approval_msg.clone())));
-                    self.trim_history();
-                    self.hooks
-                        .emit(
-                            HookEvent::TurnComplete,
-                            serde_json::json!({
-                                "mode": "cte_ask_approval",
-                                "cte_session_id": self.cte_session_id,
-                            }),
-                        )
-                        .await;
-                    self.append_control_ladder_trace(&control_ladder_trace);
-                    return Ok(approval_msg);
-                }
-                crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
-                    tracing::info!(
-                        session_id = %self.cte_session_id,
-                        "CTE recommends retrieval-augmented path"
-                    );
-                }
-                crate::causal_tree::BranchLabel::DirectAnswer => {
-                    tracing::debug!(
-                        session_id = %self.cte_session_id,
-                        "CTE recommends direct answer path"
-                    );
-                }
-            }
-        }
+        // NOTE: CTE branch consumption removed from this legacy path; CTE now runs
+        // in `loop_::run` (see the note above where the prediction block was).
 
         control_ladder_trace.mark_active(
             "runtime",
