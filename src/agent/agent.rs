@@ -1,25 +1,20 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::agent::dispatcher::{
-    NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
-};
+use crate::agent::dispatcher::{ParsedToolCall, ToolDispatcher, ToolExecutionResult};
 use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
-use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::memory::{self, Memory, MemoryCategory};
-use crate::observability::{self, Observer, ObserverEvent};
-use crate::providers::{self, ChatMessage, ChatRequest, ConversationMessage, Provider};
+use crate::observability::{Observer, ObserverEvent};
+use crate::providers::{ChatMessage, ChatRequest, ConversationMessage, Provider};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 #[cfg(feature = "llm-router")]
 use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_escalate};
-use crate::runtime;
 use crate::runtime::control_ladder::{ControlLadderSnapshot, ControlLadderTrace, append_control_ladder_trace};
-use crate::security::SecurityPolicy;
 #[cfg(feature = "llm-router")]
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
-use crate::tools::{self, Tool};
+use crate::tools::Tool;
 use anyhow::Result;
 #[cfg(feature = "llm-router")]
 use chrono::Utc;
@@ -286,153 +281,6 @@ impl Agent {
         if let Err(error) = append_control_ladder_trace(&self.workspace_dir, trace) {
             tracing::warn!("failed to append control ladder trace: {error}");
         }
-    }
-
-    pub fn from_config(config: &Config) -> Result<Self> {
-        let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
-        let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-        // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
-        let security = Arc::new(
-            SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
-                .with_audit_config(config.security.audit.clone()),
-        );
-
-        let memory: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage_and_routes_with_acl(
-            &config.memory,
-            &config.embedding_routes,
-            Some(&config.storage.provider.config),
-            &config.workspace_dir,
-            config.api_key.as_deref(),
-            &config.identity_bindings,
-            &config.user_policies,
-        )?);
-
-        let composio_key = if config.composio.enabled {
-            config.composio.api_key.as_deref()
-        } else {
-            None
-        };
-        let composio_entity_id = if config.composio.enabled {
-            Some(config.composio.entity_id.as_str())
-        } else {
-            None
-        };
-
-        let tools = tools::all_tools_with_runtime(
-            Arc::new(config.clone()),
-            &security,
-            runtime,
-            memory.clone(),
-            composio_key,
-            composio_entity_id,
-            &config.browser,
-            &config.http_request,
-            &config.workspace_dir,
-            &config.agents,
-            config.api_key.as_deref(),
-            config,
-        );
-
-        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
-
-        let model_name = config
-            .default_model
-            .as_deref()
-            .unwrap_or("anthropic/claude-sonnet-4-20250514")
-            .to_string();
-
-        let provider: Box<dyn Provider> = providers::create_routed_provider(
-            provider_name,
-            config.api_key.as_deref(),
-            config.api_url.as_deref(),
-            &config.reliability,
-            &config.model_routes,
-            &model_name,
-        )?;
-
-        let dispatcher_choice = config.agent.tool_dispatcher.as_str();
-        let tool_dispatcher: Box<dyn ToolDispatcher> = match dispatcher_choice {
-            "native" => Box::new(NativeToolDispatcher),
-            "xml" => Box::new(XmlToolDispatcher),
-            _ if provider.supports_native_tools() => Box::new(NativeToolDispatcher),
-            _ => Box::new(XmlToolDispatcher),
-        };
-
-        let available_hints: Vec<String> = config.model_routes.iter().map(|r| r.hint.clone()).collect();
-
-        #[cfg(feature = "llm-router")]
-        if config.router.enabled {
-            config.router.validate()?;
-        }
-
-        #[cfg(feature = "llm-router")]
-        let mut builder = Self::builder()
-            .provider(provider)
-            .tools(tools)
-            .memory(memory)
-            .observer(observer)
-            .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
-            .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(5, config.memory.min_relevance_score)))
-            .prompt_builder(SystemPromptBuilder::with_defaults())
-            .config(config.agent.clone())
-            .model_name(model_name)
-            .temperature(config.default_temperature)
-            .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
-            .task_routing_config(config.task_routing.clone())
-            .tool_tiering(config.tool_tiering.clone())
-            .available_hints(available_hints)
-            .control_ladder(ControlLadderSnapshot::from_config(config))
-            .model_routes(config.model_routes.clone())
-            .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
-            .auto_save(config.memory.auto_save && config.memory.semantic.auto_promote_user_messages);
-
-        #[cfg(not(feature = "llm-router"))]
-        let builder = Agent::builder()
-            .provider(provider)
-            .tools(tools)
-            .memory(memory)
-            .observer(observer)
-            .hooks(Arc::new(HookManager::new(config.workspace_dir.clone())))
-            .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(5, config.memory.min_relevance_score)))
-            .prompt_builder(SystemPromptBuilder::with_defaults())
-            .config(config.agent.clone())
-            .model_name(model_name)
-            .temperature(config.default_temperature)
-            .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
-            .task_routing_config(config.task_routing.clone())
-            .tool_tiering(config.tool_tiering.clone())
-            .available_hints(available_hints)
-            .control_ladder(ControlLadderSnapshot::from_config(config))
-            .identity_config(config.identity.clone())
-            .skills(crate::skills::load_skills_with_config(&config.workspace_dir, config))
-            .auto_save(config.memory.auto_save && config.memory.semantic.auto_promote_user_messages);
-
-        #[cfg(feature = "llm-router")]
-        if config.router.enabled {
-            let router_embedder = memory::create_embedder_from_config(config, config.api_key.as_deref());
-            let router = futures::executor::block_on(RouterEngine::new(
-                config.router.clone(),
-                provider_name.to_string(),
-                config.model_routes.clone(),
-                builder
-                    .memory
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("memory backend must be set before enabling router"))?
-                    .clone(),
-                Some(router_embedder),
-            ))?;
-            builder = builder.router(router);
-        }
-
-        let agent = builder.build()?;
-        let trace = ControlLadderSnapshot::from_config(config).build_trace("agent.init", None);
-        agent.append_control_ladder_trace(&trace);
-        Ok(agent)
     }
 
     fn trim_history(&mut self) {
@@ -1319,32 +1167,6 @@ impl Agent {
     pub async fn run_single(&mut self, message: &str) -> Result<String> {
         self.turn(message).await
     }
-
-    pub async fn run_interactive(&mut self) -> Result<()> {
-        println!("🦀 OpenPRX Interactive Mode");
-        println!("Type /quit to exit.\n");
-
-        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        let cli = crate::channels::CliChannel::new();
-
-        let listen_handle = tokio::spawn(async move {
-            let _ = crate::channels::Channel::listen(&cli, tx).await;
-        });
-
-        while let Some(msg) = rx.recv().await {
-            let response = match self.turn(&msg.content).await {
-                Ok(resp) => resp,
-                Err(e) => {
-                    eprintln!("\nError: {e}\n");
-                    continue;
-                }
-            };
-            println!("\n{response}\n");
-        }
-
-        listen_handle.abort();
-        Ok(())
-    }
 }
 
 #[cfg(feature = "llm-router")]
@@ -1380,79 +1202,6 @@ impl RouterCostEvent {
     }
 }
 
-pub async fn run(
-    config: Config,
-    message: Option<String>,
-    provider_override: Option<String>,
-    model_override: Option<String>,
-    temperature: f64,
-) -> Result<()> {
-    let start = Instant::now();
-
-    let mut effective_config = config;
-    if let Some(p) = provider_override {
-        effective_config.default_provider = Some(p);
-    }
-    if let Some(m) = model_override {
-        effective_config.default_model = Some(m);
-    }
-    effective_config.default_temperature = temperature;
-
-    let mut agent = Agent::from_config(&effective_config)?;
-
-    let provider_name = effective_config
-        .default_provider
-        .as_deref()
-        .unwrap_or("openrouter")
-        .to_string();
-    let model_name = effective_config
-        .default_model
-        .as_deref()
-        .unwrap_or("anthropic/claude-sonnet-4-20250514")
-        .to_string();
-
-    agent.observer.record_event(&ObserverEvent::AgentStart {
-        provider: provider_name.clone(),
-        model: model_name.clone(),
-    });
-    agent
-        .hooks
-        .emit(
-            HookEvent::AgentStart,
-            serde_json::json!({
-                "provider": effective_config.default_provider,
-                "model": effective_config.default_model,
-            }),
-        )
-        .await;
-
-    if let Some(msg) = message {
-        let response = agent.run_single(&msg).await?;
-        println!("{response}");
-    } else {
-        agent.run_interactive().await?;
-    }
-
-    agent.observer.record_event(&ObserverEvent::AgentEnd {
-        provider: provider_name,
-        model: model_name,
-        duration: start.elapsed(),
-        tokens_used: None,
-        cost_usd: None,
-    });
-    agent
-        .hooks
-        .emit(
-            HookEvent::AgentEnd,
-            serde_json::json!({
-                "duration_ms": start.elapsed().as_millis(),
-            }),
-        )
-        .await;
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1466,6 +1215,8 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
+    use crate::agent::dispatcher::{NativeToolDispatcher, XmlToolDispatcher};
+    use crate::config::Config;
     use async_trait::async_trait;
     use parking_lot::Mutex;
     #[cfg(feature = "llm-router")]

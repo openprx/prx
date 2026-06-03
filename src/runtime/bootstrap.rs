@@ -666,9 +666,14 @@ mod tests {
     ///   - `session_worker/runner.rs`: manifest-driven divergent core
     ///     (`manifest.workspace_dir`-bound security); intentionally NOT routed through
     ///     `RuntimeBootstrap` under the D1 behavior-unchanged guardrail (see module note).
-    ///   - `agent/agent.rs`, `agent/loop_.rs`: agent builder / `process_message` paths,
-    ///     not yet converged (later D-series).
+    ///   - `agent/loop_.rs`: `process_message` path, not yet converged (later D-series).
     ///   - `cron/scheduler.rs`: cron job path, not yet converged.
+    ///
+    /// A8 (2026-06-03): the legacy `Agent::from_config` in `agent/agent.rs` — the
+    /// only production `.with_audit_config(` site in that file — was removed when the
+    /// dead legacy `Agent::run` / `from_config` / `run_interactive` shell was deleted
+    /// (the live path is `loop_::run`). `agent/agent.rs` was therefore REMOVED from
+    /// this whitelist to keep the gate tight (`gate_whitelist_entries_are_all_live`).
     ///
     /// D2 (2026-06-02): the four gateway authorization sites — `gateway/mod.rs`
     /// (`authorize_gateway_resource_mutation`), `gateway/api/mod.rs`
@@ -677,12 +682,7 @@ mod tests {
     /// were all converged onto `build_security_policy` and so were REMOVED from this
     /// whitelist. They no longer hand-write the audit-config wiring, which keeps the
     /// gate tight (`gate_whitelist_entries_are_all_live`).
-    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &[
-        "session_worker/runner.rs",
-        "agent/agent.rs",
-        "agent/loop_.rs",
-        "cron/scheduler.rs",
-    ];
+    const HANDWIRED_AUDIT_WHITELIST: &[&str] = &["session_worker/runner.rs", "agent/loop_.rs", "cron/scheduler.rs"];
 
     /// Recursively collect every `.rs` file under `dir`.
     fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
