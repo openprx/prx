@@ -68,6 +68,9 @@ use crate::tools::{self, Tool};
 #[cfg(feature = "llm-router")]
 use crate::router::RouterEngine;
 
+#[cfg(feature = "llm-router")]
+use crate::causal_tree::CausalTreeEngine;
+
 /// Read-only core: immutable after construction, no interior `Mutex`, shared by
 /// `Arc` clone across modes and child tasks (iron rule 7: `Arc` over deep copy).
 ///
@@ -105,6 +108,16 @@ pub struct AppContext {
     #[cfg(feature = "llm-router")]
     #[allow(dead_code)]
     pub router: Option<Arc<RouterEngine>>,
+    /// Speculative branch-prediction engine (CausalTree, CTE). `Some` only under
+    /// the dedicated `AgentLoop` profile AND when `config.causal_tree.enabled`;
+    /// `None` on every other path (including `prx chat` / `Interactive`), so no
+    /// other run mode pays anything for it. Experimental, opt-in. Consumed by
+    /// `loop_::run` (the live agent tool loop) — the sole CTE consumer.
+    // Consumed by `loop_::run` from Commit 3 of this series onward; carries a
+    // temporary dead_code allow until then.
+    #[cfg(feature = "llm-router")]
+    #[allow(dead_code)]
+    pub cte: Option<Arc<CausalTreeEngine>>,
 }
 
 /// Selects which subsystems a given run mode needs, so lightweight commands do
@@ -124,8 +137,16 @@ pub enum BootstrapProfile {
     Minimal,
     /// chat `--list-sessions` early-exit: + memory, no tools/router.
     MemoryOnly,
-    /// chat (interactive): full memory + tools, no router.
+    /// chat (interactive): full memory + tools, no router, **no CTE**.
     Interactive,
+    /// `loop_::run` (the live agent tool loop): the same core as `Interactive`
+    /// (full memory + tools, no router) PLUS the opt-in CausalTreeEngine. This is
+    /// a dedicated variant so that *only* the agent loop pays for CTE — `prx chat`
+    /// (which uses `Interactive`) never builds it. Without this split, attaching
+    /// CTE to the shared `Interactive` profile would assemble the engine on the
+    /// chat path too, where nothing consumes it: dead wiring (iron rule 2) and a
+    /// non-zero cost on a path that gains nothing.
+    AgentLoop,
     /// gateway / daemon: full.
     #[allow(dead_code)]
     Server,
@@ -152,17 +173,35 @@ impl BootstrapProfile {
     }
 
     /// Whether this profile requires the tool registry. Tools depend on
-    /// security + runtime + memory, so this also implies memory.
+    /// security + runtime + memory, so this also implies memory. `AgentLoop` has
+    /// the same tool footprint as `Interactive`.
     const fn needs_tools(self) -> bool {
-        matches!(self, Self::Interactive | Self::Server | Self::Channel | Self::Worker)
+        matches!(
+            self,
+            Self::Interactive | Self::AgentLoop | Self::Server | Self::Channel | Self::Worker
+        )
     }
 
     /// Whether this profile may construct the LLM router (only relevant when the
     /// `llm-router` feature is enabled). Router needs memory; it is the
-    /// agent-builder style full profiles that use it.
+    /// agent-builder style full profiles that use it. `AgentLoop` does **not**
+    /// need the router — `loop_::run` resolves a single provider/model directly
+    /// and never routes.
     #[cfg(feature = "llm-router")]
     const fn needs_router(self) -> bool {
         matches!(self, Self::Server | Self::Channel | Self::Worker)
+    }
+
+    /// Whether this profile attaches the CausalTreeEngine (CTE). It attaches
+    /// **only** to the live agent tool loop (`AgentLoop`), which is the sole
+    /// consumer (`loop_::run`). `Interactive` (chat) must not build it — chat has
+    /// no per-turn CTE consumption point, so building it there would be dead
+    /// wiring with non-zero cost (iron rule 2). `Server`/`Channel` likewise have
+    /// no per-turn CTE consumer wired, and `Worker` is a reserved placeholder
+    /// (session_worker takes a dedicated path, not `RuntimeBootstrap`).
+    #[cfg(feature = "llm-router")]
+    const fn needs_cte(self) -> bool {
+        matches!(self, Self::AgentLoop)
     }
 }
 
@@ -259,6 +298,33 @@ impl RuntimeBootstrap {
             None
         };
 
+        // 5b. causal_tree (CTE) — experimental, opt-in. Only the dedicated
+        //     `AgentLoop` profile (consumed by `loop_::run`) attaches CTE; every
+        //     other path leaves it `None` and pays nothing. CTE depends only on the
+        //     observer (built in step 1) + config, so it is constructed here after
+        //     the router and before tools. Short-circuit on `needs_cte() &&
+        //     config.causal_tree.enabled`: when disabled, `CausalTreeEngine::new`
+        //     and all five sub-engines are never constructed (zero allocation).
+        #[cfg(feature = "llm-router")]
+        let cte: Option<Arc<CausalTreeEngine>> = if profile.needs_cte() && config.causal_tree.enabled {
+            Some(Arc::new(CausalTreeEngine::new(
+                Arc::new(crate::causal_tree::expander::DefaultTreeExpander::new()),
+                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
+                Arc::new(crate::causal_tree::scorer::DefaultBranchScorer::new()),
+                Arc::new(crate::causal_tree::selector::DefaultPathSelector::new()),
+                Arc::new(crate::causal_tree::feedback::SelfSystemFeedbackWriter::new(
+                    &config.workspace_dir,
+                )),
+                // Reuse the single context observer (matches the legacy
+                // `cte_observer = observer.clone()` wiring) so CTE telemetry lands
+                // on the same backend as the rest of the run.
+                observer.clone(),
+                config.causal_tree.clone(),
+            )))
+        } else {
+            None
+        };
+
         // 6. tools — last; depends on security + runtime + memory all being ready
         //    (all_tools_with_runtime inputs, survey §2 constraint 1).
         let tools: Option<Arc<Vec<Box<dyn Tool>>>> = if profile.needs_tools() {
@@ -304,6 +370,8 @@ impl RuntimeBootstrap {
             tools,
             #[cfg(feature = "llm-router")]
             router,
+            #[cfg(feature = "llm-router")]
+            cte,
         }))
     }
 }
@@ -378,6 +446,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_loop_profile_builds_memory_and_tools() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        let config = test_config(tmp.path());
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
+            .await
+            .expect("test: agent-loop build");
+
+        assert!(ctx.memory.is_some(), "AgentLoop must build memory");
+        assert!(ctx.tools.is_some(), "AgentLoop must build tools");
+        // AgentLoop has the same router footprint as Interactive: never routes.
+        #[cfg(feature = "llm-router")]
+        assert!(ctx.router.is_none(), "AgentLoop must not build router");
+    }
+
+    // --- CTE attachment: only AgentLoop + enabled builds it (Codex condition #1) -
+
+    /// Critical: the shared `Interactive` profile (used by `prx chat`) must NEVER
+    /// build CTE, even when `config.causal_tree.enabled` is true — chat has no CTE
+    /// consumer, so wiring it there would be dead code with non-zero cost.
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn interactive_profile_never_builds_cte_even_when_enabled() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        let mut config = test_config(tmp.path());
+        config.causal_tree.enabled = true;
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Interactive)
+            .await
+            .expect("test: interactive build");
+        assert!(
+            ctx.cte.is_none(),
+            "Interactive (chat) must not attach CTE even with causal_tree.enabled=true"
+        );
+    }
+
+    /// `AgentLoop` + `enabled = false` (the default) → no CTE, zero cost.
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn agent_loop_profile_disabled_has_no_cte() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        let config = test_config(tmp.path());
+        // test_config leaves causal_tree.enabled at its default (false).
+        assert!(!config.causal_tree.enabled, "test precondition: CTE default off");
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
+            .await
+            .expect("test: agent-loop build (CTE off)");
+        assert!(ctx.cte.is_none(), "AgentLoop with enabled=false must not attach CTE");
+    }
+
+    /// `AgentLoop` + `enabled = true` → CTE attached (`Some`).
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn agent_loop_profile_enabled_attaches_cte() {
+        let tmp = tempfile::tempdir().expect("test: create temp dir");
+        let mut config = test_config(tmp.path());
+        config.causal_tree.enabled = true;
+        let ctx = RuntimeBootstrap::build(config, BootstrapProfile::AgentLoop)
+            .await
+            .expect("test: agent-loop build (CTE on)");
+        assert!(ctx.cte.is_some(), "AgentLoop with enabled=true must attach CTE");
+        let cte = ctx.cte.as_ref().expect("test: cte present");
+        assert!(cte.is_enabled(), "attached CTE engine must report enabled");
+    }
+
+    /// Lightweight profiles never attach CTE regardless of config.
+    #[cfg(feature = "llm-router")]
+    #[tokio::test]
+    async fn lightweight_profiles_never_attach_cte() {
+        for profile in [BootstrapProfile::Minimal, BootstrapProfile::MemoryOnly] {
+            let tmp = tempfile::tempdir().expect("test: create temp dir");
+            let mut config = test_config(tmp.path());
+            config.causal_tree.enabled = true;
+            let ctx = RuntimeBootstrap::build(config, profile)
+                .await
+                .unwrap_or_else(|e| panic!("test: build {profile:?}: {e}"));
+            assert!(ctx.cte.is_none(), "{profile:?}: must not attach CTE");
+        }
+    }
+
+    #[tokio::test]
     async fn server_profile_builds_memory_and_tools() {
         let tmp = tempfile::tempdir().expect("test: create temp dir");
         let config = test_config(tmp.path());
@@ -447,6 +594,7 @@ mod tests {
     async fn golden_trace_security_and_memory_precede_tools() {
         for profile in [
             BootstrapProfile::Interactive,
+            BootstrapProfile::AgentLoop,
             BootstrapProfile::Server,
             BootstrapProfile::Channel,
             BootstrapProfile::Worker,
