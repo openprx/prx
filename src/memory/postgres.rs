@@ -2553,44 +2553,32 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let audit_table = self.qualified_access_audit_log_table();
         let key = key.to_string();
-        let channel = context.channel.clone();
-        let chat_id = context.chat_id.clone();
-        let raw_sender = context.raw_sender.clone();
-        let sender_id = context.sender_id.clone().or_else(|| {
-            if context.channel.is_some() && context.raw_sender.is_some() {
-                Some(format!(
-                    "anonymous:{}:{}",
-                    context.channel.as_deref().unwrap_or("unknown"),
-                    context.raw_sender.as_deref().unwrap_or("unknown")
-                ))
-            } else {
-                None
-            }
-        });
+
+        // D11: derive the delete-visibility scope from the shared predicate
+        // (single source with SQLite). The fixed parameter is $1=key, so the
+        // scope predicate is rendered with `$N` starting at $2 and its values
+        // appended after the key. This tightens the Postgres forget scope to the
+        // SQLite canonical truth table (removing the over-permissive
+        // `visibility IS NULL` / `visibility IN ('workspace', ...)` allow paths)
+        // and folds the secret-exclusion into the shared predicate, so an owner
+        // can delete its own secrets exactly as on SQLite.
+        let (scope_sql, scope_params) = principal.build_sql_scope_pg(2);
+        let scope_values = scope_params_to_strings(scope_params);
 
         tokio::task::spawn_blocking(move || -> Result<bool> {
             let stmt = format!(
                 "
                 DELETE FROM {qualified_table}
                 WHERE key = $1
-                  AND COALESCE(sensitivity, 'normal') != 'secret'
-                  AND (
-                      visibility IS NULL
-                      OR visibility IN ('workspace', 'public')
-                      OR (
-                          $2::TEXT IS NOT NULL
-                          AND $3::TEXT IS NOT NULL
-                          AND $4::TEXT IS NOT NULL
-                          AND channel = $2
-                          AND chat_id = $3
-                          AND raw_sender = $4
-                      )
-                      OR ($5::TEXT IS NOT NULL AND sender_id = $5)
-                  )
+                  AND ({scope_sql})
                 "
             );
             let deleted = client.with_client(|client| {
-                Ok(client.execute(&stmt, &[&key, &channel, &chat_id, &raw_sender, &sender_id])?)
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
+                for value in &scope_values {
+                    params.push(value);
+                }
+                Ok(client.execute(&stmt, &params)?)
             })?;
             let result = if deleted > 0 { "allowed" } else { "denied" };
             Self::log_access_best_effort(
