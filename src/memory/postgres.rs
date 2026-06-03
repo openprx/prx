@@ -34,6 +34,9 @@ fn scope_params_to_strings(params: Vec<ScopeParam>) -> Vec<String> {
 }
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
+/// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
+const PG_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
+    crate::memory::session_predicate::PlaceholderDialect::Postgres;
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
 const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
 
@@ -1430,6 +1433,42 @@ impl PostgresMemory {
                 .is_some_and(super::principal::is_system_principal)
     }
 
+    /// D4 read-merge: distinct legacy `session_key` candidate(s) bound to *new
+    /// trailing* `$N` placeholders. See the SQLite twin
+    /// `SqliteMemory::legacy_session_key_params` for the shared contract.
+    fn legacy_session_key_params(principal: &MemoryPrincipal) -> Vec<String> {
+        let mut candidates = principal.session_key_candidates();
+        if candidates.is_empty() {
+            candidates
+        } else {
+            candidates.split_off(1)
+        }
+    }
+
+    /// D4 read-merge: placeholder indices for the canonical key plus trailing
+    /// legacy key(s). Mirrors `SqliteMemory::session_indices`.
+    fn session_indices(
+        canonical_index: usize,
+        legacy_start: usize,
+        principal: &MemoryPrincipal,
+        legacy_keys: &[String],
+    ) -> Vec<usize> {
+        if principal
+            .session_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Vec::new();
+        }
+        let mut indices = Vec::with_capacity(1 + legacy_keys.len());
+        indices.push(canonical_index);
+        for offset in 0..legacy_keys.len() {
+            indices.push(legacy_start + offset);
+        }
+        indices
+    }
+
     fn principal_from_context(context: &MemoryWriteContext) -> Principal {
         let current_channel = context.channel.clone().unwrap_or_default();
         let current_chat_id = context.chat_id.clone().unwrap_or_default();
@@ -2697,12 +2736,28 @@ impl Memory for PostgresMemory {
         #[allow(clippy::cast_possible_wrap)]
         let offset = offset.min(100_000) as i64;
         let system_allowed = Self::is_system_principal(principal);
+        // D4 read-merge: the explicit `session_key` arg is the canonical key
+        // (bound at `$1`); the principal may carry a distinct legacy key bound
+        // at trailing placeholders starting at `$6`.
+        let legacy_session_keys: Vec<String> = principal
+            .legacy_session_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != session_key.trim())
+            .map(|key| vec![key.to_string()])
+            .unwrap_or_default();
+        let mut session_indices = vec![1usize];
+        for offset_idx in 0..legacy_session_keys.len() {
+            session_indices.push(6 + offset_idx);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<ConversationTurn>> {
             let stmt = format!(
                 "SELECT id, session_key, role, content, timestamp, message_id
                  FROM {turns_table}
-                 WHERE session_key = $1
+                 WHERE {session_fragment}
                    AND (
                        $4
                        OR owner_id = $5
@@ -2710,11 +2765,17 @@ impl Memory for PostgresMemory {
                        OR owner_id = 'legacy:' || session_key
                    )
                  ORDER BY id DESC
-                 LIMIT $2 OFFSET $3"
+                 LIMIT $2 OFFSET $3",
+                session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
                 Self::apply_rls_context_raw(client, system_allowed, owner_id.as_deref())?;
-                Ok(client.query(&stmt, &[&session_key, &limit, &offset, &system_allowed, &owner_id])?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> =
+                    vec![&session_key, &limit, &offset, &system_allowed, &owner_id];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             let mut turns: Vec<ConversationTurn> = rows
                 .iter()
@@ -2925,6 +2986,13 @@ impl Memory for PostgresMemory {
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let system_allowed = Self::is_system_principal(&principal);
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `$5` binding; legacy key(s) bind at trailing
+        // placeholders starting at `$9` (after limit at `$8`).
+        let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
@@ -2944,7 +3012,7 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                               ))
-                              OR (visibility = 'session' AND $5::TEXT IS NOT NULL AND session_key = $5)
+                              OR (visibility = 'session' AND {session_fragment})
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
@@ -2956,22 +3024,24 @@ impl Memory for PostgresMemory {
                   )
                 ORDER BY id ASC
                 LIMIT $8
-                "
+                ",
+                session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &after_id,
-                        &principal.workspace_id,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.session_key,
-                        &principal.sender,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &after_id,
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &principal.sender,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             rows.iter()
                 .map(Self::row_to_message_event)
@@ -2986,6 +3056,13 @@ impl Memory for PostgresMemory {
         let principal = principal.clone();
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         let system_allowed = Self::is_system_principal(&principal);
+
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `$4` binding; legacy key(s) bind at trailing
+        // placeholders starting at `$8` (after limit at `$7`).
+        let session_indices = Self::session_indices(4, 8, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
 
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
@@ -3005,7 +3082,7 @@ impl Memory for PostgresMemory {
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
                               ))
-                              OR (visibility = 'session' AND $4::TEXT IS NOT NULL AND session_key = $4)
+                              OR (visibility = 'session' AND {session_fragment})
                               OR (visibility = 'private' AND (
                                   ($2::TEXT IS NOT NULL AND agent_id = $2)
                                   OR ($3::TEXT IS NOT NULL AND persona_id = $3)
@@ -3017,21 +3094,23 @@ impl Memory for PostgresMemory {
                   )
                 ORDER BY id DESC
                 LIMIT $7
-                "
+                ",
+                session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &principal.workspace_id,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.session_key,
-                        &principal.sender,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &principal.sender,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             rows.iter()
                 .map(Self::row_to_message_event)
@@ -3054,6 +3133,13 @@ impl Memory for PostgresMemory {
             .filter(|role| !role.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `$5` binding; legacy key(s) bind at trailing
+        // placeholders starting at `$9` (after limit at `$8`).
+        let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(PG_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
@@ -3073,7 +3159,7 @@ impl Memory for PostgresMemory {
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
                               ))
-                              OR (visibility = 'session' AND $5::TEXT IS NOT NULL AND session_key = $5)
+                              OR (visibility = 'session' AND {session_fragment})
                               OR (visibility = 'private' AND (
                                   ($3::TEXT IS NOT NULL AND agent_id = $3)
                                   OR ($4::TEXT IS NOT NULL AND persona_id = $4)
@@ -3085,22 +3171,24 @@ impl Memory for PostgresMemory {
                   )
                 ORDER BY id DESC
                 LIMIT $8
-                "
+                ",
+                session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &after_id,
-                        &principal.workspace_id,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.session_key,
-                        &principal.sender,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &after_id,
+                    &principal.workspace_id,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.session_key,
+                    &principal.sender,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             let mut events = rows
                 .iter()
@@ -3135,6 +3223,17 @@ impl Memory for PostgresMemory {
             .filter(|role| !role.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `$3` binding; legacy key(s) bind at trailing
+        // placeholders starting at `$9` (after limit at `$8`). The top-level
+        // `session_key` hard filter becomes an `IN (...)` read-merge union.
+        let mut session_indices = vec![3usize];
+        for offset in 0..legacy_session_keys.len() {
+            session_indices.push(9 + offset);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(PG_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> Result<Vec<MessageEvent>> {
             let stmt = format!(
                 "
@@ -3145,7 +3244,7 @@ impl Memory for PostgresMemory {
                 FROM {qualified_message_events_table}
                 WHERE id > $1
                   AND workspace_id = $2
-                  AND session_key = $3
+                  AND {session_fragment}
                   AND (
                       visibility IN ('global', 'workspace')
                       OR (visibility = 'agent' AND (
@@ -3162,22 +3261,24 @@ impl Memory for PostgresMemory {
                   )
                 ORDER BY id DESC
                 LIMIT $8
-                "
+                ",
+                session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(
-                    &stmt,
-                    &[
-                        &after_id,
-                        &principal.workspace_id,
-                        &session_key,
-                        &principal.agent_id,
-                        &principal.persona_id,
-                        &principal.sender,
-                        &system_allowed,
-                        &limit_i64,
-                    ],
-                )?)
+                let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![
+                    &after_id,
+                    &principal.workspace_id,
+                    &session_key,
+                    &principal.agent_id,
+                    &principal.persona_id,
+                    &principal.sender,
+                    &system_allowed,
+                    &limit_i64,
+                ];
+                for key in &legacy_session_keys {
+                    bind.push(key);
+                }
+                Ok(client.query(&stmt, &bind)?)
             })?;
             let mut events = rows
                 .iter()
@@ -4775,6 +4876,7 @@ mod tests {
             channel: Some("telegram".to_string()),
             sender: Some("sender-1".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let events = mem.list_message_events_since(&principal, 0, 10).await.unwrap();
         assert_eq!(events.len(), 2);
@@ -4884,6 +4986,7 @@ mod tests {
             channel: None,
             sender: None,
             owner_id: None,
+            legacy_session_key: None,
         };
         let merged = mem
             .merge_memory_draft(&test_principal, "draft-1")
@@ -5152,6 +5255,7 @@ mod tests {
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let document_results = mem
             .search_document_chunks(&principal, "semantic-neighbor", 5)

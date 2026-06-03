@@ -170,9 +170,61 @@ pub struct MemoryPrincipal {
     pub sender: Option<String>,
     #[serde(default)]
     pub owner_id: Option<String>,
+    /// Optional pre-cutover (legacy) `session_key` candidate for read-merge.
+    ///
+    /// When a durable `session_key` is migrated to a canonical format (D4),
+    /// the legacy value is carried here so `session`-visibility recall can read
+    /// both the new canonical history and the old legacy history as a union
+    /// (read-merge, never move). `None` (the default) preserves the historical
+    /// single-key behaviour exactly. The legacy key is always read-only.
+    #[serde(default)]
+    pub legacy_session_key: Option<String>,
+}
+
+impl Default for MemoryPrincipal {
+    fn default() -> Self {
+        Self {
+            workspace_id: String::new(),
+            agent_id: None,
+            persona_id: None,
+            session_key: None,
+            channel: None,
+            sender: None,
+            owner_id: None,
+            legacy_session_key: None,
+        }
+    }
 }
 
 impl MemoryPrincipal {
+    /// Deduplicated `session_key` candidates for `session`-visibility recall.
+    ///
+    /// Returns the canonical `session_key` first, followed by the optional
+    /// `legacy_session_key` when it is present, non-empty, and distinct from the
+    /// canonical key. When no `session_key` is set the list is empty (the
+    /// predicate must then match nothing, mirroring the historical
+    /// `session_key IS NOT NULL AND session_key = ?` behaviour). When the legacy
+    /// key is `None` (or equal to canonical) the list degrades to a single key,
+    /// producing byte-identical SQL to the pre-D4 single-key predicate.
+    #[must_use]
+    pub fn session_key_candidates(&self) -> Vec<String> {
+        let mut candidates: Vec<String> = Vec::with_capacity(2);
+        if let Some(canonical) = self.session_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+            candidates.push(canonical.to_string());
+        }
+        if let Some(legacy) = self
+            .legacy_session_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            if !candidates.iter().any(|existing| existing == legacy) {
+                candidates.push(legacy.to_string());
+            }
+        }
+        candidates
+    }
+
     #[must_use]
     pub fn effective_owner_id(&self) -> Option<String> {
         if self.owner_id.as_deref().is_some_and(|owner| !owner.trim().is_empty()) {

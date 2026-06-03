@@ -12,6 +12,7 @@ pub mod none;
 pub mod postgres;
 pub mod principal;
 pub mod retrieval;
+pub mod session_predicate;
 pub mod snapshot;
 pub mod sqlite;
 pub mod topic;

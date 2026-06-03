@@ -1393,6 +1393,7 @@ async fn load_persisted_histories(
         channel: None,
         sender: None,
         owner_id: Some("system:*".to_string()),
+        legacy_session_key: None,
     };
     match memory
         .load_recent_conversation_histories(&principal, MAX_CHANNEL_HISTORY, MAX_HYDRATED_SESSIONS)
@@ -5546,6 +5547,7 @@ mod tests {
                     channel: Some("telegram".to_string()),
                     sender: Some("sender-1".to_string()),
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -7752,6 +7754,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel: Some("test-channel".to_string()),
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 20,
@@ -8604,6 +8607,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     channel: Some("test-channel".to_string()),
                     sender: Some("alice".to_string()),
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,

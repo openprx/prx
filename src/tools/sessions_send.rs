@@ -331,6 +331,7 @@ mod tests {
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,

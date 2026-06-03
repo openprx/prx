@@ -126,6 +126,7 @@ pub(crate) fn principal_from_args(args: &Value, workspace_id: &str) -> MemoryPri
         channel,
         sender,
         owner_id: read_scope("owner_id"),
+        legacy_session_key: None,
     }
 }
 

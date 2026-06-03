@@ -2831,6 +2831,7 @@ mod tests {
                     channel: Some("webhook".to_string()),
                     sender: Some("client-a".to_string()),
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,

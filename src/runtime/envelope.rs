@@ -483,6 +483,9 @@ impl RuntimeEnvelope {
             channel: self.channel.clone(),
             sender: self.sender.clone(),
             owner_id: Some(self.resolved_owner_id()),
+            // D4: no legacy key derived at the envelope layer yet (C2 wires the
+            // per-source derivation). `None` preserves single-key recall.
+            legacy_session_key: None,
         }
     }
 

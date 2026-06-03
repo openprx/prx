@@ -33,6 +33,9 @@ use uuid::Uuid;
 const SQLITE_OPEN_TIMEOUT_CAP_SECS: u64 = 300;
 const DEFAULT_CONVERSATION_LIMIT: usize = 50;
 const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
+/// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
+const SQLITE_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
+    crate::memory::session_predicate::PlaceholderDialect::Sqlite;
 
 fn message_event_type_for(role: &str, content: &str) -> Option<String> {
     if role != "event" {
@@ -456,6 +459,52 @@ impl SqliteMemory {
                 .persona_id
                 .as_deref()
                 .is_some_and(super::principal::is_system_principal)
+    }
+
+    /// D4 read-merge: legacy `session_key` candidate(s) that bind to *new
+    /// trailing* SQL placeholders, in addition to the canonical key which keeps
+    /// its original placeholder. Returns the deduplicated tail of
+    /// [`MemoryPrincipal::session_key_candidates`] (everything after the
+    /// canonical key). Empty when there is no distinct legacy key, in which case
+    /// the predicate degrades to the historical single-key form.
+    fn legacy_session_key_params(principal: &MemoryPrincipal) -> Vec<String> {
+        let mut candidates = principal.session_key_candidates();
+        if candidates.is_empty() {
+            candidates
+        } else {
+            candidates.split_off(1)
+        }
+    }
+
+    /// D4 read-merge: placeholder indices for the `session_key` predicate.
+    ///
+    /// `canonical_index` is the existing placeholder bound to
+    /// `principal.session_key`; `legacy_start` is the first *new trailing*
+    /// placeholder index. With no distinct legacy key the result is
+    /// `[canonical_index]` (byte-identical single-key predicate); otherwise the
+    /// canonical index is followed by consecutive trailing indices for each
+    /// legacy key. When the principal has no `session_key` at all the result is
+    /// empty (predicate becomes `FALSE`, matching nothing, as before).
+    fn session_indices(
+        canonical_index: usize,
+        legacy_start: usize,
+        principal: &MemoryPrincipal,
+        legacy_keys: &[String],
+    ) -> Vec<usize> {
+        if principal
+            .session_key
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+        {
+            return Vec::new();
+        }
+        let mut indices = Vec::with_capacity(1 + legacy_keys.len());
+        indices.push(canonical_index);
+        for offset in 0..legacy_keys.len() {
+            indices.push(legacy_start + offset);
+        }
+        indices
     }
 
     /// Initialize all tables: memories, FTS5, `embedding_cache`
@@ -3660,13 +3709,30 @@ impl Memory for SqliteMemory {
         let limit = Self::sanitize_conversation_limit(limit);
         let offset = Self::sanitize_conversation_offset(offset);
         let legacy_visible = 1_i64;
+        // D4 read-merge: the explicit `session_key` arg is the canonical key
+        // (bound at `?1`); the principal may carry a distinct legacy key bound
+        // at trailing placeholders starting at `?6`. With no legacy key the
+        // predicate degrades to the byte-identical `session_key = ?1`.
+        let legacy_session_keys: Vec<String> = principal
+            .legacy_session_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty() && *key != session_key.trim())
+            .map(|key| vec![key.to_string()])
+            .unwrap_or_default();
+        let mut session_indices = vec![1usize];
+        for offset_idx in 0..legacy_session_keys.len() {
+            session_indices.push(6 + offset_idx);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ConversationTurn>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, session_key, role, content, timestamp, message_id
                  FROM conversation_turns
-                 WHERE session_key = ?1
+                 WHERE {session_fragment}
                    AND (
                        ?4 = 'system:*'
                        OR
@@ -3675,8 +3741,14 @@ impl Memory for SqliteMemory {
                    )
                  ORDER BY id DESC
                  LIMIT ?2 OFFSET ?3",
-            )?;
-            let rows = stmt.query_map(params![session_key, limit, offset, owner_id, legacy_visible], |row| {
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> =
+                vec![&session_key, &limit, &offset, &owner_id, &legacy_visible];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), |row| {
                 Ok(ConversationTurn {
                     id: row.get(0)?,
                     session_key: row.get(1)?,
@@ -3888,9 +3960,16 @@ impl Memory for SqliteMemory {
         let limit = Self::sanitize_conversation_limit(limit);
         let system_allowed = Self::is_system_principal(&principal);
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its original `?5` binding; legacy key(s) bind to
+        // new trailing placeholders starting at `?9` (after limit at `?8`).
+        let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
@@ -3907,7 +3986,7 @@ impl Memory for SqliteMemory {
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                ))
-                               OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                               OR (visibility = 'session' AND {session_fragment})
                                OR (visibility = 'private' AND (
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
@@ -3919,20 +3998,22 @@ impl Memory for SqliteMemory {
                    )
                  ORDER BY id ASC
                  LIMIT ?8",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    after_id,
-                    principal.workspace_id,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.session_key,
-                    principal.sender,
-                    system_allowed,
-                    limit
-                ],
-                Self::message_event_from_row,
-            )?;
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &after_id,
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &principal.sender,
+                &system_allowed,
+                &limit,
+            ];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
@@ -3949,9 +4030,16 @@ impl Memory for SqliteMemory {
         let limit = Self::sanitize_conversation_limit(limit);
         let system_allowed = Self::is_system_principal(&principal);
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `?4` binding; legacy key(s) bind at trailing
+        // placeholders starting at `?8` (after limit at `?7`).
+        let session_indices = Self::session_indices(4, 8, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
@@ -3967,7 +4055,7 @@ impl Memory for SqliteMemory {
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
                                ))
-                               OR (visibility = 'session' AND ?4 IS NOT NULL AND session_key = ?4)
+                               OR (visibility = 'session' AND {session_fragment})
                                OR (visibility = 'private' AND (
                                    (?2 IS NOT NULL AND agent_id = ?2)
                                    OR (?3 IS NOT NULL AND persona_id = ?3)
@@ -3979,19 +4067,21 @@ impl Memory for SqliteMemory {
                    )
                  ORDER BY id DESC
                  LIMIT ?7",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    principal.workspace_id,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.session_key,
-                    principal.sender,
-                    system_allowed,
-                    limit
-                ],
-                Self::message_event_from_row,
-            )?;
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &principal.sender,
+                &system_allowed,
+                &limit,
+            ];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
@@ -4011,9 +4101,16 @@ impl Memory for SqliteMemory {
             .filter(|role| !role.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `?5` binding; legacy key(s) bind at trailing
+        // placeholders starting at `?9` (after limit at `?8`).
+        let session_indices = Self::session_indices(5, 9, &principal, &legacy_session_keys);
+        let session_fragment =
+            crate::memory::session_predicate::session_visibility_or_fragment(SQLITE_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
@@ -4030,7 +4127,7 @@ impl Memory for SqliteMemory {
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
                                ))
-                               OR (visibility = 'session' AND ?5 IS NOT NULL AND session_key = ?5)
+                               OR (visibility = 'session' AND {session_fragment})
                                OR (visibility = 'private' AND (
                                    (?3 IS NOT NULL AND agent_id = ?3)
                                    OR (?4 IS NOT NULL AND persona_id = ?4)
@@ -4042,20 +4139,22 @@ impl Memory for SqliteMemory {
                    )
                  ORDER BY id DESC
                  LIMIT ?8",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    after_id,
-                    principal.workspace_id,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.session_key,
-                    principal.sender,
-                    system_allowed,
-                    limit
-                ],
-                Self::message_event_from_row,
-            )?;
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &after_id,
+                &principal.workspace_id,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.session_key,
+                &principal.sender,
+                &system_allowed,
+                &limit,
+            ];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
             let mut events = rows.collect::<Result<Vec<_>, _>>()?;
             events.reverse();
@@ -4086,9 +4185,20 @@ impl Memory for SqliteMemory {
             .filter(|role| !role.is_empty())
             .collect::<std::collections::HashSet<_>>();
 
+        let legacy_session_keys = Self::legacy_session_key_params(&principal);
+        // Canonical key keeps its `?3` binding; legacy key(s) bind at trailing
+        // placeholders starting at `?9` (after limit at `?8`). The top-level
+        // `session_key` hard filter becomes an `IN (...)` read-merge union.
+        let mut session_indices = vec![3usize];
+        for offset in 0..legacy_session_keys.len() {
+            session_indices.push(9 + offset);
+        }
+        let session_fragment =
+            crate::memory::session_predicate::session_key_match_fragment(SQLITE_DIALECT, &session_indices);
+
         tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MessageEvent>> {
             let conn = conn.lock();
-            let mut stmt = conn.prepare(
+            let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, content, content_hash, raw_payload_json,
@@ -4096,7 +4206,7 @@ impl Memory for SqliteMemory {
                  FROM message_events
                  WHERE id > ?1
                    AND workspace_id = ?2
-                   AND session_key = ?3
+                   AND {session_fragment}
                    AND (
                        visibility IN ('global', 'workspace')
                        OR (visibility = 'agent' AND (
@@ -4113,20 +4223,22 @@ impl Memory for SqliteMemory {
                    )
                  ORDER BY id DESC
                  LIMIT ?8",
-            )?;
-            let rows = stmt.query_map(
-                params![
-                    after_id,
-                    principal.workspace_id,
-                    session_key,
-                    principal.agent_id,
-                    principal.persona_id,
-                    principal.sender,
-                    system_allowed,
-                    limit
-                ],
-                Self::message_event_from_row,
-            )?;
+                session_fragment = session_fragment.sql,
+            ))?;
+            let mut bind: Vec<&dyn rusqlite::types::ToSql> = vec![
+                &after_id,
+                &principal.workspace_id,
+                &session_key,
+                &principal.agent_id,
+                &principal.persona_id,
+                &principal.sender,
+                &system_allowed,
+                &limit,
+            ];
+            for key in &legacy_session_keys {
+                bind.push(key);
+            }
+            let rows = stmt.query_map(bind.as_slice(), Self::message_event_from_row)?;
 
             let mut events = rows.collect::<Result<Vec<_>, _>>()?;
             events.reverse();
@@ -5182,6 +5294,7 @@ mod tests {
             channel: Some("test".to_string()),
             sender: Some("tester".to_string()),
             owner_id: owner_id.map(str::to_string),
+            legacy_session_key: None,
         }
     }
 
@@ -5761,6 +5874,7 @@ source: tool_output\n\
             channel: Some("telegram".to_string()),
             sender: Some("alice".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let results = mem
             .search_document_chunks(&principal, "vector retrieval", 10)
@@ -5841,6 +5955,7 @@ source: tool_output\n\
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let vector_results = mem
             .search_document_chunks(&principal, "no keyword overlap", 10)
@@ -5938,6 +6053,7 @@ source: tool_output\n\
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let vector_results = mem
             .search_document_chunks(&principal, "no keyword overlap", 10)
@@ -5994,6 +6110,7 @@ source: tool_output\n\
             channel: None,
             sender: None,
             owner_id: None,
+            legacy_session_key: None,
         };
         let drafts = mem
             .list_memory_drafts_for_run(&test_principal, "run-worker")
@@ -6185,6 +6302,7 @@ source: tool_output\n\
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -6262,6 +6380,7 @@ source: tool_output\n\
             channel: None,
             sender: Some("alice".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let visible = mem.list_message_events_since(&principal, 0, 20).await.unwrap();
         let contents = visible.iter().map(|event| event.content.as_str()).collect::<Vec<_>>();
@@ -6311,6 +6430,7 @@ source: tool_output\n\
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 20,
@@ -6358,6 +6478,7 @@ source: tool_output\n\
                     channel: Some("terminal".to_string()),
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 since_event_id: None,
                 limit: 10,
@@ -6370,6 +6491,213 @@ source: tool_output\n\
             events.iter().map(|event| event.content.as_str()).collect::<Vec<_>>(),
             vec!["current session survives"]
         );
+    }
+
+    // ---- D4 read-merge (legacy_session_key) ----
+
+    #[tokio::test]
+    async fn d4_load_recent_session_context_read_merges_legacy_key() {
+        let (_tmp, mem) = temp_sqlite();
+        // Pre-cutover history under the legacy key, plus new history under the
+        // canonical key.
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "legacy history",
+            MemoryVisibility::Session,
+            None,
+            Some("chat:legacy-1"),
+            None,
+        ))
+        .await
+        .unwrap();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "canonical history",
+            MemoryVisibility::Session,
+            None,
+            Some("chat:terminal:local-user:room-1"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:terminal:local-user:room-1".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: None,
+            owner_id: None,
+            legacy_session_key: Some("chat:legacy-1".to_string()),
+        };
+        let merged = mem
+            .load_recent_session_context(SessionContextQuery {
+                principal: principal.clone(),
+                since_event_id: None,
+                limit: 10,
+                include_roles: vec!["user".to_string()],
+            })
+            .await
+            .unwrap();
+        let contents: Vec<&str> = merged.iter().map(|event| event.content.as_str()).collect();
+        assert!(
+            contents.contains(&"legacy history"),
+            "legacy history must be read-merged: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"canonical history"),
+            "canonical history must be present: {contents:?}"
+        );
+
+        // Single-key degradation (legacy=None) must NOT see the legacy row.
+        let single = mem
+            .load_recent_session_context(SessionContextQuery {
+                principal: MemoryPrincipal {
+                    legacy_session_key: None,
+                    ..principal
+                },
+                since_event_id: None,
+                limit: 10,
+                include_roles: vec!["user".to_string()],
+            })
+            .await
+            .unwrap();
+        let single_contents: Vec<&str> = single.iter().map(|event| event.content.as_str()).collect();
+        assert_eq!(single_contents, vec!["canonical history"]);
+    }
+
+    #[tokio::test]
+    async fn d4_list_message_events_recent_read_merges_legacy_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "legacy event",
+            MemoryVisibility::Session,
+            None,
+            Some("gateway:webchat:alice"),
+            None,
+        ))
+        .await
+        .unwrap();
+        mem.append_message_event(message_input(
+            "workspace-a",
+            "canonical event",
+            MemoryVisibility::Session,
+            None,
+            Some("gateway:webchat:alice:agent-bot"),
+            None,
+        ))
+        .await
+        .unwrap();
+
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("gateway:webchat:alice:agent-bot".to_string()),
+            channel: Some("webchat".to_string()),
+            sender: None,
+            owner_id: None,
+            legacy_session_key: Some("gateway:webchat:alice".to_string()),
+        };
+        let merged = mem.list_message_events_recent(&principal, 50).await.unwrap();
+        let contents: Vec<&str> = merged.iter().map(|event| event.content.as_str()).collect();
+        assert!(
+            contents.contains(&"legacy event"),
+            "legacy event must be read-merged: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"canonical event"),
+            "canonical event must be present: {contents:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn d4_list_conversation_turns_read_merges_legacy_key() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.append_conversation_turn(
+            "chat:legacy-2",
+            "terminal",
+            "tester",
+            "user",
+            "legacy turn",
+            Some("2026-03-05T00:00:00Z"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        mem.append_conversation_turn(
+            "chat:terminal:local-user:room-2",
+            "terminal",
+            "tester",
+            "user",
+            "canonical turn",
+            Some("2026-03-05T00:00:01Z"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let mut principal = test_conversation_principal("chat:terminal:local-user:room-2", None);
+        principal.legacy_session_key = Some("chat:legacy-2".to_string());
+        let merged = mem
+            .list_conversation_turns(&principal, "chat:terminal:local-user:room-2", 50, 0)
+            .await
+            .unwrap();
+        let contents: Vec<&str> = merged.iter().map(|turn| turn.content.as_str()).collect();
+        assert!(
+            contents.contains(&"legacy turn"),
+            "legacy turn must be read-merged: {contents:?}"
+        );
+        assert!(
+            contents.contains(&"canonical turn"),
+            "canonical turn must be present: {contents:?}"
+        );
+
+        // Single-key degradation: without a legacy key, only the canonical turn.
+        let single_principal = test_conversation_principal("chat:terminal:local-user:room-2", None);
+        let single = mem
+            .list_conversation_turns(&single_principal, "chat:terminal:local-user:room-2", 50, 0)
+            .await
+            .unwrap();
+        let single_contents: Vec<&str> = single.iter().map(|turn| turn.content.as_str()).collect();
+        assert_eq!(single_contents, vec!["canonical turn"]);
+    }
+
+    #[tokio::test]
+    async fn d4_session_key_candidates_dedupes_and_degrades() {
+        // None canonical → empty.
+        let none = MemoryPrincipal {
+            session_key: None,
+            ..Default::default()
+        };
+        assert!(none.session_key_candidates().is_empty());
+        // Distinct legacy → two keys, canonical first.
+        let two = MemoryPrincipal {
+            session_key: Some("canonical".to_string()),
+            legacy_session_key: Some("legacy".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            two.session_key_candidates(),
+            vec!["canonical".to_string(), "legacy".to_string()]
+        );
+        // Legacy equal to canonical → dedup to single key.
+        let dup = MemoryPrincipal {
+            session_key: Some("same".to_string()),
+            legacy_session_key: Some("same".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(dup.session_key_candidates(), vec!["same".to_string()]);
+        // Legacy None → single key (legacy single-key behaviour).
+        let one = MemoryPrincipal {
+            session_key: Some("only".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(one.session_key_candidates(), vec!["only".to_string()]);
     }
 
     #[tokio::test]
@@ -6427,6 +6755,7 @@ source: tool_output\n\
             channel: None,
             sender: None,
             owner_id: None,
+            legacy_session_key: None,
         };
         let visible = mem.list_memory_events_since(&principal, hidden.id, 20).await.unwrap();
         let event_types = visible
@@ -6472,6 +6801,7 @@ source: tool_output\n\
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 20,
@@ -6527,6 +6857,7 @@ source: tool_output\n\
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 since_event_id: None,
                 limit: 10,
@@ -8169,6 +8500,7 @@ source: tool_output\n\
             channel: None,
             sender: None,
             owner_id: Some(owner.to_string()),
+            legacy_session_key: None,
         }
     }
 
@@ -8402,6 +8734,7 @@ source: tool_output\n\
             channel: None,
             sender: None,
             owner_id: Some("self_system".to_string()),
+            legacy_session_key: None,
         };
 
         let draft = EvolutionProposalDraft {
@@ -8471,6 +8804,7 @@ source: tool_output\n\
             channel: Some("telegram".to_string()),
             sender: Some("intruder".to_string()),
             owner_id: Some("owner:intruder".to_string()),
+            legacy_session_key: None,
         };
         let hidden = mem
             .get_evolution_proposal(&other_principal, "evo-crud-1")
@@ -8627,6 +8961,7 @@ source: tool_output\n\
             channel: None,
             sender: None,
             owner_id: None,
+            legacy_session_key: None,
         };
         let events = mem
             .list_memory_events_since(&principal, 0, 50)

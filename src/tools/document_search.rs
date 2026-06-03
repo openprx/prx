@@ -75,6 +75,7 @@ pub(crate) fn parse_scope_principal(args: &serde_json::Value, workspace_id: Stri
         channel: read_scope("channel"),
         sender: read_scope("sender"),
         owner_id: read_scope("owner_id"),
+        legacy_session_key: None,
     }
 }
 

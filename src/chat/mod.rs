@@ -4002,6 +4002,7 @@ mod session_runtime_binding_tests {
                     channel: Some("terminal".to_string()),
                     sender: Some("local-user".to_string()),
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,

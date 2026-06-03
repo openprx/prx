@@ -661,6 +661,7 @@ mod tests {
                     channel: Some("terminal".to_string()),
                     sender: Some("local-user".to_string()),
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -702,6 +703,7 @@ mod tests {
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -745,6 +747,7 @@ mod tests {
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -804,6 +807,7 @@ mod tests {
                     channel: None,
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,
@@ -838,6 +842,7 @@ mod tests {
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         };
         let mut watcher = fabric.watch_memory_events(principal, 0, 10);
 
@@ -902,6 +907,7 @@ mod tests {
                     channel: Some("terminal".to_string()),
                     sender: None,
                     owner_id: None,
+                    legacy_session_key: None,
                 },
                 0,
                 10,

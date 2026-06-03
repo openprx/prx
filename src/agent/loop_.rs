@@ -1277,6 +1277,7 @@ async fn recall_context_pages(
         channel: runtime.channel.clone(),
         sender: runtime.sender.clone(),
         owner_id: runtime.owner_id.clone(),
+        legacy_session_key: None,
     };
     // Over-fetch then filter to context pages, since search spans all docs in
     // the workspace/owner scope (tool outputs, ingested files, etc.).
@@ -7678,6 +7679,7 @@ ls -la
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
                 owner_id: None,
+                legacy_session_key: None,
             },
             "what changed",
             0.0,
@@ -7802,6 +7804,7 @@ ls -la
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
                 owner_id: None,
+                legacy_session_key: None,
             },
             "operational summaries",
             0.0,
@@ -7853,6 +7856,7 @@ ls -la
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
                 owner_id: None,
+                legacy_session_key: None,
             },
             "stable source anchors",
             0.0,
@@ -7944,6 +7948,7 @@ ls -la
                 channel: Some("terminal".to_string()),
                 sender: Some("local-user".to_string()),
                 owner_id: None,
+                legacy_session_key: None,
             },
             "what is current",
             0.0,
@@ -8731,6 +8736,7 @@ Let me check the result."#;
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
             owner_id: None,
+            legacy_session_key: None,
         }
     }
 

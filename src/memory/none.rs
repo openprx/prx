@@ -165,6 +165,7 @@ mod tests {
             channel: None,
             sender: None,
             owner_id: None,
+            legacy_session_key: None,
         };
         let err = memory
             .search_document_chunks(&principal, "document", 5)
