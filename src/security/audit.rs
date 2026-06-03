@@ -264,7 +264,10 @@ impl AuditLogger {
     /// (`error`), and the `grant_id` correlation handle (folded into the action
     /// string so it survives in the structured `command` field).
     pub fn log_side_effect_decision(&self, entry: SideEffectDecisionLog<'_>) -> Result<()> {
-        let mut action = format!("{}:{}", entry.tool_name, entry.operation_name);
+        // Redact secret-bearing values in the operation name before it lands in
+        // the structured action field (the tool_name is a fixed enum and needs no
+        // redaction; the operation_name can embed raw command args / credentials).
+        let mut action = format!("{}:{}", entry.tool_name, redact_secrets(entry.operation_name));
         if let Some(grant_id) = entry.grant_id {
             // Append the grant correlation handle so a single structured field
             // ties the decision back to the authorizing grant.
@@ -278,7 +281,9 @@ impl AuditLogger {
                 None,
             )
             .with_action(action, entry.risk_level.to_string(), entry.approved, entry.allowed)
-            .with_result(entry.allowed, None, 0, entry.error.map(ToString::to_string));
+            // Redact secrets in the deny reason before it lands in the error field;
+            // gate error strings can embed the raw command / operation_name.
+            .with_result(entry.allowed, None, 0, entry.error.map(redact_secrets));
 
         self.log(&event)
     }
@@ -365,7 +370,7 @@ pub fn record_side_effect_decision_best_effort(
 ///
 /// Replaces values that look like API keys, tokens, passwords, and credential
 /// URLs with `[REDACTED]` to prevent accidental secret exposure in logs.
-fn redact_secrets(command: &str) -> String {
+pub(crate) fn redact_secrets(command: &str) -> String {
     #[allow(clippy::expect_used)]
     static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         vec![
@@ -494,6 +499,42 @@ mod tests {
         assert!(command.contains("file_write:file_write:write:abc"));
         assert!(command.contains("grant_id=grant-123"));
         assert!(action.allowed);
+        Ok(())
+    }
+
+    #[test]
+    fn audit_side_effect_decision_redacts_secrets_in_action_and_error() -> Result<()> {
+        // BUG-D1-02: the operation_name and deny reason can embed raw command
+        // arguments / credentials; both must be redacted before they land in the
+        // structured audit fields.
+        let tmp = TempDir::new()?;
+        let logger = AuditLogger::new(&AuditConfig::default(), tmp.path().to_path_buf())?;
+
+        logger.log_side_effect_decision(SideEffectDecisionLog {
+            tool_name: "shell",
+            operation_name: "shell:exec:curl -H 'Authorization: Bearer zzzsecret' --password=xxxsecret",
+            risk_level: "high",
+            approved: false,
+            allowed: false,
+            error: Some("Command not allowed by security policy: deploy --token=yyysecret"),
+            principal_id: None,
+            grant_id: None,
+        })?;
+
+        let log = std::fs::read_to_string(tmp.path().join("audit.log"))?;
+        assert!(
+            !log.contains("zzzsecret"),
+            "bearer token must be redacted in audit action"
+        );
+        assert!(
+            !log.contains("xxxsecret"),
+            "password value must be redacted in audit action"
+        );
+        assert!(
+            !log.contains("yyysecret"),
+            "token value must be redacted in audit error"
+        );
+        assert!(log.contains("[REDACTED]"), "redaction marker must be present");
         Ok(())
     }
 

@@ -1,3 +1,4 @@
+use crate::security::audit::redact_secrets;
 use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -646,8 +647,11 @@ impl<'a> SideEffectGate<'a> {
                 approved =
                     grant.is_some_and(|grant| grant.permits_resource_operation(tool_name, operation_name, risk, now));
                 if !approved {
+                    // Redact secrets before operation_name lands in a propagating
+                    // error string (can reach stderr / caller logs).
                     return Err(format!(
-                        "Resource operation requires runtime approval grant: {operation_name}"
+                        "Resource operation requires runtime approval grant: {}",
+                        redact_secrets(operation_name)
                     ));
                 }
             }
@@ -1221,7 +1225,12 @@ impl SecurityPolicy {
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            // Redact secrets before the raw command lands in an error string that
+            // can propagate (via `?`) all the way to stderr / caller logs.
+            return Err(format!(
+                "Command not allowed by security policy: {}",
+                redact_secrets(command)
+            ));
         }
 
         let risk = self.command_risk_level(command);
@@ -1459,8 +1468,11 @@ impl SecurityPolicy {
             ToolOperation::Read => Ok(()),
             ToolOperation::Act => {
                 if !self.can_act() {
+                    // operation_name can embed raw command args / credentials; redact
+                    // before it lands in an error string that can reach stderr.
                     return Err(format!(
-                        "Security policy: read-only mode, cannot perform '{operation_name}'"
+                        "Security policy: read-only mode, cannot perform '{}'",
+                        redact_secrets(operation_name)
                     ));
                 }
 
@@ -1649,6 +1661,69 @@ mod tests {
             .enforce_tool_operation(ToolOperation::Act, "memory_store")
             .unwrap_err();
         assert!(err.contains("read-only mode"));
+    }
+
+    #[test]
+    fn enforce_tool_operation_redacts_secrets_in_readonly_error() {
+        // BUG-D1-02: the read-only deny reason embeds the operation_name, which
+        // can carry credentials. The returned Err must not leak the plaintext.
+        let p = readonly_policy();
+        let err = p
+            .enforce_tool_operation(ToolOperation::Act, "memory_store --password=topsecret")
+            .unwrap_err();
+        assert!(err.contains("read-only mode"));
+        assert!(
+            !err.contains("topsecret"),
+            "secret must be redacted in policy error: {err}"
+        );
+        assert!(err.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn authorize_command_execution_redacts_secrets_in_disallowed_error() {
+        // BUG-D1-02: a command rejected by the allowlist surfaces the raw command
+        // in the returned Err (propagated via `?` to stderr). Redact the secrets.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            allowed_commands: vec!["ls".into()],
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&p);
+        let err = gate
+            .authorize_command_execution("shell", "deploy --token=supersecret", None)
+            .unwrap_err();
+        assert!(err.contains("not allowed by security policy"));
+        assert!(
+            !err.contains("supersecret"),
+            "secret must be redacted in policy error: {err}"
+        );
+        assert!(err.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn authorize_resource_operation_redacts_secrets_in_approval_error() {
+        // BUG-D1-02: the approval-required deny reason embeds operation_name; it
+        // can carry credentials, so the returned Err must be redacted.
+        let p = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            require_approval_for_medium_risk: true,
+            ..SecurityPolicy::default()
+        };
+        let gate = SideEffectGate::new(&p);
+        let err = gate
+            .authorize_resource_operation(
+                "subagents",
+                "subagents:spawn token=leakedvalue",
+                ResourceRiskLevel::Medium,
+                None,
+            )
+            .unwrap_err();
+        assert!(err.contains("runtime approval grant"));
+        assert!(
+            !err.contains("leakedvalue"),
+            "secret must be redacted in policy error: {err}"
+        );
+        assert!(err.contains("[REDACTED]"));
     }
 
     #[test]
