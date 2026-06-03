@@ -4537,6 +4537,134 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
     instructions
 }
 
+// ── CausalTree (CTE) speculative branch prediction — experimental, opt-in ──
+//
+// Runs the CTE pipeline before the tool loop for the current user turn and
+// returns the chosen `BranchLabel`. Returns `None` whenever CTE is absent,
+// disabled, failed, or timed out — in every such case the caller proceeds on the
+// normal path (behaviour-equivalent to CTE being off). The whole call is wrapped
+// in a hard `tokio::time::timeout(extra_latency_budget_ms, ...)`: the engine only
+// checks the deadline *between* pipeline stages, and a single rehearsal's
+// `rehearsal_timeout_ms` default (5000ms) can exceed the per-turn latency budget
+// (300ms), so the outer timeout guarantees a stuck rehearsal can never block the
+// turn. The dropped future is cancelled (the default rehearsal engine performs no
+// real I/O and holds no external handles, so cancellation is leak-free).
+#[cfg(feature = "llm-router")]
+async fn run_cte_prediction(
+    cte: Option<&Arc<crate::causal_tree::CausalTreeEngine>>,
+    config: &Config,
+    session_id: &str,
+    user_message: &str,
+    history: &[ChatMessage],
+) -> Option<crate::causal_tree::BranchLabel> {
+    // None / disabled → immediate return, zero cost (no classify, no snapshot, no
+    // engine touch).
+    let cte = cte?;
+    // Defensive: the engine is only attached when enabled, but honour the
+    // engine's own flag too (matches the legacy `cte.is_enabled()` guard).
+    if !cte.is_enabled() {
+        return None;
+    }
+
+    // Pure, zero-LLM intent classification, only to populate the snapshot's
+    // user_intent (the loop itself does not classify — see module note: it
+    // resolves a single provider/model directly).
+    let classify = crate::agent::classifier::classify_intent(&config.task_routing, user_message);
+    let policy = cte.config().policy.clone();
+    let state = crate::causal_tree::snapshot::build_causal_state_from_chat(
+        session_id,
+        user_message,
+        &classify,
+        history,
+        policy.default_side_effect_mode,
+        &policy,
+    );
+
+    let budget = std::time::Duration::from_millis(policy.extra_latency_budget_ms);
+    match tokio::time::timeout(budget, cte.run(&state)).await {
+        Ok(Ok((decision, branch))) => {
+            tracing::info!(
+                chosen = %decision.chosen_branch_id,
+                label = %branch.label,
+                session_id = %session_id,
+                "CTE selected branch"
+            );
+            Some(branch.label)
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, session_id = %session_id, "CTE pipeline failed; falling back to normal path");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                budget_ms = policy.extra_latency_budget_ms,
+                session_id = %session_id,
+                "CTE timed out; falling back to normal path"
+            );
+            None
+        }
+    }
+}
+
+/// Build the user-facing approval prompt for a CTE `AskApproval` early-exit.
+/// Mirrors the legacy `Agent::turn` wording (preview truncated to 200 chars).
+#[cfg(feature = "llm-router")]
+fn cte_approval_message(user_message: &str) -> String {
+    let preview: String = user_message.chars().take(200).collect();
+    let ellipsis = if user_message.chars().count() > 200 { "..." } else { "" };
+    format!(
+        "This request may involve high-risk actions. \
+         Please confirm you'd like to proceed, or rephrase your request.\n\n> {preview}{ellipsis}"
+    )
+}
+
+/// Close the turn's message/event loop for a CTE `AskApproval` early-exit so it
+/// stays symmetric with a normal turn completion: write the assistant approval
+/// message to the `MemoryFabric`, emit the observer `TurnComplete` event, and run
+/// the `TurnComplete` hook. Returns nothing — the caller owns the approval string
+/// and decides whether to `return` (single-shot) or `continue` (interactive).
+///
+/// This is deliberately *not* just a `println!`: the user message has already
+/// been recorded for this turn, so skipping the assistant side would break the
+/// inbound/outbound message-event symmetry that the rest of the loop maintains.
+#[cfg(feature = "llm-router")]
+#[allow(clippy::too_many_arguments)]
+async fn emit_cte_ask_approval(
+    memory_fabric: &MemoryFabric,
+    fabric_scope: &crate::memory::MessageEventScope,
+    observer: &dyn Observer,
+    hooks: &HookManager,
+    provider_name: &str,
+    model_name: &str,
+    session_id: &str,
+    approval_msg: &str,
+    mode: &str,
+) {
+    if let Err(error) = memory_fabric
+        .record_assistant_message(
+            fabric_scope
+                .clone()
+                .with_sender(format!("{provider_name}/{model_name}"))
+                .with_recipient("local-user"),
+            approval_msg.to_string(),
+        )
+        .await
+    {
+        tracing::warn!(error = %error, "Failed to append CTE approval assistant message event");
+    }
+    observer.record_event(&ObserverEvent::TurnComplete);
+    hooks
+        .emit(
+            HookEvent::TurnComplete,
+            serde_json::json!({
+                "mode": mode,
+                "cte_session_id": session_id,
+                "response_chars": approval_msg.chars().count(),
+            }),
+        )
+        .await;
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // provider, hardware RAG) and enters either single-shot or
@@ -4555,12 +4683,15 @@ pub async fn run(
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
     // The CLI agent entry is always a full interactive/single-shot run with no
     // memory-only early-exit (unlike chat's `--list-sessions`), so it always
-    // needs memory + tools: use `Interactive`. The bootstrap wires
-    // observer → security(+audit) → memory → runtime → tools in the hard-ordered
-    // sequence, replacing the former hand-wired block (behaviour-equivalent).
+    // needs memory + tools. It uses the dedicated `AgentLoop` profile: identical
+    // core to `Interactive` (memory + tools, no router) PLUS the opt-in
+    // CausalTreeEngine, attached only when `config.causal_tree.enabled` (otherwise
+    // `ctx.cte` is `None` → zero cost, behaviour-equivalent to before). The
+    // bootstrap wires observer → security(+audit) → memory → runtime → tools in
+    // the hard-ordered sequence, replacing the former hand-wired block.
     let ctx = crate::runtime::bootstrap::RuntimeBootstrap::build(
         config,
-        crate::runtime::bootstrap::BootstrapProfile::Interactive,
+        crate::runtime::bootstrap::BootstrapProfile::AgentLoop,
     )
     .await?;
 
@@ -4598,6 +4729,14 @@ pub async fn run(
         .tools
         .clone()
         .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for the agent CLI"))?;
+
+    // ── CausalTree (CTE) — experimental, opt-in ──────────────────
+    // `Some` only when the `AgentLoop` profile attached it (i.e. when
+    // `config.causal_tree.enabled`); `None` otherwise → the speculative
+    // branch-prediction hook below short-circuits at zero cost. Cloned out of the
+    // shared context so each turn can call it without re-borrowing `ctx`.
+    #[cfg(feature = "llm-router")]
+    let cte = ctx.cte.clone();
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -4814,6 +4953,42 @@ pub async fn run(
             };
 
             let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
+
+            // ── CTE: speculative branch prediction (experimental, opt-in) ──
+            // Runs before the tool loop. `None` when CTE is absent/disabled/
+            // failed/timed-out → falls through to the normal path unchanged. Only
+            // `AskApproval` alters the flow (early exit with a closed message/event
+            // loop); `RetrieveThenAnswer`/`DirectAnswer` are observe-only in v1.
+            #[cfg(feature = "llm-router")]
+            if let Some(label) = run_cte_prediction(cte.as_ref(), &config, &turn_run_id, &msg, &history).await {
+                match label {
+                    crate::causal_tree::BranchLabel::AskApproval => {
+                        let approval_msg = cte_approval_message(&msg);
+                        emit_cte_ask_approval(
+                            &memory_fabric,
+                            &fabric_scope,
+                            observer.as_ref(),
+                            &hooks,
+                            provider_name,
+                            model_name,
+                            &turn_run_id,
+                            &approval_msg,
+                            "cte_ask_approval_single",
+                        )
+                        .await;
+                        final_output = approval_msg.clone();
+                        println!("{approval_msg}");
+                        // Skip the tool loop entirely for this turn.
+                        return Ok::<(), anyhow::Error>(());
+                    }
+                    crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
+                        tracing::info!(session_id = %turn_run_id, "CTE recommends retrieval-augmented path");
+                    }
+                    crate::causal_tree::BranchLabel::DirectAnswer => {
+                        tracing::debug!(session_id = %turn_run_id, "CTE recommends direct answer path");
+                    }
+                }
+            }
 
             // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
             // single-shot agent turn inherits parent_run_id = the per-turn run_id.
@@ -5068,6 +5243,42 @@ pub async fn run(
                 *first = ChatMessage::system(system_prompt);
             }
             history.push(ChatMessage::user(&enriched));
+
+            // ── CTE: speculative branch prediction (experimental, opt-in) ──
+            // Same hook as single-shot. On `AskApproval` we close the message/event
+            // loop, push the approval into the persistent REPL history (so the next
+            // turn's context stays symmetric), print it, and `continue` to the next
+            // prompt without entering the tool loop. Other labels are observe-only.
+            #[cfg(feature = "llm-router")]
+            if let Some(label) = run_cte_prediction(cte.as_ref(), &config, &turn_run_id, &user_input, &history).await {
+                match label {
+                    crate::causal_tree::BranchLabel::AskApproval => {
+                        let approval_msg = cte_approval_message(&user_input);
+                        emit_cte_ask_approval(
+                            &memory_fabric,
+                            &fabric_scope,
+                            observer.as_ref(),
+                            &hooks,
+                            provider_name,
+                            model_name,
+                            &turn_run_id,
+                            &approval_msg,
+                            "cte_ask_approval_interactive",
+                        )
+                        .await;
+                        history.push(ChatMessage::assistant(approval_msg.clone()));
+                        final_output = approval_msg.clone();
+                        println!("{approval_msg}\n");
+                        continue;
+                    }
+                    crate::causal_tree::BranchLabel::RetrieveThenAnswer => {
+                        tracing::info!(session_id = %turn_run_id, "CTE recommends retrieval-augmented path");
+                    }
+                    crate::causal_tree::BranchLabel::DirectAnswer => {
+                        tracing::debug!(session_id = %turn_run_id, "CTE recommends direct answer path");
+                    }
+                }
+            }
 
             // D8-4: seed a turn-root spawn context so a sub-agent spawned from this
             // interactive agent turn inherits parent_run_id = the per-turn run_id.
@@ -9061,5 +9272,297 @@ Let me check the result."#;
         assert_eq!(results[0].source_kind.as_deref(), Some("user_note"));
         assert!(results[0].chunk.content.contains("trusted half"));
         assert!(!results[0].chunk.content.contains("untrusted half"));
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // CTE (CausalTree) branch-prediction hook — Commit 3
+    // ──────────────────────────────────────────────────────────────────────
+    #[cfg(feature = "llm-router")]
+    mod cte_hook {
+        use super::*;
+        use crate::causal_tree::CausalTreeEngine;
+        use crate::causal_tree::branch::{
+            BranchLabel, CausalBranch, CommitPolicy, CostEstimate, PathCommitDecision, RehearsalArtifact,
+            RehearsalLevel,
+        };
+        use crate::causal_tree::error::CausalTreeError;
+        use crate::causal_tree::expander::TreeExpander;
+        use crate::causal_tree::feedback::NoopFeedbackWriter;
+        use crate::causal_tree::policy::{CausalPolicy, CausalTreeConfig};
+        use crate::causal_tree::rehearsal::RehearsalEngine;
+        use crate::causal_tree::scorer::BranchScorer;
+        use crate::causal_tree::selector::PathSelector;
+        use crate::causal_tree::state::CausalState;
+        use crate::observability::ObserverMetric;
+        use crate::observability::noop::NoopObserver;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn branch(label: BranchLabel) -> CausalBranch {
+            CausalBranch {
+                branch_id: format!("branch-{label}"),
+                label,
+                parent_step_ids: vec![],
+                required_inputs: vec![],
+                predicted_gain: 0.9,
+                estimated_cost: CostEstimate::default(),
+                estimated_latency_ms: 1,
+                confidence: 0.9,
+                rehearsal_level: RehearsalLevel::ScoreOnly,
+                commit_policy: CommitPolicy::AutoCommit,
+                explanation: vec!["test".into()],
+            }
+        }
+
+        /// Expander that returns exactly one branch of a fixed label.
+        struct FixedLabelExpander(BranchLabel);
+        #[async_trait]
+        impl TreeExpander for FixedLabelExpander {
+            async fn expand(
+                &self,
+                _state: &CausalState,
+                _policy: &CausalPolicy,
+            ) -> Result<Vec<CausalBranch>, CausalTreeError> {
+                Ok(vec![branch(self.0)])
+            }
+        }
+
+        /// Scorer that always returns a high score (above any threshold).
+        struct HighScorer;
+        impl BranchScorer for HighScorer {
+            fn score(
+                &self,
+                _state: &CausalState,
+                _branch: &CausalBranch,
+                _artifact: Option<&RehearsalArtifact>,
+                _config: &CausalTreeConfig,
+            ) -> Option<f32> {
+                Some(0.99)
+            }
+        }
+
+        /// Selector that always picks the first (highest-scored) branch.
+        struct FirstSelector;
+        #[async_trait]
+        impl PathSelector for FirstSelector {
+            async fn select(
+                &self,
+                _state: &CausalState,
+                scored: &[(CausalBranch, f32, Option<RehearsalArtifact>)],
+                _policy: &CausalPolicy,
+            ) -> Result<PathCommitDecision, CausalTreeError> {
+                let chosen = scored
+                    .first()
+                    .ok_or_else(|| CausalTreeError::ExpansionFailed("no branch".into()))?;
+                Ok(PathCommitDecision {
+                    chosen_branch_id: chosen.0.branch_id.clone(),
+                    rejected_branch_ids: vec![],
+                    fallback_branch_ids: vec![],
+                    reasons: vec!["test first selector".into()],
+                    cache_ttl_seconds: 60,
+                })
+            }
+        }
+
+        /// Rehearsal engine that sleeps longer than any sane latency budget, used
+        /// to exercise the outer `tokio::time::timeout` fallback.
+        struct SlowRehearsal;
+        #[async_trait]
+        impl RehearsalEngine for SlowRehearsal {
+            async fn rehearse(
+                &self,
+                _state: &CausalState,
+                branch: &CausalBranch,
+                _policy: &CausalPolicy,
+            ) -> Result<RehearsalArtifact, CausalTreeError> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(RehearsalArtifact {
+                    branch_id: branch.branch_id.clone(),
+                    preview_output: None,
+                    retrieved_memory_keys: vec![],
+                    selected_model: None,
+                    score_delta: 0.0,
+                    warnings: vec![],
+                })
+            }
+        }
+
+        /// Observer that counts `CteRun` events and the chosen labels seen.
+        #[derive(Default)]
+        struct CountingObserver {
+            cte_runs: AtomicUsize,
+            turn_completes: AtomicUsize,
+        }
+        impl Observer for CountingObserver {
+            fn record_event(&self, event: &ObserverEvent) {
+                match event {
+                    ObserverEvent::CteRun { .. } => {
+                        self.cte_runs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    ObserverEvent::TurnComplete => {
+                        self.turn_completes.fetch_add(1, Ordering::SeqCst);
+                    }
+                    _ => {}
+                }
+            }
+            fn record_metric(&self, _metric: &ObserverMetric) {}
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+        }
+
+        fn engine_with(
+            expander: Arc<dyn TreeExpander>,
+            rehearsal: Arc<dyn RehearsalEngine>,
+            scorer: Arc<dyn BranchScorer>,
+            observer: Arc<dyn Observer>,
+            budget_ms: u64,
+        ) -> CausalTreeEngine {
+            let config = CausalTreeConfig {
+                enabled: true,
+                policy: CausalPolicy {
+                    commit_threshold: 0.30,
+                    extra_latency_budget_ms: budget_ms,
+                    ..CausalPolicy::default()
+                },
+                ..CausalTreeConfig::default()
+            };
+            CausalTreeEngine::new(
+                expander,
+                rehearsal,
+                scorer,
+                Arc::new(FirstSelector),
+                Arc::new(NoopFeedbackWriter::new()),
+                observer,
+                config,
+            )
+        }
+
+        fn default_config() -> Config {
+            Config::default()
+        }
+
+        /// Disabled / absent CTE → helper returns None at zero cost.
+        #[tokio::test]
+        async fn run_cte_prediction_none_when_absent() {
+            let cfg = default_config();
+            let out = run_cte_prediction(None, &cfg, "sess", "hello", &[]).await;
+            assert!(out.is_none(), "absent CTE must yield None");
+        }
+
+        /// Enabled CTE + AskApproval-forcing pipeline → returns AskApproval and the
+        /// engine emits a CteRun observer event (pipeline really ran).
+        #[tokio::test]
+        async fn run_cte_prediction_returns_ask_approval_and_emits_cte_run() {
+            let obs = Arc::new(CountingObserver::default());
+            let engine = Arc::new(engine_with(
+                Arc::new(FixedLabelExpander(BranchLabel::AskApproval)),
+                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
+                Arc::new(HighScorer),
+                obs.clone(),
+                5000,
+            ));
+            let cfg = default_config();
+            let out = run_cte_prediction(Some(&engine), &cfg, "sess", "delete everything", &[]).await;
+            assert_eq!(out, Some(BranchLabel::AskApproval));
+            assert_eq!(obs.cte_runs.load(Ordering::SeqCst), 1, "pipeline must emit one CteRun");
+        }
+
+        /// DirectAnswer branch flows through unchanged (helper returns the label,
+        /// caller proceeds to the tool loop).
+        #[tokio::test]
+        async fn run_cte_prediction_returns_direct_answer() {
+            let engine = Arc::new(engine_with(
+                Arc::new(FixedLabelExpander(BranchLabel::DirectAnswer)),
+                Arc::new(crate::causal_tree::rehearsal::DefaultRehearsalEngine::new()),
+                Arc::new(HighScorer),
+                Arc::new(NoopObserver),
+                5000,
+            ));
+            let cfg = default_config();
+            let out = run_cte_prediction(Some(&engine), &cfg, "sess", "hello there", &[]).await;
+            assert_eq!(out, Some(BranchLabel::DirectAnswer));
+        }
+
+        /// Slow rehearsal + tiny budget → outer timeout fires → helper returns None
+        /// (the turn falls back to the normal path; it is never blocked).
+        #[tokio::test]
+        async fn run_cte_prediction_times_out_to_none() {
+            let engine = Arc::new(engine_with(
+                Arc::new(FixedLabelExpander(BranchLabel::DirectAnswer)),
+                Arc::new(SlowRehearsal),
+                Arc::new(HighScorer),
+                Arc::new(NoopObserver),
+                10, // 10ms budget vs 30s rehearsal sleep
+            ));
+            let cfg = default_config();
+            let out = tokio::time::timeout(
+                Duration::from_secs(5),
+                run_cte_prediction(Some(&engine), &cfg, "sess", "hello", &[]),
+            )
+            .await
+            .expect("helper must itself complete well within 5s (outer CTE timeout fired)");
+            assert!(out.is_none(), "timed-out CTE run must yield None (fallback)");
+        }
+
+        /// AskApproval early-exit closure: writes the assistant approval message to
+        /// the MemoryFabric, emits the observer TurnComplete event, and runs the
+        /// TurnComplete hook — symmetric with a normal turn completion.
+        #[tokio::test]
+        async fn emit_cte_ask_approval_closes_message_event_loop() {
+            let tmp = tempfile::tempdir().expect("test: tempdir");
+            let inner: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).expect("test: sqlite"));
+            let fabric = MemoryFabric::new(inner.clone(), tmp.path().to_string_lossy());
+            let envelope = RuntimeEnvelope::agent(fabric.workspace_id().to_string(), "run-cte-approval".to_string())
+                .with_recipient("cli:local-user");
+            let scope = envelope.message_scope().with_recipient("prov/model");
+            let obs = Arc::new(CountingObserver::default());
+            let hooks = HookManager::new(tmp.path().to_path_buf());
+
+            let approval = cte_approval_message("rm -rf /");
+            emit_cte_ask_approval(
+                &fabric,
+                &scope,
+                obs.as_ref(),
+                &hooks,
+                "prov",
+                "model",
+                "run-cte-approval",
+                &approval,
+                "cte_ask_approval_test",
+            )
+            .await;
+
+            // Observer saw a TurnComplete (symmetric with a normal turn).
+            assert_eq!(obs.turn_completes.load(Ordering::SeqCst), 1);
+            // The assistant approval message was recorded as a message event.
+            let events = inner
+                .list_message_events_recent(&envelope.memory_principal(), 10)
+                .await
+                .expect("test: read message events");
+            assert!(
+                events
+                    .iter()
+                    .any(|e| e.role == "assistant" && e.content.contains("high-risk")),
+                "assistant approval message must be recorded in the fabric: {events:?}"
+            );
+        }
+
+        /// The user-facing approval message truncates the preview to 200 chars and
+        /// appends an ellipsis for longer inputs.
+        #[test]
+        fn cte_approval_message_truncates_long_preview() {
+            let long = "x".repeat(500);
+            let msg = cte_approval_message(&long);
+            assert!(msg.contains("high-risk"));
+            assert!(msg.ends_with("..."), "long preview must be ellipsised");
+            let short = cte_approval_message("ok");
+            assert!(
+                short.trim_end().ends_with("> ok"),
+                "short preview kept verbatim: {short}"
+            );
+        }
     }
 }
