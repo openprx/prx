@@ -562,3 +562,140 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ChannelCommands, Commands};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio_util::sync::CancellationToken;
+
+    // ── Mock ModeRunner: verifies the trait is usable, that `run` is invoked
+    //    exactly once, and that the external shutdown token propagates through. ──
+
+    struct MockRunner {
+        ran: Arc<AtomicBool>,
+        observed_cancel: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModeRunner for MockRunner {
+        async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+            self.ran.store(true, Ordering::SeqCst);
+            // The runner observes the external root token: when the caller cancels
+            // it, the runner sees the request and returns gracefully.
+            shutdown.cancelled().await;
+            self.observed_cancel.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn mock_runner_run_is_invoked_and_shutdown_propagates() {
+        let ran = Arc::new(AtomicBool::new(false));
+        let observed = Arc::new(AtomicBool::new(false));
+        let runner = Box::new(MockRunner {
+            ran: ran.clone(),
+            observed_cancel: observed.clone(),
+        });
+        let token = CancellationToken::new();
+        let token_for_run = token.clone();
+        let handle = tokio::spawn(async move { runner.run(token_for_run).await });
+
+        // Give the runner a chance to start and park on `cancelled()`.
+        tokio::task::yield_now().await;
+        assert!(ran.load(Ordering::SeqCst), "run() must have been invoked");
+        assert!(!observed.load(Ordering::SeqCst), "must still be awaiting cancellation");
+
+        // Cancelling the *external* root token must unblock the runner.
+        token.cancel();
+        let result = handle.await.expect("test: runner task must join");
+        assert!(result.is_ok(), "graceful run returns Ok");
+        assert!(
+            observed.load(Ordering::SeqCst),
+            "runner must observe external shutdown cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn mock_runner_returns_without_shutdown() {
+        // A runner that finishes on its own (never observing cancellation) still
+        // returns Ok — the token is a request, not a mandatory await point.
+        struct ImmediateRunner;
+        #[async_trait::async_trait]
+        impl ModeRunner for ImmediateRunner {
+            async fn run(self: Box<Self>, _shutdown: CancellationToken) -> Result<()> {
+                Ok(())
+            }
+        }
+        let token = CancellationToken::new();
+        assert!(Box::new(ImmediateRunner).run(token).await.is_ok());
+    }
+
+    // ── Signal whitelist regression (§3.3.4 速查表). The four long-running,
+    //    gracefully-interruptible modes opt in; chat / interactive agent / all
+    //    query+management commands must NOT bind a dispatch signal task. ──
+
+    fn agent_single(message: bool, positional: bool) -> Commands {
+        Commands::Agent {
+            message_pos: if positional { Some("hi".into()) } else { None },
+            message: if message { Some("hi".into()) } else { None },
+            provider: None,
+            model: None,
+            temperature: 0.7,
+        }
+    }
+
+    #[test]
+    fn whitelist_binds_gateway_daemon_channel_start() {
+        assert!(should_bind_signal(&Commands::Gateway { port: None, host: None }));
+        assert!(should_bind_signal(&Commands::Daemon { port: None, host: None }));
+        assert!(should_bind_signal(&Commands::Channel {
+            channel_command: ChannelCommands::Start
+        }));
+    }
+
+    #[test]
+    fn whitelist_binds_single_shot_agent_only() {
+        // Single-shot agent (message via -m, or positional) → bind.
+        assert!(should_bind_signal(&agent_single(true, false)));
+        assert!(should_bind_signal(&agent_single(false, true)));
+        // Interactive agent (no message at all) → must NOT bind (synchronous
+        // stdin cannot select a token; binding would steal default termination).
+        assert!(!should_bind_signal(&agent_single(false, false)));
+    }
+
+    #[test]
+    fn whitelist_excludes_chat() {
+        // chat owns ctrl_c internally (single-press cancel / double-press exit);
+        // a dispatch signal task would steal the first ctrl_c and break that.
+        assert!(!should_bind_signal(&Commands::Chat {
+            provider: None,
+            model: None,
+            temperature: 0.7,
+            plain: false,
+            session: None,
+            list_sessions: false,
+        }));
+    }
+
+    #[test]
+    fn whitelist_excludes_non_start_channel_subcommands() {
+        // Only `channel start` is long-running; doctor/list/etc. are query-style.
+        assert!(!should_bind_signal(&Commands::Channel {
+            channel_command: ChannelCommands::Doctor
+        }));
+        assert!(!should_bind_signal(&Commands::Channel {
+            channel_command: ChannelCommands::List
+        }));
+    }
+
+    #[test]
+    fn whitelist_excludes_query_and_management_commands() {
+        // A representative sample of query / management commands — none long-running.
+        assert!(!should_bind_signal(&Commands::Status));
+        assert!(!should_bind_signal(&Commands::Providers));
+        assert!(!should_bind_signal(&Commands::Doctor { doctor_command: None }));
+    }
+}
