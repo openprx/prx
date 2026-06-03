@@ -4955,12 +4955,18 @@ pub async fn run(
             let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
 
             // ── CTE: speculative branch prediction (experimental, opt-in) ──
-            // Runs before the tool loop. `None` when CTE is absent/disabled/
-            // failed/timed-out → falls through to the normal path unchanged. Only
+            // Runs before the tool loop. The outer `if let Some(cte)` guarantees
+            // strict zero overhead when CTE is absent/disabled (`ctx.cte == None`):
+            // the helper future is neither constructed nor awaited, so an
+            // enabled=false build is byte-for-byte equivalent to no CTE (no extra
+            // `.await`, no allocation). Inside, `None` from the helper (failed/
+            // timed-out) falls through to the normal path unchanged. Only
             // `AskApproval` alters the flow (early exit with a closed message/event
             // loop); `RetrieveThenAnswer`/`DirectAnswer` are observe-only in v1.
             #[cfg(feature = "llm-router")]
-            if let Some(label) = run_cte_prediction(cte.as_ref(), &config, &turn_run_id, &msg, &history).await {
+            if let Some(cte) = cte.as_ref()
+                && let Some(label) = run_cte_prediction(Some(cte), &config, &turn_run_id, &msg, &history).await
+            {
                 match label {
                     crate::causal_tree::BranchLabel::AskApproval => {
                         let approval_msg = cte_approval_message(&msg);
@@ -5245,12 +5251,17 @@ pub async fn run(
             history.push(ChatMessage::user(&enriched));
 
             // ── CTE: speculative branch prediction (experimental, opt-in) ──
-            // Same hook as single-shot. On `AskApproval` we close the message/event
-            // loop, push the approval into the persistent REPL history (so the next
-            // turn's context stays symmetric), print it, and `continue` to the next
-            // prompt without entering the tool loop. Other labels are observe-only.
+            // Same hook as single-shot. The outer `if let Some(cte)` keeps strict
+            // zero overhead when CTE is disabled (`ctx.cte == None`): no helper
+            // future is built or awaited. On `AskApproval` we close the
+            // message/event loop, push the approval into the persistent REPL
+            // history (so the next turn's context stays symmetric), trim/compact
+            // it just like a normal turn, print it, and `continue` without
+            // entering the tool loop. Other labels are observe-only.
             #[cfg(feature = "llm-router")]
-            if let Some(label) = run_cte_prediction(cte.as_ref(), &config, &turn_run_id, &user_input, &history).await {
+            if let Some(cte) = cte.as_ref()
+                && let Some(label) = run_cte_prediction(Some(cte), &config, &turn_run_id, &user_input, &history).await
+            {
                 match label {
                     crate::causal_tree::BranchLabel::AskApproval => {
                         let approval_msg = cte_approval_message(&user_input);
@@ -5269,6 +5280,25 @@ pub async fn run(
                         history.push(ChatMessage::assistant(approval_msg.clone()));
                         final_output = approval_msg.clone();
                         println!("{approval_msg}\n");
+                        // CTE-REVIEW-3: an AskApproval early-exit still pushes a
+                        // user+assistant pair into the persistent REPL history, so
+                        // run the same auto-compaction + hard trim a normal turn
+                        // completion does. Without this, repeated AskApproval turns
+                        // could grow history unbounded until the next normal turn.
+                        if let Ok(compacted) = auto_compact_history(
+                            &mut history,
+                            provider.as_ref(),
+                            model_name,
+                            config.agent.max_history_messages,
+                            mem.as_ref(),
+                        )
+                        .await
+                        {
+                            if compacted {
+                                println!("🧹 Auto-compaction complete");
+                            }
+                        }
+                        trim_history(&mut history, config.agent.max_history_messages);
                         continue;
                     }
                     crate::causal_tree::BranchLabel::RetrieveThenAnswer => {

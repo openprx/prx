@@ -87,6 +87,35 @@ fn tool_result_to_artifact(_tool_call_id: &str, content: &str, index: usize) -> 
     }
 }
 
+/// Parse a native-mode tool history message.
+///
+/// The agent loop writes native tool results as a JSON object
+/// `{"tool_call_id": <id>, "content": <result>}` (see `loop_.rs` ~4479). This
+/// extracts the `tool_call_id` and `content` fields so the artifact summary is
+/// the tool result body, not the JSON envelope.
+///
+/// Falls back to `("", Borrowed(raw))` when the message is not the expected JSON
+/// object (bare-string tool messages, or any other shape) — this keeps backward
+/// compatibility with text-mode providers and existing fixtures.
+///
+/// The body is returned as a [`Cow`]: `Borrowed` for the bare-string fallback
+/// (zero copy), `Owned` for the JSON path (the decoded `content` string, which
+/// `serde_json` materialises with escapes resolved — re-borrowing into `raw`
+/// would be unsound when the value contained escaped characters).
+#[cfg(feature = "llm-router")]
+fn parse_native_tool_message(raw: &str) -> (String, std::borrow::Cow<'_, str>) {
+    if let Ok(serde_json::Value::Object(mut map)) = serde_json::from_str::<serde_json::Value>(raw) {
+        if let Some(serde_json::Value::String(content)) = map.remove("content") {
+            let call_id = match map.remove("tool_call_id") {
+                Some(serde_json::Value::String(id)) => id,
+                _ => String::new(),
+            };
+            return (call_id, std::borrow::Cow::Owned(content));
+        }
+    }
+    (String::new(), std::borrow::Cow::Borrowed(raw))
+}
+
 /// Build an immutable [`CausalState`] snapshot from the **agent-loop** runtime,
 /// whose conversation history is a flat `&[ChatMessage]` (role + content).
 ///
@@ -139,9 +168,13 @@ pub fn build_causal_state_from_chat(
             }
             // native mode: one role == "tool" message per tool call.
             "tool" => {
-                // No tool_call_id is carried on a flat ChatMessage; pass an empty
-                // id (the field is reserved for future cross-referencing).
-                known_artifacts.push(tool_result_to_artifact("", &msg.content, artifact_index));
+                // The agent loop serialises native tool results as a JSON object
+                // `{"tool_call_id": ..., "content": ...}` (see loop_.rs ~4479).
+                // Parse it and use the `content` field as the artifact body; fall
+                // back to the raw message content for bare strings (the legacy /
+                // text shape used in some tests and providers).
+                let (call_id, body) = parse_native_tool_message(&msg.content);
+                known_artifacts.push(tool_result_to_artifact(&call_id, &body, artifact_index));
                 artifact_index += 1;
             }
             // prompt/text mode: a synthetic user message folding all tool results
@@ -276,9 +309,11 @@ mod tests {
         assert_eq!(state.user_intent, "delegate");
     }
 
+    // Bare-string native tool messages (legacy / text-mode providers) fall back
+    // to using the raw message content as the artifact summary.
     #[cfg(feature = "llm-router")]
     #[test]
-    fn from_chat_native_tool_messages_become_artifacts() {
+    fn from_chat_native_tool_messages_bare_string_fallback() {
         let policy = CausalPolicy::default();
         let history = vec![
             ChatMessage::user("run a tool"),
@@ -303,6 +338,67 @@ mod tests {
         assert_eq!(state.known_artifacts[1].summary, "native tool output B");
         // GuardedWrite → no constraints.
         assert!(state.active_constraints.is_empty());
+    }
+
+    // Production native tool history is JSON `{"tool_call_id", "content"}` (see
+    // loop_.rs ~4479). The artifact summary must be the decoded `content` body,
+    // not the JSON envelope.
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn from_chat_native_tool_messages_json_extracts_content() {
+        let policy = CausalPolicy::default();
+        // Build the exact shape the agent loop writes, including an escaped
+        // newline inside `content` to exercise JSON decoding.
+        let tool_a = serde_json::json!({
+            "tool_call_id": "call_abc",
+            "content": "line one\nline two",
+        })
+        .to_string();
+        let tool_b = serde_json::json!({
+            "tool_call_id": "call_def",
+            "content": "result B",
+        })
+        .to_string();
+        let history = vec![
+            ChatMessage::user("run a tool"),
+            ChatMessage::assistant("calling the tool"),
+            ChatMessage::tool(tool_a),
+            ChatMessage::tool(tool_b),
+        ];
+        let state = build_causal_state_from_chat(
+            "sess-loop",
+            "run a tool",
+            &default_classify(TaskIntent::Stream),
+            &history,
+            SideEffectMode::GuardedWrite,
+            &policy,
+        );
+        assert_eq!(state.known_artifacts.len(), 2);
+        // Summary is the decoded `content`, NOT the JSON envelope.
+        assert_eq!(state.known_artifacts[0].summary, "line one\nline two");
+        assert_eq!(state.known_artifacts[1].summary, "result B");
+        assert!(!state.known_artifacts[0].summary.contains("tool_call_id"));
+    }
+
+    // parse_native_tool_message: JSON object → decoded content; anything else →
+    // raw fallback.
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn parse_native_tool_message_json_and_fallback() {
+        let json = serde_json::json!({"tool_call_id": "id1", "content": "hello\tworld"}).to_string();
+        let (id, body) = parse_native_tool_message(&json);
+        assert_eq!(id, "id1");
+        assert_eq!(body.as_ref(), "hello\tworld");
+
+        // Bare string → empty id, borrowed raw body.
+        let (id, body) = parse_native_tool_message("plain text");
+        assert_eq!(id, "");
+        assert_eq!(body.as_ref(), "plain text");
+
+        // JSON without a string `content` field → fallback to raw.
+        let no_content = r#"{"tool_call_id":"x","content":123}"#;
+        let (_, body) = parse_native_tool_message(no_content);
+        assert_eq!(body.as_ref(), no_content);
     }
 
     #[cfg(feature = "llm-router")]
