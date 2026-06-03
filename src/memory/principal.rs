@@ -1300,6 +1300,126 @@ AND tp.user_id = $11\
         }
     }
 
+    // ----------------------------------------------------------------------
+    // D11 A5: cross-backend scope parity truth table. For the same
+    // (role, visibility_ceiling) the SQLite renderer and the Postgres renderer
+    // must encode the SAME allow decision: identical predicate structure
+    // (modulo placeholder syntax) and identical bound parameter values/order.
+    // This is the regression lock that the two backends no longer drift.
+    // ----------------------------------------------------------------------
+
+    /// Re-normalize a rendered SQLite SQL string back to the neutral marker so
+    /// it can be compared structurally against the PG rendering.
+    fn sqlite_to_marker(sql: &str) -> String {
+        sql.replace('?', SCOPE_BIND_MARKER)
+    }
+
+    /// Re-normalize a rendered Postgres SQL string back to the neutral marker.
+    /// Replaces `$<n>` runs with the marker. Works for any start index because
+    /// every `$N` maps back to exactly one bind point.
+    fn pg_to_marker(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut chars = sql.char_indices().peekable();
+        while let Some((_, ch)) = chars.next() {
+            if ch == '$' && matches!(chars.peek(), Some((_, d)) if d.is_ascii_digit()) {
+                // consume the digit run
+                while matches!(chars.peek(), Some((_, d)) if d.is_ascii_digit()) {
+                    chars.next();
+                }
+                out.push_str(SCOPE_BIND_MARKER);
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn param_texts(params: &[ScopeParam]) -> Vec<&str> {
+        params
+            .iter()
+            .map(|p| match p {
+                ScopeParam::Text(s) => s.as_str(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cross_backend_scope_parity_truth_table() {
+        // Cover every canonical role x visibility_ceiling combination that the
+        // truth table branches on. visibility_ceiling only affects Member/Guest
+        // (Owner is unconditional; Anonymous ignores the ceiling), so we sweep
+        // the full Visibility ladder for Member/Guest and spot-check the others.
+        let ceilings = [
+            Visibility::System,
+            Visibility::Owner,
+            Visibility::Private,
+            Visibility::User,
+            Visibility::Group,
+            Visibility::Project,
+            Visibility::Public,
+        ];
+        let roles = [Role::Owner, Role::Anonymous, Role::Member, Role::Guest];
+
+        for role in roles {
+            for ceiling in &ceilings {
+                let principal = base_principal(role.clone(), ceiling.clone());
+
+                let (sqlite_sql, sqlite_params) = principal.build_sql_scope();
+                // Use a non-trivial start index to prove the parity holds
+                // independent of the caller's parameter offset.
+                let (pg_sql, pg_params) = principal.build_sql_scope_pg(4);
+
+                assert_eq!(
+                    sqlite_to_marker(&sqlite_sql),
+                    pg_to_marker(&pg_sql),
+                    "scope predicate structure drift for role {role:?} ceiling {ceiling:?}"
+                );
+
+                let sqlite_texts: Vec<&str> = sqlite_params.iter().map(text_of).collect();
+                let pg_texts = param_texts(&pg_params);
+                assert_eq!(
+                    sqlite_texts, pg_texts,
+                    "scope parameter value/order drift for role {role:?} ceiling {ceiling:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cross_backend_parity_no_residual_placeholders_either_backend() {
+        // Defense in depth: after normalization neither rendering may contain a
+        // raw `?` or `$N` left over (which would mean a marker leaked or a
+        // placeholder was double-rendered).
+        let principal = base_principal(Role::Member, Visibility::Project);
+        let (sqlite_sql, _) = principal.build_sql_scope();
+        let (pg_sql, _) = principal.build_sql_scope_pg(7);
+        assert!(!sqlite_sql.contains(SCOPE_BIND_MARKER));
+        assert!(!pg_sql.contains(SCOPE_BIND_MARKER));
+        // The marker round-trip must be self-consistent.
+        assert_eq!(sqlite_to_marker(&sqlite_sql), pg_to_marker(&pg_sql));
+    }
+
+    #[test]
+    fn cross_backend_parity_anonymous_excludes_workspace_and_null_allow() {
+        // Regression lock for the D11 tightening: neither rendering may contain
+        // the over-permissive Postgres-only allow paths that were removed.
+        for ceiling in [Visibility::Private, Visibility::Public] {
+            let principal = base_principal(Role::Anonymous, ceiling);
+            let (pg_sql, _) = principal.build_sql_scope_pg(2);
+            assert!(
+                !pg_sql.contains("visibility IS NULL"),
+                "tightened scope must not re-introduce the NULL-visibility allow"
+            );
+            assert!(
+                !pg_sql.contains("'workspace'"),
+                "tightened scope must not re-introduce the workspace allow"
+            );
+            // It must still exclude secrets and gate on the authored triple.
+            assert!(pg_sql.contains("sensitivity != 'secret'"));
+            assert!(pg_sql.contains("raw_sender ="));
+        }
+    }
+
     #[test]
     fn post_filter_applies_nfkc_and_regex() {
         let mut principal = base_principal(Role::Guest, Visibility::Public);
