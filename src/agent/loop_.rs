@@ -4450,7 +4450,13 @@ pub(crate) async fn run_tool_call_loop(
         // Prompt mode: use XML-based text format as before.
         history.push(ChatMessage::assistant(assistant_history_content));
         if native_tool_calls.is_empty() {
-            history.push(ChatMessage::user(format!("[Tool results]\n{tool_results}")));
+            // Prompt/text mode marker. Shares the prefix constant with the CTE
+            // snapshot parser (`build_causal_state_from_chat`) so a wording change
+            // stays consistent across producer and parser.
+            history.push(ChatMessage::user(format!(
+                "{}\n{tool_results}",
+                crate::causal_tree::snapshot::TOOL_RESULTS_PREFIX
+            )));
         } else {
             for (index, (native_call, result)) in native_tool_calls.iter().zip(individual_results.iter()).enumerate() {
                 // FIX-P2-02: persistence (untrusted external copy + oversized
