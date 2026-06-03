@@ -470,14 +470,35 @@ impl RuntimeEnvelope {
     /// across every recipient of the same sender (see `channels::ConversationKey`
     /// and `channels::merged_history`).
     ///
-    /// The `chat`/`agent`/`gateway` durable `session_key`s are intentionally
-    /// left on their legacy formats for now: those keys are the primary
-    /// `message_events` persistence identity, and swapping them outright would
-    /// dark existing shared-event recall. They already derive a consistent
-    /// canonical identity through this method (each builder sets
-    /// source/channel/sender/recipient), so the cross-mode convergence is
-    /// verified at the derivation layer; a recipient-aware durable-key migration
-    /// is deferred to a dedicated wave.
+    /// Durable-key migration status (D4 — durable canonical + legacy read-merge):
+    /// the recipient-aware durable-key migration that was previously deferred is
+    /// now done for the `chat` and `gateway` *fabric* paths. Each writes its
+    /// durable `message_events` `session_key` as the recipient-aware canonical
+    /// (chat: stable `chat:terminal:local-user:{session_id}` derived from the
+    /// immutable session id — see [`Self::chat_canonical`]; gateway fabric:
+    /// `gateway:{channel}:{sender}:{recipient}`), and every read takes the
+    /// **union of the canonical and the pre-cutover legacy key**
+    /// (`legacy_session_key`) so legacy history stays visible (read-merge, never
+    /// move; the legacy row is never updated or deleted). Two exceptions are kept
+    /// deliberately legacy: the `agent` per-turn `agent:{turn_run_id}` write key
+    /// (run-boundary isolation — agent does read-merge only, no write-side
+    /// canonical collapse), and the gateway **console** external `session_id`
+    /// (a user-visible path/list contract value; canonicalizing it would break
+    /// the frontend). The `chat` blob storage key `chat_session:{id}` is also
+    /// kept on its session-id basis (whole-blob overwrite, no recipient
+    /// semantics) — only the fine-grained `message_events` `session_key` is
+    /// migrated.
+    ///
+    /// **No cross-mode exact recall claim.** Because the canonical key's first
+    /// component is the `source` (`chat:` / `agent:` / `gateway:` / ...), the
+    /// canonical keys of two different sources are structurally never equal. D4
+    /// therefore does **not** make one user's chat / agent / gateway histories
+    /// visible to each other via session-key union — that union only merges the
+    /// legacy and canonical history **within a single source**. Cross-mode
+    /// sharing is carried by the `owner_id` / `sender` / workspace visibility
+    /// dimensions, not by the session key. The derivation-layer convergence tests
+    /// (`canonical_session_key_*`) verify key-derivation determinism only and must
+    /// not be read as a cross-mode recall guarantee.
     ///
     /// # Session contract across `chat` / `gateway` / `channels` (D7)
     ///
@@ -495,11 +516,11 @@ impl RuntimeEnvelope {
     ///
     /// | dimension | `chat` | `gateway` | `channels` |
     /// |---|---|---|---|
-    /// | storage | single `MemoryEntry` JSON blob (whole-session) | `conversation_turns` rows (append-only) + `conversation_sessions` meta | in-process `HashMap<String, Vec<ChatMessage>>` cache + `conversation_turns` rows |
-    /// | key model | `chat_session:{id}` (session-id basis, **not** via `canonical_session_key`) | `console` envelope key | `ConversationKey{canonical, legacy}`: canonical via `canonical_session_key`, legacy `{channel}_{sender}` |
-    /// | load | exact `get(chat_session:{id})` → deser blob; latest = `list` + filter + sort | meta `get_conversation_session` then paged `list_conversation_turns` | `merged_history` = read-merge **union** of canonical + legacy keys from the cache |
-    /// | save | whole-blob **overwrite** (Pure-mode single-writer via `Effect::SaveSession`, `dual_write_guard` suppresses legacy side-writes) | per-turn **append** (never overwrites) | cache push + per-turn DB **append** |
-    /// | invariant | Pure-mode single-source persistence | append-only | read-merge union; legacy key **read-only, never moved/deleted** (`fdfd8ec0`) |
+    /// | storage | single `MemoryEntry` JSON blob (whole-session) + `message_events` rows | fabric `message_events` rows + console `conversation_turns` (append-only) + `conversation_sessions` meta | in-process `HashMap<String, Vec<ChatMessage>>` cache + `conversation_turns` rows |
+    /// | key model | blob `chat_session:{id}` (session-id basis, **not** via `canonical_session_key`); message_events durable key = stable canonical `chat:terminal:local-user:{id}` (D4) + legacy `chat:{id}` read-merge | fabric durable key = canonical `gateway:{ch}:{sender}:{recipient}` (D4) + legacy `gateway:…` read-merge; console external `session_id` kept **legacy** (contract) | `ConversationKey{canonical, legacy}`: canonical via `canonical_session_key`, legacy `{channel}_{sender}` |
+    /// | load | exact `get(chat_session:{id})` → deser blob; message_events recall reads **union** of canonical + legacy session keys | fabric recall reads **union** of canonical + legacy keys; console meta `get_conversation_session` then paged `list_conversation_turns` on the external id | `merged_history` = read-merge **union** of canonical + legacy keys from the cache |
+    /// | save | blob whole-blob **overwrite** (Pure-mode single-writer via `Effect::SaveSession`, `dual_write_guard` suppresses legacy side-writes); message_events **append** under canonical key | fabric per-event **append** under canonical key; console per-turn **append** under external id | cache push + per-turn DB **append** |
+    /// | invariant | Pure-mode single-source blob; message_events read-merge union, legacy key **read-only** | read-merge union, legacy key **read-only, never moved/deleted** | read-merge union; legacy key **read-only, never moved/deleted** (`fdfd8ec0`) |
     ///
     /// Three storage models, three key models, three load return shapes
     /// (`Option<ChatSession>` / paged `Vec<SessionMessage>` / `Vec<ChatMessage>`)
