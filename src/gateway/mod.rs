@@ -45,6 +45,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::timeout::TimeoutLayer;
 use uuid::Uuid;
@@ -60,6 +61,11 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+/// Upper bound on how long the gateway waits for in-flight requests to drain
+/// after a shutdown signal before forcing exit (D5/D9 step 3). Gateway-local on
+/// purpose: `main.rs`'s private `RUNTIME_SHUTDOWN_TIMEOUT` is unreachable from
+/// the lib crate.
+const GATEWAY_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
@@ -470,6 +476,7 @@ pub async fn run_gateway(
     port: u16,
     config: Config,
     shared_config: Option<crate::config::SharedConfig>,
+    shutdown: CancellationToken,
 ) -> Result<()> {
     let start_time = Instant::now();
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
@@ -945,8 +952,21 @@ pub async fn run_gateway(
             Duration::from_secs(config.gateway.request_timeout_secs.max(1)),
         ));
 
-    // Run the server
-    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
+    // Run the server with graceful shutdown (D5/D9 step 3). On root token
+    // cancellation axum stops accepting and drains in-flight requests; a bounded
+    // timeout guards against requests (e.g. long-lived connections) that never
+    // complete, after which we force-exit with a warning.
+    let serve_fut = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+        .with_graceful_shutdown(async move { shutdown.cancelled().await });
+    match tokio::time::timeout(GATEWAY_GRACEFUL_TIMEOUT, serve_fut).await {
+        Ok(result) => result?,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = GATEWAY_GRACEFUL_TIMEOUT.as_secs(),
+                "gateway graceful shutdown timed out; forcing exit"
+            );
+        }
+    }
 
     Ok(())
 }

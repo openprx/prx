@@ -119,7 +119,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             // exists, so pass `None` and let run_gateway build its own SharedConfig
             // fallback (only the in-gateway ConfigReloadTool / API reload can update
             // it; file-watch hot-reload is daemon-only).
-            gateway::run_gateway(&host, port, config, None).await
+            // D5/D9 step 3: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            gateway::run_gateway(&host, port, config, None, shutdown).await
         }
 
         Commands::Daemon { port, host } => {

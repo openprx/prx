@@ -62,7 +62,18 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
                 let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let shared = Arc::clone(&gateway_shared);
-                async move { crate::gateway::run_gateway(&host, port, cfg, Some(shared)).await }
+                async move {
+                    // Supervised gateway: the supervisor restarts it on exit, so
+                    // it uses a never-cancelled token. See never_cancelled_shutdown.
+                    crate::gateway::run_gateway(
+                        &host,
+                        port,
+                        cfg,
+                        Some(shared),
+                        crate::runtime::shutdown::never_cancelled_shutdown(),
+                    )
+                    .await
+                }
             },
         ));
     }
