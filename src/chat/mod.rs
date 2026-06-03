@@ -3599,6 +3599,19 @@ async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Result<Option<session
     // C2: a corrupt stored blob is data corruption, not absence — surface it.
     let session = session::ChatSession::from_json(&entry.content)
         .map_err(|e| anyhow::anyhow!("session '{id}' stored entry is corrupt: {e}"))?;
+    // C3 (id consistency): the embedded id must match the requested id.  If
+    // they differ the stored blob was written under the wrong key (or the key
+    // was tampered with).  Resuming it would silently continue with the wrong
+    // session and subsequent saves would land under the embedded id, burying
+    // the entry that was stored under `id`.
+    if session.id != id {
+        return Err(anyhow::anyhow!(
+            "session '{}' stored entry is corrupt: embedded id '{}' disagrees with requested id; \
+             refusing to start a fresh session that would bury it",
+            id,
+            session.id
+        ));
+    }
     Ok(Some(session))
 }
 
@@ -3831,6 +3844,34 @@ mod session_load_error_semantics_tests {
         };
         let result = load_session_by_id(&mem, "bad").await;
         assert!(result.is_err(), "corrupt stored blob must be Err, not Ok(None)");
+    }
+
+    // C3 (id consistency): embedded id that disagrees with the requested id must be Err.
+    // If `chat_session:<id>` stores a blob whose `id` field is a different value, resuming
+    // it would silently continue with the wrong session (D10 review finding).
+    #[tokio::test]
+    async fn load_session_by_id_embedded_id_mismatch_is_error() {
+        // Build a valid session blob whose embedded id is "other-id".
+        let mut s = session::ChatSession::new("p", "m");
+        s.id = "other-id".to_string();
+        let json = s.to_json().expect("test: serialize session");
+        // Store it under the key for "requested-id" — key/embedded-id disagree.
+        let mem = StaticMemory {
+            entries: vec![entry(
+                &format!("{}:requested-id", session::SESSION_MEMORY_PREFIX),
+                &json,
+            )],
+        };
+        let result = load_session_by_id(&mem, "requested-id").await;
+        assert!(
+            result.is_err(),
+            "embedded id mismatch must be Err, not Ok(Some(wrong_session))"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("refusing") && msg.contains("bury"),
+            "error message should mention 'refusing' and 'bury': {msg}"
+        );
     }
 
     // Happy path: valid stored session round-trips.
