@@ -36,7 +36,6 @@ pub mod secrets;
 pub mod traits;
 
 pub use detect::{create_sandbox_with_workspace, create_sandbox_with_workspace_and_dirs};
-pub use inbound_gate::{InboundAuthorizer, InboundGate, PolicyAuthorizer};
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 pub use policy_pipeline::{EvalContext, PolicyPipeline};
 pub use secrets::SecretStore;

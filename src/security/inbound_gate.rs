@@ -29,6 +29,15 @@ pub trait InboundAuthorizer {
     fn authorize(&self, tool_name: &str, operation_name: &str, risk: ResourceRiskLevel) -> Result<(), String>;
 }
 
+/// Blanket impl so a borrowed authorizer (e.g. `&dyn InboundAuthorizer` behind
+/// an `Arc`) can drive an `InboundGate` without taking ownership. This lets the
+/// channel test seam construct `InboundGate::new(arc.as_ref())`.
+impl<T: InboundAuthorizer + ?Sized> InboundAuthorizer for &T {
+    fn authorize(&self, tool_name: &str, operation_name: &str, risk: ResourceRiskLevel) -> Result<(), String> {
+        (**self).authorize(tool_name, operation_name, risk)
+    }
+}
+
 /// Production backend: delegates to the real [`SideEffectGate`], preserving
 /// audit / re-entrancy / M5-replay behavior unchanged.
 pub struct PolicyAuthorizer<'a> {

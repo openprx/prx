@@ -80,7 +80,10 @@ use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
 use crate::runtime;
 use crate::runtime::envelope::RuntimeEnvelope;
+#[cfg(test)]
 use crate::security::SideEffectGate;
+use crate::security::inbound_gate::InboundGate;
+#[cfg(test)]
 use crate::security::policy::ResourceRiskLevel;
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
@@ -272,6 +275,13 @@ struct ChannelRuntimeContext {
     mention_only_by_channel: HashMap<String, bool>,
     /// Skill RAG context (present when skill_rag.enabled) for per-message skill selection.
     skill_rag_ctx: Option<SkillRagContext>,
+    /// Test-only seam: when present, `process_channel_message` routes the inbound
+    /// gate through this authorizer instead of the production `for_policy` path,
+    /// so tests can express an operation-selective deny (e.g. autosave only) that
+    /// the real `SecurityPolicy` cannot. Compiled out entirely in non-test builds
+    /// (zero production overhead; `for_policy` is the only path there).
+    #[cfg(test)]
+    test_inbound_authorizer: Option<Arc<dyn crate::security::inbound_gate::InboundAuthorizer + Send + Sync>>,
 }
 
 /// Holds the data needed for per-message skill RAG selection and system prompt rebuild.
@@ -1190,6 +1200,77 @@ fn compact_sender_history(ctx: &ChannelRuntimeContext, key: &ConversationKey) ->
 
     histories.insert(key.canonical.clone(), compacted);
     true
+}
+
+/// Resolve the inbound gate for this message. Production always uses the
+/// static-dispatch `InboundGate::for_policy` over the real `SideEffectGate`. In
+/// test builds, an injected `test_inbound_authorizer` (when present) takes
+/// precedence so tests can express an operation-selective deny the real policy
+/// cannot. The three `authorize_channel_*` helpers below funnel through this so
+/// the operation-naming convention lives only in `InboundGate`.
+#[cfg(not(test))]
+fn authorize_channel_inbound(
+    _ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+    sender: &str,
+) -> Result<(), String> {
+    InboundGate::for_policy(security).authorize_inbound(channel, sender)
+}
+
+#[cfg(test)]
+fn authorize_channel_inbound(
+    ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+    sender: &str,
+) -> Result<(), String> {
+    ctx.test_inbound_authorizer.as_ref().map_or_else(
+        || InboundGate::for_policy(security).authorize_inbound(channel, sender),
+        |authorizer| InboundGate::new(authorizer.as_ref()).authorize_inbound(channel, sender),
+    )
+}
+
+#[cfg(not(test))]
+fn authorize_channel_autosave(
+    _ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+) -> Result<(), String> {
+    InboundGate::for_policy(security).authorize_autosave(channel)
+}
+
+#[cfg(test)]
+fn authorize_channel_autosave(
+    ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+) -> Result<(), String> {
+    ctx.test_inbound_authorizer.as_ref().map_or_else(
+        || InboundGate::for_policy(security).authorize_autosave(channel),
+        |authorizer| InboundGate::new(authorizer.as_ref()).authorize_autosave(channel),
+    )
+}
+
+#[cfg(not(test))]
+fn authorize_channel_outbound(
+    _ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+) -> Result<(), String> {
+    InboundGate::for_policy(security).authorize_outbound(channel)
+}
+
+#[cfg(test)]
+fn authorize_channel_outbound(
+    ctx: &ChannelRuntimeContext,
+    security: &crate::security::SecurityPolicy,
+    channel: &str,
+) -> Result<(), String> {
+    ctx.test_inbound_authorizer.as_ref().map_or_else(
+        || InboundGate::for_policy(security).authorize_outbound(channel),
+        |authorizer| InboundGate::new(authorizer.as_ref()).authorize_outbound(channel),
+    )
 }
 
 async fn append_sender_turn(
@@ -2444,20 +2525,17 @@ async fn process_channel_message(
     // ReadOnly (or when the action budget is exhausted) the gate denies and we
     // abort before the first history mutation; Supervised/Full keep normal
     // traffic flowing untouched (Low risk + grant=None is allowed there).
-    let inbound_op = format!("channel:{}:inbound:{}", msg.channel, msg.sender);
     // D2-2: use the per-message security generation captured at the top of this
     // function; rebuild only happens in the stamp-change branch of
-    // maybe_apply_runtime_config_update, never here.
-    if let Err(reason) = SideEffectGate::new(security_gen.security.as_ref()).authorize_resource_operation(
-        "channel",
-        &inbound_op,
-        ResourceRiskLevel::Low,
-        None,
-    ) {
+    // maybe_apply_runtime_config_update, never here. D6: the operation name
+    // (`channel:{channel}:inbound:{sender}`) is now owned by `InboundGate`.
+    if let Err(reason) =
+        authorize_channel_inbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel, &msg.sender)
+    {
         tracing::warn!(
             channel = %msg.channel,
             sender = %msg.sender,
-            "channel inbound blocked by SideEffectGate: {reason}"
+            "channel inbound blocked by InboundGate: {reason}"
         );
         return;
     }
@@ -2483,18 +2561,12 @@ async fn process_channel_message(
     // budget); a deny skips the autosave and logs, never aborting the turn.
     // D2-2: reuse the per-message security generation so inbound+autosave for one
     // message see one coherent policy view (no re-poll happens between them).
-    let autosave_allowed = SideEffectGate::new(security_gen.security.as_ref())
-        .authorize_resource_operation(
-            "channel",
-            &format!("channel:{}:autosave", msg.channel),
-            ResourceRiskLevel::Low,
-            None,
-        )
+    let autosave_allowed = authorize_channel_autosave(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel)
         .map_err(|reason| {
             tracing::warn!(
                 channel = %msg.channel,
                 sender = %msg.sender,
-                "channel autosave blocked by SideEffectGate: {reason}"
+                "channel autosave blocked by InboundGate: {reason}"
             );
         })
         .is_ok();
@@ -2680,20 +2752,15 @@ async fn process_channel_message(
     // independently of inbound persistence. Low/read-style: denies only under
     // ReadOnly (or exhausted budget). A deny skips the LLM call and all reply
     // sends entirely and logs; Supervised/Full proceed normally.
-    let outbound_op = format!("channel:{}:outbound", msg.channel);
     // D2-2: reuse the per-message security generation. Outbound runs after the
     // agent loop, but deliberately uses the start-of-message snapshot so the whole
-    // message stays within a single coherent generation.
-    if let Err(reason) = SideEffectGate::new(security_gen.security.as_ref()).authorize_resource_operation(
-        "channel",
-        &outbound_op,
-        ResourceRiskLevel::Low,
-        None,
-    ) {
+    // message stays within a single coherent generation. D6: the operation name
+    // (`channel:{channel}:outbound`) is now owned by `InboundGate`.
+    if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel) {
         tracing::warn!(
             channel = %msg.channel,
             sender = %msg.sender,
-            "channel outbound blocked by SideEffectGate: {reason}"
+            "channel outbound blocked by InboundGate: {reason}"
         );
         return;
     }
@@ -4740,6 +4807,8 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         bot_uuids,
         mention_only_by_channel,
         skill_rag_ctx,
+        #[cfg(test)]
+        test_inbound_authorizer: None,
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, shutdown).await;
@@ -4942,6 +5011,7 @@ mod tests {
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -5011,6 +5081,7 @@ mod tests {
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         }
     }
 
@@ -5384,6 +5455,7 @@ mod tests {
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         };
 
         let _ = append_sender_turn(
@@ -6055,6 +6127,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6133,6 +6206,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6211,6 +6285,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6291,6 +6366,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6370,6 +6446,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6455,6 +6532,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6568,6 +6646,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6654,6 +6733,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6757,6 +6837,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6884,6 +6965,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -6963,6 +7045,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -7170,6 +7253,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         })
     }
 
@@ -7304,6 +7388,7 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         })
     }
 
@@ -7705,6 +7790,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -7805,6 +7891,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -7918,6 +8005,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8014,6 +8102,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -8508,6 +8597,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -8610,6 +8700,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
@@ -8708,6 +8799,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
+            test_inbound_authorizer: None,
         });
 
         process_channel_message(
