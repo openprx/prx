@@ -7128,6 +7128,11 @@ BTC is currently around $65,000 based on latest tool output."#
     #[derive(Default)]
     struct CountingMemory {
         append_calls: AtomicUsize,
+        /// Counts the per-message autosave write path
+        /// (`store_with_context_and_metadata`, the method the channel autosave
+        /// branch actually calls), so the autosave-deny / autosave-allow tests
+        /// can assert whether the autosave side effect ran.
+        store_calls: AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -7143,6 +7148,22 @@ BTC is currently around $65,000 based on latest tool output."#
             _category: crate::memory::MemoryCategory,
             _session_id: Option<&str>,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        // The channel autosave branch writes via store_with_context_and_metadata;
+        // override it (rather than the bare store) so store_calls reflects the
+        // autosave side effect the gate is meant to permit or suppress.
+        async fn store_with_context_and_metadata(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: crate::memory::MemoryCategory,
+            _session_id: Option<&str>,
+            _context: Option<&crate::memory::MemoryWriteContext>,
+            _metadata: crate::memory::MemoryStoreMetadata,
+        ) -> anyhow::Result<()> {
+            self.store_calls.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
 
@@ -7196,11 +7217,32 @@ BTC is currently around $65,000 based on latest tool output."#
         }
     }
 
-    /// Build a minimal `ChannelRuntimeContext` wired to the given autonomy
-    /// level, the provided counting memory, and a `RecordingChannel`, for the
-    /// inbound-gate tests below.
-    fn gate_test_ctx(
+    /// Tunable knobs for the inbound-gate test contexts. Defaults reproduce the
+    /// original `gate_test_ctx` behavior (autosave off, generous action budget,
+    /// production gate authorizer).
+    struct GateTestOpts {
         autonomy: crate::security::AutonomyLevel,
+        auto_save_memory: bool,
+        max_actions_per_hour: u32,
+        test_inbound_authorizer: Option<Arc<dyn crate::security::inbound_gate::InboundAuthorizer + Send + Sync>>,
+    }
+
+    impl GateTestOpts {
+        fn new(autonomy: crate::security::AutonomyLevel) -> Self {
+            Self {
+                autonomy,
+                auto_save_memory: false,
+                max_actions_per_hour: 20,
+                test_inbound_authorizer: None,
+            }
+        }
+    }
+
+    /// Build a minimal `ChannelRuntimeContext` from explicit `GateTestOpts`,
+    /// wired to the provided counting memory and channel, for the inbound-gate
+    /// tests below.
+    fn gate_test_ctx_with(
+        opts: GateTestOpts,
         memory: Arc<CountingMemory>,
         channel: Arc<dyn Channel>,
     ) -> Arc<ChannelRuntimeContext> {
@@ -7217,7 +7259,7 @@ BTC is currently around $65,000 based on latest tool output."#
             system_prompt: Arc::new("test-system-prompt".to_string()),
             model: Arc::new("test-model".to_string()),
             temperature: 0.0,
-            auto_save_memory: false,
+            auto_save_memory: opts.auto_save_memory,
             memory_event_recording: MemoryEventRecording::default(),
             max_tool_iterations: 5,
             read_only_tool_concurrency_window: 2,
@@ -7245,7 +7287,8 @@ BTC is currently around $65,000 based on latest tool output."#
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
                 security: Arc::new(crate::security::SecurityPolicy {
-                    autonomy,
+                    autonomy: opts.autonomy,
+                    max_actions_per_hour: opts.max_actions_per_hour,
                     ..crate::security::SecurityPolicy::default()
                 }),
                 pipeline: Arc::new(crate::security::PolicyPipeline::new(
@@ -7253,8 +7296,19 @@ BTC is currently around $65,000 based on latest tool output."#
                 )),
             })),
             skill_rag_ctx: None,
-            test_inbound_authorizer: None,
+            test_inbound_authorizer: opts.test_inbound_authorizer,
         })
+    }
+
+    /// Build a minimal `ChannelRuntimeContext` wired to the given autonomy
+    /// level, the provided counting memory, and a `RecordingChannel`, for the
+    /// inbound-gate tests below.
+    fn gate_test_ctx(
+        autonomy: crate::security::AutonomyLevel,
+        memory: Arc<CountingMemory>,
+        channel: Arc<dyn Channel>,
+    ) -> Arc<ChannelRuntimeContext> {
+        gate_test_ctx_with(GateTestOpts::new(autonomy), memory, channel)
     }
 
     fn gate_test_message() -> traits::ChannelMessage {
@@ -7310,6 +7364,119 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             memory.append_calls.load(Ordering::SeqCst) >= 1,
             "Supervised autonomy must allow the inbound conversation-turn persistence (normal flow not broken)"
+        );
+    }
+
+    /// A DM message whose content is >= 30 chars and free of noise patterns, so
+    /// `should_autosave_content` returns true and the autosave branch is reached
+    /// (otherwise the gate result would be moot and the autosave assertions would
+    /// pass vacuously). `reply_target` has no group marker, so it infers as a DM.
+    fn gate_test_dm_message() -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: "gate-msg-autosave".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "chat-gate".to_string(),
+            content: "this is a sufficiently long direct message worth autosaving".to_string(),
+            channel: "test-channel".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            mentioned_uuids: vec![],
+        }
+    }
+
+    /// Test seam: deny only the `:autosave` operation, allowing inbound + outbound.
+    /// The real `SecurityPolicy` cannot express this (Act gating is autonomy + rate
+    /// only), so the autosave-deny end-to-end control flow is driven via this mock.
+    struct AutosaveOnlyDeny;
+
+    impl crate::security::inbound_gate::InboundAuthorizer for AutosaveOnlyDeny {
+        fn authorize(&self, _tool_name: &str, operation_name: &str, _risk: ResourceRiskLevel) -> Result<(), String> {
+            if operation_name.contains(":autosave") {
+                Err(format!("test deny: {operation_name}"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// D6-3 (outbound deny, budget path): with `max_actions_per_hour=2` and
+    /// Supervised autonomy, the inbound gate (action #1) and autosave gate
+    /// (action #2) pass, but the outbound gate (action #3) is rate-denied. The
+    /// inbound user turn must still be persisted (it ran before the budget was
+    /// exhausted) while no reply is sent. Uses a dedicated policy + tracker so
+    /// the budget starts fresh (no flaky pre-consumption).
+    #[tokio::test]
+    async fn process_channel_message_outbound_gate_denied_by_budget() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        opts.auto_save_memory = true;
+        opts.max_actions_per_hour = 2;
+        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.append_calls.load(Ordering::SeqCst) >= 1,
+            "inbound turn must persist (gated before the budget was exhausted)"
+        );
+        assert!(
+            channel_impl.sent_messages.lock().await.is_empty(),
+            "outbound must be suppressed once the action budget is exhausted"
+        );
+    }
+
+    /// D6-3 (autosave deny, mock seam): inject an authorizer that denies only
+    /// `:autosave`. The inbound user turn must still persist and the reply must
+    /// still be sent, but the autosave memory write must be skipped (store_calls
+    /// == 0). This isolates the autosave skip-only deny semantics from inbound /
+    /// outbound, which the real policy cannot do per-operation.
+    #[tokio::test]
+    async fn process_channel_message_autosave_gate_denied_by_mock() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        opts.auto_save_memory = true;
+        opts.test_inbound_authorizer = Some(Arc::new(AutosaveOnlyDeny));
+        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.append_calls.load(Ordering::SeqCst) >= 1,
+            "autosave deny must not abort the turn: the inbound user turn still persists"
+        );
+        assert_eq!(
+            memory.store_calls.load(Ordering::SeqCst),
+            0,
+            "autosave deny must skip the autosave memory write"
+        );
+        assert!(
+            !channel_impl.sent_messages.lock().await.is_empty(),
+            "autosave deny must not suppress the reply (skip-only, not abort)"
+        );
+    }
+
+    /// D6-3 (autosave allow, positive control): with autosave permitted (no
+    /// op-selective deny) the autosave memory write runs (store_calls > 0). This
+    /// guards the autosave-deny test above from passing vacuously — proving the
+    /// autosave branch is actually reachable for this message under allow.
+    #[tokio::test]
+    async fn process_channel_message_autosave_gate_allowed_writes_memory() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        opts.auto_save_memory = true;
+        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_dm_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.store_calls.load(Ordering::SeqCst) >= 1,
+            "autosave allow must perform the autosave memory write"
         );
     }
 
