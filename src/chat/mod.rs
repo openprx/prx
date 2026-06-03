@@ -1064,24 +1064,39 @@ pub async fn run(
 
     // ── Session: resume or create new ───────────────────────────
     let mut chat_session = match session_id.as_deref() {
+        // D10/C1: distinguish None (no session -> new) from Err (storage failure).
+        // A storage Err must fail fast: ChatSession::new mints a *new* id, so
+        // silently starting fresh on a transient DB error would fork the
+        // conversation and bury the original context (session-loss illusion),
+        // not "overwrite the same key".
         Some("last") => match load_latest_session(mem.as_ref()).await {
-            Some(s) => {
+            Ok(Some(s)) => {
                 info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
                 s
             }
-            None => {
+            Ok(None) => {
                 info!("No previous session found, starting new");
                 session::ChatSession::new(provider_name, model_name)
             }
+            Err(e) => {
+                anyhow::bail!(
+                    "failed to load the most recent session: {e}; refusing to start a fresh session that would bury it"
+                );
+            }
         },
         Some(id) => match load_session_by_id(mem.as_ref(), id).await {
-            Some(s) => {
+            Ok(Some(s)) => {
                 info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
                 s
             }
-            None => {
+            Ok(None) => {
                 eprintln!("Session '{id}' not found, starting new session.");
                 session::ChatSession::new(provider_name, model_name)
+            }
+            Err(e) => {
+                anyhow::bail!(
+                    "failed to load session '{id}': {e}; refusing to start a fresh session that would bury it"
+                );
             }
         },
         None => session::ChatSession::new(provider_name, model_name),
@@ -3566,19 +3581,57 @@ async fn save_session(mem: &dyn Memory, session: &session::ChatSession) -> Resul
 }
 
 /// Load a session by ID (exact key lookup, not similarity search).
-async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Option<session::ChatSession> {
+///
+/// Returns `Ok(None)` only when there is genuinely no entry under the key.
+/// A storage error (D10/C1) or a corrupt stored blob (D10/C2) is propagated as
+/// `Err` rather than collapsed into "not found", so callers can fail fast
+/// instead of silently starting a fresh session that buries the real context.
+async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Result<Option<session::ChatSession>> {
     let key = format!("{}:{}", session::SESSION_MEMORY_PREFIX, id);
-    let entry = mem.get(&key).await.ok()??;
-    session::ChatSession::from_json(&entry.content).ok()
+    // C1: propagate storage Err; Ok(None) is the only genuine "no such session".
+    let Some(entry) = mem
+        .get(&key)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load session '{id}': {e}"))?
+    else {
+        return Ok(None);
+    };
+    // C2: a corrupt stored blob is data corruption, not absence — surface it.
+    let session = session::ChatSession::from_json(&entry.content)
+        .map_err(|e| anyhow::anyhow!("session '{id}' stored entry is corrupt: {e}"))?;
+    Ok(Some(session))
 }
 
 /// Load the most recent session.
-async fn load_latest_session(mem: &dyn Memory) -> Option<session::ChatSession> {
-    let entries = mem.list(Some(&MemoryCategory::Conversation), None).await.ok()?;
-    // Find entries with the session prefix, parse and sort by updated_at
-    let mut sessions: Vec<session::ChatSession> = entries.iter().filter_map(valid_session_entry).collect();
+///
+/// Returns `Ok(None)` when no saved session exists. A storage error (D10/C3) or
+/// a corrupt entry under an exact session key (D10) is propagated as `Err`,
+/// never silently degraded to "no session".
+async fn load_latest_session(mem: &dyn Memory) -> Result<Option<session::ChatSession>> {
+    let entries = mem
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list saved sessions: {e}"))?;
+    // Find entries with the session prefix, parse (corrupt exact entry -> Err) and sort by updated_at.
+    let mut sessions: Vec<session::ChatSession> = collect_valid_sessions(&entries)?;
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
-    sessions.into_iter().next()
+    Ok(sessions.into_iter().next())
+}
+
+/// Parse session entries, distinguishing corruption from non-session entries.
+///
+/// A corrupt blob under an exact `chat_session:{id}` key is treated as data
+/// corruption and returned as `Err` (rather than silently dropped, which would
+/// misreport a damaged session as "no session"). Entries that are not session
+/// entries at all (wrong prefix / blank id) are skipped.
+fn collect_valid_sessions(entries: &[crate::memory::MemoryEntry]) -> Result<Vec<session::ChatSession>> {
+    let mut sessions = Vec::new();
+    for entry in entries {
+        if let Some(session) = valid_session_entry(entry)? {
+            sessions.push(session);
+        }
+    }
+    Ok(sessions)
 }
 
 fn bind_session_to_runtime_provider_model(session: &mut session::ChatSession, provider_name: &str, model_name: &str) {
@@ -3586,16 +3639,36 @@ fn bind_session_to_runtime_provider_model(session: &mut session::ChatSession, pr
     session.model = model_name.to_string();
 }
 
-fn valid_session_entry(entry: &crate::memory::MemoryEntry) -> Option<session::ChatSession> {
-    let id_from_key = entry
-        .key
-        .strip_prefix(session::SESSION_MEMORY_PREFIX)?
-        .strip_prefix(':')?;
+/// Validate and parse a candidate session entry.
+///
+/// * `Ok(None)` — the entry is not a chat-session entry (wrong prefix or blank
+///   id); skip it.
+/// * `Ok(Some(session))` — a valid session keyed by its own id.
+/// * `Err(..)` — the entry *is* keyed as a chat session (exact `chat_session:{id}`)
+///   but its blob is corrupt or its embedded id disagrees with the key. This is
+///   data corruption and must not be silently filtered out (D10): a damaged
+///   session must surface as an error, not be misreported as "no session".
+fn valid_session_entry(entry: &crate::memory::MemoryEntry) -> Result<Option<session::ChatSession>> {
+    let Some(rest) = entry.key.strip_prefix(session::SESSION_MEMORY_PREFIX) else {
+        return Ok(None);
+    };
+    let Some(id_from_key) = rest.strip_prefix(':') else {
+        return Ok(None);
+    };
     if id_from_key.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
-    let session = session::ChatSession::from_json(&entry.content).ok()?;
-    if session.id == id_from_key { Some(session) } else { None }
+    let session = session::ChatSession::from_json(&entry.content)
+        .map_err(|e| anyhow::anyhow!("saved session '{id_from_key}' stored entry is corrupt: {e}"))?;
+    if session.id == id_from_key {
+        Ok(Some(session))
+    } else {
+        Err(anyhow::anyhow!(
+            "saved session entry key '{}' disagrees with stored id '{}'",
+            entry.key,
+            session.id
+        ))
+    }
 }
 
 fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> {
@@ -3608,6 +3681,222 @@ fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> 
             content: turn.content.clone(),
         })
         .collect()
+}
+
+#[cfg(test)]
+mod session_load_error_semantics_tests {
+    //! D10/C1-C4: chat session load paths must distinguish `None` (no such
+    //! session -> start fresh) from `Err` (storage failure / corrupt blob ->
+    //! propagate, fail fast). A `FailingMemory` mock injects storage errors so
+    //! we can assert load helpers return `Err`, never silently degrade to `None`.
+    use super::*;
+    use crate::memory::MemoryEntry;
+    use async_trait::async_trait;
+
+    /// Minimal `Memory` whose `get`/`list` fail; everything else is inert.
+    struct FailingMemory;
+
+    #[async_trait]
+    impl Memory for FailingMemory {
+        fn name(&self) -> &str {
+            "failing"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, _key: &str) -> Result<Option<MemoryEntry>> {
+            Err(anyhow::anyhow!("injected storage failure on get"))
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Err(anyhow::anyhow!("injected storage failure on list"))
+        }
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(0)
+        }
+        async fn health_check(&self) -> bool {
+            false
+        }
+    }
+
+    /// `Memory` returning a fixed set of entries from `list` and exact `get`.
+    struct StaticMemory {
+        entries: Vec<MemoryEntry>,
+    }
+
+    #[async_trait]
+    impl Memory for StaticMemory {
+        fn name(&self) -> &str {
+            "static"
+        }
+        async fn store(
+            &self,
+            _key: &str,
+            _content: &str,
+            _category: MemoryCategory,
+            _session_id: Option<&str>,
+        ) -> Result<()> {
+            Ok(())
+        }
+        async fn recall(&self, _query: &str, _limit: usize, _session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {
+            Ok(vec![])
+        }
+        async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
+            Ok(self.entries.iter().find(|e| e.key == key).cloned())
+        }
+        async fn list(
+            &self,
+            _category: Option<&MemoryCategory>,
+            _session_id: Option<&str>,
+        ) -> Result<Vec<MemoryEntry>> {
+            Ok(self.entries.clone())
+        }
+        async fn forget(&self, _key: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn count(&self) -> Result<usize> {
+            Ok(self.entries.len())
+        }
+        async fn health_check(&self) -> bool {
+            true
+        }
+    }
+
+    fn entry(key: &str, content: &str) -> MemoryEntry {
+        MemoryEntry {
+            id: key.to_string(),
+            key: key.to_string(),
+            content: content.to_string(),
+            category: MemoryCategory::Conversation,
+            timestamp: "now".to_string(),
+            session_id: None,
+            score: None,
+            tags: None,
+            access_count: None,
+            useful_count: None,
+            source: None,
+            source_confidence: None,
+            verification_status: None,
+            lifecycle_state: None,
+            compressed_from: None,
+        }
+    }
+
+    fn session_entry(id: &str) -> MemoryEntry {
+        let mut s = session::ChatSession::new("p", "m");
+        s.id = id.to_string();
+        let json = s.to_json().expect("test: serialize session");
+        entry(&format!("{}:{}", session::SESSION_MEMORY_PREFIX, id), &json)
+    }
+
+    // C1: storage Err on get must propagate, not collapse to Ok(None).
+    #[tokio::test]
+    async fn load_session_by_id_propagates_storage_error() {
+        let mem = FailingMemory;
+        let result = load_session_by_id(&mem, "abc").await;
+        assert!(result.is_err(), "storage error must surface as Err, not Ok(None)");
+    }
+
+    // Ok(None): genuine absence still maps to a fresh-session path.
+    #[tokio::test]
+    async fn load_session_by_id_missing_returns_ok_none() {
+        let mem = StaticMemory { entries: vec![] };
+        let result = load_session_by_id(&mem, "missing").await;
+        assert!(matches!(result, Ok(None)), "absent session must be Ok(None)");
+    }
+
+    // C2: corrupt blob under an exact session key is data corruption -> Err.
+    #[tokio::test]
+    async fn load_session_by_id_corrupt_blob_is_error() {
+        let mem = StaticMemory {
+            entries: vec![entry(
+                &format!("{}:bad", session::SESSION_MEMORY_PREFIX),
+                "{not valid json",
+            )],
+        };
+        let result = load_session_by_id(&mem, "bad").await;
+        assert!(result.is_err(), "corrupt stored blob must be Err, not Ok(None)");
+    }
+
+    // Happy path: valid stored session round-trips.
+    #[tokio::test]
+    async fn load_session_by_id_valid_round_trips() {
+        let mem = StaticMemory {
+            entries: vec![session_entry("good")],
+        };
+        let result = load_session_by_id(&mem, "good").await.expect("test: load");
+        assert_eq!(result.map(|s| s.id), Some("good".to_string()));
+    }
+
+    // C3: storage Err on list must propagate from load_latest_session.
+    #[tokio::test]
+    async fn load_latest_session_propagates_storage_error() {
+        let mem = FailingMemory;
+        assert!(
+            load_latest_session(&mem).await.is_err(),
+            "list error must surface as Err"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_latest_session_empty_returns_ok_none() {
+        let mem = StaticMemory { entries: vec![] };
+        assert!(matches!(load_latest_session(&mem).await, Ok(None)));
+    }
+
+    // Corrupt exact session entry must not be silently filtered out of latest/list.
+    #[tokio::test]
+    async fn load_latest_session_corrupt_entry_is_error() {
+        let mem = StaticMemory {
+            entries: vec![entry(&format!("{}:rotten", session::SESSION_MEMORY_PREFIX), "{corrupt")],
+        };
+        assert!(
+            load_latest_session(&mem).await.is_err(),
+            "corrupt session entry must surface as Err, not be dropped as 'no session'"
+        );
+    }
+
+    // C4: list_saved_sessions must propagate the storage error (no unwrap_or_default).
+    #[tokio::test]
+    async fn list_saved_sessions_propagates_storage_error() {
+        let mem = FailingMemory;
+        assert!(
+            list_saved_sessions(&mem).await.is_err(),
+            "list error must surface, not print 'No saved sessions'"
+        );
+    }
+
+    // Non-session entries (wrong prefix) are skipped, not errored.
+    #[test]
+    fn valid_session_entry_skips_non_session_entries() {
+        let e = entry("unrelated:key", "whatever");
+        assert!(matches!(valid_session_entry(&e), Ok(None)));
+    }
+
+    // Key/id disagreement on an exact session entry is corruption -> Err.
+    #[test]
+    fn valid_session_entry_key_id_mismatch_is_error() {
+        let mut s = session::ChatSession::new("p", "m");
+        s.id = "embedded-id".to_string();
+        let json = s.to_json().expect("test: serialize");
+        let e = entry(&format!("{}:key-id", session::SESSION_MEMORY_PREFIX), &json);
+        assert!(valid_session_entry(&e).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -3709,8 +3998,10 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     let entries = mem
         .list(Some(&MemoryCategory::Conversation), None)
         .await
-        .unwrap_or_default();
-    let mut sessions: Vec<session::ChatSession> = entries.iter().filter_map(valid_session_entry).collect();
+        .map_err(|e| anyhow::anyhow!("failed to list saved sessions: {e}"))?;
+    // C4: surface storage Err instead of unwrap_or_default printing a misleading
+    // "No saved sessions"; corrupt exact entries propagate as Err (D10).
+    let mut sessions: Vec<session::ChatSession> = collect_valid_sessions(&entries)?;
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
 
     if sessions.is_empty() {
