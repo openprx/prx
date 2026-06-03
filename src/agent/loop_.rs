@@ -1544,12 +1544,17 @@ fn format_session_event_line(event: &MessageEvent) -> String {
 
 #[allow(dead_code)]
 fn build_shared_events_preamble(principal: &MemoryPrincipal, events: &[MessageEvent]) -> String {
+    // D4 review: classify "current session" by the full candidate key set
+    // (canonical + legacy), not the single canonical `session_key`. Otherwise a
+    // legacy-keyed current-session event is not recognized as belonging to the
+    // current session and leaks into `[Recent shared workspace events]`.
+    let session_candidates = principal.session_key_candidates();
     let mut context = String::new();
     for event in events {
-        if principal
+        if event
             .session_key
-            .as_ref()
-            .is_some_and(|session_key| event.session_key.as_ref() == Some(session_key))
+            .as_deref()
+            .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key))
         {
             continue;
         }
@@ -1577,12 +1582,21 @@ fn build_current_session_events_preamble(
     events: &[MessageEvent],
     user_msg: &str,
 ) -> String {
-    let Some(session_key) = principal.session_key.as_deref() else {
+    // D4 review: an event belongs to the current session when its `session_key`
+    // is any candidate key (canonical OR legacy), so legacy-keyed current-session
+    // history is preserved in `[Current session context]` after a canonical
+    // cutover rather than being dropped.
+    let session_candidates = principal.session_key_candidates();
+    if session_candidates.is_empty() {
         return String::new();
-    };
+    }
     let mut context = String::new();
     for event in events {
-        if event.session_key.as_deref() != Some(session_key) {
+        let belongs_to_current_session = event
+            .session_key
+            .as_deref()
+            .is_some_and(|session_key| session_candidates.iter().any(|candidate| candidate == session_key));
+        if !belongs_to_current_session {
             continue;
         }
         if event.role == "tool" || event.role == "system" {
@@ -8051,6 +8065,95 @@ ls -la
             bundle
                 .current_session_context
                 .contains("important current-session fact")
+        );
+    }
+
+    /// Minimal `MessageEvent` builder for preamble classification tests: only the
+    /// fields the two preamble builders inspect (`session_key`, `role`, `content`)
+    /// carry meaning; the rest are filled with neutral defaults.
+    fn preamble_event(session_key: Option<&str>, role: &str, content: &str) -> MessageEvent {
+        MessageEvent {
+            id: 0,
+            event_id: format!("evt-{role}-{content}"),
+            idempotency_key: None,
+            workspace_id: "workspace-a".to_string(),
+            owner_id: None,
+            source: "chat".to_string(),
+            channel: Some("terminal".to_string()),
+            session_key: session_key.map(str::to_string),
+            parent_session_key: None,
+            run_id: None,
+            parent_run_id: None,
+            agent_id: None,
+            persona_id: None,
+            sender: Some("local-user".to_string()),
+            recipient: None,
+            role: role.to_string(),
+            content: content.to_string(),
+            content_hash: None,
+            raw_payload_json: None,
+            visibility: MemoryVisibility::Workspace,
+            created_at: "2026-03-05T00:00:00Z".to_string(),
+            updated_at: "2026-03-05T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn preamble_builders_read_merge_legacy_current_session_key() {
+        // D4 review: the prompt assembly layer must classify "current session"
+        // by the full candidate key set (canonical + legacy), matching the
+        // read-merge already done in the memory store layer.
+        let principal = MemoryPrincipal {
+            workspace_id: "workspace-a".to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("chat:canonical".to_string()),
+            channel: Some("terminal".to_string()),
+            sender: Some("local-user".to_string()),
+            owner_id: None,
+            legacy_session_key: Some("chat:legacy".to_string()),
+        };
+
+        let events = vec![
+            // Canonical current-session event.
+            preamble_event(Some("chat:canonical"), "user", "canonical current fact"),
+            // Legacy current-session event (pre-cutover key).
+            preamble_event(Some("chat:legacy"), "assistant", "legacy current fact"),
+            // Genuinely cross-session shared event (neither candidate key).
+            preamble_event(Some("gateway:external:1"), "user", "external shared fact"),
+        ];
+
+        let current = build_current_session_events_preamble(&principal, &events, "what is current");
+        // (1) Both canonical AND legacy current-session events land in the
+        // current-session preamble.
+        assert!(
+            current.contains("canonical current fact"),
+            "canonical current-session event missing from current preamble: {current}"
+        );
+        assert!(
+            current.contains("legacy current fact"),
+            "legacy current-session event must read-merge into current preamble: {current}"
+        );
+        // The cross-session event must NOT be treated as current session.
+        assert!(
+            !current.contains("external shared fact"),
+            "cross-session event must not enter current preamble: {current}"
+        );
+
+        let shared = build_shared_events_preamble(&principal, &events);
+        // (2) Only the genuinely cross-session event reaches the shared preamble.
+        assert!(
+            shared.contains("external shared fact"),
+            "cross-session event must appear in shared preamble: {shared}"
+        );
+        // (3) The legacy current-session event must NOT leak into shared events.
+        assert!(
+            !shared.contains("legacy current fact"),
+            "legacy current-session event must not leak into shared preamble: {shared}"
+        );
+        assert!(
+            !shared.contains("canonical current fact"),
+            "canonical current-session event must not leak into shared preamble: {shared}"
         );
     }
 
