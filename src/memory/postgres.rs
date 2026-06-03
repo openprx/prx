@@ -1,4 +1,4 @@
-use super::principal::{ChatType, MemoryWriteContext, Principal, Role, Visibility, classify_memory};
+use super::principal::{ChatType, MemoryWriteContext, Principal, Role, ScopeParam, Visibility, classify_memory};
 use super::traits::{
     CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
     DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent,
@@ -16,6 +16,22 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// D11: lower the shared dialect-agnostic scope parameters into owned strings
+/// that the Postgres backend can bind by reference.
+///
+/// Every scope bind is a text column, so each [`ScopeParam`] becomes a `String`.
+/// Returning owned values lets the caller hold them alive for the duration of
+/// the `client.query` call and bind `&String` (which implements
+/// `postgres::types::ToSql`) — keeping the query fully parameterized (rule 9).
+fn scope_params_to_strings(params: Vec<ScopeParam>) -> Vec<String> {
+    params
+        .into_iter()
+        .map(|param| match param {
+            ScopeParam::Text(text) => text,
+        })
+        .collect()
+}
 
 /// Maximum allowed connect timeout (seconds) to avoid unreasonable waits.
 const POSTGRES_CONNECT_TIMEOUT_CAP_SECS: u64 = 300;
@@ -2381,9 +2397,9 @@ impl Memory for PostgresMemory {
         let qualified_table = self.qualified_table.clone();
         let query = query.trim().to_string();
         let sid = session_id.map(str::to_string);
-        let channel = context.channel.clone();
-        let chat_id = context.chat_id.clone();
-        let raw_sender = context.raw_sender.clone();
+        // D11: the visibility scope is now derived from the resolved `principal`
+        // (shared predicate), so the raw context triple is no longer bound into
+        // the recall SQL. `sender_id` is still needed for the RLS owner context.
         let sender_id = context.sender_id.clone().or_else(|| {
             if context.channel.is_some() && context.raw_sender.is_some() {
                 Some(format!(
@@ -2410,6 +2426,16 @@ impl Memory for PostgresMemory {
             .filter(|owner| !owner.trim().is_empty())
             .map(str::to_string);
 
+        // D11: render the ACL visibility scope from the shared, dialect-agnostic
+        // predicate (single source with SQLite). The fixed parameters are
+        // $1=query, $2=session_id, $3=limit, so the scope predicate is rendered
+        // with `$N` starting at $4 and its values appended after them. This
+        // tightens the Postgres scope to the SQLite canonical truth table,
+        // removing the previously over-permissive `visibility IS NULL` /
+        // `visibility IN ('workspace', ...)` allow paths.
+        let (scope_sql, scope_params) = principal.build_sql_scope_pg(4);
+        let scope_values = scope_params_to_strings(scope_params);
+
         let rows = tokio::task::spawn_blocking(move || -> Result<Vec<MemoryEntry>> {
             let stmt = format!(
                 "
@@ -2422,20 +2448,7 @@ impl Memory for PostgresMemory {
                 FROM {qualified_table}
                 WHERE ($2::TEXT IS NULL OR session_id = $2)
                   AND ($1 = '' OR key ILIKE '%' || $1 || '%' OR content ILIKE '%' || $1 || '%')
-                  AND COALESCE(sensitivity, 'normal') != 'secret'
-                  AND (
-                      visibility IS NULL
-                      OR visibility IN ('workspace', 'public')
-                      OR (
-                          $4::TEXT IS NOT NULL
-                          AND $5::TEXT IS NOT NULL
-                          AND $6::TEXT IS NOT NULL
-                          AND channel = $4
-                          AND chat_id = $5
-                          AND raw_sender = $6
-                      )
-                      OR ($7::TEXT IS NOT NULL AND sender_id = $7)
-                  )
+                  AND ({scope_sql})
                 ORDER BY score DESC, updated_at DESC
                 LIMIT $3
                 "
@@ -2445,10 +2458,11 @@ impl Memory for PostgresMemory {
             let limit_i64 = fetch_limit.max(1) as i64;
             let rows = client.with_client(|client| {
                 Self::apply_rls_context_raw(client, rls_system, rls_owner.as_deref())?;
-                Ok(client.query(
-                    &stmt,
-                    &[&query, &sid, &limit_i64, &channel, &chat_id, &raw_sender, &sender_id],
-                )?)
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&query, &sid, &limit_i64];
+                for value in &scope_values {
+                    params.push(value);
+                }
+                Ok(client.query(&stmt, &params)?)
             })?;
             rows.iter()
                 .map(Self::row_to_entry)
