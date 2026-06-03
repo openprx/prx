@@ -1123,9 +1123,23 @@ async fn run_gateway_chat_with_multimodal(
     let event_recording = state.config.lock().memory.event_recording_config();
     let fabric = MemoryFabric::new(state.mem.clone(), workspace_id.clone()).with_event_recording(event_recording);
     let run_id = Uuid::new_v4().to_string();
+    // D4 C4: migrate the gateway fabric durable session_key to the recipient-aware
+    // canonical (`gateway:{channel}:{sender}:{recipient}`) while carrying the
+    // pre-cutover legacy key (`gateway:webhook:{target}` / `gateway:{ch}:{sender}`)
+    // for read-merge, so existing legacy history stays visible under the new key.
+    let legacy_session_key = fabric_ctx.session_key.clone();
+    let canonical_session_key = RuntimeEnvelope::gateway(
+        workspace_id.clone(),
+        legacy_session_key.clone(),
+        fabric_ctx.channel.clone(),
+        fabric_ctx.sender.clone(),
+        fabric_ctx.recipient.clone(),
+        MemoryVisibility::Session,
+    )
+    .canonical_session_key();
     let runtime_envelope = RuntimeEnvelope::gateway(
         workspace_id,
-        fabric_ctx.session_key.clone(),
+        canonical_session_key,
         fabric_ctx.channel.clone(),
         fabric_ctx.sender.clone(),
         fabric_ctx.recipient.clone(),
@@ -1134,7 +1148,8 @@ async fn run_gateway_chat_with_multimodal(
         // content to the whole workspace; Session keeps it bound to this session.
         MemoryVisibility::Session,
     )
-    .with_run_id(run_id);
+    .with_run_id(run_id)
+    .with_legacy_session_key(legacy_session_key);
     let base_scope = runtime_envelope.message_scope();
     authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:user", ResourceRiskLevel::Low).map_err(
         |(_, body)| {
@@ -2821,21 +2836,21 @@ mod tests {
         .into_response();
         assert_eq!(response.status(), StatusCode::OK);
 
+        // D4 C4: the durable session_key is now the recipient-aware canonical
+        // (`gateway:webhook:client-a:prx`). Recalling by the canonical key (what
+        // the production envelope reads) returns both events.
+        let canonical_principal = MemoryPrincipal {
+            workspace_id: tmp.path().to_string_lossy().to_string(),
+            agent_id: None,
+            persona_id: None,
+            session_key: Some("gateway:webhook:client-a:prx".to_string()),
+            channel: Some("webhook".to_string()),
+            sender: Some("client-a".to_string()),
+            owner_id: None,
+            legacy_session_key: None,
+        };
         let events = memory
-            .list_message_events_since(
-                &MemoryPrincipal {
-                    workspace_id: tmp.path().to_string_lossy().to_string(),
-                    agent_id: None,
-                    persona_id: None,
-                    session_key: Some("gateway:webhook:client-a".to_string()),
-                    channel: Some("webhook".to_string()),
-                    sender: Some("client-a".to_string()),
-                    owner_id: None,
-                    legacy_session_key: None,
-                },
-                0,
-                10,
-            )
+            .list_message_events_since(&canonical_principal, 0, 10)
             .await
             .unwrap();
 
@@ -2844,6 +2859,7 @@ mod tests {
         assert_eq!(events[0].channel.as_deref(), Some("webhook"));
         assert_eq!(events[0].role, "user");
         assert_eq!(events[0].content, "hello gateway");
+        assert_eq!(events[0].session_key.as_deref(), Some("gateway:webhook:client-a:prx"));
         assert_eq!(
             events[0].idempotency_key.as_deref(),
             Some("gateway:webhook:gateway-event-1")
@@ -2851,6 +2867,34 @@ mod tests {
         assert_eq!(events[1].role, "assistant");
         assert_eq!(events[1].content, "ok");
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+
+        // A principal still keyed on the legacy session_key only would NOT see the
+        // canonical events (single-key), but a read-merge principal carrying the
+        // legacy key as `legacy_session_key` recalls them (D4 union).
+        let legacy_only = MemoryPrincipal {
+            session_key: Some("gateway:webhook:client-a".to_string()),
+            ..canonical_principal.clone()
+        };
+        assert!(
+            memory
+                .list_message_events_since(&legacy_only, 0, 10)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let read_merge = MemoryPrincipal {
+            session_key: Some("gateway:webhook:client-a:prx".to_string()),
+            legacy_session_key: Some("gateway:webhook:client-a".to_string()),
+            ..canonical_principal
+        };
+        assert_eq!(
+            memory
+                .list_message_events_since(&read_merge, 0, 10)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -3469,6 +3513,56 @@ mod tests {
 
     fn compute_whatsapp_signature_header(secret: &str, body: &[u8]) -> String {
         format!("sha256={}", compute_whatsapp_signature_hex(secret, body))
+    }
+
+    // D4 C4: gateway fabric durable session_key migrates to the recipient-aware
+    // canonical while the legacy key is carried for read-merge.
+    #[test]
+    fn d4_gateway_fabric_durable_key_is_canonical_with_legacy_read_merge() {
+        // webhook ingress
+        let webhook = GatewayFabricContext::generic_webhook(Some("client-42"), None);
+        assert_eq!(webhook.session_key, "gateway:webhook:client-42"); // legacy form
+        let canonical = RuntimeEnvelope::gateway(
+            "ws",
+            webhook.session_key.clone(),
+            webhook.channel.clone(),
+            webhook.sender.clone(),
+            webhook.recipient.clone(),
+            MemoryVisibility::Session,
+        )
+        .canonical_session_key();
+        // canonical is recipient-aware: gateway:{channel}:{sender}:{recipient}
+        assert_eq!(canonical, "gateway:webhook:client-42:prx");
+        assert_ne!(canonical, webhook.session_key);
+
+        // The migrated envelope writes/reads the canonical durable key and carries
+        // the legacy key for read-merge.
+        let envelope = RuntimeEnvelope::gateway(
+            "ws",
+            canonical.clone(),
+            webhook.channel.clone(),
+            webhook.sender.clone(),
+            webhook.recipient.clone(),
+            MemoryVisibility::Session,
+        )
+        .with_legacy_session_key(webhook.session_key.clone());
+        assert_eq!(
+            envelope.message_scope().session_key.as_deref(),
+            Some(canonical.as_str())
+        );
+        let principal = envelope.memory_principal();
+        assert_eq!(principal.session_key.as_deref(), Some(canonical.as_str()));
+        assert_eq!(
+            principal.legacy_session_key.as_deref(),
+            Some("gateway:webhook:client-42")
+        );
+        assert_eq!(
+            principal.session_key_candidates(),
+            vec![
+                "gateway:webhook:client-42:prx".to_string(),
+                "gateway:webhook:client-42".to_string()
+            ]
+        );
     }
 
     #[test]
