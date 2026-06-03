@@ -133,7 +133,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             } else {
                 info!("🧠 Starting OpenPRX Daemon on {host}:{port}");
             }
-            daemon::run(config, host, port).await
+            // D5/D9 step 4: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            daemon::run(config, host, port, shutdown).await
         }
 
         Commands::Status => {

@@ -13,11 +13,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
+use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 const MANUAL_DAEMON_STALE_SECONDS: i64 = 30;
 
-pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
+pub async fn run(config: Config, host: String, port: u16, shutdown: CancellationToken) -> Result<()> {
     ensure_manual_daemon_start_allowed(&config)?;
 
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
@@ -252,7 +253,14 @@ pub async fn run(config: Config, host: String, port: u16) -> Result<()> {
     println!("   Ctrl+C to stop");
     systemd_notify::ready();
 
-    tokio::signal::ctrl_c().await?;
+    // D5/D9 step 4: wait for either the external root shutdown token (e.g. the
+    // dispatch-owned signal task wired in A6) or a direct ctrl_c as a fallback.
+    // The abort-based teardown below is preserved verbatim: the daemon performs
+    // a stateless exit and must not be turned into a graceful child-await.
+    tokio::select! {
+        () = shutdown.cancelled() => {}
+        res = tokio::signal::ctrl_c() => res?,
+    }
     crate::health::mark_component_error("daemon", "shutdown requested");
     systemd_notify::stopping();
 
