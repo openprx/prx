@@ -897,6 +897,145 @@ mod tests {
         assert_eq!(params.len(), 8);
     }
 
+    /// Extract the textual payload of a rusqlite `Value` for exact golden
+    /// assertions. The scope predicate only ever binds `Value::Text`, so any
+    /// other variant is a regression and fails the test loudly.
+    fn text_of(value: &Value) -> &str {
+        match value {
+            Value::Text(s) => s.as_str(),
+            other => panic!("test: expected Value::Text in scope params, got {other:?}"),
+        }
+    }
+
+    fn texts(params: &[Value]) -> Vec<&str> {
+        params.iter().map(text_of).collect()
+    }
+
+    // ----------------------------------------------------------------------
+    // D11 A0: byte-exact golden tests for build_sql_scope. These assert the
+    // COMPLETE SQL string and the ORDERED parameter values (not just
+    // `contains` + length), forming the safety net that proves the A1
+    // refactor keeps build_sql_scope byte-for-byte identical.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn golden_build_sql_scope_owner_exact() {
+        let principal = base_principal(Role::Owner, Visibility::Public);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(scope, "1=1");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn golden_build_sql_scope_acl_disabled_exact() {
+        // A non-owner with acl_enforced = false short-circuits to "1=1".
+        let mut principal = base_principal(Role::Member, Visibility::Public);
+        principal.acl_enforced = false;
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(scope, "1=1");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn golden_build_sql_scope_anonymous_exact() {
+        let principal = base_principal(Role::Anonymous, Visibility::Private);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR (channel = ? AND chat_id = ? AND raw_sender = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1", "sender-1"]);
+    }
+
+    #[test]
+    fn golden_build_sql_scope_private_ceiling_exact() {
+        let principal = base_principal(Role::Guest, Visibility::Private);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1"]);
+    }
+
+    #[test]
+    fn golden_build_sql_scope_user_ceiling_exact() {
+        let principal = base_principal(Role::Member, Visibility::User);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?) OR \
+             (visibility = 'user' AND sender_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1", "u1"]);
+    }
+
+    #[test]
+    fn golden_build_sql_scope_group_ceiling_exact() {
+        let principal = base_principal(Role::Member, Visibility::Group);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?) OR \
+             (visibility = 'user' AND sender_id = ?) OR \
+             (visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1", "u1", "telegram", "chat-1"]);
+    }
+
+    #[test]
+    fn golden_build_sql_scope_project_ceiling_exact() {
+        // Exercises the dynamically built `?,?` placeholder run in the project
+        // sub-query (the most refactor-fragile segment).
+        let principal = base_principal(Role::Member, Visibility::Project);
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?) OR \
+             (visibility = 'user' AND sender_id = ?) OR \
+             (visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?) OR \
+             (visibility = 'project' AND topic_id IN (\
+SELECT t.id FROM topics t \
+INNER JOIN topic_participants tp ON tp.topic_id = t.id \
+WHERE t.project IN (?,?) \
+AND tp.user_id = ?\
+))) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(
+            texts(&params),
+            vec![
+                "telegram", "chat-1", "u1", "telegram", "chat-1", "proj-a", "proj-b", "u1"
+            ]
+        );
+    }
+
+    #[test]
+    fn golden_build_sql_scope_project_ceiling_empty_projects_omits_subquery() {
+        // Project ceiling but no project memberships -> the project branch is
+        // omitted entirely (no dangling placeholders).
+        let mut principal = base_principal(Role::Member, Visibility::Project);
+        principal.projects = Vec::new();
+        let (scope, params) = principal.build_sql_scope();
+        assert_eq!(
+            scope,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = ? AND chat_id = ?) OR \
+             (visibility = 'user' AND sender_id = ?) OR \
+             (visibility = 'group' AND chat_type = 'group' AND channel = ? AND chat_id = ?)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(texts(&params), vec!["telegram", "chat-1", "u1", "telegram", "chat-1"]);
+    }
+
     #[test]
     fn post_filter_applies_nfkc_and_regex() {
         let mut principal = base_principal(Role::Guest, Visibility::Public);
