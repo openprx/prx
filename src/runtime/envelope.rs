@@ -425,6 +425,39 @@ impl RuntimeEnvelope {
     /// source/channel/sender/recipient), so the cross-mode convergence is
     /// verified at the derivation layer; a recipient-aware durable-key migration
     /// is deferred to a dedicated wave.
+    ///
+    /// # Session contract across `chat` / `gateway` / `channels` (D7)
+    ///
+    /// `canonical_session_key` is the *one* shared layer between the three
+    /// session subsystems. Everything else about how they store and reload a
+    /// conversation differs, which is why D7 deliberately does **not** abstract
+    /// a `trait SessionManager{load,save,list}` over them — the common contract
+    /// surface measures ~8% (well under the 50% threshold the layer-D plan set
+    /// for introducing a shared trait). Forcing a trait would only yield
+    /// per-implementation `downcast`/empty/`unimplemented!()` methods (a dead
+    /// abstraction that violates iron rules 2/3), so D7 stops at unifying the
+    /// key-derivation layer (this method) plus documenting the contract here.
+    /// This mirrors the prior P1-27 decision (single-implementer presentation
+    /// stack → no `ModeRunner` trait).
+    ///
+    /// | dimension | `chat` | `gateway` | `channels` |
+    /// |---|---|---|---|
+    /// | storage | single `MemoryEntry` JSON blob (whole-session) | `conversation_turns` rows (append-only) + `conversation_sessions` meta | in-process `HashMap<String, Vec<ChatMessage>>` cache + `conversation_turns` rows |
+    /// | key model | `chat_session:{id}` (session-id basis, **not** via `canonical_session_key`) | `console` envelope key | `ConversationKey{canonical, legacy}`: canonical via `canonical_session_key`, legacy `{channel}_{sender}` |
+    /// | load | exact `get(chat_session:{id})` → deser blob; latest = `list` + filter + sort | meta `get_conversation_session` then paged `list_conversation_turns` | `merged_history` = read-merge **union** of canonical + legacy keys from the cache |
+    /// | save | whole-blob **overwrite** (Pure-mode single-writer via `Effect::SaveSession`, `dual_write_guard` suppresses legacy side-writes) | per-turn **append** (never overwrites) | cache push + per-turn DB **append** |
+    /// | invariant | Pure-mode single-source persistence | append-only | read-merge union; legacy key **read-only, never moved/deleted** (`fdfd8ec0`) |
+    ///
+    /// Three storage models, three key models, three load return shapes
+    /// (`Option<ChatSession>` / paged `Vec<SessionMessage>` / `Vec<ChatMessage>`)
+    /// — there is no shared `Session` type or `save`/`list` semantics to abstract,
+    /// only this key derivation. The `chat` blob key is intentionally kept on its
+    /// `chat_session:{id}` form (see the durable-key migration note above); see
+    /// [`crate::chat::session::ChatSession::memory_key`] for that special case.
+    ///
+    /// Error semantics are unified separately by D10 (load paths distinguish
+    /// `None` "no such session" from `Err` storage failure and fail fast), not by
+    /// a trait — each subsystem's degradation strategy stays storage-specific.
     #[must_use]
     pub fn canonical_session_key(&self) -> String {
         fn component(value: Option<&str>) -> &str {

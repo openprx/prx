@@ -117,6 +117,16 @@ impl ChatSession {
     }
 
     /// Memory key for storing this session.
+    ///
+    /// Chat is the one session subsystem whose durable key is **not** derived
+    /// through [`crate::runtime::RuntimeEnvelope::canonical_session_key`]: the
+    /// whole session is persisted as a single JSON blob under
+    /// `chat_session:{id}` (a session-id basis, no channel/sender/recipient
+    /// component). This `session-id` form is kept deliberately — the recipient-
+    /// aware durable-key migration is deferred to a dedicated wave (see the D7
+    /// session-contract notes on `canonical_session_key`). Chat still derives a
+    /// consistent canonical identity at the envelope layer for cross-mode recall;
+    /// only this blob storage key stays on the legacy format.
     pub fn memory_key(&self) -> String {
         format!("{SESSION_MEMORY_PREFIX}:{}", self.id)
     }
