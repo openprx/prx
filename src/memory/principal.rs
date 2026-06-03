@@ -370,6 +370,40 @@ impl Principal {
             .collect();
         (sql, params)
     }
+
+    /// Postgres renderer (`$N` placeholders).
+    ///
+    /// Renders the shared [`build_scope_predicate`](Self::build_scope_predicate)
+    /// into Postgres SQL whose bind points start at `$start_index` and increment
+    /// by one per bind marker, in template order. The caller appends the returned
+    /// [`ScopeParam`] values to its existing `$1..$(start_index - 1)` parameters,
+    /// preserving order. Each marker maps to exactly one positional parameter
+    /// (no `$N` reuse), matching the one-param-per-marker invariant of the
+    /// dialect-agnostic predicate.
+    ///
+    /// `start_index` must be >= 1 (the index of the first scope parameter in the
+    /// caller's full parameter slice). The returned SQL is fully parameterized;
+    /// no value is interpolated into the SQL text (iron rule 9).
+    pub fn build_sql_scope_pg(&self, start_index: usize) -> (String, Vec<ScopeParam>) {
+        let predicate = self.build_scope_predicate();
+
+        // Replace each marker with `$N` left-to-right, N starting at
+        // start_index. The marker count equals predicate.params.len() (asserted
+        // in tests), so the final index lines up with the appended params.
+        let mut sql = String::with_capacity(predicate.template.len());
+        let mut next_index = start_index;
+        let mut rest = predicate.template.as_str();
+        while let Some(pos) = rest.find(SCOPE_BIND_MARKER) {
+            sql.push_str(&rest[..pos]);
+            sql.push('$');
+            sql.push_str(&next_index.to_string());
+            next_index += 1;
+            rest = &rest[pos + SCOPE_BIND_MARKER.len()..];
+        }
+        sql.push_str(rest);
+
+        (sql, predicate.params)
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1162,6 +1196,108 @@ AND tp.user_id = ?\
         let disabled = member.build_scope_predicate();
         assert_eq!(disabled.template, "1=1");
         assert!(disabled.params.is_empty());
+    }
+
+    // ----------------------------------------------------------------------
+    // D11 A2: Postgres `$N` renderer. Numbering must start at start_index,
+    // increment by one per bind marker, leave no markers behind, and keep the
+    // param list identical (same order) to the dialect-agnostic predicate.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn build_sql_scope_pg_owner_is_unconditional() {
+        let principal = base_principal(Role::Owner, Visibility::Public);
+        let (sql, params) = principal.build_sql_scope_pg(4);
+        assert_eq!(sql, "1=1");
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn build_sql_scope_pg_recall_start_index_four() {
+        // recall_with_context binds query=$1, sid=$2, limit=$3, so the scope
+        // predicate starts at $4. Anonymous => three triple params at $4,$5,$6.
+        let principal = base_principal(Role::Anonymous, Visibility::Private);
+        let (sql, params) = principal.build_sql_scope_pg(4);
+        assert_eq!(
+            sql,
+            "(visibility = 'public' OR (channel = $4 AND chat_id = $5 AND raw_sender = $6)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(
+            params,
+            vec![
+                ScopeParam::Text("telegram".to_string()),
+                ScopeParam::Text("chat-1".to_string()),
+                ScopeParam::Text("sender-1".to_string()),
+            ]
+        );
+        assert!(!sql.contains(SCOPE_BIND_MARKER));
+    }
+
+    #[test]
+    fn build_sql_scope_pg_forget_start_index_two() {
+        // forget_with_context binds key=$1, so the scope predicate starts at $2.
+        let principal = base_principal(Role::Anonymous, Visibility::Private);
+        let (sql, params) = principal.build_sql_scope_pg(2);
+        assert_eq!(
+            sql,
+            "(visibility = 'public' OR (channel = $2 AND chat_id = $3 AND raw_sender = $4)) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(params.len(), 3);
+    }
+
+    #[test]
+    fn build_sql_scope_pg_project_ceiling_numbers_all_markers_sequentially() {
+        // The most marker-dense branch: 8 binds. Starting at $4 they must run
+        // $4..$11 with no gaps, no reuse, no leftover markers.
+        let principal = base_principal(Role::Member, Visibility::Project);
+        let (sql, params) = principal.build_sql_scope_pg(4);
+        assert_eq!(
+            sql,
+            "(visibility = 'public' OR \
+             (visibility = 'private' AND chat_type = 'dm' AND channel = $4 AND chat_id = $5) OR \
+             (visibility = 'user' AND sender_id = $6) OR \
+             (visibility = 'group' AND chat_type = 'group' AND channel = $7 AND chat_id = $8) OR \
+             (visibility = 'project' AND topic_id IN (\
+SELECT t.id FROM topics t \
+INNER JOIN topic_participants tp ON tp.topic_id = t.id \
+WHERE t.project IN ($9,$10) \
+AND tp.user_id = $11\
+))) \
+             AND sensitivity != 'secret'"
+        );
+        assert_eq!(params.len(), 8);
+        assert!(!sql.contains(SCOPE_BIND_MARKER));
+        // The highest placeholder is start_index + count - 1.
+        assert!(sql.contains("$11"));
+        assert!(!sql.contains("$12"));
+    }
+
+    #[test]
+    fn build_sql_scope_pg_params_match_sqlite_param_values_and_order() {
+        // The PG renderer and the SQLite renderer must surface the exact same
+        // bound values in the same order; only the placeholder syntax differs.
+        for principal in [
+            base_principal(Role::Anonymous, Visibility::Private),
+            base_principal(Role::Member, Visibility::Group),
+            base_principal(Role::Member, Visibility::Project),
+        ] {
+            let (_sqlite_sql, sqlite_params) = principal.build_sql_scope();
+            let (_pg_sql, pg_params) = principal.build_sql_scope_pg(4);
+            let sqlite_texts: Vec<&str> = sqlite_params.iter().map(text_of).collect();
+            let pg_texts: Vec<&str> = pg_params
+                .iter()
+                .map(|p| match p {
+                    ScopeParam::Text(s) => s.as_str(),
+                })
+                .collect();
+            assert_eq!(
+                sqlite_texts, pg_texts,
+                "param value/order drift for {:?}",
+                principal.role
+            );
+        }
     }
 
     #[test]
