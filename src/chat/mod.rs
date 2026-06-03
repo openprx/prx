@@ -532,25 +532,45 @@ fn autosave_memory_key(prefix: &str) -> String {
     format!("{prefix}:{ts}")
 }
 
+/// Extract the raw chat session id from the legacy `chat:{id}` durable key.
+///
+/// D4 C6: the durable `session_key` is migrated to a stable canonical derived
+/// from the immutable session id, so the helpers need the bare id. Defensive:
+/// if the key is not in `chat:{id}` form it is returned unchanged (the canonical
+/// derivation then keys on the whole string, still stable).
+fn chat_session_id_from_key(chat_session_key: &str) -> &str {
+    chat_session_key.strip_prefix("chat:").unwrap_or(chat_session_key)
+}
+
+/// Build a chat message-event write scope on the stable durable-canonical
+/// `session_key` (D4 C6).
+///
+/// The durable `session_key` is the recipient-aware canonical derived from the
+/// session id (`chat:terminal:local-user:{id}`), NOT the legacy `chat:{id}`, and
+/// NOT `{provider}/{model}` (which would split one conversation across model
+/// switches). provider/model is recorded on the event's `recipient` field only —
+/// it does not feed the durable `session_key`. The legacy `chat:{id}` key is
+/// carried for read-merge so pre-cutover history stays visible.
 fn chat_message_event_scope(
     chat_session_key: &str,
     chat_run_id: &str,
     provider_name: &str,
     model_name: &str,
 ) -> MessageEventScope {
-    RuntimeEnvelope::chat_terminal("workspace", chat_session_key.to_string(), MemoryVisibility::Workspace)
+    let chat_session_id = chat_session_id_from_key(chat_session_key);
+    RuntimeEnvelope::chat_canonical("workspace", chat_session_id, MemoryVisibility::Workspace)
         .with_recipient(format!("{provider_name}/{model_name}"))
         .with_run_id(chat_run_id.to_string())
         .message_scope()
 }
 
+/// Build the chat read envelope on the same stable durable-canonical
+/// `session_key` as the write scope (D4 C6), carrying the legacy `chat:{id}` key
+/// for read-merge so the read principal unions canonical + legacy history.
 fn chat_runtime_envelope(workspace_id: &str, chat_session_key: &str) -> RuntimeEnvelope {
-    RuntimeEnvelope::chat_terminal(
-        workspace_id.to_string(),
-        chat_session_key.to_string(),
-        MemoryVisibility::Workspace,
-    )
-    .with_recipient("terminal:user")
+    let chat_session_id = chat_session_id_from_key(chat_session_key);
+    RuntimeEnvelope::chat_canonical(workspace_id.to_string(), chat_session_id, MemoryVisibility::Workspace)
+        .with_recipient("terminal:user")
 }
 
 fn chat_runtime_write_context(envelope: &RuntimeEnvelope) -> crate::memory::principal::MemoryWriteContext {
@@ -3992,13 +4012,18 @@ mod session_runtime_binding_tests {
         .await
         .unwrap();
 
+        // D4 C6: the durable session_key is now the stable canonical derived from
+        // the session id (NOT legacy chat:{id}, NOT {provider}/{model}). Recall by
+        // the canonical key — exactly what chat_runtime_envelope reads — returns
+        // both events.
+        let canonical_key = RuntimeEnvelope::chat_canonical_session_key(&session.id.to_string());
         let events = memory
             .list_message_events_since(
                 &MemoryPrincipal {
                     workspace_id: tmp.path().to_string_lossy().to_string(),
                     agent_id: None,
                     persona_id: None,
-                    session_key: Some(session_key.clone()),
+                    session_key: Some(canonical_key.clone()),
                     channel: Some("terminal".to_string()),
                     sender: Some("local-user".to_string()),
                     owner_id: None,
@@ -4011,6 +4036,9 @@ mod session_runtime_binding_tests {
             .unwrap();
 
         assert_eq!(events.len(), 2);
+        // The durable session_key truly changed to canonical (not just recipient).
+        assert_eq!(events[0].session_key.as_deref(), Some(canonical_key.as_str()));
+        assert_ne!(events[0].session_key.as_deref(), Some(session_key.as_str()));
         let user_recorded = events.first();
         let assistant_recorded = events.get(1);
         assert_eq!(user_recorded.map(|event| event.source.as_str()), Some("chat"));
@@ -4031,6 +4059,86 @@ mod session_runtime_binding_tests {
         assert_eq!(
             assistant_recorded.and_then(|event| event.recipient.as_deref()),
             Some("local-user")
+        );
+
+        // Write/read durable canonical strict equality (C6 / R6): the read
+        // envelope's principal session_key equals the persisted event session_key.
+        let read_envelope = chat_runtime_envelope(&tmp.path().to_string_lossy(), &session_key);
+        assert_eq!(
+            read_envelope.memory_principal().session_key.as_deref(),
+            Some(canonical_key.as_str())
+        );
+        assert_eq!(
+            read_envelope.message_scope().session_key.as_deref(),
+            Some(canonical_key.as_str())
+        );
+        // legacy chat:{id} carried for read-merge.
+        assert_eq!(
+            read_envelope.memory_principal().legacy_session_key.as_deref(),
+            Some(session_key.as_str())
+        );
+
+        // Read-merge proof on the session-key-filtered path. load_recent_session_context
+        // applies a hard `session_key` filter for every visibility, so it is the
+        // path where the canonical migration + legacy union actually matters. A
+        // pre-cutover legacy event must recall via read-merge under the canonical key.
+        memory
+            .append_message_event(crate::memory::MessageEventInput {
+                event_id: None,
+                idempotency_key: None,
+                workspace_id: tmp.path().to_string_lossy().to_string(),
+                owner_id: None,
+                source: "chat".to_string(),
+                channel: Some("terminal".to_string()),
+                session_key: Some(session_key.clone()),
+                parent_session_key: None,
+                run_id: None,
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                sender: Some("local-user".to_string()),
+                recipient: None,
+                role: "user".to_string(),
+                content: "legacy pre-cutover turn".to_string(),
+                raw_payload_json: None,
+                visibility: crate::memory::MemoryVisibility::Workspace,
+            })
+            .await
+            .unwrap();
+        let merged = memory
+            .load_recent_session_context(crate::memory::SessionContextQuery {
+                principal: read_envelope.memory_principal(),
+                since_event_id: None,
+                limit: 20,
+                include_roles: vec!["user".to_string(), "assistant".to_string()],
+            })
+            .await
+            .unwrap();
+        assert!(
+            merged.iter().any(|event| event.content == "legacy pre-cutover turn"),
+            "legacy history must read-merge under canonical key on the session-filtered path"
+        );
+        assert!(merged.iter().any(|event| event.content == "hello from chat"));
+
+        // Without the legacy key, the same session-filtered path sees only the
+        // canonical history (single-key degradation), not the legacy turn.
+        let canonical_only = crate::memory::MemoryPrincipal {
+            legacy_session_key: None,
+            ..read_envelope.memory_principal()
+        };
+        let single = memory
+            .load_recent_session_context(crate::memory::SessionContextQuery {
+                principal: canonical_only,
+                since_event_id: None,
+                limit: 20,
+                include_roles: vec!["user".to_string(), "assistant".to_string()],
+            })
+            .await
+            .unwrap();
+        assert!(single.iter().any(|event| event.content == "hello from chat"));
+        assert!(
+            !single.iter().any(|event| event.content == "legacy pre-cutover turn"),
+            "single-key path must NOT see legacy history"
         );
     }
 }
