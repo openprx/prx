@@ -87,6 +87,33 @@ pub(crate) struct SpawnExecutionContext {
     pub(crate) owner_id: Option<String>,
     pub(crate) topic_id: Option<String>,
     pub(crate) source_message_event_id: Option<String>,
+    /// D8-4: distinguishes a *turn root* context (seeded at a top-level
+    /// channel/chat/agent turn so its directly-spawned children inherit
+    /// `parent_run_id`) from a *spawn run* context (a sub-agent run that may
+    /// itself spawn). The turn root represents "the turn itself, before any
+    /// spawn nesting": its first child must compute `spawn_depth` 0 — exactly as
+    /// if no context were seeded — so seeding does not tighten the
+    /// `max_spawn_depth` boundary. A spawn run's child computes `+1` as before.
+    pub(crate) is_turn_root: bool,
+}
+
+impl SpawnExecutionContext {
+    /// Seed a *turn root* context for a top-level channel/chat/agent turn. The
+    /// per-turn `run_id` becomes the `parent_run_id` of any task this turn spawns
+    /// directly, while `spawn_depth` starts at 0 and — because `is_turn_root` is
+    /// true — the first child still computes depth 0 (no boundary tightening; see
+    /// `spawn_depth` computation in `execute`).
+    pub(crate) const fn seed_turn_context(run_id: String, session_scope_key: String) -> Self {
+        Self {
+            run_id,
+            session_scope_key,
+            spawn_depth: 0,
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
+            is_turn_root: true,
+        }
+    }
 }
 
 tokio::task_local! {
@@ -711,9 +738,17 @@ impl Tool for SessionsSpawnTool {
             .filter(|s| !s.is_empty());
         let spawn_scope = parse_spawn_scope(&args);
         let parent_exec_ctx = current_spawn_execution_context();
-        let spawn_depth = parent_exec_ctx
-            .as_ref()
-            .map_or(0, |ctx| ctx.spawn_depth.saturating_add(1));
+        // D8-4: a turn-root context represents the turn itself (zero spawn nesting
+        // so far); its first child must compute depth 0 — identical to the
+        // no-context case — so seeding a turn root never tightens the
+        // max_spawn_depth boundary. A real spawn-run context's child computes +1.
+        let spawn_depth = parent_exec_ctx.as_ref().map_or(0, |ctx| {
+            if ctx.is_turn_root {
+                ctx.spawn_depth
+            } else {
+                ctx.spawn_depth.saturating_add(1)
+            }
+        });
         let parent_run_id = parent_exec_ctx.as_ref().map(|ctx| ctx.run_id.clone());
         let session_scope_key = spawn_session_scope_key(parent_exec_ctx.as_ref(), spawn_scope.as_ref());
 
@@ -984,6 +1019,9 @@ impl Tool for SessionsSpawnTool {
                 owner_id: run_lineage.owner_id.clone(),
                 topic_id: run_lineage.topic_id.clone(),
                 source_message_event_id: run_lineage.source_message_event_id.clone(),
+                // A spawn-run context (this run may itself spawn): its children
+                // compute spawn_depth + 1.
+                is_turn_root: false,
             };
             let process_memory_fabric = memory_fabric.clone();
             let process_result_scope = spawn_scope_for_event.clone();
@@ -1149,6 +1187,9 @@ impl Tool for SessionsSpawnTool {
             owner_id: run_lineage.owner_id.clone(),
             topic_id: run_lineage.topic_id.clone(),
             source_message_event_id: run_lineage.source_message_event_id.clone(),
+            // A spawn-run context (this run may itself spawn): its children
+            // compute spawn_depth + 1.
+            is_turn_root: false,
         };
         let task_memory_fabric = memory_fabric.clone();
         let task_result_scope = spawn_scope_for_event.clone();
@@ -2914,11 +2955,95 @@ mod tests {
                     owner_id: Some("owner-a".to_string()),
                     topic_id: Some("topic-a".to_string()),
                     source_message_event_id: Some("msg-a".to_string()),
+                    // A real spawn-run parent (not a turn root): the next hop is
+                    // depth 1, which exceeds max_spawn_depth=0 and is rejected.
+                    is_turn_root: false,
                 },
                 async { tool.execute(json!({"task": "nested"})).await },
             )
             .await
             .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap_or_default().contains("max_spawn_depth"));
+    }
+
+    /// D8-4: a turn-root context (is_turn_root = true, spawn_depth = 0) must NOT
+    /// tighten the max_spawn_depth boundary. With max_spawn_depth = 0, a spawn
+    /// directly from a turn root computes the child's depth as 0 (identical to the
+    /// no-context case), so it is allowed — unlike a real spawn-run parent at
+    /// depth 0, which would compute depth 1 and be rejected (see
+    /// spawn_rejected_when_depth_exceeded above).
+    #[tokio::test]
+    async fn turn_root_seed_does_not_tighten_max_spawn_depth() {
+        let (ch, _) = RecordingChannel::new();
+        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
+        spawn_cfg.max_spawn_depth = 0;
+        let tool = make_tool_with_spawn_config(
+            Arc::new(ch),
+            Arc::new(EchoProvider { response: "ok".into() }),
+            spawn_cfg,
+        );
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        let result = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext::seed_turn_context(
+                    "turn-root-run".to_string(),
+                    "signal:+15551234567:openprx_user".to_string(),
+                ),
+                async { tool.execute(with_spawn_grant(json!({"task": "child of a turn"}))).await },
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.success,
+            "a turn-root seed must not tighten max_spawn_depth=0 (first child depth is 0)"
+        );
+
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(child.spawn_depth, 0, "turn-root first child must compute spawn_depth 0");
+        assert_eq!(
+            child.parent_run_id.as_deref(),
+            Some("turn-root-run"),
+            "child must inherit parent_run_id = the per-turn run_id"
+        );
+    }
+
+    /// D8-4: a real spawn-run parent at depth 0 (is_turn_root = false) is the
+    /// boundary the turn-root case must NOT mimic: its first child computes depth
+    /// 1, which exceeds max_spawn_depth = 0 and is rejected. This is the
+    /// complement of turn_root_seed_does_not_tighten_max_spawn_depth (same
+    /// spawn_depth = 0 seed, opposite is_turn_root, opposite outcome).
+    #[tokio::test]
+    async fn spawn_run_parent_at_depth_zero_still_rejects_next_hop() {
+        let (ch, _) = RecordingChannel::new();
+        let mut spawn_cfg = crate::config::SessionsSpawnConfig::default();
+        spawn_cfg.max_spawn_depth = 0;
+        let tool = make_tool_with_spawn_config(
+            Arc::new(ch),
+            Arc::new(EchoProvider { response: "ok".into() }),
+            spawn_cfg,
+        );
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        let result = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext {
+                    run_id: "spawn-run".to_string(),
+                    session_scope_key: "signal:+15551234567:openprx_user".to_string(),
+                    spawn_depth: 0,
+                    owner_id: None,
+                    topic_id: None,
+                    source_message_event_id: None,
+                    is_turn_root: false,
+                },
+                async { tool.execute(with_spawn_grant(json!({"task": "nested"}))).await },
+            )
+            .await
+            .unwrap();
+
         assert!(!result.success);
         assert!(result.error.unwrap_or_default().contains("max_spawn_depth"));
     }

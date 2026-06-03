@@ -2933,6 +2933,18 @@ async fn process_channel_message(
         policy_pipeline: Some(security_gen.pipeline.as_ref()),
     };
 
+    // D8-4: seed a turn-root spawn execution context so any sub-agent spawned
+    // directly from this channel turn inherits parent_run_id = the per-turn
+    // run_id (top-level lineage was previously None). spawn_depth starts at 0 and
+    // is_turn_root keeps the first child's depth at 0 (no max_spawn_depth
+    // tightening). The session scope key mirrors the spawn scope convention
+    // (channel:chat_id:sender) so children share the turn's session scope.
+    let turn_spawn_session_scope_key = format!("{}:{}:{}", msg.channel, msg.reply_target, msg.sender);
+    let turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+        turn_run_id.clone(),
+        turn_spawn_session_scope_key,
+    );
+
     let mut context_overflow_retries = 0usize;
     let mut timeout_retries = 0usize;
     let final_outcome = loop {
@@ -2942,6 +2954,8 @@ async fn process_channel_message(
             () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
             result = tokio::time::timeout(
                 Duration::from_secs(timeout_budget_secs),
+                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
+                turn_spawn_ctx.clone(),
                 run_tool_call_loop(
                     active_provider.as_ref(),
                     &mut history,
@@ -2970,6 +2984,7 @@ async fn process_channel_message(
                     Some(&ctx.tool_tiering),
                     Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
                     crate::agent::loop_::ChatMode::default(),
+                ),
                 ),
             ) => LlmExecutionResult::Completed(result),
         };

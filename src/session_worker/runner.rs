@@ -948,6 +948,9 @@ where
                     owner_id: manifest.owner_id.clone(),
                     topic_id: manifest.topic_id.clone(),
                     source_message_event_id: manifest.source_message_event_id.clone(),
+                    // A resumed spawn-run process (not a turn root): children
+                    // compute spawn_depth + 1, preserving the manifest depth chain.
+                    is_turn_root: false,
                 },
                 fut,
             )
