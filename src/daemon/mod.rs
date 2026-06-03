@@ -88,7 +88,11 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
                 max_backoff,
                 move || {
                     let cfg = channels_cfg.clone();
-                    async move { crate::channels::start_channels(cfg).await }
+                    // Supervised channels: the supervisor restarts on exit, so
+                    // it uses a never-cancelled token. See never_cancelled_shutdown.
+                    async move {
+                        crate::channels::start_channels(cfg, crate::runtime::shutdown::never_cancelled_shutdown()).await
+                    }
                 },
             ));
         } else {

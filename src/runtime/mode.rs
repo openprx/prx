@@ -290,7 +290,12 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
         },
 
         Commands::Channel { channel_command } => match channel_command {
-            ChannelCommands::Start => channels::start_channels(config).await,
+            ChannelCommands::Start => {
+                // D5/D9 step 5: placeholder shutdown token (never cancelled at
+                // this stage). The real root token + signal wiring lands in A6.
+                let shutdown = tokio_util::sync::CancellationToken::new();
+                channels::start_channels(config, shutdown).await
+            }
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
         },

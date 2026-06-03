@@ -2188,11 +2188,26 @@ fn strip_isolated_tool_tag_artifacts_inner(message: &str, known_tool_names: &Has
     if trim { result.trim().to_string() } else { result }
 }
 
+/// Outcome of one supervised `listen()` round (D5/D9 step 5).
+///
+/// Introduced to give the inner `select!` a single break type carrying either
+/// the listener's own result (drives the restart logic) or an explicit shutdown
+/// request. Without this, a shutdown branch could not break out of a `select!`
+/// arm that previously broke a bare `Result`, and a long-blocked `listen()`
+/// would leave `handles.await` (in `start_channels`) hung forever.
+enum ListenerOutcome {
+    /// `ch.listen()` returned; carries its result for the restart/backoff logic.
+    Listen(Result<()>),
+    /// The external shutdown token fired; stop the supervisor without restarting.
+    Shutdown,
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     tx: tokio::sync::mpsc::Sender<traits::ChannelMessage>,
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     spawn_supervised_listener_with_health_interval(
         ch,
@@ -2200,6 +2215,7 @@ fn spawn_supervised_listener(
         initial_backoff_secs,
         max_backoff_secs,
         Duration::from_secs(CHANNEL_HEALTH_HEARTBEAT_SECS),
+        shutdown,
     )
 }
 
@@ -2209,6 +2225,7 @@ fn spawn_supervised_listener_with_health_interval(
     initial_backoff_secs: u64,
     max_backoff_secs: u64,
     health_interval: Duration,
+    shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     let health_interval = if health_interval.is_zero() {
         Duration::from_secs(1)
@@ -2226,18 +2243,27 @@ fn spawn_supervised_listener_with_health_interval(
             crate::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let result = {
+            let outcome = {
                 let listen_future = ch.listen(tx.clone());
                 tokio::pin!(listen_future);
 
                 loop {
                     tokio::select! {
+                        () = shutdown.cancelled() => break ListenerOutcome::Shutdown,
                         _ = health.tick() => {
                             crate::health::mark_component_ok(&component);
                         }
-                        result = &mut listen_future => break result,
+                        result = &mut listen_future => break ListenerOutcome::Listen(result),
                     }
                 }
+            };
+
+            // Shutdown requested: stop supervising without restarting so the
+            // owning `handles.await` in start_channels can complete even when
+            // `listen()` would otherwise block indefinitely.
+            let result = match outcome {
+                ListenerOutcome::Shutdown => break,
+                ListenerOutcome::Listen(result) => result,
             };
 
             if tx.is_closed() {
@@ -3069,6 +3095,7 @@ async fn run_message_dispatch_loop(
     mut rx: tokio::sync::mpsc::Receiver<traits::ChannelMessage>,
     ctx: Arc<ChannelRuntimeContext>,
     max_in_flight_messages: usize,
+    shutdown: CancellationToken,
 ) {
     // User messages always get full capacity — system tasks (webhooks, heartbeats)
     // get a separate, smaller pool (30% of max, min 1) so they can never starve
@@ -3084,7 +3111,17 @@ async fn run_message_dispatch_loop(
     ));
     let task_sequence = Arc::new(AtomicU64::new(1));
 
-    while let Some(msg) = rx.recv().await {
+    loop {
+        // D5/D9 step 5: observe the external shutdown token alongside inbound
+        // messages so the dispatch loop stops accepting new work promptly on a
+        // root cancel, rather than only when the channel closes.
+        let msg = tokio::select! {
+            () = shutdown.cancelled() => break,
+            maybe_msg = rx.recv() => match maybe_msg {
+                Some(msg) => msg,
+                None => break,
+            },
+        };
         let sem = if is_system_message(&msg) {
             Arc::clone(&system_semaphore)
         } else {
@@ -3928,7 +3965,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 
 /// Start all configured channels and route messages to the agent
 #[allow(clippy::too_many_lines)]
-pub async fn start_channels(config: Config) -> Result<()> {
+pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::ProviderRuntimeOptions {
         auth_profile_override: None,
@@ -4593,6 +4630,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
             tx.clone(),
             initial_backoff_secs,
             max_backoff_secs,
+            shutdown.clone(),
         ));
     }
     drop(tx); // Drop our copy so rx closes when all channels stop
@@ -4704,9 +4742,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
         skill_rag_ctx,
     });
 
-    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+    run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages, shutdown).await;
 
-    // Wait for all channel tasks
+    // Wait for all channel tasks. On shutdown the supervised listeners break out
+    // of their loops (ListenerOutcome::Shutdown above), so these joins complete
+    // instead of hanging on a still-running `listen()`.
     for h in handles {
         let _ = h.await;
     }
@@ -7695,7 +7735,7 @@ BTC is currently around $65,000 based on latest tool output."#
         drop(tx);
 
         let started = Instant::now();
-        run_message_dispatch_loop(rx, runtime_ctx, 2).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 2, CancellationToken::new()).await;
         let elapsed = started.elapsed();
 
         assert!(
@@ -7796,7 +7836,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -7909,7 +7949,7 @@ BTC is currently around $65,000 based on latest tool output."#
             .unwrap();
         });
 
-        run_message_dispatch_loop(rx, runtime_ctx, 4).await;
+        run_message_dispatch_loop(rx, runtime_ctx, 4, CancellationToken::new()).await;
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
@@ -9037,7 +9077,7 @@ After"#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener(channel, tx, 1, 1);
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, CancellationToken::new());
 
         tokio::time::sleep(Duration::from_millis(80)).await;
         drop(rx);
@@ -9080,7 +9120,14 @@ After"#;
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
-        let handle = spawn_supervised_listener_with_health_interval(channel, tx, 1, 1, Duration::from_millis(20));
+        let handle = spawn_supervised_listener_with_health_interval(
+            channel,
+            tx,
+            1,
+            1,
+            Duration::from_millis(20),
+            CancellationToken::new(),
+        );
 
         tokio::time::sleep(Duration::from_millis(35)).await;
         let first_last_ok = crate::health::snapshot_json()["components"][&component_name]["last_ok"]
@@ -9102,6 +9149,42 @@ After"#;
         let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
         assert!(join.is_ok(), "listener should stop after channel shutdown");
         assert!(calls.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn supervised_listener_stops_on_shutdown_without_restart() {
+        // D5/D9 step 5 regression: a listener blocked inside `listen()` must
+        // observe the external shutdown token and break out of its supervisor
+        // loop (ListenerOutcome::Shutdown) without restarting, so the owning
+        // `handles.await` can complete instead of hanging forever.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel_name = format!("test-supervised-shutdown-{}", uuid::Uuid::new_v4());
+        let channel: Arc<dyn Channel> = Arc::new(BlockUntilClosedChannel {
+            name: channel_name,
+            calls: Arc::clone(&calls),
+        });
+
+        // Keep our own `tx` clone alive so the channel never closes on its own:
+        // only the shutdown token should be able to stop the listener.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(1);
+        let shutdown = CancellationToken::new();
+        let handle = spawn_supervised_listener(channel, tx, 1, 1, shutdown.clone());
+
+        // Let the listener enter its blocking `listen()` (tx.closed()).
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert!(calls.load(Ordering::SeqCst) >= 1, "listener should have started");
+
+        // Request shutdown: the supervisor must break and the task must finish.
+        shutdown.cancel();
+        let join = tokio::time::timeout(Duration::from_secs(1), handle).await;
+        assert!(join.is_ok(), "listener should stop promptly on shutdown");
+
+        // It stopped via the shutdown branch, not a restart: only one listen call.
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "shutdown must not trigger a listener restart"
+        );
     }
 
     #[test]

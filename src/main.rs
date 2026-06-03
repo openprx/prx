@@ -1291,7 +1291,10 @@ async fn async_main() -> Result<()> {
             None
         };
         if let Some(config) = autostart_config {
-            channels::start_channels(config).await?;
+            // D5/D9 step 5: placeholder shutdown token (never cancelled at this
+            // stage). The real root token + signal wiring lands in A6.
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            channels::start_channels(config, shutdown).await?;
         }
         return Ok(());
     }
