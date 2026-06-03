@@ -1291,10 +1291,10 @@ async fn async_main() -> Result<()> {
             None
         };
         if let Some(config) = autostart_config {
-            // D5/D9 step 5: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-            channels::start_channels(config, shutdown).await?;
+            // Non-dispatch direct call (onboard autostart): no dispatch-level
+            // signal task is wired here, so use the explicitly-named
+            // never-cancelled token. Termination is via the process default.
+            channels::start_channels(config, crate::runtime::shutdown::never_cancelled_shutdown()).await?;
         }
         return Ok(());
     }
@@ -1326,16 +1326,16 @@ async fn async_main() -> Result<()> {
         config.config_path = tmpdir.path().join("config.toml");
 
         if let Some(msg) = message {
-            // D5/D9 step 2: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
+            // Non-dispatch direct call (`prx go --message`): no dispatch-level
+            // signal task is wired here, so use the explicitly-named
+            // never-cancelled token. Termination is via the process default.
             let result = agent::run(
                 config,
                 Some(msg.clone()),
                 None, // provider already set in config
                 None, // model already set in config
                 0.7,
-                shutdown,
+                crate::runtime::shutdown::never_cancelled_shutdown(),
             )
             .await;
             // Keep tmpdir alive until agent finishes, then drop
@@ -1343,16 +1343,18 @@ async fn async_main() -> Result<()> {
             return result.map(|_| ());
         }
 
-        // D5/D9 step 1: placeholder shutdown token (never cancelled at this
-        // stage). The real root token + signal wiring lands in A6.
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        // Non-dispatch direct call (`prx go` interactive chat): chat owns ctrl_c
+        // internally; no dispatch-level signal source. Use the explicitly-named
+        // never-cancelled token so chat's internal handler stays the sole owner.
         let result = chat::run(
-            config, None, // provider already set in config
+            config,
+            None, // provider already set in config
             None, // model already set in config
-            0.7, false, // plain mode off
+            0.7,
+            false, // plain mode off
             None,  // no session resume
             false, // don't list sessions
-            shutdown,
+            crate::runtime::shutdown::never_cancelled_shutdown(),
         )
         .await;
         // Keep tmpdir alive until chat finishes, then drop

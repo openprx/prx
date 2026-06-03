@@ -36,6 +36,7 @@
 //!   retention of `Commands` exhaustiveness.
 
 use anyhow::{Context, Result};
+use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::config::{self, Config};
@@ -50,6 +51,191 @@ use crate::{
     handle_approval_command, handle_audit_command, handle_auth_command, handle_memory_command, redact_config_show_value,
 };
 
+// ══════════════════════════════════════════════════════════════════════════════
+// D5/D9: ModeRunner trait + per-mode runners
+// ══════════════════════════════════════════════════════════════════════════════
+
+/// Unified entry point for the five long-running / ctrl_c-interruptible modes
+/// (chat / agent / gateway / daemon / channel-start).
+///
+/// Each implementor owns its own constructor arguments (config / host / port /
+/// …); [`run`](ModeRunner::run) only additionally receives the external **root**
+/// shutdown token. Red line (D5 scope): this trait unifies *signal plumbing only*
+/// — root token cancelled = "please begin graceful exit". Each mode keeps its own
+/// teardown ordering/semantics; the trait carries **no** `Arc<AppContext>` (that
+/// is bootstrapped inside each `run`) and introduces **no** `ModeOutcome` (all
+/// `run`s return `Result<()>`).
+#[async_trait::async_trait]
+pub trait ModeRunner: Send {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()>;
+}
+
+/// Interactive or single-shot chat session (graceful, ctrl_c-sensitive).
+pub struct ChatRunner {
+    pub config: Config,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub temperature: f64,
+    pub plain: bool,
+    pub session: Option<String>,
+    pub list_sessions: bool,
+}
+
+#[async_trait::async_trait]
+impl ModeRunner for ChatRunner {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+        let me = *self;
+        chat::run(
+            me.config,
+            me.provider,
+            me.model,
+            me.temperature,
+            me.plain,
+            me.session,
+            me.list_sessions,
+            shutdown,
+        )
+        .await
+    }
+}
+
+/// Agent loop — single-shot when `message` is set, otherwise interactive.
+pub struct AgentRunner {
+    pub config: Config,
+    pub message: Option<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub temperature: f64,
+}
+
+#[async_trait::async_trait]
+impl ModeRunner for AgentRunner {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+        let me = *self;
+        agent::run(me.config, me.message, me.provider, me.model, me.temperature, shutdown)
+            .await
+            .map(|_| ())
+    }
+}
+
+/// HTTP gateway server (graceful drain on shutdown).
+pub struct GatewayRunner {
+    pub host: String,
+    pub port: u16,
+    pub config: Config,
+}
+
+#[async_trait::async_trait]
+impl ModeRunner for GatewayRunner {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+        let me = *self;
+        // Direct `prx gateway` CLI path: no daemon-owned hot-reload watcher exists,
+        // so pass `None` and let run_gateway build its own SharedConfig fallback.
+        gateway::run_gateway(&me.host, me.port, me.config, None, shutdown).await
+    }
+}
+
+/// Background daemon (gateway + supervised channels, abort-style teardown).
+pub struct DaemonRunner {
+    pub config: Config,
+    pub host: String,
+    pub port: u16,
+}
+
+#[async_trait::async_trait]
+impl ModeRunner for DaemonRunner {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+        let me = *self;
+        daemon::run(me.config, me.host, me.port, shutdown).await
+    }
+}
+
+/// `prx channel start` — supervise all configured inbound channels.
+pub struct ChannelStartRunner {
+    pub config: Config,
+}
+
+#[async_trait::async_trait]
+impl ModeRunner for ChannelStartRunner {
+    async fn run(self: Box<Self>, shutdown: CancellationToken) -> Result<()> {
+        let me = *self;
+        channels::start_channels(me.config, shutdown).await
+    }
+}
+
+/// Whether `dispatch` should install a process-level signal task (SIGINT +
+/// SIGTERM on unix, ctrl_c elsewhere) that cancels the root shutdown token for
+/// this command (D5/D9 §3.3.3 explicit whitelist).
+///
+/// Only the four "long-running + gracefully signal-interruptible" modes opt in:
+/// gateway / daemon / channel-start / **single-shot** agent. Everything else —
+/// **chat**, **interactive** agent, and every query/management subcommand —
+/// returns `false`:
+///
+/// - chat owns ctrl_c internally (single-press cancels generation, double-press
+///   exits); a dispatch-level signal task would steal the first ctrl_c and break
+///   that contract.
+/// - interactive agent reads stdin synchronously and cannot `select!` a token;
+///   registering `ctrl_c()` would also rob the process of its default
+///   termination, deadlocking the session.
+///
+/// `command` is borrowed (`&Commands`) — `matches!` here must not move it, or the
+/// subsequent owning `match` in [`dispatch`] would fail to compile.
+pub const fn should_bind_signal(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Gateway { .. }
+            | Commands::Daemon { .. }
+            | Commands::Channel {
+                channel_command: ChannelCommands::Start
+            }
+    ) || matches!(
+        command,
+        Commands::Agent { message_pos, message, .. } if message.is_some() || message_pos.is_some()
+    )
+}
+
+/// Spawn the process-level shutdown signal task for whitelisted modes. On unix
+/// this listens for both SIGINT (ctrl_c) and SIGTERM; elsewhere ctrl_c only.
+/// First signal cancels the root token, asking the active mode to drain.
+fn spawn_signal_task(root: CancellationToken) {
+    tokio::spawn(async move {
+        #[cfg(unix)]
+        {
+            let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate());
+            match sigterm {
+                Ok(mut sigterm) => {
+                    tokio::select! {
+                        res = tokio::signal::ctrl_c() => {
+                            if let Err(e) = res {
+                                tracing::warn!("failed to listen for ctrl_c: {e}");
+                                return;
+                            }
+                        }
+                        _ = sigterm.recv() => {}
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("failed to register SIGTERM handler, ctrl_c only: {e}");
+                    if let Err(e) = tokio::signal::ctrl_c().await {
+                        tracing::warn!("failed to listen for ctrl_c: {e}");
+                        return;
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                tracing::warn!("failed to listen for ctrl_c: {e}");
+                return;
+            }
+        }
+        tracing::info!("shutdown signal received; requesting graceful shutdown");
+        root.cancel();
+    });
+}
+
 /// Dispatch a fully-parsed CLI command after the primary config load.
 ///
 /// This is the verbatim move of the former `main.rs` `match cli.command { ... }`
@@ -57,6 +243,17 @@ use crate::{
 /// `config` is the value previously bound from `Config::load_or_init_with_config_dir`.
 #[allow(clippy::too_many_lines)]
 pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
+    // D5/D9 §3.3.3: single root shutdown token for this dispatch. The signal
+    // source is installed via an *explicit whitelist* (see `should_bind_signal`)
+    // — only gateway / daemon / channel-start / single-shot agent get a
+    // dispatch-owned SIGINT+SIGTERM task. chat / interactive agent / query
+    // commands never do (chat owns ctrl_c internally; interactive agent must keep
+    // the process default termination). Borrow `&command` so the owning `match`
+    // below still consumes it.
+    let root_shutdown = CancellationToken::new();
+    if should_bind_signal(&command) {
+        spawn_signal_task(root_shutdown.clone());
+    }
     match command {
         Commands::Init { .. } => anyhow::bail!("BUG: Init command should have been handled earlier"),
         Commands::Onboard { .. } => anyhow::bail!("BUG: Onboard command should have been handled earlier"),
@@ -75,12 +272,19 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             // or via -m/--message. clap's `conflicts_with` guarantees at most one is
             // set, so `.or()` simply picks whichever was provided.
             let message = message.or(message_pos);
-            // D5/D9 step 2: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-            agent::run(config, message, provider, model, temperature, shutdown)
-                .await
-                .map(|_| ())
+            // D5/D9 (A6): drive via ModeRunner with the dispatch root token. A
+            // signal task is bound only for the single-shot case (see
+            // `should_bind_signal`); interactive agent receives the same token but
+            // no signal source ever cancels it (synchronous stdin path).
+            Box::new(AgentRunner {
+                config,
+                message,
+                provider,
+                model,
+                temperature,
+            })
+            .run(root_shutdown.clone())
+            .await
         }
 
         Commands::Chat {
@@ -91,10 +295,12 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             session,
             list_sessions,
         } => {
-            // D5/D9 step 1: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-            chat::run(
+            // D5/D9 (A6): drive via ModeRunner with the dispatch root token. chat
+            // is *not* whitelisted for a dispatch signal task — its internal
+            // ctrl_c single/double-press handler is the sole owner of ctrl_c and
+            // cancels this same root token. Passing it here keeps the plumbing
+            // uniform without introducing a competing external signal source.
+            Box::new(ChatRunner {
                 config,
                 provider,
                 model,
@@ -102,8 +308,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 plain,
                 session,
                 list_sessions,
-                shutdown,
-            )
+            })
+            .run(root_shutdown.clone())
             .await
         }
 
@@ -115,14 +321,11 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             } else {
                 info!("🚀 Starting OpenPRX Gateway on {host}:{port}");
             }
-            // Direct `prx gateway` CLI path: no daemon-owned hot-reload watcher
-            // exists, so pass `None` and let run_gateway build its own SharedConfig
-            // fallback (only the in-gateway ConfigReloadTool / API reload can update
-            // it; file-watch hot-reload is daemon-only).
-            // D5/D9 step 3: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-            gateway::run_gateway(&host, port, config, None, shutdown).await
+            // D5/D9 (A6): whitelisted — dispatch installs a SIGINT+SIGTERM signal
+            // task that cancels the root token; run_gateway drains gracefully.
+            Box::new(GatewayRunner { host, port, config })
+                .run(root_shutdown.clone())
+                .await
         }
 
         Commands::Daemon { port, host } => {
@@ -133,10 +336,11 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             } else {
                 info!("🧠 Starting OpenPRX Daemon on {host}:{port}");
             }
-            // D5/D9 step 4: placeholder shutdown token (never cancelled at this
-            // stage). The real root token + signal wiring lands in A6.
-            let shutdown = tokio_util::sync::CancellationToken::new();
-            daemon::run(config, host, port, shutdown).await
+            // D5/D9 (A6): whitelisted — dispatch installs a SIGINT+SIGTERM signal
+            // task that cancels the root token; daemon aborts its supervised tasks.
+            Box::new(DaemonRunner { config, host, port })
+                .run(root_shutdown.clone())
+                .await
         }
 
         Commands::Status => {
@@ -291,10 +495,10 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
 
         Commands::Channel { channel_command } => match channel_command {
             ChannelCommands::Start => {
-                // D5/D9 step 5: placeholder shutdown token (never cancelled at
-                // this stage). The real root token + signal wiring lands in A6.
-                let shutdown = tokio_util::sync::CancellationToken::new();
-                channels::start_channels(config, shutdown).await
+                // D5/D9 (A6): whitelisted — dispatch installs a SIGINT+SIGTERM
+                // signal task that cancels the root token; the channel supervisor
+                // breaks out of its listener loop on cancellation.
+                Box::new(ChannelStartRunner { config }).run(root_shutdown.clone()).await
             }
             ChannelCommands::Doctor => channels::doctor_channels(config).await,
             other => channels::handle_command(other, &config).await,
