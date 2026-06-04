@@ -59,6 +59,13 @@
 
 // Re-exports are used by lib consumers and by the loop_ integration.
 #![allow(unused_imports)]
+// Without the `llm-router` feature the CTE machinery is compiled but not
+// consumed (config schema needs `CausalTreeConfig`, control-ladder needs
+// `config.causal_tree.*`, and `loop_` needs `snapshot::TOOL_RESULTS_PREFIX`).
+// Those three touch-points are too diffuse to gate individually; suppressing
+// dead-code warnings for the whole module under no-`llm-router` is cleaner
+// than scattering `#[allow(dead_code)]` across every struct/fn.
+#![cfg_attr(not(feature = "llm-router"), allow(dead_code))]
 
 pub mod branch;
 pub mod engine;
