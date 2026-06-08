@@ -3876,11 +3876,20 @@ async fn execute_tools_with_policy(
 /// `decision.selected.model`.
 ///
 /// Multi-turn note: an agent loop may call the provider once per iteration
-/// (each tool round-trip is a separate `chat` call). This trace carries the
-/// attribution of the **final, returning turn** — the turn that produced the
-/// text answer handed back to the caller. Per-turn aggregation across every
-/// iteration is intentionally out of scope for this change; the returning turn
-/// is the most meaningful single attribution for the response the user sees.
+/// (each tool round-trip is a separate `chat` call). The `final_*` / `attempts`
+/// fields carry the attribution of the **final, returning turn** — the turn
+/// that produced the text answer handed back to the caller — since that is the
+/// most meaningful single attribution for the response the user sees.
+///
+/// FIX #2: `any_turn_had_fallback` additionally aggregates across *every* turn:
+/// it is `true` when any turn (intermediate or final) recovered via a
+/// retry/provider/model fallback. Without it, a tool-call turn that fell back
+/// followed by a clean final-answer turn would be reported as a clean
+/// `Success`, silently erasing the fact that a fallback occurred during the
+/// user turn. The chat layer ORs this into the returning turn's own
+/// classification so the recorded status reflects the whole user turn. Full
+/// per-turn attempt-detail aggregation remains out of scope (only the status
+/// signal is aggregated, kept deliberately lightweight).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ToolLoopTrace {
     /// Provider that produced the final returning turn, if a provider call ran.
@@ -3890,6 +3899,11 @@ pub(crate) struct ToolLoopTrace {
     /// Attempt sequence of the final returning turn (failures + terminal
     /// success). Empty when no provider call completed (e.g. early cancel).
     pub attempts: Vec<crate::llm::route_decision::ProviderAttempt>,
+    /// FIX #2: whether *any* turn in the loop (not just the returning one)
+    /// recovered through a retry or provider/model fallback. A turn had a
+    /// fallback when its `chat_traced` recorded more than one attempt (each
+    /// failed attempt before the terminal success adds an entry).
+    pub any_turn_had_fallback: bool,
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -4021,6 +4035,12 @@ pub(crate) async fn run_tool_call_loop_traced(
     // overwrites this with that turn's real serving provider/model + attempts;
     // the value at the returning turn is handed back to the caller.
     let mut last_turn_trace = ToolLoopTrace::default();
+    // FIX #2: sticky cross-turn fallback flag. `last_turn_trace` is overwritten
+    // every turn, so a fallback on an intermediate (tool-call) turn would be lost
+    // if a later clean turn produced the answer. Accumulate it separately and
+    // fold it into the returned trace so the recorded status reflects the whole
+    // user turn, not just its final iteration.
+    let mut any_turn_had_fallback = false;
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
         || tools_registry.iter().flat_map(|tool| tool.specs()).collect(),
@@ -4244,12 +4264,20 @@ pub(crate) async fn run_tool_call_loop_traced(
         // P0-1: chat_processed is Result so we can detect context overflow below.
         let chat_processed = match chat_result {
             Ok(trace) => {
+                // FIX #2: a turn recovered via retry/provider/model fallback when
+                // its trace recorded more than one attempt (each failed attempt
+                // before the terminal success adds an entry). Sticky across turns.
+                if trace.attempts.len() > 1 {
+                    any_turn_had_fallback = true;
+                }
                 // Record this turn's real attribution. Overwritten each turn;
                 // the value at the returning turn is what the caller receives.
                 last_turn_trace = ToolLoopTrace {
                     final_provider: Some(trace.final_provider),
                     final_model: Some(trace.final_model),
                     attempts: trace.attempts,
+                    // Folded in just before returning so it reflects all turns.
+                    any_turn_had_fallback: false,
                 };
                 let resp = trace.response;
                 let duration = llm_started_at.elapsed();
@@ -4438,6 +4466,9 @@ pub(crate) async fn run_tool_call_loop_traced(
             history.push(ChatMessage::assistant(response_text.clone()));
             // FIX-P0-30/31: returning turn — hand back this turn's real
             // provider attribution alongside the final answer.
+            // FIX #2: fold the cross-turn fallback flag into the returned trace so
+            // a fallback on any earlier turn is reflected in the recorded status.
+            last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
             return Ok((display_text, last_turn_trace));
         }
 

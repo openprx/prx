@@ -251,12 +251,13 @@ fn push_failure(
 /// [`classify_provider_error`] and its sanitized message truncated to 500
 /// chars, mirroring `failed_for_decision`), `None` for a terminal success.
 ///
-/// `seq` uses `saturating_add(u8)` at the call site: the attempt counter is a
-/// `u8` because the bounded failover space (model_chain × providers × retries)
-/// realistically stays well under 255; if it ever saturated, later attempts
-/// would all carry `seq = 255` rather than wrapping to a misleading low value.
+/// `seq` is a 1-based `u32` (FIX #4): `provider_retries` is an uncapped `u32`
+/// in config, so the bounded failover space (model_chain × providers × retries)
+/// can in principle exceed 255. A `u32` keeps every attempt index orderable and
+/// the sequence complete, satisfying the P0-31 contract; `saturating_add` at the
+/// call site is then effectively non-saturating in any realistic configuration.
 fn build_attempt(
-    seq: u8,
+    seq: u32,
     provider_name: &str,
     model: &str,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -634,10 +635,11 @@ impl Provider for ReliableProvider {
         let mut failures = Vec::new();
         let mut runtime_unavailable = Vec::new();
         let mut attempts: Vec<ProviderAttempt> = Vec::new();
-        // `seq` counts every recorded attempt. `u8` + `saturating_add` keeps the
-        // counter monotonic even in the (unreachable in practice) event that the
-        // bounded failover space exceeds 255 attempts.
-        let mut seq: u8 = 0;
+        // `seq` counts every recorded attempt (1-based after the first
+        // increment). FIX #4: `u32` so the sequence stays complete and orderable
+        // even when an uncapped `provider_retries` pushes the bounded failover
+        // space past 255; `saturating_add` is then effectively non-saturating.
+        let mut seq: u32 = 0;
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -775,6 +777,8 @@ impl Provider for ReliableProvider {
             trace.final_model,
             started_at,
             finished_at,
+            // Single chat call: no earlier-turn fallback to fold in.
+            false,
         );
         Ok((trace.response, outcome))
     }
@@ -1024,6 +1028,17 @@ impl StreamFailureClass {
 fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass {
     use super::traits::StreamError;
 
+    // Structured rate-limit (FIX-P0-33): a 429 is rate-limited; a 503 is a
+    // transient server failure worth retrying/falling back. Both already carry
+    // the parsed Retry-After hint, so no textual heuristics are needed.
+    if let StreamError::RateLimited { status, .. } = err {
+        return if *status == 429 {
+            StreamFailureClass::RateLimited
+        } else {
+            StreamFailureClass::Retryable
+        };
+    }
+
     // HTTP transport errors carry a status we can map directly.
     if let StreamError::Http(http_err) = err {
         if let Some(status) = http_err.status() {
@@ -1048,11 +1063,11 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
         StreamError::Provider(msg) | StreamError::InvalidSse(msg) => msg.clone(),
         StreamError::Json(e) => e.to_string(),
         StreamError::Io(_) => return StreamFailureClass::Retryable,
-        // `StreamError::Http` is fully classified by the status-code block above,
-        // which always returns before reaching this match. Should that invariant
-        // ever change, treat an unclassified HTTP failure as transient rather
-        // than panicking.
-        StreamError::Http(_) => return StreamFailureClass::Retryable,
+        // `StreamError::Http` and `StreamError::RateLimited` are fully classified
+        // by the blocks above, which always return before reaching this match.
+        // Should that invariant ever change, treat the failure as transient
+        // rather than panicking.
+        StreamError::Http(_) | StreamError::RateLimited { .. } => return StreamFailureClass::Retryable,
     };
     let anyhow_err = anyhow::anyhow!("{message}");
 
@@ -1071,11 +1086,22 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
     StreamFailureClass::Retryable
 }
 
-/// Extract a Retry-After value (in milliseconds) from a streaming error, if
-/// present. Mirrors [`parse_retry_after_ms`] by routing the error's textual
-/// form through the same parser (HTTP errors stringify their status/headers,
-/// provider/SSE errors carry the upstream message verbatim).
+/// Extract a Retry-After value (in milliseconds) from a streaming error.
+///
+/// FIX-P0-33: prefers the **structured** `retry_after_ms` field carried by
+/// [`StreamError::RateLimited`] — read directly off the real HTTP `Retry-After`
+/// header by the provider — so the honor path works against live upstreams
+/// rather than only against errors whose textual form happens to embed the
+/// value. Falls back to parsing the error's `Display` form (mirroring
+/// [`parse_retry_after_ms`]) for any other error shape.
 fn parse_stream_retry_after_ms(err: &super::traits::StreamError) -> Option<u64> {
+    if let super::traits::StreamError::RateLimited {
+        retry_after_ms: Some(ms),
+        ..
+    } = err
+    {
+        return Some(*ms);
+    }
     let anyhow_err = anyhow::anyhow!("{err}");
     parse_retry_after_ms(&anyhow_err)
 }
@@ -2574,6 +2600,126 @@ mod tests {
             0,
             "retry-after on the same provider must not trigger provider failover"
         );
+    }
+
+    /// Streaming mock that fails the first `fail_first` calls with a *structured*
+    /// [`StreamError::RateLimited`] carrying `retry_after_ms` read off a real HTTP
+    /// header (FIX-P0-33), then succeeds. This is the production shape — the
+    /// reliability layer must honor the structured field, not text parsing.
+    struct StructuredRateLimitStreamMock {
+        calls: Arc<AtomicUsize>,
+        fail_first: usize,
+        retry_after_ms: Option<u64>,
+        success_text: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for StructuredRateLimitStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= self.fail_first {
+                let retry_after_ms = self.retry_after_ms;
+                stream::iter(vec![Err(StreamError::RateLimited {
+                    status: 429,
+                    retry_after_ms,
+                    // Intentionally NO "retry-after" substring in the message:
+                    // proves the honor path uses the structured field, not text.
+                    message: "Too Many Requests".to_string(),
+                })])
+                .boxed()
+            } else {
+                stream::iter(vec![Ok(text_chunk(self.success_text, true))]).boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_honors_structured_retry_after_header_and_retries_same_provider() {
+        // FIX-P0-33 (#3): a real HTTP Retry-After header arrives as a structured
+        // `StreamError::RateLimited { retry_after_ms }`. The driver must read the
+        // structured field, sleep, and retry the SAME provider/model — not fall
+        // back. The error text carries no "retry-after" substring, so a recovery
+        // here proves the structured path (not Display parsing) is in effect.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        fail_first: 1,
+                        retry_after_ms: Some(0), // Honor the header; stay fast.
+                        success_text: "recovered via structured retry-after",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "structured retry-after should recover, got {err:?}");
+        assert_eq!(text, "recovered via structured retry-after");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2, "same provider retried once");
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "structured retry-after must not trigger provider failover"
+        );
+    }
+
+    #[test]
+    fn retry_after_ms_from_headers_parses_delta_seconds() {
+        use crate::providers::traits::retry_after_ms_from_headers;
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("12"),
+        );
+        assert_eq!(retry_after_ms_from_headers(&headers), Some(12_000));
+
+        // Missing header → None.
+        let empty = reqwest::header::HeaderMap::new();
+        assert_eq!(retry_after_ms_from_headers(&empty), None);
+
+        // HTTP-date form is not parsed here → None (falls back to layer backoff).
+        let mut date_headers = reqwest::header::HeaderMap::new();
+        date_headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("Wed, 21 Oct 2099 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after_ms_from_headers(&date_headers), None);
     }
 
     #[tokio::test]

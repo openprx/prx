@@ -2785,6 +2785,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     final_model,
                     provider_started_at,
                     chrono::Utc::now(),
+                    // FIX #2: a fallback on any earlier (tool-call) turn must
+                    // surface as FallbackSuccess even when the final turn is clean.
+                    turn_trace.any_turn_had_fallback,
                 )
             } else {
                 ProviderExecutionOutcome::success_for_decision(&route_decision, provider_started_at)
