@@ -3866,8 +3866,38 @@ async fn execute_tools_with_policy(
 //   • max_iterations is reached (runaway safety), or
 //   • the cancellation token fires (external abort).
 
+/// Provider-attribution trace for a completed (or returning) tool-call loop.
+///
+/// FIX-P0-30/31: `run_tool_call_loop` itself only returns the final answer
+/// `String`, dropping the provider/model that actually served the request and
+/// the failover attempt sequence. [`run_tool_call_loop_traced`] surfaces those
+/// via this struct so the chat orchestration layer can attribute the provider
+/// outcome to the *real* serving model instead of the routed
+/// `decision.selected.model`.
+///
+/// Multi-turn note: an agent loop may call the provider once per iteration
+/// (each tool round-trip is a separate `chat` call). This trace carries the
+/// attribution of the **final, returning turn** — the turn that produced the
+/// text answer handed back to the caller. Per-turn aggregation across every
+/// iteration is intentionally out of scope for this change; the returning turn
+/// is the most meaningful single attribution for the response the user sees.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ToolLoopTrace {
+    /// Provider that produced the final returning turn, if a provider call ran.
+    pub final_provider: Option<String>,
+    /// Model that produced the final returning turn, if a provider call ran.
+    pub final_model: Option<String>,
+    /// Attempt sequence of the final returning turn (failures + terminal
+    /// success). Empty when no provider call completed (e.g. early cancel).
+    pub attempts: Vec<crate::llm::route_decision::ProviderAttempt>,
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
+///
+/// Thin shell over [`run_tool_call_loop_traced`] that drops the provider
+/// attribution trace. Preserves the historical `Result<String>` signature so
+/// existing callers are unaffected (FIX-P0-30/31).
 ///
 /// RouteDecision / ProviderExecutionOutcome timeline recording is currently
 /// owned by callers that have a MemoryFabric scope for the concrete ingress.
@@ -3904,11 +3934,93 @@ pub(crate) async fn run_tool_call_loop(
     document_ingest: Option<DocumentIngestRuntime>,
     chat_mode: ChatMode,
 ) -> Result<String> {
+    let (text, trace) = run_tool_call_loop_traced(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        hooks,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        parallel_tools_enabled,
+        read_only_tool_concurrency_window,
+        read_only_tool_timeout_secs,
+        priority_scheduling_enabled,
+        low_priority_tool_names,
+        concurrency_governance,
+        compaction_config,
+        cancellation_token,
+        on_delta,
+        scope_ctx,
+        on_tool_call,
+        tool_tiering,
+        document_ingest,
+        chat_mode,
+    )
+    .await?;
+    // Callers of the legacy `String`-only entrypoint do not consume the
+    // attribution trace, but surface it at debug level so the serving
+    // provider/model and attempt count are still observable on this path.
+    if let (Some(provider), Some(model)) = (trace.final_provider.as_deref(), trace.final_model.as_deref()) {
+        tracing::debug!(
+            final_provider = provider,
+            final_model = model,
+            attempts = trace.attempts.len(),
+            "tool-call loop completed (legacy entrypoint; trace discarded)"
+        );
+    }
+    Ok(text)
+}
+
+/// Trace-returning variant of [`run_tool_call_loop`]. Identical control flow,
+/// but also returns a [`ToolLoopTrace`] attributing the final returning turn
+/// to the provider/model that actually served it (FIX-P0-30/31).
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_traced(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    hooks: &HookManager,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    parallel_tools_enabled: bool,
+    read_only_tool_concurrency_window: usize,
+    read_only_tool_timeout_secs: u64,
+    priority_scheduling_enabled: bool,
+    low_priority_tool_names: Vec<String>,
+    concurrency_governance: ToolConcurrencyGovernanceConfig,
+    compaction_config: Option<&crate::config::AgentCompactionConfig>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    scope_ctx: Option<&ScopeContext<'_>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
+    tool_tiering: Option<&crate::config::ToolTieringConfig>,
+    document_ingest: Option<DocumentIngestRuntime>,
+    chat_mode: ChatMode,
+) -> Result<(String, ToolLoopTrace)> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
+
+    // FIX-P0-30/31: attribution of the final returning turn. Each provider call
+    // overwrites this with that turn's real serving provider/model + attempts;
+    // the value at the returning turn is handed back to the caller.
+    let mut last_turn_trace = ToolLoopTrace::default();
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
         || tools_registry.iter().flat_map(|tool| tool.specs()).collect(),
@@ -4107,7 +4219,11 @@ pub(crate) async fn run_tool_call_loop(
             None
         };
 
-        let chat_future = provider.chat(
+        // FIX-P0-30/31: use the trace-returning provider entrypoint so this
+        // turn's real serving provider/model and failover attempts flow back
+        // to the caller. The `ReliableProvider` overrides `chat_traced`; other
+        // providers get a synthetic single-attempt trace via the trait default.
+        let chat_future = provider.chat_traced(
             ChatRequest {
                 messages: &prepared_messages.messages,
                 tools: request_tools,
@@ -4127,7 +4243,15 @@ pub(crate) async fn run_tool_call_loop(
 
         // P0-1: chat_processed is Result so we can detect context overflow below.
         let chat_processed = match chat_result {
-            Ok(resp) => {
+            Ok(trace) => {
+                // Record this turn's real attribution. Overwritten each turn;
+                // the value at the returning turn is what the caller receives.
+                last_turn_trace = ToolLoopTrace {
+                    final_provider: Some(trace.final_provider),
+                    final_model: Some(trace.final_model),
+                    attempts: trace.attempts,
+                };
+                let resp = trace.response;
                 let duration = llm_started_at.elapsed();
                 hooks
                     .emit(
@@ -4312,7 +4436,9 @@ pub(crate) async fn run_tool_call_loop(
                 }
             }
             history.push(ChatMessage::assistant(response_text.clone()));
-            return Ok(display_text);
+            // FIX-P0-30/31: returning turn — hand back this turn's real
+            // provider attribution alongside the final answer.
+            return Ok((display_text, last_turn_trace));
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)

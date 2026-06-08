@@ -385,6 +385,67 @@ impl ProviderExecutionOutcome {
         }
     }
 
+    /// Build an outcome from a real execution trace produced by the provider
+    /// layer (`ReliableProvider::chat_traced`).
+    ///
+    /// This replaces the synthetic single-attempt outcome of
+    /// `success_for_decision` with the *actual* attempt sequence, the *actual*
+    /// provider/model that served the request, and a fallback classification:
+    ///
+    /// * `Success` — the very first attempt of the routed provider/model
+    ///   succeeded (no retry, no provider/model fallback).
+    /// * `FallbackSuccess` — the request succeeded only after a retry or after
+    ///   falling back to a different provider/model than the routed one. The
+    ///   `fallback_reason` carries a stable classification string
+    ///   (`retry_recovered` / `provider_fallback` / `model_fallback`).
+    ///
+    /// `attempts` is taken verbatim from the trace; callers MUST pass a
+    /// non-empty slice ending in a `Success` attempt for a successful trace.
+    #[must_use]
+    pub fn from_trace(
+        decision: &RouteDecision,
+        attempts: Vec<ProviderAttempt>,
+        final_provider: String,
+        final_model: String,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+    ) -> Self {
+        // A fallback occurred when more than one attempt was made (a retry or a
+        // provider/model switch each add an attempt) or when the serving
+        // provider/model differs from what the router selected.
+        let provider_differs = final_provider != decision.selected.provider;
+        let model_differs = final_model != decision.selected.model;
+        let had_fallback = attempts.len() > 1 || provider_differs || model_differs;
+
+        let (status, fallback_reason) = if had_fallback {
+            // Prefer the most specific classification: a provider switch is the
+            // strongest signal, then a model switch, otherwise a same-target
+            // retry recovered the call.
+            let reason = if provider_differs {
+                "provider_fallback"
+            } else if model_differs {
+                "model_fallback"
+            } else {
+                "retry_recovered"
+            };
+            (ExecutionStatus::FallbackSuccess, Some(reason.to_string()))
+        } else {
+            (ExecutionStatus::Success, None)
+        };
+
+        Self {
+            decision_id: decision.decision_id.clone(),
+            started_at,
+            finished_at,
+            attempts,
+            final_provider,
+            final_model,
+            status,
+            fallback_reason,
+            tokens_used: TokenUsage::default(),
+        }
+    }
+
     #[must_use]
     pub fn failed_for_decision(decision: &RouteDecision, started_at: DateTime<Utc>, error: &anyhow::Error) -> Self {
         let finished_at = Utc::now();

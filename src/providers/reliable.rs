@@ -1,6 +1,6 @@
 use super::Provider;
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
-use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
+use super::traits::{ChatMessage, ChatRequest, ChatResponse, ChatTrace, StreamChunk, StreamOptions, StreamResult};
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use std::collections::HashMap;
@@ -243,6 +243,43 @@ fn push_failure(
     failures.push(format!(
         "provider={provider_name} model={model} attempt {attempt}/{max_attempts}: {reason}; error={error_detail}"
     ));
+}
+
+/// Build a `ProviderAttempt` record for a single (provider, model) call.
+///
+/// `error` is `Some` for a failed attempt (the error is classified via
+/// [`classify_provider_error`] and its sanitized message truncated to 500
+/// chars, mirroring `failed_for_decision`), `None` for a terminal success.
+///
+/// `seq` uses `saturating_add(u8)` at the call site: the attempt counter is a
+/// `u8` because the bounded failover space (model_chain × providers × retries)
+/// realistically stays well under 255; if it ever saturated, later attempts
+/// would all carry `seq = 255` rather than wrapping to a misleading low value.
+fn build_attempt(
+    seq: u8,
+    provider_name: &str,
+    model: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+    error: Option<&anyhow::Error>,
+) -> ProviderAttempt {
+    let (status, error_class, error_message) = error.map_or((AttemptStatus::Success, None, None), |err| {
+        (
+            AttemptStatus::Failed,
+            Some(crate::llm::route_decision::classify_provider_error(err)),
+            Some(super::sanitize_api_error(&err.to_string()).chars().take(500).collect()),
+        )
+    });
+    ProviderAttempt {
+        seq,
+        provider: provider_name.to_string(),
+        model: model.to_string(),
+        started_at,
+        finished_at,
+        status,
+        error_class,
+        error_message,
+    }
 }
 
 // ── Resilient Provider Wrapper ────────────────────────────────────────────
@@ -578,9 +615,29 @@ impl Provider for ReliableProvider {
     }
 
     async fn chat(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatResponse> {
+        // Thin shell over `chat_traced`: the structured chat path runs the full
+        // failover loop in `chat_traced` and discards the trace here. The
+        // `Provider` trait signature is preserved so every existing caller is
+        // unaffected (FIX-P0-30/31).
+        Ok(self.chat_traced(request, model, temperature).await?.response)
+    }
+
+    /// Structured chat that returns the real failover trace.
+    ///
+    /// FIX-P0-30 / FIX-P0-31: this is the single source of the non-streaming
+    /// three-level failover loop (model chain × provider × retry). It records a
+    /// `ProviderAttempt` for **every** failed attempt and a terminal `Success`
+    /// attempt, and reports the provider/model that *actually* served the
+    /// request (rather than the routed `decision.selected.model`).
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatTrace> {
         let models = self.model_chain(model);
         let mut failures = Vec::new();
         let mut runtime_unavailable = Vec::new();
+        let mut attempts: Vec<ProviderAttempt> = Vec::new();
+        // `seq` counts every recorded attempt. `u8` + `saturating_add` keeps the
+        // counter monotonic even in the (unreachable in practice) event that the
+        // bounded failover space exceeds 255 attempts.
+        let mut seq: u8 = 0;
 
         for current_model in &models {
             for (provider_name, provider) in &self.providers {
@@ -595,7 +652,8 @@ impl Provider for ReliableProvider {
                 let mut backoff_ms = self.base_backoff_ms;
 
                 for attempt in 0..=self.max_retries {
-                    match provider.chat(request.clone(), current_model, temperature).await {
+                    let attempt_started_at = chrono::Utc::now();
+                    match provider.chat(request, current_model, temperature).await {
                         Ok(resp) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
@@ -606,7 +664,21 @@ impl Provider for ReliableProvider {
                                     "Provider recovered (failover/retry)"
                                 );
                             }
-                            return Ok(resp);
+                            seq = seq.saturating_add(1);
+                            attempts.push(build_attempt(
+                                seq,
+                                provider_name,
+                                current_model,
+                                attempt_started_at,
+                                chrono::Utc::now(),
+                                None,
+                            ));
+                            return Ok(ChatTrace {
+                                response: resp,
+                                attempts,
+                                final_provider: provider_name.to_string(),
+                                final_model: (*current_model).to_string(),
+                            });
                         }
                         Err(e) => {
                             let non_retryable_rate_limit = is_non_retryable_rate_limit(&e);
@@ -624,6 +696,15 @@ impl Provider for ReliableProvider {
                                 failure_reason,
                                 &error_detail,
                             );
+                            seq = seq.saturating_add(1);
+                            attempts.push(build_attempt(
+                                seq,
+                                provider_name,
+                                current_model,
+                                attempt_started_at,
+                                chrono::Utc::now(),
+                                Some(&e),
+                            ));
 
                             if non_retryable {
                                 tracing::warn!(
@@ -679,11 +760,23 @@ impl Provider for ReliableProvider {
         temperature: f64,
     ) -> anyhow::Result<(ChatResponse, ProviderExecutionOutcome)> {
         let started_at = chrono::Utc::now();
-        let response = self.chat(request, decision.effective_model(), temperature).await?;
-        Ok((
-            response,
-            ProviderExecutionOutcome::success_for_decision(decision, started_at),
-        ))
+        // FIX-P0-30/31: build the outcome from the real trace so the recorded
+        // final_provider/final_model and attempt sequence reflect what actually
+        // executed, and the status distinguishes a clean Success from a
+        // retry/provider/model FallbackSuccess.
+        let trace = self
+            .chat_traced(request, decision.effective_model(), temperature)
+            .await?;
+        let finished_at = chrono::Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            decision,
+            trace.attempts,
+            trace.final_provider,
+            trace.final_model,
+            started_at,
+            finished_at,
+        );
+        Ok((trace.response, outcome))
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1270,6 +1363,154 @@ mod tests {
         assert_eq!(result, "from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    // ── FIX-P0-30/31: chat_traced attempt accumulation + fallback attribution ──
+
+    #[tokio::test]
+    async fn chat_traced_accumulates_attempts_and_reports_real_final_model() {
+        use crate::llm::route_decision::AttemptStatus;
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        // Primary always fails (retryable) → exhausts retries; fallback succeeds.
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 primary down",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                    }),
+                ),
+            ],
+            1, // max_retries = 1 → 2 attempts per provider before moving on.
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let trace = provider.chat_traced(request, "test", 0.0).await.unwrap();
+
+        assert_eq!(trace.response.text_or_empty(), "from fallback");
+        // Primary: 2 failed attempts (attempt 0 + retry). Fallback: 1 success.
+        assert_eq!(trace.attempts.len(), 3, "two primary failures + one fallback success");
+
+        // seq is strictly increasing starting at 1.
+        for (idx, attempt) in trace.attempts.iter().enumerate() {
+            assert_eq!(attempt.seq as usize, idx + 1, "seq must be monotonic from 1");
+        }
+
+        // The two primary attempts are Failed with a classified error; the final
+        // fallback attempt is Success with no error.
+        assert_eq!(trace.attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(trace.attempts[0].provider, "primary");
+        assert!(trace.attempts[0].error_class.is_some());
+        assert_eq!(trace.attempts[1].status, AttemptStatus::Failed);
+        assert_eq!(trace.attempts[1].provider, "primary");
+        assert_eq!(trace.attempts[2].status, AttemptStatus::Success);
+        assert_eq!(trace.attempts[2].provider, "fallback");
+        assert!(trace.attempts[2].error_class.is_none());
+
+        // final_provider/final_model reflect what actually executed.
+        assert_eq!(trace.final_provider, "fallback");
+        assert_eq!(trace.final_model, "test");
+    }
+
+    #[tokio::test]
+    async fn chat_with_decision_marks_fallback_success_with_real_final_provider() {
+        use crate::llm::route_decision::{ExecutionStatus, RouteDecision};
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 primary down",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: 0,
+                        response: "served by fallback",
+                        error: "unused",
+                    }),
+                ),
+            ],
+            0, // no retries → straight provider fallback.
+            1,
+        );
+
+        // Router selected "primary" but it fails; "fallback" actually serves.
+        let decision = RouteDecision::single_candidate("primary", "test");
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let (response, outcome) = provider.chat_with_decision(&decision, request, 0.0).await.unwrap();
+        assert_eq!(response.text_or_empty(), "served by fallback");
+
+        // A provider switch must be recorded as FallbackSuccess (not Success).
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("provider_fallback"));
+        // final_provider differs from the routed selection.
+        assert_eq!(outcome.final_provider, "fallback");
+        assert_ne!(outcome.final_provider, decision.selected.provider);
+        // Two attempts: one failed (primary) + one success (fallback).
+        assert_eq!(outcome.attempts.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn chat_with_decision_clean_success_is_not_fallback() {
+        use crate::llm::route_decision::{ExecutionStatus, RouteDecision};
+
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(MockProvider {
+                    calls: Arc::new(AtomicUsize::new(0)),
+                    fail_until_attempt: 0,
+                    response: "first try",
+                    error: "unused",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let decision = RouteDecision::single_candidate("primary", "test");
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let (_resp, outcome) = provider.chat_with_decision(&decision, request, 0.0).await.unwrap();
+        assert_eq!(outcome.status, ExecutionStatus::Success);
+        assert!(outcome.fallback_reason.is_none());
+        assert_eq!(outcome.final_provider, "primary");
+        assert_eq!(outcome.attempts.len(), 1);
     }
 
     #[tokio::test]

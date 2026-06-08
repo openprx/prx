@@ -1,4 +1,4 @@
-use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
+use crate::llm::route_decision::{ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -72,6 +72,30 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+}
+
+/// Execution trace for a single `chat` call carrying the real attempt
+/// sequence and the provider/model that actually served the request.
+///
+/// Produced by [`Provider::chat_traced`]. The non-streaming `ReliableProvider`
+/// builds a full trace from its three-level failover loop (model chain ×
+/// provider × retry); other providers fall back to a synthetic single-attempt
+/// trace via the default trait implementation.
+///
+/// FIX-P0-30 / FIX-P0-31: this is the channel by which the *actual* serving
+/// model and the *complete* attempt timeline are threaded back up to the chat
+/// orchestration layer (which previously attributed everything to the routed
+/// `decision.selected.model`).
+#[derive(Debug, Clone)]
+pub struct ChatTrace {
+    /// The successful response.
+    pub response: ChatResponse,
+    /// Every attempt made (failures + the terminal success), in order.
+    pub attempts: Vec<ProviderAttempt>,
+    /// Provider name that actually produced `response`.
+    pub final_provider: String,
+    /// Model that actually produced `response`.
+    pub final_model: String,
 }
 
 /// Request payload for provider chat calls.
@@ -526,6 +550,35 @@ pub trait Provider: Send + Sync {
             text: Some(text),
             tool_calls: Vec::new(),
             reasoning_content: None,
+        })
+    }
+
+    /// Structured chat that also returns a full execution [`ChatTrace`].
+    ///
+    /// The default implementation delegates to [`chat`](Provider::chat) and
+    /// synthesizes a single-attempt trace (so simple providers need no extra
+    /// code). [`ReliableProvider`](crate::providers::reliable::ReliableProvider)
+    /// overrides this to surface its real failover attempt sequence and the
+    /// provider/model that actually served the request (FIX-P0-30/31).
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatTrace> {
+        use crate::llm::route_decision::AttemptStatus;
+        let started_at = chrono::Utc::now();
+        let response = self.chat(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "default".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "default".to_string(),
+            final_model: model.to_string(),
         })
     }
 
