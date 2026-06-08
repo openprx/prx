@@ -6374,6 +6374,212 @@ mod tests {
         );
     }
 
+    /// FIX #2 (#3): a native-tool provider that scripts BOTH the response and the
+    /// `ChatTrace` attribution per turn. The first turn returns a tool call while
+    /// reporting a serving provider that *deviates* from the routed selection (a
+    /// fallback). The second turn returns clean final text on the routed
+    /// provider. This lets `run_tool_call_loop_traced` exercise the real
+    /// cross-turn `any_turn_had_fallback` aggregation, not a `from_trace` helper.
+    struct TraceScriptedProvider {
+        turns: Arc<Mutex<VecDeque<ScriptedTurn>>>,
+    }
+
+    struct ScriptedTurn {
+        response: ChatResponse,
+        final_provider: String,
+        /// Number of attempts to record (>1 also signals a fallback).
+        attempts: Vec<crate::llm::route_decision::ProviderAttempt>,
+    }
+
+    #[async_trait]
+    impl Provider for TraceScriptedProvider {
+        fn capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                native_tool_calling: true,
+                vision: false,
+            }
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("chat_with_system unused in trace-scripted provider tests")
+        }
+
+        async fn chat_traced(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            let turn = self
+                .turns
+                .lock()
+                .expect("turns lock valid")
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("trace-scripted provider exhausted turns"))?;
+            Ok(crate::providers::traits::ChatTrace {
+                response: turn.response,
+                attempts: turn.attempts,
+                final_provider: turn.final_provider,
+                final_model: model.to_string(),
+            })
+        }
+    }
+
+    fn success_attempt(seq: u32, provider: &str, model: &str) -> crate::llm::route_decision::ProviderAttempt {
+        use crate::llm::route_decision::AttemptStatus;
+        let now = chrono::Utc::now();
+        crate::llm::route_decision::ProviderAttempt {
+            seq,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        }
+    }
+
+    fn failed_attempt(seq: u32, provider: &str, model: &str) -> crate::llm::route_decision::ProviderAttempt {
+        use crate::llm::route_decision::AttemptStatus;
+        let now = chrono::Utc::now();
+        crate::llm::route_decision::ProviderAttempt {
+            seq,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Failed,
+            error_class: Some("retryable".to_string()),
+            error_message: Some("500 transient".to_string()),
+        }
+    }
+
+    #[tokio::test]
+    async fn run_tool_call_loop_aggregates_intermediate_turn_fallback() {
+        // #3: turn 1 (tool-call turn) falls back — its trace records a failed
+        // attempt on the routed provider then a success on a DIFFERENT provider.
+        // Turn 2 returns clean final text on the routed provider with a single
+        // success attempt. The returned `ToolLoopTrace` must carry
+        // `any_turn_had_fallback = true` so the chat layer records the whole user
+        // turn as FallbackSuccess (not a clean Success) — locking the cross-turn
+        // sticky-fallback aggregation end to end at the loop layer.
+        let routed_provider = "routed-provider";
+        let routed_model = "routed-model";
+
+        let provider = TraceScriptedProvider {
+            turns: Arc::new(Mutex::new(VecDeque::from(vec![
+                // Turn 1: a native tool call, served by a DEVIATED provider after a
+                // failed attempt on the routed one → this turn had a fallback.
+                ScriptedTurn {
+                    response: ChatResponse {
+                        text: None,
+                        tool_calls: vec![ToolCall {
+                            id: "call-1".to_string(),
+                            name: "noop_tool".to_string(),
+                            arguments: "{}".to_string(),
+                        }],
+                        reasoning_content: None,
+                    },
+                    final_provider: "deviated-provider".to_string(),
+                    attempts: vec![
+                        failed_attempt(1, routed_provider, routed_model),
+                        success_attempt(2, "deviated-provider", routed_model),
+                    ],
+                },
+                // Turn 2: clean final answer on the routed provider, single attempt.
+                ScriptedTurn {
+                    response: ChatResponse {
+                        text: Some("final clean answer".to_string()),
+                        tool_calls: Vec::new(),
+                        reasoning_content: None,
+                    },
+                    final_provider: routed_provider.to_string(),
+                    attempts: vec![success_attempt(1, routed_provider, routed_model)],
+                },
+            ]))),
+        };
+
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+            name: "noop_tool".to_string(),
+            execution_order: Arc::new(std::sync::Mutex::new(Vec::new())),
+        })];
+        let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("do a tool then answer")];
+        let tmp = TempDir::new().unwrap();
+
+        let (text, trace) = run_tool_call_loop_traced(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &NoopObserver,
+            &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+            routed_provider,
+            routed_model,
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChatMode::default(),
+        )
+        .await
+        .expect("multi-turn loop should complete");
+
+        assert_eq!(text, "final clean answer");
+        // The returning (final) turn was clean and on the routed provider...
+        assert_eq!(trace.final_provider.as_deref(), Some(routed_provider));
+        assert_eq!(trace.final_model.as_deref(), Some(routed_model));
+        assert_eq!(trace.attempts.len(), 1, "final turn recorded a single success attempt");
+        // ...but an EARLIER turn fell back, so the sticky aggregate flag is set.
+        assert!(
+            trace.any_turn_had_fallback,
+            "an intermediate tool-call turn fell back → any_turn_had_fallback must be true"
+        );
+
+        // End-to-end: feed the loop trace into the same `from_trace` call the chat
+        // layer uses. The clean final turn alone would be `Success`, but the
+        // earlier-turn fallback flag must promote it to `FallbackSuccess` /
+        // `earlier_turn_fallback`.
+        use crate::llm::route_decision::{ExecutionStatus, RouteDecision};
+        let decision = RouteDecision::single_candidate(routed_provider, routed_model);
+        let now = chrono::Utc::now();
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::from_trace(
+            &decision,
+            trace.attempts,
+            trace.final_provider.unwrap_or_default(),
+            trace.final_model.unwrap_or_default(),
+            now,
+            now,
+            trace.any_turn_had_fallback,
+        );
+        assert_eq!(
+            outcome.status,
+            ExecutionStatus::FallbackSuccess,
+            "earlier-turn fallback must make the whole user turn a FallbackSuccess"
+        );
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("earlier_turn_fallback"));
+    }
+
     #[test]
     fn document_ingest_runtime_inherits_envelope_lineage() {
         let tmp = TempDir::new().unwrap();

@@ -1623,6 +1623,201 @@ mod tests {
         assert_eq!(outcome.attempts.len(), 1);
     }
 
+    /// Mock that fails for a specific set of `(provider_model)` combinations and
+    /// succeeds otherwise, recording the `(model)` of every call. The provider
+    /// identity is fixed at construction via `provider_tag`, so two instances
+    /// registered under different names can model a cross-provider failover.
+    struct ProviderModelAwareMock {
+        provider_tag: &'static str,
+        calls: Arc<AtomicUsize>,
+        models_seen: parking_lot::Mutex<Vec<String>>,
+        /// `(provider_tag, model)` pairs that must fail.
+        fail_on: Vec<(&'static str, &'static str)>,
+        response: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for ProviderModelAwareMock {
+        async fn chat(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.models_seen.lock().push(model.to_string());
+            if self.fail_on.iter().any(|(p, m)| *p == self.provider_tag && *m == model) {
+                anyhow::bail!("500 {} cannot serve {}", self.provider_tag, model);
+            }
+            Ok(ChatResponse {
+                text: Some(self.response.to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(format!("{}:{model}", self.provider_tag))
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_traced_real_provider_model_failover_lands_on_different_provider_and_model() {
+        // #2: a REAL `ReliableProvider` failover (not a `from_trace` helper). The
+        // model chain is m1 -> m2. Provider A can serve neither m1 nor m2;
+        // provider B can serve m2 only. So the sequence is:
+        //   A/m1 (fail) → B/m1 (fail) → A/m2 (fail) → B/m2 (success)
+        // The terminal success lands on a DIFFERENT provider AND a DIFFERENT model
+        // than routed, so the outcome must be `provider_model_fallback`.
+        use crate::llm::route_decision::{AttemptStatus, ExecutionStatus, RouteDecision};
+
+        let a_calls = Arc::new(AtomicUsize::new(0));
+        let b_calls = Arc::new(AtomicUsize::new(0));
+        let mut model_fallbacks = std::collections::HashMap::new();
+        model_fallbacks.insert("m1".to_string(), vec!["m2".to_string()]);
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "provider-a".into(),
+                    Box::new(ProviderModelAwareMock {
+                        provider_tag: "provider-a",
+                        calls: Arc::clone(&a_calls),
+                        models_seen: parking_lot::Mutex::new(Vec::new()),
+                        // A fails for every model it is asked to serve.
+                        fail_on: vec![("provider-a", "m1"), ("provider-a", "m2")],
+                        response: "unused",
+                    }),
+                ),
+                (
+                    "provider-b".into(),
+                    Box::new(ProviderModelAwareMock {
+                        provider_tag: "provider-b",
+                        calls: Arc::clone(&b_calls),
+                        models_seen: parking_lot::Mutex::new(Vec::new()),
+                        // B fails on m1 but serves m2.
+                        fail_on: vec![("provider-b", "m1")],
+                        response: "served by B on m2",
+                    }),
+                ),
+            ],
+            0, // no in-place retries → straight provider/model failover.
+            1,
+        )
+        .with_model_fallbacks(model_fallbacks);
+
+        // Router selected provider-a / m1.
+        let decision = RouteDecision::single_candidate("provider-a", "m1");
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let (response, outcome) = provider.chat_with_decision(&decision, request, 0.0).await.unwrap();
+        assert_eq!(response.text_or_empty(), "served by B on m2");
+
+        // Real failover crossed both provider AND model boundaries.
+        assert_eq!(outcome.final_provider, "provider-b");
+        assert_eq!(outcome.final_model, "m2");
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(
+            outcome.fallback_reason.as_deref(),
+            Some("provider_model_fallback"),
+            "crossing both provider and model must be classified provider_model_fallback"
+        );
+
+        // Attempt sequence: 3 failures (A/m1, B/m1, A/m2) + 1 success (B/m2).
+        assert_eq!(outcome.attempts.len(), 4, "three failures then one success");
+        let failed: Vec<_> = outcome
+            .attempts
+            .iter()
+            .filter(|a| a.status == AttemptStatus::Failed)
+            .collect();
+        assert_eq!(failed.len(), 3, "exactly three failed attempts before success");
+        let last = outcome.attempts.last().unwrap();
+        assert_eq!(last.status, AttemptStatus::Success);
+        assert_eq!(last.provider, "provider-b");
+        assert_eq!(last.model, "m2");
+        // seq is monotonic from 1.
+        for (idx, attempt) in outcome.attempts.iter().enumerate() {
+            assert_eq!(attempt.seq as usize, idx + 1, "seq must be monotonic from 1");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_with_decision_all_candidates_failing_yields_error_not_silent_success() {
+        // #7 (chat-outcome level): when every provider fails, `chat_with_decision`
+        // must propagate an error (it cannot fabricate a clean Success). The chat
+        // orchestration layer turns this into an `ExecutionStatus::AllFailed`
+        // outcome via `failed_for_decision`; here we lock the contract that the
+        // provider surfaces a failure rather than a degraded success.
+        use crate::llm::route_decision::{ExecutionStatus, RouteDecision};
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "p1".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 p1 down",
+                    }),
+                ),
+                (
+                    "p2".into(),
+                    Box::new(MockProvider {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "503 p2 down",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let decision = RouteDecision::single_candidate("p1", "test");
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+
+        let started = chrono::Utc::now();
+        let err = provider
+            .chat_with_decision(&decision, request, 0.0)
+            .await
+            .expect_err("all providers failing must surface an error, not a degraded success");
+
+        // The chat layer maps this failure to an AllFailed outcome; assert that
+        // mapping records the correct terminal status and a classified error.
+        let outcome = ProviderExecutionOutcome::failed_for_decision(&decision, started, &err);
+        assert!(
+            matches!(outcome.status, ExecutionStatus::AllFailed { .. }),
+            "all-candidates-failed must record AllFailed, got {:?}",
+            outcome.status
+        );
+        if let ExecutionStatus::AllFailed { last_error_class } = &outcome.status {
+            assert!(
+                !last_error_class.is_empty(),
+                "AllFailed must carry a non-empty classified error class"
+            );
+        }
+        assert_eq!(
+            outcome.final_provider, "p1",
+            "failed outcome attributes to the routed selection"
+        );
+    }
+
     #[tokio::test]
     async fn returns_aggregated_error_when_all_providers_fail() {
         let provider = ReliableProvider::new(
@@ -2809,6 +3004,439 @@ mod tests {
             "no structured hint → primary tried exactly once, no in-place retry"
         );
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1, "fallback served the request");
+    }
+
+    /// Streaming mock that first emits a content chunk (a visible-text delta, a
+    /// reasoning-only delta, or a tool-call chunk — selectable) and *then* yields
+    /// an error. Records every call so a test can prove the next candidate was
+    /// never reached. FIX-P0-33: once any chunk is forwarded downstream the
+    /// driver must surface a mid-stream error as-is (no resume / no failover).
+    struct PostContentErrorStreamMock {
+        calls: Arc<AtomicUsize>,
+        kind: PostContentKind,
+        error: StreamError,
+    }
+
+    #[derive(Clone, Copy)]
+    enum PostContentKind {
+        Text,
+        Reasoning,
+        ToolCall,
+    }
+
+    #[async_trait]
+    impl Provider for PostContentErrorStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let first = match self.kind {
+                PostContentKind::Text => StreamChunk::delta("partial answer"),
+                PostContentKind::Reasoning => StreamChunk::reasoning_delta("thinking..."),
+                PostContentKind::ToolCall => StreamChunk::tool_call_chunk(Vec::new()),
+            };
+            let err = clone_stream_error(&self.error);
+            stream::iter(vec![Ok(first), Err(err)]).boxed()
+        }
+    }
+
+    /// `StreamError` is not `Clone` (it wraps non-clonable reqwest/io/serde
+    /// errors). The variants the mocks build are simple data variants, so a
+    /// shallow rebuild is sufficient for tests.
+    fn clone_stream_error(err: &StreamError) -> StreamError {
+        match err {
+            StreamError::Provider(m) => StreamError::Provider(m.clone()),
+            StreamError::InvalidSse(m) => StreamError::InvalidSse(m.clone()),
+            StreamError::RateLimited {
+                status,
+                retry_after_ms,
+                message,
+            } => StreamError::RateLimited {
+                status: *status,
+                retry_after_ms: *retry_after_ms,
+                message: message.clone(),
+            },
+            other => StreamError::Provider(format!("{other}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_does_not_resume_after_text_content_emitted() {
+        // FIX-P0-33 (design lock): once a visible-text chunk has been forwarded,
+        // a subsequent pre-terminal error must be surfaced verbatim — the driver
+        // must NOT switch to the next candidate (resuming would duplicate or
+        // truncate the already-emitted text).
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PostContentErrorStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        kind: PostContentKind::Text,
+                        // A normally fallback-eligible error (rate limit) — proves
+                        // the *content-emitted* guard, not the error class, blocks
+                        // failover here.
+                        error: StreamError::RateLimited {
+                            status: 429,
+                            retry_after_ms: Some(0),
+                            message: "rate limited mid-stream".to_string(),
+                        },
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        // The already-emitted content is delivered, then the error is surfaced.
+        assert_eq!(text, "partial answer", "emitted content must reach the receiver");
+        assert!(
+            matches!(err, Some(StreamError::RateLimited { .. })),
+            "mid-stream error must be surfaced verbatim, got {err:?}"
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1, "primary called exactly once");
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "fallback must never be reached after content was emitted (no resume)"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_does_not_resume_after_reasoning_content_emitted() {
+        // FIX-P0-33: `emitted_content` flips to true for ANY forwarded chunk,
+        // including reasoning/thinking deltas. A failure after a reasoning chunk
+        // must therefore also surface without failover.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PostContentErrorStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        kind: PostContentKind::Reasoning,
+                        error: StreamError::Provider("500 transient after reasoning".to_string()),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        // Reasoning carries no visible delta, so `text` stays empty, but the
+        // failover is still suppressed because content (reasoning) was emitted.
+        assert!(text.is_empty(), "reasoning chunk carries no visible delta");
+        assert!(
+            matches!(err, Some(StreamError::Provider(_))),
+            "error after reasoning chunk must be surfaced, got {err:?}"
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "a reasoning chunk counts as emitted content → no failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_does_not_resume_after_tool_call_chunk_emitted() {
+        // FIX-P0-33: a tool-call chunk also counts as emitted content. A failure
+        // afterward must surface without rotating providers.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(PostContentErrorStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        kind: PostContentKind::ToolCall,
+                        error: StreamError::Provider("503 transient after tool_call".to_string()),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (_text, err) = collect_stream(s).await;
+
+        assert!(
+            matches!(err, Some(StreamError::Provider(_))),
+            "error after tool-call chunk must be surfaced, got {err:?}"
+        );
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "a tool-call chunk counts as emitted content → no failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_exhausts_retry_after_budget_before_falling_back() {
+        // FIX-P0-33 (#4): a primary that keeps returning a structured Retry-After
+        // beyond the retry budget must be tried `max_retries + 1` times (initial +
+        // each honored retry) before the driver rotates to the next candidate.
+        let max_retries = 2u32;
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        // Fail more times than the budget so retries are exhausted.
+                        fail_first: (max_retries as usize) + 5,
+                        status: 429,
+                        retry_after_ms: Some(0), // Honor, but stay fast.
+                        success_text: "never reached",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("served by fallback"),
+                    }),
+                ),
+            ],
+            max_retries,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(
+            err.is_none(),
+            "fallback should serve after retries exhausted, got {err:?}"
+        );
+        assert_eq!(text, "served by fallback");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            (max_retries as usize) + 1,
+            "primary must be tried initial + max_retries times before fallback"
+        );
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            1,
+            "fallback runs exactly once after the primary's retry budget is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_interrupts_retry_after_sleep_when_receiver_dropped() {
+        // FIX-P0-33 (#5): the Retry-After backoff sleep is interruptible — if the
+        // stream receiver is dropped while the driver is waiting out the
+        // Retry-After, the task must bail out promptly via the `tx.closed()` arm
+        // of its `tokio::select!` rather than waiting out the full delay for
+        // nobody.
+        //
+        // Discriminator without faking the clock: `fail_first = 1` means a
+        // *completed* sleep would trigger exactly one same-provider RETRY (a
+        // second call). We pick a Retry-After (700ms) long enough to observe, drop
+        // the receiver while the driver is parked in the sleep, then wait WELL
+        // PAST the Retry-After. If the sleep were not interruptible the retry
+        // would have fired by then (calls == 2); with interruption the task exited
+        // and `calls` stays at 1. The wait is bounded and small to keep the test
+        // fast and non-flaky.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let retry_after = Duration::from_millis(700);
+        let provider = ReliableProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(StructuredRateLimitStreamMock {
+                    calls: Arc::clone(&primary_calls),
+                    fail_first: 1,
+                    status: 429,
+                    retry_after_ms: Some(u64::try_from(retry_after.as_millis()).unwrap()),
+                    success_text: "never reached",
+                }),
+            )],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+
+        // Let the spawned driver run: it makes the first call, receives the 429,
+        // and enters the interruptible sleep. A short real-time yield window well
+        // under the 700ms Retry-After guarantees the initial call happened but the
+        // retry has NOT yet fired.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "driver must have made the initial call and be parked in the Retry-After sleep"
+        );
+
+        // Drop the receiver mid-sleep → closes the channel → the `tx.closed()`
+        // arm must win and the task must exit WITHOUT performing the retry.
+        let dropped_at = std::time::Instant::now();
+        drop(s);
+
+        // Wait past the full Retry-After. An interruptible sleep means the retry
+        // never fires; a blocking sleep would have resolved and bumped calls to 2.
+        tokio::time::sleep(retry_after + Duration::from_millis(300)).await;
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "dropping the receiver must interrupt the Retry-After sleep before the same-provider retry fires"
+        );
+        // Sanity: we genuinely waited past the Retry-After window, so a
+        // non-interrupted sleep would have had ample time to fire the retry.
+        assert!(
+            dropped_at.elapsed() > retry_after,
+            "test must observe a window longer than the Retry-After to be conclusive"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_caps_oversized_retry_after_at_30s_floor_backoff() {
+        // FIX-P0-33 (#6): the honored wait is `retry_after_ms.min(30_000).max(backoff)`.
+        // With retry_after_ms = 0 the floor is the layer backoff (>=1ms here), and
+        // with a huge value the 30s cap applies. We exercise the floor branch end
+        // to end (a 0ms hint must still recover quickly via the same provider),
+        // proving the `.max(backoff_ms)` floor does not break recovery.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        fail_first: 1,
+                        status: 429,
+                        retry_after_ms: Some(0), // Below the backoff floor.
+                        success_text: "recovered after floored backoff",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1, // base backoff = 50ms floor (clamped in `new`); used as the wait floor.
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "floored backoff must still recover, got {err:?}");
+        assert_eq!(text, "recovered after floored backoff");
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2, "same provider retried once");
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_all_failed_surfaces_last_error_class_and_status() {
+        // #7 (strengthened): when every candidate fails, the driver must surface
+        // the LAST candidate's error (not the first), preserving its class/status
+        // for the caller's diagnostics.
+        let p1_calls = Arc::new(AtomicUsize::new(0));
+        let p2_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "p1".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&p1_calls),
+                        outcome: Err("500 first candidate down"),
+                    }),
+                ),
+                (
+                    "p2".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&p2_calls),
+                        // No retry-after hint → falls back/surfaces immediately as
+                        // the terminal candidate.
+                        fail_first: usize::MAX,
+                        status: 503,
+                        retry_after_ms: None,
+                        success_text: "never",
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(text.is_empty());
+        match err {
+            Some(StreamError::RateLimited { status, message, .. }) => {
+                assert_eq!(status, 503, "must surface the LAST candidate's status, not the first");
+                assert_eq!(message, "upstream overloaded");
+            }
+            other => panic!("expected the last candidate's RateLimited error, got {other:?}"),
+        }
+        assert_eq!(p1_calls.load(Ordering::SeqCst), 1, "first candidate tried once");
+        assert_eq!(p2_calls.load(Ordering::SeqCst), 1, "last candidate tried once");
     }
 
     #[test]
