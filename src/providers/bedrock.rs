@@ -1157,10 +1157,11 @@ impl BedrockProvider {
             request = request.header("x-amz-security-token", token);
         }
 
+        // FIX-P0-33: return the raw response (success or not) so the streaming
+        // caller can read the `Retry-After` header off a 429/503 before the body
+        // is consumed. The non-streaming callers still get an error via the
+        // status check the caller performs.
         let response = request.body(payload).send().await?;
-        if !response.status().is_success() {
-            return Err(super::api_error("Bedrock", response).await);
-        }
         Ok(response)
     }
 
@@ -1355,6 +1356,13 @@ impl Provider for BedrockProvider {
                     return;
                 }
             };
+            // FIX-P0-33: surface 429/503 as a structured `RateLimited` (carrying
+            // the real `Retry-After` header) so the reliability layer can honor
+            // the upstream backoff instead of parsing the error text.
+            if !response.status().is_success() {
+                let _ = tx.send(Err(super::stream_api_error("Bedrock", response).await)).await;
+                return;
+            }
 
             let mut bytes_stream = response.bytes_stream();
             let mut buffer = Vec::<u8>::new();

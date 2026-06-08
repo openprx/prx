@@ -754,15 +754,7 @@ impl Provider for OllamaProvider {
             };
 
             if !response.status().is_success() {
-                let status = response.status();
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP error: {status}"));
-                let sanitized = super::sanitize_api_error(&body);
-                let _ = tx
-                    .send(Err(StreamError::Provider(format!("{status}: {sanitized}"))))
-                    .await;
+                let _ = tx.send(Err(super::stream_api_error("Ollama", response).await)).await;
                 return;
             }
 

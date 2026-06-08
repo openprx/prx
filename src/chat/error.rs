@@ -41,6 +41,17 @@ pub enum TransportError {
 
     #[error("transport provider message: {0}")]
     ProviderMessage(String),
+
+    /// Upstream rate-limit (429) or temporary unavailability (503).
+    ///
+    /// FIX-P0-33: retryable, since the reliability layer honors the carried
+    /// `Retry-After` hint and retries the same provider/model.
+    #[error("transport rate limited (HTTP {status}): {message}")]
+    RateLimited {
+        status: u16,
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
 }
 
 impl TransportError {
@@ -49,7 +60,7 @@ impl TransportError {
     /// 与 `dispatcher.rs::stream_error_is_retryable` 同源（Http/Io 视为瞬时故障 retryable）。
     #[must_use]
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Http(_) | Self::Io(_))
+        matches!(self, Self::Http(_) | Self::Io(_) | Self::RateLimited { .. })
     }
 }
 
@@ -61,6 +72,15 @@ impl From<StreamError> for TransportError {
             StreamError::Json(e) => Self::Json(e.to_string()),
             StreamError::InvalidSse(msg) => Self::InvalidSse(msg),
             StreamError::Provider(msg) => Self::ProviderMessage(msg),
+            StreamError::RateLimited {
+                status,
+                retry_after_ms,
+                message,
+            } => Self::RateLimited {
+                status,
+                retry_after_ms,
+                message,
+            },
         }
     }
 }

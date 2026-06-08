@@ -1151,6 +1151,38 @@ pub async fn api_error(provider: &str, response: reqwest::Response) -> anyhow::E
     anyhow::anyhow!("{provider} API error ({status}): {sanitized}")
 }
 
+/// Build a [`StreamError`](traits::StreamError) from a failed streaming HTTP
+/// response, reading the real `Retry-After` header before the body is consumed.
+///
+/// FIX-P0-33: for `429` (Too Many Requests) and `503` (Service Unavailable) the
+/// header is parsed into a structured [`StreamError::RateLimited`] so the
+/// reliability layer can honor the upstream backoff hint without relying on the
+/// error's textual form (which previously dropped the header entirely). All
+/// other non-2xx statuses map to [`StreamError::Provider`] as before.
+///
+/// The `Retry-After` header is captured *before* `response.text()` consumes the
+/// response, since reading the body takes ownership.
+pub async fn stream_api_error(provider: &str, response: reqwest::Response) -> traits::StreamError {
+    use traits::StreamError;
+    let status = response.status();
+    let code = status.as_u16();
+    let retry_after_ms = traits::retry_after_ms_from_headers(response.headers());
+    let body = response
+        .text()
+        .await
+        .unwrap_or_else(|_| "<failed to read provider error body>".to_string());
+    let sanitized = sanitize_api_error(&body);
+    if code == 429 || code == 503 {
+        StreamError::RateLimited {
+            status: code,
+            retry_after_ms,
+            message: format!("{provider} streaming HTTP {status}: {sanitized}"),
+        }
+    } else {
+        StreamError::Provider(format!("{provider} streaming HTTP {status}: {sanitized}"))
+    }
+}
+
 /// Resolve API key for a provider from explicit config only.
 ///
 /// Resolution order:

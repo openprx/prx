@@ -962,12 +962,16 @@ pub(crate) fn resolve_supervised_approval_override(raw: Option<&str>) -> bool {
 /// 与 reducer `Action::StreamFailed { retryable, .. }` 字段对齐：让上层（chat::run
 /// 主循环或未来的自动重试逻辑）依据布尔值决定是否安排另一轮 turn。当前判断准则：
 /// - `Http` / `Io`：网络瞬时故障，retryable
+/// - `RateLimited`：上游限流 (429/503)，retryable（FIX-P0-33：携带 Retry-After 结构化提示）
 /// - `Json` / `InvalidSse`：数据破损，多半重试也复发，non-retryable
 /// - `Provider`：服务端语义错误，倾向于 non-retryable（让上层显示并由用户决定）
 #[must_use]
 const fn stream_error_is_retryable(err: &crate::providers::traits::StreamError) -> bool {
     use crate::providers::traits::StreamError;
-    matches!(err, StreamError::Http(_) | StreamError::Io(_))
+    matches!(
+        err,
+        StreamError::Http(_) | StreamError::Io(_) | StreamError::RateLimited { .. }
+    )
 }
 
 /// **S3 T3-1**: 网络超时 / 连接错误识别 — 决定 driver 是否走 exponential backoff retry.
@@ -983,7 +987,12 @@ fn stream_error_is_network_timeout(err: &crate::providers::traits::StreamError) 
     match err {
         StreamError::Io(_) => true,
         StreamError::Http(http_err) => http_err.is_timeout() || http_err.is_connect(),
-        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Provider(_) => false,
+        // A rate-limit is not a network timeout; it is honored via Retry-After in
+        // the reliability layer, not the network-backoff retry loop here.
+        StreamError::Json(_)
+        | StreamError::InvalidSse(_)
+        | StreamError::Provider(_)
+        | StreamError::RateLimited { .. } => false,
     }
 }
 
@@ -1001,7 +1010,9 @@ fn stream_error_is_context_overflow(err: &crate::providers::traits::StreamError)
     let msg = match err {
         StreamError::Provider(s) => s.as_str(),
         StreamError::Http(http_err) => return matches!(http_err.status(), Some(s) if s.as_u16() == 413),
-        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) => return false,
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) | StreamError::RateLimited { .. } => {
+            return false;
+        }
     };
     let needles = [
         "context_length_exceeded",

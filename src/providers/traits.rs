@@ -403,8 +403,46 @@ pub enum StreamError {
     #[error("Provider error: {0}")]
     Provider(String),
 
+    /// Upstream rate-limit (429) or temporary unavailability (503) on a
+    /// streaming request *before any content was emitted*.
+    ///
+    /// FIX-P0-33: carries the structured `Retry-After` hint (in milliseconds,
+    /// parsed from the real HTTP response header) so the reliability layer can
+    /// honor the upstream backoff and retry the **same** provider/model instead
+    /// of guessing from the error's textual form. `retry_after_ms` is `None`
+    /// when the upstream sent no parseable `Retry-After` header.
+    #[error("Rate limited (HTTP {status}): {message}")]
+    RateLimited {
+        status: u16,
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Parse a `Retry-After` HTTP header into milliseconds.
+///
+/// FIX-P0-33: handles the RFC 7231 delta-seconds form (`Retry-After: 120`),
+/// which is what rate-limiting upstreams (OpenAI / Anthropic / OpenRouter /
+/// Gemini / …) send. The alternate HTTP-date form is not parsed here (it is not
+/// used for `429`/`503` backoff in practice and would pull in a date-parsing
+/// dependency); such a header simply yields `None`, falling back to the
+/// reliability layer's own backoff. Returns `None` for a missing, empty,
+/// non-numeric, or negative value.
+#[must_use]
+pub fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Delta-seconds form: a bare (optionally fractional) non-negative number.
+    let secs = raw.parse::<f64>().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    u64::try_from(std::time::Duration::from_secs_f64(secs).as_millis()).ok()
 }
 
 /// Structured error returned when a requested capability is not supported.
