@@ -133,6 +133,29 @@ impl Provider for RouterProvider {
         provider.chat(request, &resolved_model, temperature).await
     }
 
+    /// Override `chat_traced` so routing preserves the *real* attribution
+    /// (BLOCKER #1 / FIX-P0-30/31). Without this, the default trait
+    /// implementation would call [`chat`](Self::chat) (discarding the inner
+    /// provider's trace) and synthesize a `final_provider = "default"` /
+    /// single-attempt trace — making every routed call look like a `"default"`
+    /// provider fallback and losing the resolved model for `hint:*` requests.
+    ///
+    /// Instead we resolve the route and delegate to the resolved inner
+    /// provider's own `chat_traced`. The inner provider is a
+    /// [`ReliableProvider`](crate::providers::reliable::ReliableProvider), so the
+    /// returned [`ChatTrace`] carries the provider/model that *actually* served
+    /// the request and the full failover attempt sequence.
+    async fn chat_traced(
+        &self,
+        request: ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<super::traits::ChatTrace> {
+        let (provider_idx, resolved_model) = self.resolve(model)?;
+        let (_, provider) = &self.providers[provider_idx];
+        provider.chat_traced(request, &resolved_model, temperature).await
+    }
+
     async fn chat_with_decision(
         &self,
         decision: &RouteDecision,
@@ -926,6 +949,145 @@ mod tests {
         assert_eq!(messages[0].content, "system prompt");
         assert_eq!(messages[1].role, "user");
         assert_eq!(messages[1].content, "hello");
+    }
+
+    /// Inner provider that reports a *real* (non-"default") attribution trace,
+    /// recording the model it was resolved to — emulating a `ReliableProvider`.
+    struct TracingInnerMock {
+        provider_label: &'static str,
+        response: &'static str,
+        seen_model: Arc<parking_lot::Mutex<String>>,
+    }
+
+    #[async_trait]
+    impl Provider for TracingInnerMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(self.response.to_string())
+        }
+
+        async fn chat_traced(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<super::super::traits::ChatTrace> {
+            use crate::llm::route_decision::{AttemptStatus, ProviderAttempt};
+            *self.seen_model.lock() = model.to_string();
+            let now = chrono::Utc::now();
+            Ok(super::super::traits::ChatTrace {
+                response: ChatResponse {
+                    text: Some(self.response.to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![ProviderAttempt {
+                    seq: 1,
+                    provider: self.provider_label.to_string(),
+                    model: model.to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    status: AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: self.provider_label.to_string(),
+                final_model: model.to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_traced_preserves_resolved_provider_and_model_for_hint() {
+        // BLOCKER #1: a routed success must NOT be attributed to "default".
+        // RouterProvider must resolve the hint and delegate to the inner
+        // provider's chat_traced, preserving the real provider + resolved model.
+        let seen_model = Arc::new(parking_lot::Mutex::new(String::new()));
+        let inner = TracingInnerMock {
+            provider_label: "smart-reliable",
+            response: "smart-answer",
+            seen_model: Arc::clone(&seen_model),
+        };
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(TracingInnerMock {
+                        provider_label: "default-reliable",
+                        response: "default-answer",
+                        seen_model: Arc::new(parking_lot::Mutex::new(String::new())),
+                    }) as Box<dyn Provider>,
+                ),
+                ("smart".into(), Box::new(inner) as Box<dyn Provider>),
+            ],
+            vec![(
+                "reasoning".into(),
+                Route {
+                    provider_name: "smart".into(),
+                    model: "claude-opus".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "think".to_string(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let trace = router
+            .chat_traced(request, "hint:reasoning", 0.5)
+            .await
+            .expect("routed chat_traced must succeed");
+
+        // Real provider/model preserved — not the synthetic "default".
+        assert_eq!(trace.final_provider, "smart-reliable");
+        assert_ne!(trace.final_provider, "default");
+        // hint:reasoning resolved to the route model and threaded to the inner.
+        assert_eq!(trace.final_model, "claude-opus");
+        assert_eq!(*seen_model.lock(), "claude-opus");
+        assert_eq!(trace.attempts.len(), 1);
+        assert_eq!(trace.attempts[0].provider, "smart-reliable");
+        assert_eq!(trace.attempts[0].model, "claude-opus");
+        assert_eq!(trace.response.text.as_deref(), Some("smart-answer"));
+    }
+
+    #[tokio::test]
+    async fn chat_traced_non_hint_uses_default_provider_real_attribution() {
+        // A plain (non-hint) model still routes to the default provider but must
+        // carry that provider's real label, not the trait-default "default".
+        let router = RouterProvider::new(
+            vec![(
+                "primary".into(),
+                Box::new(TracingInnerMock {
+                    provider_label: "primary-reliable",
+                    response: "ok",
+                    seen_model: Arc::new(parking_lot::Mutex::new(String::new())),
+                }) as Box<dyn Provider>,
+            )],
+            vec![],
+            "default-model".into(),
+        );
+
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let trace = router.chat_traced(request, "gpt-4o", 0.0).await.expect("must succeed");
+        assert_eq!(trace.final_provider, "primary-reliable");
+        assert_eq!(trace.final_model, "gpt-4o");
     }
 
     #[test]
