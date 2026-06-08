@@ -923,6 +923,8 @@ impl Provider for ReliableProvider {
             attempts,
             temperature,
             options,
+            self.max_retries,
+            self.base_backoff_ms,
             move |provider, model, temperature, options| {
                 provider.stream_chat_with_history(&messages, model, temperature, options)
             },
@@ -947,6 +949,8 @@ impl Provider for ReliableProvider {
             attempts,
             temperature,
             options,
+            self.max_retries,
+            self.base_backoff_ms,
             move |provider, model, temperature, options| {
                 provider.stream_chat_with_system(system_prompt.as_deref(), &message, model, temperature, options)
             },
@@ -1067,6 +1071,15 @@ fn classify_stream_error(err: &super::traits::StreamError) -> StreamFailureClass
     StreamFailureClass::Retryable
 }
 
+/// Extract a Retry-After value (in milliseconds) from a streaming error, if
+/// present. Mirrors [`parse_retry_after_ms`] by routing the error's textual
+/// form through the same parser (HTTP errors stringify their status/headers,
+/// provider/SSE errors carry the upstream message verbatim).
+fn parse_stream_retry_after_ms(err: &super::traits::StreamError) -> Option<u64> {
+    let anyhow_err = anyhow::anyhow!("{err}");
+    parse_retry_after_ms(&anyhow_err)
+}
+
 /// Error stream returned when no streaming-capable provider is available.
 fn no_streaming_provider_stream() -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
     stream::once(async move {
@@ -1082,16 +1095,27 @@ fn no_streaming_provider_stream() -> stream::BoxStream<'static, StreamResult<Str
 /// `build_stream` creates the per-attempt provider stream from owned request
 /// data. The driver:
 /// 1. Tries candidates in order, buffering the first chunk of each.
-/// 2. If the first chunk is an error that [allows fallback](StreamFailureClass::allows_fallback)
-///    and another viable candidate remains, moves on (context-overflow only
-///    falls back to a *different* model). Otherwise the error is surfaced.
-/// 3. Once content has started, forwards the remaining chunks verbatim — a
+/// 2. If the first chunk is a rate-limit error carrying a `Retry-After`
+///    ([FIX-P0-33]), sleeps for that interval and retries the **same**
+///    provider/model (up to `max_retries`) before considering fallback — this
+///    honors the upstream backoff hint instead of immediately rotating
+///    candidates. The sleep is interruptible via `tx.closed()` so a dropped
+///    receiver never leaves the driver sleeping pointlessly.
+/// 3. Otherwise, if the first chunk is an error that
+///    [allows fallback](StreamFailureClass::allows_fallback) and another viable
+///    candidate remains, moves on (context-overflow only falls back to a
+///    *different* model). Otherwise the error is surfaced.
+/// 4. Once content has started, forwards the remaining chunks verbatim — a
 ///    mid-content error is never swallowed (switching providers would corrupt
-///    the already-emitted response).
+///    the already-emitted response). FIX-P0-33: mid-stream **resume** (retrying
+///    a different provider after partial content) is intentionally NOT done
+///    here — see the `emitted_content` branch below.
 fn drive_streaming_fallback<F>(
     attempts: Vec<StreamAttempt>,
     temperature: f64,
     options: StreamOptions,
+    max_retries: u32,
+    base_backoff_ms: u64,
     build_stream: F,
 ) -> stream::BoxStream<'static, StreamResult<StreamChunk>>
 where
@@ -1110,66 +1134,116 @@ where
             // For context overflow, only a *different* model is worth trying.
             let next_model_differs = attempts.get(index + 1).is_some_and(|next| next.model != attempt.model);
 
-            let mut stream = build_stream(&attempt.provider, &attempt.model, temperature, options.clone());
-            let mut emitted_content = false;
+            // Pre-content retry budget for the *same* candidate. FIX-P0-33: a
+            // rate-limit error with a Retry-After hint earns an in-place retry
+            // (after sleeping) before we fall back to the next candidate.
+            let mut backoff_ms = base_backoff_ms;
+            let mut pre_content_retries = 0u32;
 
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(content) => {
-                        emitted_content = true;
-                        if tx.send(Ok(content)).await.is_err() {
-                            return; // Receiver dropped.
+            'candidate: loop {
+                let mut stream = build_stream(&attempt.provider, &attempt.model, temperature, options.clone());
+                let mut emitted_content = false;
+
+                while let Some(chunk) = stream.next().await {
+                    match chunk {
+                        Ok(content) => {
+                            emitted_content = true;
+                            if tx.send(Ok(content)).await.is_err() {
+                                return; // Receiver dropped.
+                            }
                         }
-                    }
-                    Err(err) => {
-                        // Mid-content failure: surface as-is, never switch providers.
-                        if emitted_content {
-                            tracing::warn!(
-                                provider = %attempt.provider_name,
-                                model = %attempt.model,
-                                "Streaming error after content emitted; surfacing without failover: {err}"
-                            );
-                            let _ = tx.send(Err(err)).await;
-                            return;
-                        }
+                        Err(err) => {
+                            // Mid-content failure: surface as-is, never switch
+                            // providers. FIX-P0-33: post-content mid-stream
+                            // resume is a *deliberate* non-goal. Resuming would
+                            // require provider-side checkpointing (a resumable
+                            // cursor / token offset); blindly re-issuing the
+                            // request against another provider or the same one
+                            // would duplicate or truncate the already-emitted
+                            // text and corrupt the response. We surface the error
+                            // to the caller instead of silently degrading.
+                            //
+                            // Note: `emitted_content` flips to true for ANY
+                            // forwarded chunk — including reasoning/thinking and
+                            // tool-call chunks, not just visible text. That is a
+                            // conservative choice: once anything has been emitted
+                            // downstream, a transparent retry is unsafe.
+                            if emitted_content {
+                                tracing::warn!(
+                                    provider = %attempt.provider_name,
+                                    model = %attempt.model,
+                                    "Streaming error after content emitted; surfacing without failover (mid-stream resume not supported): {err}"
+                                );
+                                let _ = tx.send(Err(err)).await;
+                                return;
+                            }
 
-                        // Pre-content failure: classify and decide on failover.
-                        let class = classify_stream_error(&err);
-                        let can_fallback = !is_last
-                            && class.allows_fallback()
-                            && (class != StreamFailureClass::ContextOverflow || next_model_differs);
+                            // Pre-content failure: classify and decide.
+                            let class = classify_stream_error(&err);
 
-                        if can_fallback {
+                            // FIX-P0-33: honor Retry-After on a rate-limit before
+                            // falling back. Retry the SAME provider/model after
+                            // sleeping, up to `max_retries`.
+                            if class == StreamFailureClass::RateLimited && pre_content_retries < max_retries {
+                                if let Some(retry_after_ms) = parse_stream_retry_after_ms(&err) {
+                                    let wait = retry_after_ms.min(30_000).max(backoff_ms);
+                                    tracing::warn!(
+                                        provider = %attempt.provider_name,
+                                        model = %attempt.model,
+                                        retry_after_ms,
+                                        wait_ms = wait,
+                                        attempt = pre_content_retries + 1,
+                                        "Streaming rate-limited before content; honoring Retry-After and retrying same provider/model: {err}"
+                                    );
+                                    // Interruptible sleep: bail out early if the
+                                    // receiver has gone away rather than waiting
+                                    // out the full backoff for nobody.
+                                    tokio::select! {
+                                        () = tx.closed() => return,
+                                        () = tokio::time::sleep(Duration::from_millis(wait)) => {}
+                                    }
+                                    pre_content_retries += 1;
+                                    backoff_ms = (backoff_ms.saturating_mul(2)).min(10_000);
+                                    last_error = Some(err);
+                                    continue 'candidate; // Retry the same candidate.
+                                }
+                            }
+
+                            let can_fallback = !is_last
+                                && class.allows_fallback()
+                                && (class != StreamFailureClass::ContextOverflow || next_model_differs);
+
+                            if can_fallback {
+                                tracing::warn!(
+                                    provider = %attempt.provider_name,
+                                    model = %attempt.model,
+                                    ?class,
+                                    "Streaming attempt failed before content; falling back to next candidate: {err}"
+                                );
+                                last_error = Some(err);
+                                break 'candidate; // Try next candidate.
+                            }
+
                             tracing::warn!(
                                 provider = %attempt.provider_name,
                                 model = %attempt.model,
                                 ?class,
-                                "Streaming attempt failed before content; falling back to next candidate: {err}"
+                                "Streaming attempt failed with no viable failover; surfacing: {err}"
                             );
-                            last_error = Some(err);
-                            break; // Try next candidate.
+                            let _ = tx.send(Err(err)).await;
+                            return;
                         }
-
-                        tracing::warn!(
-                            provider = %attempt.provider_name,
-                            model = %attempt.model,
-                            ?class,
-                            "Streaming attempt failed with no viable failover; surfacing: {err}"
-                        );
-                        let _ = tx.send(Err(err)).await;
-                        return;
                     }
                 }
-            }
 
-            // Stream ended. If it produced content, we are done.
-            if emitted_content {
-                return;
-            }
-            // Empty, error-free stream: treat as a transient failure and try the
-            // next candidate (parity with non-streaming "exhausted, try next").
-            if !is_last {
-                continue;
+                // Stream ended. If it produced content, we are done.
+                if emitted_content {
+                    return;
+                }
+                // Empty, error-free stream: treat as a transient failure and try
+                // the next candidate (parity with non-streaming "exhausted, try
+                // next"). Break the per-candidate retry loop either way.
+                break 'candidate;
             }
         }
 
@@ -2411,6 +2485,95 @@ mod tests {
         let (text, err) = collect_stream(s).await;
         assert!(text.is_empty());
         assert!(err.is_some(), "all-failed streaming must surface an error");
+    }
+
+    /// Streaming mock that fails the first `fail_first` calls with a 429
+    /// carrying a `Retry-After`, then succeeds. Records every call so a test
+    /// can assert the *same* provider was retried (not failed over).
+    struct RetryAfterStreamMock {
+        calls: Arc<AtomicUsize>,
+        fail_first: usize,
+        retry_after_error: &'static str,
+        success_text: &'static str,
+    }
+
+    #[async_trait]
+    impl Provider for RetryAfterStreamMock {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("non-stream".to_string())
+        }
+
+        fn supports_streaming(&self) -> bool {
+            true
+        }
+
+        fn stream_chat_with_history(
+            &self,
+            _messages: &[ChatMessage],
+            _model: &str,
+            _temperature: f64,
+            _options: StreamOptions,
+        ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if n <= self.fail_first {
+                let msg = self.retry_after_error.to_string();
+                stream::iter(vec![Err(StreamError::Provider(msg))]).boxed()
+            } else {
+                stream::iter(vec![Ok(text_chunk(self.success_text, true))]).boxed()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_honors_retry_after_and_retries_same_provider() {
+        // FIX-P0-33: a pre-content 429 with Retry-After must retry the SAME
+        // provider/model (after sleeping) rather than immediately falling back.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(RetryAfterStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        fail_first: 1,
+                        // Small Retry-After so the test stays fast.
+                        retry_after_error: "429 Too Many Requests, Retry-After: 0",
+                        success_text: "recovered on retry",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2, // max_retries = 2 → room for the in-place retry.
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "retry-after retry should recover, got {err:?}");
+        assert_eq!(text, "recovered on retry", "must retry primary, not fall back");
+        // Primary called twice: initial 429 + the honored retry.
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        // Fallback must never be reached.
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "retry-after on the same provider must not trigger provider failover"
+        );
     }
 
     #[tokio::test]
