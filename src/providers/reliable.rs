@@ -1207,19 +1207,29 @@ where
                             // Pre-content failure: classify and decide.
                             let class = classify_stream_error(&err);
 
-                            // FIX-P0-33: honor Retry-After on a rate-limit before
-                            // falling back. Retry the SAME provider/model after
-                            // sleeping, up to `max_retries`.
-                            if class == StreamFailureClass::RateLimited && pre_content_retries < max_retries {
+                            // FIX-P0-33 (#3): honor a structured Retry-After hint
+                            // before falling back, regardless of failure class.
+                            // 503/529 overload responses (classified `Retryable`)
+                            // carry the same parsed `retry_after_ms` as a 429
+                            // (`RateLimited`); both deserve a same-provider/model
+                            // backoff retry rather than an immediate rotation. The
+                            // honor condition is therefore keyed on the presence of
+                            // a structured `retry_after_ms` — not on the class — so
+                            // 429 and 503/529 are treated consistently. A
+                            // `Retryable` error WITHOUT a structured hint falls
+                            // through to the normal fallback path below, preserving
+                            // prior behavior.
+                            if pre_content_retries < max_retries {
                                 if let Some(retry_after_ms) = parse_stream_retry_after_ms(&err) {
                                     let wait = retry_after_ms.min(30_000).max(backoff_ms);
                                     tracing::warn!(
                                         provider = %attempt.provider_name,
                                         model = %attempt.model,
+                                        ?class,
                                         retry_after_ms,
                                         wait_ms = wait,
                                         attempt = pre_content_retries + 1,
-                                        "Streaming rate-limited before content; honoring Retry-After and retrying same provider/model: {err}"
+                                        "Streaming failure before content carries Retry-After; honoring it and retrying same provider/model: {err}"
                                     );
                                     // Interruptible sleep: bail out early if the
                                     // receiver has gone away rather than waiting
@@ -2609,6 +2619,7 @@ mod tests {
     struct StructuredRateLimitStreamMock {
         calls: Arc<AtomicUsize>,
         fail_first: usize,
+        status: u16,
         retry_after_ms: Option<u64>,
         success_text: &'static str,
     }
@@ -2640,11 +2651,11 @@ mod tests {
             if n <= self.fail_first {
                 let retry_after_ms = self.retry_after_ms;
                 stream::iter(vec![Err(StreamError::RateLimited {
-                    status: 429,
+                    status: self.status,
                     retry_after_ms,
                     // Intentionally NO "retry-after" substring in the message:
                     // proves the honor path uses the structured field, not text.
-                    message: "Too Many Requests".to_string(),
+                    message: "upstream overloaded".to_string(),
                 })])
                 .boxed()
             } else {
@@ -2669,6 +2680,7 @@ mod tests {
                     Box::new(StructuredRateLimitStreamMock {
                         calls: Arc::clone(&primary_calls),
                         fail_first: 1,
+                        status: 429,
                         retry_after_ms: Some(0), // Honor the header; stay fast.
                         success_text: "recovered via structured retry-after",
                     }),
@@ -2697,6 +2709,106 @@ mod tests {
             0,
             "structured retry-after must not trigger provider failover"
         );
+    }
+
+    #[tokio::test]
+    async fn streaming_honors_retry_after_on_503_overload_and_retries_same_provider() {
+        // FIX-P0-33 (#3, completeness): a 503/529 overload response carries the
+        // same structured `retry_after_ms` as a 429, but is classified
+        // `Retryable` rather than `RateLimited`. The honor path is keyed on the
+        // presence of a structured Retry-After, NOT on the failure class, so a
+        // 503 with a hint must back off and retry the SAME provider/model rather
+        // than immediately rotating to the fallback candidate.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        fail_first: 1,
+                        status: 503,             // Overload, classified Retryable (not RateLimited).
+                        retry_after_ms: Some(0), // Honor the header; stay fast.
+                        success_text: "recovered after 503 retry-after",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "503 retry-after should recover, got {err:?}");
+        assert_eq!(
+            text, "recovered after 503 retry-after",
+            "must retry primary, not fall back"
+        );
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            2,
+            "503 with Retry-After must retry the same provider once"
+        );
+        assert_eq!(
+            fallback_calls.load(Ordering::SeqCst),
+            0,
+            "503 Retry-After must be honored before any provider failover"
+        );
+    }
+
+    #[tokio::test]
+    async fn streaming_503_without_retry_after_falls_back_immediately() {
+        // Guard the unchanged path: a 503 (Retryable) carrying NO structured
+        // Retry-After hint must keep its prior behavior — fall back to the next
+        // candidate rather than retrying the same provider.
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StructuredRateLimitStreamMock {
+                        calls: Arc::clone(&primary_calls),
+                        fail_first: 1,
+                        status: 503,
+                        retry_after_ms: None, // No hint → no same-provider retry.
+                        success_text: "never reached",
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::clone(&fallback_calls),
+                        outcome: Ok("from fallback"),
+                    }),
+                ),
+            ],
+            2,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let s = provider.stream_chat_with_history(&messages, "test", 0.0, enabled_options());
+        let (text, err) = collect_stream(s).await;
+
+        assert!(err.is_none(), "should recover via fallback, got {err:?}");
+        assert_eq!(text, "from fallback", "503 without Retry-After falls back");
+        assert_eq!(
+            primary_calls.load(Ordering::SeqCst),
+            1,
+            "no structured hint → primary tried exactly once, no in-place retry"
+        );
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1, "fallback served the request");
     }
 
     #[test]

@@ -4264,10 +4264,18 @@ pub(crate) async fn run_tool_call_loop_traced(
         // P0-1: chat_processed is Result so we can detect context overflow below.
         let chat_processed = match chat_result {
             Ok(trace) => {
-                // FIX #2: a turn recovered via retry/provider/model fallback when
-                // its trace recorded more than one attempt (each failed attempt
-                // before the terminal success adds an entry). Sticky across turns.
-                if trace.attempts.len() > 1 {
+                // FIX #2: a turn recovered via fallback when its trace recorded
+                // more than one attempt (each failed attempt before the terminal
+                // success adds an entry) OR when the serving provider/model
+                // deviated from the routed selection for this turn — a single
+                // attempt can still land on a non-routed provider/model (e.g. a
+                // sticky/affinity reroute). This mirrors `from_trace`'s fallback
+                // predicate (`attempts.len() > 1 || final_provider != selected ||
+                // final_model != selected`), where `provider_name`/`model` here
+                // are this turn's routed selection. Sticky across turns.
+                let turn_had_fallback =
+                    trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
+                if turn_had_fallback {
                     any_turn_had_fallback = true;
                 }
                 // Record this turn's real attribution. Overwritten each turn;

@@ -816,4 +816,45 @@ mod tests {
         assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
         assert_eq!(outcome.fallback_reason.as_deref(), Some("retry_recovered"));
     }
+
+    #[test]
+    fn from_trace_single_attempt_deviated_provider_is_fallback() {
+        // FIX #2 (alignment): a single successful attempt that landed on a
+        // provider different from the routed selection is still a fallback. The
+        // agent loop's per-turn sticky flag mirrors exactly this predicate so an
+        // intermediate tool-call turn with attempts==1 but a deviated
+        // provider/model is not silently recorded as a clean Success.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("secondary", "m1")],
+            "secondary".to_string(),
+            "m1".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("provider_fallback"));
+    }
+
+    #[test]
+    fn from_trace_single_attempt_deviated_model_is_fallback() {
+        // Companion to the provider case: a single attempt that served a model
+        // different from the routed selection is a model-level fallback.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("primary", "m2")],
+            "primary".to_string(),
+            "m2".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("model_fallback"));
+    }
 }
