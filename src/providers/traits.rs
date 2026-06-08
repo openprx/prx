@@ -1,4 +1,4 @@
-use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision};
+use crate::llm::route_decision::{ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -72,6 +72,30 @@ impl ChatResponse {
     pub fn text_or_empty(&self) -> &str {
         self.text.as_deref().unwrap_or("")
     }
+}
+
+/// Execution trace for a single `chat` call carrying the real attempt
+/// sequence and the provider/model that actually served the request.
+///
+/// Produced by [`Provider::chat_traced`]. The non-streaming `ReliableProvider`
+/// builds a full trace from its three-level failover loop (model chain ×
+/// provider × retry); other providers fall back to a synthetic single-attempt
+/// trace via the default trait implementation.
+///
+/// FIX-P0-30 / FIX-P0-31: this is the channel by which the *actual* serving
+/// model and the *complete* attempt timeline are threaded back up to the chat
+/// orchestration layer (which previously attributed everything to the routed
+/// `decision.selected.model`).
+#[derive(Debug, Clone)]
+pub struct ChatTrace {
+    /// The successful response.
+    pub response: ChatResponse,
+    /// Every attempt made (failures + the terminal success), in order.
+    pub attempts: Vec<ProviderAttempt>,
+    /// Provider name that actually produced `response`.
+    pub final_provider: String,
+    /// Model that actually produced `response`.
+    pub final_model: String,
 }
 
 /// Request payload for provider chat calls.
@@ -379,8 +403,46 @@ pub enum StreamError {
     #[error("Provider error: {0}")]
     Provider(String),
 
+    /// Upstream rate-limit (429) or temporary unavailability (503) on a
+    /// streaming request *before any content was emitted*.
+    ///
+    /// FIX-P0-33: carries the structured `Retry-After` hint (in milliseconds,
+    /// parsed from the real HTTP response header) so the reliability layer can
+    /// honor the upstream backoff and retry the **same** provider/model instead
+    /// of guessing from the error's textual form. `retry_after_ms` is `None`
+    /// when the upstream sent no parseable `Retry-After` header.
+    #[error("Rate limited (HTTP {status}): {message}")]
+    RateLimited {
+        status: u16,
+        retry_after_ms: Option<u64>,
+        message: String,
+    },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// Parse a `Retry-After` HTTP header into milliseconds.
+///
+/// FIX-P0-33: handles the RFC 7231 delta-seconds form (`Retry-After: 120`),
+/// which is what rate-limiting upstreams (OpenAI / Anthropic / OpenRouter /
+/// Gemini / …) send. The alternate HTTP-date form is not parsed here (it is not
+/// used for `429`/`503` backoff in practice and would pull in a date-parsing
+/// dependency); such a header simply yields `None`, falling back to the
+/// reliability layer's own backoff. Returns `None` for a missing, empty,
+/// non-numeric, or negative value.
+#[must_use]
+pub fn retry_after_ms_from_headers(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    // Delta-seconds form: a bare (optionally fractional) non-negative number.
+    let secs = raw.parse::<f64>().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    u64::try_from(std::time::Duration::from_secs_f64(secs).as_millis()).ok()
 }
 
 /// Structured error returned when a requested capability is not supported.
@@ -526,6 +588,35 @@ pub trait Provider: Send + Sync {
             text: Some(text),
             tool_calls: Vec::new(),
             reasoning_content: None,
+        })
+    }
+
+    /// Structured chat that also returns a full execution [`ChatTrace`].
+    ///
+    /// The default implementation delegates to [`chat`](Provider::chat) and
+    /// synthesizes a single-attempt trace (so simple providers need no extra
+    /// code). [`ReliableProvider`](crate::providers::reliable::ReliableProvider)
+    /// overrides this to surface its real failover attempt sequence and the
+    /// provider/model that actually served the request (FIX-P0-30/31).
+    async fn chat_traced(&self, request: ChatRequest<'_>, model: &str, temperature: f64) -> anyhow::Result<ChatTrace> {
+        use crate::llm::route_decision::AttemptStatus;
+        let started_at = chrono::Utc::now();
+        let response = self.chat(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "default".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "default".to_string(),
+            final_model: model.to_string(),
         })
     }
 

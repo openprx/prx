@@ -1946,6 +1946,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
+        let provider_name = self.name.clone();
 
         // Use a channel to bridge the async HTTP response to the stream
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
@@ -1973,12 +1974,10 @@ impl Provider for OpenAiCompatibleProvider {
                 }
             };
 
-            // Check status
+            // Check status. FIX-P0-33: 429/503 carry a structured Retry-After.
             if !response.status().is_success() {
-                let status = response.status();
-                let error = (response.text().await).unwrap_or_else(|_| format!("HTTP error: {}", status));
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, error))))
+                    .send(Err(super::stream_api_error(&provider_name, response).await))
                     .await;
                 return;
             }
@@ -2019,6 +2018,7 @@ impl Provider for OpenAiCompatibleProvider {
         let url = self.chat_completions_url();
         let client = self.http_client();
         let auth_header = self.auth_header.clone();
+        let provider_name = self.name.clone();
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(100);
 
@@ -2039,15 +2039,10 @@ impl Provider for OpenAiCompatibleProvider {
                 }
             };
 
+            // FIX-P0-33: 429/503 carry a structured Retry-After.
             if !response.status().is_success() {
-                let status = response.status();
-                let error = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| format!("HTTP error: {}", status));
-                let sanitized = super::sanitize_api_error(&error);
                 let _ = tx
-                    .send(Err(StreamError::Provider(format!("{}: {}", status, sanitized))))
+                    .send(Err(super::stream_api_error(&provider_name, response).await))
                     .await;
                 return;
             }

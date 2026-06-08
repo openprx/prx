@@ -99,7 +99,14 @@ pub struct ProviderExecutionOutcome {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProviderAttempt {
-    pub seq: u8,
+    /// 1-based monotonic attempt index within a single `chat` failover loop.
+    ///
+    /// FIX-P0-31/#4: `u32` (not `u8`) so the "complete attempt sequence"
+    /// contract holds even when `provider_retries` (an uncapped `u32` in config)
+    /// pushes the bounded failover space (model_chain × providers × retries)
+    /// past 255 — a `u8` would saturate and collapse later attempts onto a
+    /// single non-orderable index.
+    pub seq: u32,
     pub provider: String,
     pub model: String,
     pub started_at: DateTime<Utc>,
@@ -385,6 +392,84 @@ impl ProviderExecutionOutcome {
         }
     }
 
+    /// Build an outcome from a real execution trace produced by the provider
+    /// layer (`ReliableProvider::chat_traced`).
+    ///
+    /// This replaces the synthetic single-attempt outcome of
+    /// `success_for_decision` with the *actual* attempt sequence, the *actual*
+    /// provider/model that served the request, and a fallback classification:
+    ///
+    /// * `Success` — the very first attempt of the routed provider/model
+    ///   succeeded (no retry, no provider/model fallback).
+    /// * `FallbackSuccess` — the request succeeded only after a retry or after
+    ///   falling back to a different provider/model than the routed one. The
+    ///   `fallback_reason` carries a stable classification string
+    ///   (`retry_recovered` / `provider_fallback` / `model_fallback` /
+    ///   `provider_model_fallback` / `earlier_turn_fallback`).
+    ///
+    /// `attempts` is taken verbatim from the trace; callers MUST pass a
+    /// non-empty slice ending in a `Success` attempt for a successful trace.
+    ///
+    /// FIX #2: `prior_turns_had_fallback` lets a multi-turn agent loop signal
+    /// that an *earlier* turn (not reflected in this final turn's `attempts`)
+    /// recovered through a fallback. When set, the outcome is `FallbackSuccess`
+    /// even if the final turn itself was clean, so the recorded status reflects
+    /// the whole user turn rather than only its final iteration. Single-turn
+    /// callers pass `false`.
+    #[must_use]
+    pub fn from_trace(
+        decision: &RouteDecision,
+        attempts: Vec<ProviderAttempt>,
+        final_provider: String,
+        final_model: String,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+        prior_turns_had_fallback: bool,
+    ) -> Self {
+        // A fallback occurred when more than one attempt was made (a retry or a
+        // provider/model switch each add an attempt), when the serving
+        // provider/model differs from what the router selected, or when an
+        // earlier turn in the same user turn fell back (FIX #2).
+        let provider_differs = final_provider != decision.selected.provider;
+        let model_differs = final_model != decision.selected.model;
+        let this_turn_fallback = attempts.len() > 1 || provider_differs || model_differs;
+        let had_fallback = this_turn_fallback || prior_turns_had_fallback;
+
+        let (status, fallback_reason) = if had_fallback {
+            // Prefer the most specific classification: a combined provider+model
+            // switch, then provider-only, then model-only, then a same-target
+            // retry recovered the call. #5: distinguish the combined case. When
+            // only an earlier turn fell back (this turn was clean), attribute it
+            // to that earlier turn.
+            let reason = if provider_differs && model_differs {
+                "provider_model_fallback"
+            } else if provider_differs {
+                "provider_fallback"
+            } else if model_differs {
+                "model_fallback"
+            } else if this_turn_fallback {
+                "retry_recovered"
+            } else {
+                "earlier_turn_fallback"
+            };
+            (ExecutionStatus::FallbackSuccess, Some(reason.to_string()))
+        } else {
+            (ExecutionStatus::Success, None)
+        };
+
+        Self {
+            decision_id: decision.decision_id.clone(),
+            started_at,
+            finished_at,
+            attempts,
+            final_provider,
+            final_model,
+            status,
+            fallback_reason,
+            tokens_used: TokenUsage::default(),
+        }
+    }
+
     #[must_use]
     pub fn failed_for_decision(decision: &RouteDecision, started_at: DateTime<Utc>, error: &anyhow::Error) -> Self {
         let finished_at = Utc::now();
@@ -621,5 +706,155 @@ mod tests {
                 .iter()
                 .any(|filtered| { filtered.model == "openai/gpt-4o-mini" && filtered.reason == "hint_mismatch" })
         );
+    }
+
+    fn success_attempt(provider: &str, model: &str) -> ProviderAttempt {
+        let now = Utc::now();
+        ProviderAttempt {
+            seq: 1,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            started_at: now,
+            finished_at: now,
+            status: AttemptStatus::Success,
+            error_class: None,
+            error_message: None,
+        }
+    }
+
+    #[test]
+    fn from_trace_clean_single_attempt_is_success() {
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("primary", "m1")],
+            "primary".to_string(),
+            "m1".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::Success);
+        assert!(outcome.fallback_reason.is_none());
+    }
+
+    #[test]
+    fn from_trace_prior_turn_fallback_marks_fallback_even_when_final_turn_clean() {
+        // FIX #2: the final turn is clean (single attempt, same target), but an
+        // earlier turn fell back → the whole user turn is FallbackSuccess.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("primary", "m1")],
+            "primary".to_string(),
+            "m1".to_string(),
+            now,
+            now,
+            true, // an earlier turn fell back
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("earlier_turn_fallback"));
+    }
+
+    #[test]
+    fn from_trace_provider_and_model_both_differ_is_provider_model_fallback() {
+        // #5: when both provider AND model differ, classify distinctly.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![
+                ProviderAttempt {
+                    seq: 1,
+                    provider: "primary".to_string(),
+                    model: "m1".to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    status: AttemptStatus::Failed,
+                    error_class: Some("server_error".to_string()),
+                    error_message: Some("500".to_string()),
+                },
+                success_attempt("secondary", "m2"),
+            ],
+            "secondary".to_string(),
+            "m2".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("provider_model_fallback"));
+    }
+
+    #[test]
+    fn from_trace_retry_same_target_is_retry_recovered() {
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![
+                ProviderAttempt {
+                    seq: 1,
+                    provider: "primary".to_string(),
+                    model: "m1".to_string(),
+                    started_at: now,
+                    finished_at: now,
+                    status: AttemptStatus::Failed,
+                    error_class: Some("rate_limited".to_string()),
+                    error_message: Some("429".to_string()),
+                },
+                success_attempt("primary", "m1"),
+            ],
+            "primary".to_string(),
+            "m1".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("retry_recovered"));
+    }
+
+    #[test]
+    fn from_trace_single_attempt_deviated_provider_is_fallback() {
+        // FIX #2 (alignment): a single successful attempt that landed on a
+        // provider different from the routed selection is still a fallback. The
+        // agent loop's per-turn sticky flag mirrors exactly this predicate so an
+        // intermediate tool-call turn with attempts==1 but a deviated
+        // provider/model is not silently recorded as a clean Success.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("secondary", "m1")],
+            "secondary".to_string(),
+            "m1".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("provider_fallback"));
+    }
+
+    #[test]
+    fn from_trace_single_attempt_deviated_model_is_fallback() {
+        // Companion to the provider case: a single attempt that served a model
+        // different from the routed selection is a model-level fallback.
+        let decision = RouteDecision::single_candidate("primary", "m1");
+        let now = Utc::now();
+        let outcome = ProviderExecutionOutcome::from_trace(
+            &decision,
+            vec![success_attempt("primary", "m2")],
+            "primary".to_string(),
+            "m2".to_string(),
+            now,
+            now,
+            false,
+        );
+        assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
+        assert_eq!(outcome.fallback_reason.as_deref(), Some("model_fallback"));
     }
 }

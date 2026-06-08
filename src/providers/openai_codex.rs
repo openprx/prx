@@ -1108,8 +1108,9 @@ impl OpenAiCodexProvider {
             };
 
             if !response.status().is_success() {
-                let err = super::api_error("OpenAI Codex", response).await;
-                let _ = tx.send(Err(StreamError::Provider(err.to_string()))).await;
+                let _ = tx
+                    .send(Err(super::stream_api_error("OpenAI Codex", response).await))
+                    .await;
                 return;
             }
 

@@ -68,7 +68,7 @@ pub mod tui;
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
     build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, run_tool_call_loop, select_prompt_skills,
+    is_tool_loop_cancelled, run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -2289,7 +2289,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // failure (continue), but the reducer now sees the correct semantic
         // (`StreamCancelled` vs `StreamFailed { err, retryable }`).
         enum TurnOutcome {
-            Success(String),
+            // FIX-P0-30/31: carry the loop's provider-attribution trace so the
+            // success path can record the *real* serving model/attempts instead
+            // of the routed `decision.selected.model`.
+            Success(String, crate::agent::loop_::ToolLoopTrace),
             /// User-initiated cancel (Ctrl+C) or `is_tool_loop_cancelled` from
             /// the inner loop. Reducer side maps to `StreamCancelled`.
             Cancelled,
@@ -2494,7 +2497,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 timeout_budget,
                 crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
                     turn_spawn_ctx.clone(),
-                    run_tool_call_loop(
+                    run_tool_call_loop_traced(
                         provider.as_ref(),
                         &mut history,
                         &tools_registry,
@@ -2569,7 +2572,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     };
                 }
                 // ── Success ───────────────────────────────────────
-                Ok(Ok(resp)) => break TurnOutcome::Success(resp),
+                Ok(Ok((resp, trace))) => break TurnOutcome::Success(resp, trace),
                 // ── Cancelled (Ctrl+C) ────────────────────────────
                 Ok(Err(ref e)) if is_tool_loop_cancelled(e) || cancellation.is_cancelled() => {
                     if let Some(ref d_id) = draft_id {
@@ -2703,7 +2706,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // 之后 dispatch，确保 reducer 构造 SaveSession 快照时 session.turns 已含当轮
         // assistant。Cancelled / FailedWithError 不写 assistant turn，dispatch 位置不变。
         match &turn_outcome {
-            TurnOutcome::Success(_) => {}
+            TurnOutcome::Success(..) => {}
             TurnOutcome::Cancelled => {
                 if let Some(ref d_id) = draft_id {
                     let _ = chat_dispatcher.dispatch_or_log(
@@ -2754,11 +2757,42 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         // If the turn failed or was cancelled, skip response processing
-        let response = match turn_outcome {
-            TurnOutcome::Success(resp) => resp,
+        let (response, turn_trace) = match turn_outcome {
+            TurnOutcome::Success(resp, trace) => (resp, trace),
             TurnOutcome::Cancelled | TurnOutcome::FailedWithError { .. } => continue,
         };
-        let provider_outcome = ProviderExecutionOutcome::success_for_decision(&route_decision, provider_started_at);
+        // FIX-P0-30/31: build the provider outcome from the loop's real
+        // attribution trace. When the trace carries the actual serving
+        // provider/model + attempts (the `ReliableProvider` path), use them so a
+        // retry/fallback is recorded as `FallbackSuccess` and `final_model`
+        // reflects what truly executed. Fall back to the routed
+        // `decision.selected.{provider,model}` only when no trace is available
+        // (e.g. a provider whose `chat_traced` default produced a synthetic
+        // attribution).
+        let provider_outcome = {
+            let has_trace = turn_trace.final_model.is_some() && !turn_trace.attempts.is_empty();
+            if has_trace {
+                let final_provider = turn_trace
+                    .final_provider
+                    .unwrap_or_else(|| route_decision.selected.provider.clone());
+                let final_model = turn_trace
+                    .final_model
+                    .unwrap_or_else(|| route_decision.selected.model.clone());
+                ProviderExecutionOutcome::from_trace(
+                    &route_decision,
+                    turn_trace.attempts,
+                    final_provider,
+                    final_model,
+                    provider_started_at,
+                    chrono::Utc::now(),
+                    // FIX #2: a fallback on any earlier (tool-call) turn must
+                    // surface as FallbackSuccess even when the final turn is clean.
+                    turn_trace.any_turn_had_fallback,
+                )
+            } else {
+                ProviderExecutionOutcome::success_for_decision(&route_decision, provider_started_at)
+            }
+        };
         if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
             tracing::warn!(error = %e, "Failed to append provider.final_outcome message event");
         }

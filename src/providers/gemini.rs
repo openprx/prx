@@ -748,14 +748,7 @@ impl Provider for GeminiProvider {
             };
 
             if !response.status().is_success() {
-                let status = response.status();
-                let body = response.text().await.unwrap_or_default();
-                let preview = body.chars().take(300).collect::<String>();
-                let _ = tx
-                    .send(Err(StreamError::Provider(format!(
-                        "Gemini streaming HTTP {status}: {preview}"
-                    ))))
-                    .await;
+                let _ = tx.send(Err(super::stream_api_error("Gemini", response).await)).await;
                 return;
             }
 
