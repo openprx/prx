@@ -57,6 +57,12 @@ pub enum SessionEvent {
     Delta { id: SessionId, text: String },
     /// A human-readable tool-call notification (from `on_tool_call`).
     ToolCall { id: SessionId, summary: String },
+    /// The drainer had to drop one or more events for this session because the
+    /// chat main loop's event channel was full (soft degradation, §0.4). Carries
+    /// no payload — it only tells the main loop to flag the session's ring
+    /// `truncated` so `/attach` shows `[output truncated]`. Emitted lazily on the
+    /// next successful forward after a drop (the drainer never blocks to send it).
+    Truncated { id: SessionId },
 }
 
 impl SessionEvent {
@@ -64,7 +70,7 @@ impl SessionEvent {
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
         match self {
-            Self::Delta { id, .. } | Self::ToolCall { id, .. } => id,
+            Self::Delta { id, .. } | Self::ToolCall { id, .. } | Self::Truncated { id } => id,
         }
     }
 }
@@ -139,11 +145,18 @@ fn spawn_drainer(
     tokio::spawn(async move {
         let mut delta_open = true;
         let mut tool_open = true;
+        // Set whenever a `forward` drops an event because the main-loop channel
+        // was full. On the next successful forward we first emit a
+        // `SessionEvent::Truncated` marker so the main loop can flag the ring
+        // `truncated` (and `/attach` shows `[output truncated]`). This is the
+        // only way the drainer signals a drop: it never blocks, never holds a
+        // lock, never touches the ring, and never back-pressures the agent.
+        let mut dropped = false;
         while delta_open || tool_open {
             tokio::select! {
                 delta = raw_delta_rx.recv(), if delta_open => {
                     match delta {
-                        Some(text) => forward(&event_tx, SessionEvent::Delta { id: id.clone(), text }),
+                        Some(text) => forward(&event_tx, &id, SessionEvent::Delta { id: id.clone(), text }, &mut dropped),
                         None => delta_open = false,
                     }
                 }
@@ -151,7 +164,7 @@ fn spawn_drainer(
                     match tool {
                         Some(notif) => {
                             if let Some(summary) = summarize_tool_call(&notif) {
-                                forward(&event_tx, SessionEvent::ToolCall { id: id.clone(), summary });
+                                forward(&event_tx, &id, SessionEvent::ToolCall { id: id.clone(), summary }, &mut dropped);
                             }
                         }
                         None => tool_open = false,
@@ -164,14 +177,35 @@ fn spawn_drainer(
 
 /// Forward one event to the chat main loop, dropping on a full/closed channel
 /// (soft degradation — never blocks the drainer, never back-pressures the agent).
-fn forward(event_tx: &mpsc::Sender<SessionEvent>, event: SessionEvent) {
+///
+/// `dropped` carries the "we dropped at least one event since the last
+/// successful send" flag across calls. When set, this function first tries to
+/// emit a [`SessionEvent::Truncated`] marker (a single, cheap signal that the
+/// main loop turns into a `truncated` flag on the session ring). The marker
+/// itself is sent with `try_send`: if the channel is still full it stays
+/// pending (`dropped` remains set) and we simply skip this event too — the
+/// drainer never blocks.
+fn forward(event_tx: &mpsc::Sender<SessionEvent>, id: &SessionId, event: SessionEvent, dropped: &mut bool) {
+    // If we owe a truncation marker, try to send it before the real event so the
+    // `[output truncated]` indicator precedes the next visible output.
+    if *dropped {
+        match event_tx.try_send(SessionEvent::Truncated { id: id.clone() }) {
+            Ok(()) => *dropped = false,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Still backed up; keep `dropped` set and drop this event too.
+                return;
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return,
+        }
+    }
     match event_tx.try_send(event) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(_)) => {
-            // Main loop is behind; drop the event (soft degradation). The drainer
-            // never writes the ring, so it simply drops here — back-pressure
-            // never reaches the background agent. The ring separately flags
-            // `truncated` when its own line capacity overflows.
+            // Main loop is behind; drop the event (soft degradation) and remember
+            // it so the next successful forward emits a `Truncated` marker. The
+            // drainer never writes the ring and never blocks — back-pressure
+            // never reaches the background agent.
+            *dropped = true;
         }
         Err(mpsc::error::TrySendError::Closed(_)) => {
             // Chat main loop has shut down its receiver; nothing more to do.
@@ -241,10 +275,20 @@ impl SessionRing {
         self.buf.push_back(line);
     }
 
-    /// Whether any line has been dropped due to capacity.
+    /// Whether any line has been dropped — either by this ring's own line
+    /// capacity overflow, or by the drainer dropping events on a full main-loop
+    /// channel (signalled via [`SessionEvent::Truncated`], applied with
+    /// [`Self::mark_truncated`]).
     #[must_use]
     pub const fn is_truncated(&self) -> bool {
         self.truncated
+    }
+
+    /// Flag the ring `truncated` because the drainer dropped one or more events
+    /// upstream (a full main-loop channel), not this ring's own capacity. Pure
+    /// main-loop state; no lock, no await. Idempotent.
+    pub const fn mark_truncated(&mut self) {
+        self.truncated = true;
     }
 
     /// Number of lines currently held.
@@ -388,11 +432,141 @@ mod tests {
                     assert_eq!(summary, "→ read");
                     got_tool = true;
                 }
+                Some(SessionEvent::Truncated { .. }) => {
+                    // No drop expected in this small, fully-drained scenario.
+                    panic!("test: unexpected truncation marker without a drop");
+                }
                 None => break,
             }
         }
         assert!(got_delta, "delta event forwarded");
         assert!(got_tool, "tool event forwarded");
+    }
+
+    #[test]
+    fn forward_emits_truncated_marker_after_a_drop() {
+        // Capacity-1 channel: fill it, force a drop, then drain and confirm the
+        // next successful forward is preceded by a `Truncated` marker (P1).
+        let (event_tx, mut rx) = mpsc::channel::<SessionEvent>(1);
+        let id = SessionId::from_run_id("run-trunc");
+        let mut dropped = false;
+
+        // 1) First forward fills the channel (succeeds, no pending drop).
+        forward(
+            &event_tx,
+            &id,
+            SessionEvent::Delta {
+                id: id.clone(),
+                text: "a".into(),
+            },
+            &mut dropped,
+        );
+        assert!(!dropped, "first send fits");
+
+        // 2) Channel is now full → this forward drops and records it.
+        forward(
+            &event_tx,
+            &id,
+            SessionEvent::Delta {
+                id: id.clone(),
+                text: "b".into(),
+            },
+            &mut dropped,
+        );
+        assert!(dropped, "second send dropped on full channel");
+
+        // 3) Drain the one buffered event so the channel has room again.
+        assert_eq!(
+            rx.try_recv().expect("test: first buffered event"),
+            SessionEvent::Delta {
+                id: id.clone(),
+                text: "a".into(),
+            }
+        );
+
+        // 4) Next forward must first emit a Truncated marker, then the event.
+        forward(
+            &event_tx,
+            &id,
+            SessionEvent::Delta {
+                id: id.clone(),
+                text: "c".into(),
+            },
+            &mut dropped,
+        );
+        // The marker was sent first (channel had room for exactly one), which
+        // cleared the pending-drop flag; then the real "c" event found the
+        // channel full again and was dropped, re-arming the flag.
+        assert!(dropped, "the 'c' event dropped on the now-full channel, re-arming");
+        assert_eq!(
+            rx.try_recv().expect("test: truncated marker first"),
+            SessionEvent::Truncated { id: id.clone() }
+        );
+        // And nothing else is buffered ("c" was dropped).
+        assert!(rx.try_recv().is_err(), "no further event buffered");
+    }
+
+    #[test]
+    fn ring_mark_truncated_flags_without_pushing() {
+        let mut ring = SessionRing::with_capacity(10);
+        ring.push("a".into());
+        assert!(!ring.is_truncated());
+        ring.mark_truncated();
+        assert!(ring.is_truncated(), "marker flags truncated");
+        assert_eq!(ring.len(), 1, "no line was added by the marker");
+        // Idempotent.
+        ring.mark_truncated();
+        assert!(ring.is_truncated());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drainer_signals_truncation_when_main_loop_stalls() {
+        // End-to-end through the real drainer task: a slow consumer drains one
+        // event at a time with a pause, so the bounded event channel fills and
+        // the drainer must drop. Because the consumer keeps draining (creating
+        // room) while the producer keeps feeding (backlog remains), the drainer's
+        // next successful forward emits a `Truncated` marker. We assert at least
+        // one marker reaches the consumer. The consumer always stays slower than
+        // the producer's burst, guaranteeing drops without relying on exact
+        // timing windows.
+        let (sink, mut rx) = SessionEventSink::channel();
+        let id = SessionId::from_run_id("run-trunc-flood");
+        let (delta_tx, _tool_tx) = sink.attach_run(id.clone());
+
+        // Producer: flood far beyond channel capacity, then close.
+        let producer = tokio::spawn(async move {
+            for i in 0..(EVENT_CHANNEL_CAPACITY * 8) {
+                if delta_tx.send(format!("line {i}")).await.is_err() {
+                    break;
+                }
+            }
+            drop(delta_tx);
+        });
+
+        // Consumer: drain slowly so the channel overflows (drops) but still keeps
+        // making room, so a marker is eventually forwarded.
+        let mut saw_truncated = false;
+        let mut received = 0usize;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv()).await {
+                Ok(Some(SessionEvent::Truncated { id: eid })) => {
+                    assert_eq!(eid, id);
+                    saw_truncated = true;
+                    break;
+                }
+                Ok(Some(_)) => {
+                    received += 1;
+                    // Pause periodically to let the channel fill behind us.
+                    if received % 16 == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        producer.await.expect("test: producer joins");
+        assert!(saw_truncated, "a truncation marker must be surfaced after drops");
     }
 
     #[tokio::test]

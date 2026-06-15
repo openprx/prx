@@ -1690,6 +1690,11 @@ pub async fn run(
         crate::chat::sessions::SessionRing,
     > = std::collections::HashMap::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
+    // Sessions for which the live follow has already surfaced an `[output
+    // truncated]` notice, so the marker (P1) is shown at most once per session
+    // while following. Cleared on `/attach` (a fresh follow re-evaluates).
+    let mut attach_truncated_shown: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
+        std::collections::HashSet::new();
     // Guards the event-drain select arm: once the event channel closes (only at
     // shutdown — the sender lives as long as the tool registry) we disable the
     // arm so a closed channel does not busy-spin returning `None`.
@@ -1757,20 +1762,35 @@ pub async fn run(
                     continue;
                 };
                 let sid = event.session_id().clone();
-                let line = match &event {
-                    crate::chat::sessions::SessionEvent::Delta { text, .. } => text.clone(),
-                    crate::chat::sessions::SessionEvent::ToolCall { summary, .. } => summary.clone(),
-                };
                 let ring = session_rings
                     .entry(sid.clone())
                     .or_insert_with(|| crate::chat::sessions::SessionRing::with_capacity(
                         crate::chat::sessions::event::DEFAULT_RING_CAPACITY,
                     ));
-                ring.push(line);
+                // A `Truncated` marker carries no output line; it only flags the
+                // ring so `/attach` shows `[output truncated]` for events the
+                // drainer had to drop on a full channel (P1 fix). Delta/ToolCall
+                // append their text as a new ring line.
+                let line = match &event {
+                    crate::chat::sessions::SessionEvent::Delta { text, .. } => Some(text.clone()),
+                    crate::chat::sessions::SessionEvent::ToolCall { summary, .. } => Some(summary.clone()),
+                    crate::chat::sessions::SessionEvent::Truncated { .. } => {
+                        ring.mark_truncated();
+                        None
+                    }
+                };
+                if let Some(line) = line {
+                    ring.push(line);
+                }
                 if attached_follow.as_ref() == Some(&sid) {
                     // Follow mode: surface only the newly-appended lines inline.
                     let new_lines = ring.drain_new();
-                    if !new_lines.is_empty() {
+                    // Show `[output truncated]` once per truncation: either riding
+                    // along with new output, or on its own when a `Truncated`
+                    // marker (P1) arrives with no accompanying line.
+                    let show_truncated =
+                        ring.is_truncated() && !attach_truncated_shown.contains(&sid);
+                    if !new_lines.is_empty() || show_truncated {
                         let mut out = String::new();
                         for l in &new_lines {
                             out.push_str(l);
@@ -1778,14 +1798,18 @@ pub async fn run(
                                 out.push('\n');
                             }
                         }
-                        if ring.is_truncated() {
+                        if show_truncated {
                             out.push_str("[output truncated]\n");
+                            attach_truncated_shown.insert(sid.clone());
                         }
-                        surface_session_message(
-                            &chat_dispatcher,
-                            sessions_redraw_handle.as_ref(),
-                            out.trim_end(),
-                        );
+                        let trimmed = out.trim_end();
+                        if !trimmed.is_empty() {
+                            surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                trimmed,
+                            );
+                        }
                     }
                 }
                 continue;
@@ -2406,6 +2430,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             match chat_sessions.resolve_run_id(seq).await {
                                 Ok(run_id) => {
                                     let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    // P2 fix — dedup attach replay. A terminal
+                                    // session's final answer already lives in the
+                                    // registry history (printed as the tail below)
+                                    // *and* was captured in the live ring via
+                                    // `on_delta`. Printing both duplicates it, so
+                                    // for terminal sessions we print only the
+                                    // history tail and skip ring replay. Running
+                                    // sessions still replay the retained ring +
+                                    // live-follow new lines so incremental output
+                                    // remains visible.
+                                    let is_terminal = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
                                     // Print the historical tail (registry history)
                                     // once for context, then start the live follow.
                                     match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
@@ -2420,21 +2455,32 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         Ok(_) => {}
                                         Err(e) => emit_chat_output(&format!("Attach tail failed: {e}")),
                                     }
-                                    // Replay any retained live-stream lines already
-                                    // captured in the ring before this attach, then
-                                    // follow new ones.
+                                    // Fresh follow: re-evaluate the one-shot
+                                    // truncation notice for this session.
+                                    attach_truncated_shown.remove(&sid);
                                     if let Some(ring) = session_rings.get_mut(&sid) {
-                                        ring.rewind();
-                                        let retained = ring.drain_new();
-                                        if !retained.is_empty() {
-                                            let mut out = String::new();
-                                            for l in &retained {
-                                                out.push_str(l);
-                                                if !l.ends_with('\n') {
-                                                    out.push('\n');
+                                        if is_terminal {
+                                            // Skip ring replay (would duplicate the
+                                            // history tail); align the drained
+                                            // cursor to the end so a later re-attach
+                                            // does not replay stale lines either.
+                                            let _ = ring.drain_new();
+                                        } else {
+                                            // Running: replay any retained
+                                            // live-stream lines captured before this
+                                            // attach, then follow new ones.
+                                            ring.rewind();
+                                            let retained = ring.drain_new();
+                                            if !retained.is_empty() {
+                                                let mut out = String::new();
+                                                for l in &retained {
+                                                    out.push_str(l);
+                                                    if !l.ends_with('\n') {
+                                                        out.push('\n');
+                                                    }
                                                 }
+                                                emit_chat_output(out.trim_end());
                                             }
-                                            emit_chat_output(out.trim_end());
                                         }
                                     }
                                     attached_follow = Some(sid);

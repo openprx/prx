@@ -168,6 +168,32 @@ impl ChatSessionsHandle {
             .ok_or_else(|| anyhow!("no session #{seq}"))
     }
 
+    /// Whether the session at display sequence `#N` has reached a terminal state
+    /// (`Completed` / `Failed` / `Cancelled`). Refreshes the seq map first so a
+    /// just-spawned run is addressable. Returns an error (never panics) if the
+    /// sequence is unknown.
+    ///
+    /// Used by `/attach` to decide its replay strategy: a terminal session's
+    /// final answer already lives in the registry history (printed as the tail),
+    /// and the same content was also captured in the live ring via `on_delta`, so
+    /// replaying the ring would duplicate it. Running sessions keep ring replay +
+    /// live follow so new incremental output is still visible.
+    pub async fn is_terminal_for_seq(&mut self, seq: u64) -> Result<bool> {
+        let runs = self.refresh_seqs().await;
+        let target_id = self
+            .id_for_seq(seq)
+            .map(|id| id.as_str().to_string())
+            .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        let run = runs
+            .iter()
+            .find(|r| r.id == target_id)
+            .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        Ok(matches!(
+            project_status(&run.status),
+            ManagedStatus::Completed | ManagedStatus::Failed | ManagedStatus::Cancelled
+        ))
+    }
+
     /// Read a read-only tail of a background session's accumulated history.
     ///
     /// v1b `/attach` is a **read-only snapshot** (plan §v1b): it polls the run's
@@ -332,6 +358,27 @@ mod tests {
         )]));
         let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
         assert_eq!(handle.resolve_run_id(1).await.expect("test: #1 after bg"), "fresh");
+    }
+
+    #[tokio::test]
+    async fn is_terminal_distinguishes_running_from_finished() {
+        let runs = Arc::new(RwLock::new(vec![
+            make_run("a", "task a", SubAgentStatus::Running),
+            make_run("b", "task b", SubAgentStatus::Completed("done".into())),
+            make_run("c", "task c", SubAgentStatus::Failed("boom".into())),
+        ]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let _ = handle.snapshot().await; // assign seqs #1..#3
+
+        assert!(!handle.is_terminal_for_seq(1).await.expect("test: #1 running"));
+        assert!(handle.is_terminal_for_seq(2).await.expect("test: #2 completed"));
+        assert!(handle.is_terminal_for_seq(3).await.expect("test: #3 failed"));
+
+        let err = handle
+            .is_terminal_for_seq(99)
+            .await
+            .expect_err("test: unknown seq must error");
+        assert!(err.to_string().contains("no session #99"));
     }
 
     fn entry(role: &str, content: &str) -> HistoryEntry {
