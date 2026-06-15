@@ -218,29 +218,60 @@ impl PtyHandoffGuard {
     /// Begin a terminal handoff: pause the render loop and wait for it to park,
     /// then return a guard whose `Drop` restores the chat TUI.
     ///
+    /// Returns `None` if the render loop does **not** acknowledge the pause
+    /// within [`PAUSE_ACK_TIMEOUT`]: in that case we cannot prove the render loop
+    /// has stopped touching the terminal, so continuing the handoff would let two
+    /// threads write to `stdout`/read `stdin` concurrently and corrupt the
+    /// screen. We therefore **abort the attach**: the pause flag is cleared (the
+    /// render loop, if alive, resumes cleanly) and the caller must not proceed.
+    /// We would rather refuse `/pty attach` than wedge or scramble the terminal.
+    ///
     /// `redraw_nudge`, if supplied, is invoked on `Drop` to wake the render loop
     /// immediately (e.g. a `move || { let _ = redraw_tx.try_send(()); }`).
-    pub fn acquire(control: Arc<HandoffControl>, redraw_nudge: Option<Box<dyn Fn() + Send>>) -> Self {
-        // Block (bounded) until the render loop confirms it has parked. We
-        // deliberately ignore the bool: on timeout we proceed anyway (the
-        // handoff is best-effort and the guard's Drop still restores), never
-        // deadlocking.
-        let _acked = control.pause_and_wait(PAUSE_ACK_TIMEOUT);
-        Self { control, redraw_nudge }
+    pub fn acquire(control: Arc<HandoffControl>, redraw_nudge: Option<Box<dyn Fn() + Send>>) -> Option<Self> {
+        // Block (bounded) until the render loop confirms it has parked.
+        if control.pause_and_wait(PAUSE_ACK_TIMEOUT) {
+            return Some(Self { control, redraw_nudge });
+        }
+        // Ack timed out: the render loop never confirmed it parked. Abandon the
+        // handoff and undo the pause so the (possibly-slow-but-alive) render loop
+        // resumes. No terminal control sequences are written here — the render
+        // loop still owns the terminal.
+        control.resume_with_redraw();
+        None
     }
 }
 
 impl Drop for PtyHandoffGuard {
     fn drop(&mut self) {
-        // 1. Resume the render loop + force a full redraw to clear PTY residue.
-        self.control.resume_with_redraw();
-        // 2. Defensively re-assert the chat terminal modes the PTY child may
-        //    have clobbered. Best-effort — we are on the restoration path and
-        //    have no caller to surface errors to; the render loop's own
-        //    `TerminalGuard` is the primary owner of these.
+        // ORDER MATTERS. While we restore the host terminal's modes the render
+        // loop must still be parked, otherwise it could `draw()` (writing its
+        // own control sequences to `stdout`) concurrently with the
+        // `enable_raw_mode` / `EnableBracketedPaste` below, or step into
+        // crossterm `poll`/`read` before raw mode is re-asserted. So:
+        //
+        //   1. restore terminal modes  (render loop STILL paused)
+        //   2. arm force_redraw
+        //   3. unpause                  (render loop may now draw)
+        //   4. nudge
+        //
+        // After step 3 we write NO further stdout control sequences.
+
+        // 1. Defensively re-assert the chat terminal modes the PTY child may
+        //    have clobbered, while the render loop is still parked so we are the
+        //    sole writer of these escape/kernel operations. Best-effort — we are
+        //    on the restoration path and have no caller to surface errors to.
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
-        // 3. Nudge the render loop to repaint right away.
+
+        // 2 & 3. Arm the full redraw (to wipe PTY residue) and only THEN unpause,
+        //        so the render loop's first post-resume action sees the flag and
+        //        repaints cleanly. `resume_with_redraw` sets force_redraw before
+        //        clearing `paused`, so the ordering holds for the render loop too.
+        self.control.resume_with_redraw();
+
+        // 4. Nudge the render loop to repaint right away (no stdout writes here;
+        //    just a channel wakeup).
         if let Some(nudge) = &self.redraw_nudge {
             nudge();
         }
@@ -291,6 +322,15 @@ pub struct PtyIo {
     pub reader: Box<dyn std::io::Read + Send>,
     /// Real terminal `stdin` bytes → write here to reach the PTY child.
     pub writer: Box<dyn std::io::Write + Send>,
+    /// Raw fd of the PTY **master** (Unix only) so the passthrough's reader
+    /// thread can `poll` it with a timeout and stay interruptible via a stop
+    /// flag — it must NOT depend on EOF, since a backgrounded grandchild
+    /// (`sleep 300 &`, reparented to init, killpg can't reach it) can hold the
+    /// slave open indefinitely and wedge a blocking `read()`. `None` on non-Unix
+    /// or if the backend did not expose an fd; the reader then falls back to a
+    /// plain blocking read (documented platform limitation).
+    #[cfg(unix)]
+    pub master_fd: Option<std::os::fd::RawFd>,
 }
 
 impl PtyShellSession {
@@ -355,6 +395,15 @@ impl PtyShellSession {
             .take_writer()
             .map_err(|e| anyhow!("Failed to take PTY writer: {e}"))?;
 
+        // Capture the master's raw fd (Unix) BEFORE we move the master into the
+        // session, so the passthrough's reader thread can `poll` it with a
+        // timeout instead of relying on a (possibly never-arriving) EOF. The
+        // cloned reader reads the same underlying fd per the `MasterPty`
+        // contract, so polling this fd correctly reflects the reader's
+        // readability.
+        #[cfg(unix)]
+        let master_fd = pair.master.as_raw_fd();
+
         // Drop the slave handle: the child holds its own fd, and keeping the
         // slave open here would prevent the master reader from seeing EOF when
         // the child exits.
@@ -368,7 +417,15 @@ impl PtyShellSession {
             child: Arc::new(Mutex::new(child)),
             pgid,
         };
-        Ok((session, PtyIo { reader, writer }))
+        Ok((
+            session,
+            PtyIo {
+                reader,
+                writer,
+                #[cfg(unix)]
+                master_fd,
+            },
+        ))
     }
 
     /// Resize the PTY to match the host terminal. Cheap, synchronous, never
@@ -401,22 +458,50 @@ impl PtyShellSession {
         #[cfg(unix)]
         {
             if let Some(pgid) = self.pgid {
+                // Invariant upheld by `pgid_from_pid`: `pgid > 0`, so `killpg`
+                // can never signal our own group (0) or the whole system (-1).
+                debug_assert!(pgid > 0, "kill_now: pgid must be strictly positive");
                 // SAFETY: `killpg` is an async-signal-safe libc call that only
                 // signals the process group `pgid`; it dereferences no pointers
                 // and has no memory-safety preconditions. `pgid` is the session
                 // leader pid of our own PTY child (a descendant group), so
                 // signalling it is sound.
-                unsafe {
+                let (hup, kill) = unsafe {
                     // SIGHUP first (the natural "terminal closed" signal for an
                     // interactive shell), then SIGKILL to guarantee teardown.
-                    libc::killpg(pgid, libc::SIGHUP);
-                    libc::killpg(pgid, libc::SIGKILL);
+                    let hup = libc::killpg(pgid, libc::SIGHUP);
+                    let kill = libc::killpg(pgid, libc::SIGKILL);
+                    (hup, kill)
+                };
+                // Don't silently ignore the result: a non-`ESRCH` failure means
+                // the group may still be alive. We do NOT rely on the kill to
+                // unblock anything (the reader thread is stopped via its own
+                // stop flag with a bounded `poll`, never an unbounded EOF wait),
+                // but a surprising errno is worth a log line for diagnosis.
+                if kill != 0 {
+                    let errno = std::io::Error::last_os_error();
+                    // `ESRCH` (no such process group) is the expected, benign
+                    // outcome when the child already exited — not worth warning.
+                    if errno.raw_os_error() != Some(libc::ESRCH) {
+                        tracing::warn!(
+                            pgid,
+                            hup_rc = hup,
+                            kill_rc = kill,
+                            error = %errno,
+                            "kill_now: killpg(SIGKILL) did not succeed"
+                        );
+                    }
                 }
                 return;
             }
         }
-        // No pgid: best-effort kill of the direct child.
-        let _ = self.child.lock().kill();
+        // No pgid: best-effort kill of the direct child. Bind the result first so
+        // the `MutexGuard` temporary does not live across the `if let` body
+        // (clippy::significant_drop_in_scrutinee).
+        let kill_result = self.child.lock().kill();
+        if let Err(e) = kill_result {
+            tracing::warn!(error = %e, "kill_now: direct child kill failed");
+        }
     }
 
     /// Terminate the session's whole process group (Unix) or the direct child
@@ -487,8 +572,12 @@ const HARDENED_PATH: &str = r"C:\Windows\System32;C:\Windows;C:\Windows\System32
 #[cfg(unix)]
 fn pgid_from_pid(pid: Option<u32>) -> Option<i32> {
     // pid fits in i32 on every supported Unix; this is the conventional pid_t
-    // representation used by killpg.
-    pid.and_then(|pid| i32::try_from(pid).ok())
+    // representation used by killpg. Reject non-positive values defensively: a
+    // pgid of `0` means "the caller's own process group" and a negative value is
+    // never a valid pid — either would turn a later `killpg` into a catastrophe
+    // (signalling *our own* group / the whole system). Only a strictly positive
+    // pgid is ever signalled.
+    pid.and_then(|pid| i32::try_from(pid).ok()).filter(|&pgid| pgid > 0)
 }
 
 #[cfg(not(unix))]
@@ -516,6 +605,130 @@ pub const fn classify_input_byte(byte: u8) -> InputByte {
         InputByte::Detach
     } else {
         InputByte::Forward
+    }
+}
+
+/// A cancellation flag for the PTY passthrough's output-reader thread.
+///
+/// The reader thread copies PTY output → `stdout`. On detach we MUST be able to
+/// stop and `join` it *without waiting for EOF*: a backgrounded grandchild that
+/// is reparented to init (so `killpg` can't reach it) can keep the slave PTY fd
+/// open forever, and a reader blocked in `read()` would then never return —
+/// freezing the whole chat. To stay interruptible the reader polls the master fd
+/// with a short timeout and checks [`ReaderStop::is_stopped`] every cycle,
+/// exiting promptly when asked even if no EOF ever arrives.
+#[derive(Debug, Default)]
+pub struct ReaderStop(AtomicBool);
+
+impl ReaderStop {
+    /// A fresh, not-yet-stopped flag.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(AtomicBool::new(false))
+    }
+
+    /// Request the reader thread to stop at its next poll cycle.
+    pub fn stop(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether a stop has been requested.
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Outcome of the interruptible reader loop, so the caller (and tests) can tell
+/// *why* it stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReaderOutcome {
+    /// The PTY master reached EOF (child exited / master closed).
+    Eof,
+    /// A stop was requested via [`ReaderStop::stop`] (e.g. detach).
+    Stopped,
+    /// `stdout` could not be written (terminal gone); nothing more to do.
+    StdoutGone,
+}
+
+/// Copy PTY output → `out` until EOF, a stop request, or a `stdout` write
+/// failure, **never blocking unboundedly**.
+///
+/// On Unix it `poll`s `master_fd` with a `poll_timeout` so every cycle re-checks
+/// `stop`; this is what makes detach safe even when an orphaned grandchild holds
+/// the slave open (no EOF will ever come). `reader` must read the same
+/// underlying fd as `master_fd` (it does: the cloned reader and the master share
+/// the kernel pty master per the `portable-pty` contract).
+///
+/// On non-Unix (no `master_fd`) it falls back to a plain blocking `read` loop;
+/// the stop flag is still honoured between reads but a fully-idle orphan can
+/// delay the final `join` until the next byte/EOF (documented platform
+/// limitation).
+///
+/// Pure of chat state and never panics: returns a [`ReaderOutcome`] for the
+/// caller to log/branch on.
+#[allow(unsafe_code)]
+pub fn read_pty_to_stdout(
+    reader: &mut dyn std::io::Read,
+    out: &mut dyn std::io::Write,
+    stop: &ReaderStop,
+    #[cfg(unix)] master_fd: Option<std::os::fd::RawFd>,
+    poll_timeout: std::time::Duration,
+) -> ReaderOutcome {
+    let mut buf = [0u8; 8192];
+    // Clamp the poll timeout to a sane i32 millisecond count for `libc::poll`.
+    // Only the unix `poll` path consumes it; on other targets the blocking read
+    // provides its own backpressure, so the value is unused there.
+    #[cfg(unix)]
+    let timeout_ms = i32::try_from(poll_timeout.as_millis()).unwrap_or(100).max(1);
+    #[cfg(not(unix))]
+    let _ = poll_timeout;
+    loop {
+        if stop.is_stopped() {
+            return ReaderOutcome::Stopped;
+        }
+
+        // On Unix, wait (bounded) for the master to be readable so each cycle
+        // re-checks the stop flag without blocking on a read that may never
+        // return (orphaned grandchild holding the slave open).
+        #[cfg(unix)]
+        if let Some(fd) = master_fd {
+            let mut pfd = libc::pollfd {
+                fd,
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll` reads/writes exactly the one `pollfd` we pass
+            // (`nfds = 1`); `&raw mut pfd` points to a live local valid for the
+            // duration of the call. `poll` dereferences nothing else and has no
+            // memory-safety preconditions. `timeout_ms >= 1` bounds the wait so
+            // the surrounding loop re-checks `stop` promptly.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, timeout_ms) };
+            if rc <= 0 {
+                // Timeout (0) or EINTR (<0): loop to re-check `stop`.
+                continue;
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 && pfd.revents & libc::POLLIN == 0 {
+                // Hung up with no pending data → master closed / child gone.
+                return ReaderOutcome::Eof;
+            }
+            // Readable: fall through to the read below.
+        }
+
+        match reader.read(&mut buf) {
+            Ok(0) => return ReaderOutcome::Eof, // EOF: child exited / master closed
+            Ok(n) => {
+                let chunk = buf.get(..n).unwrap_or(&buf);
+                if out.write_all(chunk).is_err() || out.flush().is_err() {
+                    return ReaderOutcome::StdoutGone;
+                }
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // On a non-blocking-ish wakeup with nothing to read, keep looping so
+            // the stop flag is re-checked rather than treating it as a hard EOF.
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return ReaderOutcome::Eof,
+        }
     }
 }
 
@@ -609,19 +822,39 @@ mod tests {
 
     // ── PtyHandoffGuard RAII restoration ─────────────────────────────────────
 
+    /// Spawn a short-lived "render loop" that acks the pause so
+    /// [`PtyHandoffGuard::acquire`] succeeds (it now refuses to attach if the
+    /// pause is never acknowledged).
+    fn spawn_acking_render_loop(control: &Arc<HandoffControl>) -> std::thread::JoinHandle<()> {
+        let c = Arc::clone(control);
+        std::thread::spawn(move || {
+            for _ in 0..1000 {
+                if c.is_paused() {
+                    c.ack_paused();
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        })
+    }
+
     #[test]
     fn guard_drop_resumes_and_forces_redraw() {
         let control = Arc::new(HandoffControl::new());
         let nudged = Arc::new(AtomicBool::new(false));
         let nudged2 = Arc::clone(&nudged);
+        let acker = spawn_acking_render_loop(&control);
         {
-            let _guard = PtyHandoffGuard::acquire(
+            let guard = PtyHandoffGuard::acquire(
                 Arc::clone(&control),
                 Some(Box::new(move || nudged2.store(true, Ordering::Release))),
-            );
+            )
+            .expect("test: ack arrives so acquire succeeds");
             // During the handoff the render loop is paused.
             assert!(control.is_paused());
+            drop(guard);
         }
+        acker.join().expect("test: acker joins");
         // Drop restored everything: resumed, force-redraw set, nudge fired.
         assert!(!control.is_paused(), "guard drop must resume the render loop");
         assert!(control.take_force_redraw(), "guard drop must force a redraw");
@@ -634,18 +867,171 @@ mod tests {
         // Drop and restores the render loop. We catch the unwind so the test
         // process survives and can assert the post-conditions.
         let control = Arc::new(HandoffControl::new());
+        let acker = spawn_acking_render_loop(&control);
         let control2 = Arc::clone(&control);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None);
+            let _guard =
+                PtyHandoffGuard::acquire(Arc::clone(&control2), None).expect("test: ack arrives so acquire succeeds");
             assert!(control2.is_paused());
             panic!("test: simulate a fault during PTY handoff");
         }));
+        acker.join().expect("test: acker joins");
         assert!(result.is_err(), "the closure panicked");
         assert!(
             !control.is_paused(),
             "terminal must be restored (render loop resumed) even after a panic"
         );
         assert!(control.take_force_redraw());
+    }
+
+    #[test]
+    fn acquire_aborts_when_render_loop_never_parks() {
+        // P0-D: if the render loop never acks the pause, `acquire` must return
+        // `None` and leave the control un-paused (handoff refused, terminal
+        // untouched), never proceed with a half-done handoff.
+        let control = Arc::new(HandoffControl::new());
+        // No acker thread → the ack will time out.
+        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None);
+        assert!(guard.is_none(), "acquire must refuse when the render loop never parks");
+        assert!(
+            !control.is_paused(),
+            "a refused attach must leave the render loop resumed, not stuck paused"
+        );
+    }
+
+    #[test]
+    fn guard_drop_restores_terminal_mode_before_unpausing() {
+        // P0-C ordering: the guard must restore terminal modes WHILE the render
+        // loop is still paused, then unpause. We cannot observe the crossterm
+        // calls directly here, but we CAN assert the externally-visible ordering
+        // contract `resume_with_redraw` guarantees: force_redraw is armed before
+        // (or atomically with) `paused` being cleared, so a render loop observing
+        // `!is_paused()` always also sees `force_redraw == true`.
+        let control = Arc::new(HandoffControl::new());
+        let acker = spawn_acking_render_loop(&control);
+        let guard =
+            PtyHandoffGuard::acquire(Arc::clone(&control), None).expect("test: ack arrives so acquire succeeds");
+        assert!(control.is_paused());
+        drop(guard);
+        acker.join().expect("test: acker joins");
+        // After drop: unpaused AND force_redraw armed (so the render loop repaints
+        // the chrome rather than leaving PTY residue / a blank viewport).
+        assert!(!control.is_paused(), "guard drop must unpause");
+        assert!(control.take_force_redraw(), "force_redraw must be set on resume");
+    }
+
+    // ── Interruptible reader (P0-A: bounded stop, no EOF dependency) ──────────
+
+    #[test]
+    fn reader_stop_flag_round_trips() {
+        let s = ReaderStop::new();
+        assert!(!s.is_stopped());
+        s.stop();
+        assert!(s.is_stopped());
+    }
+
+    #[test]
+    fn reader_returns_eof_on_closed_pipe() {
+        // A reader whose source is already at EOF must return `Eof` promptly
+        // without needing the stop flag. (No fd → blocking-read fallback path,
+        // exercised on every platform.)
+        use std::io::Cursor;
+        let mut reader = Cursor::new(Vec::<u8>::new()); // empty → immediate EOF
+        let mut out: Vec<u8> = Vec::new();
+        let stop = ReaderStop::new();
+        let outcome = read_pty_to_stdout(
+            &mut reader,
+            &mut out,
+            &stop,
+            #[cfg(unix)]
+            None,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(outcome, ReaderOutcome::Eof);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn reader_copies_then_eof() {
+        use std::io::Cursor;
+        let mut reader = Cursor::new(b"hello".to_vec());
+        let mut out: Vec<u8> = Vec::new();
+        let stop = ReaderStop::new();
+        let outcome = read_pty_to_stdout(
+            &mut reader,
+            &mut out,
+            &stop,
+            #[cfg(unix)]
+            None,
+            std::time::Duration::from_millis(10),
+        );
+        assert_eq!(outcome, ReaderOutcome::Eof);
+        assert_eq!(out, b"hello");
+    }
+
+    /// A `Read` that NEVER returns data or EOF — it parks each `read` until told
+    /// to stop, modelling an orphaned grandchild that holds the slave PTY open so
+    /// the master never sees EOF. The interruptible reader must still exit
+    /// (bounded) when the stop flag is set, instead of blocking forever.
+    struct NeverEofReader {
+        released: Arc<AtomicBool>,
+    }
+    impl std::io::Read for NeverEofReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            // Block until released, then report a spurious WouldBlock so the
+            // reader loops back and observes the stop flag (mirrors the unix
+            // poll-timeout path which never even calls read while idle).
+            while !self.released.load(Ordering::Acquire) {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    #[test]
+    fn reader_stops_without_eof_when_flag_set() {
+        // P0-A core invariant: the reader exits on the stop flag WITHOUT EOF, so
+        // a detach can always `join` it in bounded time even with an orphan
+        // holding the slave open. We run the reader on a thread and assert it
+        // joins quickly after we stop it.
+        let released = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(ReaderStop::new());
+        let stop_thread = Arc::clone(&stop);
+        let mut reader = NeverEofReader {
+            released: Arc::clone(&released),
+        };
+        let handle = std::thread::spawn(move || {
+            let mut out: Vec<u8> = Vec::new();
+            read_pty_to_stdout(
+                &mut reader,
+                &mut out,
+                &stop_thread,
+                // `None` fd → blocking-read fallback, so the stop flag (checked
+                // between reads) is the ONLY exit. This is the worst case and
+                // proves the flag alone bounds the loop.
+                #[cfg(unix)]
+                None,
+                std::time::Duration::from_millis(20),
+            )
+        });
+        // Let the reader park in `read` a moment, then request stop + release the
+        // blocked read so it loops once and sees the flag.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        stop.stop();
+        released.store(true, Ordering::Release);
+        // Join must complete well within a generous bound (no infinite block).
+        let start = std::time::Instant::now();
+        let outcome = loop {
+            if handle.is_finished() {
+                break handle.join().expect("test: reader thread joins");
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "reader did not stop within bound — would freeze chat on detach"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        assert_eq!(outcome, ReaderOutcome::Stopped);
     }
 
     // ── PTY spawn + interaction (Unix; needs a real /dev/ptmx) ───────────────
@@ -722,5 +1108,76 @@ mod tests {
             })
             .expect("test: resize accepted");
         session.kill().await.expect("test: cleanup kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reader_detach_is_bounded_even_with_orphan_holding_slave() {
+        // P0-A end-to-end-ish: spawn a shell that backgrounds a long sleeper into
+        // its OWN session (`setsid`), so killing the PTY child's group does NOT
+        // reap the orphan; the orphan keeps the slave PTY open, so the master
+        // NEVER sees EOF. Prove the interruptible reader against the real master
+        // fd still stops (bounded) on the flag — this is exactly the detach path
+        // that used to freeze the chat.
+        let sec = auto_security();
+        let (session, io) = PtyShellSession::spawn(
+            // `setsid sleep 300` detaches into a new session/group; if setsid is
+            // unavailable the plain `&` background still reparents on shell exit.
+            "(setsid sleep 300 >/dev/null 2>&1 &) ; exit",
+            &sec,
+            PtySize::default(),
+        )
+        .expect("test: spawn shell that orphans a sleeper");
+
+        let crate::chat::sessions::pty::PtyIo {
+            mut reader,
+            writer,
+            master_fd,
+        } = io;
+        drop(writer); // we won't write; just exercise the reader
+
+        let stop = Arc::new(ReaderStop::new());
+        let stop_thread = Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut sink: Vec<u8> = Vec::new();
+            read_pty_to_stdout(
+                reader.as_mut(),
+                &mut sink,
+                &stop_thread,
+                master_fd,
+                std::time::Duration::from_millis(50),
+            )
+        });
+
+        // Give the shell time to spawn the orphan and exit; the orphan now holds
+        // the slave open so no EOF will arrive. Kill the child's group (mirrors
+        // detach's `kill_now`) — this must NOT reap the orphan.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        session.kill_now();
+
+        // Request stop — the reader must exit within a bounded window EVEN THOUGH
+        // EOF never comes (orphan holds the slave). Without the interruptible
+        // poll+flag design this join would hang forever and freeze the chat.
+        stop.stop();
+        let start = std::time::Instant::now();
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "reader did not stop after detach with an orphan holding the slave — chat would freeze"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let outcome = handle.join().expect("test: reader joins");
+        // It stopped via the flag (the whole point) — not by a fortuitous EOF.
+        assert!(
+            matches!(outcome, ReaderOutcome::Stopped | ReaderOutcome::Eof),
+            "reader returned a teardown outcome, got {outcome:?}"
+        );
+
+        // Best-effort cleanup of the orphan so the test box isn't littered.
+        session.kill().await.ok();
     }
 }

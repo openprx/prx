@@ -4316,22 +4316,44 @@ async fn handle_pty_command(
     let handoff = Arc::clone(handoff);
     let session_for_passthrough = session.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        let _guard = PtyHandoffGuard::acquire(handoff, redraw_nudge);
-        run_pty_passthrough(io, &session_for_passthrough)
-        // `_guard` drops here → render loop resumes + full redraw forced.
+        // Acquire the handoff guard: this pauses the render loop and waits for it
+        // to acknowledge it has parked. If the ack times out we do NOT proceed —
+        // running the passthrough while the render loop might still touch the
+        // terminal would corrupt the screen. `acquire` returns `None` after
+        // having already un-paused the render loop, so we just report the abort.
+        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
+            return Ok(PtyOutcome::AttachAborted);
+        };
+        run_pty_passthrough(io, &session_for_passthrough).map(PtyOutcome::Exited)
+        // `_guard` drops here → terminal modes restored, then render loop resumes
+        //  + full redraw forced.
     })
     .await;
 
     // Best-effort: terminate the child's process group so a detach (Ctrl-]) does
     // not leave an interactive shell running headless with no way to see it.
-    // (If the child already exited this is a no-op.)
+    // (If the child already exited this is a no-op.) Skipped when the attach was
+    // aborted before any handoff — but a harmless no-op even then.
     if let Err(e) = session.kill().await {
         tracing::warn!(error = %e, seq, "failed to terminate PTY group after detach");
     }
 
     match outcome {
-        Ok(Ok(PtyExit::Detached)) => emit_chat_output(&format!("Detached from PTY session #{seq}.")),
-        Ok(Ok(PtyExit::ChildExited)) => emit_chat_output(&format!("Interactive PTY session #{seq} exited.")),
+        Ok(Ok(PtyOutcome::Exited(PtyExit::Detached))) => {
+            emit_chat_output(&format!("Detached from PTY session #{seq}."));
+        }
+        Ok(Ok(PtyOutcome::Exited(PtyExit::ChildExited))) => {
+            emit_chat_output(&format!("Interactive PTY session #{seq} exited."));
+        }
+        Ok(Ok(PtyOutcome::AttachAborted)) => {
+            // The render loop never acked the pause, so we refused the handoff to
+            // avoid two threads fighting over the terminal. The session was
+            // killed above; tell the user why nothing happened.
+            tracing::warn!(seq, "PTY attach aborted: render loop did not park in time");
+            emit_chat_output(&format!(
+                "Could not enter PTY session #{seq}: the chat renderer did not pause in time (terminal unchanged)."
+            ));
+        }
         Ok(Err(e)) => emit_chat_output(&format!("PTY session #{seq} error: {e}")),
         Err(e) => {
             // The passthrough task panicked; the guard's Drop still ran during
@@ -4340,6 +4362,18 @@ async fn handle_pty_command(
             emit_chat_output(&format!("PTY session #{seq} ended unexpectedly; terminal restored."));
         }
     }
+}
+
+/// The result of an attempted `/pty` attach: either the passthrough ran and
+/// ended ([`PtyExit`]), or the handoff was refused because the render loop never
+/// acknowledged the pause (so the terminal was left untouched).
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyOutcome {
+    /// The passthrough ran and ended this way.
+    Exited(PtyExit),
+    /// The handoff was aborted before takeover (render loop did not park).
+    AttachAborted,
 }
 
 /// How an interactive PTY passthrough ended.
@@ -4374,10 +4408,17 @@ fn run_pty_passthrough(
     io: crate::chat::sessions::pty::PtyIo,
     session: &crate::chat::sessions::pty::PtyShellSession,
 ) -> Result<PtyExit> {
-    use crate::chat::sessions::pty::{InputByte, classify_input_byte};
-    use std::io::{Read as _, Write as _};
+    use crate::chat::sessions::pty::{InputByte, ReaderOutcome, ReaderStop, classify_input_byte, read_pty_to_stdout};
+    use std::io::Write as _;
 
-    let crate::chat::sessions::pty::PtyIo { mut reader, mut writer } = io;
+    #[cfg(unix)]
+    let crate::chat::sessions::pty::PtyIo {
+        mut reader,
+        writer,
+        master_fd,
+    } = io;
+    #[cfg(not(unix))]
+    let crate::chat::sessions::pty::PtyIo { mut reader, writer } = io;
 
     // Clear the screen + home the cursor so the PTY child starts on a clean
     // surface (the chat inline chrome was drawn at the bottom before the
@@ -4389,57 +4430,100 @@ fn run_pty_passthrough(
         let _ = out.flush();
     }
 
-    // ── Reader thread: PTY output → stdout ───────────────────────────────────
+    // ── Reader thread: PTY output → stdout (interruptible) ────────────────────
+    //
+    // The reader does NOT wait for EOF: a backgrounded grandchild (e.g.
+    // `sleep 300 &`, reparented to init so `killpg` cannot reach it) can hold the
+    // slave PTY open forever. Instead the reader `poll`s the master fd with a
+    // 100 ms timeout and checks `reader_stop` each cycle, so on detach we set the
+    // stop flag and the `join` below is always bounded — the chat can never
+    // freeze waiting on an orphan.
+    let reader_stop = Arc::new(ReaderStop::new());
+    // `child_done` records that the reader observed EOF (true child exit), so the
+    // stdin loop can end the passthrough promptly when the child exits while the
+    // user is idle.
     let child_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let child_done_reader = Arc::clone(&child_done);
+    let reader_stop_thread = Arc::clone(&reader_stop);
+    let child_done_thread = Arc::clone(&child_done);
     let reader_handle = std::thread::spawn(move || {
-        let mut buf = [0u8; 8192];
         let mut out = std::io::stdout();
-        loop {
-            match reader.read(&mut buf) {
-                Ok(0) => break, // EOF: child exited / master closed
-                Ok(n) => {
-                    let chunk = buf.get(..n).unwrap_or(&buf);
-                    if out.write_all(chunk).is_err() || out.flush().is_err() {
-                        break; // stdout gone — nothing more we can do
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(_) => break,
-            }
+        let outcome = read_pty_to_stdout(
+            reader.as_mut(),
+            &mut out,
+            &reader_stop_thread,
+            #[cfg(unix)]
+            master_fd,
+            std::time::Duration::from_millis(100),
+        );
+        // Only EOF means the child genuinely exited; a Stopped/StdoutGone outcome
+        // is a teardown signal, not a child-exit signal.
+        if outcome == ReaderOutcome::Eof {
+            child_done_thread.store(true, Ordering::Release);
         }
-        child_done_reader.store(true, Ordering::Release);
     });
 
+    // RAII cleanup: runs on EVERY exit path of the stdin loop — `Ok`, `?`
+    // early-return, or panic unwind — so the reader thread is always stopped and
+    // joined (bounded) and the child group is killed before the `PtyHandoffGuard`
+    // resumes the chat render loop. Without this, an error in the stdin/writer
+    // loop would skip cleanup and the reader could keep scribbling on `stdout`
+    // over the restored TUI (Codex P0-B).
+    struct PassthroughCleanup<'a> {
+        session: &'a crate::chat::sessions::pty::PtyShellSession,
+        reader_stop: Arc<ReaderStop>,
+        reader_handle: Option<std::thread::JoinHandle<()>>,
+        writer: Option<Box<dyn std::io::Write + Send>>,
+    }
+    impl Drop for PassthroughCleanup<'_> {
+        fn drop(&mut self) {
+            // Terminate the child's group synchronously (no async grace) so the
+            // master closes and an orphan can't keep us alive. Idempotent / a
+            // no-op if the child already exited.
+            self.session.kill_now();
+            // Ask the reader thread to stop at its next poll cycle (it does NOT
+            // wait for EOF, so this is what guarantees a bounded join).
+            self.reader_stop.stop();
+            // Drop our writer so the slave end observes EOF too.
+            self.writer.take();
+            // Bounded join: the reader exits within one poll cycle (~100 ms) of
+            // the stop flag, so by the time the guard resumes the render loop no
+            // other thread is writing to `stdout`.
+            if let Some(handle) = self.reader_handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    // Move the writer into the cleanup guard so it is owned in exactly one place
+    // and dropped during cleanup. We forward bytes to it through the guard.
+    let mut cleanup = PassthroughCleanup {
+        session,
+        reader_stop: Arc::clone(&reader_stop),
+        reader_handle: Some(reader_handle),
+        writer: Some(writer),
+    };
+
     // ── This thread: stdin → PTY writer, watching for detach + child exit ─────
-    let exit = pty_stdin_loop(&child_done, |byte| {
+    // The result is captured (not `?`-propagated directly) so `cleanup`'s Drop
+    // runs on success AND error before we return. (Drop also runs on panic.)
+    let result = pty_stdin_loop(&child_done, |byte| {
         match classify_input_byte(byte) {
             InputByte::Detach => Ok(true), // stop the loop (detach)
             InputByte::Forward => {
-                writer.write_all(&[byte]).and_then(|()| writer.flush())?;
+                let w = cleanup
+                    .writer
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("PTY writer already closed"))?;
+                w.write_all(&[byte]).and_then(|()| w.flush())?;
                 Ok(false)
             }
         }
-    })?;
+    });
 
-    // CRITICAL ordering for terminal safety: the reader thread may still be
-    // blocked in `reader.read()` and could write more PTY bytes to `stdout`. We
-    // MUST stop it before the `PtyHandoffGuard` resumes the chat render loop,
-    // otherwise lingering PTY output would scribble over the restored TUI.
-    //
-    // On detach the child is still alive, so synchronously terminate its group
-    // here (no async grace) to close the PTY master and make the reader see EOF.
-    // On child-exit the master is already closed, so this is a no-op.
-    if exit == PtyExit::Detached {
-        session.kill_now();
-    }
-    // Drop our writer so the slave end observes EOF too.
-    drop(writer);
-    // Join the reader thread: now that the master is closed it sees EOF and
-    // returns promptly, so by the time the guard drops (resuming the render
-    // loop) no other thread is writing to `stdout`.
-    let _ = reader_handle.join();
-    Ok(exit)
+    // `cleanup` drops at end of scope (kill_now + stop reader + drop writer +
+    // bounded join) regardless of whether `result` is Ok or Err.
+    drop(cleanup);
+    result
 }
 
 /// Read raw `stdin` byte-by-byte, invoking `on_byte` for each, until `on_byte`
@@ -4611,17 +4695,33 @@ fn run_tui_unified_loop(
         // Just resumed from a handoff: the PTY scribbled over the whole
         // screen, so force a full clear + repaint to wipe its residue before
         // resuming normal inline rendering.
+        //
+        // P2-B (render stability across repeated PTY enter/exit): order matters
+        // here. We must (a) clear the screen, (b) re-push the FULL conversation
+        // history via `insert_before` (sections 1), and only THEN (c) draw the
+        // bottom chrome once (section 2) so the status bar + input box land at
+        // the bottom and are not scrolled away by a later `insert_before`. The
+        // previous code drew the chrome *before* re-pushing history, so each
+        // `insert_before` shoved that freshly-drawn chrome up; after a few
+        // enter/exit cycles the title/input bar drifted out of the viewport.
+        //
+        // So here we ONLY clear + reset the push cursor, and we clear
+        // `skip_next_draw` so section 2 is guaranteed to repaint the chrome this
+        // iteration after history has been flushed. No chrome draw happens in
+        // this block.
         if handoff.take_force_redraw() {
             if let Err(e) = terminal.clear() {
                 tracing::warn!(error = %e, "post-PTY terminal clear failed");
             }
-            // Re-materialise the inline viewport immediately.
-            if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
-                tracing::warn!(error = %e, "post-PTY redraw failed");
-            }
             // Everything in scrollback was wiped by the PTY; re-push from the
-            // start so the conversation history is visible again.
+            // start so the conversation history is visible again. Section 1
+            // (below) does the actual `insert_before`, then section 2 draws the
+            // chrome at the bottom — this fixed ordering keeps the chrome stable
+            // across repeated enter/exit.
             last_pushed_idx = 0;
+            // Guarantee the chrome is (re)drawn this iteration even if no redraw
+            // wakeup is pending, so the bottom bar is never left blank.
+            skip_next_draw = false;
         }
 
         // ── 1. Flush newly-finalised conversation lines to scrollback ──
