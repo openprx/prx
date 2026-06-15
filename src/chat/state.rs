@@ -2069,9 +2069,7 @@ mod tests {
                 title: "b".into(),
             },
         ];
-        let effects = state.reduce(Action::SwitcherOpened {
-            entries: entries.clone(),
-        });
+        let effects = state.reduce(Action::SwitcherOpened { entries });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         let sw = state.ui.switcher.as_ref().expect("test: switcher open");
         assert_eq!(sw.len(), 2);

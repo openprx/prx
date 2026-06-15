@@ -193,6 +193,54 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     EscAction::Cancel
 }
 
+/// Pure model of the input-routing focus transition used by the v1.1b key
+/// thread (P0 attach/detach race fix).
+///
+/// The synchronous key thread, on switcher-Enter (`/attach N`) or empty-Esc
+/// (`/detach`), must point the prompt indicator, its own Esc judgment, and the
+/// next submittable input at the same target *before* the synthetic command is
+/// enqueued — otherwise the FIFO `input_tx` routes a just-typed line to the new
+/// session while the user still sees the old prompt. [`optimistic_focus`] is the
+/// pure decision the key thread applies; [`rollback_focus`] is what the async
+/// main loop restores if an attach ultimately fails.
+///
+/// `Attach(seq)` optimistically focuses that session; `Detach` returns to main.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoutingIntent {
+    /// Switcher Enter / typed `/attach N` → focus session `#seq`.
+    Attach { seq: u64 },
+    /// Empty Esc / typed `/detach` → return routing to the main chat agent.
+    Detach,
+}
+
+/// The focus the key thread optimistically applies for a routing intent.
+///
+/// This is the single value written to all three authorities at once
+/// (`mirror.focus`, the reducer snapshot via `SessionFocusChanged`, and — by
+/// virtue of being enqueued ahead of any later input on the same FIFO — the
+/// effective routing target), keeping perception and routing consistent.
+#[must_use]
+pub const fn optimistic_focus(intent: RoutingIntent) -> FocusTarget {
+    match intent {
+        RoutingIntent::Attach { seq } => FocusTarget::Session { seq },
+        RoutingIntent::Detach => FocusTarget::Main,
+    }
+}
+
+/// The focus the main loop restores when an optimistic attach fails, given the
+/// still-authoritative currently-followed sequence (`None` ⇒ main).
+///
+/// On attach failure `attached_follow` is unchanged, so the prompt must snap
+/// back to whatever was actually focused before the optimistic set — never the
+/// failed target.
+#[must_use]
+pub const fn rollback_focus(current_follow_seq: Option<u64>) -> FocusTarget {
+    match current_follow_seq {
+        Some(seq) => FocusTarget::Session { seq },
+        None => FocusTarget::Main,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::id::SessionId;
@@ -295,5 +343,68 @@ mod tests {
     #[test]
     fn resolve_esc_empty_main_cancels() {
         assert_eq!(resolve_esc(true, FocusTarget::Main, false), EscAction::Cancel);
+    }
+
+    // ── v1.1b P0: attach/detach input-routing race ──────────────────────────
+    //
+    // These cover the invariant Codex flagged: the prompt indicator, the key
+    // thread's Esc judgment, and the FIFO routing target must agree the instant
+    // a `/attach` / `/detach` is enqueued. The key thread enqueues
+    // `optimistic_focus(intent)` on all three authorities before sending the
+    // synthetic command, so a line typed immediately afterwards is *perceived*
+    // to go exactly where FIFO ordering will actually route it.
+
+    #[test]
+    fn optimistic_attach_focuses_target_session() {
+        assert_eq!(
+            optimistic_focus(RoutingIntent::Attach { seq: 7 }),
+            FocusTarget::Session { seq: 7 }
+        );
+    }
+
+    #[test]
+    fn optimistic_detach_focuses_main() {
+        assert_eq!(optimistic_focus(RoutingIntent::Detach), FocusTarget::Main);
+    }
+
+    #[test]
+    fn ctrl_g_enter_then_immediate_input_sees_attached_prompt() {
+        // Models: Ctrl+G Enter selects #5, then the user types + Enter before the
+        // async main loop has processed the synthetic `/attach`. Because the key
+        // thread applies the optimistic focus first, the Esc judgment for that
+        // next (empty) input already detaches from #5 — i.e. perception tracks
+        // the new target, not the stale Main.
+        let focus = optimistic_focus(RoutingIntent::Attach { seq: 5 });
+        assert_eq!(focus, FocusTarget::Session { seq: 5 });
+        // Next submittable input perceives session focus, matching FIFO routing.
+        assert_eq!(resolve_esc(true, focus, false), EscAction::RequestDetach);
+    }
+
+    #[test]
+    fn esc_detach_then_immediate_input_sees_main_prompt() {
+        // Symmetric: empty-Esc detach optimistically returns to Main, so the next
+        // input is perceived (and routed) as a main-chat turn, not a stale steer.
+        let focus = optimistic_focus(RoutingIntent::Detach);
+        assert_eq!(focus, FocusTarget::Main);
+        assert_eq!(resolve_esc(true, focus, false), EscAction::Cancel);
+    }
+
+    #[test]
+    fn rollback_on_attach_failure_restores_previous_target() {
+        // No prior follow → a failed attach snaps the prompt back to Main, never
+        // the failed target.
+        assert_eq!(rollback_focus(None), FocusTarget::Main);
+        // Already following #2 and an attach to a now-gone seq fails → restore #2.
+        assert_eq!(rollback_focus(Some(2)), FocusTarget::Session { seq: 2 });
+    }
+
+    #[test]
+    fn rollback_is_inverse_of_optimistic_when_attach_fails_from_main() {
+        // Start at Main, optimistically attach #9, attach fails → rollback to the
+        // unchanged follow (None ⇒ Main): perception ends consistent with routing.
+        let optimistic = optimistic_focus(RoutingIntent::Attach { seq: 9 });
+        assert_eq!(optimistic, FocusTarget::Session { seq: 9 });
+        let current_follow_seq: Option<u64> = None; // attach never bound it
+        assert_eq!(rollback_focus(current_follow_seq), FocusTarget::Main);
     }
 }

@@ -1702,6 +1702,12 @@ pub async fn run(
         crate::chat::sessions::SessionRing,
     > = std::collections::HashMap::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
+    // Display sequence `#N` of the currently-followed session, kept in lock-step
+    // with `attached_follow`. Used purely to reconstruct the *previous* focus
+    // target when an optimistic attach must be rolled back (v1.1b review P0): on
+    // attach failure the key thread has already pointed the prompt at the new
+    // seq, so the main loop restores `Main` (when None) or `Session { seq }`.
+    let mut attached_follow_seq: Option<u64> = None;
     // Sessions for which the live follow has already surfaced an `[output
     // truncated]` notice, so the marker (P1) is shown at most once per session
     // while following. Cleared on `/attach` (a fresh follow re-evaluates).
@@ -2504,11 +2510,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         }
                                     }
                                     attached_follow = Some(sid);
+                                    attached_follow_seq = Some(seq);
                                     // v1.1b: route plain input to this session as
                                     // a steer and reflect the target in the prompt
                                     // (colour+glyph). Update both the render
                                     // snapshot (Action) and the key thread's
-                                    // mirror (read by `resolve_esc`).
+                                    // mirror (read by `resolve_esc`). When the
+                                    // attach was triggered from the switcher the
+                                    // key thread already set this optimistically;
+                                    // re-affirming it here is idempotent and also
+                                    // covers the typed `/attach N` path.
                                     let focus = crate::chat::sessions::FocusTarget::Session { seq };
                                     let _ = chat_dispatcher.dispatch_or_log(
                                         crate::chat::action::Action::SessionFocusChanged { focus },
@@ -2525,12 +2536,38 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         "Following session #{seq} (live, routing input as steer). Type /detach or press Esc to stop."
                                     ));
                                 }
-                                Err(e) => emit_chat_output(&format!("Attach failed: {e}")),
+                                Err(e) => {
+                                    // P0 race fix: the switcher key thread may have
+                                    // optimistically pointed the prompt + Esc
+                                    // judgment at `seq` before this attach ran. The
+                                    // attach failed (seq no longer resolves / the
+                                    // session is gone), so `attached_follow` is
+                                    // unchanged — restore the prompt to the *actual*
+                                    // current target so perception cannot diverge
+                                    // from routing. (A typed `/attach N` that fails
+                                    // has no optimistic set, but restoring the same
+                                    // unchanged focus is an idempotent no-op there.)
+                                    let prev_focus = crate::chat::sessions::focus::rollback_focus(attached_follow_seq);
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
+                                        "chat.session_focus_attach_rollback",
+                                    );
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        chat_mirror.lock().focus = prev_focus;
+                                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                            let _ = tx.try_send(());
+                                        }
+                                    }
+                                    emit_chat_output(&format!("Attach failed: {e}"));
+                                }
                             }
                             continue;
                         }
                         SessionCommand::Detach => {
-                            if attached_follow.take().is_some() {
+                            let was_following = attached_follow.take().is_some();
+                            attached_follow_seq = None;
+                            if was_following {
                                 // v1.1b: reset input routing back to main and clear
                                 // the prompt target indicator (snapshot + mirror).
                                 let focus = crate::chat::sessions::FocusTarget::Main;
@@ -4007,6 +4044,40 @@ fn send_synthetic_command(
     input_tx.blocking_send(msg).map_err(|_| ())
 }
 
+/// Optimistically apply an input-routing focus change from the synchronous TUI
+/// key thread, keeping the three authorities that decide "where the next
+/// submittable input goes" consistent at the *same instant* the synthetic
+/// `/attach` / `/detach` is enqueued (v1.1b review P0 — close the attach/detach
+/// TOCTOU race):
+///
+/// 1. **`mirror.focus`** — read by [`tui::dispatch_global_key`]'s `resolve_esc`
+///    in this same key thread, so the very next Esc judgment matches.
+/// 2. **`Action::SessionFocusChanged`** — drives the reducer-owned `UiSnapshot`
+///    the prompt indicator (colour+glyph) is rendered from, so the prompt the
+///    user sees matches before they can type the next character.
+/// 3. The caller then sends the synthetic command on the **same FIFO
+///    `input_tx`** as real submissions, so the actual main-loop routing of any
+///    immediately-following input lands on the same target the prompt shows.
+///
+/// The main loop remains the sole owner of the authoritative `attached_follow`
+/// and rolls this optimistic focus back if the attach ultimately fails.
+#[cfg(feature = "terminal-tui")]
+fn apply_optimistic_focus(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+    focus: crate::chat::sessions::FocusTarget,
+) {
+    mirror.lock().focus = focus;
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged { focus },
+        "chat.optimistic_focus",
+    );
+    // Nudge the renderer so the prompt repaints with the new target without
+    // waiting for the idle poll.
+    let _ = redraw_tx.try_send(());
+}
+
 /// Inner body of [`spawn_tui_unified_loop`].
 ///
 /// **P3-inline architecture.** ratatui owns only a fixed-height inline
@@ -4322,6 +4393,20 @@ fn run_tui_unified_loop(
                             crate::chat::action::Action::SwitcherClosed,
                             "chat.switcher_closed_attach",
                         );
+                        // P0 race fix: optimistically point the prompt + Esc
+                        // judgment at the new target *before* enqueuing the
+                        // synthetic command, so any input the user types
+                        // immediately afterwards is perceived to go where FIFO
+                        // ordering will actually route it. The main loop rolls
+                        // this back if the attach fails.
+                        apply_optimistic_focus(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            crate::chat::sessions::focus::optimistic_focus(
+                                crate::chat::sessions::focus::RoutingIntent::Attach { seq },
+                            ),
+                        );
                         if send_synthetic_command(&input_tx, &format!("/attach {seq}")).is_err() {
                             return Ok(());
                         }
@@ -4330,6 +4415,18 @@ fn run_tui_unified_loop(
                         // Esc on empty input while a session is focused → route a
                         // synthetic `/detach` so the main loop clears
                         // `attached_follow` + focus via its existing handler.
+                        // P0 race fix: optimistically reset routing to main first
+                        // so the prompt + next-input perception match the FIFO
+                        // detach that is about to be processed. Detach never
+                        // fails (it is a local clear), so no rollback is needed.
+                        apply_optimistic_focus(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            crate::chat::sessions::focus::optimistic_focus(
+                                crate::chat::sessions::focus::RoutingIntent::Detach,
+                            ),
+                        );
                         if send_synthetic_command(&input_tx, "/detach").is_err() {
                             return Ok(());
                         }
