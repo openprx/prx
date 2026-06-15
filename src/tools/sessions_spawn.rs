@@ -32,7 +32,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Default timeout for sub-agent runs (10 minutes).
-const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 0;
+///
+/// A value of `0` means "no timeout" (run until natural completion), matching
+/// the session-worker semantics in `session_worker/runner.rs`.
+const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
@@ -1277,28 +1280,34 @@ impl Tool for SessionsSpawnTool {
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                run_sub_agent_task(
-                    &task_owned,
-                    provider,
-                    &provider_name,
-                    &model,
-                    temperature,
-                    filtered_tools,
-                    &system_prompt,
-                    &workspace_dir,
-                    security,
-                    &multimodal_config,
-                    &compaction_config,
-                    max_iterations,
-                    steer_rx,
-                    history_arc,
-                    task_scope,
-                    task_memory,
-                ),
-            )
-            .await;
+            let run_future = run_sub_agent_task(
+                &task_owned,
+                provider,
+                &provider_name,
+                &model,
+                temperature,
+                filtered_tools,
+                &system_prompt,
+                &workspace_dir,
+                security,
+                &multimodal_config,
+                &compaction_config,
+                max_iterations,
+                steer_rx,
+                history_arc,
+                task_scope,
+                task_memory,
+            );
+            // `timeout_secs == 0` means "no timeout" — run until natural
+            // completion. This matches the session-worker semantics in
+            // `session_worker/runner.rs`. A non-zero value wraps the run in a
+            // `tokio::time::timeout`. `Ok(_)` => ran to completion (no timeout
+            // or finished in time), `Err(_)` => elapsed.
+            let result = if timeout_secs == 0 {
+                Ok(run_future.await)
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
+            };
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
             let (status, result_text) = match result {
@@ -2374,7 +2383,17 @@ async fn run_sub_agent_process(
         stdin.flush().await?;
     }
 
-    let parent_timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    // `timeout_secs == 0` means "no timeout" — the child (see
+    // `session_worker/runner.rs`) runs until natural completion, so the parent
+    // must not kill it prematurely. We use a far-future cap (30 days) as an
+    // effectively-unbounded parent timeout, which keeps the existing
+    // `tokio::time::timeout` wrapping intact while avoiding timer overflow.
+    const NO_TIMEOUT_PARENT_CAP_SECS: u64 = 30 * 24 * 60 * 60;
+    let parent_timeout = if timeout_secs == 0 {
+        std::time::Duration::from_secs(NO_TIMEOUT_PARENT_CAP_SECS)
+    } else {
+        std::time::Duration::from_secs(timeout_secs)
+    };
     let stdout_stream = child
         .stdout
         .take()
@@ -2689,6 +2708,38 @@ mod tests {
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("history"));
         assert!(tool.description().contains("steer"));
+    }
+
+    #[test]
+    fn default_sub_agent_timeout_is_ten_minutes() {
+        // Regression: the constant was 0 (instant timeout in task mode) while
+        // its doc claimed "10 minutes". It must now be 600s.
+        assert_eq!(DEFAULT_SUB_AGENT_TIMEOUT_SECS, 600);
+    }
+
+    #[tokio::test]
+    async fn task_mode_zero_timeout_does_not_elapse_immediately() {
+        // Mirrors the task-mode timeout-wrapping logic at the spawn site:
+        // `timeout_secs == 0` must run the future to completion (no timeout),
+        // rather than wrapping it in `tokio::time::timeout(ZERO, ..)` which
+        // would elapse on the first poll. Use a future with a real (small)
+        // delay so a ZERO-duration timeout would observably fail.
+        async fn wrap_like_task_mode(timeout_secs: u64) -> Result<&'static str, tokio::time::error::Elapsed> {
+            let run_future = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                "done"
+            };
+            if timeout_secs == 0 {
+                Ok(run_future.await)
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
+            }
+        }
+
+        // 0 => no timeout => runs to completion.
+        assert_eq!(wrap_like_task_mode(0).await, Ok("done"));
+        // Non-zero generous timeout also completes.
+        assert_eq!(wrap_like_task_mode(60).await, Ok("done"));
     }
 
     #[test]
