@@ -9,7 +9,9 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{
+    DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig, run_tool_call_loop,
+};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -306,6 +308,12 @@ pub struct SessionsSpawnTool {
     /// Shared memory backend for normalized spawn lifecycle events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
+    /// Optional event bridge sink. When set (chat `/bg` path), a task-mode
+    /// sub-agent streams its incremental output + tool calls through a
+    /// per-session drainer (provisioned by the chat side) into the chat UI's
+    /// ring buffers (v1.1a). When `None` (channels/gateway path), spawns stay
+    /// silent — zero behaviour change for those callers.
+    event_sink: Option<SpawnEventSink>,
 }
 
 impl SessionsSpawnTool {
@@ -393,7 +401,20 @@ impl SessionsSpawnTool {
             spawn_config,
             memory: None,
             event_recording: MemoryEventRecording::default(),
+            event_sink: None,
         }
+    }
+
+    /// Attach a [`SpawnEventSink`] so task-mode sub-agents spawned by this tool
+    /// stream their incremental output and tool-call notifications to the chat UI
+    /// (live read-only attach, v1.1a).
+    ///
+    /// Only the chat `/bg` path sets this; channels/gateway leave it `None` and
+    /// keep spawning silently (zero behaviour change for those callers).
+    #[must_use]
+    pub fn with_event_sink(mut self, sink: SpawnEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
     }
 
     /// Return a shareable handle to the default-recipient slot so callers can
@@ -1224,6 +1245,12 @@ impl Tool for SessionsSpawnTool {
         };
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
+        // Event bridge (v1.1a): if a chat-side sink is attached, create this
+        // session's middle channels + drainer up front (run_id is already
+        // minted, so the drainer is tagged with the correct id — no race). The
+        // background agent only ever `.send().await`s onto these; the drainer
+        // continuously empties them, so the agent never back-pressures.
+        let run_event_streams = self.event_sink.as_ref().map(|sink| sink.streams_for(&run_id));
         let task_owned = task.to_string();
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
@@ -1280,6 +1307,10 @@ impl Tool for SessionsSpawnTool {
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
+            let (run_on_delta, run_on_tool) = match run_event_streams {
+                Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
+                None => (None, None),
+            };
             let run_future = run_sub_agent_task(
                 &task_owned,
                 provider,
@@ -1297,6 +1328,8 @@ impl Tool for SessionsSpawnTool {
                 history_arc,
                 task_scope,
                 task_memory,
+                run_on_delta,
+                run_on_tool,
             );
             // `timeout_secs == 0` means "no timeout" — run until natural
             // completion. This matches the session-worker semantics in
@@ -2024,12 +2057,22 @@ async fn run_sub_agent_task(
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
     memory: Option<Arc<dyn Memory>>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
         let response = provider
             .chat_with_system(Some(system_prompt), task, model, temperature)
             .await?;
+        // No incremental loop output exists on this path (single completion);
+        // surface the final response as one delta so an attached follower sees
+        // it (best-effort; dropped on a full/closed channel).
+        if let Some(ref tx) = on_delta
+            && !response.trim().is_empty()
+        {
+            let _ = tx.try_send(response.clone());
+        }
         let history = vec![
             HistoryEntry {
                 role: "user".into(),
@@ -2071,6 +2114,18 @@ async fn run_sub_agent_task(
         let security = security.clone();
         let scope_owned = scope.clone();
         let memory_owned = memory.clone();
+        // Clone the event-bridge senders per iteration so they survive across
+        // steer-driven loop restarts (the inner spawn consumes its clones; the
+        // originals stay owned by this outer loop). When `None`, the loop runs
+        // silently exactly as before (channels/gateway behaviour unchanged).
+        //
+        // NOTE: the agent stays `silent = true` regardless. `silent` only gates
+        // the loop's *direct* `print!` to stdout (loop_.rs); a background
+        // sub-agent must never print to the chat's terminal (it would corrupt
+        // the TUI). The `on_delta` / `on_tool_call` channel sends are NOT gated
+        // by `silent`, so the event bridge streams to the drainer either way.
+        let on_delta_iter = on_delta.clone();
+        let on_tool_call_iter = on_tool_call.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
@@ -2096,7 +2151,7 @@ async fn run_sub_agent_task(
                 &provider_name_owned,
                 &model_name,
                 temperature_value,
-                true, // silent — no streaming output
+                true, // silent — never print to the chat terminal (see note above)
                 None, // no approval manager
                 "sessions_spawn",
                 &multimodal_config_owned,
@@ -2116,10 +2171,10 @@ async fn run_sub_agent_task(
                 },
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
-                None, // no streaming sender
+                on_delta_iter, // chat event bridge: incremental loop output (v1.1a)
                 scope_ctx.as_ref(),
-                None,
-                None, // spawned sessions do not use tool tiering
+                on_tool_call_iter, // chat event bridge: tool-call notifications (v1.1a)
+                None,              // spawned sessions do not use tool tiering
                 scope_ctx.as_ref().and_then(|ctx| {
                     memory_owned
                         .as_ref()

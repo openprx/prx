@@ -11,16 +11,21 @@
 //! - [`runtime::ChatSessionsHandle`] — thin handle over the shared registry for
 //!   `/sessions`, `/kill`, `/steer`, and `/attach`.
 //! - [`runtime::status_summary`] — persistent status-line summary builder.
+//! - [`event::SessionEvent`] / [`event::SessionEventSink`] / [`event::SessionRing`]
+//!   — the v1.1a event bridge: decoupled delta/tool streaming from background
+//!   agents into per-session ring buffers for live read-only attach.
 //!
 //! See `task/prx/chat-background-runtime-v1-execution-plan.md` (v1a/v1b) for
 //! scope.
 
 pub mod command;
+pub mod event;
 pub mod id;
 pub mod model;
 pub mod runtime;
 
 pub use command::{SessionCommand, parse_session_command};
+pub use event::{SessionEvent, SessionEventSink, SessionRing};
 // `FinishedSession` / `TailLine` are returned by `ChatSessionsHandle` methods
 // and reachable as `runtime::{FinishedSession, TailLine}`; not re-exported at
 // this level until a caller needs to name them (avoids an unused-import warning).

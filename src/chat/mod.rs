@@ -1130,6 +1130,11 @@ pub async fn run(
     let active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>> =
         Arc::new(tokio::sync::RwLock::new(Vec::new()));
     let sessions_workspace_id = config.workspace_dir.to_string_lossy().to_string();
+    // Event bridge (v1.1a): the chat main loop owns the single `SessionEvent`
+    // receiver; the spawn tool gets the matching library-level sink so task-mode
+    // `/bg` sub-agents stream incremental output + tool calls (via a per-session
+    // drainer) into per-session ring buffers for live read-only `/attach`.
+    let (session_event_sink, mut session_event_rx) = crate::chat::sessions::SessionEventSink::channel();
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
         Arc::clone(&provider),
@@ -1147,7 +1152,8 @@ pub async fn run(
         Arc::clone(&active_runs),
     )
     .with_shared_memory(Arc::clone(&mem))
-    .with_event_recording(config.memory.event_recording_config());
+    .with_event_recording(config.memory.event_recording_config())
+    .with_event_sink(session_event_sink.into_spawn_sink());
     let spawn_tools_handle = spawn_tool.tools_handle();
 
     // Sibling tools share the same single-source registry (only the v1a four;
@@ -1673,6 +1679,21 @@ pub async fn run(
     let mut last_sessions_summary: String = String::new();
     let mut sessions_tick = tokio::time::interval(Duration::from_secs(1));
     sessions_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // ── Event bridge state (v1.1a) ────────────────────────────────
+    // Per-session ring buffers, written ONLY here (single consumer; iron law:
+    // the ring is never written by the background agent or the drainer). Live
+    // `/attach` follows one session at a time: when `attached_follow` matches an
+    // incoming event's session, its delta/tool lines are streamed inline to the
+    // existing scrollback (read-only — no input routing; that is v1.1b).
+    let mut session_rings: std::collections::HashMap<
+        crate::chat::sessions::id::SessionId,
+        crate::chat::sessions::SessionRing,
+    > = std::collections::HashMap::new();
+    let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
+    // Guards the event-drain select arm: once the event channel closes (only at
+    // shutdown — the sender lives as long as the tool registry) we disable the
+    // arm so a closed channel does not busy-spin returning `None`.
+    let mut session_events_open = true;
     // Renderer nudge handle, available in both feature configs (the TUI-only
     // `redraw_tx_for_main` is `Some` only on the TUI path; `None` otherwise so
     // the helpers fall back to plain stdout).
@@ -1723,6 +1744,50 @@ pub async fn run(
                     }
                 }
                 // Keep waiting (do not break the inner loop / produce a message).
+                continue;
+            }
+            maybe_event = session_event_rx.recv(), if session_events_open => {
+                // Drain one background-session event: append it to that session's
+                // ring (single-consumer write, no lock) and, if we are currently
+                // following that session, stream the new line(s) inline.
+                let Some(event) = maybe_event else {
+                    // Sender side closed (chat shutting down). Disable this arm so
+                    // a closed channel does not busy-spin; other arms drive exit.
+                    session_events_open = false;
+                    continue;
+                };
+                let sid = event.session_id().clone();
+                let line = match &event {
+                    crate::chat::sessions::SessionEvent::Delta { text, .. } => text.clone(),
+                    crate::chat::sessions::SessionEvent::ToolCall { summary, .. } => summary.clone(),
+                };
+                let ring = session_rings
+                    .entry(sid.clone())
+                    .or_insert_with(|| crate::chat::sessions::SessionRing::with_capacity(
+                        crate::chat::sessions::event::DEFAULT_RING_CAPACITY,
+                    ));
+                ring.push(line);
+                if attached_follow.as_ref() == Some(&sid) {
+                    // Follow mode: surface only the newly-appended lines inline.
+                    let new_lines = ring.drain_new();
+                    if !new_lines.is_empty() {
+                        let mut out = String::new();
+                        for l in &new_lines {
+                            out.push_str(l);
+                            if !l.ends_with('\n') {
+                                out.push('\n');
+                            }
+                        }
+                        if ring.is_truncated() {
+                            out.push_str("[output truncated]\n");
+                        }
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            out.trim_end(),
+                        );
+                    }
+                }
                 continue;
             }
         }
@@ -2332,29 +2397,65 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Attach { seq } => {
-                            // v1b `/attach` is a read-only tail: snapshot the
-                            // session's recent history and print it. It does NOT
-                            // route input or steal focus (that is v1.1).
+                            // v1.1a `/attach` is a live read-only follow: it
+                            // streams the session's new incremental output + tool
+                            // calls inline to the existing scrollback. It still
+                            // does NOT route input or take over the screen (input
+                            // routing is v1.1b). Stop following with `/detach`.
                             const ATTACH_TAIL_LINES: usize = 20;
-                            match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
-                                Ok(lines) => {
-                                    if lines.is_empty() {
-                                        emit_chat_output(&format!("Session #{seq} has no output yet."));
-                                    } else {
-                                        let mut out =
-                                            format!("Session #{seq} (last {} lines, read-only):\n", lines.len());
-                                        for l in &lines {
-                                            out.push_str(&format!("  [{}] {}\n", l.role, l.content));
+                            match chat_sessions.resolve_run_id(seq).await {
+                                Ok(run_id) => {
+                                    let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    // Print the historical tail (registry history)
+                                    // once for context, then start the live follow.
+                                    match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
+                                        Ok(lines) if !lines.is_empty() => {
+                                            let mut out =
+                                                format!("Session #{seq} (last {} lines, read-only):\n", lines.len());
+                                            for l in &lines {
+                                                out.push_str(&format!("  [{}] {}\n", l.role, l.content));
+                                            }
+                                            emit_chat_output(out.trim_end());
                                         }
-                                        emit_chat_output(out.trim_end());
+                                        Ok(_) => {}
+                                        Err(e) => emit_chat_output(&format!("Attach tail failed: {e}")),
                                     }
+                                    // Replay any retained live-stream lines already
+                                    // captured in the ring before this attach, then
+                                    // follow new ones.
+                                    if let Some(ring) = session_rings.get_mut(&sid) {
+                                        ring.rewind();
+                                        let retained = ring.drain_new();
+                                        if !retained.is_empty() {
+                                            let mut out = String::new();
+                                            for l in &retained {
+                                                out.push_str(l);
+                                                if !l.ends_with('\n') {
+                                                    out.push('\n');
+                                                }
+                                            }
+                                            emit_chat_output(out.trim_end());
+                                        }
+                                    }
+                                    attached_follow = Some(sid);
+                                    emit_chat_output(&format!(
+                                        "Following session #{seq} (live, read-only). Type /detach to stop."
+                                    ));
                                 }
                                 Err(e) => emit_chat_output(&format!("Attach failed: {e}")),
                             }
                             continue;
                         }
-                        // Deferred to later stages (v1.1: Detach; v2: Shell/Logs).
-                        SessionCommand::Detach | SessionCommand::Shell { .. } | SessionCommand::Logs { .. } => {
+                        SessionCommand::Detach => {
+                            if attached_follow.take().is_some() {
+                                emit_chat_output("Detached. No longer following a background session.");
+                            } else {
+                                emit_chat_output("Not currently following any session.");
+                            }
+                            continue;
+                        }
+                        // Deferred to later stages (v2: Shell/Logs).
+                        SessionCommand::Shell { .. } | SessionCommand::Logs { .. } => {
                             emit_chat_output("That session command is not available yet.");
                             continue;
                         }

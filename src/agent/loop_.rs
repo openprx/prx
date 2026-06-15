@@ -77,7 +77,7 @@ impl ChatMode {
 
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
-pub(crate) enum ToolCallNotification {
+pub enum ToolCallNotification {
     /// A tool call is about to be executed.
     Started { name: String, args_summary: String },
     /// A tool call has finished executing.
@@ -88,6 +88,71 @@ pub(crate) enum ToolCallNotification {
     },
     /// Progress indication for multi-iteration tool loops.
     Progress { iteration: usize, max_iterations: usize },
+}
+
+/// A neutral, crate-library-level sink that provisions the per-run event
+/// streams for a background sub-agent (used by `tools::sessions_spawn`).
+///
+/// The actual wiring (middle channel + drainer + chat ring buffers) lives in the
+/// binary crate (`chat::sessions::event`), but `sessions_spawn` is a *library*
+/// module and must not depend on `chat`. So the binary constructs a
+/// [`SpawnEventSink`] from a closure that, given a run id, creates the run's
+/// `on_delta` / `on_tool_call` senders (and spawns its drainer); the library
+/// only ever invokes that closure. This inverts the dependency without pulling
+/// `chat` into the library crate.
+#[derive(Clone)]
+pub struct SpawnEventSink {
+    #[allow(clippy::type_complexity)]
+    factory: Arc<
+        dyn Fn(
+                &str,
+            ) -> (
+                tokio::sync::mpsc::Sender<String>,
+                tokio::sync::mpsc::Sender<ToolCallNotification>,
+            ) + Send
+            + Sync,
+    >,
+}
+
+impl SpawnEventSink {
+    /// Build a sink from a per-run stream factory.
+    ///
+    /// `factory(run_id)` must return the `(on_delta, on_tool_call)` senders for
+    /// that run and arrange for them to be drained (the chat side spawns the
+    /// drainer there). It is called exactly once per spawned task-mode run.
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: Fn(
+                &str,
+            ) -> (
+                tokio::sync::mpsc::Sender<String>,
+                tokio::sync::mpsc::Sender<ToolCallNotification>,
+            ) + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            factory: Arc::new(factory),
+        }
+    }
+
+    /// Provision the `(on_delta, on_tool_call)` senders for one run.
+    #[must_use]
+    pub fn streams_for(
+        &self,
+        run_id: &str,
+    ) -> (
+        tokio::sync::mpsc::Sender<String>,
+        tokio::sync::mpsc::Sender<ToolCallNotification>,
+    ) {
+        (self.factory)(run_id)
+    }
+}
+
+impl std::fmt::Debug for SpawnEventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnEventSink")
+    }
 }
 
 /// Context for scope-based tool access control.
