@@ -17,6 +17,7 @@ use super::id::SessionId;
 use super::shell::{ShellSession, ShellStatus};
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 /// Sentinel message written by `sessions_spawn` kill, projected to `Cancelled`.
 const KILLED_BY_USER: &str = "killed by user";
@@ -84,6 +85,71 @@ pub struct ManagedSessionView {
     pub status: ManagedStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Persisted summary of a background session that ran during a chat session
+/// (v4).
+///
+/// This is the **durable** counterpart of [`ManagedSessionView`]: it carries
+/// only the fields needed to *describe* a finished (or interrupted) background
+/// session after the live process is long gone. It is serialized inside the
+/// owning [`crate::chat::session::ChatSession`] blob and reloaded for display
+/// only — reloading **never** revives a process, sub-agent, or PTY.
+///
+/// Status is stored as a stable lowercase string (the `ManagedStatus::as_str`
+/// vocabulary plus the v4 terminal sentinel `"interrupted"`) rather than the
+/// enum, so the persisted format stays decoupled from the in-memory enum and
+/// tolerant of future variants.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PersistedSessionSummary {
+    /// Underlying session id (run UUID for agents, shell/pty id otherwise).
+    pub id: String,
+    /// Display sequence `#N` it held during the live session.
+    pub seq: u64,
+    /// Session kind label (`agent` / `shell` / `pty`).
+    pub kind: String,
+    /// Final status label. One of `completed` / `failed` / `cancelled` /
+    /// `interrupted` (the latter is the v4 sentinel for a session that was
+    /// still `running` when the chat session was persisted).
+    pub status: String,
+    /// Task text (agent) or command line (shell/pty).
+    pub title: String,
+    /// Completion / failure summary body recorded by the run (may be empty).
+    #[serde(default)]
+    pub summary: String,
+    /// When the background session started.
+    pub created_at: DateTime<Utc>,
+}
+
+/// The v4 sentinel status for a background session that was still `running` when
+/// its owning chat session was persisted. Reload presents it as a terminal,
+/// non-revivable state (the live process is gone).
+pub const STATUS_INTERRUPTED: &str = "interrupted";
+
+impl PersistedSessionSummary {
+    /// Build a persisted summary from a [`ManagedSessionView`] and an optional
+    /// completion summary body, mapping a still-`Running` session to the
+    /// terminal [`STATUS_INTERRUPTED`] sentinel (v4: never persist a live
+    /// status that reload could mistake for an active process).
+    #[must_use]
+    pub fn from_view(view: &ManagedSessionView, summary: impl Into<String>) -> Self {
+        let status = match view.status {
+            // A session still running at persistence time can never be revived,
+            // so it is recorded as a distinct terminal sentinel rather than
+            // "running" / "needs-input".
+            ManagedStatus::Running | ManagedStatus::NeedsInput => STATUS_INTERRUPTED.to_string(),
+            terminal => terminal.as_str().to_string(),
+        };
+        Self {
+            id: view.id.as_str().to_string(),
+            seq: view.seq,
+            kind: view.kind.as_str().to_string(),
+            status,
+            title: view.title.clone(),
+            summary: summary.into(),
+            created_at: view.created_at,
+        }
+    }
 }
 
 /// Project a registry [`SubAgentStatus`] onto the UI [`ManagedStatus`].
@@ -227,6 +293,57 @@ mod tests {
             project_status(&SubAgentStatus::Failed("boom".into())),
             ManagedStatus::Failed
         );
+    }
+
+    fn view_with_status(status: ManagedStatus) -> ManagedSessionView {
+        ManagedSessionView {
+            id: SessionId::from_run_id("run-x"),
+            seq: 3,
+            kind: ManagedKind::Agent,
+            title: "build the report".to_string(),
+            status,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn from_view_maps_running_to_interrupted() {
+        // A session still running at persistence time can never be revived, so
+        // it must be recorded as the terminal `interrupted` sentinel.
+        let summary = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::Running), "");
+        assert_eq!(summary.status, STATUS_INTERRUPTED);
+        assert_eq!(summary.id, "run-x");
+        assert_eq!(summary.seq, 3);
+        assert_eq!(summary.kind, "agent");
+        assert_eq!(summary.title, "build the report");
+    }
+
+    #[test]
+    fn from_view_maps_needs_input_to_interrupted() {
+        let summary = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::NeedsInput), "");
+        assert_eq!(summary.status, STATUS_INTERRUPTED);
+    }
+
+    #[test]
+    fn from_view_preserves_terminal_status_and_summary() {
+        let summary = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::Completed), "result body");
+        assert_eq!(summary.status, "completed");
+        assert_eq!(summary.summary, "result body");
+
+        let failed = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::Failed), "boom");
+        assert_eq!(failed.status, "failed");
+
+        let cancelled = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::Cancelled), "");
+        assert_eq!(cancelled.status, "cancelled");
+    }
+
+    #[test]
+    fn persisted_summary_serde_round_trip() {
+        let original = PersistedSessionSummary::from_view(&view_with_status(ManagedStatus::Completed), "done");
+        let json = serde_json::to_string(&original).expect("test: serialize");
+        let restored: PersistedSessionSummary = serde_json::from_str(&json).expect("test: deserialize");
+        assert_eq!(restored, original);
     }
 
     #[test]

@@ -187,6 +187,11 @@ pub struct SessionState {
     pub history: Vec<ChatMessage>,
     /// 会话创建时间（首次 RecordUserTurn 时延迟初始化；build_session_snapshot 不再覆盖）
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 本会话内运行过的后台 session（agent/shell/pty）摘要（v4）。仅持久化摘要，
+    /// reload 时还原用于展示——绝不重建进程/sub-agent/PTY。由主循环经
+    /// `Action::BackgroundSessionRecorded` 写入（去重 by id），随
+    /// `build_session_snapshot` 落盘，`reduce_session_loaded` 还原。
+    pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
 }
 
 /// TUI UI 临时状态（退出即弃，不持久化）.
@@ -353,6 +358,7 @@ impl ChatState {
                 turns: Vec::new(),
                 history: Vec::new(),
                 created_at: None,
+                background_sessions: Vec::new(),
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
@@ -606,6 +612,7 @@ impl ChatState {
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
+            Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
             Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
@@ -1438,6 +1445,11 @@ impl ChatState {
         self.session.model = Arc::from(loaded.model.as_str());
         self.session.mode = loaded.mode;
         self.session.turns = loaded.turns;
+        // v4: restore persisted background-session summaries (display only —
+        // the live processes are gone and are never revived). Carrying them in
+        // SessionState means the next save_session snapshot re-persists them, so
+        // they survive across multiple reload cycles.
+        self.session.background_sessions = loaded.background_sessions;
         // S4-B T4-B-6: 保留原 session 的 created_at，避免下次 save_session 覆盖
         self.session.created_at = Some(loaded.created_at);
         // history 从 turns 重建（仅 user/assistant 角色进 LLM context）
@@ -1514,6 +1526,7 @@ impl ChatState {
             created_at: self.session.created_at.unwrap_or(now),
             updated_at: now,
             turns: self.session.turns.clone(),
+            background_sessions: self.session.background_sessions.clone(),
             mode: self.session.mode,
         }
     }
@@ -1665,6 +1678,28 @@ impl ChatState {
         }
         self.ui.sessions_status = summary;
         vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
+    /// summary into `session.background_sessions` so the next `SaveSession`
+    /// snapshot persists it (and reload can display it). Dedup is by session id:
+    /// a later record for the same id replaces the earlier one (e.g. an
+    /// `interrupted` entry written at exit overwrites nothing, or a terminal
+    /// summary supersedes a placeholder). This records **summary only** — it
+    /// never spawns or revives a process / sub-agent / PTY.
+    fn reduce_background_session_recorded(
+        &mut self,
+        summary: crate::chat::sessions::PersistedSessionSummary,
+    ) -> Vec<Effect> {
+        if let Some(existing) = self.session.background_sessions.iter_mut().find(|s| s.id == summary.id) {
+            if *existing == summary {
+                return Vec::new();
+            }
+            *existing = summary;
+        } else {
+            self.session.background_sessions.push(summary);
+        }
+        Vec::new()
     }
 
     /// `Action::SessionFocusChanged` (v1.1b) — record the current input-routing
@@ -1910,6 +1945,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. } => false,
+        // v4: BackgroundSessionRecorded only upserts session.background_sessions
+        // (a persistence field, not a snapshot/UI field) → no UI dirty.
+        Action::BackgroundSessionRecorded { .. } => false,
 
         // UI 镜像账本 / 历史清空 / Pure 模式用户 echo：直接动 conversation_lines → dirty
         Action::SystemMessageAdded { .. }
@@ -3241,6 +3279,87 @@ mod tests {
             );
             assert!(has_request_redraw(&effects), "应含 RequestRedraw");
             assert!(has_log_trace(&effects), "应含 LogTrace");
+        }
+
+        fn bg_summary(id: &str, status: &str) -> crate::chat::sessions::PersistedSessionSummary {
+            crate::chat::sessions::PersistedSessionSummary {
+                id: id.to_string(),
+                seq: 1,
+                kind: "agent".to_string(),
+                status: status.to_string(),
+                title: "task".to_string(),
+                summary: String::new(),
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        /// v4: BackgroundSessionRecorded upserts into session.background_sessions
+        /// (dedup by id) without marking the UI dirty.
+        #[test]
+        fn test_redux_background_session_recorded_upserts() {
+            let mut state = s();
+            let e1 = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-1", "running"),
+            });
+            assert!(
+                e1.is_empty(),
+                "background record is a pure persistence write, no effects"
+            );
+            assert_eq!(state.session.background_sessions.len(), 1);
+
+            // Same id again with a terminal status replaces, does not duplicate.
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-1", "completed"),
+            });
+            assert_eq!(state.session.background_sessions.len(), 1);
+            assert_eq!(
+                state.session.background_sessions.first().map(|s| s.status.as_str()),
+                Some("completed")
+            );
+
+            // A different id appends.
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-2", "failed"),
+            });
+            assert_eq!(state.session.background_sessions.len(), 2);
+        }
+
+        /// v4: a recorded background session must survive a save→load round trip
+        /// through the reducer (snapshot persists it, SessionLoaded restores it),
+        /// and a still-running session is never restored as a live one.
+        #[test]
+        fn test_redux_background_sessions_survive_snapshot_and_reload() {
+            let mut state = s();
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-1", "completed"),
+            });
+            // An interrupted entry stands in for "was running at last exit".
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-2", crate::chat::sessions::model::STATUS_INTERRUPTED),
+            });
+
+            // The snapshot the SaveSession effect would persist must carry them.
+            let snapshot = state.build_session_snapshot();
+            assert_eq!(snapshot.background_sessions.len(), 2);
+
+            // Reloading that snapshot into a fresh state restores the summaries.
+            let mut fresh = s();
+            let _ = fresh.reduce(Action::SessionLoaded(snapshot));
+            assert_eq!(fresh.session.background_sessions.len(), 2);
+            // None of the restored entries is a live status — reload never
+            // resurrects a running process.
+            for bg in &fresh.session.background_sessions {
+                assert_ne!(bg.status, "running");
+                assert_ne!(bg.status, "needs-input");
+            }
+            let statuses: Vec<&str> = fresh
+                .session
+                .background_sessions
+                .iter()
+                .map(|s| s.status.as_str())
+                .collect();
+            assert!(statuses.contains(&"completed"));
+            assert!(statuses.contains(&crate::chat::sessions::model::STATUS_INTERRUPTED));
         }
 
         /// Step4-5b: SessionLoaded 含 system prompt — history 中保留 user/assistant，

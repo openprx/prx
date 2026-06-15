@@ -290,6 +290,28 @@ fn print_fallback_chat_output(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Format the recap of background sessions restored from a reloaded chat
+/// session (v4). Pure string builder (no I/O, no lock) so it is trivially
+/// unit-testable. Each line shows the kind, display seq `#N`, terminal status,
+/// title/command, and (when present) the completion summary. The header makes
+/// it explicit that these are historical results — nothing has been revived.
+fn format_reloaded_background_sessions(sessions: &[crate::chat::sessions::PersistedSessionSummary]) -> String {
+    let mut out = String::new();
+    out.push_str("[previous session — background task results (not resumed)]");
+    for s in sessions {
+        let summary = s.summary.trim();
+        if summary.is_empty() {
+            out.push_str(&format!("\n  · {} #{} {} — {}", s.kind, s.seq, s.status, s.title));
+        } else {
+            out.push_str(&format!(
+                "\n  · {} #{} {} — {}: {}",
+                s.kind, s.seq, s.status, s.title, summary
+            ));
+        }
+    }
+    out
+}
+
 /// Surface a background-session system message into the chat (v1b reflow).
 ///
 /// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
@@ -1739,6 +1761,18 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
 
+    // ── Reload notice: historical background sessions (v4) ────────
+    // If this chat session was resumed and carried persisted background-session
+    // summaries, surface a one-shot recap so the user sees what their previous
+    // background tasks produced. These are **summaries only** — no process,
+    // sub-agent, or PTY is revived (those belonged to the prior process and are
+    // long gone); any session that was still running at last exit shows as
+    // `interrupted`.
+    if !chat_session.background_sessions.is_empty() {
+        let recap = format_reloaded_background_sessions(&chat_session.background_sessions);
+        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &recap);
+    }
+
     // ── Main message loop ────────────────────────────────────────
     //
     // The inner `loop` lets a timer tick do background-session work (summary
@@ -1754,6 +1788,8 @@ pub async fn run(
                 // 1) Summary reflow: surface each newly-finished session once,
                 //    carrying its `#N` + status (plan §v1b). No auto-focus.
                 let finished = chat_sessions.poll_finished(&mut reported_sessions).await;
+                // 2) Persistent status line: recompute and dispatch only on change.
+                let views = chat_sessions.snapshot().await;
                 for fin in &finished {
                     let summary = fin.summary.trim();
                     let kind = fin.kind.as_str();
@@ -1767,9 +1803,37 @@ pub async fn run(
                         sessions_redraw_handle.as_ref(),
                         &line,
                     );
+                    // v4: persist a summary of this finished background session
+                    // into the chat session so a reload can show what it
+                    // produced. Title / created_at come from the live view (the
+                    // finished record itself only carries seq/status/summary);
+                    // if the view is already gone we still record with the
+                    // finished record's own fields so nothing is lost.
+                    let persisted = views
+                        .iter()
+                        .find(|v| v.id.as_str() == fin.run_id)
+                        .map_or_else(
+                            || crate::chat::sessions::PersistedSessionSummary {
+                                id: fin.run_id.clone(),
+                                seq: fin.seq,
+                                kind: fin.kind.as_str().to_string(),
+                                status: fin.status.as_str().to_string(),
+                                title: String::new(),
+                                summary: fin.summary.clone(),
+                                created_at: chrono::Utc::now(),
+                            },
+                            |view| crate::chat::sessions::PersistedSessionSummary::from_view(view, fin.summary.clone()),
+                        );
+                    // Legacy (non-TUI) persistence path serializes `chat_session`
+                    // directly, so mirror the record there too. The Redux/TUI
+                    // path persists from SessionState, fed by the dispatched
+                    // action below. Both write the same backward-compatible field.
+                    chat_session.record_background_session(persisted.clone());
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+                        "chat.bg_session_recorded",
+                    );
                 }
-                // 2) Persistent status line: recompute and dispatch only on change.
-                let views = chat_sessions.snapshot().await;
                 // v1.1b: refresh the switcher cache the key thread reads on Ctrl+G
                 // (it cannot run async registry queries itself). Display staleness
                 // is harmless: switcher Enter re-resolves the seq via /attach.
@@ -3840,6 +3904,36 @@ Retry with a compatible model: /provider {new_provider} <model>"
             );
             // observer.record_event 仍然调用（observer 只是本地计数，无外部副作用）
             observer.record_event(&ObserverEvent::TurnComplete);
+        }
+    }
+
+    // ── Persist background-session summaries on exit (v4) ─────────
+    // Snapshot every background session (agent / shell / pty) still tracked at
+    // exit and record a summary so a future reload of this chat session can show
+    // what its background tasks were. `from_view` maps any session still in a
+    // live state (Running / NeedsInput) to the terminal `interrupted` sentinel:
+    // its process is about to be killed below and can never be revived — reload
+    // must present it as a non-revivable terminal state, never as "running".
+    // Sessions that already finished during the loop were recorded in the poll
+    // path; recording again here is an idempotent upsert (dedup by id).
+    {
+        use crate::chat::sessions::model::ManagedStatus;
+        let exit_views = chat_sessions.snapshot().await;
+        for view in &exit_views {
+            // Only record sessions still live at exit: terminal sessions already
+            // recorded their (richer) summary text during the poll loop, and
+            // re-recording with an empty summary here would clobber it. A live
+            // session has no captured summary anyway — `from_view` maps it to the
+            // `interrupted` terminal sentinel, the load-bearing fact for reload.
+            if !matches!(view.status, ManagedStatus::Running | ManagedStatus::NeedsInput) {
+                continue;
+            }
+            let persisted = crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new());
+            chat_session.record_background_session(persisted.clone());
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+                "chat.bg_session_recorded_exit",
+            );
         }
     }
 
@@ -6508,5 +6602,50 @@ mod wave8_routing_failure_trace_tests {
         );
         assert_eq!(outcome.final_provider, "test-provider");
         assert_eq!(outcome.final_model, "test-model");
+    }
+}
+
+#[cfg(test)]
+mod v4_reload_recap_tests {
+    use super::format_reloaded_background_sessions;
+    use crate::chat::sessions::PersistedSessionSummary;
+
+    fn summary(id: &str, status: &str, title: &str, body: &str) -> PersistedSessionSummary {
+        PersistedSessionSummary {
+            id: id.to_string(),
+            seq: 2,
+            kind: "agent".to_string(),
+            status: status.to_string(),
+            title: title.to_string(),
+            summary: body.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn recap_has_not_resumed_header_and_one_line_per_session() {
+        let sessions = vec![
+            summary("a", "completed", "build report", "report ready"),
+            summary("b", "interrupted", "long crawl", ""),
+        ];
+        let out = format_reloaded_background_sessions(&sessions);
+        assert!(out.contains("not resumed"), "header must signal nothing was revived");
+        assert!(out.contains("completed"));
+        assert!(out.contains("build report"));
+        assert!(out.contains("report ready"));
+        // Interrupted (was-running) session shows as terminal, not running.
+        assert!(out.contains("interrupted"));
+        assert!(!out.contains("running"));
+        // One header line + two session lines.
+        assert_eq!(out.lines().count(), 3);
+    }
+
+    #[test]
+    fn recap_omits_empty_summary_body() {
+        let sessions = vec![summary("a", "cancelled", "task", "")];
+        let out = format_reloaded_background_sessions(&sessions);
+        // No trailing ": " when there is no summary body.
+        assert!(out.contains("cancelled — task"));
+        assert!(!out.contains("task: "));
     }
 }

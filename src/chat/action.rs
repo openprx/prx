@@ -213,6 +213,14 @@ pub enum Action {
     /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
     /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
     SessionsStatusUpdated { summary: String },
+    /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
+    /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
+    /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
+    /// `session.background_sessions`，随下次 `SaveSession` 落盘，reload 后展示。
+    /// **只记录摘要，绝不重建进程/sub-agent/PTY**。
+    BackgroundSessionRecorded {
+        summary: crate::chat::sessions::PersistedSessionSummary,
+    },
     /// 输入路由目标变更（v1.1b）。由 chat 主循环在 `/attach` / `/detach` 时
     /// dispatch（它独占权威 `attached_follow`），reducer 写入 `ui.focus`，经快照
     /// 驱动提示符的颜色+字形目标指示。`None` 等价 `FocusTarget::Main`。
@@ -282,6 +290,7 @@ impl Action {
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
+            Self::BackgroundSessionRecorded { .. } => "BackgroundSessionRecorded",
             Self::SessionFocusChanged { .. } => "SessionFocusChanged",
             Self::SwitcherOpened { .. } => "SwitcherOpened",
             Self::SwitcherMoved { .. } => "SwitcherMoved",
