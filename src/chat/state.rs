@@ -210,6 +210,10 @@ pub struct UiState {
     /// 最近一次输入提交（reducer 内 KeyPressed::Enter 时由 reduce 自身派生
     /// `Action::InputSubmitted`；该字段用于测试断言双写期最后一次提交内容）
     pub last_submitted: Option<String>,
+    /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
+    /// 仅由 chat 主循环经 `Action::SessionsStatusUpdated` 写入；后台 spawn 任务
+    /// 绝不触碰（铁律：state 只在主循环写）。
+    pub sessions_status: String,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -246,6 +250,8 @@ pub struct UiSnapshot {
     pub streaming: Option<StreamingDraft>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
+    /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
+    pub sessions_status: Arc<str>,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -265,6 +271,7 @@ impl UiSnapshot {
             conversation_generation: 0,
             streaming: None,
             input: TuiInput::new(),
+            sessions_status: Arc::from(""),
         }
     }
 }
@@ -341,6 +348,7 @@ impl ChatState {
                 ascii_fallback: false,
                 last_ctrlc_ms: 0,
                 last_submitted: None,
+                sessions_status: String::new(),
             },
             stream: StreamState {
                 draft: None,
@@ -400,6 +408,7 @@ impl ChatState {
             conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
+            sessions_status: Arc::from(self.ui.sessions_status.as_str()),
         }
     }
 
@@ -578,6 +587,7 @@ impl ChatState {
             Action::RedrawRequested => vec![Effect::RequestRedraw],
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
+            Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
@@ -1623,6 +1633,18 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::SessionsStatusUpdated` — replace the persistent background-session
+    /// status line (v1b). The main loop already dedups (only dispatches when the
+    /// summary changed), but we still no-op an identical write so a stray
+    /// duplicate cannot mark the UI dirty for nothing.
+    fn reduce_sessions_status_updated(&mut self, summary: String) -> Vec<Effect> {
+        if self.ui.sessions_status == summary {
+            return Vec::new();
+        }
+        self.ui.sessions_status = summary;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
     ///
     /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
@@ -1824,6 +1846,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::HistoryCleared
         | Action::HistoryClearedWithNotice { .. }
         | Action::UserMessageEchoed(_) => true,
+        // v1b: writes ui.sessions_status (a snapshot field) → dirty. The main
+        // loop only dispatches this when the summary actually changed, and the
+        // reducer also no-ops identical writes, so this never churns frames.
+        Action::SessionsStatusUpdated { .. } => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -1887,6 +1913,33 @@ mod tests {
         let state = make_state();
         assert!(state.stream.draft.is_none());
         assert!(state.stream.pending_tool_cards.is_empty());
+    }
+
+    /// v1b: SessionsStatusUpdated 写入 ui.sessions_status 并经快照反映；相同内容 no-op.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_status_updated_writes_and_dedups() {
+        let mut state = make_state();
+        assert!(state.ui.sessions_status.is_empty());
+
+        let effects = state.reduce(Action::SessionsStatusUpdated {
+            summary: "bg: 1 running".to_string(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.sessions_status, "bg: 1 running");
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(&*snap.sessions_status, "bg: 1 running");
+
+        // Identical write is a no-op (no redraw effect).
+        let effects = state.reduce(Action::SessionsStatusUpdated {
+            summary: "bg: 1 running".to_string(),
+        });
+        assert!(effects.is_empty(), "identical status must not emit an effect");
+
+        // Clearing hides the row (empty string flows through).
+        let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.sessions_status.is_empty());
     }
 
     /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）

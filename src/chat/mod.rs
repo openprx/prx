@@ -290,6 +290,33 @@ fn print_fallback_chat_output(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Surface a background-session system message into the chat (v1b reflow).
+///
+/// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
+/// timer-tick branch — which runs inside the `select!` header, before the
+/// closure is in scope — can use it. Behaviour mirrors `emit_chat_output`:
+/// route through the dispatcher (single source, reaches both render paths) and
+/// nudge the renderer on the TUI path; fall back to plain stdout otherwise.
+#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
+fn surface_session_message(dispatcher: &dispatcher::ChatDispatcher, redraw_tx: Option<&mpsc::Sender<()>>, text: &str) {
+    #[cfg(feature = "terminal-tui")]
+    {
+        let _ = dispatcher.dispatch_or_log(
+            crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
+            "chat.system_message_session",
+        );
+        if let Some(tx) = redraw_tx {
+            let _ = tx.try_send(());
+        } else {
+            print_fallback_chat_output(text);
+        }
+    }
+    #[cfg(not(feature = "terminal-tui"))]
+    {
+        print_fallback_chat_output(text);
+    }
+}
+
 fn format_fallback_chat_output_for(text: &str, stdout_is_terminal: bool) -> String {
     if !stdout_is_terminal {
         let mut out = String::with_capacity(text.len() + 1);
@@ -1635,10 +1662,70 @@ pub async fn run(
     // `/provider <name>` 时用新 provider 重建并替换此 Arc，同步 set 进 provider_slot（Redux 路径）。
     let mut provider = provider;
 
+    // ── Background-session observation state (v1b) ────────────────
+    // Owned by the main loop (single-threaded), per the iron law that runtime
+    // state is only written here — the detached spawn tasks only mutate the
+    // shared registry, never this. `reported_sessions` dedups the one-shot
+    // summary reflow; `last_sessions_summary` dedups the persistent status-line
+    // action so we only dispatch on change. The 1s timer is a read-only poll of
+    // the registry (no event bus until v1.1).
+    let mut reported_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_sessions_summary: String = String::new();
+    let mut sessions_tick = tokio::time::interval(Duration::from_secs(1));
+    sessions_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Renderer nudge handle, available in both feature configs (the TUI-only
+    // `redraw_tx_for_main` is `Some` only on the TUI path; `None` otherwise so
+    // the helpers fall back to plain stdout).
+    #[cfg(feature = "terminal-tui")]
+    let sessions_redraw_handle: Option<mpsc::Sender<()>> = redraw_tx_for_main.clone();
+    #[cfg(not(feature = "terminal-tui"))]
+    let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
+
     // ── Main message loop ────────────────────────────────────────
-    while let Some(msg) = tokio::select! {
-        msg = input_rx.recv() => msg,
-        _ = shutdown.cancelled() => None,
+    //
+    // The inner `loop` lets a timer tick do background-session work (summary
+    // reflow + status-line refresh) without producing a message or ending the
+    // outer loop: it only `break`s with a real input message (or `None` on
+    // shutdown). On a tick we poll the registry and surface results via the
+    // dispatcher (single source, reaches both render paths), then keep waiting.
+    while let Some(msg) = loop {
+        tokio::select! {
+            msg = input_rx.recv() => break msg,
+            _ = shutdown.cancelled() => break None,
+            _ = sessions_tick.tick() => {
+                // 1) Summary reflow: surface each newly-finished session once,
+                //    carrying its `#N` + status (plan §v1b). No auto-focus.
+                let finished = chat_sessions.poll_finished(&mut reported_sessions).await;
+                for fin in &finished {
+                    let summary = fin.summary.trim();
+                    let line = if summary.is_empty() {
+                        format!("[session #{} {}]", fin.seq, fin.status.as_str())
+                    } else {
+                        format!("[session #{} {}] {summary}", fin.seq, fin.status.as_str())
+                    };
+                    surface_session_message(
+                        &chat_dispatcher,
+                        sessions_redraw_handle.as_ref(),
+                        &line,
+                    );
+                }
+                // 2) Persistent status line: recompute and dispatch only on change.
+                let views = chat_sessions.snapshot().await;
+                let new_summary = crate::chat::sessions::status_summary(&views);
+                if new_summary != last_sessions_summary {
+                    last_sessions_summary = new_summary.clone();
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::SessionsStatusUpdated { summary: new_summary },
+                        "chat.sessions_status",
+                    );
+                    if let Some(tx) = sessions_redraw_handle.as_ref() {
+                        let _ = tx.try_send(());
+                    }
+                }
+                // Keep waiting (do not break the inner loop / produce a message).
+                continue;
+            }
+        }
     } {
         let user_input = msg.content.clone();
 
@@ -2038,11 +2125,40 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             // so a hot switch is honoured (plan §C.0 blocker 3).
                             match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
                                 Some(tool) => {
-                                    let args = serde_json::json!({
+                                    let mut args = serde_json::json!({
                                         "task": task,
                                         "provider": current_provider_owned,
                                         "model": current_model_owned,
                                     });
+                                    // Spawning is a Medium-risk side effect; under
+                                    // supervised autonomy the gate requires a grant
+                                    // bound to `sessions_spawn:spawn`. The operator
+                                    // typed `/bg`, so issue the matching grant here
+                                    // (same op name the gate authorizes), mirroring
+                                    // `/kill` and `/steer` and how the agent loop
+                                    // grants after operator approval.
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        "sessions_spawn:spawn",
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize spawn approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
                                     match tool.execute_named("sessions_spawn", args).await {
                                         Ok(result) => {
                                             let out = if result.output.is_empty() {
@@ -2153,13 +2269,93 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
-                        // v1b/v2 surface: parsed but not yet executable in v1a.
-                        SessionCommand::Steer { .. }
-                        | SessionCommand::Attach { .. }
-                        | SessionCommand::Detach
-                        | SessionCommand::Shell { .. }
-                        | SessionCommand::Logs { .. } => {
-                            emit_chat_output("That session command is not available yet (v1a).");
+                        SessionCommand::Steer { seq, message } => {
+                            // Resolve `#N` -> run UUID, then delegate to the
+                            // sessions_spawn tool's `steer` action so the shared
+                            // semantics apply uniformly (Low-risk side-effect gate
+                            // op `sessions_spawn:steer:<run_id>`, running-status
+                            // check, steer_tx delivery). Mirrors `/kill`.
+                            let run_id = match chat_sessions.resolve_run_id(seq).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    emit_chat_output(&format!("Steer failed: {e}"));
+                                    continue;
+                                }
+                            };
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    let operation_name = format!("sessions_spawn:steer:{run_id}");
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        &operation_name,
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    let mut args = serde_json::json!({
+                                        "action": "steer",
+                                        "run_id": run_id,
+                                        "message": message,
+                                    });
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize steer approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Steer failed: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Attach { seq } => {
+                            // v1b `/attach` is a read-only tail: snapshot the
+                            // session's recent history and print it. It does NOT
+                            // route input or steal focus (that is v1.1).
+                            const ATTACH_TAIL_LINES: usize = 20;
+                            match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
+                                Ok(lines) => {
+                                    if lines.is_empty() {
+                                        emit_chat_output(&format!("Session #{seq} has no output yet."));
+                                    } else {
+                                        let mut out =
+                                            format!("Session #{seq} (last {} lines, read-only):\n", lines.len());
+                                        for l in &lines {
+                                            out.push_str(&format!("  [{}] {}\n", l.role, l.content));
+                                        }
+                                        emit_chat_output(out.trim_end());
+                                    }
+                                }
+                                Err(e) => emit_chat_output(&format!("Attach failed: {e}")),
+                            }
+                            continue;
+                        }
+                        // Deferred to later stages (v1.1: Detach; v2: Shell/Logs).
+                        SessionCommand::Detach | SessionCommand::Shell { .. } | SessionCommand::Logs { .. } => {
+                            emit_chat_output("That session command is not available yet.");
                             continue;
                         }
                     }

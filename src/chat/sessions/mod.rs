@@ -9,9 +9,11 @@
 //! - [`model::ManagedSessionView`] / [`model::project_run`] — UI projection.
 //! - [`command::SessionCommand`] / [`command::parse_session_command`] — parsing.
 //! - [`runtime::ChatSessionsHandle`] — thin handle over the shared registry for
-//!   `/sessions` and `/kill`.
+//!   `/sessions`, `/kill`, `/steer`, and `/attach`.
+//! - [`runtime::status_summary`] — persistent status-line summary builder.
 //!
-//! See `task/prx/chat-background-runtime-v1-execution-plan.md` (v1a) for scope.
+//! See `task/prx/chat-background-runtime-v1-execution-plan.md` (v1a/v1b) for
+//! scope.
 
 pub mod command;
 pub mod id;
@@ -19,4 +21,7 @@ pub mod model;
 pub mod runtime;
 
 pub use command::{SessionCommand, parse_session_command};
-pub use runtime::ChatSessionsHandle;
+// `FinishedSession` / `TailLine` are returned by `ChatSessionsHandle` methods
+// and reachable as `runtime::{FinishedSession, TailLine}`; not re-exported at
+// this level until a caller needs to name them (avoids an unused-import warning).
+pub use runtime::{ChatSessionsHandle, status_summary};

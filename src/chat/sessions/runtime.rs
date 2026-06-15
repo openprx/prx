@@ -10,11 +10,36 @@
 //! single-threaded state (`seq_map`); it is never shared across a lock.
 
 use super::id::SessionId;
-use super::model::{ManagedSessionView, project_run};
-use crate::tools::sessions_spawn::SubAgentRun;
+use super::model::{ManagedSessionView, ManagedStatus, project_run, project_status};
+use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use anyhow::{Result, anyhow};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// One line of a session's recent output, projected for `/attach` display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TailLine {
+    /// History entry role (e.g. `user` / `assistant` / `tool`).
+    pub role: String,
+    /// Entry content (already owned; the registry lock is released before
+    /// returning these so we never hold a lock across the print `.await`).
+    pub content: String,
+}
+
+/// A background session that has just reached a terminal state, surfaced once
+/// to the chat main loop for the v1b summary reflow.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FinishedSession {
+    /// Display sequence `#N`.
+    pub seq: u64,
+    /// Underlying run UUID (used by the caller to dedup "already reported").
+    pub run_id: String,
+    /// Terminal status (`Completed` / `Failed` / `Cancelled`).
+    pub status: ManagedStatus,
+    /// Result / failure text recorded by the run (the `Completed`/`Failed`
+    /// payload), used as the reflow summary body.
+    pub summary: String,
+}
 
 /// Chat-side handle over the shared sub-agent registry.
 pub struct ChatSessionsHandle {
@@ -86,6 +111,46 @@ impl ChatSessionsHandle {
         views
     }
 
+    /// Poll the registry for sessions that have reached a terminal state and
+    /// have not yet been reported, for the v1b summary reflow.
+    ///
+    /// `reported` is the caller-owned set of run UUIDs already surfaced; this
+    /// method appends newly-finished run ids to it and returns one
+    /// [`FinishedSession`] per newly-finished run. It is a **read-only poll**
+    /// (no event bus — that is v1.1): the chat main loop calls it on a timer.
+    /// Running sessions are skipped; only `Completed` / `Failed` / `Cancelled`
+    /// are reported, and each run is reported exactly once.
+    pub async fn poll_finished(&mut self, reported: &mut std::collections::HashSet<String>) -> Vec<FinishedSession> {
+        let runs = self.refresh_seqs().await;
+        let mut finished = Vec::new();
+        for run in &runs {
+            let status = project_status(&run.status);
+            let is_terminal = matches!(
+                status,
+                ManagedStatus::Completed | ManagedStatus::Failed | ManagedStatus::Cancelled
+            );
+            if !is_terminal {
+                continue;
+            }
+            if reported.contains(&run.id) {
+                continue;
+            }
+            reported.insert(run.id.clone());
+            let seq = self.seq_for(&SessionId::from_run_id(&run.id));
+            let summary = match &run.status {
+                SubAgentStatus::Completed(s) | SubAgentStatus::Failed(s) => s.clone(),
+                SubAgentStatus::Running => String::new(),
+            };
+            finished.push(FinishedSession {
+                seq,
+                run_id: run.id.clone(),
+                status,
+                summary,
+            });
+        }
+        finished
+    }
+
     /// Resolve a display sequence `#N` to the underlying run UUID, refreshing the
     /// seq map from the live registry first so newly spawned (e.g. just-`/bg`-ed)
     /// runs are addressable without a prior `/sessions`.
@@ -102,6 +167,89 @@ impl ChatSessionsHandle {
             .map(|id| id.as_str().to_string())
             .ok_or_else(|| anyhow!("no session #{seq}"))
     }
+
+    /// Read a read-only tail of a background session's accumulated history.
+    ///
+    /// v1b `/attach` is a **read-only snapshot** (plan §v1b): it polls the run's
+    /// `history` once and returns at most `last_n` most-recent entries. It does
+    /// not subscribe to a live stream and never routes input into the session
+    /// (that is v1.1). Returns an error (never panics) if the sequence is
+    /// unknown.
+    ///
+    /// The registry read lock and the per-run history read lock are both
+    /// released before this returns (the entries are cloned into owned
+    /// [`TailLine`]s), so the caller can `.await` on printing without holding any
+    /// lock across the await point (iron law).
+    pub async fn tail(&mut self, seq: u64, last_n: usize) -> Result<Vec<TailLine>> {
+        let runs = self.refresh_seqs().await;
+        let target_id = self
+            .id_for_seq(seq)
+            .map(|id| id.as_str().to_string())
+            .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        let history = {
+            let run = runs
+                .iter()
+                .find(|r| r.id == target_id)
+                .ok_or_else(|| anyhow!("no session #{seq}"))?;
+            // Clone the `Arc<RwLock<…>>` so the registry read lock (held by the
+            // `refresh_seqs` snapshot above is already dropped here) is not a
+            // concern; we only take the per-run history lock below.
+            Arc::clone(&run.history)
+        };
+        let entries = history.read().await;
+        let start = entries.len().saturating_sub(last_n);
+        let lines = entries
+            .iter()
+            .skip(start)
+            .map(|e| TailLine {
+                role: e.role.clone(),
+                content: e.content.clone(),
+            })
+            .collect();
+        Ok(lines)
+    }
+}
+
+/// Build the persistent status-line summary from a session snapshot.
+///
+/// Returns an empty string when there are no sessions (the chat status row is
+/// then hidden). Otherwise produces a compact `running/completed/failed/
+/// cancelled` count line, e.g. `bg: 2 running · 1 completed`. `NeedsInput` has
+/// no underlying source in v1b and is therefore never counted (plan §C.2 P0-5).
+#[must_use]
+pub fn status_summary(views: &[ManagedSessionView]) -> String {
+    if views.is_empty() {
+        return String::new();
+    }
+    let (mut running, mut completed, mut failed, mut cancelled) = (0usize, 0usize, 0usize, 0usize);
+    for v in views {
+        match v.status {
+            ManagedStatus::Running => running += 1,
+            ManagedStatus::Completed => completed += 1,
+            ManagedStatus::Failed => failed += 1,
+            ManagedStatus::Cancelled => cancelled += 1,
+            // No underlying source in v1b; never produced by `project_status`.
+            ManagedStatus::NeedsInput => {}
+        }
+    }
+    let mut parts: Vec<String> = Vec::with_capacity(4);
+    if running > 0 {
+        parts.push(format!("{running} running"));
+    }
+    if completed > 0 {
+        parts.push(format!("{completed} completed"));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    if cancelled > 0 {
+        parts.push(format!("{cancelled} cancelled"));
+    }
+    if parts.is_empty() {
+        // All sessions are in the (unreachable in v1b) NeedsInput bucket.
+        return String::new();
+    }
+    format!("bg: {}", parts.join(" \u{00B7} "))
 }
 
 #[cfg(test)]
@@ -184,5 +332,107 @@ mod tests {
         )]));
         let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
         assert_eq!(handle.resolve_run_id(1).await.expect("test: #1 after bg"), "fresh");
+    }
+
+    fn entry(role: &str, content: &str) -> HistoryEntry {
+        HistoryEntry {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn tail_returns_last_n_entries_in_order() {
+        let run = make_run("a", "task a", SubAgentStatus::Running);
+        {
+            let mut h = run.history.write().await;
+            h.push(entry("user", "1"));
+            h.push(entry("assistant", "2"));
+            h.push(entry("assistant", "3"));
+        }
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let _ = handle.snapshot().await; // assign seq #1
+
+        let last_two = handle.tail(1, 2).await.expect("test: tail #1");
+        assert_eq!(last_two.len(), 2);
+        assert_eq!(last_two[0].content, "2");
+        assert_eq!(last_two[1].content, "3");
+        assert_eq!(last_two[1].role, "assistant");
+    }
+
+    #[tokio::test]
+    async fn tail_clamps_to_available_and_errors_on_unknown_seq() {
+        let run = make_run("a", "task a", SubAgentStatus::Running);
+        {
+            run.history.write().await.push(entry("user", "only"));
+        }
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        // last_n larger than available -> returns all without panicking.
+        let all = handle.tail(1, 100).await.expect("test: tail clamp");
+        assert_eq!(all.len(), 1);
+        // Unknown seq -> error, never panic.
+        let err = handle.tail(42, 5).await.expect_err("test: unknown seq");
+        assert!(err.to_string().contains("no session #42"));
+    }
+
+    #[tokio::test]
+    async fn poll_finished_reports_each_terminal_run_once() {
+        let runs = Arc::new(RwLock::new(vec![
+            make_run("a", "task a", SubAgentStatus::Completed("done a".into())),
+            make_run("b", "task b", SubAgentStatus::Running),
+            make_run("c", "task c", SubAgentStatus::Failed("boom".into())),
+            make_run("d", "task d", SubAgentStatus::Failed("killed by user".into())),
+        ]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let mut reported = std::collections::HashSet::new();
+
+        let first = handle.poll_finished(&mut reported).await;
+        // a (completed), c (failed), d (cancelled) — not b (running).
+        assert_eq!(first.len(), 3);
+        let statuses: Vec<ManagedStatus> = first.iter().map(|f| f.status).collect();
+        assert!(statuses.contains(&ManagedStatus::Completed));
+        assert!(statuses.contains(&ManagedStatus::Failed));
+        assert!(statuses.contains(&ManagedStatus::Cancelled));
+        // Summary carries the status payload.
+        let a = first.iter().find(|f| f.run_id == "a").expect("test: run a");
+        assert_eq!(a.summary, "done a");
+
+        // A second poll with the same `reported` set surfaces nothing new.
+        let second = handle.poll_finished(&mut reported).await;
+        assert!(second.is_empty(), "each terminal run reports exactly once");
+    }
+
+    #[test]
+    fn status_summary_empty_when_no_sessions() {
+        assert_eq!(status_summary(&[]), "");
+    }
+
+    #[test]
+    fn status_summary_counts_by_bucket() {
+        let mk = |seq: u64, status: ManagedStatus| ManagedSessionView {
+            id: SessionId::from_run_id(&format!("r{seq}")),
+            seq,
+            kind: super::super::model::ManagedKind::Agent,
+            title: "t".to_string(),
+            status,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let views = vec![
+            mk(1, ManagedStatus::Running),
+            mk(2, ManagedStatus::Running),
+            mk(3, ManagedStatus::Completed),
+            mk(4, ManagedStatus::Failed),
+            mk(5, ManagedStatus::Cancelled),
+        ];
+        let s = status_summary(&views);
+        assert!(s.starts_with("bg: "), "got {s}");
+        assert!(s.contains("2 running"));
+        assert!(s.contains("1 completed"));
+        assert!(s.contains("1 failed"));
+        assert!(s.contains("1 cancelled"));
     }
 }

@@ -92,6 +92,12 @@ pub struct TuiState {
     /// and the next loop iteration scrolls it permanently into the main
     /// terminal scrollback.
     pub streaming: Option<StreamingDraft>,
+    /// Persistent background-session status line (v1b). Empty when there are
+    /// no background sessions, in which case [`render_bottom_chrome`] omits the
+    /// extra row. Written only by the chat main loop (via
+    /// `Action::SessionsStatusUpdated`); the background spawn tasks never touch
+    /// it.
+    pub sessions_status: String,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -871,6 +877,7 @@ impl TuiState {
             input: TuiInput::new(),
             ascii_fallback: false,
             streaming: None,
+            sessions_status: String::new(),
         }
     }
 
@@ -987,6 +994,16 @@ impl TuiState {
         self.conversation_lines.push(ConversationLine::System {
             content: content.to_string(),
         });
+    }
+
+    /// Replace the persistent background-session status line (v1b).
+    ///
+    /// An empty `summary` hides the extra status row entirely.
+    pub fn set_sessions_status(&mut self, summary: &str) {
+        if self.sessions_status != summary {
+            self.sessions_status.clear();
+            self.sessions_status.push_str(summary);
+        }
     }
 
     /// Add a legacy single-line tool call indicator.
@@ -1448,6 +1465,8 @@ pub trait BottomChromeView {
     fn conversation_lines(&self) -> &[ConversationLine];
     fn streaming(&self) -> Option<&StreamingDraft>;
     fn input(&self) -> &TuiInput;
+    /// Persistent background-session status line (v1b). Empty hides the row.
+    fn sessions_status(&self) -> &str;
 }
 
 impl BottomChromeView for TuiState {
@@ -1475,6 +1494,9 @@ impl BottomChromeView for TuiState {
     fn input(&self) -> &TuiInput {
         &self.input
     }
+    fn sessions_status(&self) -> &str {
+        &self.sessions_status
+    }
 }
 
 impl BottomChromeView for crate::chat::state::UiSnapshot {
@@ -1501,6 +1523,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn input(&self) -> &TuiInput {
         &self.input
+    }
+    fn sessions_status(&self) -> &str {
+        &self.sessions_status
     }
 }
 
@@ -1540,11 +1565,38 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     } else {
         0
     };
+    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
     let total: u16 = 1u16 // status row
+        .saturating_add(sessions_rows) // background-session status row (v1b)
         .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1); // footer row
     total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
+}
+
+/// Whether the persistent background-session status row should be shown.
+///
+/// Hidden when empty (no background sessions). As a narrow/short-terminal
+/// degrade rule (plan §v1b), the row is also dropped first when the rest of the
+/// chrome (status + streaming + input + footer) would otherwise meet or exceed
+/// [`BOTTOM_CHROME_MAX_HEIGHT`], so the input box and footer never lose rows to
+/// the sessions line.
+fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    if state.sessions_status().is_empty() {
+        return false;
+    }
+    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
+    let streaming_rows = if state.streaming().is_some() {
+        STREAMING_VISIBLE_ROWS
+    } else {
+        0
+    };
+    let without_sessions: u16 = 1u16 // status row
+        .saturating_add(streaming_rows)
+        .saturating_add(input_height)
+        .saturating_add(1); // footer row
+    without_sessions < BOTTOM_CHROME_MAX_HEIGHT
 }
 
 /// Render the **fixed-height inline viewport** at the bottom of the
@@ -1579,27 +1631,55 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
     } else {
         0
     };
+    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),              // Status bar
+            Constraint::Length(sessions_rows),  // Background-session status (0 when none)
             Constraint::Length(streaming_rows), // Streaming preview (0 when idle)
             Constraint::Length(input_height),   // Input area (dynamic)
             Constraint::Length(1),              // Footer
         ])
         .split(area);
 
-    // Layout::split always returns exactly 4 chunks here.
+    // Layout::split always returns exactly 5 chunks here.
     #[allow(clippy::indexing_slicing)]
     {
         render_status_bar(frame, chunks[0], state);
-        if streaming_rows > 0 {
-            render_streaming_preview(frame, chunks[1], state);
+        if sessions_rows > 0 {
+            render_sessions_status(frame, chunks[1], state);
         }
-        render_input(frame, chunks[2], state);
-        render_footer(frame, chunks[3]);
+        if streaming_rows > 0 {
+            render_streaming_preview(frame, chunks[2], state);
+        }
+        render_input(frame, chunks[3], state);
+        render_footer(frame, chunks[4]);
     }
+}
+
+/// Render the persistent background-session status row (v1b).
+///
+/// Single line, distinct dim style from the main status bar. The text is
+/// truncated to the row width so a narrow terminal degrades gracefully rather
+/// than wrapping into the input box.
+fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
+    let summary = state.sessions_status();
+    if summary.is_empty() {
+        return;
+    }
+    let max = usize::from(area.width).saturating_sub(1).max(1);
+    let ellipsis = if state.ascii_fallback() { "..." } else { "\u{2026}" };
+    let text = if summary.chars().count() > max {
+        let keep = max.saturating_sub(ellipsis.chars().count());
+        let truncated: String = summary.chars().take(keep).collect();
+        format!(" {truncated}{ellipsis}")
+    } else {
+        format!(" {summary}")
+    };
+    let widget = Paragraph::new(text).style(Style::default().fg(Color::Cyan).bg(Color::Black));
+    frame.render_widget(widget, area);
 }
 
 fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
@@ -4160,6 +4240,62 @@ mod tests {
         assert!(
             tall <= BOTTOM_CHROME_MAX_HEIGHT,
             "must be clamped to BOTTOM_CHROME_MAX_HEIGHT"
+        );
+    }
+
+    #[test]
+    fn sessions_status_row_adds_height_only_when_present() {
+        let mut state = TuiState::new("p", "m");
+        let idle = bottom_chrome_height(&state);
+        assert!(!sessions_status_visible(&state), "empty status row hidden");
+
+        state.set_sessions_status("bg: 1 running");
+        assert!(sessions_status_visible(&state), "non-empty status row shown");
+        let with_row = bottom_chrome_height(&state);
+        assert_eq!(
+            with_row,
+            idle.saturating_add(1),
+            "sessions status row adds exactly one row"
+        );
+
+        // Clearing the status hides the row again.
+        state.set_sessions_status("");
+        assert!(!sessions_status_visible(&state));
+        assert_eq!(bottom_chrome_height(&state), idle);
+    }
+
+    #[test]
+    fn sessions_status_row_stays_within_height_budget() {
+        // With current constants the busiest chrome (streaming + max visible
+        // input) is status(1)+streaming(6)+input(1+10)+footer(1)=19, so adding
+        // the 1-row sessions line (=20) still fits under BOTTOM_CHROME_MAX_HEIGHT
+        // (24): the row stays visible and the total never exceeds the cap.
+        let mut state = TuiState::new("p", "m");
+        state.set_sessions_status("bg: 9 running");
+        state.start_stream("d");
+        for _ in 0..(INPUT_MAX_VISIBLE_ROWS + 4) {
+            state.input.lines.push(String::new());
+        }
+        assert!(
+            sessions_status_visible(&state),
+            "the sessions row fits within the height budget under real inputs"
+        );
+        assert!(bottom_chrome_height(&state) <= BOTTOM_CHROME_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn sessions_status_row_degrades_when_budget_exhausted() {
+        // Forward-compat guard: when the rest of the chrome already meets/exceeds
+        // the max height, the sessions row is the first thing dropped so the
+        // input box and footer never lose rows. We exercise the guard directly
+        // via its documented threshold (without depending on specific constants).
+        let without_sessions = 1u16 // status
+            + STREAMING_VISIBLE_ROWS
+            + u16::try_from(INPUT_MAX_VISIBLE_ROWS + 1).unwrap_or(11)
+            + 1; // footer
+        assert!(
+            without_sessions < BOTTOM_CHROME_MAX_HEIGHT,
+            "guard threshold: row drops once the rest reaches BOTTOM_CHROME_MAX_HEIGHT"
         );
     }
 

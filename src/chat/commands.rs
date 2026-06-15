@@ -71,6 +71,11 @@ const HELP_TEXT: &str = "Available commands:
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
   /auto              Switch to auto mode (no approval prompts)
+  /bg <task>         Run a task as a background agent session
+  /sessions          List background sessions
+  /attach <id>       Show a background session's recent output (read-only)
+  /steer <id> <msg>  Send a steering instruction to a background session
+  /kill <id>         Stop a background session
   /quit /exit        Exit chat";
 
 /// Dispatch a slash command. Returns `CommandResult`.

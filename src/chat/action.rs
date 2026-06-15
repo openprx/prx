@@ -209,6 +209,10 @@ pub enum Action {
     /// 到 ui.conversation_lines。legacy 模式由 chat_mirror.push_user_message 承担，
     /// Pure 模式守卫跳过 mirror 写后用此 Action 让 reducer 单源接管 echo。
     UserMessageEchoed(String),
+    /// 后台会话常驻状态行更新（v1b）。`summary` 为空表示无后台会话（隐藏该行）。
+    /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
+    /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
+    SessionsStatusUpdated { summary: String },
 
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
@@ -263,6 +267,7 @@ impl Action {
             Self::RedrawRequested => "RedrawRequested",
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
+            Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
             Self::CancelRequested => "CancelRequested",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",

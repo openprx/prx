@@ -5,10 +5,10 @@
 //! to execute (the loop owns the mutable runtime state; the command dispatcher
 //! only holds immutable borrows, so it cannot run these directly).
 //!
-//! v1a implements `Bg` / `Sessions` / `Kill`. The remaining variants are parsed
-//! into shape for later stages (v1b: `Steer` / `Attach` / `Detach`; v2:
-//! `Shell` / `Logs`) so the surface is stable, but the chat main loop currently
-//! only executes the v1a subset.
+//! v1a implements `Bg` / `Sessions` / `Kill`; v1b adds `Steer` / `Attach`. The
+//! remaining variants are parsed into shape for later stages (v1.1: `Detach`;
+//! v2: `Shell` / `Logs`) so the surface is stable, but the chat main loop only
+//! executes the v1a+v1b subset.
 
 /// A parsed chat session command, handed back to the main loop for execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +21,7 @@ pub enum SessionCommand {
     Kill { seq: u64 },
     /// `/steer <seq> <message>` — inject a steering message (v1b).
     Steer { seq: u64, message: String },
-    /// `/attach <seq>` — read-only tail (v1b).
+    /// `/attach <seq>` — read-only tail of recent output (v1b).
     Attach { seq: u64 },
     /// `/detach` — return focus to main (v1.1).
     Detach,
