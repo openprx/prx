@@ -14,6 +14,7 @@
 //!   **never** produced here (there is no underlying signal for it yet).
 
 use super::id::SessionId;
+use super::shell::{ShellSession, ShellStatus};
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use chrono::{DateTime, Utc};
 
@@ -119,6 +120,42 @@ pub fn project_run(run: &SubAgentRun, seq: u64) -> ManagedSessionView {
         status: project_status(&run.status),
         created_at: run.started_at,
         updated_at: run.started_at,
+    }
+}
+
+/// Project a background [`ShellSession`]'s [`ShellStatus`] onto the unified UI
+/// [`ManagedStatus`]. Pure function (no lock beyond the cheap status read in the
+/// caller), trivially unit-testable.
+#[must_use]
+pub const fn project_shell_status(status: &ShellStatus) -> ManagedStatus {
+    match status {
+        ShellStatus::Running => ManagedStatus::Running,
+        ShellStatus::Completed => ManagedStatus::Completed,
+        ShellStatus::Failed(_) => ManagedStatus::Failed,
+        ShellStatus::Cancelled => ManagedStatus::Cancelled,
+    }
+}
+
+/// Project a background shell session onto a [`ManagedSessionView`] with the
+/// supplied display sequence number, so `/sessions`, the switcher, and the
+/// status line treat agents and shells uniformly (one seq space).
+#[must_use]
+pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
+    const MAX_TITLE: usize = 80;
+    let title = if session.command.chars().count() > MAX_TITLE {
+        let truncated: String = session.command.chars().take(MAX_TITLE).collect();
+        format!("{truncated}…")
+    } else {
+        session.command.clone()
+    };
+    ManagedSessionView {
+        id: session.id.clone(),
+        seq,
+        kind: ManagedKind::Shell,
+        title,
+        status: project_shell_status(&session.status()),
+        created_at: session.started_at,
+        updated_at: session.started_at,
     }
 }
 

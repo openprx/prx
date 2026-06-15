@@ -1147,6 +1147,11 @@ pub async fn run(
     // `/bg` sub-agents stream incremental output + tool calls (via a per-session
     // drainer) into per-session ring buffers for live read-only `/attach`.
     let (session_event_sink, mut session_event_rx) = crate::chat::sessions::SessionEventSink::channel();
+    // Keep a clone for background `/shell` sessions (v2): they stream stdout/
+    // stderr through the same event bridge / per-session drainer that agents use,
+    // so live `/attach` and `/logs` work uniformly across both kinds. The other
+    // clone is consumed by the spawn tool's `into_spawn_sink` below.
+    let shell_event_sink = session_event_sink.clone();
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
         Arc::clone(&provider),
@@ -1742,10 +1747,11 @@ pub async fn run(
                 let finished = chat_sessions.poll_finished(&mut reported_sessions).await;
                 for fin in &finished {
                     let summary = fin.summary.trim();
+                    let kind = fin.kind.as_str();
                     let line = if summary.is_empty() {
-                        format!("[session #{} {}]", fin.seq, fin.status.as_str())
+                        format!("[{kind} session #{} {}]", fin.seq, fin.status.as_str())
                     } else {
-                        format!("[session #{} {}] {summary}", fin.seq, fin.status.as_str())
+                        format!("[{kind} session #{} {}] {summary}", fin.seq, fin.status.as_str())
                     };
                     surface_session_message(
                         &chat_dispatcher,
@@ -2313,15 +2319,34 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Kill { seq } => {
-                            // Resolve `#N` -> run UUID (refreshing the seq map so a
-                            // just-`/bg`-ed run is addressable), then delegate the
-                            // actual kill to the `sessions_spawn` tool's `kill`
-                            // action. Routing through the tool — instead of mutating
-                            // the registry here — keeps the shared kill semantics:
-                            // side-effect gate authorization, completed/failed
-                            // status check (no overwriting a finished run),
-                            // `task.killed` event, `steer_tx` cleanup, and the
-                            // channel announcement. Mirrors the `/bg` delegation.
+                            // Unified kill: shells terminate their process group via
+                            // the shell registry; agents delegate to the
+                            // sessions_spawn tool's `kill` action (shared semantics).
+                            match chat_sessions.kind_for_seq(seq).await {
+                                Ok(crate::chat::sessions::model::ManagedKind::Shell) => {
+                                    match chat_sessions.kill_shell(seq).await {
+                                        Ok(()) => emit_chat_output(&format!(
+                                            "Killed background shell #{seq} (process group terminated)."
+                                        )),
+                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                    }
+                                    continue;
+                                }
+                                Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
+                                Err(e) => {
+                                    emit_chat_output(&format!("Kill failed: {e}"));
+                                    continue;
+                                }
+                            }
+                            // Agent path: resolve `#N` -> run UUID (refreshing the
+                            // seq map so a just-`/bg`-ed run is addressable), then
+                            // delegate the actual kill to the `sessions_spawn` tool's
+                            // `kill` action. Routing through the tool — instead of
+                            // mutating the registry here — keeps the shared kill
+                            // semantics: side-effect gate authorization,
+                            // completed/failed status check (no overwriting a
+                            // finished run), `task.killed` event, `steer_tx`
+                            // cleanup, and the channel announcement.
                             let run_id = match chat_sessions.resolve_run_id(seq).await {
                                 Ok(id) => id,
                                 Err(e) => {
@@ -2588,9 +2613,62 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
-                        // Deferred to later stages (v2: Shell/Logs).
-                        SessionCommand::Shell { .. } | SessionCommand::Logs { .. } => {
-                            emit_chat_output("That session command is not available yet.");
+                        SessionCommand::Shell { command } => {
+                            // v2: run a non-interactive command in the background.
+                            // Reuses the shell tool's SideEffectGate (high-risk
+                            // commands still blocked), workspace cwd, hardened env,
+                            // and the v1.1 event bridge for live `/attach`/`/logs`.
+                            match crate::chat::sessions::shell::spawn_shell(&command, &security, &shell_event_sink) {
+                                Ok(session) => {
+                                    let seq = chat_sessions.add_shell(session);
+                                    emit_chat_output(&format!("Started background shell #{seq}: {command}"));
+                                }
+                                Err(e) => {
+                                    emit_chat_output(&format!("Failed to start background shell: {e}"));
+                                }
+                            }
+                            continue;
+                        }
+                        SessionCommand::Logs { seq } => {
+                            // v2: dump a session's accumulated output buffer (the
+                            // per-session ring) — applies to both agents and
+                            // shells. Resolving the seq first refreshes the map so a
+                            // just-spawned session is addressable.
+                            const LOGS_MAX_LINES: usize = 200;
+                            match chat_sessions.resolve_run_id(seq).await {
+                                Ok(run_id) => {
+                                    let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    match session_rings.get(&sid) {
+                                        Some(ring) => {
+                                            // Replay the full retained window without
+                                            // disturbing the live-follow drained
+                                            // cursor: snapshot via a temporary rewind.
+                                            let lines = ring.recent_lines(LOGS_MAX_LINES);
+                                            if lines.is_empty() {
+                                                emit_chat_output(&format!(
+                                                    "Session #{seq} has no buffered output yet."
+                                                ));
+                                            } else {
+                                                let mut out =
+                                                    format!("Session #{seq} logs (last {} lines):\n", lines.len());
+                                                if ring.is_truncated() {
+                                                    out.push_str("  [output truncated]\n");
+                                                }
+                                                for l in &lines {
+                                                    out.push_str("  ");
+                                                    out.push_str(l);
+                                                    out.push('\n');
+                                                }
+                                                emit_chat_output(out.trim_end());
+                                            }
+                                        }
+                                        None => {
+                                            emit_chat_output(&format!("Session #{seq} has no buffered output yet."))
+                                        }
+                                    }
+                                }
+                                Err(e) => emit_chat_output(&format!("Logs failed: {e}")),
+                            }
                             continue;
                         }
                     }
@@ -3714,6 +3792,21 @@ Retry with a compatible model: /provider {new_provider} <model>"
             );
             // observer.record_event 仍然调用（observer 只是本地计数，无外部副作用）
             observer.record_event(&ObserverEvent::TurnComplete);
+        }
+    }
+
+    // ── Background shell cleanup (v2) ─────────────────────────────
+    // On chat exit, terminate every background shell's whole process group so no
+    // child (e.g. a `sleep` forked by `sh -c`) is left orphaned. `kill()` is
+    // idempotent and only signals still-running groups (already-exited groups
+    // return ESRCH, treated as success).
+    {
+        let shells = chat_sessions.shell_registry();
+        let to_kill: Vec<_> = shells.lock().clone();
+        for shell in &to_kill {
+            if let Err(e) = shell.kill() {
+                tracing::warn!(error = %e, "Failed to terminate background shell process group on exit");
+            }
         }
     }
 

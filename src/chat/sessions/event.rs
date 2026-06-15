@@ -116,10 +116,14 @@ impl SessionEventSink {
         })
     }
 
-    /// Test helper: create a run's middle channels + drainer directly, mirroring
-    /// what [`Self::into_spawn_sink`]'s closure does, so unit tests can exercise
-    /// the drainer without going through the library indirection.
-    #[cfg(test)]
+    /// Create a run's middle channels + drainer directly, mirroring what
+    /// [`Self::into_spawn_sink`]'s closure does for agents.
+    ///
+    /// Background shell sessions (v2) call this to obtain `on_delta`-style
+    /// senders that stream their stdout/stderr through the same decoupled drainer
+    /// → ring-buffer path agents use, so live `/attach` and `/logs` work
+    /// uniformly across both kinds. Unit tests also use it to exercise the
+    /// drainer without the library indirection.
     #[must_use]
     pub fn attach_run(&self, id: SessionId) -> (mpsc::Sender<String>, mpsc::Sender<ToolCallNotification>) {
         let (raw_delta_tx, raw_delta_rx) = mpsc::channel::<String>(RAW_CHANNEL_CAPACITY);
@@ -315,6 +319,15 @@ impl SessionRing {
     /// full retained window (then follows new lines via [`Self::drain_new`]).
     pub const fn rewind(&mut self) {
         self.drained = 0;
+    }
+
+    /// Snapshot up to `max` of the most recent retained lines **without** touching
+    /// the drained cursor (read-only). Used by `/logs` to dump a session's buffer
+    /// while a concurrent live `/attach` follow keeps streaming uninterrupted.
+    #[must_use]
+    pub fn recent_lines(&self, max: usize) -> Vec<String> {
+        let start = self.buf.len().saturating_sub(max);
+        self.buf.iter().skip(start).cloned().collect()
     }
 }
 

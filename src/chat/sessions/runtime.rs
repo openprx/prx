@@ -10,11 +10,22 @@
 //! single-threaded state (`seq_map`); it is never shared across a lock.
 
 use super::id::SessionId;
-use super::model::{ManagedSessionView, ManagedStatus, project_run, project_status};
+use super::model::{
+    ManagedKind, ManagedSessionView, ManagedStatus, project_run, project_shell, project_shell_status, project_status,
+};
+use super::shell::ShellSession;
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use anyhow::{Result, anyhow};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+/// Shared, single-source registry of background shell sessions (v2).
+///
+/// `parking_lot::Mutex` (synchronous, never held across `.await`): shell
+/// entries are short clonable handles, added/removed/scanned without any await
+/// while the lock is held.
+pub type ShellRegistry = Arc<Mutex<Vec<ShellSession>>>;
 
 /// One line of a session's recent output, projected for `/attach` display.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,8 +43,11 @@ pub struct TailLine {
 pub struct FinishedSession {
     /// Display sequence `#N`.
     pub seq: u64,
-    /// Underlying run UUID (used by the caller to dedup "already reported").
+    /// Underlying session id (run UUID for agents, shell id for shells); used by
+    /// the caller to dedup "already reported".
     pub run_id: String,
+    /// What kind of session finished (agent vs shell), for the reflow label.
+    pub kind: ManagedKind,
     /// Terminal status (`Completed` / `Failed` / `Cancelled`).
     pub status: ManagedStatus,
     /// Result / failure text recorded by the run (the `Completed`/`Failed`
@@ -41,27 +55,57 @@ pub struct FinishedSession {
     pub summary: String,
 }
 
-/// Chat-side handle over the shared sub-agent registry.
+/// Chat-side handle over the shared agent + shell registries.
+///
+/// Unifies two single-source registries into **one display seq space** so
+/// `/sessions`, the Ctrl+G switcher, the status line, `/attach`, `/kill`, and
+/// `/logs` treat background agents and background shells uniformly (plan §v2
+/// "unified session list"):
+///
+/// - **agents**: `runs` is the same `Arc<RwLock<Vec<SubAgentRun>>>` injected into
+///   the four sessions tools via `SessionsSpawnTool::new_with_registry`.
+/// - **shells**: `shells` is the chat-side shell registry (v2); shell sessions
+///   are added here by `/shell` and reaped lazily (they keep their terminal
+///   status for `/sessions` history until chat exit).
 pub struct ChatSessionsHandle {
-    /// The single-source `active_runs` registry (same `Arc` injected into the
-    /// four sessions tools via `SessionsSpawnTool::new_with_registry`).
+    /// The single-source `active_runs` agent registry.
     runs: Arc<RwLock<Vec<SubAgentRun>>>,
-    /// `#N` -> run UUID, assigned in first-seen order. Owned by the main loop
-    /// (single-threaded), so a plain `Vec` with no lock is correct.
+    /// The single-source shell-session registry (v2).
+    shells: ShellRegistry,
+    /// `#N` -> session id, assigned in first-seen order across **both** kinds.
+    /// Owned by the main loop (single-threaded), so a plain `Vec` with no lock is
+    /// correct.
     seq_map: Vec<(u64, SessionId)>,
     /// Next sequence number to hand out.
     next_seq: u64,
 }
 
 impl ChatSessionsHandle {
-    /// Build a handle over the supplied single-source registry Arc.
+    /// Build a handle over the supplied single-source agent registry Arc, with a
+    /// fresh empty shell registry.
     #[must_use]
-    pub const fn new(runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
+    pub fn new(runs: Arc<RwLock<Vec<SubAgentRun>>>) -> Self {
         Self {
             runs,
+            shells: Arc::new(Mutex::new(Vec::new())),
             seq_map: Vec::new(),
             next_seq: 1,
         }
+    }
+
+    /// The shell registry Arc, so the chat exit path can `kill` all shells (and
+    /// tests can assert on its contents). Cheap `Arc` clone.
+    #[must_use]
+    pub fn shell_registry(&self) -> ShellRegistry {
+        Arc::clone(&self.shells)
+    }
+
+    /// Register a freshly spawned shell session and return its display seq `#N`.
+    /// Pure main-loop state mutation plus a short `parking_lot` lock (no await).
+    pub fn add_shell(&mut self, session: ShellSession) -> u64 {
+        let id = session.id.clone();
+        self.shells.lock().push(session);
+        self.seq_for(&id)
     }
 
     /// Assign a stable `#N` to a run UUID if it has not been seen before,
@@ -81,24 +125,42 @@ impl ChatSessionsHandle {
         self.seq_map.iter().find(|(mapped, _)| *mapped == seq).map(|(_, id)| id)
     }
 
-    /// Refresh the `#N` -> UUID mapping from the live registry, assigning a new
-    /// sequence to any run not seen before. Runs in first-seen order so display
-    /// numbers stay stable across calls. Takes only a read lock.
+    /// Refresh the `#N` -> session-id mapping from **both** live registries,
+    /// assigning a new sequence to any session not seen before. Agents are
+    /// enumerated first, then shells, in first-seen order, so display numbers stay
+    /// stable across calls. Takes only a read lock on agents and a short
+    /// `parking_lot` lock on shells.
     ///
-    /// This is the single place seqs are minted: both `snapshot` (for `/sessions`)
-    /// and `resolve_run_id` (for `/kill`) call it, so a freshly spawned run gets a
-    /// `#N` even when the user kills it via `/bg` -> `/kill <N>` without first
-    /// running `/sessions` (otherwise the seq map would be stale).
+    /// This is the single place seqs are minted: `snapshot` (for `/sessions`),
+    /// `resolve_run_id` (for `/kill`/`/steer`), and `kind_for_seq` (for the
+    /// kind-dependent dispatch) all call it, so a freshly spawned agent or shell
+    /// gets a `#N` even when addressed before the next `/sessions`.
+    ///
+    /// Returns the agent run snapshot (shells are read separately via the registry
+    /// when needed) so existing agent-only callers keep their shape.
     async fn refresh_seqs(&mut self) -> Vec<SubAgentRun> {
         let runs: Vec<SubAgentRun> = self.runs.read().await.clone();
         for run in &runs {
             let _ = self.seq_for(&SessionId::from_run_id(&run.id));
         }
+        // Shells come after agents in seq order. Clone the ids out under the lock,
+        // then assign (no await while the lock is held).
+        let shell_ids: Vec<SessionId> = self.shells.lock().iter().map(|s| s.id.clone()).collect();
+        for id in &shell_ids {
+            let _ = self.seq_for(id);
+        }
         runs
     }
 
-    /// Snapshot all background sessions as chat-side views, assigning/refreshing
-    /// display sequence numbers.
+    /// Find a shell session by its display seq `#N`, cloning the (cheap) handle
+    /// out of the registry. Returns `None` if the seq does not map to a shell.
+    fn shell_for_seq(&self, seq: u64) -> Option<ShellSession> {
+        let id = self.id_for_seq(seq)?.clone();
+        self.shells.lock().iter().find(|s| s.id == id).cloned()
+    }
+
+    /// Snapshot all background sessions (agents + shells) as chat-side views in a
+    /// single seq space, assigning/refreshing display sequence numbers.
     pub async fn snapshot(&mut self) -> Vec<ManagedSessionView> {
         let runs = self.refresh_seqs().await;
         let mut views = Vec::with_capacity(runs.len());
@@ -108,6 +170,13 @@ impl ChatSessionsHandle {
             let seq = self.seq_for(&SessionId::from_run_id(&run.id));
             views.push(project_run(run, seq));
         }
+        // Shells, projected with their already-assigned seqs (after agents).
+        let shells = self.shells.lock().clone();
+        for shell in &shells {
+            let seq = self.seq_for(&shell.id);
+            views.push(project_shell(shell, seq));
+        }
+        views.sort_by_key(|v| v.seq);
         views
     }
 
@@ -144,11 +213,71 @@ impl ChatSessionsHandle {
             finished.push(FinishedSession {
                 seq,
                 run_id: run.id.clone(),
+                kind: ManagedKind::Agent,
+                status,
+                summary,
+            });
+        }
+        // Shells: same once-only terminal reporting, keyed by shell id.
+        let shells = self.shells.lock().clone();
+        for shell in &shells {
+            let shell_status = shell.status();
+            let status = project_shell_status(&shell_status);
+            let is_terminal = matches!(
+                status,
+                ManagedStatus::Completed | ManagedStatus::Failed | ManagedStatus::Cancelled
+            );
+            if !is_terminal {
+                continue;
+            }
+            let key = shell.id.as_str().to_string();
+            if reported.contains(&key) {
+                continue;
+            }
+            reported.insert(key.clone());
+            let seq = self.seq_for(&shell.id);
+            let summary = match &shell_status {
+                super::shell::ShellStatus::Failed(reason) => reason.clone(),
+                _ => String::new(),
+            };
+            finished.push(FinishedSession {
+                seq,
+                run_id: key,
+                kind: ManagedKind::Shell,
                 status,
                 summary,
             });
         }
         finished
+    }
+
+    /// Resolve a display seq `#N` to the kind of session it addresses (agent vs
+    /// shell), refreshing the seq map first. Returns an error (never panics) if
+    /// the seq is unknown. Lets the chat loop dispatch `/kill` / `/logs` to the
+    /// right backend.
+    pub async fn kind_for_seq(&mut self, seq: u64) -> Result<ManagedKind> {
+        self.refresh_seqs().await;
+        let id = self
+            .id_for_seq(seq)
+            .cloned()
+            .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        if self.shells.lock().iter().any(|s| s.id == id) {
+            Ok(ManagedKind::Shell)
+        } else {
+            Ok(ManagedKind::Agent)
+        }
+    }
+
+    /// Kill the shell session at display seq `#N` (terminating its whole process
+    /// group). Refreshes the seq map first so a just-`/shell`-ed session is
+    /// addressable. Returns an error (never panics) if the seq is unknown or is
+    /// not a shell.
+    pub async fn kill_shell(&mut self, seq: u64) -> Result<()> {
+        self.refresh_seqs().await;
+        let shell = self
+            .shell_for_seq(seq)
+            .ok_or_else(|| anyhow!("no shell session #{seq}"))?;
+        shell.kill()
     }
 
     /// Resolve a display sequence `#N` to the underlying run UUID, refreshing the
@@ -184,6 +313,10 @@ impl ChatSessionsHandle {
             .id_for_seq(seq)
             .map(|id| id.as_str().to_string())
             .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        // Shell first (its id never appears in the agent registry).
+        if let Some(shell) = self.shells.lock().iter().find(|s| s.id.as_str() == target_id) {
+            return Ok(shell.is_terminal());
+        }
         let run = runs
             .iter()
             .find(|r| r.id == target_id)
@@ -212,6 +345,13 @@ impl ChatSessionsHandle {
             .id_for_seq(seq)
             .map(|id| id.as_str().to_string())
             .ok_or_else(|| anyhow!("no session #{seq}"))?;
+        // Shells have no registry history; their stdout/stderr lives only in the
+        // chat-side ring (replayed by `/attach` and dumped by `/logs`). Return an
+        // empty tail (not an error) so `/attach <shell>` falls straight through to
+        // ring replay.
+        if self.shells.lock().iter().any(|s| s.id.as_str() == target_id) {
+            return Ok(Vec::new());
+        }
         let history = {
             let run = runs
                 .iter()
@@ -302,6 +442,94 @@ mod tests {
             session_scope_key: String::new(),
             spawn_depth: 0,
         }
+    }
+
+    // ── Unified agent + shell session list (v2) ─────────────────────────────
+
+    fn permissive_security() -> Arc<crate::security::SecurityPolicy> {
+        Arc::new(crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            allowed_commands: vec!["*".into()],
+            ..crate::security::SecurityPolicy::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn snapshot_merges_agents_and_shells_in_one_seq_space() {
+        let runs = Arc::new(RwLock::new(vec![make_run("a", "agent a", SubAgentStatus::Running)]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+
+        // Agent gets #1.
+        let first = handle.snapshot().await;
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].seq, 1);
+        assert_eq!(first[0].kind, ManagedKind::Agent);
+
+        // Add a shell — it must appear in the *same* list with #2.
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let shell_seq = handle.add_shell(shell.clone());
+        assert_eq!(shell_seq, 2, "shells are numbered after agents");
+
+        let merged = handle.snapshot().await;
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].kind, ManagedKind::Agent);
+        assert_eq!(merged[1].kind, ManagedKind::Shell);
+        assert_eq!(merged[1].seq, 2);
+        assert!(merged[1].title.contains("sleep 30"));
+
+        // kind_for_seq routes correctly.
+        assert_eq!(handle.kind_for_seq(1).await.expect("test: #1 kind"), ManagedKind::Agent);
+        assert_eq!(handle.kind_for_seq(2).await.expect("test: #2 kind"), ManagedKind::Shell);
+
+        // kill_shell(#2) terminates the shell; kill_shell on the agent #1 errors.
+        handle.kill_shell(2).await.expect("test: kill shell #2");
+        assert!(shell.is_terminal());
+        assert!(handle.kill_shell(1).await.is_err(), "agent seq is not a shell");
+    }
+
+    #[tokio::test]
+    async fn poll_finished_reports_shell_once_with_kind() {
+        let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
+        let mut handle = ChatSessionsHandle::new(runs);
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("exit 0", &sec, &sink).expect("test: spawn shell");
+        handle.add_shell(shell.clone());
+
+        // Wait for the shell to finish.
+        for _ in 0..50 {
+            if shell.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut reported = std::collections::HashSet::new();
+        let finished = handle.poll_finished(&mut reported).await;
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0].kind, ManagedKind::Shell);
+        assert_eq!(finished[0].status, ManagedStatus::Completed);
+        // Reported exactly once.
+        assert!(handle.poll_finished(&mut reported).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn tail_returns_empty_for_shell_without_error() {
+        let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
+        let mut handle = ChatSessionsHandle::new(runs);
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let seq = handle.add_shell(shell.clone());
+        // Shells have no registry history; tail is empty, not an error.
+        let lines = handle.tail(seq, 10).await.expect("test: shell tail empty ok");
+        assert!(lines.is_empty());
+        // is_terminal_for_seq works for shells too.
+        assert!(!handle.is_terminal_for_seq(seq).await.expect("test: shell not terminal"));
+        shell.kill().expect("test: cleanup kill");
     }
 
     #[tokio::test]

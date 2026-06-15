@@ -27,6 +27,7 @@ pub mod focus;
 pub mod id;
 pub mod model;
 pub mod runtime;
+pub mod shell;
 
 pub use command::{SessionCommand, parse_session_command};
 pub use event::{SessionEvent, SessionEventSink, SessionRing};
