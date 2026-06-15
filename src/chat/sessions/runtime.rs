@@ -56,42 +56,51 @@ impl ChatSessionsHandle {
         self.seq_map.iter().find(|(mapped, _)| *mapped == seq).map(|(_, id)| id)
     }
 
-    /// Snapshot all background sessions as chat-side views, assigning/refreshing
-    /// display sequence numbers. Takes a read lock and projects each run.
-    pub async fn snapshot(&mut self) -> Vec<ManagedSessionView> {
-        // Collect (id, projected-without-seq inputs) under the lock, then assign
-        // seqs outside to keep the lock scope minimal and avoid borrow conflicts.
+    /// Refresh the `#N` -> UUID mapping from the live registry, assigning a new
+    /// sequence to any run not seen before. Runs in first-seen order so display
+    /// numbers stay stable across calls. Takes only a read lock.
+    ///
+    /// This is the single place seqs are minted: both `snapshot` (for `/sessions`)
+    /// and `resolve_run_id` (for `/kill`) call it, so a freshly spawned run gets a
+    /// `#N` even when the user kills it via `/bg` -> `/kill <N>` without first
+    /// running `/sessions` (otherwise the seq map would be stale).
+    async fn refresh_seqs(&mut self) -> Vec<SubAgentRun> {
         let runs: Vec<SubAgentRun> = self.runs.read().await.clone();
+        for run in &runs {
+            let _ = self.seq_for(&SessionId::from_run_id(&run.id));
+        }
+        runs
+    }
+
+    /// Snapshot all background sessions as chat-side views, assigning/refreshing
+    /// display sequence numbers.
+    pub async fn snapshot(&mut self) -> Vec<ManagedSessionView> {
+        let runs = self.refresh_seqs().await;
         let mut views = Vec::with_capacity(runs.len());
         for run in &runs {
-            let id = SessionId::from_run_id(&run.id);
-            let seq = self.seq_for(&id);
+            // `refresh_seqs` already assigned a seq for every present run, so the
+            // lookup below cannot fail; `seq_for` is idempotent regardless.
+            let seq = self.seq_for(&SessionId::from_run_id(&run.id));
             views.push(project_run(run, seq));
         }
         views
     }
 
-    /// Abort the session with the given display sequence `#N`.
+    /// Resolve a display sequence `#N` to the underlying run UUID, refreshing the
+    /// seq map from the live registry first so newly spawned (e.g. just-`/bg`-ed)
+    /// runs are addressable without a prior `/sessions`.
     ///
-    /// Mirrors the `sessions_spawn` kill path: abort the spawned task (if a
-    /// handle exists) and mark the run `Failed("killed by user")`, which the UI
-    /// projects to `Cancelled`. Returns an error (never panics) if the sequence
-    /// or the run is unknown.
-    pub async fn kill(&self, seq: u64) -> Result<()> {
-        let id = self
-            .id_for_seq(seq)
-            .ok_or_else(|| anyhow!("no session #{seq}"))?
-            .clone();
-        let mut guard = self.runs.write().await;
-        let run = guard
-            .iter_mut()
-            .find(|run| run.id == id.as_str())
-            .ok_or_else(|| anyhow!("session #{seq} is no longer present"))?;
-        if let Some(handle) = run.abort_handle.as_ref() {
-            handle.abort();
-        }
-        run.status = crate::tools::sessions_spawn::SubAgentStatus::Failed("killed by user".into());
-        Ok(())
+    /// This does **not** perform the kill itself: the chat loop delegates the
+    /// actual termination to the `sessions_spawn` tool's `kill` action so the
+    /// shared kill semantics (side-effect gate authorization, completed/failed
+    /// status check, `task.killed` event, `steer_tx` cleanup, channel
+    /// announcement) apply uniformly. Returns an error (never panics) if the
+    /// sequence is unknown after refresh.
+    pub async fn resolve_run_id(&mut self, seq: u64) -> Result<String> {
+        self.refresh_seqs().await;
+        self.id_for_seq(seq)
+            .map(|id| id.as_str().to_string())
+            .ok_or_else(|| anyhow!("no session #{seq}"))
     }
 }
 
@@ -141,24 +150,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kill_unknown_seq_errors() {
+    async fn resolve_unknown_seq_errors() {
         let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
-        let handle = ChatSessionsHandle::new(runs);
-        let err = handle.kill(99).await.expect_err("test: unknown seq must error");
+        let mut handle = ChatSessionsHandle::new(runs);
+        let err = handle
+            .resolve_run_id(99)
+            .await
+            .expect_err("test: unknown seq must error");
         assert!(err.to_string().contains("no session #99"));
     }
 
     #[tokio::test]
-    async fn kill_marks_cancelled() {
-        let runs = Arc::new(RwLock::new(vec![make_run("z", "long", SubAgentStatus::Running)]));
+    async fn resolve_returns_run_id_for_seq() {
+        let runs = Arc::new(RwLock::new(vec![
+            make_run("a", "task a", SubAgentStatus::Running),
+            make_run("b", "task b", SubAgentStatus::Running),
+        ]));
         let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
-        // Establish the seq mapping.
+        // Establish the seq mapping via /sessions.
         let _ = handle.snapshot().await;
-        handle.kill(1).await.expect("test: kill #1");
-        let guard = runs.read().await;
-        match &guard[0].status {
-            SubAgentStatus::Failed(msg) => assert_eq!(msg, "killed by user"),
-            other => panic!("test: expected Failed, got {other:?}"),
-        }
+        assert_eq!(handle.resolve_run_id(1).await.expect("test: #1"), "a");
+        assert_eq!(handle.resolve_run_id(2).await.expect("test: #2"), "b");
+    }
+
+    #[tokio::test]
+    async fn resolve_assigns_seq_without_prior_snapshot() {
+        // Regression: `/bg` then `/kill 1` must work even though `/sessions` was
+        // never called — `resolve_run_id` refreshes the seq map itself.
+        let runs = Arc::new(RwLock::new(vec![make_run(
+            "fresh",
+            "just spawned",
+            SubAgentStatus::Running,
+        )]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        assert_eq!(handle.resolve_run_id(1).await.expect("test: #1 after bg"), "fresh");
     }
 }

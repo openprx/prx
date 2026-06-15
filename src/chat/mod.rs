@@ -1151,7 +1151,15 @@ pub async fn run(
     // set (resolves the spawn-tool-needs-the-tool-table chicken-and-egg; mirrors
     // the channels path).
     let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(base_tools_vec);
-    spawn_tools_handle.set(Arc::clone(&tools_registry)).ok();
+    // Re-inject the completed registry into sessions_spawn's OnceLock. A failure
+    // here means the handle was already set (the spawn tool's tool table never got
+    // this full registry) — spawned sub-agents would then run with an incomplete
+    // tool set, so surface it instead of swallowing silently.
+    if spawn_tools_handle.set(Arc::clone(&tools_registry)).is_err() {
+        tracing::warn!(
+            "sessions_spawn tools registry was already initialized; spawned sub-agents may have an incomplete tool set"
+        );
+    }
 
     // Chat-side handle over the same single-source registry for `/sessions` and
     // `/kill` (side-channel — same Arc, no type erasure / downcast).
@@ -2074,9 +2082,74 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Kill { seq } => {
-                            match chat_sessions.kill(seq).await {
-                                Ok(()) => emit_chat_output(&format!("Killed session #{seq} (cancelled).")),
-                                Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                            // Resolve `#N` -> run UUID (refreshing the seq map so a
+                            // just-`/bg`-ed run is addressable), then delegate the
+                            // actual kill to the `sessions_spawn` tool's `kill`
+                            // action. Routing through the tool — instead of mutating
+                            // the registry here — keeps the shared kill semantics:
+                            // side-effect gate authorization, completed/failed
+                            // status check (no overwriting a finished run),
+                            // `task.killed` event, `steer_tx` cleanup, and the
+                            // channel announcement. Mirrors the `/bg` delegation.
+                            let run_id = match chat_sessions.resolve_run_id(seq).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    emit_chat_output(&format!("Kill failed: {e}"));
+                                    continue;
+                                }
+                            };
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    // The kill operation is Medium-risk; under
+                                    // supervised autonomy the gate requires a grant
+                                    // bound to `sessions_spawn:kill:<run_id>`. The
+                                    // operator typed `/kill`, so issue the matching
+                                    // grant here (same op name the gate authorizes),
+                                    // mirroring how the agent loop grants after
+                                    // operator approval.
+                                    let operation_name = format!("sessions_spawn:kill:{run_id}");
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        &operation_name,
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    let mut args = serde_json::json!({
+                                        "action": "kill",
+                                        "run_id": run_id,
+                                    });
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize kill approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
                             }
                             continue;
                         }
