@@ -14,18 +14,23 @@
 //! - [`event::SessionEvent`] / [`event::SessionEventSink`] / [`event::SessionRing`]
 //!   — the v1.1a event bridge: decoupled delta/tool streaming from background
 //!   agents into per-session ring buffers for live read-only attach.
+//! - [`focus::FocusTarget`] / [`focus::SwitcherState`] / [`focus::resolve_esc`]
+//!   — the v1.1b input-routing target, Ctrl+G switcher overlay state, and the
+//!   pure Esc decision function.
 //!
 //! See `task/prx/chat-background-runtime-v1-execution-plan.md` (v1a/v1b) for
 //! scope.
 
 pub mod command;
 pub mod event;
+pub mod focus;
 pub mod id;
 pub mod model;
 pub mod runtime;
 
 pub use command::{SessionCommand, parse_session_command};
 pub use event::{SessionEvent, SessionEventSink, SessionRing};
+pub use focus::{FocusTarget, SwitcherEntry, SwitcherState};
 // `FinishedSession` / `TailLine` are returned by `ChatSessionsHandle` methods
 // and reachable as `runtime::{FinishedSession, TailLine}`; not re-exported at
 // this level until a caller needs to name them (avoids an unused-import warning).

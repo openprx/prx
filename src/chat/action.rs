@@ -213,6 +213,20 @@ pub enum Action {
     /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
     /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
     SessionsStatusUpdated { summary: String },
+    /// 输入路由目标变更（v1.1b）。由 chat 主循环在 `/attach` / `/detach` 时
+    /// dispatch（它独占权威 `attached_follow`），reducer 写入 `ui.focus`，经快照
+    /// 驱动提示符的颜色+字形目标指示。`None` 等价 `FocusTarget::Main`。
+    SessionFocusChanged { focus: crate::chat::sessions::FocusTarget },
+    /// Ctrl+G 打开 session switcher 弹层（v1.1b）。`entries` 为打开时的会话快照
+    /// （来自 1s 轮询缓存）。reducer 写入 `ui.switcher = Some(..)`。
+    SwitcherOpened {
+        entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    },
+    /// switcher 选中行移动（v1.1b）。`selected` 为新的高亮索引（已被 key 线程
+    /// 钳制到有效范围）。reducer 更新 `ui.switcher` 的 selected。
+    SwitcherMoved { selected: usize },
+    /// 关闭 switcher 弹层（v1.1b）。reducer 写入 `ui.switcher = None`。
+    SwitcherClosed,
 
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
@@ -268,6 +282,10 @@ impl Action {
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
+            Self::SessionFocusChanged { .. } => "SessionFocusChanged",
+            Self::SwitcherOpened { .. } => "SwitcherOpened",
+            Self::SwitcherMoved { .. } => "SwitcherMoved",
+            Self::SwitcherClosed => "SwitcherClosed",
             Self::CancelRequested => "CancelRequested",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",

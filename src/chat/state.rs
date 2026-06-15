@@ -214,6 +214,14 @@ pub struct UiState {
     /// 仅由 chat 主循环经 `Action::SessionsStatusUpdated` 写入；后台 spawn 任务
     /// 绝不触碰（铁律：state 只在主循环写）。
     pub sessions_status: String,
+    /// 当前输入路由目标（v1.1b）。`Main` = 主 chat；`Session{seq}` = 已 attach
+    /// 的后台 session（输入作为 steer）。由 chat 主循环经
+    /// `Action::SessionFocusChanged` 在 /attach//detach 时写入；驱动提示符的
+    /// 颜色+字形目标指示。
+    pub focus: crate::chat::sessions::FocusTarget,
+    /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
+    /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
+    pub switcher: Option<crate::chat::sessions::SwitcherState>,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -252,6 +260,10 @@ pub struct UiSnapshot {
     pub input: TuiInput,
     /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
     pub sessions_status: Arc<str>,
+    /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
+    pub focus: crate::chat::sessions::FocusTarget,
+    /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
+    pub switcher: Option<crate::chat::sessions::SwitcherState>,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -272,6 +284,8 @@ impl UiSnapshot {
             streaming: None,
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
+            focus: crate::chat::sessions::FocusTarget::Main,
+            switcher: None,
         }
     }
 }
@@ -349,6 +363,8 @@ impl ChatState {
                 last_ctrlc_ms: 0,
                 last_submitted: None,
                 sessions_status: String::new(),
+                focus: crate::chat::sessions::FocusTarget::Main,
+                switcher: None,
             },
             stream: StreamState {
                 draft: None,
@@ -409,6 +425,8 @@ impl ChatState {
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
+            focus: self.ui.focus,
+            switcher: self.ui.switcher.clone(),
         }
     }
 
@@ -588,6 +606,10 @@ impl ChatState {
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
+            Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
+            Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
+            Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
+            Action::SwitcherClosed => self.reduce_switcher_closed(),
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
@@ -1645,6 +1667,54 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::SessionFocusChanged` (v1.1b) — record the current input-routing
+    /// target so the snapshot prompt indicator (colour+glyph) reflects it.
+    /// Idempotent: an unchanged focus is a no-op (no needless redraw).
+    fn reduce_session_focus_changed(&mut self, focus: crate::chat::sessions::FocusTarget) -> Vec<Effect> {
+        if self.ui.focus == focus {
+            return Vec::new();
+        }
+        self.ui.focus = focus;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherOpened` (v1.1b) — open the Ctrl+G switcher overlay over
+    /// the supplied session snapshot, highlighting the first row.
+    fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
+        self.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(entries));
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherMoved` (v1.1b) — update the highlighted row. The index is
+    /// clamped to a valid row by the key thread; we clamp again defensively so a
+    /// stale snapshot can never index out of range. No-op (no redraw) when the
+    /// switcher is closed or the selection is unchanged.
+    fn reduce_switcher_moved(&mut self, selected: usize) -> Vec<Effect> {
+        let Some(switcher) = self.ui.switcher.as_mut() else {
+            return Vec::new();
+        };
+        let clamped = if switcher.entries.is_empty() {
+            0
+        } else {
+            selected.min(switcher.entries.len().saturating_sub(1))
+        };
+        if switcher.selected == clamped {
+            return Vec::new();
+        }
+        switcher.selected = clamped;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherClosed` (v1.1b) — close the switcher overlay. No-op (no
+    /// redraw) when already closed.
+    fn reduce_switcher_closed(&mut self) -> Vec<Effect> {
+        if self.ui.switcher.is_none() {
+            return Vec::new();
+        }
+        self.ui.switcher = None;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
     ///
     /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
@@ -1850,6 +1920,13 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // loop only dispatches this when the summary actually changed, and the
         // reducer also no-ops identical writes, so this never churns frames.
         Action::SessionsStatusUpdated { .. } => true,
+        // v1.1b: focus + switcher are snapshot fields driving the prompt
+        // indicator and switcher overlay → dirty. Each reducer no-ops identical
+        // writes so unchanged state never churns frames.
+        Action::SessionFocusChanged { .. }
+        | Action::SwitcherOpened { .. }
+        | Action::SwitcherMoved { .. }
+        | Action::SwitcherClosed => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -1940,6 +2017,83 @@ mod tests {
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.sessions_status.is_empty());
+    }
+
+    /// v1.1b: SessionFocusChanged writes ui.focus + flows to the snapshot; an
+    /// identical focus is a no-op.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn session_focus_changed_writes_and_dedups() {
+        use crate::chat::sessions::FocusTarget;
+        let mut state = make_state();
+        assert_eq!(state.ui.focus, FocusTarget::Main);
+
+        let focus = FocusTarget::Session { seq: 2 };
+        let effects = state.reduce(Action::SessionFocusChanged { focus });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.focus, focus);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.focus, focus);
+
+        // Identical focus → no-op.
+        let effects = state.reduce(Action::SessionFocusChanged { focus });
+        assert!(effects.is_empty(), "identical focus must not emit an effect");
+
+        // Back to main.
+        let effects = state.reduce(Action::SessionFocusChanged {
+            focus: FocusTarget::Main,
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.focus, FocusTarget::Main);
+    }
+
+    /// v1.1b: switcher open/move/close lifecycle through the reducer.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn switcher_open_move_close_lifecycle() {
+        use crate::chat::sessions::SwitcherEntry;
+        let mut state = make_state();
+        assert!(state.ui.switcher.is_none());
+
+        let entries = vec![
+            SwitcherEntry {
+                seq: 1,
+                kind: "agent",
+                status: "running",
+                title: "a".into(),
+            },
+            SwitcherEntry {
+                seq: 2,
+                kind: "agent",
+                status: "completed",
+                title: "b".into(),
+            },
+        ];
+        let effects = state.reduce(Action::SwitcherOpened {
+            entries: entries.clone(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let sw = state.ui.switcher.as_ref().expect("test: switcher open");
+        assert_eq!(sw.len(), 2);
+        assert_eq!(sw.selected, 0);
+        // Snapshot carries it.
+        assert!(state.build_ui_snapshot(1).switcher.is_some());
+
+        // Move to row 1.
+        let effects = state.reduce(Action::SwitcherMoved { selected: 1 });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.switcher.as_ref().expect("test").selected, 1);
+        // Out-of-range selection is clamped to the last row, not a panic.
+        let _ = state.reduce(Action::SwitcherMoved { selected: 99 });
+        assert_eq!(state.ui.switcher.as_ref().expect("test").selected, 1);
+
+        // Close.
+        let effects = state.reduce(Action::SwitcherClosed);
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.switcher.is_none());
+        // Closing again is a no-op.
+        let effects = state.reduce(Action::SwitcherClosed);
+        assert!(effects.is_empty());
     }
 
     /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）

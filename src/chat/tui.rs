@@ -98,6 +98,20 @@ pub struct TuiState {
     /// `Action::SessionsStatusUpdated`); the background spawn tasks never touch
     /// it.
     pub sessions_status: String,
+    /// Current input-routing target (v1.1b). `Main` routes plain text to the
+    /// main chat agent; `Session { seq }` routes it as a steer to the attached
+    /// background session. Drives the prompt's colour+glyph target indicator.
+    /// Written by the chat main loop on `/attach` / `/detach` (it owns the
+    /// authoritative `attached_follow`); the key thread only reads it.
+    pub focus: crate::chat::sessions::FocusTarget,
+    /// Open Ctrl+G session switcher overlay (v1.1b), or `None` when closed.
+    /// Owned by the synchronous key thread (opened/navigated/closed in
+    /// `dispatch_global_key`); rendered as a bottom-chrome popup.
+    pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// Cached background-session snapshot for the switcher, refreshed by the
+    /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
+    /// run async registry queries) when opening the switcher with Ctrl+G.
+    pub sessions_cache: Vec<crate::chat::sessions::SwitcherEntry>,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -281,6 +295,26 @@ pub enum KeyDispatch {
     InterruptTurn,
     /// EOF (`Ctrl+D` on an empty buffer) — the event loop should exit.
     Exit,
+    /// v1.1b: the Ctrl+G switcher overlay was opened over the supplied session
+    /// snapshot. The key loop dispatches `Action::SwitcherOpened` so the render
+    /// snapshot reflects it (the mirror was already mutated in place).
+    SwitcherOpened {
+        entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    },
+    /// v1.1b: the switcher highlight moved to row `selected`. The key loop
+    /// dispatches `Action::SwitcherMoved`.
+    SwitcherMoved { selected: usize },
+    /// v1.1b: the switcher overlay was closed (Esc / Ctrl+G toggle / after
+    /// attach). The key loop dispatches `Action::SwitcherClosed`.
+    SwitcherClosed,
+    /// v1.1b: attach to the given display sequence `#N` (switcher Enter). The
+    /// key loop sends a synthetic `/attach <seq>` through the input channel so
+    /// the async main loop performs the attach via its existing handler.
+    AttachSession { seq: u64 },
+    /// v1.1b: detach the focused background session (Esc on empty input while a
+    /// session is focused). The key loop sends a synthetic `/detach` through the
+    /// input channel so the async main loop performs the detach.
+    RequestDetach,
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -313,6 +347,20 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
         "dispatch_global_key_entry"
     );
+    // v1.1b: when the Ctrl+G switcher overlay is open it captures navigation /
+    // selection keys before anything else (Tab, input box, etc.). Handled in a
+    // dedicated resolver so the open-state key table is self-contained.
+    if state.switcher.is_some() {
+        return dispatch_switcher_key(key, state);
+    }
+    // v1.1b: Ctrl+G opens the session switcher over the cached session list.
+    // Never falls through to the input box. Opening an empty switcher is still
+    // valid — it shows the "no background sessions" hint with an Esc to close.
+    if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL {
+        let entries = state.sessions_cache.clone();
+        state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
+        return KeyDispatch::SwitcherOpened { entries };
+    }
     // Tab → toggle the most recent foldable card (reasoning OR tool-result,
     // whichever appears later in the conversation). When neither exists Tab
     // is still consumed — per spec it never falls through to the input box.
@@ -343,6 +391,28 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         let _ = state.handle_input_key(synthetic);
         return KeyDispatch::Consumed;
     }
+    // v1.1b: context-aware Esc. The switcher-open case is already handled above
+    // (the early return). Here, with no switcher open, `resolve_esc` decides
+    // between the established "non-empty clears input" muscle memory and the new
+    // "empty + session focused → detach" behaviour, never weakening the former.
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        use crate::chat::sessions::focus::{EscAction, resolve_esc};
+        match resolve_esc(state.input.is_empty(), state.focus, false) {
+            EscAction::ClearInput => {
+                // Preserve existing behaviour: clear the buffer, signal cancel.
+                let _ = state.handle_input_key(key);
+                return KeyDispatch::Cancelled;
+            }
+            EscAction::RequestDetach => return KeyDispatch::RequestDetach,
+            EscAction::Cancel => {
+                // Empty buffer + main focus → unchanged legacy cancel semantics.
+                let _ = state.handle_input_key(key);
+                return KeyDispatch::Cancelled;
+            }
+            // Unreachable here (switcher_open=false), but keep the match total.
+            EscAction::CloseSwitcher => return KeyDispatch::Cancelled,
+        }
+    }
     // All other keys → input box.
     match state.handle_input_key(key) {
         InputOutcome::Submitted(text) => KeyDispatch::Submitted(text),
@@ -350,6 +420,51 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         InputOutcome::Consumed | InputOutcome::Unhandled => KeyDispatch::Consumed,
         InputOutcome::Ignored => KeyDispatch::Ignored,
     }
+}
+
+/// Resolve a key while the Ctrl+G session switcher overlay is open (v1.1b).
+///
+/// The overlay captures navigation + selection keys; everything else is a
+/// no-op `Consumed` so stray keystrokes do not leak into the input box or fire
+/// global shortcuts while the popup has focus. Mutates the mirror switcher in
+/// place and returns the matching [`KeyDispatch`] so the key loop can mirror the
+/// change into the render snapshot.
+fn dispatch_switcher_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    // Up / Ctrl+P → previous; Down / Ctrl+N → next.
+    let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+    let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+    if up || down {
+        let Some(switcher) = state.switcher.as_mut() else {
+            return KeyDispatch::Consumed;
+        };
+        if up {
+            switcher.select_prev();
+        } else {
+            switcher.select_next();
+        }
+        return KeyDispatch::SwitcherMoved {
+            selected: switcher.selected,
+        };
+    }
+    // Enter → attach the highlighted session, then close. Empty list → just close.
+    if key.code == KeyCode::Enter {
+        let seq = state.switcher.as_ref().and_then(|s| s.selected_seq());
+        state.switcher = None;
+        return seq.map_or(KeyDispatch::SwitcherClosed, |seq| {
+            // The key loop closes the snapshot switcher *and* sends the synthetic
+            // `/attach`, so signal the attach here; the close rides along.
+            KeyDispatch::AttachSession { seq }
+        });
+    }
+    // Esc → close the switcher (resolve_esc gives CloseSwitcher when open).
+    // Ctrl+G → toggle closed. Both just close.
+    if key.code == KeyCode::Esc || (ctrl && key.code == KeyCode::Char('g')) {
+        state.switcher = None;
+        return KeyDispatch::SwitcherClosed;
+    }
+    // Any other key is swallowed while the overlay has focus.
+    KeyDispatch::Consumed
 }
 
 /// Multi-line text input with history navigation.
@@ -878,6 +993,9 @@ impl TuiState {
             ascii_fallback: false,
             streaming: None,
             sessions_status: String::new(),
+            focus: crate::chat::sessions::FocusTarget::Main,
+            switcher: None,
+            sessions_cache: Vec::new(),
         }
     }
 
@@ -1467,6 +1585,11 @@ pub trait BottomChromeView {
     fn input(&self) -> &TuiInput;
     /// Persistent background-session status line (v1b). Empty hides the row.
     fn sessions_status(&self) -> &str;
+    /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
+    /// target indicator (`main >` vs `agent #N ▸`).
+    fn focus(&self) -> crate::chat::sessions::FocusTarget;
+    /// Open Ctrl+G session switcher overlay (v1.1b), or `None` when closed.
+    fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState>;
 }
 
 impl BottomChromeView for TuiState {
@@ -1497,6 +1620,12 @@ impl BottomChromeView for TuiState {
     fn sessions_status(&self) -> &str {
         &self.sessions_status
     }
+    fn focus(&self) -> crate::chat::sessions::FocusTarget {
+        self.focus
+    }
+    fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
+        self.switcher.as_ref()
+    }
 }
 
 impl BottomChromeView for crate::chat::state::UiSnapshot {
@@ -1526,6 +1655,12 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn sessions_status(&self) -> &str {
         &self.sessions_status
+    }
+    fn focus(&self) -> crate::chat::sessions::FocusTarget {
+        self.focus
+    }
+    fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
+        self.switcher.as_ref()
     }
 }
 
@@ -1558,6 +1693,17 @@ pub const STREAMING_VISIBLE_ROWS: u16 = 6;
 ///
 /// S4-A Commit 2: 泛型化让 UiSnapshot 与 TuiState 共用同一份高度计算逻辑。
 pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
+    // v1.1b: when the Ctrl+G switcher is open it replaces the streaming preview
+    // + input box with a popup list. The popup wants 1 title row + 1 row per
+    // session + 1 footer row, clamped so the whole chrome still fits the budget.
+    if let Some(switcher) = state.switcher() {
+        let list_rows = u16::try_from(switcher.len().max(1)).unwrap_or(1);
+        let total: u16 = 1u16 // status row
+            .saturating_add(1) // switcher title row
+            .saturating_add(list_rows) // one row per session (min 1 for the empty hint)
+            .saturating_add(1); // switcher footer (hint row)
+        return total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT);
+    }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let streaming_rows = if state.streaming().is_some() {
@@ -1624,6 +1770,27 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
         ..frame_area
     };
 
+    // v1.1b: the Ctrl+G switcher overlay replaces the streaming/input chrome
+    // with a status row + popup list while open. It is rendered inside the same
+    // reserved bottom chrome (never an alternate screen), so the user's history
+    // scrollback above is untouched.
+    if let Some(switcher) = state.switcher() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),                                    // Status bar
+                Constraint::Length(area.height.saturating_sub(1).max(1)), // Switcher popup
+            ])
+            .split(area);
+        // Layout::split always returns exactly 2 chunks here.
+        #[allow(clippy::indexing_slicing)]
+        {
+            render_status_bar(frame, chunks[0], state);
+            render_switcher(frame, chunks[1], switcher, state.ascii_fallback());
+        }
+        return;
+    }
+
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let streaming_rows = if state.streaming().is_some() {
@@ -1680,6 +1847,93 @@ fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area:
     };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::Cyan).bg(Color::Black));
     frame.render_widget(widget, area);
+}
+
+/// Render the Ctrl+G session switcher popup (v1.1b) inside the reserved bottom
+/// chrome (never an alternate screen).
+///
+/// Layout: a bordered block titled `Sessions`, one row per session, then a
+/// trailing hint row. The highlighted row is reverse-video + bold (plus a `>`
+/// marker so it reads even without colour). When the list is taller than the
+/// available rows it scrolls to keep the selection visible and shows a
+/// `N more` overflow hint (narrow/short-terminal degrade, plan §0.4).
+fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessions::SwitcherState, ascii: bool) {
+    let marker = if ascii { ">" } else { "\u{25B8}" }; // ▸
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(" Sessions (Ctrl+G) ")
+        .border_style(Style::default().fg(Color::Blue));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    // Reserve the last inner row for the hint/footer; the rest lists sessions.
+    let hint_rows: u16 = 1;
+    let list_height = inner.height.saturating_sub(hint_rows) as usize;
+
+    if switcher.is_empty() {
+        let empty =
+            Paragraph::new(" No background sessions. Esc to close. ").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    // Scroll so the selected row stays visible when the list overflows.
+    let total = switcher.len();
+    let start = if list_height == 0 || total <= list_height {
+        0
+    } else {
+        // Keep the selection roughly centred but clamped to valid bounds.
+        let half = list_height / 2;
+        switcher
+            .selected
+            .saturating_sub(half)
+            .min(total.saturating_sub(list_height))
+    };
+    let end = (start + list_height).min(total);
+
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(list_height.saturating_add(1));
+    #[allow(clippy::indexing_slicing)]
+    for (idx, entry) in switcher.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
+        let abs = start + idx;
+        let selected = abs == switcher.selected;
+        let head = if selected {
+            format!("{marker} ")
+        } else {
+            "  ".to_string()
+        };
+        let body = format!("#{} {} {} {}", entry.seq, entry.kind, entry.status, entry.title);
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Blue)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.is_terminal() {
+            Style::default().fg(Color::DarkGray)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("{head}{body}"), style)));
+    }
+
+    // Hint / overflow row.
+    let hidden = total.saturating_sub(end).saturating_add(start);
+    let hint = if hidden > 0 {
+        format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter attach \u{00B7} Esc close \u{00B7} {hidden} more ")
+    } else {
+        " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter attach \u{00B7} Esc close ".to_string()
+    };
+    let hint = if ascii {
+        hint.replace('\u{2191}', "Up").replace('\u{2193}', "Down")
+    } else {
+        hint
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+
+    let widget = Paragraph::new(Text::from(lines));
+    frame.render_widget(widget, inner);
 }
 
 fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
@@ -2272,20 +2526,49 @@ fn subagent_identity_tag(meta: &SubagentMeta) -> String {
     }
 }
 
+/// Build the prompt's input-target indicator span + its display width (v1.1b).
+///
+/// The target is dual-encoded with **colour AND text/glyph** so it is never
+/// colour-only (colour-blind / no-color terminals still read the target):
+/// - [`FocusTarget::Main`] → dim cyan `> ` (unchanged from the original prompt).
+/// - [`FocusTarget::Session`] → blue bold `agent #N ▸ ` (or `agent #N > ` under
+///   ASCII fallback). The literal "agent #N" text carries the meaning even with
+///   styling stripped.
+///
+/// Returns the [`Span`] plus its column width so the continuation rows and the
+/// terminal cursor can align under the typed text.
+fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (Span<'static>, usize) {
+    match focus {
+        crate::chat::sessions::FocusTarget::Main => {
+            // Calmer dim cyan `> ` (matches the long-standing Claude Code prompt).
+            let span = Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM));
+            (span, 2)
+        }
+        crate::chat::sessions::FocusTarget::Session { seq } => {
+            let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
+            let label = format!("agent #{seq} {arrow} ");
+            let width = label.chars().count();
+            let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
+            (span, width)
+        }
+    }
+}
+
 fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    // Compose prompt lines: first row gets "> ", continuation rows get "  ".
+    // Compose prompt lines: the first row gets the input-target indicator
+    // (v1.1b), continuation rows are aligned with blanks of the same width.
     let input_ref = state.input();
+    let (prompt_span, prompt_width) = prompt_indicator(state.focus(), state.ascii_fallback());
+    let continuation = " ".repeat(prompt_width);
     let rendered_lines: Vec<Line<'_>> = input_ref
         .lines
         .iter()
         .enumerate()
         .map(|(idx, content)| {
             let prefix = if idx == 0 {
-                // Claude Code uses a dim cyan `> ` prompt (no bold) — calmer
-                // than the previous bright bold cyan.
-                Span::styled("> ", Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))
+                prompt_span.clone()
             } else {
-                Span::raw("  ")
+                Span::raw(continuation.clone())
             };
             Line::from(vec![prefix, Span::raw(content.as_str())])
         })
@@ -2308,7 +2591,8 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
 
     // Place the terminal cursor at the visual cursor location inside the box.
     // Borders::TOP consumes the first row of `area`, so the body starts at
-    // `area.y + 1` and the prompt prefix takes the first 2 columns.
+    // `area.y + 1` and the prompt prefix takes `prompt_width` columns (the
+    // input-target indicator width, which varies between `main` and `agent #N`).
     let (cursor_line, cursor_offset) = input_ref.cursor;
     let max_visible_rows = area.height.saturating_sub(1) as usize;
     if cursor_line < input_ref.lines.len() && cursor_line < max_visible_rows {
@@ -2322,7 +2606,7 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
             .get(..cursor_offset.min(row_text.len()))
             .map_or(0, UnicodeWidthStr::width);
         let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
-        let prefix_cols: u16 = 2;
+        let prefix_cols: u16 = u16::try_from(prompt_width).unwrap_or(2);
         let row_offset = u16::try_from(cursor_line).unwrap_or(u16::MAX);
         let cx = area.x.saturating_add(prefix_cols).saturating_add(col_offset);
         let cy = area.y.saturating_add(1).saturating_add(row_offset);
@@ -2337,7 +2621,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
     let footer = Paragraph::new(
-        " ! for bash \u{00B7} / for commands \u{00B7} Tab to fold \u{00B7} Ctrl+R to expand \u{00B7} Esc to cancel ",
+        " ! for bash \u{00B7} / for commands \u{00B7} Ctrl+G sessions \u{00B7} Tab to fold \u{00B7} Esc to cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -3983,6 +4267,136 @@ mod tests {
         let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
         assert_eq!(out, KeyDispatch::Cancelled);
         assert!(state.input.is_empty(), "Esc clears the in-flight draft");
+    }
+
+    // ── v1.1b: switcher + Esc-detach + focus indicator ───────────────────────
+
+    fn entry(seq: u64) -> crate::chat::sessions::SwitcherEntry {
+        crate::chat::sessions::SwitcherEntry {
+            seq,
+            kind: "agent",
+            status: "running",
+            title: format!("task {seq}"),
+        }
+    }
+
+    #[test]
+    fn p0_8_esc_empty_main_cancels() {
+        // Empty input + main focus → unchanged legacy cancel semantics.
+        let mut state = TuiState::new("p", "m");
+        assert!(state.input.is_empty());
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::Cancelled);
+    }
+
+    #[test]
+    fn p0_8_esc_nonempty_clears_input_even_when_attached() {
+        // Muscle memory preserved: non-empty input clears first, never detaches.
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
+        for ch in "hi".chars() {
+            dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+        }
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::Cancelled);
+        assert!(state.input.is_empty(), "non-empty Esc clears, does not detach");
+    }
+
+    #[test]
+    fn p0_8_esc_empty_attached_requests_detach() {
+        // Empty input + session focus → detach.
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 3 };
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::RequestDetach);
+    }
+
+    #[test]
+    fn ctrl_g_opens_switcher_over_cache() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2)];
+        let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        match out {
+            KeyDispatch::SwitcherOpened { entries } => assert_eq!(entries.len(), 2),
+            other => panic!("expected SwitcherOpened, got {other:?}"),
+        }
+        assert!(state.switcher.is_some(), "switcher opened in mirror");
+    }
+
+    #[test]
+    fn switcher_navigation_and_enter_attaches_selected() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        // Down twice → select #3.
+        let m1 = dispatch_global_key(key(KeyCode::Down), &mut state);
+        assert_eq!(m1, KeyDispatch::SwitcherMoved { selected: 1 });
+        dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state);
+        // Enter attaches the highlighted session and closes the switcher.
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(out, KeyDispatch::AttachSession { seq: 3 });
+        assert!(state.switcher.is_none(), "switcher closed after attach");
+    }
+
+    #[test]
+    fn switcher_esc_closes_without_attaching() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::SwitcherClosed);
+        assert!(state.switcher.is_none());
+    }
+
+    #[test]
+    fn switcher_ctrl_g_toggles_closed() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        assert!(state.switcher.is_some());
+        let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::SwitcherClosed);
+        assert!(state.switcher.is_none(), "second Ctrl+G toggles closed");
+    }
+
+    #[test]
+    fn switcher_empty_enter_just_closes() {
+        let mut state = TuiState::new("p", "m");
+        // No cached sessions.
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::SwitcherClosed,
+            "empty switcher Enter closes, no attach"
+        );
+        assert!(state.switcher.is_none());
+    }
+
+    #[test]
+    fn switcher_open_swallows_plain_keys() {
+        // While the overlay has focus, plain typing must not leak into the input.
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        let out = dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_empty(), "switcher swallowed the keystroke");
+    }
+
+    #[test]
+    fn prompt_indicator_main_vs_session() {
+        let (main_span, main_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Main, false);
+        assert_eq!(main_span.content.as_ref(), "> ");
+        assert_eq!(main_w, 2);
+        let (sess_span, sess_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, false);
+        assert!(sess_span.content.contains("agent #4"), "carries the target as text");
+        assert!(sess_span.content.contains('\u{25B8}'), "uses the ▸ glyph");
+        assert_eq!(sess_w, sess_span.content.chars().count());
+        // ASCII fallback drops the unicode glyph but keeps the text target.
+        let (ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, true);
+        assert!(ascii_span.content.contains("agent #4"));
+        assert!(!ascii_span.content.contains('\u{25B8}'), "ascii fallback omits ▸");
     }
 
     #[test]

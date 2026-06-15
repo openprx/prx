@@ -495,6 +495,13 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::Cancelled => "Cancelled",
         tui::KeyDispatch::Consumed => "Consumed",
         tui::KeyDispatch::Ignored => "Ignored",
+        // v1.1b switcher/focus control flow — treated as consumed-equivalent for
+        // the legacy redux-diff comparison (they neither submit nor quit).
+        tui::KeyDispatch::SwitcherOpened { .. } => "SwitcherOpened",
+        tui::KeyDispatch::SwitcherMoved { .. } => "SwitcherMoved",
+        tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
+        tui::KeyDispatch::AttachSession { .. } => "AttachSession",
+        tui::KeyDispatch::RequestDetach => "RequestDetach",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -532,7 +539,12 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::InterruptTurn
         | tui::KeyDispatch::Cancelled
         | tui::KeyDispatch::Consumed
-        | tui::KeyDispatch::Ignored => new_has_quit,
+        | tui::KeyDispatch::Ignored
+        | tui::KeyDispatch::SwitcherOpened { .. }
+        | tui::KeyDispatch::SwitcherMoved { .. }
+        | tui::KeyDispatch::SwitcherClosed
+        | tui::KeyDispatch::AttachSession { .. }
+        | tui::KeyDispatch::RequestDetach => new_has_quit,
     };
 
     if is_diff {
@@ -1737,6 +1749,14 @@ pub async fn run(
                 }
                 // 2) Persistent status line: recompute and dispatch only on change.
                 let views = chat_sessions.snapshot().await;
+                // v1.1b: refresh the switcher cache the key thread reads on Ctrl+G
+                // (it cannot run async registry queries itself). Display staleness
+                // is harmless: switcher Enter re-resolves the seq via /attach.
+                #[cfg(feature = "terminal-tui")]
+                {
+                    let entries = crate::chat::sessions::focus::switcher_entries(&views);
+                    chat_mirror.lock().sessions_cache = entries;
+                }
                 let new_summary = crate::chat::sessions::status_summary(&views);
                 if new_summary != last_sessions_summary {
                     last_sessions_summary = new_summary.clone();
@@ -2484,8 +2504,25 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         }
                                     }
                                     attached_follow = Some(sid);
+                                    // v1.1b: route plain input to this session as
+                                    // a steer and reflect the target in the prompt
+                                    // (colour+glyph). Update both the render
+                                    // snapshot (Action) and the key thread's
+                                    // mirror (read by `resolve_esc`).
+                                    let focus = crate::chat::sessions::FocusTarget::Session { seq };
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::SessionFocusChanged { focus },
+                                        "chat.session_focus_attach",
+                                    );
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        chat_mirror.lock().focus = focus;
+                                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                            let _ = tx.try_send(());
+                                        }
+                                    }
                                     emit_chat_output(&format!(
-                                        "Following session #{seq} (live, read-only). Type /detach to stop."
+                                        "Following session #{seq} (live, routing input as steer). Type /detach or press Esc to stop."
                                     ));
                                 }
                                 Err(e) => emit_chat_output(&format!("Attach failed: {e}")),
@@ -2494,7 +2531,21 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         }
                         SessionCommand::Detach => {
                             if attached_follow.take().is_some() {
-                                emit_chat_output("Detached. No longer following a background session.");
+                                // v1.1b: reset input routing back to main and clear
+                                // the prompt target indicator (snapshot + mirror).
+                                let focus = crate::chat::sessions::FocusTarget::Main;
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::SessionFocusChanged { focus },
+                                    "chat.session_focus_detach",
+                                );
+                                #[cfg(feature = "terminal-tui")]
+                                {
+                                    chat_mirror.lock().focus = focus;
+                                    if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                        let _ = tx.try_send(());
+                                    }
+                                }
+                                emit_chat_output("Detached. Input routes to main chat again.");
                             } else {
                                 emit_chat_output("Not currently following any session.");
                             }
@@ -2507,7 +2558,70 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         }
                     }
                 }
-                commands::CommandResult::NotACommand => {}
+                commands::CommandResult::NotACommand => {
+                    // v1.1b input routing (head footgun: input-target ambiguity).
+                    // When a background session is attached, plain text + Enter is
+                    // routed as a *steer* to that session instead of starting a
+                    // main-chat turn. The prompt's colour+glyph indicator already
+                    // shows the target, and `/detach` (or Esc) returns to main.
+                    // We never auto-switch focus — only an explicit /attach or the
+                    // switcher changes the routing target.
+                    if let Some(sid) = attached_follow.clone() {
+                        let run_id = sid.as_str().to_string();
+                        match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                            Some(tool) => {
+                                // Same Low-risk steer path as `/steer`: delegate to
+                                // the sessions_spawn tool with the matching grant so
+                                // the shared side-effect gate + running-status check
+                                // + steer_tx delivery all apply uniformly.
+                                let operation_name = format!("sessions_spawn:steer:{run_id}");
+                                let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                    "sessions_spawn",
+                                    &operation_name,
+                                    "chat-operator",
+                                    None,
+                                );
+                                let mut args = serde_json::json!({
+                                    "action": "steer",
+                                    "run_id": run_id,
+                                    "message": user_input,
+                                });
+                                match serde_json::to_value(&grant) {
+                                    Ok(grant_value) => {
+                                        if let Some(obj) = args.as_object_mut() {
+                                            obj.insert(
+                                                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                grant_value,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to serialize steer approval grant; proceeding without it"
+                                        );
+                                    }
+                                }
+                                match tool.execute_named("sessions_spawn", args).await {
+                                    Ok(result) => {
+                                        let out = if result.output.is_empty() {
+                                            result
+                                                .error
+                                                .filter(|e| !e.is_empty())
+                                                .unwrap_or_else(|| "(steered)".to_string())
+                                        } else {
+                                            result.output
+                                        };
+                                        emit_chat_output(&out);
+                                    }
+                                    Err(e) => emit_chat_output(&format!("Steer failed: {e}")),
+                                }
+                            }
+                            None => emit_chat_output("Background sessions are not available in this session."),
+                        }
+                        continue;
+                    }
+                }
             }
         }
 
@@ -3864,6 +3978,35 @@ fn spawn_tui_unified_loop(
     });
 }
 
+/// Send a synthetic slash command from the TUI key thread to the async main
+/// loop, reusing the same `input_tx` channel as real user submissions (v1.1b).
+///
+/// Used for switcher Enter (`/attach <seq>`) and Esc-detach (`/detach`) so the
+/// attach/detach logic stays in the single async owner (`attached_follow` lives
+/// in the main loop) rather than being duplicated in the synchronous key thread.
+/// Returns `Err(())` if the receiver has been dropped (chat tearing down).
+#[cfg(feature = "terminal-tui")]
+fn send_synthetic_command(
+    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    command: &str,
+) -> Result<(), ()> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let msg = crate::channels::traits::ChannelMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        sender: "user".to_string(),
+        reply_target: "user".to_string(),
+        content: command.to_string(),
+        channel: "terminal".to_string(),
+        timestamp,
+        thread_ts: None,
+        mentioned_uuids: vec![],
+    };
+    input_tx.blocking_send(msg).map_err(|_| ())
+}
+
 /// Inner body of [`spawn_tui_unified_loop`].
 ///
 /// **P3-inline architecture.** ratatui owns only a fixed-height inline
@@ -4150,6 +4293,46 @@ fn run_tui_unified_loop(
                             crate::chat::action::Action::CancelRequested,
                             "chat.cancel_tui_single_ctrlc",
                         );
+                    }
+                    tui::KeyDispatch::SwitcherOpened { entries } => {
+                        // v1.1b: mirror the just-opened switcher into the render
+                        // snapshot (the mirror was already mutated in place).
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherOpened { entries },
+                            "chat.switcher_opened",
+                        );
+                    }
+                    tui::KeyDispatch::SwitcherMoved { selected } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherMoved { selected },
+                            "chat.switcher_moved",
+                        );
+                    }
+                    tui::KeyDispatch::SwitcherClosed => {
+                        let _ = chat_dispatcher
+                            .dispatch_or_log(crate::chat::action::Action::SwitcherClosed, "chat.switcher_closed");
+                    }
+                    tui::KeyDispatch::AttachSession { seq } => {
+                        // Close the switcher in the snapshot, then route a
+                        // synthetic `/attach <seq>` through the same input channel
+                        // user submissions use, so the async main loop performs
+                        // the attach via its existing handler (single owner of
+                        // `attached_follow`; no async work in the key thread).
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherClosed,
+                            "chat.switcher_closed_attach",
+                        );
+                        if send_synthetic_command(&input_tx, &format!("/attach {seq}")).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    tui::KeyDispatch::RequestDetach => {
+                        // Esc on empty input while a session is focused → route a
+                        // synthetic `/detach` so the main loop clears
+                        // `attached_follow` + focus via its existing handler.
+                        if send_synthetic_command(&input_tx, "/detach").is_err() {
+                            return Ok(());
+                        }
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }
