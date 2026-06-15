@@ -277,7 +277,7 @@ impl ChatSessionsHandle {
         let shell = self
             .shell_for_seq(seq)
             .ok_or_else(|| anyhow!("no shell session #{seq}"))?;
-        shell.kill()
+        shell.kill().await
     }
 
     /// Resolve a display sequence `#N` to the underlying run UUID, refreshing the
@@ -529,7 +529,7 @@ mod tests {
         assert!(lines.is_empty());
         // is_terminal_for_seq works for shells too.
         assert!(!handle.is_terminal_for_seq(seq).await.expect("test: shell not terminal"));
-        shell.kill().expect("test: cleanup kill");
+        shell.kill().await.expect("test: cleanup kill");
     }
 
     #[tokio::test]

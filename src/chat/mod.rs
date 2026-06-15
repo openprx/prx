@@ -3796,15 +3796,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
     }
 
     // ── Background shell cleanup (v2) ─────────────────────────────
-    // On chat exit, terminate every background shell's whole process group so no
-    // child (e.g. a `sleep` forked by `sh -c`) is left orphaned. `kill()` is
-    // idempotent and only signals still-running groups (already-exited groups
-    // return ESRCH, treated as success).
+    // On chat exit, terminate every **still-running** background shell's whole
+    // process group so no child (e.g. a `sleep` forked by `sh -c`) is left
+    // orphaned. We skip already-terminal shells (v2 review fix 1④): their pgid
+    // may have been recycled by the OS, so signalling them could mis-kill an
+    // unrelated process group. `kill()` is async (graceful SIGTERM → SIGKILL) and
+    // idempotent.
     {
         let shells = chat_sessions.shell_registry();
         let to_kill: Vec<_> = shells.lock().clone();
         for shell in &to_kill {
-            if let Err(e) = shell.kill() {
+            if shell.is_terminal() {
+                continue;
+            }
+            if let Err(e) = shell.kill().await {
                 tracing::warn!(error = %e, "Failed to terminate background shell process group on exit");
             }
         }
