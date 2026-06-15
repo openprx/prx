@@ -99,7 +99,30 @@ pub struct AppContext {
     /// Tool registry, shared as `Arc<Vec<Box<dyn Tool>>>` (matches chat's
     /// `tools_registry`). `None` for `Minimal`/`MemoryOnly` — e.g. chat
     /// `--list-sessions` early-exits before tools are needed (F4).
+    ///
+    /// Also `None` for `Interactive` (chat): chat needs an *owned* `Vec` it can
+    /// append the chat-side sessions tools to (built after provider + channel),
+    /// so the `Interactive` profile delivers the base registry through
+    /// `base_tools` instead. The "security & memory precede tools" ordering
+    /// invariant is preserved either way (see `golden_trace_*` tests).
     pub tools: Option<Arc<Vec<Box<dyn Tool>>>>,
+    /// Owned base tool registry for the `Interactive` (chat) profile only.
+    ///
+    /// `Box<dyn Tool>` is not `Clone`, so a shared `Arc<Vec<…>>` cannot be
+    /// unpacked back into an owned `Vec` without sole ownership. chat needs to
+    /// append the four chat-side sessions tools (`sessions_spawn`/`sessions_list`
+    /// /`session_status`/`sessions_send`) *after* the provider and
+    /// `TerminalChannel` exist, then wrap the result in `Arc` itself. To avoid a
+    /// from-`Arc` move, the `Interactive` profile hands chat an owned `Vec` here
+    /// and leaves `tools` as `None`.
+    ///
+    /// `AppContext` is shared as `Arc<AppContext>`, so the owned `Vec` lives
+    /// behind a `parking_lot::Mutex<Option<…>>` to allow a one-shot
+    /// `lock().take()` through the shared reference. chat takes it exactly once
+    /// before entering the main loop (a pure sync `take`, never held across an
+    /// `.await`). `None` for every other profile (they use the shared `tools`
+    /// `Arc`); after chat's `take`, the inner `Option` is `None` (no dead state).
+    pub base_tools: Option<parking_lot::Mutex<Option<Vec<Box<dyn Tool>>>>>,
     /// Heuristic LLM router. Only built for profiles that need it and only when
     /// the `llm-router` feature is enabled; always constructed after memory
     /// (`agent/agent.rs:446` invariant).
@@ -327,7 +350,14 @@ impl RuntimeBootstrap {
 
         // 6. tools — last; depends on security + runtime + memory all being ready
         //    (all_tools_with_runtime inputs, survey §2 constraint 1).
-        let tools: Option<Arc<Vec<Box<dyn Tool>>>> = if profile.needs_tools() {
+        //
+        // The `Interactive` (chat) profile receives the registry as an *owned*
+        // `Vec` in `base_tools` (so chat can append its sessions tools after the
+        // provider/channel exist) and leaves `tools` as `None`; every other
+        // tools-bearing profile keeps the shared `Arc` in `tools`.
+        let mut tools: Option<Arc<Vec<Box<dyn Tool>>>> = None;
+        let mut base_tools: Option<parking_lot::Mutex<Option<Vec<Box<dyn Tool>>>>> = None;
+        if profile.needs_tools() {
             // runtime is always Some when needs_tools() is true (built in step 4).
             let rt = runtime.ok_or_else(|| anyhow::anyhow!("runtime must be set before building tools"))?;
             let mem = memory
@@ -356,10 +386,12 @@ impl RuntimeBootstrap {
                 config.api_key.as_deref(),
                 &config,
             );
-            Some(Arc::new(registry))
-        } else {
-            None
-        };
+            if matches!(profile, BootstrapProfile::Interactive) {
+                base_tools = Some(parking_lot::Mutex::new(Some(registry)));
+            } else {
+                tools = Some(Arc::new(registry));
+            }
+        }
 
         Ok(Arc::new(AppContext {
             config,
@@ -368,6 +400,7 @@ impl RuntimeBootstrap {
             workspace_dir,
             memory,
             tools,
+            base_tools,
             #[cfg(feature = "llm-router")]
             router,
             #[cfg(feature = "llm-router")]
@@ -435,11 +468,21 @@ mod tests {
             .expect("test: interactive build");
 
         assert!(ctx.memory.is_some(), "Interactive must build memory");
-        assert!(ctx.tools.is_some(), "Interactive must build tools");
+        // Interactive delivers the base registry as an owned `Vec` in
+        // `base_tools` (so chat can append its sessions tools), leaving `tools`
+        // as `None`.
         assert!(
-            !ctx.tools.as_ref().expect("test: tools present").is_empty(),
-            "tool registry should be non-empty"
+            ctx.tools.is_none(),
+            "Interactive delivers tools via base_tools, not tools"
         );
+        let base = ctx
+            .base_tools
+            .as_ref()
+            .expect("test: Interactive must build base_tools");
+        let taken = base.lock().take().expect("test: base_tools present once");
+        assert!(!taken.is_empty(), "tool registry should be non-empty");
+        // The owned Vec is a one-shot take; the inner Option is now None.
+        assert!(base.lock().is_none(), "base_tools take is one-shot");
         // Interactive does not enable the router.
         #[cfg(feature = "llm-router")]
         assert!(ctx.router.is_none(), "Interactive must not build router");
@@ -607,10 +650,14 @@ mod tests {
 
             // tools present => its hard predecessors (security, memory) were ready
             // first; this is the ordering constraint, observed at the output.
-            assert!(
-                ctx.tools.is_some(),
-                "{profile:?}: tools-bearing profile must build tools"
-            );
+            // Interactive delivers the registry via `base_tools` (owned Vec for
+            // chat to extend); every other tools-bearing profile via `tools`.
+            let tools_built = if matches!(profile, BootstrapProfile::Interactive) {
+                ctx.base_tools.is_some()
+            } else {
+                ctx.tools.is_some()
+            };
+            assert!(tools_built, "{profile:?}: tools-bearing profile must build tools");
             assert!(
                 ctx.memory.is_some(),
                 "{profile:?}: memory must be ready before tools (ordering invariant)"

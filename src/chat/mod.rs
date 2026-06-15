@@ -57,6 +57,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod sanitize;
 pub mod session;
+pub mod sessions;
 pub mod state;
 pub mod terminal_proto;
 
@@ -1003,13 +1004,19 @@ pub async fn run(
     }
 
     // ── Tools ────────────────────────────────────────────────────
-    // The Interactive profile built the tool registry inside the bootstrap
-    // (security + runtime + memory all ready); take it explicitly. The bootstrap
-    // uses the identical `all_tools_with_runtime` call with the same arguments.
-    let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
-        .tools
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for chat"))?;
+    // The Interactive profile built the base tool registry inside the bootstrap
+    // (security + runtime + memory all ready) and handed it to chat as an *owned*
+    // `Vec` in `base_tools` (so chat can append its session tools after the
+    // provider + TerminalChannel exist). Take it exactly once; we wrap it in
+    // `Arc` ourselves once the chat session tools are appended (see "Chat session
+    // runtime" below).
+    let mut base_tools_vec: Vec<Box<dyn Tool>> = ctx
+        .base_tools
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for chat"))?
+        .lock()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("chat base tool registry was already taken"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -1081,6 +1088,74 @@ pub async fn run(
 
     // ── Create TerminalChannel (Arc-wrapped for sharing with streaming tasks) ──
     let terminal: Arc<TerminalChannel> = Arc::new(TerminalChannel::new(plain_mode));
+
+    // ── Chat session runtime (v1a registry wiring) ──────────────────
+    // The single source of truth for the chat background-session runtime: one
+    // `active_runs` registry, owned here, shared by reference (Arc clones) with
+    // the four session tools (sessions_spawn/list/status/send) and the chat-side
+    // `ChatSessionsHandle` used by `/sessions` and `/kill`. This is the v1a
+    // "step 0" foundation (see chat-background-runtime-v1-execution-plan.md §C.0).
+    //
+    // Built here — after provider + TerminalChannel exist — because
+    // `SessionsSpawnTool::new_with_registry` requires both; the generic tool
+    // factory (`all_tools_with_runtime`) runs in bootstrap before either is
+    // available, so chat appends these tools to its owned base registry instead.
+    let active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>> =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let sessions_workspace_id = config.workspace_dir.to_string_lossy().to_string();
+    let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
+        Arc::clone(&terminal) as Arc<dyn Channel>,
+        Arc::clone(&provider),
+        provider_name,
+        model_name,
+        temperature,
+        security.clone(),
+        config.workspace_dir.clone(),
+        config.multimodal.clone(),
+        config.agent.compaction.clone(),
+        config.agents.clone(),
+        config.api_key.clone(),
+        provider_runtime_options.clone(),
+        config.sessions_spawn.clone(),
+        Arc::clone(&active_runs),
+    )
+    .with_shared_memory(Arc::clone(&mem))
+    .with_event_recording(config.memory.event_recording_config());
+    let spawn_tools_handle = spawn_tool.tools_handle();
+
+    // Sibling tools share the same single-source registry (only the v1a four;
+    // `subagents`/`sessions_history` are intentionally not registered in chat —
+    // see plan §C.0 blocker 4).
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
+            .with_shared_memory(Arc::clone(&mem), sessions_workspace_id.clone()),
+    ));
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), security.clone())
+            .with_shared_memory(Arc::clone(&mem))
+            .with_event_recording(config.memory.event_recording_config()),
+    ));
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionStatusTool::new(
+            Arc::clone(&active_runs),
+            provider_name,
+            model_name,
+            vec![terminal.name().to_string()],
+        )
+        .with_shared_memory(Arc::clone(&mem), sessions_workspace_id),
+    ));
+    base_tools_vec.push(Box::new(spawn_tool));
+
+    // Wrap the now-complete registry in `Arc`, then inject it back into
+    // sessions_spawn's tools OnceLock so spawned sub-agents can use the full tool
+    // set (resolves the spawn-tool-needs-the-tool-table chicken-and-egg; mirrors
+    // the channels path).
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(base_tools_vec);
+    spawn_tools_handle.set(Arc::clone(&tools_registry)).ok();
+
+    // Chat-side handle over the same single-source registry for `/sessions` and
+    // `/kill` (side-channel — same Arc, no type erasure / downcast).
+    let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(Arc::clone(&active_runs));
 
     // ── Session: resume or create new ───────────────────────────
     let mut chat_session = match session_id.as_deref() {
@@ -1944,6 +2019,77 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     };
                     emit_chat_output(msg);
                     continue;
+                }
+                commands::CommandResult::SessionAction(action) => {
+                    use crate::chat::sessions::SessionCommand;
+                    match action {
+                        SessionCommand::Bg { task } => {
+                            // Spawn a background agent via sessions_spawn, passing
+                            // the *current* provider/model (read from the main-loop
+                            // strings, which `/provider` and `/model` keep in sync)
+                            // so a hot switch is honoured (plan §C.0 blocker 3).
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    let args = serde_json::json!({
+                                        "task": task,
+                                        "provider": current_provider_owned,
+                                        "model": current_model_owned,
+                                    });
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Failed to start background agent: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Sessions => {
+                            let views = chat_sessions.snapshot().await;
+                            if views.is_empty() {
+                                emit_chat_output("No background sessions.");
+                            } else {
+                                let mut out = String::from("Background sessions:\n");
+                                for v in &views {
+                                    out.push_str(&format!(
+                                        "  #{} {} {} {}\n",
+                                        v.seq,
+                                        v.kind.as_str(),
+                                        v.status.as_str(),
+                                        v.title
+                                    ));
+                                }
+                                emit_chat_output(out.trim_end());
+                            }
+                            continue;
+                        }
+                        SessionCommand::Kill { seq } => {
+                            match chat_sessions.kill(seq).await {
+                                Ok(()) => emit_chat_output(&format!("Killed session #{seq} (cancelled).")),
+                                Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                            }
+                            continue;
+                        }
+                        // v1b/v2 surface: parsed but not yet executable in v1a.
+                        SessionCommand::Steer { .. }
+                        | SessionCommand::Attach { .. }
+                        | SessionCommand::Detach
+                        | SessionCommand::Shell { .. }
+                        | SessionCommand::Logs { .. } => {
+                            emit_chat_output("That session command is not available yet (v1a).");
+                            continue;
+                        }
+                    }
                 }
                 commands::CommandResult::NotACommand => {}
             }

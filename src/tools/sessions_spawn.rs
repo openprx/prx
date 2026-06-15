@@ -307,6 +307,12 @@ pub struct SessionsSpawnTool {
 
 impl SessionsSpawnTool {
     /// Create a new `SessionsSpawnTool` with the given channel and provider.
+    ///
+    /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
+    /// `active_runs` registry owned solely by this tool. Behaviour is identical to
+    /// the previous inline construction (channels/gateway call sites are
+    /// unaffected).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
         provider: Arc<dyn Provider>,
@@ -322,6 +328,49 @@ impl SessionsSpawnTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
         spawn_config: SessionsSpawnConfig,
     ) -> Self {
+        Self::new_with_registry(
+            channel,
+            provider,
+            provider_name,
+            model,
+            temperature,
+            security,
+            workspace_dir,
+            multimodal_config,
+            compaction_config,
+            agents,
+            fallback_api_key,
+            provider_runtime_options,
+            spawn_config,
+            Arc::new(RwLock::new(Vec::new())),
+        )
+    }
+
+    /// Create a new `SessionsSpawnTool` backed by a caller-provided `active_runs`
+    /// registry.
+    ///
+    /// Identical to [`Self::new`] except the `active_runs` registry is injected
+    /// rather than freshly minted, letting a single owner (e.g. chat) build one
+    /// `Arc<RwLock<Vec<SubAgentRun>>>` and share it across `sessions_spawn`,
+    /// `sessions_list`, `sessions_send`, `session_status`, and a side-channel
+    /// handle — the single-source-of-truth registry for the chat session runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_registry(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn Provider>,
+        provider_name: impl Into<String>,
+        model: impl Into<String>,
+        temperature: f64,
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        multimodal_config: MultimodalConfig,
+        compaction_config: AgentCompactionConfig,
+        agents: HashMap<String, DelegateAgentConfig>,
+        fallback_api_key: Option<String>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+        spawn_config: SessionsSpawnConfig,
+        active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    ) -> Self {
         Self {
             channel,
             provider,
@@ -330,7 +379,7 @@ impl SessionsSpawnTool {
             temperature,
             security,
             default_recipient: Arc::new(RwLock::new(None)),
-            active_runs: Arc::new(RwLock::new(Vec::new())),
+            active_runs,
             tools: Arc::new(OnceLock::new()),
             workspace_dir,
             multimodal_config,

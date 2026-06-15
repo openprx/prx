@@ -41,6 +41,11 @@ pub enum CommandResult {
     /// stays out of this module's `CommandContext` (which only carries
     /// immutable borrows).
     SetMode(ChatMode),
+    /// /bg, /sessions, /kill (and later session commands) — `dispatch` only
+    /// parses these; the chat main loop executes them because it owns the
+    /// mutable session runtime state (registry handle + provider/model strings),
+    /// which the immutable [`CommandContext`] cannot touch.
+    SessionAction(super::sessions::SessionCommand),
 }
 
 /// Context passed to command handlers (borrows from the main loop).
@@ -148,6 +153,16 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/theme" => CommandResult::HandledWithOutput(
             "Available themes: dark (default), light, monokai\nSet via: PRX_CHAT_THEME=monokai prx chat".to_string(),
         ),
+        // Session runtime commands (/bg, /sessions, /kill, …). MUST come before
+        // the generic unknown-slash fallback so they are not swallowed as
+        // "unknown command". Parsing only here; execution happens in the chat
+        // main loop (it owns the mutable session runtime state).
+        _ if super::sessions::parse_session_command(input).is_some() => {
+            // The guard already confirmed `Some`; on the (unreachable) `None`
+            // path fall through safely rather than panic.
+            super::sessions::parse_session_command(input)
+                .map_or(CommandResult::NotACommand, CommandResult::SessionAction)
+        }
         _ if input.starts_with('/') => {
             CommandResult::HandledWithOutput(format!("Unknown command: {input}. Type /help for available commands."))
         }
