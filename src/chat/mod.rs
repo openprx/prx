@@ -5699,9 +5699,12 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     println!("Saved sessions:\n");
     for s in &sessions {
         let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
+        // B2 (v4 review): print the FULL session id. The previous 8-char
+        // truncation could not be passed back to `--session`, which requires
+        // the complete UUID — copy/pasting a listed id now resumes correctly.
         println!(
             "  {} | {} | {} turns | {}",
-            &s.id[..8.min(s.id.len())],
+            s.id,
             title,
             s.turn_count(),
             s.updated_at.format("%Y-%m-%d %H:%M")

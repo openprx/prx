@@ -1681,12 +1681,30 @@ impl ChatState {
     }
 
     /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
-    /// summary into `session.background_sessions` so the next `SaveSession`
-    /// snapshot persists it (and reload can display it). Dedup is by session id:
-    /// a later record for the same id replaces the earlier one (e.g. an
-    /// `interrupted` entry written at exit overwrites nothing, or a terminal
-    /// summary supersedes a placeholder). This records **summary only** — it
+    /// summary into `session.background_sessions` and **immediately emit
+    /// `Effect::SaveSession`** so the summary is durably persisted to the memory
+    /// backend (the only write path; `dispatcher.rs` `Effect::SaveSession`).
+    ///
+    /// Why emit SaveSession here (P0, v4 review): under `terminal-tui` (now the
+    /// default) the legacy exit-save path is disabled (`mod.rs`
+    /// `legacy_exit_save_enabled=false`), and no other action snapshots after a
+    /// background session reaches a terminal state. Without this effect the
+    /// summary lived only in memory and was lost on exit → reload recap broke.
+    /// Emitting SaveSession **after** the upsert guarantees the snapshot
+    /// (`build_session_snapshot`, which clones `self.session.background_sessions`)
+    /// already contains this record, eliminating the prior race where a snapshot
+    /// taken before the action could miss it.
+    ///
+    /// Dedup is by session id: a later record for the same id replaces the
+    /// earlier one (e.g. an `interrupted` entry written at exit, or a terminal
+    /// summary superseding a placeholder). This records **summary only** — it
     /// never spawns or revives a process / sub-agent / PTY.
+    ///
+    /// No save storm: a background session reaching a terminal state is a
+    /// low-frequency event, and an unchanged re-record short-circuits to
+    /// `Vec::new()` before emitting any effect. `Effect::SaveSession` is a pure
+    /// persistence sink (it never dispatches a new action), so there is no
+    /// SaveSession → BackgroundSessionRecorded feedback loop.
     fn reduce_background_session_recorded(
         &mut self,
         summary: crate::chat::sessions::PersistedSessionSummary,
@@ -1699,7 +1717,8 @@ impl ChatState {
         } else {
             self.session.background_sessions.push(summary);
         }
-        Vec::new()
+        // Persist the updated snapshot now (state already mutated above).
+        vec![Effect::SaveSession(self.build_session_snapshot())]
     }
 
     /// `Action::SessionFocusChanged` (v1.1b) — record the current input-routing
@@ -3294,34 +3313,98 @@ mod tests {
         }
 
         /// v4: BackgroundSessionRecorded upserts into session.background_sessions
-        /// (dedup by id) without marking the UI dirty.
+        /// (dedup by id) and emits SaveSession so the summary is persisted.
         #[test]
         fn test_redux_background_session_recorded_upserts() {
             let mut state = s();
             let e1 = state.reduce(Action::BackgroundSessionRecorded {
                 summary: bg_summary("run-1", "running"),
             });
+            // P0 (v4 review): a record that changed state must emit SaveSession
+            // (the only durable write path). It must NOT redraw — a background
+            // summary write is invisible to the live conversation surface.
+            assert_eq!(e1.len(), 1, "exactly one effect: SaveSession");
             assert!(
-                e1.is_empty(),
-                "background record is a pure persistence write, no effects"
+                matches!(e1.first(), Some(Effect::SaveSession(_))),
+                "changed record must emit SaveSession, got {e1:?}"
             );
             assert_eq!(state.session.background_sessions.len(), 1);
 
-            // Same id again with a terminal status replaces, does not duplicate.
-            let _ = state.reduce(Action::BackgroundSessionRecorded {
-                summary: bg_summary("run-1", "completed"),
+            // Same id again with a terminal status replaces, does not duplicate,
+            // and still emits a fresh SaveSession (state changed). Reuse the same
+            // value for the no-op check below (bg_summary stamps a fresh
+            // created_at per call, which would otherwise count as a change).
+            let completed = bg_summary("run-1", "completed");
+            let e2 = state.reduce(Action::BackgroundSessionRecorded {
+                summary: completed.clone(),
             });
+            assert!(matches!(e2.first(), Some(Effect::SaveSession(_))));
             assert_eq!(state.session.background_sessions.len(), 1);
             assert_eq!(
                 state.session.background_sessions.first().map(|s| s.status.as_str()),
                 Some("completed")
             );
 
-            // A different id appends.
-            let _ = state.reduce(Action::BackgroundSessionRecorded {
+            // An identical re-record is a no-op: no state change, no effect, no
+            // save storm.
+            let e_dup = state.reduce(Action::BackgroundSessionRecorded { summary: completed });
+            assert!(
+                e_dup.is_empty(),
+                "unchanged re-record must short-circuit with no SaveSession (no save storm)"
+            );
+
+            // A different id appends and saves.
+            let e3 = state.reduce(Action::BackgroundSessionRecorded {
                 summary: bg_summary("run-2", "failed"),
             });
+            assert!(matches!(e3.first(), Some(Effect::SaveSession(_))));
             assert_eq!(state.session.background_sessions.len(), 2);
+        }
+
+        /// B1 (P0, v4 review): dispatching BackgroundSessionRecorded must emit a
+        /// SaveSession whose snapshot ALREADY contains the just-recorded summary.
+        /// This is the regression guard: previously the reducer returned no
+        /// effect, so the terminal-summary never reached the memory backend
+        /// (legacy exit-save is disabled under terminal-tui), breaking reload
+        /// recap. Round-trip: capture the SaveSession snapshot → reload it into a
+        /// fresh state → the background summary is present.
+        #[test]
+        fn test_redux_background_session_recorded_emits_savesession_with_summary() {
+            let mut state = s();
+            let effects = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-42", "completed"),
+            });
+            let snapshot = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::SaveSession(session) => Some(session.clone()),
+                    _ => None,
+                })
+                .expect("BackgroundSessionRecorded must emit Effect::SaveSession");
+            // The emitted snapshot must already carry the recorded summary —
+            // proving the save happens AFTER the upsert (no race where the
+            // snapshot predates the state mutation).
+            assert_eq!(
+                snapshot.background_sessions.len(),
+                1,
+                "SaveSession snapshot must contain the just-recorded background session"
+            );
+            let recorded = snapshot
+                .background_sessions
+                .first()
+                .expect("snapshot background session present");
+            assert_eq!(recorded.id, "run-42");
+            assert_eq!(recorded.status, "completed");
+
+            // Round-trip: reloading that snapshot into a fresh state restores it,
+            // confirming the persisted blob is sufficient for reload recap.
+            let mut reloaded = s();
+            let _ = reloaded.reduce(Action::SessionLoaded(snapshot));
+            assert_eq!(reloaded.session.background_sessions.len(), 1);
+            assert_eq!(
+                reloaded.session.background_sessions.first().map(|s| s.id.as_str()),
+                Some("run-42")
+            );
         }
 
         /// v4: a recorded background session must survive a save→load round trip
