@@ -3003,6 +3003,36 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
                 RiskLevel::Low,
             ))
         }
+        "sessions_spawn" => {
+            // Mirror SessionsSpawnTool::execute's per-action gate op-id + risk
+            // verbatim, or the v2 no-escalation check rejects an approved call:
+            //   spawn (default/unknown)     → sessions_spawn:spawn,           Medium
+            //   kill                        → sessions_spawn:kill:<run_id>,   Medium
+            //   steer                       → sessions_spawn:steer:<run_id>,  Low
+            //   list / history (no gate)    → None
+            // run_id is trimmed to match the tool, which trims it before
+            // building the op-id (see execute_kill / execute_steer callers).
+            let action = string_arg("action").unwrap_or("spawn");
+            let run_id = string_arg("run_id").unwrap_or_default().trim();
+            match action {
+                "kill" => Some(GrantOp::ResourceExact(
+                    format!("sessions_spawn:kill:{run_id}"),
+                    RiskLevel::Medium,
+                )),
+                "steer" => Some(GrantOp::ResourceExact(
+                    format!("sessions_spawn:steer:{run_id}"),
+                    RiskLevel::Low,
+                )),
+                // list / history are read-only and the tool gates neither.
+                "list" | "history" => None,
+                // Default and any unrecognized action fall through to spawn,
+                // exactly as the tool's `_ => {}` arm does.
+                _ => Some(GrantOp::ResourceExact(
+                    "sessions_spawn:spawn".to_string(),
+                    RiskLevel::Medium,
+                )),
+            }
+        }
         "subagents" => {
             let action = string_arg("action").unwrap_or("list");
             let run_id = string_arg("run_id").unwrap_or_default();
@@ -5822,6 +5852,63 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn grant_op_for_sessions_spawn_matches_tool_gate() {
+        use crate::acl::approval_grant::RiskLevel;
+
+        // spawn (explicit) → exact `sessions_spawn:spawn`, Medium.
+        match grant_op_for_call("sessions_spawn", &serde_json::json!({"action": "spawn"})) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:spawn");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact spawn grant"),
+        }
+
+        // default (no action) also derives the spawn grant.
+        match grant_op_for_call("sessions_spawn", &serde_json::json!({"task": "do it"})) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:spawn");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact spawn grant for default action"),
+        }
+
+        // kill → exact `sessions_spawn:kill:<run_id>`, Medium (run_id trimmed).
+        match grant_op_for_call(
+            "sessions_spawn",
+            &serde_json::json!({"action": "kill", "run_id": "  run-1  "}),
+        ) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:kill:run-1");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact kill grant"),
+        }
+
+        // steer → exact `sessions_spawn:steer:<run_id>`, Low.
+        match grant_op_for_call(
+            "sessions_spawn",
+            &serde_json::json!({"action": "steer", "run_id": "run-2", "message": "hi"}),
+        ) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:steer:run-2");
+                assert_eq!(risk, RiskLevel::Low);
+            }
+            _ => panic!("expected exact steer grant"),
+        }
+
+        // Read-only actions are not gated by the tool, so derive no grant.
+        assert!(grant_op_for_call("sessions_spawn", &serde_json::json!({"action": "list"})).is_none());
+        assert!(
+            grant_op_for_call(
+                "sessions_spawn",
+                &serde_json::json!({"action": "history", "run_id": "x"})
+            )
+            .is_none()
+        );
+    }
 
     fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
         tools_registry
