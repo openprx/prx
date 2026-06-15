@@ -122,6 +122,30 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
     None
 }
 
+/// v5: the operator-facing message explaining why `/steer #N` does not apply to
+/// a non-agent session, or `None` when the kind *is* steerable (agents).
+///
+/// Steer appends an instruction to a running sub-agent's steer channel; shells
+/// run a fixed command and PTYs are interactive, so neither has a steer channel.
+/// Returning a clear message (instead of letting the seq resolve to a non-agent
+/// id the `sessions_spawn` tool can't address) keeps the failure legible. Pure
+/// so the wording is unit-testable.
+#[must_use]
+pub fn steer_unsupported_message(kind: super::model::ManagedKind, seq: u64) -> Option<String> {
+    use super::model::ManagedKind;
+    match kind {
+        ManagedKind::Agent => None,
+        ManagedKind::Shell => Some(format!(
+            "Steer is not supported for background shell #{seq}. \
+             Shells run a fixed command — use /logs #{seq} to view output or /kill #{seq} to stop it."
+        )),
+        ManagedKind::Pty => Some(format!(
+            "Steer is not supported for interactive PTY session #{seq}. \
+             Re-enter it with /pty to type directly, or /kill #{seq} to stop it."
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +253,23 @@ mod tests {
         ] {
             assert_eq!(parse_session_command(input), None, "input: {input}");
         }
+    }
+
+    #[test]
+    fn steer_unsupported_message_agent_is_none() {
+        use super::super::model::ManagedKind;
+        assert!(steer_unsupported_message(ManagedKind::Agent, 1).is_none());
+    }
+
+    #[test]
+    fn steer_unsupported_message_shell_and_pty_are_clear() {
+        use super::super::model::ManagedKind;
+        let shell = steer_unsupported_message(ManagedKind::Shell, 2).expect("test: shell msg");
+        assert!(shell.contains("shell #2"), "names the shell: {shell}");
+        assert!(shell.to_lowercase().contains("not supported"), "states it: {shell}");
+
+        let pty = steer_unsupported_message(ManagedKind::Pty, 4).expect("test: pty msg");
+        assert!(pty.contains("PTY session #4"), "names the pty: {pty}");
+        assert!(pty.to_lowercase().contains("not supported"), "states it: {pty}");
     }
 }

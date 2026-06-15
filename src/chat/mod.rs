@@ -2379,10 +2379,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             } else {
                                 let mut out = String::from("Background sessions:\n");
                                 for v in &views {
+                                    // v5 (§17): tag origin (user `/bg` vs model
+                                    // self-spawn) so both kinds of session are
+                                    // visible in one unified list, distinguishable.
                                     out.push_str(&format!(
-                                        "  #{} {} {} {}\n",
+                                        "  #{} {} {} {} {}\n",
                                         v.seq,
                                         v.kind.as_str(),
+                                        v.origin.as_str(),
                                         v.status.as_str(),
                                         v.title
                                     ));
@@ -2495,6 +2499,28 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Steer { seq, message } => {
+                            // v5: steer only applies to agent sessions (it appends
+                            // an instruction to a running sub-agent's steer
+                            // channel). Shells and PTYs have no steer channel —
+                            // resolving their seq would yield a non-agent id that
+                            // the sessions_spawn tool can't address, producing a
+                            // cryptic "run not found". Guard with a clear message
+                            // up front, mirroring `/kill`'s kind dispatch.
+                            match chat_sessions.kind_for_seq(seq).await {
+                                Ok(kind) => {
+                                    if let Some(msg) =
+                                        crate::chat::sessions::command::steer_unsupported_message(kind, seq)
+                                    {
+                                        emit_chat_output(&msg);
+                                        continue;
+                                    }
+                                    // Agent: fall through to the steer delegation.
+                                }
+                                Err(e) => {
+                                    emit_chat_output(&format!("Steer failed: {e}"));
+                                    continue;
+                                }
+                            }
                             // Resolve `#N` -> run UUID, then delegate to the
                             // sessions_spawn tool's `steer` action so the shared
                             // semantics apply uniformly (Low-risk side-effect gate
@@ -2562,6 +2588,45 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             // calls inline to the existing scrollback. It still
                             // does NOT route input or take over the screen (input
                             // routing is v1.1b). Stop following with `/detach`.
+                            //
+                            // v5: PTY sessions are interactive terminal handoffs,
+                            // not line-streamed output, so a read-only follow makes
+                            // no sense for them. The Ctrl+G switcher routes Enter
+                            // through this same `/attach <seq>` path for every kind,
+                            // so guard PTYs here with a clear redirect rather than
+                            // silently starting an empty follow. (A live PTY can be
+                            // re-entered with `/pty`; an exited one is terminal.)
+                            #[cfg(feature = "terminal-tui")]
+                            if matches!(
+                                chat_sessions.kind_for_seq(seq).await,
+                                Ok(crate::chat::sessions::model::ManagedKind::Pty)
+                            ) {
+                                let exited = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
+                                if exited {
+                                    emit_chat_output(&format!(
+                                        "Interactive PTY session #{seq} has exited — nothing to attach to. \
+                                         Start a new one with /pty <command>."
+                                    ));
+                                } else {
+                                    emit_chat_output(&format!(
+                                        "Session #{seq} is an interactive PTY, not a streamed session. \
+                                         Use /pty <command> to open an interactive terminal (live read-only follow does not apply to PTYs)."
+                                    ));
+                                }
+                                // Restore the prompt/focus the switcher may have set
+                                // optimistically (it pointed at this seq before we
+                                // declined the follow), so perception matches routing.
+                                let prev_focus = crate::chat::sessions::focus::rollback_focus(attached_follow_seq);
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
+                                    "chat.session_focus_attach_pty_decline",
+                                );
+                                chat_mirror.lock().focus = prev_focus;
+                                if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                    let _ = tx.try_send(());
+                                }
+                                continue;
+                            }
                             const ATTACH_TAIL_LINES: usize = 20;
                             match chat_sessions.resolve_run_id(seq).await {
                                 Ok(run_id) => {
@@ -4600,7 +4665,32 @@ fn run_pty_passthrough(
     // ── This thread: stdin → PTY writer, watching for detach + child exit ─────
     // The result is captured (not `?`-propagated directly) so `cleanup`'s Drop
     // runs on success AND error before we return. (Drop also runs on panic.)
-    let result = pty_stdin_loop(&child_done, |byte| {
+    //
+    // v5: forward host terminal resizes to the PTY. The chat render loop is
+    // parked during the handoff, so crossterm `Resize` events go unconsumed;
+    // instead we poll the host size each loop tick (≤100 ms) and push a `resize`
+    // to the PTY master whenever it changes, so full-screen curses programs
+    // (vim, htop, …) re-flow. `resize` is cheap, synchronous and non-panicking
+    // (errors are logged, never fatal — a failed resize just leaves the old
+    // geometry). We seed `last_size` from the spawn-time geometry so the first
+    // real change is detected.
+    let mut last_size: Option<(u16, u16)> = crossterm::terminal::size().ok();
+    let on_tick = || {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            if last_size != Some((cols, rows)) {
+                last_size = Some((cols, rows));
+                if let Err(e) = session.resize(portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    tracing::warn!(error = %e, cols, rows, "PTY resize forward failed");
+                }
+            }
+        }
+    };
+    let result = pty_stdin_loop(&child_done, on_tick, |byte| {
         match classify_input_byte(byte) {
             InputByte::Detach => Ok(true), // stop the loop (detach)
             InputByte::Forward => {
@@ -4637,6 +4727,7 @@ fn run_pty_passthrough(
 #[allow(unsafe_code)]
 fn pty_stdin_loop(
     child_done: &Arc<std::sync::atomic::AtomicBool>,
+    mut on_tick: impl FnMut(),
     mut on_byte: impl FnMut(u8) -> Result<bool>,
 ) -> Result<PtyExit> {
     use std::io::Read as _;
@@ -4648,6 +4739,14 @@ fn pty_stdin_loop(
         if child_done.load(Ordering::Acquire) {
             return Ok(PtyExit::ChildExited);
         }
+
+        // Per-iteration housekeeping that must run even while the user is idle
+        // (the poll below wakes at least every 100 ms). Used to forward host
+        // terminal resizes to the PTY so curses programs re-flow. The render
+        // loop is parked during the handoff, so crossterm `Resize` events are
+        // not being consumed elsewhere — polling the size here is the
+        // self-contained way to track it.
+        on_tick();
 
         // Wait (bounded) for stdin to be readable so we can re-check child exit.
         #[cfg(unix)]

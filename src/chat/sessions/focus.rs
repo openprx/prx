@@ -58,8 +58,11 @@ impl FocusTarget {
 pub struct SwitcherEntry {
     /// Display sequence `#N`.
     pub seq: u64,
-    /// Stable lowercase kind label (`agent` / `shell`).
+    /// Stable lowercase kind label (`agent` / `shell` / `pty`).
     pub kind: &'static str,
+    /// Stable lowercase origin label (`user` / `model`), so the operator can
+    /// tell which sessions the model started for itself (v5, §17).
+    pub origin: &'static str,
     /// Stable lowercase status label (`running` / `completed` / …).
     pub status: &'static str,
     /// Task / command title (already truncated by the projection).
@@ -73,8 +76,23 @@ impl SwitcherEntry {
         Self {
             seq: view.seq,
             kind: view.kind.as_str(),
+            origin: view.origin.as_str(),
             status: view.status.as_str(),
             title: view.title.clone(),
+        }
+    }
+
+    /// A compact status glyph for accessibility / no-color rendering (§0.2.1 F):
+    /// status is conveyed by shape, not only color. Running uses an hourglass,
+    /// terminal states use check/cross marks.
+    #[must_use]
+    pub fn status_glyph(&self) -> &'static str {
+        match self.status {
+            s if s == ManagedStatus::Running.as_str() => "⏳",
+            s if s == ManagedStatus::NeedsInput.as_str() => "❓",
+            s if s == ManagedStatus::Completed.as_str() => "✓",
+            s if s == ManagedStatus::Cancelled.as_str() => "⊘",
+            _ => "✗",
         }
     }
 
@@ -253,6 +271,7 @@ mod tests {
             id: SessionId::from_run_id(&format!("r{seq}")),
             seq,
             kind: ManagedKind::Agent,
+            origin: super::super::model::SessionOrigin::User,
             title: title.to_string(),
             status,
             created_at: Utc::now(),
@@ -309,6 +328,66 @@ mod tests {
             ManagedStatus::Cancelled,
         ] {
             assert!(SwitcherEntry::from_view(&view(1, st, "x")).is_terminal());
+        }
+    }
+
+    /// v5: build a typed view to verify the switcher lists all three kinds and
+    /// carries the kind + origin labels through to the entry.
+    fn typed_view(
+        seq: u64,
+        kind: super::super::model::ManagedKind,
+        origin: super::super::model::SessionOrigin,
+    ) -> ManagedSessionView {
+        ManagedSessionView {
+            id: SessionId::from_run_id(&format!("r{seq}")),
+            seq,
+            kind,
+            origin,
+            title: format!("t{seq}"),
+            status: ManagedStatus::Running,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn switcher_lists_all_three_kinds_with_labels() {
+        use super::super::model::{ManagedKind, SessionOrigin};
+        let views = vec![
+            typed_view(1, ManagedKind::Agent, SessionOrigin::Model),
+            typed_view(2, ManagedKind::Shell, SessionOrigin::User),
+            typed_view(3, ManagedKind::Pty, SessionOrigin::User),
+        ];
+        let entries = switcher_entries(&views);
+        assert_eq!(entries.len(), 3, "all three kinds present in the switcher");
+        let kinds: Vec<(&str, &str)> = entries.iter().map(|e| (e.kind, e.origin)).collect();
+        assert_eq!(
+            kinds,
+            vec![("agent", "model"), ("shell", "user"), ("pty", "user")],
+            "kind + origin labels thread through the switcher"
+        );
+    }
+
+    #[test]
+    fn switcher_entry_status_glyph_is_shape_coded() {
+        // Accessibility: distinct shapes per status (not only colour).
+        let running = SwitcherEntry::from_view(&view(1, ManagedStatus::Running, "x"));
+        let completed = SwitcherEntry::from_view(&view(2, ManagedStatus::Completed, "x"));
+        let failed = SwitcherEntry::from_view(&view(3, ManagedStatus::Failed, "x"));
+        let cancelled = SwitcherEntry::from_view(&view(4, ManagedStatus::Cancelled, "x"));
+        // All four are distinct glyphs.
+        let glyphs = [
+            running.status_glyph(),
+            completed.status_glyph(),
+            failed.status_glyph(),
+            cancelled.status_glyph(),
+        ];
+        for (i, a) in glyphs.iter().enumerate() {
+            for (j, b) in glyphs.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "status glyphs must be distinct ({i} vs {j})");
+                }
+            }
         }
     }
 

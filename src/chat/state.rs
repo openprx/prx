@@ -2116,12 +2116,14 @@ mod tests {
             SwitcherEntry {
                 seq: 1,
                 kind: "agent",
+                origin: "user",
                 status: "running",
                 title: "a".into(),
             },
             SwitcherEntry {
                 seq: 2,
                 kind: "agent",
+                origin: "model",
                 status: "completed",
                 title: "b".into(),
             },

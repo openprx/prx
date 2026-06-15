@@ -46,6 +46,49 @@ impl ManagedKind {
     }
 }
 
+/// Who initiated a background session (v5, §17 unification).
+///
+/// Both user-initiated `/bg`/`/shell`/`/pty` sessions and model-initiated
+/// sub-agents (the LLM calling `sessions_spawn` mid-turn) share the *same*
+/// registry and the *same* list / switcher; this marker only distinguishes their
+/// provenance for display so the operator can tell at a glance which sessions the
+/// model started for itself.
+///
+/// The discriminator is `SubAgentRun.parent_run_id`: a user `/bg` is invoked
+/// directly with no spawn-execution context (`None`), whereas a model-spawned
+/// sub-agent inherits the per-turn run id as its `parent_run_id` (`Some`).
+/// Shells and PTYs are always operator-initiated, so they are always `User`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOrigin {
+    /// Started by the operator (`/bg`, `/shell`, `/pty`).
+    User,
+    /// Started by the model itself via a `sessions_spawn` tool call mid-turn.
+    Model,
+}
+
+impl SessionOrigin {
+    /// Stable lowercase label for display.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Model => "model",
+        }
+    }
+
+    /// Infer the origin of an agent run from its `parent_run_id` (see the type
+    /// docs): a child run created by the model mid-turn carries the per-turn run
+    /// id as parent; a top-level operator `/bg` has none.
+    #[must_use]
+    pub const fn from_parent_run_id(parent_run_id: Option<&String>) -> Self {
+        if parent_run_id.is_some() {
+            Self::Model
+        } else {
+            Self::User
+        }
+    }
+}
+
 /// UI-facing status of a managed session.
 ///
 /// `NeedsInput` is retained as a reserved variant for the v1.1 event bridge but
@@ -80,6 +123,8 @@ pub struct ManagedSessionView {
     /// Display-only short alias `#N`.
     pub seq: u64,
     pub kind: ManagedKind,
+    /// Who initiated the session (v5): operator vs model.
+    pub origin: SessionOrigin,
     /// Task / command text (already trimmed by the source).
     pub title: String,
     pub status: ManagedStatus,
@@ -185,6 +230,7 @@ pub fn project_run(run: &SubAgentRun, seq: u64) -> ManagedSessionView {
         id: SessionId::from_run_id(&run.id),
         seq,
         kind: ManagedKind::Agent,
+        origin: SessionOrigin::from_parent_run_id(run.parent_run_id.as_ref()),
         title,
         status: project_status(&run.status),
         created_at: run.started_at,
@@ -221,6 +267,9 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
         id: session.id.clone(),
         seq,
         kind: ManagedKind::Shell,
+        // Shells are always operator-initiated (`/shell`); the model has no
+        // shell-spawn path.
+        origin: SessionOrigin::User,
         title,
         status: project_shell_status(&session.status()),
         created_at: session.started_at,
@@ -255,6 +304,9 @@ pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSe
         id: session.id.clone(),
         seq,
         kind: ManagedKind::Pty,
+        // PTYs are always operator-initiated (`/pty`); the model has no
+        // interactive-PTY spawn path.
+        origin: SessionOrigin::User,
         title,
         status,
         created_at: session.started_at,
@@ -265,6 +317,46 @@ pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSe
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn origin_user_when_no_parent_run() {
+        // A top-level operator `/bg` has no spawn-execution context, so the
+        // registry run carries no parent_run_id → User origin.
+        assert_eq!(SessionOrigin::from_parent_run_id(None), SessionOrigin::User);
+        assert_eq!(SessionOrigin::User.as_str(), "user");
+    }
+
+    #[test]
+    fn origin_model_when_parent_run_present() {
+        // A model-spawned sub-agent inherits the per-turn run id as its
+        // parent_run_id → Model origin.
+        let parent = "turn-run-123".to_string();
+        assert_eq!(SessionOrigin::from_parent_run_id(Some(&parent)), SessionOrigin::Model);
+        assert_eq!(SessionOrigin::Model.as_str(), "model");
+    }
+
+    #[test]
+    fn project_run_infers_origin_from_parent() {
+        let mut run = SubAgentRun {
+            id: "child".into(),
+            task: "do thing".into(),
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
+            started_at: Utc::now(),
+            status: SubAgentStatus::Running,
+            recipient: None,
+            abort_handle: None,
+            history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "scope".into(),
+            spawn_depth: 0,
+        };
+        assert_eq!(project_run(&run, 1).origin, SessionOrigin::User);
+        run.parent_run_id = Some("turn-1".into());
+        assert_eq!(project_run(&run, 1).origin, SessionOrigin::Model);
+    }
 
     #[test]
     fn running_maps_to_running() {
@@ -300,6 +392,7 @@ mod tests {
             id: SessionId::from_run_id("run-x"),
             seq: 3,
             kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
             title: "build the report".to_string(),
             status,
             created_at: Utc::now(),

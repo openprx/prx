@@ -1857,6 +1857,58 @@ fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area:
 /// marker so it reads even without colour). When the list is taller than the
 /// available rows it scrolls to keep the selection visible and shows a
 /// `N more` overflow hint (narrow/short-terminal degrade, plan §0.4).
+/// Build the text body for one switcher row (v5).
+///
+/// Pure (no `Frame`/`Rect`/lock) so it is unit-testable. Layout:
+/// - wide:   `<glyph> #N <kind> <origin> <status> <title>`
+/// - narrow: `<glyph> #N <kind> <title>` (origin + long status dropped, title
+///   hard-truncated to fit `max_width` columns) so a row never overflows a
+///   small terminal.
+///
+/// `max_width` is the column budget for the body (the caller already reserves
+/// space for the selection marker). A `0` budget yields an empty string. Title
+/// truncation counts `char`s (not bytes) and appends `…` when it elides.
+fn render_switcher_row(
+    entry: &crate::chat::sessions::SwitcherEntry,
+    glyph: &str,
+    narrow: bool,
+    max_width: u16,
+) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let max_width = max_width as usize;
+    // Fixed prefix (everything but the title), then fit the title into whatever
+    // columns remain so the whole row stays within `max_width`.
+    let prefix = if narrow {
+        format!("{glyph} #{} {} ", entry.seq, entry.kind)
+    } else {
+        format!(
+            "{glyph} #{} {} {} {} ",
+            entry.seq, entry.kind, entry.origin, entry.status
+        )
+    };
+    let prefix_cols = prefix.chars().count();
+    if prefix_cols >= max_width {
+        // No room for the title at all: clamp the prefix itself.
+        return prefix.chars().take(max_width).collect();
+    }
+    let title_budget = max_width - prefix_cols;
+    let title_cols = entry.title.chars().count();
+    let title = if title_cols <= title_budget {
+        entry.title.clone()
+    } else if title_budget == 0 {
+        String::new()
+    } else {
+        // Reserve one column for the ellipsis when we actually elide.
+        let take = title_budget.saturating_sub(1);
+        let mut t: String = entry.title.chars().take(take).collect();
+        t.push('\u{2026}');
+        t
+    };
+    format!("{prefix}{title}")
+}
+
 fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessions::SwitcherState, ascii: bool) {
     let marker = if ascii { ">" } else { "\u{25B8}" }; // ▸
     let block = Block::default()
@@ -1904,7 +1956,25 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
         } else {
             "  ".to_string()
         };
-        let body = format!("#{} {} {} {}", entry.seq, entry.kind, entry.status, entry.title);
+        // Accessibility (§0.2.1 F): status is conveyed by a leading glyph
+        // (shape), not only by the grey-out colour, so it survives no-color
+        // terminals. We also tag the kind (agent/shell/pty) and origin
+        // (user/model, §17) so the operator can tell at a glance which sessions
+        // the model started for itself. On a narrow terminal we drop the origin
+        // tag and hard-truncate the title so the row never overflows / wraps.
+        let glyph = if ascii {
+            match entry.status {
+                "running" => "[~]",
+                "needs-input" => "[?]",
+                "completed" => "[x]",
+                "cancelled" => "[-]",
+                _ => "[!]",
+            }
+        } else {
+            entry.status_glyph()
+        };
+        let narrow = inner.width < 48;
+        let body = render_switcher_row(entry, glyph, narrow, inner.width.saturating_sub(2));
         let style = if selected {
             Style::default()
                 .fg(Color::White)
@@ -4275,6 +4345,7 @@ mod tests {
         crate::chat::sessions::SwitcherEntry {
             seq,
             kind: "agent",
+            origin: "user",
             status: "running",
             title: format!("task {seq}"),
         }
@@ -4287,6 +4358,61 @@ mod tests {
         assert!(state.input.is_empty());
         let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
         assert_eq!(out, KeyDispatch::Cancelled);
+    }
+
+    // ── v5: switcher row layout (origin tag + narrow-terminal degradation) ────
+
+    fn pty_entry(seq: u64, title: &str) -> crate::chat::sessions::SwitcherEntry {
+        crate::chat::sessions::SwitcherEntry {
+            seq,
+            kind: "pty",
+            origin: "user",
+            status: "running",
+            title: title.to_string(),
+        }
+    }
+
+    #[test]
+    fn switcher_row_wide_includes_kind_origin_status() {
+        let e = pty_entry(3, "vim notes.md");
+        let row = render_switcher_row(&e, "⏳", false, 80);
+        assert!(row.contains("#3"), "row carries the seq: {row}");
+        assert!(row.contains("pty"), "row carries the kind: {row}");
+        assert!(row.contains("user"), "row carries the origin: {row}");
+        assert!(row.contains("running"), "wide row carries the status text: {row}");
+        assert!(row.contains("vim notes.md"), "row carries the title: {row}");
+    }
+
+    #[test]
+    fn switcher_row_narrow_drops_origin_and_keeps_kind() {
+        // narrow=true → origin + long status text dropped to save columns.
+        let e = pty_entry(3, "vim notes.md");
+        let row = render_switcher_row(&e, "⏳", true, 30);
+        assert!(row.contains("#3"));
+        assert!(row.contains("pty"), "kind is still shown when narrow: {row}");
+        assert!(!row.contains("user"), "origin tag dropped when narrow: {row}");
+    }
+
+    #[test]
+    fn switcher_row_never_exceeds_budget_and_truncates_title() {
+        let e = pty_entry(
+            7,
+            "a-very-long-interactive-command-that-will-not-fit-in-a-tiny-terminal",
+        );
+        let budget: u16 = 24;
+        let row = render_switcher_row(&e, "⏳", true, budget);
+        assert!(
+            row.chars().count() <= budget as usize,
+            "row ({} cols) must fit budget {budget}: {row}",
+            row.chars().count()
+        );
+        assert!(row.contains('\u{2026}'), "an elided title ends with an ellipsis: {row}");
+    }
+
+    #[test]
+    fn switcher_row_zero_budget_is_empty() {
+        let e = pty_entry(1, "x");
+        assert!(render_switcher_row(&e, "⏳", false, 0).is_empty());
     }
 
     #[test]

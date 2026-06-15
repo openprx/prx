@@ -813,6 +813,7 @@ mod tests {
             id: SessionId::from_run_id(&format!("r{seq}")),
             seq,
             kind: super::super::model::ManagedKind::Agent,
+            origin: super::super::model::SessionOrigin::User,
             title: "t".to_string(),
             status,
             created_at: chrono::Utc::now(),
