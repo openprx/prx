@@ -26,6 +26,8 @@ pub mod event;
 pub mod focus;
 pub mod id;
 pub mod model;
+#[cfg(feature = "terminal-tui")]
+pub mod pty;
 pub mod runtime;
 pub mod shell;
 

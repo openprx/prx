@@ -29,6 +29,8 @@ pub enum ManagedKind {
     Agent,
     /// A background shell session (v2; not produced in v1a).
     Shell,
+    /// An interactive PTY shell session (v3; `/pty`).
+    Pty,
 }
 
 impl ManagedKind {
@@ -38,6 +40,7 @@ impl ManagedKind {
         match self {
             Self::Agent => "agent",
             Self::Shell => "shell",
+            Self::Pty => "pty",
         }
     }
 }
@@ -154,6 +157,40 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
         kind: ManagedKind::Shell,
         title,
         status: project_shell_status(&session.status()),
+        created_at: session.started_at,
+        updated_at: session.started_at,
+    }
+}
+
+/// Project an interactive PTY shell session onto a [`ManagedSessionView`] with
+/// the supplied display sequence number, so `/sessions` and `/kill` treat PTY
+/// sessions in the same seq space as agents and background shells (v3a).
+///
+/// PTY sessions have only a binary liveness signal (`has_exited`); a live
+/// session is `Running`, an exited one is `Completed` (we do not distinguish the
+/// exit code here — the user saw the full interactive output during the
+/// handoff).
+#[cfg(feature = "terminal-tui")]
+#[must_use]
+pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSessionView {
+    const MAX_TITLE: usize = 80;
+    let title = if session.command.chars().count() > MAX_TITLE {
+        let truncated: String = session.command.chars().take(MAX_TITLE).collect();
+        format!("{truncated}…")
+    } else {
+        session.command.clone()
+    };
+    let status = if session.has_exited() {
+        ManagedStatus::Completed
+    } else {
+        ManagedStatus::Running
+    };
+    ManagedSessionView {
+        id: session.id.clone(),
+        seq,
+        kind: ManagedKind::Pty,
+        title,
+        status,
         created_at: session.started_at,
         updated_at: session.started_at,
     }

@@ -27,6 +27,13 @@ use tokio::sync::RwLock;
 /// while the lock is held.
 pub type ShellRegistry = Arc<Mutex<Vec<ShellSession>>>;
 
+/// Shared, single-source registry of interactive PTY shell sessions (v3a).
+///
+/// Same rationale as [`ShellRegistry`]: clonable handles, short `parking_lot`
+/// critical sections, never held across `.await`.
+#[cfg(feature = "terminal-tui")]
+pub type PtyRegistry = Arc<Mutex<Vec<super::pty::PtyShellSession>>>;
+
 /// One line of a session's recent output, projected for `/attach` display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TailLine {
@@ -72,6 +79,9 @@ pub struct ChatSessionsHandle {
     runs: Arc<RwLock<Vec<SubAgentRun>>>,
     /// The single-source shell-session registry (v2).
     shells: ShellRegistry,
+    /// The single-source interactive PTY-session registry (v3a).
+    #[cfg(feature = "terminal-tui")]
+    ptys: PtyRegistry,
     /// `#N` -> session id, assigned in first-seen order across **both** kinds.
     /// Owned by the main loop (single-threaded), so a plain `Vec` with no lock is
     /// correct.
@@ -88,9 +98,47 @@ impl ChatSessionsHandle {
         Self {
             runs,
             shells: Arc::new(Mutex::new(Vec::new())),
+            #[cfg(feature = "terminal-tui")]
+            ptys: Arc::new(Mutex::new(Vec::new())),
             seq_map: Vec::new(),
             next_seq: 1,
         }
+    }
+
+    /// The PTY registry Arc, so the chat exit path can `kill` all interactive
+    /// PTY sessions (and tests can assert on its contents). Cheap `Arc` clone.
+    #[cfg(feature = "terminal-tui")]
+    #[must_use]
+    pub fn pty_registry(&self) -> PtyRegistry {
+        Arc::clone(&self.ptys)
+    }
+
+    /// Register a freshly spawned interactive PTY session and return its display
+    /// seq `#N`. Pure main-loop state mutation plus a short `parking_lot` lock.
+    #[cfg(feature = "terminal-tui")]
+    pub fn add_pty(&mut self, session: super::pty::PtyShellSession) -> u64 {
+        let id = session.id.clone();
+        self.ptys.lock().push(session);
+        self.seq_for(&id)
+    }
+
+    /// Find a PTY session by its display seq `#N`, cloning the (cheap) handle out
+    /// of the registry. Returns `None` if the seq does not map to a PTY session.
+    #[cfg(feature = "terminal-tui")]
+    fn pty_for_seq(&self, seq: u64) -> Option<super::pty::PtyShellSession> {
+        let id = self.id_for_seq(seq)?.clone();
+        self.ptys.lock().iter().find(|s| s.id == id).cloned()
+    }
+
+    /// Kill the interactive PTY session at display seq `#N` (terminating its
+    /// whole process group). Refreshes the seq map first so a just-`/pty`-ed
+    /// session is addressable. Returns an error (never panics) if the seq is
+    /// unknown or is not a PTY session.
+    #[cfg(feature = "terminal-tui")]
+    pub async fn kill_pty(&mut self, seq: u64) -> Result<()> {
+        self.refresh_seqs().await;
+        let pty = self.pty_for_seq(seq).ok_or_else(|| anyhow!("no PTY session #{seq}"))?;
+        pty.kill().await
     }
 
     /// The shell registry Arc, so the chat exit path can `kill` all shells (and
@@ -149,6 +197,14 @@ impl ChatSessionsHandle {
         for id in &shell_ids {
             let _ = self.seq_for(id);
         }
+        // PTY sessions come after shells in seq order (v3a). Same lock discipline.
+        #[cfg(feature = "terminal-tui")]
+        {
+            let pty_ids: Vec<SessionId> = self.ptys.lock().iter().map(|s| s.id.clone()).collect();
+            for id in &pty_ids {
+                let _ = self.seq_for(id);
+            }
+        }
         runs
     }
 
@@ -175,6 +231,15 @@ impl ChatSessionsHandle {
         for shell in &shells {
             let seq = self.seq_for(&shell.id);
             views.push(project_shell(shell, seq));
+        }
+        // Interactive PTY sessions, after shells (v3a).
+        #[cfg(feature = "terminal-tui")]
+        {
+            let ptys = self.ptys.lock().clone();
+            for pty in &ptys {
+                let seq = self.seq_for(&pty.id);
+                views.push(super::model::project_pty(pty, seq));
+            }
         }
         views.sort_by_key(|v| v.seq);
         views
@@ -262,10 +327,13 @@ impl ChatSessionsHandle {
             .cloned()
             .ok_or_else(|| anyhow!("no session #{seq}"))?;
         if self.shells.lock().iter().any(|s| s.id == id) {
-            Ok(ManagedKind::Shell)
-        } else {
-            Ok(ManagedKind::Agent)
+            return Ok(ManagedKind::Shell);
         }
+        #[cfg(feature = "terminal-tui")]
+        if self.ptys.lock().iter().any(|s| s.id == id) {
+            return Ok(ManagedKind::Pty);
+        }
+        Ok(ManagedKind::Agent)
     }
 
     /// Kill the shell session at display seq `#N` (terminating its whole process
@@ -317,6 +385,11 @@ impl ChatSessionsHandle {
         if let Some(shell) = self.shells.lock().iter().find(|s| s.id.as_str() == target_id) {
             return Ok(shell.is_terminal());
         }
+        // PTY sessions: terminal once the child has exited (v3a).
+        #[cfg(feature = "terminal-tui")]
+        if let Some(pty) = self.ptys.lock().iter().find(|s| s.id.as_str() == target_id) {
+            return Ok(pty.has_exited());
+        }
         let run = runs
             .iter()
             .find(|r| r.id == target_id)
@@ -350,6 +423,12 @@ impl ChatSessionsHandle {
         // empty tail (not an error) so `/attach <shell>` falls straight through to
         // ring replay.
         if self.shells.lock().iter().any(|s| s.id.as_str() == target_id) {
+            return Ok(Vec::new());
+        }
+        // PTY sessions are full terminal handoffs with no captured history; an
+        // empty tail (not an error) keeps `/attach`/`/logs` graceful (v3a).
+        #[cfg(feature = "terminal-tui")]
+        if self.ptys.lock().iter().any(|s| s.id.as_str() == target_id) {
             return Ok(Vec::new());
         }
         let history = {
@@ -488,6 +567,49 @@ mod tests {
         handle.kill_shell(2).await.expect("test: kill shell #2");
         assert!(shell.is_terminal());
         assert!(handle.kill_shell(1).await.is_err(), "agent seq is not a shell");
+    }
+
+    // ── Interactive PTY sessions in the unified list (v3a) ───────────────────
+
+    #[cfg(all(unix, feature = "terminal-tui"))]
+    #[tokio::test]
+    async fn snapshot_includes_pty_and_kill_routes_to_it() {
+        use super::super::pty::PtyShellSession;
+        use portable_pty::PtySize;
+
+        let runs = Arc::new(RwLock::new(vec![make_run("a", "agent a", SubAgentStatus::Running)]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+
+        // Agent gets #1.
+        assert_eq!(handle.snapshot().await.len(), 1);
+
+        // Add an interactive PTY session — it must appear in the *same* list,
+        // numbered after agents and shells, with kind `pty`.
+        let sec = permissive_security();
+        let (pty, _io) = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
+        let pty_seq = handle.add_pty(pty.clone());
+        assert_eq!(pty_seq, 2, "PTY numbered after the single agent");
+
+        let merged = handle.snapshot().await;
+        assert_eq!(merged.len(), 2);
+        let pty_view = merged.iter().find(|v| v.seq == 2).expect("test: PTY view present");
+        assert_eq!(pty_view.kind, ManagedKind::Pty);
+        assert!(pty_view.title.contains("sleep 30"));
+
+        // kind_for_seq routes #2 to the PTY backend, #1 to the agent.
+        assert_eq!(handle.kind_for_seq(2).await.expect("test: #2 kind"), ManagedKind::Pty);
+        assert_eq!(handle.kind_for_seq(1).await.expect("test: #1 kind"), ManagedKind::Agent);
+
+        // kill_pty(#2) terminates the PTY group; kill_pty on the agent #1 errors.
+        handle.kill_pty(2).await.expect("test: kill PTY #2");
+        for _ in 0..50 {
+            if pty.has_exited() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pty.has_exited(), "PTY child terminated after kill_pty");
+        assert!(handle.kill_pty(1).await.is_err(), "agent seq is not a PTY session");
     }
 
     #[tokio::test]

@@ -29,6 +29,8 @@ pub enum SessionCommand {
     Shell { command: String },
     /// `/logs <seq>` — show a session log (v2).
     Logs { seq: u64 },
+    /// `/pty <command>` — interactive PTY shell with full terminal handoff (v3).
+    Pty { command: String },
 }
 
 /// Parse a chat session command from raw input.
@@ -65,6 +67,18 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
             return None;
         }
         return Some(SessionCommand::Shell {
+            command: command.to_string(),
+        });
+    }
+
+    // `/pty <command>` — interactive PTY shell (v3). Everything after the command
+    // word is the command line run inside the pseudo-terminal.
+    if let Some(rest) = trimmed.strip_prefix("/pty") {
+        let command = rest.strip_prefix(char::is_whitespace)?.trim();
+        if command.is_empty() {
+            return None;
+        }
+        return Some(SessionCommand::Pty {
             command: command.to_string(),
         });
     }
@@ -176,6 +190,30 @@ mod tests {
                 command: "echo hi".to_string()
             })
         );
+    }
+
+    #[test]
+    fn parses_pty() {
+        assert_eq!(
+            parse_session_command("/pty sh"),
+            Some(SessionCommand::Pty {
+                command: "sh".to_string()
+            })
+        );
+        assert_eq!(
+            parse_session_command("/pty python3 -i"),
+            Some(SessionCommand::Pty {
+                command: "python3 -i".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn pty_requires_command_and_separator() {
+        assert_eq!(parse_session_command("/pty"), None);
+        assert_eq!(parse_session_command("/pty   "), None);
+        // `/ptyfoo` must not be mistaken for `/pty foo`.
+        assert_eq!(parse_session_command("/ptyfoo"), None);
     }
 
     #[test]

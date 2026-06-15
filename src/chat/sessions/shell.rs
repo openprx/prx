@@ -179,7 +179,7 @@ impl ShellSession {
 /// returns `Ok(())`.
 #[cfg(unix)]
 #[allow(unsafe_code)]
-async fn kill_process_group(pgid: i32) -> Result<()> {
+pub(super) async fn kill_process_group(pgid: i32) -> Result<()> {
     // SAFETY: `killpg` is an async-signal-safe libc call that only sends a
     // signal to the process group `pgid`; it dereferences no pointers and has no
     // memory-safety preconditions. `pgid` is the group id we created via

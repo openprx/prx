@@ -1215,6 +1215,14 @@ pub async fn run(
     // `/kill` (side-channel — same Arc, no type erasure / downcast).
     let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(Arc::clone(&active_runs));
 
+    // v3a: coordination handle for interactive PTY terminal handoff. Shared with
+    // the unified TUI render loop (which parks while a PTY is attached) and the
+    // main loop's `/pty` handler (which pauses/resumes it around the passthrough).
+    // Only the TUI path performs the handoff; the non-TUI fallback has no render
+    // loop to suspend.
+    #[cfg(feature = "terminal-tui")]
+    let pty_handoff = Arc::new(crate::chat::sessions::pty::HandoffControl::new());
+
     // ── Session: resume or create new ───────────────────────────
     let mut chat_session = match session_id.as_deref() {
         // D10/C1: distinguish None (no session -> new) from Err (storage failure).
@@ -1534,6 +1542,7 @@ pub async fn run(
                         Arc::clone(&last_ctrlc_ms),
                         chat_dispatcher.clone(),
                         snapshot_rx_for_tui.clone(),
+                        Arc::clone(&pty_handoff),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -2332,6 +2341,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     }
                                     continue;
                                 }
+                                Ok(crate::chat::sessions::model::ManagedKind::Pty) => {
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        match chat_sessions.kill_pty(seq).await {
+                                            Ok(()) => emit_chat_output(&format!(
+                                                "Killed interactive PTY session #{seq} (process group terminated)."
+                                            )),
+                                            Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                        }
+                                    }
+                                    continue;
+                                }
                                 Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
                                 Err(e) => {
                                     emit_chat_output(&format!("Kill failed: {e}"));
@@ -2668,6 +2689,33 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     }
                                 }
                                 Err(e) => emit_chat_output(&format!("Logs failed: {e}")),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Pty { command } => {
+                            // v3a: interactive PTY shell with a full terminal
+                            // handoff. The chat ratatui render loop is suspended
+                            // and the real terminal is wired straight to the PTY
+                            // for the duration; Ctrl-] detaches, Ctrl-C/Ctrl-D
+                            // pass through. Restoration is guaranteed by the RAII
+                            // `PtyHandoffGuard` regardless of how the passthrough
+                            // ends (detach, child exit, error, or panic).
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                handle_pty_command(
+                                    &command,
+                                    &security,
+                                    &mut chat_sessions,
+                                    &pty_handoff,
+                                    sessions_redraw_handle.as_ref(),
+                                    &emit_chat_output,
+                                )
+                                .await;
+                            }
+                            #[cfg(not(feature = "terminal-tui"))]
+                            {
+                                let _ = &command;
+                                emit_chat_output("Interactive PTY sessions require the terminal UI.");
                             }
                             continue;
                         }
@@ -3815,6 +3863,24 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
     }
 
+    // ── Interactive PTY cleanup (v3a) ─────────────────────────────
+    // Same rationale as the background shell cleanup: terminate every PTY
+    // session's process group on chat exit so no interactive shell (or anything
+    // it backgrounded) is left orphaned. Skip already-exited sessions.
+    #[cfg(feature = "terminal-tui")]
+    {
+        let ptys = chat_sessions.pty_registry();
+        let to_kill: Vec<_> = ptys.lock().clone();
+        for pty in &to_kill {
+            if pty.has_exited() {
+                continue;
+            }
+            if let Err(e) = pty.kill().await {
+                tracing::warn!(error = %e, "Failed to terminate PTY process group on exit");
+            }
+        }
+    }
+
     // Give the reducer-owned turn persistence path a bounded chance to finish
     // before shutdown cancellation drains the dispatcher. This closes the
     // piped-stdin race where a successful response followed immediately by
@@ -4095,6 +4161,7 @@ fn spawn_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     chat_dispatcher: dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
+    handoff: Arc<crate::chat::sessions::pty::HandoffControl>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -4106,6 +4173,7 @@ fn spawn_tui_unified_loop(
             last_ctrlc_ms,
             &chat_dispatcher,
             snapshot_rx,
+            &handoff,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
@@ -4176,6 +4244,271 @@ fn apply_optimistic_focus(
     let _ = redraw_tx.try_send(());
 }
 
+/// Handle `/pty <command>` (v3a): spawn an interactive PTY shell and hand the
+/// terminal over to it for the duration of an attach.
+///
+/// Flow:
+/// 1. Spawn the PTY session (security-gated, hardened env) at the host
+///    terminal's current size.
+/// 2. Register it so `/sessions` / `/kill` can see / terminate it.
+/// 3. Acquire a [`PtyHandoffGuard`] — this pauses the chat render loop and
+///    blocks until it has parked, so we can take over `stdin`/`stdout` without a
+///    keystroke-stealing race. The guard's `Drop` restores the chat TUI on
+///    **every** exit path.
+/// 4. Run the byte passthrough on blocking threads until detach (`Ctrl-]`) or
+///    child exit.
+/// 5. The guard drops here, restoring the chat TUI (resume render loop + force a
+///    full redraw to wipe PTY residue).
+#[cfg(feature = "terminal-tui")]
+async fn handle_pty_command(
+    command: &str,
+    security: &Arc<crate::security::SecurityPolicy>,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    redraw_handle: Option<&mpsc::Sender<()>>,
+    emit_chat_output: &impl Fn(&str),
+) {
+    use crate::chat::sessions::pty::{PtyHandoffGuard, PtyShellSession};
+    use portable_pty::PtySize;
+
+    // Host terminal size → PTY winsize (fall back to a sane 80x24).
+    let size = crossterm::terminal::size().map_or(
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        |(cols, rows)| PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    );
+
+    let (session, io) = match PtyShellSession::spawn(command, security, size) {
+        Ok(pair) => pair,
+        Err(e) => {
+            emit_chat_output(&format!("Failed to start interactive PTY session: {e}"));
+            return;
+        }
+    };
+    let seq = chat_sessions.add_pty(session.clone());
+    emit_chat_output(&format!(
+        "Interactive PTY session #{seq}: {command} — Ctrl-] to detach (Ctrl-C/Ctrl-D pass through to the shell)."
+    ));
+
+    // Build a redraw nudge for the guard so the chat TUI repaints the instant we
+    // resume (rather than waiting out the render loop's idle poll).
+    let redraw_nudge: Option<Box<dyn Fn() + Send>> = redraw_handle.cloned().map(|tx| {
+        let f: Box<dyn Fn() + Send> = Box::new(move || {
+            let _ = tx.try_send(());
+        });
+        f
+    });
+
+    // Run the passthrough on a blocking thread. The `PtyHandoffGuard` is acquired
+    // *inside* that thread (pausing the render loop + waiting for its ack) and
+    // dropped when the closure returns — on detach, child exit, error, OR panic —
+    // so the chat TUI is always restored. We move the session in for resize and
+    // post-exit reaping.
+    let handoff = Arc::clone(handoff);
+    let session_for_passthrough = session.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _guard = PtyHandoffGuard::acquire(handoff, redraw_nudge);
+        run_pty_passthrough(io, &session_for_passthrough)
+        // `_guard` drops here → render loop resumes + full redraw forced.
+    })
+    .await;
+
+    // Best-effort: terminate the child's process group so a detach (Ctrl-]) does
+    // not leave an interactive shell running headless with no way to see it.
+    // (If the child already exited this is a no-op.)
+    if let Err(e) = session.kill().await {
+        tracing::warn!(error = %e, seq, "failed to terminate PTY group after detach");
+    }
+
+    match outcome {
+        Ok(Ok(PtyExit::Detached)) => emit_chat_output(&format!("Detached from PTY session #{seq}.")),
+        Ok(Ok(PtyExit::ChildExited)) => emit_chat_output(&format!("Interactive PTY session #{seq} exited.")),
+        Ok(Err(e)) => emit_chat_output(&format!("PTY session #{seq} error: {e}")),
+        Err(e) => {
+            // The passthrough task panicked; the guard's Drop still ran during
+            // unwind, so the terminal is restored. Surface the fault.
+            tracing::error!(error = %e, seq, "PTY passthrough task panicked");
+            emit_chat_output(&format!("PTY session #{seq} ended unexpectedly; terminal restored."));
+        }
+    }
+}
+
+/// How an interactive PTY passthrough ended.
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyExit {
+    /// The user pressed `Ctrl-]`.
+    Detached,
+    /// The PTY child process exited on its own.
+    ChildExited,
+}
+
+/// Drive the raw terminal ⇄ PTY byte passthrough until detach or child exit.
+///
+/// Runs on a `spawn_blocking` thread with the chat render loop parked (the
+/// [`PtyHandoffGuard`] owned by the caller guarantees that). It owns the real
+/// terminal's `stdin`/`stdout` for the duration:
+///
+/// - a dedicated **reader thread** copies PTY output → `stdout` (so curses
+///   programs draw normally), signalling `child_done` on EOF (child exit);
+/// - this thread reads raw `stdin` with a short poll timeout, classifies each
+///   byte ([`crate::chat::sessions::pty::classify_input_byte`]) — `Ctrl-]`
+///   detaches, everything else (including `Ctrl-C`/`Ctrl-D`) is forwarded to the
+///   PTY writer — and rechecks `child_done` between polls so a child that exits
+///   while the user is idle still ends the passthrough promptly.
+///
+/// Never panics: all I/O errors are returned as `Err` (the guard still restores
+/// the terminal). The PTY writer is owned solely by this thread (synchronous
+/// `Write`, no lock, never across an `.await`).
+#[cfg(feature = "terminal-tui")]
+fn run_pty_passthrough(
+    io: crate::chat::sessions::pty::PtyIo,
+    session: &crate::chat::sessions::pty::PtyShellSession,
+) -> Result<PtyExit> {
+    use crate::chat::sessions::pty::{InputByte, classify_input_byte};
+    use std::io::{Read as _, Write as _};
+
+    let crate::chat::sessions::pty::PtyIo { mut reader, mut writer } = io;
+
+    // Clear the screen + home the cursor so the PTY child starts on a clean
+    // surface (the chat inline chrome was drawn at the bottom before the
+    // handoff). Best-effort: a failure here is non-fatal (the child will repaint
+    // its own UI), and the guard's post-handoff full redraw cleans up either way.
+    {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
+
+    // ── Reader thread: PTY output → stdout ───────────────────────────────────
+    let child_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let child_done_reader = Arc::clone(&child_done);
+    let reader_handle = std::thread::spawn(move || {
+        let mut buf = [0u8; 8192];
+        let mut out = std::io::stdout();
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) => break, // EOF: child exited / master closed
+                Ok(n) => {
+                    let chunk = buf.get(..n).unwrap_or(&buf);
+                    if out.write_all(chunk).is_err() || out.flush().is_err() {
+                        break; // stdout gone — nothing more we can do
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        child_done_reader.store(true, Ordering::Release);
+    });
+
+    // ── This thread: stdin → PTY writer, watching for detach + child exit ─────
+    let exit = pty_stdin_loop(&child_done, |byte| {
+        match classify_input_byte(byte) {
+            InputByte::Detach => Ok(true), // stop the loop (detach)
+            InputByte::Forward => {
+                writer.write_all(&[byte]).and_then(|()| writer.flush())?;
+                Ok(false)
+            }
+        }
+    })?;
+
+    // CRITICAL ordering for terminal safety: the reader thread may still be
+    // blocked in `reader.read()` and could write more PTY bytes to `stdout`. We
+    // MUST stop it before the `PtyHandoffGuard` resumes the chat render loop,
+    // otherwise lingering PTY output would scribble over the restored TUI.
+    //
+    // On detach the child is still alive, so synchronously terminate its group
+    // here (no async grace) to close the PTY master and make the reader see EOF.
+    // On child-exit the master is already closed, so this is a no-op.
+    if exit == PtyExit::Detached {
+        session.kill_now();
+    }
+    // Drop our writer so the slave end observes EOF too.
+    drop(writer);
+    // Join the reader thread: now that the master is closed it sees EOF and
+    // returns promptly, so by the time the guard drops (resuming the render
+    // loop) no other thread is writing to `stdout`.
+    let _ = reader_handle.join();
+    Ok(exit)
+}
+
+/// Read raw `stdin` byte-by-byte, invoking `on_byte` for each, until `on_byte`
+/// returns `Ok(true)` (detach) or `child_done` is observed (child exit).
+///
+/// Uses `libc::poll` on fd 0 with a 100 ms timeout so a child that exits while
+/// the user is idle ends the passthrough promptly (a blocking `read` alone would
+/// hang until the next keystroke). On non-Unix targets, where this `poll` is
+/// unavailable, it falls back to a plain blocking read (the child-exit-while-idle
+/// case is handled when the reader thread closes `stdin`'s peer; documented
+/// platform limitation, plan §v3 risk 3).
+///
+/// `on_byte` returns `Ok(true)` to stop (detach), `Ok(false)` to continue, or an
+/// `Err` to abort the passthrough (surfaced to the caller; the guard still
+/// restores the terminal).
+#[cfg(feature = "terminal-tui")]
+#[allow(unsafe_code)]
+fn pty_stdin_loop(
+    child_done: &Arc<std::sync::atomic::AtomicBool>,
+    mut on_byte: impl FnMut(u8) -> Result<bool>,
+) -> Result<PtyExit> {
+    use std::io::Read as _;
+
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 1024];
+
+    loop {
+        if child_done.load(Ordering::Acquire) {
+            return Ok(PtyExit::ChildExited);
+        }
+
+        // Wait (bounded) for stdin to be readable so we can re-check child exit.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let mut pfd = libc::pollfd {
+                fd: stdin.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll` reads/writes exactly the one `pollfd` we pass
+            // (`nfds = 1`); the pointer is to a live local, valid for the call.
+            // It dereferences nothing else and has no memory-safety
+            // preconditions. A 100 ms timeout bounds the wait.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, 100) };
+            if rc <= 0 {
+                // Timeout (0) or EINTR (<0): loop to re-check `child_done`.
+                continue;
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0 {
+                // stdin hung up with no data: treat as child-exit-equivalent.
+                return Ok(PtyExit::ChildExited);
+            }
+        }
+
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => return Ok(PtyExit::ChildExited), // stdin EOF
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::anyhow!("PTY stdin read failed: {e}")),
+        };
+        for &byte in buf.get(..n).unwrap_or(&buf) {
+            if on_byte(byte)? {
+                return Ok(PtyExit::Detached);
+            }
+        }
+    }
+}
+
 /// Inner body of [`spawn_tui_unified_loop`].
 ///
 /// **P3-inline architecture.** ratatui owns only a fixed-height inline
@@ -4197,6 +4530,7 @@ fn run_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
+    handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
@@ -4259,6 +4593,35 @@ fn run_tui_unified_loop(
                 frame.render_widget(ratatui::widgets::Clear, area);
             });
             return Ok(());
+        }
+
+        // ── 0. PTY terminal handoff (v3a) ─────────────────────────────
+        // While an interactive PTY session is attached, the chat owns NONE
+        // of the terminal: the main loop has handed raw stdin/stdout to the
+        // PTY passthrough. We must not touch `crossterm` (poll/read) or
+        // `terminal.draw`/`insert_before` here, or we would corrupt the
+        // PTY's full-screen output and steal its keystrokes. We park,
+        // acknowledge the park (so the handoff can deterministically know
+        // we are out of the way before it takes stdin), and re-check shortly.
+        if handoff.is_paused() {
+            handoff.ack_paused();
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        // Just resumed from a handoff: the PTY scribbled over the whole
+        // screen, so force a full clear + repaint to wipe its residue before
+        // resuming normal inline rendering.
+        if handoff.take_force_redraw() {
+            if let Err(e) = terminal.clear() {
+                tracing::warn!(error = %e, "post-PTY terminal clear failed");
+            }
+            // Re-materialise the inline viewport immediately.
+            if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
+                tracing::warn!(error = %e, "post-PTY redraw failed");
+            }
+            // Everything in scrollback was wiped by the PTY; re-push from the
+            // start so the conversation history is visible again.
+            last_pushed_idx = 0;
         }
 
         // ── 1. Flush newly-finalised conversation lines to scrollback ──
