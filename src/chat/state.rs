@@ -86,6 +86,14 @@ pub enum Effect {
         /// tools when in [`ChatMode::Plan`] and feed back a simulated
         /// "[plan mode] would call X" result instead of executing them.
         chat_mode: ChatMode,
+        /// D8-4 (redux path): the turn-root spawn execution context for this
+        /// turn (forwarded from `Action::StartLLMTurn`). The `EffectExecutor`
+        /// wraps `drive_start_turn_stream` in `SPAWN_EXECUTION_CONTEXT.scope(..)`
+        /// with this value so `sessions_spawn` tool calls inside the turn inherit
+        /// `parent_run_id = turn run_id` → origin = Model, mirroring the legacy
+        /// `run_tool_call_loop_traced` wrapper in `chat::run`. `None` → no scope
+        /// (sub-agents fall back to user origin, correct for non-turn callers).
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -561,7 +569,8 @@ impl ChatState {
                 draft_id,
                 history,
                 cancel,
-            } => self.reduce_start_llm_turn(draft_id, history, cancel),
+                turn_spawn_ctx,
+            } => self.reduce_start_llm_turn(draft_id, history, cancel, turn_spawn_ctx),
             Action::StreamChunkReceived {
                 draft_id,
                 delta,
@@ -913,6 +922,7 @@ impl ChatState {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -934,6 +944,7 @@ impl ChatState {
                 history,
                 cancel,
                 chat_mode,
+                turn_spawn_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -945,6 +956,7 @@ impl ChatState {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -966,6 +978,7 @@ impl ChatState {
                 history,
                 cancel,
                 chat_mode,
+                turn_spawn_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -3837,6 +3850,7 @@ mod tests {
                 draft_id: "draft-1".to_string(),
                 history,
                 cancel,
+                turn_spawn_ctx: None,
             });
 
             // 状态变更：draft + active_cancel + generating
@@ -3871,6 +3885,7 @@ mod tests {
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
                 cancel: cancel.clone(),
+                turn_spawn_ctx: None,
             });
             // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
             cancel.cancel();
@@ -3967,6 +3982,7 @@ mod tests {
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
                 cancel,
+                turn_spawn_ctx: None,
             });
             assert!(state.control.generating);
 

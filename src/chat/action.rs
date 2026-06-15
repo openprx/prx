@@ -103,6 +103,17 @@ pub enum Action {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        /// D8-4 (redux path): the turn-root spawn execution context seeded by
+        /// `chat::run` for this turn. Threaded through the reducer into
+        /// `Effect::StartTurn` so the Redux driver can `SPAWN_EXECUTION_CONTEXT
+        /// .scope(...)` its tool-call loop. Without this, sub-agents spawned via
+        /// `sessions_spawn` on the redux path see `parent_run_id = None` and are
+        /// mislabeled as user-originated instead of model-originated.
+        ///
+        /// `None` means "no turn-root context" (e.g. tests, or callers that do
+        /// not originate a chat turn) — sub-agents then fall back to user origin,
+        /// which is correct for non-turn paths such as the `/bg` slash command.
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     },
     /// 收到一个 streaming 增量块
     StreamChunkReceived {

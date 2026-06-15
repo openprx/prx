@@ -3323,11 +3323,25 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
             // S2.5 P1-A: 显式分支处理 dispatch_result（StartLLMTurn 失败必须 fall-through
             // 否则 notify_fut 永挂）；dispatch_or_log 同时埋点 + warn，无需重复 tracing.
+            // D8-4 (redux path real fix): seed the turn-root spawn execution
+            // context for this turn and hand it to the driver via StartLLMTurn →
+            // Effect::StartTurn. This is the redux mirror of the legacy
+            // `SPAWN_EXECUTION_CONTEXT.scope(seed_turn_context(turn_run_id, ..))`
+            // wrapper applied below at the legacy `run_tool_call_loop_traced` call
+            // — the redux path `continue`s before reaching it, so the seed must
+            // travel with the effect. Same `turn_run_id` + `chat_session_key`
+            // source as the legacy path (single source of truth) so a sub-agent
+            // spawned inside this turn inherits `parent_run_id = turn_run_id`.
+            let redux_turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                turn_run_id.clone(),
+                chat_session_key.clone(),
+            );
             let dispatch_result = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StartLLMTurn {
                     draft_id: d_id.clone(),
                     history: history.clone(),
                     cancel: cancellation.clone(),
+                    turn_spawn_ctx: Some(redux_turn_spawn_ctx),
                 },
                 "chat.start_llm_turn",
             );
