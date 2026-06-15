@@ -55,6 +55,11 @@ pub struct FinishedSession {
     pub run_id: String,
     /// What kind of session finished (agent vs shell), for the reflow label.
     pub kind: ManagedKind,
+    /// Who initiated the session (v5): operator (`/bg`/`/shell`/`/pty`) vs the
+    /// model (a mid-turn `sessions_spawn`). Carried so the persisted summary
+    /// fallback (when the live view is already gone) still records the correct
+    /// provenance.
+    pub origin: super::model::SessionOrigin,
     /// Terminal status (`Completed` / `Failed` / `Cancelled`).
     pub status: ManagedStatus,
     /// Result / failure text recorded by the run (the `Completed`/`Failed`
@@ -279,6 +284,7 @@ impl ChatSessionsHandle {
                 seq,
                 run_id: run.id.clone(),
                 kind: ManagedKind::Agent,
+                origin: super::model::SessionOrigin::from_parent_run_id(run.parent_run_id.as_ref()),
                 status,
                 summary,
             });
@@ -309,6 +315,8 @@ impl ChatSessionsHandle {
                 seq,
                 run_id: key,
                 kind: ManagedKind::Shell,
+                // Shells are always operator-initiated (`/shell`).
+                origin: super::model::SessionOrigin::User,
                 status,
                 summary,
             });

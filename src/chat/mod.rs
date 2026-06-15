@@ -300,12 +300,19 @@ fn format_reloaded_background_sessions(sessions: &[crate::chat::sessions::Persis
     out.push_str("[previous session — background task results (not resumed)]");
     for s in sessions {
         let summary = s.summary.trim();
+        // v5: tag model-spawned sessions so the recap distinguishes them from
+        // operator-initiated ones. User-initiated sessions stay untagged to keep
+        // the common case quiet (origin defaults to "user" for legacy blobs).
+        let origin_tag = if s.origin == "model" { " [model]" } else { "" };
         if summary.is_empty() {
-            out.push_str(&format!("\n  · {} #{} {} — {}", s.kind, s.seq, s.status, s.title));
+            out.push_str(&format!(
+                "\n  · {} #{}{} {} — {}",
+                s.kind, s.seq, origin_tag, s.status, s.title
+            ));
         } else {
             out.push_str(&format!(
-                "\n  · {} #{} {} — {}: {}",
-                s.kind, s.seq, s.status, s.title, summary
+                "\n  · {} #{}{} {} — {}: {}",
+                s.kind, s.seq, origin_tag, s.status, s.title, summary
             ));
         }
     }
@@ -1817,6 +1824,7 @@ pub async fn run(
                                 id: fin.run_id.clone(),
                                 seq: fin.seq,
                                 kind: fin.kind.as_str().to_string(),
+                                origin: fin.origin.as_str().to_string(),
                                 status: fin.status.as_str().to_string(),
                                 title: String::new(),
                                 summary: fin.summary.clone(),
@@ -6717,6 +6725,7 @@ mod v4_reload_recap_tests {
             id: id.to_string(),
             seq: 2,
             kind: "agent".to_string(),
+            origin: "user".to_string(),
             status: status.to_string(),
             title: title.to_string(),
             summary: body.to_string(),
@@ -6749,5 +6758,26 @@ mod v4_reload_recap_tests {
         // No trailing ": " when there is no summary body.
         assert!(out.contains("cancelled — task"));
         assert!(!out.contains("task: "));
+    }
+
+    #[test]
+    fn recap_tags_model_origin_and_leaves_user_untagged() {
+        // Bug-V5-2: the persisted origin must be visible on reload so the
+        // operator can tell which sessions the model started for itself.
+        let mut user = summary("a", "completed", "user task", "done");
+        user.origin = "user".to_string();
+        user.seq = 1;
+        let mut model = summary("b", "completed", "model task", "done");
+        model.origin = "model".to_string();
+        model.seq = 2;
+        let out = format_reloaded_background_sessions(&[user, model]);
+        assert!(
+            out.contains("#1 completed — user task"),
+            "user line stays untagged: {out}"
+        );
+        assert!(
+            out.contains("#2 [model] completed — model task"),
+            "model line is tagged: {out}"
+        );
     }
 }

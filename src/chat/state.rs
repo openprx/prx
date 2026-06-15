@@ -3307,6 +3307,7 @@ mod tests {
                 id: id.to_string(),
                 seq: 1,
                 kind: "agent".to_string(),
+                origin: "user".to_string(),
                 status: status.to_string(),
                 title: "task".to_string(),
                 summary: String::new(),

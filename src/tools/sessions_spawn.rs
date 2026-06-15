@@ -3277,6 +3277,64 @@ mod tests {
         assert_eq!(runs[0].task, "Some task");
     }
 
+    /// Bug-V5-1 regression: a `sessions_spawn` call made *inside* a turn-root
+    /// `SPAWN_EXECUTION_CONTEXT` scope (i.e. the model invoking the tool mid-turn)
+    /// must capture the per-turn run id as the child's `parent_run_id`. The
+    /// capture is synchronous — read at the top of `execute`, **before** any
+    /// `tokio::spawn` — so the task-local is always present when read and never
+    /// lost across the spawn boundary. The chat `/sessions` projection reads this
+    /// `Some(parent)` as model-origin (see `SessionOrigin::from_parent_run_id`,
+    /// asserted in the chat-side `model.rs` tests, which can reach that module).
+    #[tokio::test]
+    async fn model_spawn_within_turn_scope_captures_parent_run_id() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        let result = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext::seed_turn_context("turn-run-xyz".to_string(), "chat:session-1".to_string()),
+                async { tool.execute(with_spawn_grant(json!({"task": "model child"}))).await },
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "spawn inside a turn scope must succeed");
+
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(
+            child.parent_run_id.as_deref(),
+            Some("turn-run-xyz"),
+            "child captured the per-turn run id as parent before the spawn boundary (=> model origin)"
+        );
+    }
+
+    /// Bug-V5-1 complement: a `sessions_spawn` call made with **no**
+    /// `SPAWN_EXECUTION_CONTEXT` in scope (the operator `/bg` slash-command path,
+    /// dispatched outside the turn tool-loop scope) carries no `parent_run_id`,
+    /// which the chat projection reads as user-origin.
+    #[tokio::test]
+    async fn user_spawn_without_scope_has_no_parent_run_id() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        // No `.scope(...)` wrapper: the task-local is absent, exactly as on the
+        // operator slash-command path.
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "operator child"})))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(
+            child.parent_run_id, None,
+            "no spawn-execution context means no parent_run_id (=> user origin)"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_action_obeys_readonly_resource_gate() {
         let (ch, _) = RecordingChannel::new();

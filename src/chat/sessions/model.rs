@@ -153,6 +153,16 @@ pub struct PersistedSessionSummary {
     pub seq: u64,
     /// Session kind label (`agent` / `shell` / `pty`).
     pub kind: String,
+    /// Provenance label (`user` / `model`), so reload recap can still
+    /// distinguish operator-initiated sessions from model-spawned sub-agents
+    /// (v5). Stored as a stable lowercase string (the [`SessionOrigin::as_str`]
+    /// vocabulary) for the same format-decoupling reason as `kind` / `status`.
+    ///
+    /// `#[serde(default)]` keeps pre-v5 persisted blobs (which lack this field)
+    /// loadable: a missing `origin` defaults to `"user"`, the conservative
+    /// assumption for legacy summaries (operator-initiated).
+    #[serde(default = "default_origin")]
+    pub origin: String,
     /// Final status label. One of `completed` / `failed` / `cancelled` /
     /// `interrupted` (the latter is the v4 sentinel for a session that was
     /// still `running` when the chat session was persisted).
@@ -170,6 +180,14 @@ pub struct PersistedSessionSummary {
 /// its owning chat session was persisted. Reload presents it as a terminal,
 /// non-revivable state (the live process is gone).
 pub const STATUS_INTERRUPTED: &str = "interrupted";
+
+/// Serde default for [`PersistedSessionSummary::origin`]: a pre-v5 blob without
+/// the field is treated as operator-initiated (`"user"`), the conservative
+/// assumption matching the legacy behaviour where only `/bg`/`/shell`/`/pty`
+/// existed.
+fn default_origin() -> String {
+    SessionOrigin::User.as_str().to_string()
+}
 
 impl PersistedSessionSummary {
     /// Build a persisted summary from a [`ManagedSessionView`] and an optional
@@ -189,6 +207,7 @@ impl PersistedSessionSummary {
             id: view.id.as_str().to_string(),
             seq: view.seq,
             kind: view.kind.as_str().to_string(),
+            origin: view.origin.as_str().to_string(),
             status,
             title: view.title.clone(),
             summary: summary.into(),
@@ -437,6 +456,60 @@ mod tests {
         let json = serde_json::to_string(&original).expect("test: serialize");
         let restored: PersistedSessionSummary = serde_json::from_str(&json).expect("test: deserialize");
         assert_eq!(restored, original);
+    }
+
+    fn view_with_origin(origin: SessionOrigin) -> ManagedSessionView {
+        ManagedSessionView {
+            id: SessionId::from_run_id("run-o"),
+            seq: 7,
+            kind: ManagedKind::Agent,
+            origin,
+            title: "model child".to_string(),
+            status: ManagedStatus::Completed,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn from_view_carries_origin_label() {
+        // Bug-V5-2: from_view must persist the view's provenance so reload recap
+        // can still distinguish model-spawned from operator-initiated sessions.
+        let model = PersistedSessionSummary::from_view(&view_with_origin(SessionOrigin::Model), "done");
+        assert_eq!(model.origin, "model");
+        let user = PersistedSessionSummary::from_view(&view_with_origin(SessionOrigin::User), "done");
+        assert_eq!(user.origin, "user");
+    }
+
+    #[test]
+    fn persisted_summary_origin_round_trip() {
+        // Bug-V5-2: a model-origin summary survives a serialize/deserialize cycle.
+        let original = PersistedSessionSummary::from_view(&view_with_origin(SessionOrigin::Model), "done");
+        assert_eq!(original.origin, "model");
+        let json = serde_json::to_string(&original).expect("test: serialize");
+        let restored: PersistedSessionSummary = serde_json::from_str(&json).expect("test: deserialize");
+        assert_eq!(restored, original);
+        assert_eq!(restored.origin, "model");
+    }
+
+    #[test]
+    fn persisted_summary_legacy_blob_without_origin_defaults_to_user() {
+        // Bug-V5-2 backward compat: a pre-v5 persisted blob has no `origin` field.
+        // It must deserialize (not error) and default the field to "user".
+        let legacy = r#"{
+            "id": "run-legacy",
+            "seq": 1,
+            "kind": "agent",
+            "status": "completed",
+            "title": "old task",
+            "summary": "old body",
+            "created_at": "2024-01-01T00:00:00Z"
+        }"#;
+        let restored: PersistedSessionSummary =
+            serde_json::from_str(legacy).expect("test: legacy blob without origin must still deserialize");
+        assert_eq!(restored.origin, "user");
+        assert_eq!(restored.id, "run-legacy");
+        assert_eq!(restored.kind, "agent");
     }
 
     #[test]

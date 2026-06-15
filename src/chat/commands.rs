@@ -73,7 +73,10 @@ const HELP_TEXT: &str = "Available commands:
   /auto              Switch to auto mode (no approval prompts)
   /bg <task>         Run a task as a background agent session
   /sessions          List background sessions
+  /shell <command>   Run a command as a background shell session
+  /pty <command>     Open an interactive PTY shell (full terminal handoff)
   /attach <id>       Show a background session's recent output (read-only)
+  /logs <id>         Dump a background session's buffered output (last 200 lines)
   /steer <id> <msg>  Send a steering instruction to a background session
   /kill <id>         Stop a background session
   /quit /exit        Exit chat";
@@ -505,6 +508,29 @@ mod mode_tests {
         match r {
             CommandResult::HandledWithOutput(s) => assert_eq!(s, "hello"),
             _ => panic!("expected HandledWithOutput variant"),
+        }
+    }
+
+    #[test]
+    fn help_text_lists_session_commands_including_logs() {
+        // v5 regression: `/logs` and `/pty` are implemented and parsed but were
+        // missing from `/help`, leading an operator to believe `/logs` did not
+        // exist. The help surface must advertise the full session command family.
+        for cmd in [
+            "/bg",
+            "/sessions",
+            "/shell",
+            "/pty",
+            "/attach",
+            "/logs",
+            "/steer",
+            "/kill",
+        ] {
+            assert!(
+                super::HELP_TEXT.contains(cmd),
+                "/help must list {cmd}: {}",
+                super::HELP_TEXT
+            );
         }
     }
 
