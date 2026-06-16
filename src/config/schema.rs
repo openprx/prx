@@ -281,6 +281,10 @@ pub struct Config {
     #[serde(default)]
     pub router: RouterConfig,
 
+    /// Smart group-reply pre-gate configuration (`[smart_group]`).
+    #[serde(default)]
+    pub smart_group: SmartGroupConfig,
+
     /// Heartbeat configuration for periodic health pings (`[heartbeat]`).
     #[serde(default)]
     pub heartbeat: HeartbeatConfig,
@@ -432,6 +436,7 @@ impl std::fmt::Debug for Config {
             .field("query_classification", &self.query_classification)
             .field("task_routing", &self.task_routing)
             .field("router", &self.router)
+            .field("smart_group", &self.smart_group)
             .field("heartbeat", &self.heartbeat)
             .field("xin", &self.xin)
             .field("cron", &self.cron)
@@ -3916,6 +3921,98 @@ impl GroupReplyMode {
     }
 }
 
+const fn default_pre_gate_enabled() -> bool {
+    true
+}
+
+const fn default_pre_gate_classifier_timeout_secs() -> u64 {
+    5
+}
+
+const fn default_pre_gate_classifier_temperature() -> f64 {
+    0.0
+}
+
+const fn default_pre_gate_max_context_messages() -> usize {
+    3
+}
+
+/// Token-saving pre-gate for smart group-reply (`[smart_group]`).
+///
+/// The pre-gate runs *before* the full agent loop for smart-mode group messages
+/// that do NOT explicitly @-mention the bot. It cheaply triages each such
+/// message into one of three buckets via a 0-token heuristic:
+///   - clearly relevant  → enter the loop,
+///   - obvious noise      → stay silent (skip the loop entirely),
+///   - uncertain          → ask a cheap-tier classifier model for a yes/no.
+///
+/// @-mentions, DMs, and non-smart modes NEVER reach the pre-gate. The pre-gate
+/// is fail-open: any classifier error/timeout enters the loop (it must never
+/// silently drop a message that should have been answered).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SmartGroupConfig {
+    /// Master switch for the pre-gate. Default: `true`. Even when enabled the
+    /// pre-gate only affects smart-mode group messages, which are themselves
+    /// opt-in, so the safe default is on. When disabled, every smart group
+    /// message enters the full loop (the pre-MVP-B "always enter loop" behavior).
+    #[serde(default = "default_pre_gate_enabled")]
+    pub enabled: bool,
+    /// Whether the Tier-2 cheap-model classifier is consulted for the
+    /// "uncertain" heuristic bucket. Default: `true`. When `false`, uncertain
+    /// messages enter the loop directly (fail-open / err-toward-entering),
+    /// trading some token savings for zero classifier latency.
+    #[serde(default = "default_pre_gate_enabled")]
+    pub classifier_enabled: bool,
+    /// Provider id/alias for the Tier-2 classifier. When empty, the channel's
+    /// own routed provider is reused (no extra provider construction).
+    #[serde(default)]
+    pub classifier_provider: String,
+    /// Model id for the Tier-2 classifier. When empty, the channel's routed
+    /// model is reused. Set this to a cheap-tier model id (e.g. one listed in
+    /// `router.automix.cheap_model_tiers`) to minimize cost.
+    #[serde(default)]
+    pub classifier_model: String,
+    /// Per-call timeout (seconds) for the Tier-2 classifier. On timeout the
+    /// pre-gate fails open (enters the loop). Default: `5`.
+    #[serde(default = "default_pre_gate_classifier_timeout_secs")]
+    pub classifier_timeout_secs: u64,
+    /// Sampling temperature for the classifier call. Default: `0.0` (the
+    /// decision should be deterministic).
+    #[serde(default = "default_pre_gate_classifier_temperature")]
+    pub classifier_temperature: f64,
+    /// How many recent conversation turns to feed the classifier as context.
+    /// Default: `3`. Bounded to keep the classifier prompt (and cost) tiny.
+    #[serde(default = "default_pre_gate_max_context_messages")]
+    pub classifier_max_context_messages: usize,
+}
+
+impl Default for SmartGroupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_pre_gate_enabled(),
+            classifier_enabled: default_pre_gate_enabled(),
+            classifier_provider: String::new(),
+            classifier_model: String::new(),
+            classifier_timeout_secs: default_pre_gate_classifier_timeout_secs(),
+            classifier_temperature: default_pre_gate_classifier_temperature(),
+            classifier_max_context_messages: default_pre_gate_max_context_messages(),
+        }
+    }
+}
+
+impl SmartGroupConfig {
+    /// Validate numeric ranges. Called from [`Config`] validation.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if !(0.0..=2.0).contains(&self.classifier_temperature) {
+            anyhow::bail!("smart_group.classifier_temperature must be in [0,2]");
+        }
+        if self.classifier_timeout_secs == 0 {
+            anyhow::bail!("smart_group.classifier_timeout_secs must be > 0");
+        }
+        Ok(())
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 /// Cron job configuration (`[cron]` section).
@@ -4996,6 +5093,7 @@ impl Default for Config {
             embedding_routes: Vec::new(),
             task_routing: TaskRoutingConfig::default(),
             router: RouterConfig::default(),
+            smart_group: SmartGroupConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             xin: crate::xin::XinConfig::default(),
             cron: CronConfig::default(),
@@ -5609,6 +5707,9 @@ impl Config {
         // validated at all; wire it into the top-level validator.
         self.memory.validate()?;
 
+        // Smart group-reply pre-gate numeric ranges.
+        self.smart_group.validate()?;
+
         Ok(())
     }
 
@@ -6060,6 +6161,7 @@ min_chars = 12
             query_classification: QueryClassificationConfig::default(),
             task_routing: TaskRoutingConfig::default(),
             router: RouterConfig::default(),
+            smart_group: SmartGroupConfig::default(),
             heartbeat: HeartbeatConfig {
                 enabled: true,
                 interval_minutes: 15,
@@ -6349,6 +6451,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             query_classification: QueryClassificationConfig::default(),
             task_routing: TaskRoutingConfig::default(),
             router: RouterConfig::default(),
+            smart_group: SmartGroupConfig::default(),
             heartbeat: HeartbeatConfig::default(),
             xin: crate::xin::XinConfig::default(),
             cron: CronConfig::default(),
@@ -8205,6 +8308,47 @@ allowed_from = ["*"]
         // None => derive from legacy mention_only, preserving prior behavior.
         assert_eq!(GroupReplyMode::resolve(None, true), GroupReplyMode::MentionOnly);
         assert_eq!(GroupReplyMode::resolve(None, false), GroupReplyMode::Off);
+    }
+
+    #[test]
+    async fn smart_group_config_defaults_and_validation() {
+        let cfg = SmartGroupConfig::default();
+        // Pre-gate defaults to ON (only affects opt-in smart mode).
+        assert!(cfg.enabled);
+        assert!(cfg.classifier_enabled);
+        assert!(cfg.classifier_provider.is_empty());
+        assert!(cfg.classifier_model.is_empty());
+        assert_eq!(cfg.classifier_timeout_secs, 5);
+        assert_eq!(cfg.classifier_max_context_messages, 3);
+        cfg.validate().expect("default smart_group config is valid");
+
+        // Out-of-range temperature and zero timeout are rejected.
+        let mut bad = SmartGroupConfig::default();
+        bad.classifier_temperature = 3.0;
+        assert!(bad.validate().is_err());
+        let mut bad_timeout = SmartGroupConfig::default();
+        bad_timeout.classifier_timeout_secs = 0;
+        assert!(bad_timeout.validate().is_err());
+    }
+
+    #[test]
+    async fn smart_group_config_parses_from_toml() {
+        let toml = r#"
+default_temperature = 0.7
+
+[smart_group]
+enabled = true
+classifier_enabled = false
+classifier_provider = "ollama"
+classifier_model = "qwen2.5:3b"
+classifier_timeout_secs = 8
+"#;
+        let cfg: Config = toml::from_str(toml).expect("parse smart_group toml");
+        assert!(cfg.smart_group.enabled);
+        assert!(!cfg.smart_group.classifier_enabled);
+        assert_eq!(cfg.smart_group.classifier_provider, "ollama");
+        assert_eq!(cfg.smart_group.classifier_model, "qwen2.5:3b");
+        assert_eq!(cfg.smart_group.classifier_timeout_secs, 8);
     }
 
     #[test]

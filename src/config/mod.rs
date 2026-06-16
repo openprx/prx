@@ -17,7 +17,7 @@ pub use schema::{
     NodesConfig, ObservabilityConfig, OsPagingConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
     ReliabilityConfig, RemoteNodeConfig, ResourceLimitsConfig, RetrievalInjectionRole, RouterConfig, RouterModelConfig,
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig,
-    SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, StorageConfig,
+    SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
     TaskRoutingRule, TelegramConfig, ToolPolicyConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig,
     WebSearchConfig, WebhookConfig, apply_runtime_proxy_to_builder, build_runtime_proxy_client,
