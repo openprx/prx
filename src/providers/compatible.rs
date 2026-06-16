@@ -237,6 +237,38 @@ impl OpenAiCompatibleProvider {
         }
     }
 
+    /// Returns `true` when this provider is a Kimi/Moonshot endpoint.
+    ///
+    /// Kimi's coding API (`api.kimi.com`) only accepts `temperature == 1`; any
+    /// other value causes a 400 "invalid temperature: only 1 is allowed" error.
+    /// Detection is based on the configured `base_url` so it is stable across
+    /// provider name variants (`kimi-code`, `kimi_coding`, `kimi_for_coding`).
+    fn is_kimi_provider(&self) -> bool {
+        self.base_url.to_ascii_lowercase().contains("kimi.com")
+    }
+
+    /// Clamp `temperature` to the value the provider actually accepts.
+    ///
+    /// Kimi Code (`api.kimi.com`) rejects any `temperature` other than `1.0`
+    /// with HTTP 400 "invalid temperature: only 1 is allowed". This helper
+    /// overrides the caller-supplied value for Kimi endpoints and logs a
+    /// one-shot `debug` message so the override is observable without being
+    /// noisy in normal runs.
+    fn effective_temperature(&self, requested: f64) -> f64 {
+        if self.is_kimi_provider() {
+            if (requested - 1.0_f64).abs() > f64::EPSILON {
+                tracing::debug!(
+                    provider = %self.name,
+                    requested_temperature = requested,
+                    "Kimi API only accepts temperature=1; overriding requested value"
+                );
+            }
+            1.0_f64
+        } else {
+            requested
+        }
+    }
+
     #[cfg(test)]
     fn tool_specs_to_openai_format(tools: &[crate::tools::ToolSpec]) -> Vec<serde_json::Value> {
         tools
@@ -1361,7 +1393,7 @@ impl OpenAiCompatibleProvider {
         NativeChatRequest {
             model: model.to_string(),
             messages: Self::convert_messages_for_native(&effective_messages),
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(options.enabled),
             tools,
             tool_choice,
@@ -1492,7 +1524,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1606,7 +1638,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(false),
             tools: None,
             tool_choice: None,
@@ -1706,7 +1738,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages: api_messages,
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(false),
             tools: if tools.is_empty() { None } else { Some(tools.to_vec()) },
             tool_choice: if tools.is_empty() {
@@ -1802,7 +1834,7 @@ impl Provider for OpenAiCompatibleProvider {
         let native_request = NativeChatRequest {
             model: model.to_string(),
             messages: native_messages,
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(false),
             tool_choice: tools.as_ref().map(|_| "auto".to_string()),
             tools,
@@ -1937,7 +1969,7 @@ impl Provider for OpenAiCompatibleProvider {
         let request = ApiChatRequest {
             model: model.to_string(),
             messages,
-            temperature,
+            temperature: self.effective_temperature(temperature),
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
@@ -2612,7 +2644,9 @@ mod tests {
         let serialized_messages = value["messages"].as_array().unwrap();
 
         assert_eq!(value["model"], "kimi-k2");
-        assert_eq!(value["temperature"], 0.3);
+        // Kimi API only accepts temperature=1; the effective_temperature() override
+        // must clamp the caller-supplied 0.3 to 1.0 before serializing.
+        assert_eq!(value["temperature"], 1.0);
         assert_eq!(value["stream"], true);
         assert_eq!(serialized_messages.len(), 4);
         assert_eq!(serialized_messages[0]["role"], "system");
@@ -3359,5 +3393,57 @@ mod tests {
         assert_eq!(emitted2[0].id, "call_x");
         assert_eq!(emitted2[0].status, ToolCallChunkStatus::Streaming);
         assert_eq!(emitted2[0].arguments_delta.as_deref(), Some(""));
+    }
+
+    // ---------------------------------------------------------------
+    // is_kimi_provider / effective_temperature
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn kimi_code_base_url_detected_as_kimi_provider() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent(
+            "Kimi Code",
+            "https://api.kimi.com/coding/v1",
+            Some("fake-key"),
+            AuthStyle::Bearer,
+            "KimiCLI/0.77",
+        );
+        assert!(
+            p.is_kimi_provider(),
+            "api.kimi.com base URL must be detected as Kimi provider"
+        );
+    }
+
+    #[test]
+    fn non_kimi_provider_not_detected_as_kimi() {
+        let p = make_provider("Venice", "https://api.venice.ai", Some("key"));
+        assert!(!p.is_kimi_provider());
+        let p2 = make_provider("OpenAI", "https://api.openai.com", Some("key"));
+        assert!(!p2.is_kimi_provider());
+    }
+
+    #[test]
+    fn effective_temperature_kimi_always_returns_one() {
+        let p = OpenAiCompatibleProvider::new_with_user_agent(
+            "Kimi Code",
+            "https://api.kimi.com/coding/v1",
+            Some("fake-key"),
+            AuthStyle::Bearer,
+            "KimiCLI/0.77",
+        );
+        // Default prx temperature (0.7) must be overridden to 1.0.
+        assert!((p.effective_temperature(0.7) - 1.0_f64).abs() < f64::EPSILON);
+        // Explicitly set 0.0 must also be overridden.
+        assert!((p.effective_temperature(0.0) - 1.0_f64).abs() < f64::EPSILON);
+        // Already-1.0 passes through unchanged.
+        assert!((p.effective_temperature(1.0) - 1.0_f64).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn effective_temperature_non_kimi_passes_through() {
+        let p = make_provider("Venice", "https://api.venice.ai", Some("key"));
+        assert!((p.effective_temperature(0.7) - 0.7_f64).abs() < f64::EPSILON);
+        assert!((p.effective_temperature(0.0) - 0.0_f64).abs() < f64::EPSILON);
+        assert!((p.effective_temperature(2.0) - 2.0_f64).abs() < f64::EPSILON);
     }
 }
