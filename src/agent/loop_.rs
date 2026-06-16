@@ -155,6 +155,54 @@ impl std::fmt::Debug for SpawnEventSink {
     }
 }
 
+/// A crate-library-level factory that mints a per-run [`ApprovalResolver`] for a
+/// background sub-agent (used by `tools::sessions_spawn`).
+///
+/// Mirrors the [`SpawnEventSink`] inversion-of-control: `sessions_spawn` is a
+/// *library* module and must not depend on `chat`, so the binary constructs the
+/// resolver factory (capturing the chat-side event channel + decision registry)
+/// and the library only invokes it. The factory is called at most once per
+/// spawned task-mode run, with that run's id, so the returned resolver can tag
+/// its NeedsInput event / registry update with the correct [`SessionId`].
+///
+/// **Behaviour-preserving for non-chat callers:** only the chat `/bg` path
+/// (which already attaches a [`SpawnEventSink`]) attaches a factory. The
+/// channels / gateway spawn paths attach `None`, so their background sub-agents
+/// keep the historical auto-fail-on-gate behaviour (no human suspension).
+#[derive(Clone)]
+pub(crate) struct SpawnApprovalResolverFactory {
+    #[allow(clippy::type_complexity)]
+    factory: Arc<dyn Fn(&str) -> Arc<dyn ApprovalResolver> + Send + Sync>,
+}
+
+impl SpawnApprovalResolverFactory {
+    /// Build a factory from a per-run resolver constructor.
+    // Constructed by the binary crate's `chat::sessions::approval`
+    // (`build_resolver_factory`); the library only invokes the factory, so a
+    // `--lib`-only build cannot see the constructor's call site.
+    #[allow(dead_code)]
+    pub(crate) fn new<F>(factory: F) -> Self
+    where
+        F: Fn(&str) -> Arc<dyn ApprovalResolver> + Send + Sync + 'static,
+    {
+        Self {
+            factory: Arc::new(factory),
+        }
+    }
+
+    /// Mint the [`ApprovalResolver`] for one run.
+    #[must_use]
+    pub(crate) fn resolver_for(&self, run_id: &str) -> Arc<dyn ApprovalResolver> {
+        (self.factory)(run_id)
+    }
+}
+
+impl std::fmt::Debug for SpawnApprovalResolverFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnApprovalResolverFactory")
+    }
+}
+
 /// Context for scope-based tool access control.
 /// When present, `run_tool_call_loop` will check each tool call against
 /// the security policy's scope rules before execution.
@@ -4058,7 +4106,7 @@ impl ToolLoopOutcome {
     /// to its inner string. The non-`Text` variants are unreachable on those
     /// paths in phase 0; they collapse to an empty string defensively rather
     /// than panicking, so introducing them later cannot crash a legacy caller.
-    fn into_text(self) -> String {
+    pub(crate) fn into_text(self) -> String {
         match self {
             Self::Text(text) => text,
             Self::Silent { reason } => {
@@ -4100,9 +4148,10 @@ pub(crate) struct AwaitingApproval {
 }
 
 /// Decision returned by an [`ApprovalResolver`] for a pending tool call.
-// Phase-0 scaffolding: constructed only on the resolver path in
-// `execute_tool_call_serial`, which no caller exercises yet (every path threads
-// a `None` resolver). Allowed until phase 1 supplies a resolver.
+// The variants are *consumed* in the library (the resolver match in
+// `execute_tool_call_serial`) but only *constructed* by the binary crate's chat
+// approval path + `/approve`/`/deny` handler, so a `--lib`-only build sees them
+// as never-constructed.
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum ApprovalDecision {
@@ -4122,11 +4171,10 @@ pub(crate) enum ApprovalDecision {
 /// CLI prompt / implicit deny. This is the seam phase 1 uses to drive
 /// TUI approval cards / suspended-turn resumption.
 ///
-/// **Behavior-preserving in phase 0:** no caller supplies a resolver yet (every
-/// execution path threads `None`), so the existing `SideEffectGate` / CLI-prompt
-/// behavior runs unchanged. The trait merely defines the contract and is wired
-/// to the call site so phase 1 can opt in without re-plumbing.
-#[allow(dead_code)]
+/// **Behavior-preserving for non-opt-in callers:** a caller that threads `None`
+/// keeps the existing `SideEffectGate` / CLI-prompt behavior. Only the chat
+/// `/bg` background path supplies a resolver (to suspend on the approval gate);
+/// channels / gateway keep `None`.
 #[async_trait::async_trait]
 pub(crate) trait ApprovalResolver: Send + Sync {
     /// Resolve an approval decision for a tool call that

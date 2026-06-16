@@ -122,6 +122,9 @@ impl Tool for SessionsListTool {
             .map(|r| {
                 let status = match &r.status {
                     SubAgentStatus::Running => "🔄 running".to_string(),
+                    SubAgentStatus::AwaitingInput { prompt } => {
+                        format!("❓ awaiting approval: {prompt}")
+                    }
                     SubAgentStatus::Completed(msg) => {
                         let preview = msg.chars().take(60).collect::<String>();
                         let ellipsis = if msg.len() > 60 { "…" } else { "" };

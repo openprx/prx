@@ -9,9 +9,7 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{
-    DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig, run_tool_call_loop,
-};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -50,6 +48,14 @@ const PROCESS_MEMORY_STRATEGY_HYBRID: &str = "hybrid";
 #[derive(Debug, Clone)]
 pub enum SubAgentStatus {
     Running,
+    /// The run suspended on a tool call that requires an operator approval
+    /// decision (NeedsInput). `prompt` is a short human-readable description of
+    /// what is awaiting approval. This is a reversible, non-terminal state: once
+    /// the operator decides (`/approve` / `/deny`) or the approval times out, the
+    /// run returns to [`Running`](Self::Running) (or fails) and continues.
+    AwaitingInput {
+        prompt: String,
+    },
     Completed(String),
     Failed(String),
 }
@@ -254,13 +260,21 @@ fn spawn_lineage(
 
 fn running_run_count(runs: &[SubAgentRun]) -> usize {
     runs.iter()
-        .filter(|run| matches!(run.status, SubAgentStatus::Running))
+        // A suspended (AwaitingInput) run is still live — it holds a concurrency
+        // slot until it resumes or is killed/times out — so it counts here.
+        .filter(|run| {
+            matches!(
+                run.status,
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
+            )
+        })
         .count()
 }
 
 const fn status_label(status: &SubAgentStatus) -> &'static str {
     match status {
         SubAgentStatus::Running => "running",
+        SubAgentStatus::AwaitingInput { .. } => "awaiting-input",
         SubAgentStatus::Completed(_) => "completed",
         SubAgentStatus::Failed(_) => "failed",
     }
@@ -314,6 +328,12 @@ pub struct SessionsSpawnTool {
     /// ring buffers (v1.1a). When `None` (channels/gateway path), spawns stay
     /// silent — zero behaviour change for those callers.
     event_sink: Option<SpawnEventSink>,
+    /// Optional approval resolver factory. When set (chat `/bg` path only), a
+    /// task-mode sub-agent that hits the supervised approval gate **suspends**
+    /// (NeedsInput) awaiting an operator `/approve` / `/deny` decision instead of
+    /// auto-failing. When `None` (channels/gateway path, or chat without the
+    /// factory) the historical auto-fail-on-gate semantics are preserved.
+    approval_resolver_factory: Option<crate::agent::loop_::SpawnApprovalResolverFactory>,
 }
 
 impl SessionsSpawnTool {
@@ -402,6 +422,7 @@ impl SessionsSpawnTool {
             memory: None,
             event_recording: MemoryEventRecording::default(),
             event_sink: None,
+            approval_resolver_factory: None,
         }
     }
 
@@ -414,6 +435,25 @@ impl SessionsSpawnTool {
     #[must_use]
     pub fn with_event_sink(mut self, sink: SpawnEventSink) -> Self {
         self.event_sink = Some(sink);
+        self
+    }
+
+    /// Attach a [`SpawnApprovalResolverFactory`](crate::agent::loop_::SpawnApprovalResolverFactory)
+    /// so a task-mode sub-agent that hits the supervised approval gate suspends
+    /// (NeedsInput) awaiting an operator decision instead of auto-failing.
+    ///
+    /// Only the chat `/bg` path sets this; channels/gateway leave it `None` and
+    /// keep the historical auto-fail-on-gate semantics (no human is present to
+    /// approve, so suspending would only create a zombie).
+    // Called only by the binary crate's `chat::run` (the sole NeedsInput
+    // opt-in), which is not part of a `--lib` build.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_approval_resolver_factory(
+        mut self,
+        factory: crate::agent::loop_::SpawnApprovalResolverFactory,
+    ) -> Self {
+        self.approval_resolver_factory = Some(factory);
         self
     }
 
@@ -570,6 +610,7 @@ async fn record_spawn_result_event(
     let (success, error) = match status {
         SubAgentStatus::Completed(_) => (true, None),
         SubAgentStatus::Running => (false, Some("still running".to_string())),
+        SubAgentStatus::AwaitingInput { prompt } => (false, Some(format!("awaiting approval: {prompt}"))),
         SubAgentStatus::Failed(error) => (false, Some(error.clone())),
     };
     if let Err(error) = fabric
@@ -1251,6 +1292,14 @@ impl Tool for SessionsSpawnTool {
         // background agent only ever `.send().await`s onto these; the drainer
         // continuously empties them, so the agent never back-pressures.
         let run_event_streams = self.event_sink.as_ref().map(|sink| sink.streams_for(&run_id));
+        // NeedsInput (chat `/bg` only): mint this run's approval resolver so a
+        // supervised gate hit suspends awaiting an operator decision instead of
+        // auto-failing. `None` everywhere else (channels/gateway) preserves the
+        // historical auto-fail-on-gate semantics.
+        let run_approval_resolver = self
+            .approval_resolver_factory
+            .as_ref()
+            .map(|factory| factory.resolver_for(&run_id));
         let task_owned = task.to_string();
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
@@ -1330,6 +1379,7 @@ impl Tool for SessionsSpawnTool {
                 task_memory,
                 run_on_delta,
                 run_on_tool,
+                run_approval_resolver,
             );
             // `timeout_secs == 0` means "no timeout" — run until natural
             // completion. This matches the session-worker semantics in
@@ -1465,6 +1515,9 @@ impl SessionsSpawnTool {
             .map(|r| {
                 let status = match &r.status {
                     SubAgentStatus::Running => "🔄 running".to_string(),
+                    SubAgentStatus::AwaitingInput { prompt } => {
+                        format!("❓ awaiting approval: {prompt}")
+                    }
                     SubAgentStatus::Completed(msg) => {
                         let preview = msg.chars().take(60).collect::<String>();
                         let ellipsis = if msg.len() > 60 { "…" } else { "" };
@@ -1494,7 +1547,10 @@ impl SessionsSpawnTool {
             let mut runs = self.active_runs.write().await;
             if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
                 match &run.status {
-                    SubAgentStatus::Running => {
+                    // A live run (executing) or one suspended awaiting approval
+                    // (NeedsInput) is killable: aborting the task tears down the
+                    // suspended approval resolver's pending await along with it.
+                    SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                         let operation_name = format!("sessions_spawn:kill:{run_id}");
                         if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
                             self.name(),
@@ -1579,6 +1635,7 @@ impl SessionsSpawnTool {
         if entries.is_empty() {
             let status = match &run.status {
                 SubAgentStatus::Running => "still running, no history captured yet",
+                SubAgentStatus::AwaitingInput { .. } => "awaiting approval, no history captured yet",
                 SubAgentStatus::Completed(_) => "completed but history is empty",
                 SubAgentStatus::Failed(_) => "failed, history may be incomplete",
             };
@@ -1628,7 +1685,12 @@ impl SessionsSpawnTool {
             };
 
             match &run.status {
-                SubAgentStatus::Running => {
+                // A suspended (AwaitingInput) run still owns a live steer channel;
+                // a plain steer cancels the inner loop (tearing down the pending
+                // approval await) and re-injects the operator's message as a new
+                // turn, exactly as for a running session. Structured approval
+                // decisions go through `/approve` / `/deny` instead.
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                     let Some(ref tx) = run.steer_tx else {
                         return Ok(ToolResult {
                             success: false,
@@ -2059,6 +2121,7 @@ async fn run_sub_agent_task(
     memory: Option<Arc<dyn Memory>>,
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
+    approval_resolver: Option<Arc<dyn crate::agent::loop_::ApprovalResolver>>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -2126,6 +2189,12 @@ async fn run_sub_agent_task(
         // by `silent`, so the event bridge streams to the drainer either way.
         let on_delta_iter = on_delta.clone();
         let on_tool_call_iter = on_tool_call.clone();
+        // NeedsInput: clone the per-run resolver for this iteration. When present
+        // (chat `/bg` only), a supervised `ApprovalManager` is built so the loop
+        // consults the resolver at the approval decision point (suspend-on-gate).
+        // When absent (channels/gateway), no manager + no resolver = the
+        // historical auto-fail-on-gate path (zero behaviour change).
+        let approval_resolver_iter = approval_resolver.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
@@ -2142,7 +2211,14 @@ async fn run_sub_agent_task(
                 source_message_event_id: scope.source_message_event_id.as_deref(),
                 policy_pipeline: None,
             });
-            let result = run_tool_call_loop(
+            // Only build an `ApprovalManager` when a resolver is attached. The
+            // manager's `needs_approval` (supervised: flags act-tools) is what
+            // routes a call into the resolver suspend path. Built from the live
+            // policy's autonomy level so `Full` / `ReadOnly` never suspend.
+            let approval_manager = approval_resolver_iter
+                .as_ref()
+                .map(|_| crate::approval::ApprovalManager::from_autonomy_level(security.autonomy));
+            let loop_outcome = crate::agent::loop_::run_tool_call_loop_outcome(
                 provider_instance.as_ref(),
                 &mut task_history,
                 tools_registry_owned.as_slice(),
@@ -2152,7 +2228,7 @@ async fn run_sub_agent_task(
                 &model_name,
                 temperature_value,
                 true, // silent — never print to the chat terminal (see note above)
-                None, // no approval manager
+                approval_manager.as_ref(),
                 "sessions_spawn",
                 &multimodal_config_owned,
                 max_iterations,
@@ -2181,8 +2257,11 @@ async fn run_sub_agent_task(
                         .map(|memory| DocumentIngestRuntime::from_scope(memory.clone(), ctx))
                 }),
                 crate::agent::loop_::ChatMode::default(),
+                approval_resolver_iter,
+                false,
             )
             .await;
+            let result = loop_outcome.map(|(outcome, _trace)| outcome.into_text());
             (task_history, result)
         });
 

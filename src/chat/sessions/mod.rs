@@ -21,6 +21,7 @@
 //! See `task/prx/chat-background-runtime-v1-execution-plan.md` (v1a/v1b) for
 //! scope.
 
+pub mod approval;
 pub mod command;
 pub mod event;
 pub mod focus;
@@ -31,6 +32,7 @@ pub mod pty;
 pub mod runtime;
 pub mod shell;
 
+pub use approval::{PendingApprovals, build_resolver_factory};
 pub use command::{SessionCommand, parse_session_command};
 pub use event::{SessionEvent, SessionEventSink, SessionRing};
 pub use focus::{FocusTarget, SwitcherEntry, SwitcherState};

@@ -159,7 +159,10 @@ impl Tool for SessionsSendTool {
             };
 
             match &run.status {
-                SubAgentStatus::Running => {
+                // A suspended (AwaitingInput) run still has a live message channel,
+                // so an operator message is delivered the same way as for a running
+                // session.
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                     if let Some(ref tx) = run.steer_tx {
                         tx.send(message.to_string())
                             .map_err(|_| anyhow::anyhow!("Session message channel closed unexpectedly"))?;

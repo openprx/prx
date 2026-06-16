@@ -63,6 +63,17 @@ pub enum SessionEvent {
     /// `truncated` so `/attach` shows `[output truncated]`. Emitted lazily on the
     /// next successful forward after a drop (the drainer never blocks to send it).
     Truncated { id: SessionId },
+    /// The background session suspended on a tool call that needs an operator
+    /// approval decision (NeedsInput). `prompt` summarises what is awaiting
+    /// approval (tool name + a short argument digest). The main loop surfaces a
+    /// non-intrusive `/approve` / `/deny` hint and the session's status flips to
+    /// `❓ needs-input`. Sent directly on the [`SessionEventSink`] channel (not
+    /// via the drainer) so it is never dropped under output back-pressure.
+    NeedsInput { id: SessionId, prompt: String },
+    /// A previously [`NeedsInput`](Self::NeedsInput) session resumed — the
+    /// operator decided (`/approve` / `/deny`) or the approval timed out, so the
+    /// suspend banner can be cleared. Sent directly on the sink channel.
+    Resumed { id: SessionId },
 }
 
 impl SessionEvent {
@@ -70,7 +81,11 @@ impl SessionEvent {
     #[must_use]
     pub const fn session_id(&self) -> &SessionId {
         match self {
-            Self::Delta { id, .. } | Self::ToolCall { id, .. } | Self::Truncated { id } => id,
+            Self::Delta { id, .. }
+            | Self::ToolCall { id, .. }
+            | Self::Truncated { id }
+            | Self::NeedsInput { id, .. }
+            | Self::Resumed { id } => id,
         }
     }
 }
@@ -96,6 +111,17 @@ impl SessionEventSink {
     pub fn channel() -> (Self, mpsc::Receiver<SessionEvent>) {
         let (event_tx, event_rx) = mpsc::channel(EVENT_CHANNEL_CAPACITY);
         (Self { event_tx }, event_rx)
+    }
+
+    /// Clone the underlying [`SessionEvent`] sender.
+    ///
+    /// Used by the NeedsInput approval path (`super::approval`): its resolver
+    /// emits [`SessionEvent::NeedsInput`] / [`SessionEvent::Resumed`] **directly**
+    /// on this channel (not via the per-session drainer), so suspend/resume
+    /// banners are never dropped under output back-pressure.
+    #[must_use]
+    pub fn event_sender(&self) -> mpsc::Sender<SessionEvent> {
+        self.event_tx.clone()
     }
 
     /// Build the library-level [`SpawnEventSink`] to hand to the spawn tool.
@@ -448,6 +474,11 @@ mod tests {
                 Some(SessionEvent::Truncated { .. }) => {
                     // No drop expected in this small, fully-drained scenario.
                     panic!("test: unexpected truncation marker without a drop");
+                }
+                Some(SessionEvent::NeedsInput { .. } | SessionEvent::Resumed { .. }) => {
+                    // Control signals are emitted only by the approval resolver,
+                    // never by `forward`; the stream-bridge test cannot produce them.
+                    panic!("test: unexpected approval control signal from forward()");
                 }
                 None => break,
             }

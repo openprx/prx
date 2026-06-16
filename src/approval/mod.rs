@@ -84,6 +84,27 @@ impl ApprovalManager {
         }
     }
 
+    /// Create a manager driven solely by an [`AutonomyLevel`], with no
+    /// config-level `auto_approve` / `always_ask` lists.
+    ///
+    /// Used by the background sub-agent NeedsInput path, which only knows the
+    /// effective autonomy level (from the live [`crate::security::SecurityPolicy`])
+    /// and wants the default supervised behaviour: every non-read-only tool call
+    /// is flagged for approval so the suspend resolver can gate it. Under
+    /// `ReadOnly` / `Full` autonomy `needs_approval` returns `false`, so no
+    /// suspension occurs (matching the policy).
+    #[must_use]
+    pub fn from_autonomy_level(level: AutonomyLevel) -> Self {
+        Self {
+            auto_approve: HashSet::new(),
+            always_ask: HashSet::new(),
+            autonomy_level: level,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+            generated_grants: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Check whether a tool call requires interactive approval.
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
@@ -341,6 +362,20 @@ mod tests {
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn from_autonomy_level_gates_per_level() {
+        // Supervised: every non-explicitly-allowed tool needs approval (drives
+        // the background NeedsInput suspend path).
+        let supervised = ApprovalManager::from_autonomy_level(AutonomyLevel::Supervised);
+        assert!(supervised.needs_approval("shell"));
+        assert!(supervised.needs_approval("file_write"));
+        // Full / ReadOnly: never flagged, so no suspension occurs for backgrounded runs.
+        let full = ApprovalManager::from_autonomy_level(AutonomyLevel::Full);
+        assert!(!full.needs_approval("shell"));
+        let read_only = ApprovalManager::from_autonomy_level(AutonomyLevel::ReadOnly);
+        assert!(!read_only.needs_approval("shell"));
     }
 
     #[test]

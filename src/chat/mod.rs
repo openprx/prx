@@ -1181,6 +1181,18 @@ pub async fn run(
     // so live `/attach` and `/logs` work uniformly across both kinds. The other
     // clone is consumed by the spawn tool's `into_spawn_sink` below.
     let shell_event_sink = session_event_sink.clone();
+    // NeedsInput (chat `/bg` only): shared pending-approval registry + per-run
+    // resolver factory. When a background sub-agent hits the supervised approval
+    // gate it suspends (NeedsInput) awaiting an operator `/approve` / `/deny`
+    // decision instead of auto-failing. Only the chat path attaches this; the
+    // channels/gateway spawn tools leave it `None` (auto-fail-on-gate preserved).
+    let pending_approvals = crate::chat::sessions::PendingApprovals::new();
+    let approval_resolver_factory = crate::chat::sessions::build_resolver_factory(
+        session_event_sink.event_sender(),
+        Arc::clone(&active_runs),
+        pending_approvals.clone(),
+        crate::chat::sessions::approval::DEFAULT_APPROVAL_TIMEOUT,
+    );
     let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
         Arc::clone(&terminal) as Arc<dyn Channel>,
         Arc::clone(&provider),
@@ -1199,7 +1211,8 @@ pub async fn run(
     )
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
-    .with_event_sink(session_event_sink.into_spawn_sink());
+    .with_event_sink(session_event_sink.into_spawn_sink())
+    .with_approval_resolver_factory(approval_resolver_factory);
     let spawn_tools_handle = spawn_tool.tools_handle();
 
     // Sibling tools share the same single-source registry (only the v1a four;
@@ -1891,9 +1904,49 @@ pub async fn run(
                         ring.mark_truncated();
                         None
                     }
+                    // NeedsInput: a background sub-agent suspended awaiting an
+                    // operator approval decision. Record a ring line for `/attach`
+                    // visibility; the non-intrusive `/approve` hint is surfaced
+                    // below (after the seq is resolved). Status flips to
+                    // `❓ needs-input` via the registry (already set by the
+                    // resolver) on the next status refresh.
+                    crate::chat::sessions::SessionEvent::NeedsInput { prompt, .. } => {
+                        Some(format!("[needs approval] {prompt}"))
+                    }
+                    crate::chat::sessions::SessionEvent::Resumed { .. } => {
+                        Some("[approval resolved — resuming]".to_string())
+                    }
                 };
                 if let Some(line) = line {
                     ring.push(line);
+                }
+                // NeedsInput / Resumed are control signals (not stream output):
+                // surface a non-intrusive operator hint with the session's `#N`
+                // and refresh the status line / switcher so the `❓` glyph and
+                // `needs-input` counter appear immediately, regardless of attach.
+                match &event {
+                    crate::chat::sessions::SessionEvent::NeedsInput { prompt, .. } => {
+                        let seq = chat_sessions.seq_for_id(&sid).await;
+                        let label = seq
+                            .map(|n| format!("#{n}"))
+                            .unwrap_or_else(|| sid.as_str().to_string());
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            &format!(
+                                "session {label} awaiting approval: {prompt} — /approve {} or /deny {} (/attach {} to inspect)",
+                                seq.map(|n| n.to_string()).unwrap_or_else(|| label.clone()),
+                                seq.map(|n| n.to_string()).unwrap_or_else(|| label.clone()),
+                                seq.map(|n| n.to_string()).unwrap_or_else(|| label.clone()),
+                            ),
+                        );
+                    }
+                    crate::chat::sessions::SessionEvent::Resumed { .. } => {
+                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                            let _ = tx.try_send(());
+                        }
+                    }
+                    _ => {}
                 }
                 if attached_follow.as_ref() == Some(&sid) {
                     // Follow mode: surface only the newly-appended lines inline.
@@ -2866,6 +2919,41 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             {
                                 let _ = &command;
                                 emit_chat_output("Interactive PTY sessions require the terminal UI.");
+                            }
+                            continue;
+                        }
+                        SessionCommand::Approve { seq } | SessionCommand::Deny { seq } => {
+                            // NeedsInput: deliver an approval decision to a
+                            // background sub-agent suspended on the supervised
+                            // approval gate. `/approve` injects a runtime grant
+                            // (Grant) so the gated tool can pass the gate; `/deny`
+                            // reports the tool as denied to the sub-agent.
+                            let approve = matches!(action, SessionCommand::Approve { .. });
+                            let run_id = match chat_sessions.resolve_run_id(seq).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    emit_chat_output(&format!(
+                                        "{} failed: {e}",
+                                        if approve { "Approve" } else { "Deny" }
+                                    ));
+                                    continue;
+                                }
+                            };
+                            let decision = if approve {
+                                crate::agent::loop_::ApprovalDecision::Grant
+                            } else {
+                                crate::agent::loop_::ApprovalDecision::Deny
+                            };
+                            if pending_approvals.resolve(&run_id, decision) {
+                                emit_chat_output(&format!(
+                                    "{} session #{seq}.",
+                                    if approve { "Approved" } else { "Denied" }
+                                ));
+                            } else {
+                                emit_chat_output(&format!(
+                                    "Session #{seq} is not awaiting approval (it may have resumed, \
+                                     timed out, completed, or was killed)."
+                                ));
                             }
                             continue;
                         }

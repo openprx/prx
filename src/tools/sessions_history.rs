@@ -126,6 +126,7 @@ impl Tool for SessionsHistoryTool {
         if entries.is_empty() {
             let status = match &run.status {
                 SubAgentStatus::Running => "still running, no history captured yet",
+                SubAgentStatus::AwaitingInput { .. } => "awaiting approval, no history captured yet",
                 SubAgentStatus::Completed(_) => "completed but history is empty",
                 SubAgentStatus::Failed(_) => "failed, history may be incomplete",
             };
