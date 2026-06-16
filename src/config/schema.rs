@@ -3857,6 +3857,65 @@ pub enum GroupPolicy {
     Disabled,
 }
 
+/// How the bot decides whether to reply in a group/guild conversation.
+///
+/// This is orthogonal to [`GroupPolicy`] (which decides *which* groups are
+/// visible at all): `GroupReplyMode` decides, within a visible group, *whether
+/// to speak*. It refines the legacy per-channel `mention_only` boolean.
+///
+/// Backward compatibility: per-channel config carries
+/// `group_reply_mode: Option<GroupReplyMode>`. When `None`, the mode is derived
+/// from the existing `mention_only` flag (`true => MentionOnly`,
+/// `false => Off`), so existing configs behave exactly as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub enum GroupReplyMode {
+    /// Never reply to group messages unless explicitly @-mentioned at the
+    /// channel layer (equivalent to the legacy `mention_only = false` behavior:
+    /// non-@ group messages are dropped at the channel layer as today).
+    Off,
+    /// Reply only when the bot is @-mentioned (legacy `mention_only = true`).
+    #[default]
+    MentionOnly,
+    /// Read every group message and let the model decide whether to reply or
+    /// stay silent (via the `stay_silent` tool). Only honored for channels that
+    /// support smart group-reply (currently Telegram and Discord).
+    Smart,
+}
+
+impl GroupReplyMode {
+    /// Resolve the effective mode from an explicit `group_reply_mode` plus the
+    /// legacy `mention_only` flag.
+    ///
+    /// When `explicit` is `Some`, it wins. When `None`, derive from
+    /// `mention_only` so existing configs are byte-for-byte unchanged:
+    /// `mention_only = true => MentionOnly`, `mention_only = false => Off`.
+    #[must_use]
+    pub const fn resolve(explicit: Option<Self>, mention_only: bool) -> Self {
+        match explicit {
+            Some(mode) => mode,
+            None if mention_only => Self::MentionOnly,
+            None => Self::Off,
+        }
+    }
+
+    /// Whether this mode lets the model autonomously decide to reply or stay
+    /// silent in groups.
+    #[must_use]
+    pub const fn is_smart(self) -> bool {
+        matches!(self, Self::Smart)
+    }
+
+    /// Whether non-@ group messages should be dropped at the channel layer.
+    ///
+    /// `Off`/`MentionOnly` keep the historical drop-on-no-mention behavior;
+    /// `Smart` passes everything through to the central pipeline.
+    #[must_use]
+    pub const fn drops_unmentioned_at_channel_layer(self) -> bool {
+        !self.is_smart()
+    }
+}
+
 // ── Cron ────────────────────────────────────────────────────────
 
 /// Cron job configuration (`[cron]` section).
@@ -4076,6 +4135,12 @@ pub struct TelegramConfig {
     /// Direct messages are always processed.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group reply decision mode. When `None` (default), derived from
+    /// `mention_only` for backward compatibility (`true => MentionOnly`,
+    /// `false => Off`). Set to `smart` to let the model decide per-message
+    /// whether to reply or stay silent in groups.
+    #[serde(default)]
+    pub group_reply_mode: Option<GroupReplyMode>,
 }
 
 /// Discord bot channel configuration.
@@ -4096,6 +4161,12 @@ pub struct DiscordConfig {
     /// Other messages in the guild are silently ignored.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group reply decision mode. When `None` (default), derived from
+    /// `mention_only` for backward compatibility (`true => MentionOnly`,
+    /// `false => Off`). Set to `smart` to let the model decide per-message
+    /// whether to reply or stay silent in guild channels.
+    #[serde(default)]
+    pub group_reply_mode: Option<GroupReplyMode>,
 }
 
 /// Slack bot channel configuration.
@@ -6005,6 +6076,7 @@ min_chars = 12
                     draft_update_interval_ms: default_draft_update_interval_ms(),
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    group_reply_mode: None,
                 }),
                 discord: None,
                 slack: None,
@@ -6444,6 +6516,7 @@ model = "override-beta"
             draft_update_interval_ms: default_draft_update_interval_ms(),
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply_mode: None,
         });
         config.memory.backend = "markdown".into();
         config.storage.provider.config.provider = "postgres".into();
@@ -6634,6 +6707,7 @@ model = "override-beta"
             draft_update_interval_ms: 500,
             interrupt_on_new_message: true,
             mention_only: false,
+            group_reply_mode: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -6661,6 +6735,7 @@ model = "override-beta"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply_mode: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -6676,6 +6751,7 @@ model = "override-beta"
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply_mode: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -8110,5 +8186,56 @@ allowed_from = ["*"]
             let name = name.to_string_lossy();
             assert!(!name.contains(".tmp-"), "leftover temp file lingered: {name}");
         }
+    }
+
+    #[test]
+    async fn group_reply_mode_resolve_explicit_wins() {
+        assert_eq!(
+            GroupReplyMode::resolve(Some(GroupReplyMode::Smart), false),
+            GroupReplyMode::Smart
+        );
+        assert_eq!(
+            GroupReplyMode::resolve(Some(GroupReplyMode::Off), true),
+            GroupReplyMode::Off
+        );
+    }
+
+    #[test]
+    async fn group_reply_mode_resolve_derives_from_mention_only() {
+        // None => derive from legacy mention_only, preserving prior behavior.
+        assert_eq!(GroupReplyMode::resolve(None, true), GroupReplyMode::MentionOnly);
+        assert_eq!(GroupReplyMode::resolve(None, false), GroupReplyMode::Off);
+    }
+
+    #[test]
+    async fn group_reply_mode_smart_flags() {
+        assert!(GroupReplyMode::Smart.is_smart());
+        assert!(!GroupReplyMode::MentionOnly.is_smart());
+        assert!(!GroupReplyMode::Off.is_smart());
+        // Only smart passes unmentioned messages through the channel layer.
+        assert!(!GroupReplyMode::Smart.drops_unmentioned_at_channel_layer());
+        assert!(GroupReplyMode::MentionOnly.drops_unmentioned_at_channel_layer());
+        assert!(GroupReplyMode::Off.drops_unmentioned_at_channel_layer());
+    }
+
+    #[test]
+    async fn telegram_config_group_reply_mode_defaults_none() {
+        let toml = r#"
+            bot_token = "x"
+            allowed_users = ["*"]
+        "#;
+        let cfg: TelegramConfig = toml::from_str(toml).expect("parse telegram config");
+        assert_eq!(cfg.group_reply_mode, None);
+        assert!(!cfg.mention_only);
+    }
+
+    #[test]
+    async fn discord_config_group_reply_mode_smart_parses() {
+        let toml = r#"
+            bot_token = "x"
+            group_reply_mode = "smart"
+        "#;
+        let cfg: DiscordConfig = toml::from_str(toml).expect("parse discord config");
+        assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
     }
 }

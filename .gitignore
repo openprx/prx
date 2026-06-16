@@ -33,3 +33,6 @@ credentials.json
 console/dist/
 pdk/rust/examples/voice-talk-realtime/target/
 *.log
+
+# Chat session exports (E2E test artifacts — never commit)
+prx_chat_*.md

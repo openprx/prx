@@ -1,7 +1,7 @@
 use crate::config::IdentityConfig;
 use crate::identity;
 use crate::skills::Skill;
-use crate::tools::Tool;
+use crate::tools::{Tool, tool_name_is_exposed};
 use anyhow::Result;
 use chrono::Local;
 use std::fmt::Write;
@@ -119,6 +119,11 @@ impl PromptSection for ToolsSection {
     fn build(&self, ctx: &PromptContext<'_>) -> Result<String> {
         let mut out = String::from("## Tools\n\n");
         for tool in ctx.tools {
+            // Agent::turn path never uses smart-group reply; stay_silent must not
+            // be advertised here (expose_stay_silent = false).
+            if !tool_name_is_exposed(tool.name(), false) {
+                continue;
+            }
             let _ = writeln!(
                 out,
                 "- **{}**: {}\n  Parameters: `{}`",
@@ -413,5 +418,30 @@ mod tests {
         assert!(
             prompt.contains("<instruction>Use &lt;tool_call&gt; and &amp; keep output &quot;safe&quot;</instruction>")
         );
+    }
+
+    #[test]
+    fn tools_section_excludes_stay_silent_on_agent_path() {
+        // Agent::turn is never a smart-group-reply turn, so the ToolsSection must
+        // never advertise `stay_silent` regardless of what tools are registered.
+        let stay_silent: Box<dyn Tool> = Box::new(crate::tools::StaySilentTool::new());
+        let normal: Box<dyn Tool> = Box::new(TestTool);
+        let tools: Vec<Box<dyn Tool>> = vec![stay_silent, normal];
+
+        let ctx = PromptContext {
+            workspace_dir: Path::new("/tmp"),
+            model_name: "test-model",
+            tools: &tools,
+            skills: &[],
+            identity_config: None,
+            dispatcher_instructions: "",
+        };
+
+        let output = ToolsSection.build(&ctx).unwrap();
+        assert!(
+            !output.contains(crate::tools::STAY_SILENT_TOOL_NAME),
+            "stay_silent must not appear in Agent prompt-guided tool listing"
+        );
+        assert!(output.contains("test_tool"), "normal tools must still be listed");
     }
 }

@@ -62,6 +62,7 @@ pub(crate) mod sessions_read_model;
 pub mod sessions_send;
 pub mod sessions_spawn;
 pub mod shell;
+pub mod stay_silent;
 pub mod subagents;
 pub mod traits;
 pub mod tts;
@@ -112,6 +113,7 @@ pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
+pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
 pub use traits::{ToolCategory, ToolResult, ToolSpec, ToolTier};
@@ -127,6 +129,32 @@ use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Single, authoritative gate for advertising the smart group-reply `stay_silent`
+/// tool to the model. `stay_silent` is registered globally (so the tool loop can
+/// always resolve a call), but its *spec* must only ever be advertised on smart
+/// group-reply turns. Every tool-spec / prompt-instruction construction path
+/// (native specs, prompt-guided text, skill-RAG rebuilds, the TUI/Redux
+/// dispatcher, gateway sessions) funnels through this helper so that DMs and any
+/// non-smart turn — on *any* provider type and *any* path — can never see, and
+/// thus never call, `stay_silent`.
+///
+/// `expose_stay_silent` is `true` only for a smart group-reply turn; otherwise
+/// the `stay_silent` spec is removed in place.
+pub fn filter_tool_specs_for_exposure(specs: &mut Vec<ToolSpec>, expose_stay_silent: bool) {
+    if !expose_stay_silent {
+        specs.retain(|spec| spec.name != STAY_SILENT_TOOL_NAME);
+    }
+}
+
+/// Whether a tool should be advertised to the model given the current exposure
+/// context. Mirrors [`filter_tool_specs_for_exposure`] for callers that iterate
+/// the registry directly (e.g. the prompt-guided `build_tool_instructions`),
+/// keeping a single rule for which tools are exposure-gated.
+#[must_use]
+pub fn tool_name_is_exposed(name: &str, expose_stay_silent: bool) -> bool {
+    expose_stay_silent || name != STAY_SILENT_TOOL_NAME
+}
 
 #[derive(Clone)]
 struct ArcDelegatingTool {
@@ -320,6 +348,11 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
+        // stay_silent lets the model decline to reply in smart group-reply mode.
+        // Always registered so the loop can resolve the call; its spec is only
+        // advertised to the model on smart group turns (loop-side `expose_stay_silent`
+        // gate). A defensive `execute` makes any out-of-loop call a no-op.
+        Arc::new(StaySilentTool::new()),
     ];
 
     // Vision tools are always available
@@ -566,6 +599,42 @@ mod tests {
     use super::*;
     use crate::config::{BrowserConfig, Config, MemoryConfig, ModulesConfig};
     use tempfile::TempDir;
+
+    fn spec(name: &str) -> ToolSpec {
+        ToolSpec {
+            name: name.to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({}),
+        }
+    }
+
+    #[test]
+    fn filter_tool_specs_for_exposure_removes_stay_silent_when_not_exposed() {
+        let mut specs = vec![spec("shell"), spec(STAY_SILENT_TOOL_NAME), spec("file_read")];
+        filter_tool_specs_for_exposure(&mut specs, false);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["shell", "file_read"]);
+        assert!(!names.contains(&STAY_SILENT_TOOL_NAME));
+    }
+
+    #[test]
+    fn filter_tool_specs_for_exposure_keeps_stay_silent_when_exposed() {
+        let mut specs = vec![spec("shell"), spec(STAY_SILENT_TOOL_NAME)];
+        filter_tool_specs_for_exposure(&mut specs, true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert!(names.contains(&STAY_SILENT_TOOL_NAME));
+        assert_eq!(names.len(), 2);
+    }
+
+    #[test]
+    fn tool_name_is_exposed_gates_only_stay_silent() {
+        // Non-stay_silent tools are always exposed regardless of the flag.
+        assert!(tool_name_is_exposed("shell", false));
+        assert!(tool_name_is_exposed("shell", true));
+        // stay_silent is gated on the flag.
+        assert!(!tool_name_is_exposed(STAY_SILENT_TOOL_NAME, false));
+        assert!(tool_name_is_exposed(STAY_SILENT_TOOL_NAME, true));
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         Config {

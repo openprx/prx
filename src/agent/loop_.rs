@@ -2024,7 +2024,9 @@ pub(crate) fn build_runtime_system_prompt(
     );
 
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry));
+        // These callers (chat REPL, gateway sessions, loop one-shots) are never
+        // smart group-reply turns, so `stay_silent` is never advertised here.
+        system_prompt.push_str(&build_tool_instructions(tools_registry, false));
     }
 
     system_prompt
@@ -4289,6 +4291,7 @@ pub(crate) async fn run_tool_call_loop_traced(
         document_ingest,
         chat_mode,
         None,
+        false,
     )
     .await?;
     Ok((outcome.into_text(), trace))
@@ -4304,7 +4307,7 @@ pub(crate) async fn run_tool_call_loop_traced(
 ///
 /// [`run_tool_call_loop`] and [`run_tool_call_loop_traced`] are behavior-
 /// preserving shells over this function.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub(crate) async fn run_tool_call_loop_outcome(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
@@ -4334,6 +4337,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     document_ingest: Option<DocumentIngestRuntime>,
     chat_mode: ChatMode,
     approval_resolver: Option<Arc<dyn ApprovalResolver>>,
+    expose_stay_silent: bool,
 ) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
@@ -4375,6 +4379,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
             filtered.iter().flat_map(|tool| tool.specs()).collect()
         },
     );
+    // `stay_silent` is registered globally so the loop can always resolve a call,
+    // but it is only *advertised* to the model on smart group turns. Filter its
+    // spec out everywhere else so DMs / non-smart turns can never see (and thus
+    // never call) it — one of the three hard-coded "DM never stays silent" guards.
+    // Routed through the single shared exposure gate so every spec-construction
+    // path applies the identical rule.
+    let mut tool_specs = tool_specs;
+    crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
     let rollout = resolve_rollout_decision(parallel_tools_enabled, &concurrency_governance, channel_name, scope_ctx);
     tracing::info!(
         channel = channel_name,
@@ -4790,6 +4802,25 @@ pub(crate) async fn run_tool_call_loop_outcome(
             return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
         }
 
+        // Smart group-reply: a `stay_silent` call is a *terminal* decision for the
+        // turn. Detect it BEFORE executing any tool and BEFORE pushing the
+        // assistant/tool turn into history, so a silent turn leaves zero trace in
+        // the conversation history and produces no channel output. Only honored
+        // when the caller advertised the tool (`expose_stay_silent`), which is
+        // restricted to smart group turns; this keeps DMs / non-smart turns from
+        // ever short-circuiting to Silent even if a model hallucinates the name.
+        if expose_stay_silent {
+            if let Some(silent_call) = tool_calls
+                .iter()
+                .find(|call| call.name == crate::tools::STAY_SILENT_TOOL_NAME)
+            {
+                let reason = crate::tools::stay_silent::extract_reason(&silent_call.arguments);
+                tracing::info!(reason = reason.as_str(), "tool loop: model chose to stay silent");
+                last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
+                return Ok((ToolLoopOutcome::Silent { reason }, last_turn_trace));
+            }
+        }
+
         // Print any text the LLM produced alongside tool calls (unless silent)
         if !silent && !display_text.is_empty() {
             print!("{display_text}");
@@ -4985,8 +5016,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+/// how to invoke tools (prompt-guided / non-native provider path).
+///
+/// `expose_stay_silent` gates the smart group-reply `stay_silent` tool exactly
+/// like the native spec path: it is advertised only on smart group turns. Every
+/// non-native construction site (channels static prompt, skill-RAG rebuild,
+/// `build_runtime_system_prompt`) passes its own smart-turn context here so DMs
+/// / non-smart turns never learn the tool exists.
+pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>], expose_stay_silent: bool) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -5002,6 +5039,9 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 
     for tool in tools_registry {
         for spec in tool.specs() {
+            if !crate::tools::tool_name_is_exposed(&spec.name, expose_stay_silent) {
+                continue;
+            }
             let _ = writeln!(
                 instructions,
                 "**{}**: {}\nParameters: `{}`\n",
@@ -8315,13 +8355,34 @@ ls -la
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, false);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn build_tool_instructions_excludes_stay_silent_unless_exposed() {
+        use crate::tools::{STAY_SILENT_TOOL_NAME, StaySilentTool};
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
+
+        // DM / non-smart (expose_stay_silent = false): the tool must NOT appear in
+        // the prompt-guided instructions, so a non-native model can never learn it.
+        let hidden = build_tool_instructions(&tools, false);
+        assert!(
+            !hidden.contains(STAY_SILENT_TOOL_NAME),
+            "stay_silent must be filtered out of non-smart prompt-guided instructions"
+        );
+
+        // Smart group turn (expose_stay_silent = true): the tool IS advertised.
+        let shown = build_tool_instructions(&tools, true);
+        assert!(
+            shown.contains(STAY_SILENT_TOOL_NAME),
+            "stay_silent must be advertised on smart group turns"
+        );
     }
 
     #[test]
@@ -10333,6 +10394,135 @@ Let me check the result."#;
             assert!(
                 short.trim_end().ends_with("> ok"),
                 "short preview kept verbatim: {short}"
+            );
+        }
+    }
+
+    // ── Smart group-reply: stay_silent terminal outcome ──────────────────────
+    mod stay_silent_outcome {
+        use super::*;
+        use crate::tools::StaySilentTool;
+
+        async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {
+            let provider = ScriptedProvider::from_text_responses(vec![response]);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("some group chatter")];
+            let tmp = TempDir::new().unwrap();
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                false,
+                2,
+                30,
+                false,
+                Vec::new(),
+                ToolConcurrencyGovernanceConfig::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatMode::default(),
+                None,
+                expose,
+            )
+            .await
+            .expect("loop should complete");
+            (outcome, history)
+        }
+
+        #[tokio::test]
+        async fn stay_silent_call_produces_silent_outcome() {
+            let resp =
+                "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"off-topic banter\"}}\n</tool_call>";
+            let (outcome, _history) = run_with_response(resp, true).await;
+            match outcome {
+                ToolLoopOutcome::Silent { reason } => assert_eq!(reason, "off-topic banter"),
+                other => panic!("expected Silent, got {other:?}"),
+            }
+        }
+
+        #[tokio::test]
+        async fn silent_outcome_writes_no_assistant_turn() {
+            let resp =
+                "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"not relevant\"}}\n</tool_call>";
+            let before = 2; // system + user
+            let (outcome, history) = run_with_response(resp, true).await;
+            assert!(matches!(outcome, ToolLoopOutcome::Silent { .. }));
+            // No assistant / tool turn appended: silent leaves zero history trace.
+            assert_eq!(
+                history.len(),
+                before,
+                "silent turn must not append assistant/tool history, got: {history:?}"
+            );
+            assert!(
+                history.iter().all(|m| m.role != "assistant"),
+                "no assistant turn should be written on a silent decision"
+            );
+        }
+
+        #[tokio::test]
+        async fn stay_silent_not_honored_when_not_exposed() {
+            // When the tool is NOT exposed (DM / non-smart), a stay_silent call
+            // is treated as an ordinary tool call: it executes (benign no-op) and
+            // the loop continues — it never short-circuits to Silent. The model
+            // then has no further scripted response, so the loop errors out
+            // (exhausted responses), proving Silent was NOT taken.
+            let resp = "<tool_call>\n{\"name\":\"stay_silent\",\"arguments\":{\"reason\":\"x\"}}\n</tool_call>";
+            let provider = ScriptedProvider::from_text_responses(vec![resp]);
+            let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+            let tmp = TempDir::new().unwrap();
+            let result = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "telegram",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                false,
+                2,
+                30,
+                false,
+                Vec::new(),
+                ToolConcurrencyGovernanceConfig::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatMode::default(),
+                None,
+                false, // not exposed
+            )
+            .await;
+            // The single scripted response was consumed continuing the loop, so a
+            // second LLM call is attempted and fails (exhausted) — i.e. NOT Silent.
+            assert!(
+                result.is_err(),
+                "non-exposed stay_silent must continue the loop (execute as a tool), not short-circuit to Silent"
             );
         }
     }

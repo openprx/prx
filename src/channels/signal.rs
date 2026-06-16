@@ -1534,6 +1534,9 @@ impl SignalChannel {
                         .collect()
                 })
                 .unwrap_or_default(),
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
         })
     }
 

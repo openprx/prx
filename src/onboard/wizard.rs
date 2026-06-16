@@ -2722,6 +2722,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     draft_update_interval_ms: 1000,
                     interrupt_on_new_message: false,
                     mention_only: false,
+                    group_reply_mode: None,
                 });
             }
             ChannelMenuChoice::Discord => {
@@ -2816,6 +2817,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     allowed_users,
                     listen_to_bots: false,
                     mention_only: false,
+                    group_reply_mode: None,
                 });
             }
             ChannelMenuChoice::Slack => {

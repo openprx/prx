@@ -164,6 +164,9 @@ impl NextcloudTalkChannel {
             timestamp,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
         });
 
         messages
