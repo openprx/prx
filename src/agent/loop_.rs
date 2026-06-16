@@ -2024,7 +2024,9 @@ pub(crate) fn build_runtime_system_prompt(
     );
 
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(tools_registry));
+        // These callers (chat REPL, gateway sessions, loop one-shots) are never
+        // smart group-reply turns, so `stay_silent` is never advertised here.
+        system_prompt.push_str(&build_tool_instructions(tools_registry, false));
     }
 
     system_prompt
@@ -4381,10 +4383,10 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // but it is only *advertised* to the model on smart group turns. Filter its
     // spec out everywhere else so DMs / non-smart turns can never see (and thus
     // never call) it — one of the three hard-coded "DM never stays silent" guards.
+    // Routed through the single shared exposure gate so every spec-construction
+    // path applies the identical rule.
     let mut tool_specs = tool_specs;
-    if !expose_stay_silent {
-        tool_specs.retain(|spec| spec.name != crate::tools::STAY_SILENT_TOOL_NAME);
-    }
+    crate::tools::filter_tool_specs_for_exposure(&mut tool_specs, expose_stay_silent);
     let rollout = resolve_rollout_decision(parallel_tools_enabled, &concurrency_governance, channel_name, scope_ctx);
     tracing::info!(
         channel = channel_name,
@@ -5014,8 +5016,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
 }
 
 /// Build the tool instruction block for the system prompt so the LLM knows
-/// how to invoke tools.
-pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> String {
+/// how to invoke tools (prompt-guided / non-native provider path).
+///
+/// `expose_stay_silent` gates the smart group-reply `stay_silent` tool exactly
+/// like the native spec path: it is advertised only on smart group turns. Every
+/// non-native construction site (channels static prompt, skill-RAG rebuild,
+/// `build_runtime_system_prompt`) passes its own smart-turn context here so DMs
+/// / non-smart turns never learn the tool exists.
+pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>], expose_stay_silent: bool) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
     instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
@@ -5031,6 +5039,9 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
 
     for tool in tools_registry {
         for spec in tool.specs() {
+            if !crate::tools::tool_name_is_exposed(&spec.name, expose_stay_silent) {
+                continue;
+            }
             let _ = writeln!(
                 instructions,
                 "**{}**: {}\nParameters: `{}`\n",
@@ -8344,13 +8355,34 @@ ls -la
             std::path::Path::new("/tmp"),
         ));
         let tools = tools::default_tools(security);
-        let instructions = build_tool_instructions(&tools);
+        let instructions = build_tool_instructions(&tools, false);
 
         assert!(instructions.contains("## Tool Use Protocol"));
         assert!(instructions.contains("<tool_call>"));
         assert!(instructions.contains("shell"));
         assert!(instructions.contains("file_read"));
         assert!(instructions.contains("file_write"));
+    }
+
+    #[test]
+    fn build_tool_instructions_excludes_stay_silent_unless_exposed() {
+        use crate::tools::{STAY_SILENT_TOOL_NAME, StaySilentTool};
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(StaySilentTool::new())];
+
+        // DM / non-smart (expose_stay_silent = false): the tool must NOT appear in
+        // the prompt-guided instructions, so a non-native model can never learn it.
+        let hidden = build_tool_instructions(&tools, false);
+        assert!(
+            !hidden.contains(STAY_SILENT_TOOL_NAME),
+            "stay_silent must be filtered out of non-smart prompt-guided instructions"
+        );
+
+        // Smart group turn (expose_stay_silent = true): the tool IS advertised.
+        let shown = build_tool_instructions(&tools, true);
+        assert!(
+            shown.contains(STAY_SILENT_TOOL_NAME),
+            "stay_silent must be advertised on smart group turns"
+        );
     }
 
     #[test]

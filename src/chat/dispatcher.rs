@@ -1208,6 +1208,22 @@ enum StreamPassOutcome {
 /// **5a-6**: 多轮 tool turn 支持。
 /// **S3 T3-1**: 四件套扩展（工具回合状态机 / context overflow compact / approval 桥接 /
 /// timeout backoff retry）。详见 `task/prx/T3-1.md`.
+/// Build the tool specs advertised to the provider for a TUI / Redux chat turn.
+///
+/// TUI / Redux chat is always a plain (non-group, non-smart) conversation, so the
+/// smart group-reply `stay_silent` tool must NEVER be advertised here. Routed
+/// through the shared exposure gate (`expose_stay_silent = false`) so this path
+/// applies the identical rule as every other tool-spec construction site.
+fn build_dispatcher_tool_specs(
+    tools_registry: Option<&Vec<Box<dyn crate::tools::Tool>>>,
+) -> Vec<crate::tools::ToolSpec> {
+    let mut specs: Vec<crate::tools::ToolSpec> = tools_registry.map_or_else(Vec::new, |registry| {
+        registry.iter().flat_map(|tool| tool.specs()).collect()
+    });
+    crate::tools::filter_tool_specs_for_exposure(&mut specs, false);
+    specs
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -1252,9 +1268,7 @@ async fn drive_start_turn_stream(
     // call (permission denied / not allowed / rejected …) the count climbs; once it
     // recurs we stop the turn early instead of spinning to `max_tool_iterations`.
     let mut unrecoverable_seen: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
-    let stream_tool_specs: Vec<crate::tools::ToolSpec> = tools_registry.as_ref().map_or_else(Vec::new, |registry| {
-        registry.iter().flat_map(|tool| tool.specs()).collect()
-    });
+    let stream_tool_specs: Vec<crate::tools::ToolSpec> = build_dispatcher_tool_specs(tools_registry.as_deref());
 
     'outer: loop {
         iteration = iteration.saturating_add(1);
@@ -2472,6 +2486,41 @@ mod tests {
     use super::*;
     use crate::chat::action::Action;
     use crate::providers::router::MockEnvProvider;
+
+    #[test]
+    fn dispatcher_tool_specs_never_include_stay_silent() {
+        use crate::security::SecurityPolicy;
+        use crate::tools::{STAY_SILENT_TOOL_NAME, ShellTool, StaySilentTool};
+
+        let security = Arc::new(SecurityPolicy::from_config(
+            &crate::config::AutonomyConfig::default(),
+            std::path::Path::new("/tmp"),
+        ));
+        let registry: Vec<Box<dyn crate::tools::Tool>> = vec![
+            Box::new(ShellTool::new(
+                security,
+                Arc::new(crate::runtime::NativeRuntime::new()),
+                Arc::new(crate::security::traits::NoopSandbox),
+                false,
+            )),
+            Box::new(StaySilentTool::new()),
+        ];
+
+        let specs = build_dispatcher_tool_specs(Some(&registry));
+        assert!(
+            specs.iter().any(|s| s.name == "shell"),
+            "non-gated tools must still be advertised in the TUI dispatcher"
+        );
+        assert!(
+            !specs.iter().any(|s| s.name == STAY_SILENT_TOOL_NAME),
+            "TUI / Redux dispatcher must never advertise stay_silent (plain chat is never smart)"
+        );
+    }
+
+    #[test]
+    fn dispatcher_tool_specs_empty_when_no_registry() {
+        assert!(build_dispatcher_tool_specs(None).is_empty());
+    }
 
     // ── BUG-07: ModelSlot hot-swap ─────────────────────────────────────
     #[test]

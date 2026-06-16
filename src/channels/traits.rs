@@ -40,6 +40,12 @@ pub struct ChannelMessage {
     /// gate smart group-reply behavior (stay_silent exposure + outbound
     /// suppression); it does not change `infer_chat_type_from_message` / scope.
     pub is_group_hint: bool,
+    /// Authoritative platform flag: whether the sender is itself a bot account
+    /// (Telegram `from.is_bot`, Discord `author.bot`). Anti bot-to-bot-loop
+    /// signal for smart proactive replies — the central `is_bot_sender` heuristic
+    /// (sender-name suffix) is kept only as a fallback for channels that do not
+    /// supply this flag. Defaults to `false`.
+    pub sender_is_bot: bool,
 }
 
 impl Default for ChannelMessage {
@@ -55,6 +61,7 @@ impl Default for ChannelMessage {
             mentioned_uuids: Vec::new(),
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         }
     }
 }
@@ -303,6 +310,7 @@ mod tests {
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -322,6 +330,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
 
         let cloned = message;

@@ -433,6 +433,7 @@ impl EmailChannel {
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             };
 
             if tx.send(msg).await.is_err() {

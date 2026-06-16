@@ -4402,6 +4402,7 @@ fn send_synthetic_command(
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
+        sender_is_bot: false,
     };
     input_tx.blocking_send(msg).map_err(|_| ())
 }
@@ -5135,6 +5136,7 @@ fn run_tui_unified_loop(
                             mentioned_uuids: vec![],
                             mentioned: false,
                             is_group_hint: false,
+                            sender_is_bot: false,
                         };
                         if input_tx.blocking_send(msg).is_err() {
                             // Receiver dropped — chat::run is tearing down.

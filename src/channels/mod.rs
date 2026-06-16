@@ -279,6 +279,11 @@ struct ChannelRuntimeContext {
     /// Per-group cooldown tracker for proactive (non-@) smart replies, to avoid
     /// the bot dominating a busy group. Keyed by `channel:group_id`.
     smart_reply_cooldown: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Whether the configured provider supports native tool calling. Drives the
+    /// non-native-only per-turn `stay_silent` instruction append on the static
+    /// (skill-RAG-off) prompt path; native providers advertise it via filtered
+    /// tool specs instead.
+    native_tools: bool,
     /// Skill RAG context (present when skill_rag.enabled) for per-message skill selection.
     skill_rag_ctx: Option<SkillRagContext>,
     /// Test-only seam: when present, `process_channel_message` routes the inbound
@@ -819,6 +824,25 @@ const fn smart_group_prompt_addendum(mentioned: bool) -> &'static str {
            most messages — do not feel obliged to reply.\n\
          - Never reply just to acknowledge; silence is better than noise.\n"
     }
+}
+
+/// Prompt-guided instruction block advertising ONLY the `stay_silent` tool, for
+/// the non-native + skill-RAG-off smart group-reply path. The startup static
+/// prompt deliberately excludes `stay_silent` (so DMs / non-smart never see it);
+/// this appends just that tool's spec on a smart group turn so a prompt-guided
+/// model learns it exists. Native providers advertise it via filtered tool specs
+/// instead and never need this.
+fn stay_silent_tool_instructions() -> String {
+    let tool = tools::StaySilentTool::new();
+    let mut block = String::from("\n### Additional Tool (group chat)\n\n");
+    for spec in tool.specs() {
+        let _ = writeln!(
+            block,
+            "**{}**: {}\nParameters: `{}`\n",
+            spec.name, spec.description, spec.parameters
+        );
+    }
+    block
 }
 
 fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
@@ -2729,9 +2753,20 @@ async fn process_channel_message(
     // Smart proactive guard: when the bot was NOT explicitly addressed in a smart
     // group, apply anti-spam protections BEFORE spending a full LLM loop:
     //  - never proactively react to a bot's own / another bot's message
-    //    (prevents bot-to-bot feedback loops);
+    //    (prevents bot-to-bot feedback loops). `is_bot_sender` now trusts the
+    //    authoritative platform flag (`sender_is_bot`: Telegram `from.is_bot` /
+    //    Discord `author.bot`) first, with the sender-name suffix heuristic only
+    //    as a fallback — so a bot that does NOT name itself "*bot" is still caught.
     //  - per-group cooldown so the bot does not dominate a busy group.
-    // @-mentions (explicit summons) bypass both guards and always proceed.
+    //
+    // ACCEPTED RISK: an explicit @-mention (`mentioned`) bypasses BOTH guards and
+    // always proceeds — "@ always answers" is an intentional product invariant.
+    // This means a single peer could @-spam the bot to drive replies; we accept
+    // that here because (a) @ is an explicit human summons, (b) the bot-sender
+    // guard above still blocks an @-spamming *bot* unless `listen_to_bots` is on,
+    // and (c) the per-turn LLM loop and outbound side-effect gates bound cost. If
+    // @-flood abuse is observed, add a per-sender token-bucket here (kept out for
+    // now to avoid over-engineering the group MVP).
     if smart_group && !mentioned {
         if is_bot_sender(&msg) {
             tracing::debug!(channel = %msg.channel, sender = %msg.sender, "smart: skip proactive reply to bot sender");
@@ -2855,11 +2890,22 @@ async fn process_channel_message(
             rag_ctx.native_tools,
         );
         if !rag_ctx.native_tools {
-            prompt.push_str(&build_tool_instructions(&ctx.tools_registry));
+            // Skill-RAG rebuild path: advertise `stay_silent` only on smart group
+            // turns, mirroring the native spec gate so DMs / non-smart never see it.
+            prompt.push_str(&build_tool_instructions(&ctx.tools_registry, smart_group));
         }
         prompt
     } else {
-        ctx.system_prompt.to_string()
+        // Static-prompt path (skill RAG off): `ctx.system_prompt` is built once at
+        // startup with `stay_silent` excluded (build_tool_instructions(.., false)).
+        // For a non-native smart group turn we must still teach the model the tool,
+        // so append just its instruction block here. Native providers get it via
+        // the per-turn filtered tool specs instead.
+        let mut prompt = ctx.system_prompt.to_string();
+        if smart_group && !ctx.native_tools {
+            prompt.push_str(&stay_silent_tool_instructions());
+        }
+        prompt
     };
     let mut system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
     // Smart group-reply: override the default "respond directly / response is
@@ -3392,12 +3438,18 @@ const SMART_PROACTIVE_COOLDOWN_SECS: u64 = 45;
 /// Discord `listen_to_bots`); this is a defense-in-depth central guard keyed on
 /// the bot's own configured identities plus a common `bot`-suffix heuristic.
 fn is_bot_sender(msg: &traits::ChannelMessage) -> bool {
+    // Primary signal: the authoritative platform flag (Telegram `from.is_bot`,
+    // Discord `author.bot`). When the channel knows the sender is a bot, trust it.
+    if msg.sender_is_bot {
+        return true;
+    }
+    // Fallback heuristic for channels that do not supply `sender_is_bot`: common
+    // bot account naming conventions across platforms.
     let sender = msg.sender.trim();
     if sender.is_empty() {
         return false;
     }
     let lower = sender.to_lowercase();
-    // Common bot account naming conventions across platforms.
     lower.ends_with("bot") || lower.ends_with("-bot") || lower.contains(":bot:")
 }
 
@@ -4505,7 +4557,10 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         native_tools,
     );
     if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_list));
+        // Startup static prompt: NEVER advertise `stay_silent` here — this prompt
+        // is reused for every turn (DM and group). A non-native smart group turn
+        // appends the tool's instructions per-turn in `process_channel_message`.
+        system_prompt.push_str(&build_tool_instructions(&tools_list, false));
     }
 
     if !skills.is_empty() {
@@ -5099,6 +5154,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         mention_only_by_channel,
         group_reply_mode_by_channel,
         smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        native_tools,
         skill_rag_ctx,
         #[cfg(test)]
         test_inbound_authorizer: None,
@@ -5155,6 +5211,22 @@ mod tests {
         assert!(is_bot_sender(&smart_test_msg("news-bot", "g1")));
         assert!(!is_bot_sender(&smart_test_msg("alice", "g1")));
         assert!(!is_bot_sender(&smart_test_msg("", "g1")));
+    }
+
+    #[test]
+    fn is_bot_sender_trusts_platform_flag_over_name() {
+        // Authoritative platform flag wins even when the name looks human — a bot
+        // that does NOT name itself "*bot" is still caught (anti bot-to-bot loop).
+        let mut msg = smart_test_msg("alice", "g1");
+        msg.sender_is_bot = true;
+        assert!(
+            is_bot_sender(&msg),
+            "sender_is_bot=true must mark a human-named account as a bot"
+        );
+
+        // Flag false + human name => not a bot (fallback heuristic does not match).
+        let human = smart_test_msg("alice", "g1");
+        assert!(!is_bot_sender(&human));
     }
 
     #[test]
@@ -5382,6 +5454,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         };
@@ -5454,6 +5527,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         }
@@ -5830,6 +5904,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         };
@@ -5901,6 +5976,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -5924,6 +6000,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -5947,6 +6024,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -5970,6 +6048,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
 
@@ -6011,6 +6090,7 @@ mod tests {
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -6555,6 +6635,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6572,6 +6653,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -6638,6 +6720,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6655,6 +6738,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -6721,6 +6805,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6738,6 +6823,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -6806,6 +6892,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6823,6 +6910,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -6890,6 +6978,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6907,6 +6996,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -6980,6 +7070,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -6997,6 +7088,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7098,6 +7190,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -7115,6 +7208,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7189,6 +7283,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -7206,6 +7301,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7297,6 +7393,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -7314,6 +7411,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7429,6 +7527,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -7446,6 +7545,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7513,6 +7613,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -7530,6 +7631,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -7768,6 +7870,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: opts.test_inbound_authorizer,
         })
@@ -7796,6 +7899,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         }
     }
 
@@ -7858,6 +7962,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         }
     }
 
@@ -7937,6 +8042,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         }
     }
 
@@ -8116,6 +8222,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -8238,6 +8345,7 @@ BTC is currently around $65,000 based on latest tool output."#
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         })
@@ -8642,6 +8750,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -8658,6 +8767,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         })
         .await
         .unwrap();
@@ -8672,6 +8782,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         })
         .await
         .unwrap();
@@ -8749,6 +8860,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -8766,6 +8878,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             })
             .await
             .unwrap();
@@ -8781,6 +8894,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             })
             .await
             .unwrap();
@@ -8869,6 +8983,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -8886,6 +9001,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             })
             .await
             .unwrap();
@@ -8901,6 +9017,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             })
             .await
             .unwrap();
@@ -8972,6 +9089,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -8989,6 +9107,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -9068,7 +9187,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "build_system_prompt should not emit protocol block directly"
         );
 
-        prompt.push_str(&build_tool_instructions(&[]));
+        prompt.push_str(&build_tool_instructions(&[], false));
 
         assert_eq!(
             prompt.matches("## Tool Use Protocol").count(),
@@ -9326,6 +9445,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -9344,6 +9464,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9356,6 +9477,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
 
         assert_ne!(conversation_memory_key(&msg1), conversation_memory_key(&msg2));
@@ -9377,6 +9499,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -9389,6 +9512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
         };
 
         mem.store(
@@ -9482,6 +9606,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -9499,6 +9624,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -9517,6 +9643,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -9591,6 +9718,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -9608,6 +9736,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
@@ -9694,6 +9823,7 @@ BTC is currently around $65,000 based on latest tool output."#
                     crate::config::ToolPolicyConfig::default(),
                 )),
             })),
+            native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         });
@@ -9711,6 +9841,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
+                sender_is_bot: false,
             },
             CancellationToken::new(),
         )
