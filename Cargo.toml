@@ -152,6 +152,12 @@ unicode-width = { version = "0.2", optional = true }
 # because the interactive PTY is a full-screen terminal handoff of the chat TUI
 # (the non-TUI reedline path never enters PTY handoff and so does not need it).
 portable-pty = { version = "0.9", optional = true }
+# In-process terminal emulator (v3b-b): parses PTY output into a screen grid so a
+# re-attach can redraw the *current* screen state (vim/htop) instead of replaying
+# raw bytes (which leaves full-screen programs scrambled for a frame). Pure Rust
+# (vte/itoa/unicode-width — no C/native deps), so it cross-compiles cleanly to
+# every release target. Gated with portable-pty under terminal-tui.
+vt100 = { version = "0.16.2", optional = true }
 
 # Binary discovery (init system detection)
 which = "7.0"
@@ -246,7 +252,7 @@ wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 llm-router = ["dep:skillratings", "dep:tiktoken-rs"]
 # Terminal TUI advanced features (Phase 3): ratatui layout, syntect highlighting,
 # CJK width, and interactive PTY shell sessions (v3 terminal handoff).
-terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width", "dep:portable-pty"]
+terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width", "dep:portable-pty", "dep:vt100"]
 # test-mock = expose an in-process MockProvider as the `"mock"` provider name so
 # PTY end-to-end tests can drive `prx chat` without hitting any real LLM.
 # Implementation: src/providers/router.rs + src/providers/mod.rs (factory match).

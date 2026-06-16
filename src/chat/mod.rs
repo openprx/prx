@@ -4621,12 +4621,14 @@ enum PtyExit {
 /// **not** spawn a per-attach reader or own the writer: the session's persistent
 /// drain reader is already running, and this function only:
 ///
-/// 1. clears the screen and replays the session's raw-byte ring so the user sees
-///    recent context (re-attach restore, v3b-a scheme (a));
+/// 1. syncs the PTY + emulator to the current host size, clears the screen, and
+///    renders the in-process emulator's current screen so the user sees the exact
+///    on-screen state (re-attach restore, v3b-b — correct for vim/htop, not just a
+///    raw byte replay);
 /// 2. marks the sink attached so the drain reader mirrors live PTY output to
 ///    `stdout` while we are here;
-/// 3. nudges the child with a `SIGWINCH` size jitter so full-screen programs
-///    repaint over any ring-replay artefacts (v3b-a scheme (c));
+/// 3. nudges the child with a `SIGWINCH` size jitter as a secondary safeguard so a
+///    program tracking its own size also re-flows (v3b-b);
 /// 4. reads raw `stdin`, classifying each byte
 ///    ([`crate::chat::sessions::pty::classify_input_byte`]) — `Ctrl-]` detaches,
 ///    everything else (incl. `Ctrl-C`/`Ctrl-D`) is forwarded to the PTY child —
@@ -4678,13 +4680,25 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
     }
     let _scope = AttachScope { session };
 
-    // 1. Clear the screen + home the cursor, then attach. `attach()` flips the
-    //    sink to `attached` AND replays the ring to `stdout` atomically under the
-    //    sink lock (v3b-a blocker-1): because the drain reader's live-mirror
-    //    `write()` contends for that same lock, the replayed scrollback can never
-    //    interleave with live bytes — the replay completes first, then live bytes
-    //    follow in order. No separate out-of-lock replay write (which was the
-    //    source of escape-sequence corruption for full-screen programs).
+    // 0. Sync the PTY + emulator to the CURRENT host geometry BEFORE rendering the
+    //    restore. The host may have been resized while this PTY was detached; if we
+    //    rendered the emulator's old-size screen it would be offset / wrapped wrong.
+    //    `resize` updates the emulator grid and the PTY master together (v3b-b), so
+    //    the subsequent `attach()` redraw is laid out for the real terminal. Cheap,
+    //    synchronous, non-fatal.
+    if let Err(e) = session.resize(host_size()) {
+        tracing::debug!(error = %e, "PTY resize-to-host before re-attach redraw failed");
+    }
+
+    // 1. Clear the screen + home the cursor, then attach. `attach()` flips the sink
+    //    to `attached` AND renders the emulator's CURRENT screen to `stdout`
+    //    atomically under the sink lock (v3b-b): because the drain reader's
+    //    live-mirror `write()` (which also feeds the emulator) contends for that
+    //    same lock, the screen-restore escape codes can never interleave with live
+    //    bytes — the restore completes first, then live bytes follow in order.
+    //    Rendering from the emulator (`state_formatted`) rather than replaying the
+    //    raw ring means full-screen programs (vim/htop) re-appear correct on the
+    //    first frame instead of being scrambled by spliced-in cursor sequences.
     {
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[2J\x1b[H");
@@ -4692,8 +4706,9 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
     }
     session.attach();
 
-    // 3. Nudge full-screen programs to repaint over any replay artefacts
-    //    (SIGWINCH size jitter). Harmless to streaming programs.
+    // 3. Secondary safeguard (v3b-b): the emulator already restored the picture, but
+    //    nudge the child with a SIGWINCH size jitter so a program tracking its own
+    //    size also re-flows. Harmless to streaming programs.
     session.nudge_redraw(host_size());
 
     // ── This thread: stdin → PTY writer, watching for detach + child exit ─────

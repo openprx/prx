@@ -304,28 +304,63 @@ pub const PTY_RING_CAPACITY: usize = 256 * 1024;
 /// A single long-lived reader thread copies PTY master output here for the whole
 /// life of the session. This sink:
 ///
+/// - **always** feeds the bytes to an in-process terminal emulator
+///   ([`vt100::Parser`]) so a screen grid (cells + cursor + attributes + input
+///   modes) tracking the *current* on-screen state is maintained at all times,
+///   even while detached (v3b-b);
 /// - **always** appends bytes to a bounded ring buffer (so detached PTYs keep
-///   draining — a full kernel pty buffer would otherwise block the child — and
-///   so a re-attach can replay recent context); and
+///   draining — a full kernel pty buffer would otherwise block the child — and so
+///   a re-attach has raw scrollback to fall back on / diagnose with); and
 /// - **when attached**, also writes the bytes straight to the real terminal
 ///   `stdout` (so the attached user sees live output).
 ///
-/// Routing (the attached check + ring append + optional `stdout` write) happens
-/// under a single `parking_lot::Mutex`, and detach flips `attached` under that
-/// **same** lock. This closes the v3a invariant precisely: once detach has set
-/// `attached = false`, the reader's *next* write observes it; a write already
-/// in-flight completes its `stdout` write before detach can flip the flag (they
-/// serialize on the mutex). So the reader is guaranteed to have stopped writing
-/// `stdout` by the time detach returns — before the `PtyHandoffGuard` resumes the
-/// chat render loop. Synchronous `parking_lot` only; never held across `.await`.
-#[derive(Debug)]
+/// Routing (the attached check + emulator feed + ring append + optional `stdout`
+/// write) happens under a single `parking_lot::Mutex`, and detach flips `attached`
+/// under that **same** lock. This closes the v3a invariant precisely: once detach
+/// has set `attached = false`, the reader's *next* write observes it; a write
+/// already in-flight completes its `stdout` write before detach can flip the flag
+/// (they serialize on the mutex). So the reader is guaranteed to have stopped
+/// writing `stdout` by the time detach returns — before the `PtyHandoffGuard`
+/// resumes the chat render loop. Synchronous `parking_lot` only; never held across
+/// `.await`.
+///
+/// # v3b-b: emulator-backed re-attach redraw
+///
+/// On re-attach we no longer replay the raw ring (which, for full-screen programs
+/// like vim/htop, splices historical cursor-positioning escape sequences over the
+/// real screen and scrambles it for a frame). Instead we ask the emulator for
+/// [`vt100::Screen::state_formatted`] — a self-contained escape-code sequence that
+/// reconstructs the *exact current screen* (every cell, the cursor position, the
+/// active SGR attributes, and the input/keypad modes). Writing that to `stdout`
+/// after a clear restores the screen correctly without relying on the child to
+/// redraw itself. The raw ring is kept only as a diagnostic / fallback (it never
+/// drives the visible re-attach picture anymore).
 struct SinkInner {
     /// Whether the session is currently attached (reader should mirror to
-    /// `stdout`). Guarded by the same lock as the ring so flip + write serialize.
+    /// `stdout`). Guarded by the same lock as the parser/ring so flip + write
+    /// serialize.
     attached: bool,
+    /// In-process terminal emulator fed every PTY output byte. Its `screen()`
+    /// always reflects the current on-screen state; on re-attach we render that
+    /// screen's `state_formatted()` to restore the picture (v3b-b). Sized to the
+    /// PTY geometry and kept in sync via [`PtySink::set_size`].
+    parser: vt100::Parser,
     /// Bounded raw-byte scrollback ring. `VecDeque` for O(1) push-back /
-    /// pop-front; capped at [`PTY_RING_CAPACITY`].
+    /// pop-front; capped at [`PTY_RING_CAPACITY`]. Diagnostic / fallback only since
+    /// v3b-b; the visible re-attach redraw comes from `parser` instead.
     ring: std::collections::VecDeque<u8>,
+}
+
+impl std::fmt::Debug for SinkInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (rows, cols) = self.parser.screen().size();
+        f.debug_struct("SinkInner")
+            .field("attached", &self.attached)
+            .field("emulator_rows", &rows)
+            .field("emulator_cols", &cols)
+            .field("ring_len", &self.ring.len())
+            .finish()
+    }
 }
 
 /// Handle to a PTY's drain sink, shared between the drain reader and the session.
@@ -335,64 +370,77 @@ struct SinkInner {
 struct PtySink(Arc<Mutex<SinkInner>>);
 
 impl PtySink {
-    /// A fresh, detached sink with an empty ring.
-    fn new() -> Self {
+    /// A fresh, detached sink with an empty ring and an emulator sized to `size`.
+    ///
+    /// The emulator is given the PTY geometry so its screen grid matches what the
+    /// child draws; `scrollback_len = 0` because the visible re-attach redraw only
+    /// needs the current screen (the raw ring still keeps recent bytes for
+    /// diagnostics). Geometry is kept in sync via [`PtySink::set_size`].
+    fn new(size: PtySize) -> Self {
+        let parser = vt100::Parser::new(size.rows.max(1), size.cols.max(1), 0);
         Self(Arc::new(Mutex::new(SinkInner {
             attached: false,
+            parser,
             ring: std::collections::VecDeque::with_capacity(8192),
         })))
     }
 
-    /// Mark the sink attached **and** replay the ring to `stdout` atomically under
-    /// the sink lock, so the replayed scrollback can never interleave with live
-    /// bytes from the drain reader.
+    /// Mark the sink attached **and** render the emulator's current screen to
+    /// `stdout` atomically under the sink lock, so the redraw can never interleave
+    /// with live bytes from the drain reader (v3b-b; replaces the v3b-a raw-ring
+    /// replay).
     ///
-    /// v3b-a blocker-1 fix: previously the caller snapshotted the ring under the
-    /// lock, returned, then replayed *outside* the lock — leaving a window where
-    /// the (already `attached`) drain reader's `write()` could mirror live bytes to
-    /// `stdout` interleaved with the replay, corrupting full-screen escape
-    /// sequences. By flipping `attached` and writing the replay under the **same**
-    /// lock the reader's `write()` contends for, the replay completes before any
-    /// live byte reaches `stdout`; bytes the child produced *during* the replay are
-    /// read by the drain reader only after this unlocks and are then mirrored in
-    /// order, right after the replay. No byte is lost, none is reordered.
+    /// Holding the sink lock across the `attached = true` flip AND the redraw write
+    /// is what makes the handoff safe: the drain reader's [`PtySink::write`] (which
+    /// feeds the emulator + mirrors `stdout` under the **same** lock) cannot
+    /// interleave a live byte between the screen-restore escape codes; bytes the
+    /// child produces *during* the redraw are read only after this unlocks and are
+    /// then mirrored in order, right after the restore. No byte is lost or
+    /// reordered, and full-screen programs (vim/htop) re-appear correct on the
+    /// first frame instead of relying on self-redraw.
     ///
-    /// The `stdout` write is bounded (the ring is capped at [`PTY_RING_CAPACITY`] =
-    /// 256 KiB) and synchronous — the same locking discipline `PtySink::write`
-    /// already uses for live mirroring, so this introduces no new lock-hold class.
-    /// `parking_lot`, never held across `.await`.
-    fn attach_and_replay(&self) {
+    /// The write is bounded (one screen of [`vt100::Screen::state_formatted`]
+    /// escape codes, proportional to rows×cols) and synchronous — the same locking
+    /// discipline `PtySink::write` already uses. `parking_lot`, never held across
+    /// `.await`.
+    fn attach_and_render(&self) {
         let mut out = std::io::stdout();
-        self.attach_and_replay_to(&mut out);
+        self.attach_and_render_to(&mut out);
     }
 
-    /// Inner implementation of [`attach_and_replay`] with the replay target
-    /// injected, so tests can assert the under-lock ordering against a capturing
-    /// sink instead of the real terminal. Production always passes `stdout`.
+    /// Inner implementation of [`attach_and_render`] with the redraw target
+    /// injected, so tests can assert the under-lock ordering / non-empty redraw
+    /// against a capturing sink instead of the real terminal. Production always
+    /// passes `stdout`.
     ///
-    /// Holds the sink lock across the `attached = true` flip AND the replay write,
-    /// so the drain reader's [`PtySink::write`] (which takes the same lock) cannot
-    /// interleave live bytes with the replay.
-    fn attach_and_replay_to(&self, out: &mut dyn std::io::Write) {
+    /// Holds the sink lock across the `attached = true` flip AND the redraw write.
+    /// `state_formatted()` is a self-contained sequence (it re-homes the cursor,
+    /// repaints every cell with its attributes, and restores the cursor + input
+    /// modes), so the caller need only clear the screen first.
+    fn attach_and_render_to(&self, out: &mut dyn std::io::Write) {
         let mut inner = self.0.lock();
         inner.attached = true;
-        if inner.ring.is_empty() {
-            return;
-        }
-        // `VecDeque` may be split across two contiguous slices; write both in
-        // order so the replay is byte-exact.
-        let (front, back) = inner.ring.as_slices();
-        let _ = out.write_all(front);
-        if !back.is_empty() {
-            let _ = out.write_all(back);
-        }
+        // `state_formatted` rebuilds the entire current screen (cells + cursor +
+        // SGR + input modes) — exactly what restores vim/htop correctly on
+        // re-attach without waiting for the child to repaint.
+        let redraw = inner.parser.screen().state_formatted();
+        let _ = out.write_all(&redraw);
         let _ = out.flush();
     }
 
+    /// Resize the emulator's screen grid to match the PTY geometry. Called whenever
+    /// the PTY is resized so the emulator stays the same size as the real terminal;
+    /// otherwise the [`state_formatted`](vt100::Screen::state_formatted) redraw
+    /// would be laid out for the wrong dimensions and the re-attach picture would
+    /// be offset. Under the sink lock, serialized with the drain reader's feed.
+    fn set_size(&self, rows: u16, cols: u16) {
+        self.0.lock().parser.screen_mut().set_size(rows.max(1), cols.max(1));
+    }
+
     /// Mark the sink detached (reader stops mirroring to `stdout`, keeps draining
-    /// into the ring). Taking the lock here serializes with any in-flight reader
-    /// write, so after this returns the reader will not touch `stdout` again until
-    /// re-attached — the v3a "no stdout writes after the render loop resumes"
+    /// into the emulator + ring). Taking the lock here serializes with any in-flight
+    /// reader write, so after this returns the reader will not touch `stdout` again
+    /// until re-attached — the v3a "no stdout writes after the render loop resumes"
     /// invariant.
     fn detach(&self) {
         self.0.lock().attached = false;
@@ -403,6 +451,14 @@ impl PtySink {
     #[cfg(test)]
     fn attach_and_snapshot_vec_for_test(&self) -> Vec<u8> {
         self.0.lock().ring.iter().copied().collect()
+    }
+
+    /// Test-only: render the emulator screen as plain text (no escape codes), so
+    /// unit tests can assert what the emulator currently shows without touching
+    /// `stdout`. Mirrors what a re-attach would visually restore.
+    #[cfg(test)]
+    fn screen_contents_for_test(&self) -> String {
+        self.0.lock().parser.screen().contents()
     }
 }
 
@@ -415,7 +471,11 @@ impl std::io::Write for PtySink {
         // after detach has returned. The `stdout` write is brief (a single PTY
         // read chunk, ≤ 8 KiB) so holding the lock over it is bounded.
         let mut inner = self.0.lock();
-        // Always append to the ring, trimming the oldest bytes past the cap.
+        // Always feed the emulator so its screen grid tracks the current on-screen
+        // state (used to redraw correctly on re-attach), even while detached.
+        inner.parser.process(buf);
+        // Always append to the ring (diagnostic / fallback), trimming the oldest
+        // bytes past the cap.
         inner.ring.extend(buf.iter().copied());
         let overflow = inner.ring.len().saturating_sub(PTY_RING_CAPACITY);
         if overflow > 0 {
@@ -587,7 +647,7 @@ impl PtyShellSession {
         //    `stdout` only while attached. It stops only on teardown
         //    (`reader_stop`), never on detach, and never blocks unboundedly (it
         //    polls `master_fd` and re-checks the stop flag each cycle).
-        let sink = PtySink::new();
+        let sink = PtySink::new(size);
         let reader_stop = Arc::new(ReaderStop::new());
         let child_done = Arc::new(AtomicBool::new(false));
         let reader_handle = {
@@ -648,15 +708,21 @@ impl PtyShellSession {
     }
 
     /// Begin an attach: under the sink lock, mark the sink attached (the drain
-    /// reader resumes mirroring PTY output to `stdout`) **and** replay the current
-    /// ring to `stdout` to restore on-screen context — atomically, so the replay
-    /// never interleaves with the reader's live mirror (v3b-a blocker-1).
+    /// reader resumes mirroring PTY output to `stdout`) **and** render the
+    /// emulator's current screen to `stdout` to restore on-screen context —
+    /// atomically, so the redraw never interleaves with the reader's live mirror
+    /// (v3b-b; replaces the v3b-a raw-ring replay).
     ///
-    /// Idempotent-ish: calling while already attached just re-replays the ring. The
-    /// caller is responsible for ensuring only one attach is active at a time (the
-    /// chat main loop is single-threaded, so this holds).
+    /// Because the redraw comes from the in-process terminal emulator
+    /// ([`vt100::Screen::state_formatted`]) rather than a raw byte replay,
+    /// full-screen programs (vim/htop) re-appear correct on the first frame instead
+    /// of being scrambled by spliced-in historical cursor sequences.
+    ///
+    /// Idempotent-ish: calling while already attached just re-renders the screen.
+    /// The caller is responsible for ensuring only one attach is active at a time
+    /// (the chat main loop is single-threaded, so this holds).
     pub fn attach(&self) {
-        self.runtime.sink.attach_and_replay();
+        self.runtime.sink.attach_and_render();
     }
 
     /// Mark the sink attached and return the current ring contents WITHOUT writing
@@ -693,8 +759,15 @@ impl PtyShellSession {
 
     /// Send a redraw nudge to a full-screen child after a re-attach: toggle the
     /// PTY size (shrink one row then restore) so curses/readline programs receive
-    /// `SIGWINCH` and repaint the whole screen, covering any artefacts left by the
-    /// raw-byte ring replay (v3b-a画面恢复 scheme (a)+(c)). Best-effort: a resize
+    /// `SIGWINCH` and repaint the whole screen.
+    ///
+    /// v3b-b: the visible re-attach picture is now restored directly from the
+    /// in-process emulator ([`PtyShellSession::attach`] →
+    /// [`vt100::Screen::state_formatted`]), so this nudge is no longer required for
+    /// correctness — it is kept as a **secondary safeguard** so a child that tracks
+    /// its own size also re-flows after the handoff (and so a re-attach matching the
+    /// child's current geometry still settles cleanly). Each `resize` also keeps
+    /// the emulator in sync via [`PtyShellSession::resize`]. Best-effort: a resize
     /// failure is logged, never fatal. `size` is the current host geometry to
     /// settle on.
     pub fn nudge_redraw(&self, size: PtySize) {
@@ -747,9 +820,18 @@ impl PtyShellSession {
         }
     }
 
-    /// Resize the PTY to match the host terminal. Cheap, synchronous, never
-    /// panics (errors are returned). Safe to call while attached.
+    /// Resize the PTY to match the host terminal, keeping the in-process emulator
+    /// the same size (v3b-b). The emulator must track the PTY geometry or its
+    /// re-attach redraw ([`vt100::Screen::state_formatted`]) would be laid out for
+    /// the wrong dimensions and the restored picture would be offset / wrapped
+    /// wrong. We resize the emulator first (infallible) then the PTY master; both
+    /// are cheap, synchronous, and never panic (master errors are returned). Safe
+    /// to call while attached.
     pub fn resize(&self, size: PtySize) -> Result<()> {
+        // Keep the emulator grid in step with the PTY winsize. Done before the
+        // master resize so even if the master resize errors the emulator already
+        // reflects the host geometry we are settling on.
+        self.runtime.sink.set_size(size.rows, size.cols);
         self.master
             .lock()
             .resize(size)
@@ -1456,7 +1538,16 @@ mod tests {
         );
     }
 
-    // ── v3b-a blocker-1: re-attach replay must not interleave with live mirror ─
+    // ── v3b-b: in-process terminal emulator (feed / render / resize / serialize) ─
+
+    fn test_size(rows: u16, cols: u16) -> PtySize {
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
 
     /// A `Write` sink that records everything written to it and can be told to
     /// sleep at the *start* of its first write — used to widen the window in which
@@ -1482,86 +1573,147 @@ mod tests {
     }
 
     #[test]
-    fn attach_replay_serializes_under_lock_no_interleave() {
-        // Blocker-1 invariant: when an attach replays the ring under the sink lock,
-        // the drain reader's live-mirror `write()` (same lock) cannot interleave —
-        // the replayed bytes must all land BEFORE any live byte. We pre-fill the
-        // ring with a replay marker, then race a slow replay against a live write
-        // and assert the captured stream is `<replay><live>`, never interleaved.
+    fn emulator_tracks_screen_after_feed() {
+        // Feeding the sink (as the drain reader does) must update the emulator
+        // screen, so a re-attach can render the current contents. Detached or not,
+        // the screen reflects the latest bytes.
         use std::io::Write as _;
-
-        let sink = PtySink::new();
-        // Pre-fill the ring with the "scrollback" the attach will replay.
-        let replay_marker = b"REPLAY-SCROLLBACK-AAAA";
+        let sink = PtySink::new(test_size(24, 80));
         {
             let mut s = sink.clone();
-            s.write_all(replay_marker).expect("test: seed ring");
-            // Note: not attached yet, so this only filled the ring (no stdout).
+            s.write_all(b"hello-emulator").expect("test: feed emulator");
+        }
+        let screen = sink.screen_contents_for_test();
+        assert!(
+            screen.contains("hello-emulator"),
+            "emulator screen must reflect fed bytes, got: {screen:?}"
+        );
+        // Overwriting the line (carriage-return + new text) must be reflected too,
+        // proving the emulator interprets control bytes rather than just buffering.
+        {
+            let mut s = sink.clone();
+            s.write_all(b"\rgoodbye").expect("test: overwrite line");
+        }
+        let screen = sink.screen_contents_for_test();
+        assert!(
+            screen.contains("goodbye"),
+            "emulator must apply CR overwrite, got: {screen:?}"
+        );
+    }
+
+    #[test]
+    fn attach_render_produces_nonempty_redraw_reflecting_screen() {
+        // The re-attach redraw must be non-empty and reproduce the current screen.
+        // We feed some text, render to a capture, then parse that render back into a
+        // FRESH emulator and assert the reconstructed screen matches — proving the
+        // render bytes actually rebuild the picture (not just that they are present).
+        use std::io::Write as _;
+        let sink = PtySink::new(test_size(10, 40));
+        {
+            let mut s = sink.clone();
+            s.write_all(b"RESTORE-ME-XYZ").expect("test: feed emulator");
+        }
+        let mut captured: Vec<u8> = Vec::new();
+        sink.attach_and_render_to(&mut captured);
+        assert!(!captured.is_empty(), "re-attach redraw must not be empty");
+
+        // Replay the redraw into a clean emulator of the same size; its screen must
+        // show the same text we fed — i.e. the render reconstructs the screen.
+        let mut fresh = vt100::Parser::new(10, 40, 0);
+        fresh.process(&captured);
+        let reconstructed = fresh.screen().contents();
+        assert!(
+            reconstructed.contains("RESTORE-ME-XYZ"),
+            "re-attach redraw did not reconstruct the screen, got: {reconstructed:?}"
+        );
+    }
+
+    #[test]
+    fn set_size_resizes_emulator_grid() {
+        // Resizing the sink must resize the emulator grid so the redraw is laid out
+        // for the real terminal geometry (otherwise a re-attach would be offset).
+        let sink = PtySink::new(test_size(24, 80));
+        sink.set_size(40, 120);
+        // Inspect via the locked screen size.
+        let (rows, cols) = sink.0.lock().parser.screen().size();
+        assert_eq!((rows, cols), (40, 120), "emulator grid must follow set_size");
+        // Zero dimensions are clamped to 1 (never a 0-sized grid).
+        sink.set_size(0, 0);
+        let (rows, cols) = sink.0.lock().parser.screen().size();
+        assert_eq!((rows, cols), (1, 1), "set_size must clamp 0 to 1");
+    }
+
+    #[test]
+    fn attach_render_serializes_under_lock_no_interleave() {
+        // v3b-b invariant (carried over from v3b-a blocker-1): the re-attach redraw
+        // happens under the sink lock, so the drain reader's live-mirror `write()`
+        // (same lock) cannot interleave a live byte into the screen-restore escape
+        // codes. We race a deliberately-slow redraw against a live write and assert
+        // the live write is BLOCKED until the redraw's lock hold ends (timing
+        // proof), and that the live bytes still reach the emulator/ring afterwards.
+        use std::io::Write as _;
+
+        let sink = PtySink::new(test_size(24, 80));
+        // Seed the screen so the redraw is non-trivial.
+        {
+            let mut s = sink.clone();
+            s.write_all(b"SEED-SCREEN").expect("test: seed screen");
         }
 
         let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
         let mut recorder = RecordingSink {
             buf: Arc::clone(&captured),
-            // Sleep mid-replay so a live write, if it could interleave, would.
+            // Sleep mid-render so a live write, if it could interleave, would.
             first_write_delay: std::time::Duration::from_millis(150),
             first_write_done: Arc::new(AtomicBool::new(false)),
         };
 
-        // Thread 1: the attach — replays the ring to the recorder under the lock.
+        // Thread 1: the attach — renders the emulator screen to the recorder under
+        // the sink lock (holds the lock across the slow first write).
         let sink_attach = sink.clone();
         let attach_thread = std::thread::spawn(move || {
-            sink_attach.attach_and_replay_to(&mut recorder);
+            sink_attach.attach_and_render_to(&mut recorder);
         });
 
-        // Give the attach a moment to acquire the lock and begin its (slow) replay.
+        // Give the attach a moment to acquire the lock and begin its (slow) render.
         std::thread::sleep(std::time::Duration::from_millis(30));
 
-        // Thread 2: the drain reader mirrors a live byte sequence. Because the sink
-        // is now `attached`, `write()` would mirror to... the SAME captured buffer
-        // only if it shared the recorder — it does not; the live mirror writes to
-        // real stdout. So to observe interleave we instead route the live write
-        // through the recorder by mirroring manually under the public `write` path
-        // is not possible. Instead we assert the *lock* is held: the live `write`
-        // must block until the replay finishes. We prove that by timing: the live
-        // write cannot complete before the replay's 150ms sleep elapses.
-        let live_marker = b"LIVE-BYTES-BBBB";
+        // Thread 2 (this thread): a live write contends for the SAME sink lock held
+        // by the in-flight render; it must block until the render's 150ms sleep ends.
+        let live_marker = b"LIVE-AFTER";
         let start = std::time::Instant::now();
         {
             let mut s = sink.clone();
-            // This contends for the sink lock held by the in-flight replay.
             s.write_all(live_marker).expect("test: live write");
         }
         let live_write_elapsed = start.elapsed();
 
         attach_thread.join().expect("test: attach thread joins");
 
-        // 1. The live write was blocked by the replay's lock hold: it could not
-        //    return until the 150ms replay sleep (started ~30ms before) completed.
+        // 1. The live write was blocked by the render's lock hold: it could not
+        //    return until the 150ms render sleep (started ~30ms before) completed.
         assert!(
             live_write_elapsed >= std::time::Duration::from_millis(90),
             "live mirror write returned too fast ({live_write_elapsed:?}) — it was NOT \
-             serialized behind the under-lock replay (interleave possible)"
+             serialized behind the under-lock render (interleave possible)"
         );
 
-        // 2. The replay captured exactly the ring scrollback, contiguous and whole
-        //    (no live bytes spliced in — the recorder only ever saw the replay).
+        // 2. The render captured a non-empty self-contained redraw.
         let got = captured.lock().clone();
-        assert_eq!(
-            got, replay_marker,
-            "replay output was not the contiguous ring scrollback"
-        );
+        assert!(!got.is_empty(), "render produced no redraw bytes");
 
-        // 3. The live bytes did make it into the ring (no loss) after the replay.
-        let ring_after = sink.attach_and_snapshot_vec_for_test();
-        let ring_str = String::from_utf8_lossy(&ring_after);
+        // 3. The live bytes made it into the emulator AFTER the render (no loss).
+        let screen = sink.screen_contents_for_test();
         assert!(
-            ring_str.contains("LIVE-BYTES-BBBB"),
-            "live bytes lost from ring after replay: {ring_str:?}"
+            screen.contains("LIVE-AFTER"),
+            "live bytes lost from emulator after render: {screen:?}"
         );
-        // And the live bytes come AFTER the replay marker in the ring order.
-        let rpos = ring_str.find("REPLAY-SCROLLBACK").expect("test: replay marker in ring");
-        let lpos = ring_str.find("LIVE-BYTES").expect("test: live marker in ring");
-        assert!(rpos < lpos, "live bytes must follow replayed scrollback in order");
+        // And into the raw ring fallback too.
+        let ring = sink.attach_and_snapshot_vec_for_test();
+        assert!(
+            String::from_utf8_lossy(&ring).contains("LIVE-AFTER"),
+            "live bytes lost from ring fallback after render"
+        );
     }
 
     // ── PTY spawn + interaction (Unix; needs a real /dev/ptmx) ───────────────
@@ -1771,6 +1923,39 @@ mod tests {
             String::from_utf8_lossy(&snapshot).contains("replay-marker"),
             "attach snapshot must replay recent ring context"
         );
+
+        session.kill().await.expect("test: cleanup kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn emulator_screen_reflects_real_pty_output_for_reattach() {
+        // v3b-b end-to-end: the persistent drain reader feeds the in-process
+        // emulator, so a re-attach renders the CURRENT screen of a real PTY child
+        // (not a raw byte replay). We run a real child that prints a marker, then
+        // assert the emulator screen shows it — the bytes a re-attach would redraw.
+        let sec = auto_security();
+        let session = PtyShellSession::spawn("printf 'EMU-SCREEN-MARK'; sleep 5", &sec, PtySize::default())
+            .expect("test: spawn printf child");
+
+        let mut screen = String::new();
+        for _ in 0..50 {
+            screen = session.runtime.sink.screen_contents_for_test();
+            if screen.contains("EMU-SCREEN-MARK") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            screen.contains("EMU-SCREEN-MARK"),
+            "emulator screen must reflect real PTY output for re-attach redraw, got: {screen:?}"
+        );
+
+        // The render path produces a non-empty, screen-reconstructing redraw.
+        let mut redraw: Vec<u8> = Vec::new();
+        session.runtime.sink.attach_and_render_to(&mut redraw);
+        session.detach();
+        assert!(!redraw.is_empty(), "re-attach render of a live PTY must not be empty");
 
         session.kill().await.expect("test: cleanup kill");
     }
