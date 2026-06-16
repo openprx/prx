@@ -274,6 +274,8 @@ impl Channel for DingTalkChannel {
                             .as_secs(),
                         thread_ts: None,
                         mentioned_uuids: vec![],
+                        mentioned: false,
+                        is_group_hint: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

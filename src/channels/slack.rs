@@ -292,6 +292,8 @@ impl Channel for SlackChannel {
                             .as_secs(),
                         thread_ts: Self::inbound_thread_ts(msg, ts),
                         mentioned_uuids: vec![],
+                        mentioned: false,
+                        is_group_hint: false,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

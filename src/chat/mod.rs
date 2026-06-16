@@ -4400,6 +4400,8 @@ fn send_synthetic_command(
         timestamp,
         thread_ts: None,
         mentioned_uuids: vec![],
+        mentioned: false,
+        is_group_hint: false,
     };
     input_tx.blocking_send(msg).map_err(|_| ())
 }
@@ -5131,6 +5133,8 @@ fn run_tui_unified_loop(
                             timestamp,
                             thread_ts: None,
                             mentioned_uuids: vec![],
+                            mentioned: false,
+                            is_group_hint: false,
                         };
                         if input_tx.blocking_send(msg).is_err() {
                             // Receiver dropped — chat::run is tearing down.

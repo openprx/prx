@@ -68,7 +68,7 @@ pub use whatsapp_web::WhatsAppWebChannel;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    build_tool_instructions, run_tool_call_loop,
+    build_tool_instructions,
 };
 use crate::config::Config;
 use crate::hooks::HookManager;
@@ -273,6 +273,12 @@ struct ChannelRuntimeContext {
     bot_names: Vec<String>,
     bot_uuids: Vec<String>,
     mention_only_by_channel: HashMap<String, bool>,
+    /// Per-channel effective group reply mode (smart group-reply). Populated for
+    /// channels that opt into smart mode; absent => derive from mention_only.
+    group_reply_mode_by_channel: HashMap<String, crate::config::GroupReplyMode>,
+    /// Per-group cooldown tracker for proactive (non-@) smart replies, to avoid
+    /// the bot dominating a busy group. Keyed by `channel:group_id`.
+    smart_reply_cooldown: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
     /// Skill RAG context (present when skill_rag.enabled) for per-message skill selection.
     skill_rag_ctx: Option<SkillRagContext>,
     /// Test-only seam: when present, `process_channel_message` routes the inbound
@@ -574,8 +580,38 @@ fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
     mention_only
 }
 
+/// Collect the effective group reply mode for channels that support smart
+/// group-reply (currently Telegram and Discord). Other channels are absent and
+/// fall back to their `mention_only`-derived behavior unchanged.
+fn collect_group_reply_mode_by_channel(config: &Config) -> HashMap<String, crate::config::GroupReplyMode> {
+    let mut modes = HashMap::new();
+    if let Some(telegram) = config.channels_config.telegram.as_ref() {
+        modes.insert(
+            "telegram".to_string(),
+            crate::config::GroupReplyMode::resolve(telegram.group_reply_mode, telegram.mention_only),
+        );
+    }
+    if let Some(discord) = config.channels_config.discord.as_ref() {
+        modes.insert(
+            "discord".to_string(),
+            crate::config::GroupReplyMode::resolve(discord.group_reply_mode, discord.mention_only),
+        );
+    }
+    modes
+}
+
 fn is_mention_only_enabled(ctx: &ChannelRuntimeContext, channel_name: &str) -> bool {
     ctx.mention_only_by_channel.get(channel_name).copied().unwrap_or(false)
+}
+
+/// Effective group reply mode for a channel (smart group-reply). Defaults to
+/// `MentionOnly`-equivalent behavior when the channel is not registered as a
+/// smart-capable channel.
+fn group_reply_mode_for(ctx: &ChannelRuntimeContext, channel_name: &str) -> crate::config::GroupReplyMode {
+    ctx.group_reply_mode_by_channel
+        .get(channel_name)
+        .copied()
+        .unwrap_or_else(|| crate::config::GroupReplyMode::resolve(None, is_mention_only_enabled(ctx, channel_name)))
 }
 
 fn is_bot_mentioned(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage, content: &str) -> bool {
@@ -757,6 +793,31 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
             "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
         ),
         _ => None,
+    }
+}
+
+/// System-prompt addendum for smart group-reply turns. Overrides the default
+/// "respond directly" guidance: tells the model it is one participant in a group
+/// and that staying silent (via `stay_silent`) is often the correct choice.
+///
+/// When the bot was explicitly @-mentioned, it should normally answer; otherwise
+/// it should only speak when it can clearly add value.
+const fn smart_group_prompt_addendum(mentioned: bool) -> &'static str {
+    if mentioned {
+        "\n## Group Chat Mode (smart)\n\n\
+         - You are ONE participant in a group conversation. This message addresses you directly.\n\
+         - Reply normally — but stay concise and on-topic; do not dominate the conversation.\n\
+         - If a reply truly is not warranted, you may call the `stay_silent` tool with a short reason \
+           instead of sending a message.\n"
+    } else {
+        "\n## Group Chat Mode (smart)\n\n\
+         - You are ONE participant in a group conversation. This message was NOT addressed to you.\n\
+         - Only speak when you can clearly add value (answer a question aimed at the group, correct a \
+           critical error, or provide help you are uniquely able to give).\n\
+         - For small talk, chatter between other people, or anything not relevant to you, call the \
+           `stay_silent` tool with a short reason. Staying silent is the DEFAULT and correct choice for \
+           most messages — do not feel obliged to reply.\n\
+         - Never reply just to acknowledge; silence is better than noise.\n"
     }
 }
 
@@ -2634,16 +2695,51 @@ async fn process_channel_message(
     let is_group = msg.reply_target.starts_with("group:")
         || msg.reply_target.ends_with("@g.us")
         || msg.reply_target.contains("@g.us");
+
+    // ── Smart group-reply decision context ──────────────────────────────────
+    // Effective mode for this channel. Smart-capable channels (Telegram/Discord)
+    // tag group-ness via `msg.is_group_hint` since their `reply_target` is a bare
+    // chat/channel id; other channels rely on `is_group` above.
+    let group_reply_mode = group_reply_mode_for(ctx.as_ref(), &msg.channel);
+    // A message is "in a group" for smart purposes if either the central
+    // reply_target encoding says so OR the channel layer flagged it.
+    let in_group_for_smart = is_group || msg.is_group_hint;
+    // 🔴 Invariant #1 (DM never silent): smart suppression is gated on a real
+    // group message. DMs (`!in_group_for_smart`) can never be smart, so
+    // stay_silent is never exposed and outbound is never suppressed for them.
+    // 🔴 Invariant: system/webhook senders (`system:` prefix) bypass smart
+    // entirely — they always get a normal reply.
+    let smart_group = group_reply_mode.is_smart() && in_group_for_smart && !is_system_message(&msg);
+
+    // Whether the bot is explicitly addressed: central detection OR channel hint.
+    let user_text_for_mention = strip_channel_metadata(&msg.content);
+    let mentioned = msg.mentioned || is_bot_mentioned(ctx.as_ref(), &msg, &user_text_for_mention);
+
     if is_group {
         let mention_only = is_mention_only_enabled(ctx.as_ref(), &msg.channel);
-        if mention_only {
-            // Strip metadata lines (e.g. [signal-meta ...]) before checking for mentions,
-            // otherwise group names containing the bot name cause false positives.
-            let user_text = strip_channel_metadata(&msg.content);
-            if !is_bot_mentioned(ctx.as_ref(), &msg, &user_text) {
-                println!("  ⏭️ Group message stored but skipped (no mention)");
-                return;
-            }
+        // Non-smart mention_only behavior is byte-identical to before. Smart mode
+        // never drops here (it lets the model decide via stay_silent).
+        if mention_only && !group_reply_mode.is_smart() && !is_bot_mentioned(ctx.as_ref(), &msg, &user_text_for_mention)
+        {
+            println!("  ⏭️ Group message stored but skipped (no mention)");
+            return;
+        }
+    }
+
+    // Smart proactive guard: when the bot was NOT explicitly addressed in a smart
+    // group, apply anti-spam protections BEFORE spending a full LLM loop:
+    //  - never proactively react to a bot's own / another bot's message
+    //    (prevents bot-to-bot feedback loops);
+    //  - per-group cooldown so the bot does not dominate a busy group.
+    // @-mentions (explicit summons) bypass both guards and always proceed.
+    if smart_group && !mentioned {
+        if is_bot_sender(&msg) {
+            tracing::debug!(channel = %msg.channel, sender = %msg.sender, "smart: skip proactive reply to bot sender");
+            return;
+        }
+        if smart_proactive_within_cooldown(ctx.as_ref(), &msg) {
+            tracing::debug!(channel = %msg.channel, "smart: skip proactive reply (within cooldown window)");
+            return;
         }
     }
 
@@ -2765,7 +2861,15 @@ async fn process_channel_message(
     } else {
         ctx.system_prompt.to_string()
     };
-    let system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
+    let mut system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
+    // Smart group-reply: override the default "respond directly / response is
+    // automatically sent" guidance so the model knows it is one participant in a
+    // group and may decline to speak via `stay_silent`. Only appended for smart
+    // group turns (never DMs / non-smart), preserving the default behavior
+    // everywhere else.
+    if smart_group {
+        system_prompt.push_str(smart_group_prompt_addendum(mentioned));
+    }
     let rebuild_history = || {
         // Read the canonical ∪ legacy union (FIX-P1-25b read-merge) so pre-cutover
         // turns stored under the legacy key remain visible alongside new canonical
@@ -2916,8 +3020,9 @@ async fn process_channel_message(
         }
     });
 
+    type LoopResult = Result<(crate::agent::loop_::ToolLoopOutcome, crate::agent::loop_::ToolLoopTrace), anyhow::Error>;
     enum LlmExecutionResult {
-        Completed(Result<Result<String, anyhow::Error>, tokio::time::error::Elapsed>),
+        Completed(Result<LoopResult, tokio::time::error::Elapsed>),
         Cancelled,
     }
 
@@ -2926,6 +3031,11 @@ async fn process_channel_message(
         Success {
             response: String,
             history_len_before_tools: usize,
+        },
+        /// Smart group-reply: the model chose to stay silent. No message is sent
+        /// and no assistant turn is written to history.
+        Silent {
+            reason: String,
         },
         Error(anyhow::Error),
         Timeout,
@@ -2982,7 +3092,7 @@ async fn process_channel_message(
                 Duration::from_secs(timeout_budget_secs),
                 crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
                 turn_spawn_ctx.clone(),
-                run_tool_call_loop(
+                crate::agent::loop_::run_tool_call_loop_outcome(
                     active_provider.as_ref(),
                     &mut history,
                     ctx.tools_registry.as_ref(),
@@ -3010,6 +3120,10 @@ async fn process_channel_message(
                     Some(&ctx.tool_tiering),
                     Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
                     crate::agent::loop_::ChatMode::default(),
+                    None,
+                    // expose_stay_silent: ONLY on smart group turns. DMs / non-smart
+                    // never see the tool, so they can never short-circuit to Silent.
+                    smart_group,
                 ),
                 ),
             ) => LlmExecutionResult::Completed(result),
@@ -3017,12 +3131,28 @@ async fn process_channel_message(
 
         match llm_result {
             LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
-            LlmExecutionResult::Completed(Ok(Ok(response))) => {
-                break LlmFinalOutcome::Success {
-                    response,
-                    history_len_before_tools,
-                };
-            }
+            LlmExecutionResult::Completed(Ok(Ok((outcome, _trace)))) => match outcome {
+                crate::agent::loop_::ToolLoopOutcome::Text(response) => {
+                    break LlmFinalOutcome::Success {
+                        response,
+                        history_len_before_tools,
+                    };
+                }
+                crate::agent::loop_::ToolLoopOutcome::Silent { reason } => {
+                    break LlmFinalOutcome::Silent { reason };
+                }
+                // AwaitingApproval is not produced on this (None-resolver) path;
+                // treat it defensively as a no-op silent turn rather than panic.
+                crate::agent::loop_::ToolLoopOutcome::AwaitingApproval(pending) => {
+                    tracing::warn!(
+                        tool = pending.tool_name.as_str(),
+                        "channel loop produced unexpected awaiting-approval outcome (no resolver); treating as silent"
+                    );
+                    break LlmFinalOutcome::Silent {
+                        reason: "unexpected awaiting-approval outcome".to_string(),
+                    };
+                }
+            },
             LlmExecutionResult::Completed(Ok(Err(e))) => {
                 if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
                     break LlmFinalOutcome::Cancelled;
@@ -3160,6 +3290,37 @@ async fn process_channel_message(
                     eprintln!("  ❌ Failed to reply on {}: {e}", channel.name());
                 }
             }
+            // Smart group-reply: when the bot just spoke proactively (not @-ed),
+            // start the per-group cooldown so it does not immediately speak again.
+            if smart_group && !mentioned {
+                record_smart_proactive_reply(ctx.as_ref(), &msg);
+            }
+        }
+        LlmFinalOutcome::Silent { reason } => {
+            // 🔴 Invariant: outbound suppression only happens on smart group
+            // turns (`expose_stay_silent` was gated on `smart_group`, so Silent
+            // can only originate there). Do NOT send and do NOT write an
+            // assistant turn to history — the silent decision leaves no trace.
+            // Cancel any in-flight draft so no empty bubble lingers.
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                reason = reason.as_str(),
+                "smart group-reply: staying silent (no message sent, no history written)"
+            );
+            println!(
+                "  🤫 Stayed silent ({}ms): {}",
+                started_at.elapsed().as_millis(),
+                truncate_with_ellipsis(&reason, 80)
+            );
+            if let (Some(channel), Some(draft_id)) = (target_channel.as_ref(), draft_message_id.as_deref()) {
+                if let Err(err) = channel.cancel_draft(&msg.reply_target, draft_id).await {
+                    tracing::debug!(
+                        "Failed to cancel draft after silent decision on {}: {err}",
+                        channel.name()
+                    );
+                }
+            }
         }
         LlmFinalOutcome::Error(e) => {
             eprintln!("  ❌ LLM error after {}ms: {e}", started_at.elapsed().as_millis());
@@ -3218,6 +3379,53 @@ async fn process_channel_message(
 /// (e.g. webhook `system:*` senders, internal cron ticks) vs. a real user.
 fn is_system_message(msg: &traits::ChannelMessage) -> bool {
     msg.sender.starts_with("system:")
+}
+
+/// Cooldown window between proactive (non-@) smart group replies in the same
+/// group, to keep the bot from dominating a busy conversation. Explicit
+/// @-mentions bypass this entirely.
+const SMART_PROACTIVE_COOLDOWN_SECS: u64 = 45;
+
+/// Best-effort detection that a message originated from a bot (this bot or
+/// another bot), used to suppress proactive smart replies and break potential
+/// bot-to-bot feedback loops. Channel layers also filter bots upstream (e.g.
+/// Discord `listen_to_bots`); this is a defense-in-depth central guard keyed on
+/// the bot's own configured identities plus a common `bot`-suffix heuristic.
+fn is_bot_sender(msg: &traits::ChannelMessage) -> bool {
+    let sender = msg.sender.trim();
+    if sender.is_empty() {
+        return false;
+    }
+    let lower = sender.to_lowercase();
+    // Common bot account naming conventions across platforms.
+    lower.ends_with("bot") || lower.ends_with("-bot") || lower.contains(":bot:")
+}
+
+/// Group key for proactive smart-reply cooldown tracking.
+fn smart_cooldown_key(msg: &traits::ChannelMessage) -> String {
+    let group = extract_group_identifier(msg).unwrap_or_else(|| msg.reply_target.clone());
+    format!("{}:{}", msg.channel, group)
+}
+
+/// Whether a proactive smart reply for this group is still within the cooldown
+/// window since the last proactive reply. Read-only (does not record).
+fn smart_proactive_within_cooldown(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) -> bool {
+    let key = smart_cooldown_key(msg);
+    let window = std::time::Duration::from_secs(SMART_PROACTIVE_COOLDOWN_SECS);
+    let now = std::time::Instant::now();
+    let guard = ctx.smart_reply_cooldown.lock();
+    guard.get(&key).is_some_and(|last| now.duration_since(*last) < window)
+}
+
+/// Record that a proactive smart reply was just sent for this group, starting a
+/// fresh cooldown window. Also prunes stale entries to bound memory.
+fn record_smart_proactive_reply(ctx: &ChannelRuntimeContext, msg: &traits::ChannelMessage) {
+    let key = smart_cooldown_key(msg);
+    let now = std::time::Instant::now();
+    let window = std::time::Duration::from_secs(SMART_PROACTIVE_COOLDOWN_SECS);
+    let mut guard = ctx.smart_reply_cooldown.lock();
+    guard.retain(|_, last| now.duration_since(*last) < window);
+    guard.insert(key, now);
 }
 
 async fn run_message_dispatch_loop(
@@ -3836,7 +4044,11 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
             "Telegram",
             Arc::new(
                 TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), tg.mention_only)
-                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                    .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                    .with_group_reply_mode(crate::config::GroupReplyMode::resolve(
+                        tg.group_reply_mode,
+                        tg.mention_only,
+                    )),
             ),
         ));
     }
@@ -3844,13 +4056,19 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     if let Some(ref dc) = config.channels_config.discord {
         channels.push((
             "Discord",
-            Arc::new(DiscordChannel::new(
-                dc.bot_token.clone(),
-                dc.guild_id.clone(),
-                dc.allowed_users.clone(),
-                dc.listen_to_bots,
-                dc.mention_only,
-            )),
+            Arc::new(
+                DiscordChannel::new(
+                    dc.bot_token.clone(),
+                    dc.guild_id.clone(),
+                    dc.allowed_users.clone(),
+                    dc.listen_to_bots,
+                    dc.mention_only,
+                )
+                .with_group_reply_mode(crate::config::GroupReplyMode::resolve(
+                    dc.group_reply_mode,
+                    dc.mention_only,
+                )),
+            ),
         ));
     }
 
@@ -4322,18 +4540,28 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     if let Some(ref tg) = config.channels_config.telegram {
         channels.push(Arc::new(
             TelegramChannel::new(tg.bot_token.clone(), tg.allowed_users.clone(), tg.mention_only)
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_group_reply_mode(crate::config::GroupReplyMode::resolve(
+                    tg.group_reply_mode,
+                    tg.mention_only,
+                )),
         ));
     }
 
     if let Some(ref dc) = config.channels_config.discord {
-        channels.push(Arc::new(DiscordChannel::new(
-            dc.bot_token.clone(),
-            dc.guild_id.clone(),
-            dc.allowed_users.clone(),
-            dc.listen_to_bots,
-            dc.mention_only,
-        )));
+        channels.push(Arc::new(
+            DiscordChannel::new(
+                dc.bot_token.clone(),
+                dc.guild_id.clone(),
+                dc.allowed_users.clone(),
+                dc.listen_to_bots,
+                dc.mention_only,
+            )
+            .with_group_reply_mode(crate::config::GroupReplyMode::resolve(
+                dc.group_reply_mode,
+                dc.mention_only,
+            )),
+        ));
     }
 
     if let Some(ref sl) = config.channels_config.slack {
@@ -4819,6 +5047,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     let bot_names = collect_bot_names(&config);
     let bot_uuids = collect_bot_uuids(&config);
     let mention_only_by_channel = collect_mention_only_by_channel(&config);
+    let group_reply_mode_by_channel = collect_group_reply_mode_by_channel(&config);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
@@ -4868,6 +5097,8 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         bot_names,
         bot_uuids,
         mention_only_by_channel,
+        group_reply_mode_by_channel,
+        smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
         skill_rag_ctx,
         #[cfg(test)]
         test_inbound_authorizer: None,
@@ -4908,6 +5139,83 @@ mod tests {
 
     const CHANNEL_MESSAGE_TIMEOUT_SECS: u64 = 300;
     use tempfile::TempDir;
+
+    fn smart_test_msg(sender: &str, reply_target: &str) -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            sender: sender.to_string(),
+            reply_target: reply_target.to_string(),
+            channel: "telegram".to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_bot_sender_detects_bot_naming() {
+        assert!(is_bot_sender(&smart_test_msg("helperbot", "g1")));
+        assert!(is_bot_sender(&smart_test_msg("news-bot", "g1")));
+        assert!(!is_bot_sender(&smart_test_msg("alice", "g1")));
+        assert!(!is_bot_sender(&smart_test_msg("", "g1")));
+    }
+
+    #[test]
+    fn smart_proactive_cooldown_blocks_then_record_extends() {
+        let ctx_cooldown: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>> =
+            Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        // Build a minimal ctx-like surface is heavy; instead test the pure key +
+        // map semantics that the helpers rely on.
+        let msg = smart_test_msg("alice", "group:teamchat");
+        let key = smart_cooldown_key(&msg);
+        assert_eq!(key, "telegram:teamchat");
+        // Empty map => not within cooldown.
+        {
+            let guard = ctx_cooldown.lock();
+            assert!(guard.get(&key).is_none());
+        }
+        // After inserting "now", a fresh lookup is within the window.
+        {
+            let mut guard = ctx_cooldown.lock();
+            guard.insert(key.clone(), std::time::Instant::now());
+        }
+        {
+            let guard = ctx_cooldown.lock();
+            let within = guard.get(&key).is_some_and(|last| {
+                std::time::Instant::now().duration_since(*last)
+                    < std::time::Duration::from_secs(SMART_PROACTIVE_COOLDOWN_SECS)
+            });
+            assert!(within, "just-recorded proactive reply must be within cooldown");
+        }
+    }
+
+    #[test]
+    fn collect_group_reply_mode_resolves_smart_capable_channels() {
+        // The collector only registers smart-capable channels (telegram/discord)
+        // and resolves their effective mode from explicit + mention_only.
+        let mut config = Config::default();
+        config.channels_config.telegram = Some(crate::config::TelegramConfig {
+            bot_token: "t".into(),
+            allowed_users: vec!["*".into()],
+            stream_mode: crate::config::StreamMode::default(),
+            draft_update_interval_ms: 1000,
+            interrupt_on_new_message: false,
+            mention_only: true,
+            group_reply_mode: Some(crate::config::GroupReplyMode::Smart),
+        });
+        config.channels_config.discord = Some(crate::config::DiscordConfig {
+            bot_token: "d".into(),
+            guild_id: None,
+            allowed_users: vec!["*".into()],
+            listen_to_bots: false,
+            mention_only: true,
+            group_reply_mode: None, // derive => MentionOnly
+        });
+        let modes = collect_group_reply_mode_by_channel(&config);
+        assert_eq!(modes.get("telegram"), Some(&crate::config::GroupReplyMode::Smart));
+        assert_eq!(modes.get("discord"), Some(&crate::config::GroupReplyMode::MentionOnly));
+        assert!(
+            !modes.contains_key("slack"),
+            "non-smart-capable channels are not registered"
+        );
+    }
 
     fn make_workspace() -> TempDir {
         let tmp = TempDir::new().unwrap();
@@ -5072,6 +5380,8 @@ mod tests {
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         };
@@ -5142,6 +5452,8 @@ mod tests {
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         }
@@ -5516,6 +5828,8 @@ mod tests {
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         };
@@ -5585,6 +5899,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -5606,6 +5922,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -5627,6 +5945,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         assert!(!evaluate_inbound_policy(&policy, &msg));
     }
@@ -5648,6 +5968,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
 
@@ -5687,6 +6009,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
     }
@@ -6221,6 +6545,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6244,6 +6570,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6300,6 +6628,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6323,6 +6653,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6379,6 +6711,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6402,6 +6736,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6460,6 +6796,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6483,6 +6821,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6540,6 +6880,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6563,6 +6905,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6626,6 +6970,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6649,6 +6995,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6740,6 +7088,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6763,6 +7113,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6827,6 +7179,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6850,6 +7204,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 3,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -6931,6 +7287,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6954,6 +7312,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 4,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -7059,6 +7419,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7082,6 +7444,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -7139,6 +7503,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7162,6 +7528,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -7386,6 +7754,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7424,6 +7794,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         }
     }
 
@@ -7484,6 +7856,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         }
     }
 
@@ -7561,6 +7935,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         }
     }
 
@@ -7727,6 +8103,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7855,6 +8233,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
@@ -8252,6 +8632,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8274,6 +8656,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         })
         .await
         .unwrap();
@@ -8286,6 +8670,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         })
         .await
         .unwrap();
@@ -8353,6 +8739,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8376,6 +8764,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             })
             .await
             .unwrap();
@@ -8389,6 +8779,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             })
             .await
             .unwrap();
@@ -8467,6 +8859,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8490,6 +8884,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             })
             .await
             .unwrap();
@@ -8503,6 +8899,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             })
             .await
             .unwrap();
@@ -8564,6 +8962,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8587,6 +8987,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -8922,6 +9324,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
 
         assert_eq!(conversation_memory_key(&msg), "slack_U123_msg_abc123");
@@ -8938,6 +9342,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -8948,6 +9354,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
 
         assert_ne!(conversation_memory_key(&msg1), conversation_memory_key(&msg2));
@@ -8967,6 +9375,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
         let msg2 = traits::ChannelMessage {
             id: "msg_2".into(),
@@ -8977,6 +9387,8 @@ BTC is currently around $65,000 based on latest tool output."#
             timestamp: 2,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
 
         mem.store(
@@ -9060,6 +9472,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9083,6 +9497,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -9099,6 +9515,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 2,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -9163,6 +9581,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9186,6 +9606,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )
@@ -9262,6 +9684,8 @@ BTC is currently around $65,000 based on latest tool output."#
             bot_names: vec!["prx".to_string()],
             bot_uuids: vec![],
             mention_only_by_channel: HashMap::new(),
+            group_reply_mode_by_channel: HashMap::new(),
+            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9285,6 +9709,8 @@ BTC is currently around $65,000 based on latest tool output."#
                 timestamp: 1,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             },
             CancellationToken::new(),
         )

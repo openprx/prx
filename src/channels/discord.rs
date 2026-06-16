@@ -14,6 +14,10 @@ pub struct DiscordChannel {
     allowed_users: Vec<String>,
     listen_to_bots: bool,
     mention_only: bool,
+    /// Effective group reply mode. In `Smart` mode the channel layer stops
+    /// dropping non-@ guild messages and tags them with `mentioned` /
+    /// `is_group_hint` for the central pipeline.
+    group_reply_mode: crate::config::GroupReplyMode,
     typing_handles: Mutex<HashMap<String, tokio::task::JoinHandle<()>>>,
 }
 
@@ -31,8 +35,18 @@ impl DiscordChannel {
             allowed_users,
             listen_to_bots,
             mention_only,
+            // Default preserves legacy behavior; overridden via
+            // `with_group_reply_mode` from config when smart mode is enabled.
+            group_reply_mode: crate::config::GroupReplyMode::resolve(None, mention_only),
             typing_handles: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set the effective group reply mode (resolved from config).
+    #[must_use]
+    pub const fn with_group_reply_mode(mut self, mode: crate::config::GroupReplyMode) -> Self {
+        self.group_reply_mode = mode;
+        self
     }
 
     fn http_client(&self) -> reqwest::Client {
@@ -387,10 +401,25 @@ impl Channel for DiscordChannel {
                     }
 
                     let content = d.get("content").and_then(|c| c.as_str()).unwrap_or("");
-                    let Some(clean_content) =
-                        normalize_incoming_content(content, self.mention_only, &bot_user_id)
-                    else {
-                        continue;
+                    // Guild messages carry `guild_id`; DMs do not. Used only as a
+                    // smart-mode group hint (the central pipeline cannot infer
+                    // group-ness from Discord's bare channel_id reply_target).
+                    let is_guild_message = d.get("guild_id").and_then(serde_json::Value::as_str).is_some();
+                    let bot_mentioned = contains_bot_mention(content, &bot_user_id);
+                    let smart = self.group_reply_mode.is_smart();
+                    // Smart mode passes every (guild) message through; non-smart
+                    // keeps the historical drop-on-no-mention behavior unchanged.
+                    let clean_content = if smart {
+                        let trimmed = content.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        trimmed.to_string()
+                    } else {
+                        match normalize_incoming_content(content, self.mention_only, &bot_user_id) {
+                            Some(c) => c,
+                            None => continue,
+                        }
                     };
 
                     let message_id = d.get("id").and_then(|i| i.as_str()).unwrap_or("");
@@ -416,6 +445,9 @@ impl Channel for DiscordChannel {
                             .as_secs(),
                         thread_ts: None,
                         mentioned_uuids: vec![],
+                        // Smart-mode hints (only consulted centrally in smart mode).
+                        mentioned: bot_mentioned,
+                        is_group_hint: is_guild_message,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

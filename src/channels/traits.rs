@@ -22,6 +22,41 @@ pub struct ChannelMessage {
     /// UUIDs/identifiers of users mentioned in this message (e.g. Signal @mentions).
     /// Used by mention_only filter to detect if the bot was explicitly mentioned.
     pub mentioned_uuids: Vec<String>,
+    /// Smart group-reply hint: whether the channel layer detected that this
+    /// message explicitly mentions the bot (@-mention / reply-to-bot).
+    ///
+    /// Only meaningful for channels that participate in smart group-reply and
+    /// whose `reply_target` does not encode group-ness centrally (Telegram,
+    /// Discord). Defaults to `false`; the central pipeline still computes its own
+    /// mention detection where applicable, so a `false` here never suppresses a
+    /// reply on non-smart paths.
+    pub mentioned: bool,
+    /// Smart group-reply hint: whether the channel layer knows this message
+    /// originated in a group/guild channel.
+    ///
+    /// Required for channels (Telegram, Discord) whose `reply_target` is a bare
+    /// chat/channel id with no `group:` prefix, so the central pipeline cannot
+    /// otherwise distinguish group from DM. Defaults to `false`. Used ONLY to
+    /// gate smart group-reply behavior (stay_silent exposure + outbound
+    /// suppression); it does not change `infer_chat_type_from_message` / scope.
+    pub is_group_hint: bool,
+}
+
+impl Default for ChannelMessage {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            sender: String::new(),
+            reply_target: String::new(),
+            content: String::new(),
+            channel: String::new(),
+            timestamp: 0,
+            thread_ts: None,
+            mentioned_uuids: Vec::new(),
+            mentioned: false,
+            is_group_hint: false,
+        }
+    }
 }
 
 /// Message to send through a channel
@@ -266,6 +301,8 @@ mod tests {
                 timestamp: 123,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -283,6 +320,8 @@ mod tests {
             timestamp: 999,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
 
         let cloned = message;

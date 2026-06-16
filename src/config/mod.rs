@@ -10,8 +10,8 @@ pub use schema::{
     A2aConfig, AgentCompactionConfig, AgentCompactionMode, AgentConfig, AuditConfig, AuthConfig, AutomixConfig,
     AutonomyConfig, BrowserComputerUseConfig, BrowserConfig, ChannelsConfig, ClassificationRule, ComposioConfig,
     Config, CostConfig, CronConfig, DelegateAgentConfig, DiscordConfig, DmPolicy, DockerRuntimeConfig,
-    EmbeddingRouteConfig, GatewayConfig, GroupPolicy, HeartbeatConfig, HttpRequestConfig, IMessageConfig,
-    IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
+    EmbeddingRouteConfig, GatewayConfig, GroupPolicy, GroupReplyMode, HeartbeatConfig, HttpRequestConfig,
+    IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
     McpServerRuntimeConfig, McpTransport, MediaConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig,
     MemoryWebhookConfig, ModelRouteConfig, ModulesConfig, MultimodalConfig, NextcloudTalkConfig, NodeServerConfig,
     NodesConfig, ObservabilityConfig, OsPagingConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
@@ -46,6 +46,7 @@ mod tests {
             draft_update_interval_ms: 1000,
             interrupt_on_new_message: false,
             mention_only: false,
+            group_reply_mode: None,
         };
 
         let discord = DiscordConfig {
@@ -54,6 +55,7 @@ mod tests {
             allowed_users: vec![],
             listen_to_bots: false,
             mention_only: false,
+            group_reply_mode: None,
         };
 
         let lark = LarkConfig {

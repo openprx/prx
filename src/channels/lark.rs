@@ -554,6 +554,8 @@ impl LarkChannel {
                             .as_secs(),
                         thread_ts: None,
                         mentioned_uuids: vec![],
+                        mentioned: false,
+                        is_group_hint: false,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -745,6 +747,8 @@ impl LarkChannel {
             timestamp,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         });
 
         messages

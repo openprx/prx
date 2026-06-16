@@ -62,6 +62,7 @@ pub(crate) mod sessions_read_model;
 pub mod sessions_send;
 pub mod sessions_spawn;
 pub mod shell;
+pub mod stay_silent;
 pub mod subagents;
 pub mod traits;
 pub mod tts;
@@ -112,6 +113,7 @@ pub use sessions_list::SessionsListTool;
 pub use sessions_send::SessionsSendTool;
 pub use sessions_spawn::SessionsSpawnTool;
 pub use shell::ShellTool;
+pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
 pub use traits::{ToolCategory, ToolResult, ToolSpec, ToolTier};
@@ -320,6 +322,11 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
+        // stay_silent lets the model decline to reply in smart group-reply mode.
+        // Always registered so the loop can resolve the call; its spec is only
+        // advertised to the model on smart group turns (loop-side `expose_stay_silent`
+        // gate). A defensive `execute` makes any out-of-loop call a no-op.
+        Arc::new(StaySilentTool::new()),
     ];
 
     // Vision tools are always available

@@ -302,6 +302,10 @@ pub struct TelegramChannel {
     draft_update_interval_ms: u64,
     last_draft_edit: Mutex<std::collections::HashMap<String, std::time::Instant>>,
     mention_only: bool,
+    /// Effective group reply mode. In `Smart` mode the channel layer stops
+    /// dropping non-@ group messages and instead tags them with a
+    /// `mentioned` / `is_group_hint` so the central pipeline can decide.
+    group_reply_mode: crate::config::GroupReplyMode,
     bot_username: Mutex<Option<String>>,
 }
 
@@ -329,8 +333,18 @@ impl TelegramChannel {
             last_draft_edit: Mutex::new(std::collections::HashMap::new()),
             typing_handle: Mutex::new(None),
             mention_only,
+            // Default preserves legacy behavior; overridden via
+            // `with_group_reply_mode` from config when smart mode is enabled.
+            group_reply_mode: crate::config::GroupReplyMode::resolve(None, mention_only),
             bot_username: Mutex::new(None),
         }
+    }
+
+    /// Set the effective group reply mode (resolved from config).
+    #[must_use]
+    pub const fn with_group_reply_mode(mut self, mode: crate::config::GroupReplyMode) -> Self {
+        self.group_reply_mode = mode;
+        self
     }
 
     /// Configure streaming mode for progressive draft updates.
@@ -766,7 +780,20 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         }
 
         let is_group = Self::is_group_message(message);
-        if self.mention_only && is_group {
+        // Compute whether the bot is @-mentioned (used for both the legacy drop
+        // gate and the smart-mode passthrough hint).
+        let bot_mentioned = {
+            let bot_username = self.bot_username.lock();
+            bot_username
+                .as_ref()
+                .is_some_and(|name| Self::contains_bot_mention(text, name))
+        };
+        let smart = self.group_reply_mode.is_smart();
+        // Legacy drop gate: only when NOT smart. In smart mode every group
+        // message flows through to the central pipeline (tagged below); this is
+        // the ONLY behavioral change and it is fully gated on smart mode, so
+        // non-smart behavior is byte-identical.
+        if !smart && self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             if let Some(ref bot_username) = *bot_username {
                 if !Self::contains_bot_mention(text, bot_username) {
@@ -797,7 +824,10 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         // reply_target: chat_id or chat_id:thread_id format
         let reply_target = thread_id.map_or_else(|| chat_id.clone(), |tid| format!("{}:{}", chat_id, tid));
 
-        let content = if self.mention_only && is_group {
+        // In smart mode keep the raw text (don't strip the mention) so the model
+        // sees the full message; the central pipeline uses the `mentioned` hint
+        // instead of re-parsing. Non-smart mention_only keeps stripping as before.
+        let content = if !smart && self.mention_only && is_group {
             let bot_username = self.bot_username.lock();
             let bot_username = bot_username.as_ref()?;
             Self::normalize_incoming_content(text, bot_username)?
@@ -817,6 +847,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .as_secs(),
             thread_ts: None,
             mentioned_uuids: vec![],
+            // Smart-mode hints (only consulted centrally in smart mode).
+            mentioned: bot_mentioned,
+            is_group_hint: is_group,
         })
     }
 
@@ -2691,6 +2724,86 @@ mod tests {
         });
 
         assert!(ch.parse_update_message(&empty_update).is_none());
+    }
+
+    #[test]
+    fn smart_mode_passes_through_unmentioned_group_message_with_hints() {
+        // Smart mode: a non-@ group message must NOT be dropped; it flows through
+        // with is_group_hint=true and mentioned=false, and content is NOT stripped.
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true)
+            .with_group_reply_mode(crate::config::GroupReplyMode::Smart);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 60,
+                "text": "anyone seen the latest build?",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch.parse_update_message(&update).expect("smart mode must pass through");
+        assert_eq!(parsed.content, "anyone seen the latest build?");
+        assert!(parsed.is_group_hint, "group message must be flagged");
+        assert!(!parsed.mentioned, "no @-mention => mentioned=false");
+    }
+
+    #[test]
+    fn smart_mode_sets_mentioned_hint_when_addressed() {
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true)
+            .with_group_reply_mode(crate::config::GroupReplyMode::Smart);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 21,
+            "message": {
+                "message_id": 61,
+                "text": "hey @mybot what's the status?",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        let parsed = ch.parse_update_message(&update).expect("smart mode must pass through");
+        // Raw text preserved (not stripped) so the model sees the full message.
+        assert_eq!(parsed.content, "hey @mybot what's the status?");
+        assert!(parsed.is_group_hint);
+        assert!(parsed.mentioned, "explicit @-mention => mentioned=true");
+    }
+
+    #[test]
+    fn non_smart_mention_only_still_drops_unmentioned_group_message() {
+        // Regression guard: with the smart field added, the legacy mention_only
+        // drop behavior must be byte-identical (no @ => dropped at channel layer).
+        let ch = TelegramChannel::new("token".into(), vec!["*".into()], true)
+            .with_group_reply_mode(crate::config::GroupReplyMode::MentionOnly);
+        {
+            let mut cache = ch.bot_username.lock();
+            *cache = Some("mybot".to_string());
+        }
+
+        let update = serde_json::json!({
+            "update_id": 22,
+            "message": {
+                "message_id": 62,
+                "text": "just chatting, no mention here",
+                "from": { "id": 555, "username": "alice" },
+                "chat": { "id": -100_200_300, "type": "group" }
+            }
+        });
+
+        assert!(
+            ch.parse_update_message(&update).is_none(),
+            "mention_only must still drop unmentioned group messages"
+        );
     }
 
     #[test]

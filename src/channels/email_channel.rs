@@ -431,6 +431,8 @@ impl EmailChannel {
                 timestamp: email.timestamp,
                 thread_ts: None,
                 mentioned_uuids: vec![],
+                mentioned: false,
+                is_group_hint: false,
             };
 
             if tx.send(msg).await.is_err() {

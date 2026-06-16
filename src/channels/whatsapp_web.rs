@@ -278,6 +278,8 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         mentioned_uuids: vec![],
+                                        mentioned: false,
+                                        is_group_hint: false,
                                     })
                                     .await
                                 {

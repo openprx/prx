@@ -2560,6 +2560,8 @@ mod tests {
             timestamp: 1,
             thread_ts: None,
             mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
         };
 
         let key = whatsapp_memory_key(&msg);
