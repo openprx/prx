@@ -3668,6 +3668,7 @@ async fn execute_tool_call_serial(
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
     chat_mode: ChatMode,
+    approval_resolver: Option<&Arc<dyn ApprovalResolver>>,
 ) -> Result<String> {
     if let Some(denied) = scope_or_pipeline_denial(call, scope_ctx) {
         return Ok(denied);
@@ -3680,10 +3681,21 @@ async fn execute_tool_call_serial(
                 arguments: call.arguments.clone(),
             };
 
-            let decision = if channel_name == "cli" {
-                mgr.prompt_cli(&request)
+            // Phase-0 approval decision point. When an `ApprovalResolver` is
+            // supplied (phase 1+), await it for the allow/deny/grant decision.
+            // When `None` (every current caller) the historical synchronous
+            // path runs unchanged: interactive CLI prompt on the `cli` channel,
+            // implicit deny everywhere else.
+            let (decision, runtime_grant) = if let Some(resolver) = approval_resolver {
+                match resolver.resolve(&request, channel_name).await {
+                    ApprovalDecision::Allow => (ApprovalResponse::Yes, false),
+                    ApprovalDecision::Grant => (ApprovalResponse::Yes, true),
+                    ApprovalDecision::Deny => (ApprovalResponse::No, false),
+                }
+            } else if channel_name == "cli" {
+                (mgr.prompt_cli(&request), true)
             } else {
-                ApprovalResponse::No
+                (ApprovalResponse::No, true)
             };
 
             mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
@@ -3699,7 +3711,7 @@ async fn execute_tool_call_serial(
                 observer,
                 cancellation_token,
                 scope_ctx,
-                true,
+                runtime_grant,
                 chat_mode,
             )
             .await;
@@ -3814,6 +3826,7 @@ async fn execute_tools_with_policy(
     cancellation_token: Option<&CancellationToken>,
     scope_ctx: Option<&ScopeContext<'_>>,
     chat_mode: ChatMode,
+    approval_resolver: Option<&Arc<dyn ApprovalResolver>>,
 ) -> Result<Vec<String>> {
     let mut ordered_indices = Vec::with_capacity(tool_calls.len());
     if schedule.priority_enabled {
@@ -3940,6 +3953,7 @@ async fn execute_tools_with_policy(
             cancellation_token,
             scope_ctx,
             chat_mode,
+            approval_resolver,
         )
         .await?;
         results_by_original[index] = result;
@@ -3999,6 +4013,127 @@ pub(crate) struct ToolLoopTrace {
     /// fallback when its `chat_traced` recorded more than one attempt (each
     /// failed attempt before the terminal success adds an entry).
     pub any_turn_had_fallback: bool,
+}
+
+/// Terminal outcome of the agent tool-call loop.
+///
+/// Phase-0 foundation for the "chat multi-session runtime" work
+/// (`/opt/worker/task/prx/chat-needsinput-plan.md` §18/§19). The inner loop
+/// produces this enum so later phases can distinguish a normal text answer from
+/// a silent turn or a turn that suspended awaiting an out-of-band approval.
+///
+/// **Behavior-preserving in phase 0:** the loop only ever yields
+/// [`ToolLoopOutcome::Text`] today. The compatibility shells
+/// ([`run_tool_call_loop`] / [`run_tool_call_loop_traced`]) extract that `Text`
+/// back into the historical `String` return, so existing callers are unaffected.
+/// The [`Silent`](ToolLoopOutcome::Silent) and
+/// [`AwaitingApproval`](ToolLoopOutcome::AwaitingApproval) variants are defined
+/// now but are not produced until phase 1.
+// Phase-0 scaffolding: `Silent` / `AwaitingApproval` are forward-declared for
+// phase 1 (suspend/resume + stay_silent) and are not yet constructed. Allowed
+// rather than deleted so the public contract lands with the foundation.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum ToolLoopOutcome {
+    /// The loop produced a final text answer (the only variant emitted today).
+    Text(String),
+    /// The loop intentionally produced no user-facing text (phase 1).
+    ///
+    /// `reason` is a short machine/operator-readable explanation of why the
+    /// turn stayed silent (e.g. an explicit `stay_silent` decision).
+    Silent { reason: String },
+    /// The loop suspended on a tool call that requires an out-of-band approval
+    /// decision (phase 1). Carries the minimal context needed to resume the
+    /// call once a decision/grant is injected.
+    AwaitingApproval(AwaitingApproval),
+}
+
+impl ToolLoopOutcome {
+    /// Collapse the outcome to the historical `String` representation.
+    ///
+    /// Phase-0 callers of the legacy `String`/`(String, trace)` entrypoints use
+    /// this to preserve their exact prior behavior: a [`Text`](Self::Text) maps
+    /// to its inner string. The non-`Text` variants are unreachable on those
+    /// paths in phase 0; they collapse to an empty string defensively rather
+    /// than panicking, so introducing them later cannot crash a legacy caller.
+    fn into_text(self) -> String {
+        match self {
+            Self::Text(text) => text,
+            Self::Silent { reason } => {
+                tracing::debug!(
+                    reason = reason.as_str(),
+                    "tool loop produced a silent outcome on a legacy text path"
+                );
+                String::new()
+            }
+            Self::AwaitingApproval(pending) => {
+                tracing::debug!(
+                    tool = pending.tool_name.as_str(),
+                    "tool loop produced an awaiting-approval outcome on a legacy text path"
+                );
+                String::new()
+            }
+        }
+    }
+}
+
+/// Minimal context captured when the loop suspends awaiting an approval.
+///
+/// Deliberately small in phase 0 — enough to identify which tool call is
+/// pending so phase 1 can resurface it and resume once a decision is injected.
+/// Fields may be extended as the suspend/resume machinery lands.
+// Phase-0 scaffolding: consumed by the phase-1 suspend/resume path; fields are
+// captured here so the resume context shape is fixed with the foundation.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) struct AwaitingApproval {
+    /// Name of the tool call awaiting approval.
+    pub tool_name: String,
+    /// Arguments of the pending call (re-injected on resume).
+    pub arguments: serde_json::Value,
+    /// Operation identifier the approval applies to, when known.
+    pub operation: Option<String>,
+    /// Run/turn identifier the pending call belongs to, when known.
+    pub run_id: Option<String>,
+}
+
+/// Decision returned by an [`ApprovalResolver`] for a pending tool call.
+// Phase-0 scaffolding: constructed only on the resolver path in
+// `execute_tool_call_serial`, which no caller exercises yet (every path threads
+// a `None` resolver). Allowed until phase 1 supplies a resolver.
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+pub(crate) enum ApprovalDecision {
+    /// Allow the call to proceed (no runtime grant injected).
+    Allow,
+    /// Deny the call; the loop substitutes a denial result.
+    Deny,
+    /// Allow the call and inject a runtime approval grant, mirroring the
+    /// interactive `Yes`/`Always` track that mints an `ApprovalGrantV2`.
+    Grant,
+}
+
+/// Out-of-band approval decision point for the tool-call loop.
+///
+/// Phase-0 foundation: when an [`ApprovalResolver`] is supplied, the loop awaits
+/// it at the approval decision point instead of falling back to the synchronous
+/// CLI prompt / implicit deny. This is the seam phase 1 uses to drive
+/// TUI approval cards / suspended-turn resumption.
+///
+/// **Behavior-preserving in phase 0:** no caller supplies a resolver yet (every
+/// execution path threads `None`), so the existing `SideEffectGate` / CLI-prompt
+/// behavior runs unchanged. The trait merely defines the contract and is wired
+/// to the call site so phase 1 can opt in without re-plumbing.
+#[allow(dead_code)]
+#[async_trait::async_trait]
+pub(crate) trait ApprovalResolver: Send + Sync {
+    /// Resolve an approval decision for a tool call that
+    /// [`ApprovalManager::needs_approval`] flagged.
+    ///
+    /// Implementations may await an external decision (e.g. a UI card). The
+    /// returned [`ApprovalDecision`] determines whether the call proceeds, is
+    /// denied, or proceeds with a runtime grant.
+    async fn resolve(&self, request: &ApprovalRequest, channel: &str) -> ApprovalDecision;
 }
 
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
@@ -4090,6 +4225,11 @@ pub(crate) async fn run_tool_call_loop(
 /// Trace-returning variant of [`run_tool_call_loop`]. Identical control flow,
 /// but also returns a [`ToolLoopTrace`] attributing the final returning turn
 /// to the provider/model that actually served it (FIX-P0-30/31).
+///
+/// Thin compatibility shell over [`run_tool_call_loop_outcome`]: supplies no
+/// [`ApprovalResolver`] (`None`) and collapses the [`ToolLoopOutcome`] back to
+/// the historical `String`, preserving the exact prior signature and behavior
+/// for all existing callers (phase-0 behavior-preserving requirement).
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_tool_call_loop_traced(
     provider: &dyn Provider,
@@ -4120,6 +4260,81 @@ pub(crate) async fn run_tool_call_loop_traced(
     document_ingest: Option<DocumentIngestRuntime>,
     chat_mode: ChatMode,
 ) -> Result<(String, ToolLoopTrace)> {
+    let (outcome, trace) = run_tool_call_loop_outcome(
+        provider,
+        history,
+        tools_registry,
+        observer,
+        hooks,
+        provider_name,
+        model,
+        temperature,
+        silent,
+        approval,
+        channel_name,
+        multimodal_config,
+        max_tool_iterations,
+        parallel_tools_enabled,
+        read_only_tool_concurrency_window,
+        read_only_tool_timeout_secs,
+        priority_scheduling_enabled,
+        low_priority_tool_names,
+        concurrency_governance,
+        compaction_config,
+        cancellation_token,
+        on_delta,
+        scope_ctx,
+        on_tool_call,
+        tool_tiering,
+        document_ingest,
+        chat_mode,
+        None,
+    )
+    .await?;
+    Ok((outcome.into_text(), trace))
+}
+
+/// Outcome-aware core of the agent tool-call loop (phase-0 foundation).
+///
+/// This is where the actual loop lives. It returns a [`ToolLoopOutcome`] (today
+/// always [`ToolLoopOutcome::Text`]) plus the [`ToolLoopTrace`] (FIX-P0-30/31).
+/// It additionally accepts an optional [`ApprovalResolver`]; when `Some` it is
+/// awaited at the approval decision point. When `None` (every current caller),
+/// the historical synchronous approval behavior runs unchanged.
+///
+/// [`run_tool_call_loop`] and [`run_tool_call_loop_traced`] are behavior-
+/// preserving shells over this function.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_tool_call_loop_outcome(
+    provider: &dyn Provider,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    observer: &dyn Observer,
+    hooks: &HookManager,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    silent: bool,
+    approval: Option<&ApprovalManager>,
+    channel_name: &str,
+    multimodal_config: &crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    parallel_tools_enabled: bool,
+    read_only_tool_concurrency_window: usize,
+    read_only_tool_timeout_secs: u64,
+    priority_scheduling_enabled: bool,
+    low_priority_tool_names: Vec<String>,
+    concurrency_governance: ToolConcurrencyGovernanceConfig,
+    compaction_config: Option<&crate::config::AgentCompactionConfig>,
+    cancellation_token: Option<CancellationToken>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    scope_ctx: Option<&ScopeContext<'_>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<ToolCallNotification>>,
+    tool_tiering: Option<&crate::config::ToolTieringConfig>,
+    document_ingest: Option<DocumentIngestRuntime>,
+    chat_mode: ChatMode,
+    approval_resolver: Option<Arc<dyn ApprovalResolver>>,
+) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
@@ -4572,7 +4787,7 @@ pub(crate) async fn run_tool_call_loop_traced(
             // FIX #2: fold the cross-turn fallback flag into the returned trace so
             // a fallback on any earlier turn is reflected in the recorded status.
             last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
-            return Ok((display_text, last_turn_trace));
+            return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
         }
 
         // Print any text the LLM produced alongside tool calls (unless silent)
@@ -4621,6 +4836,7 @@ pub(crate) async fn run_tool_call_loop_traced(
             cancellation_token.as_ref(),
             scope_ctx,
             chat_mode,
+            approval_resolver.as_ref(),
         )
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
@@ -7390,6 +7606,7 @@ mod tests {
             None,
             None,
             ChatMode::default(),
+            None,
         )
         .await
         .expect("priority scheduling should execute successfully");
@@ -7458,6 +7675,7 @@ mod tests {
             None,
             None,
             ChatMode::default(),
+            None,
         )
         .await
         .expect("scheduler should complete with rollback");
