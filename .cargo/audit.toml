@@ -6,6 +6,8 @@ ignore = [
     "RUSTSEC-2026-0141",
     # derivative unmaintained — matrix-sdk-indexeddb transitive，仅 wasm 路径
     "RUSTSEC-2024-0388",
+    # proc-macro-error2 unmaintained — transitive via matrix-sdk (vodozemac/aquamarine), no maintained alternative
+    "RUSTSEC-2026-0173",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"

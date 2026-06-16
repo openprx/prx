@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -141,7 +141,7 @@ dialoguer = { version = "0.12", features = ["fuzzy-select"] }
 console = "0.16"
 
 # Terminal chat UI
-crossterm = { version = "0.28", default-features = false, features = ["events", "bracketed-paste"] }
+crossterm = { version = "0.28", default-features = false, features = ["events", "bracketed-paste", "windows"] }
 
 # TUI advanced features (Phase 3) — gated behind terminal-tui feature
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "scrolling-regions"] }
