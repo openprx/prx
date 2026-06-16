@@ -135,6 +135,40 @@ impl ChatSessionsHandle {
         self.ptys.lock().iter().find(|s| s.id == id).cloned()
     }
 
+    /// Public accessor for [`Self::pty_for_seq`], so the chat loop's `/attach`
+    /// branch can fetch a live PTY handle to re-attach to it (v3b). The seq map is
+    /// assumed already refreshed by a preceding `kind_for_seq`/`snapshot` in the
+    /// same command handling; callers that need a guaranteed-fresh map should
+    /// `snapshot()` first. Returns `None` if the seq is unknown or not a PTY.
+    #[cfg(feature = "terminal-tui")]
+    #[must_use]
+    pub fn pty_for_seq_public(&self, seq: u64) -> Option<super::pty::PtyShellSession> {
+        self.pty_for_seq(seq)
+    }
+
+    /// Count *live* (not-yet-exited) PTY sessions, for the v3b spawn cap. Reaps
+    /// any sessions whose child has exited first (so the count reflects only
+    /// re-attachable sessions and dead drain threads do not linger).
+    #[cfg(feature = "terminal-tui")]
+    #[must_use]
+    pub fn live_pty_count(&self) -> usize {
+        self.reap_dead_ptys();
+        self.ptys.lock().iter().filter(|s| !s.has_exited()).count()
+    }
+
+    /// Reap PTY sessions whose child has exited: tear down their persistent drain
+    /// reader (stop + bounded join) so no drain thread outlives the child. Dead
+    /// sessions are KEPT in the registry (their `#N` stays visible as `exited` in
+    /// `/sessions`) but their thread/fd resources are released. Idempotent.
+    #[cfg(feature = "terminal-tui")]
+    pub fn reap_dead_ptys(&self) {
+        let dead: Vec<super::pty::PtyShellSession> =
+            self.ptys.lock().iter().filter(|s| s.has_exited()).cloned().collect();
+        for pty in &dead {
+            pty.reap_reader();
+        }
+    }
+
     /// Kill the interactive PTY session at display seq `#N` (terminating its
     /// whole process group). Refreshes the seq map first so a just-`/pty`-ed
     /// session is addressable. Returns an error (never panics) if the seq is
@@ -594,7 +628,7 @@ mod tests {
         // Add an interactive PTY session — it must appear in the *same* list,
         // numbered after agents and shells, with kind `pty`.
         let sec = permissive_security();
-        let (pty, _io) = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
+        let pty = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
         let pty_seq = handle.add_pty(pty.clone());
         assert_eq!(pty_seq, 2, "PTY numbered after the single agent");
 
@@ -618,6 +652,44 @@ mod tests {
         }
         assert!(pty.has_exited(), "PTY child terminated after kill_pty");
         assert!(handle.kill_pty(1).await.is_err(), "agent seq is not a PTY session");
+    }
+
+    #[cfg(all(unix, feature = "terminal-tui"))]
+    #[tokio::test]
+    async fn live_pty_count_caps_and_reaps_dead() {
+        // v3b: `live_pty_count` counts only not-yet-exited PTYs (so the `/pty`
+        // spawn cap is enforced) and reaps the drain readers of exited ones.
+        use super::super::pty::PtyShellSession;
+        use portable_pty::PtySize;
+
+        let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let sec = permissive_security();
+
+        // Two live PTYs → count is 2.
+        let a = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn live a");
+        let b = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn live b");
+        handle.add_pty(a.clone());
+        handle.add_pty(b.clone());
+        assert_eq!(handle.live_pty_count(), 2, "two live PTYs counted");
+
+        // A third that exits on its own must NOT count once dead, and reaping must
+        // tear its drain reader down.
+        let dead = PtyShellSession::spawn("exit 0", &sec, PtySize::default()).expect("test: spawn fast-exit");
+        handle.add_pty(dead.clone());
+        for _ in 0..100 {
+            if dead.has_exited() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(dead.has_exited(), "fast-exit PTY reached terminal state");
+
+        // live_pty_count reaps the dead one and counts only the two live PTYs.
+        assert_eq!(handle.live_pty_count(), 2, "dead PTY is not counted, only the 2 live");
+
+        a.kill().await.expect("test: cleanup a");
+        b.kill().await.expect("test: cleanup b");
     }
 
     #[tokio::test]

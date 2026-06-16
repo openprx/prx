@@ -284,15 +284,156 @@ impl Drop for PtyHandoffGuard {
 /// or absent loop never deadlocks the handoff.
 const PAUSE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Maximum number of *live* (running, attached-or-detached) interactive PTY
+/// sessions allowed to coexist. v3b keeps detached PTYs alive (each holding a
+/// drain thread + a ring buffer + master/child/writer fds), so an unbounded
+/// `/pty` would leak threads and memory. Spawning past this limit is refused with
+/// a hint to `/kill` an existing one. Exited (dead) sessions do not count.
+pub const MAX_LIVE_PTYS: usize = 8;
+
+/// Capacity (bytes) of a PTY's raw-output ring buffer (v3b). Detached PTY output
+/// is drained into this fixed-size ring so the child never blocks on a full
+/// kernel pty buffer, and so a re-attach can replay recent history to restore
+/// context. Oldest bytes are dropped on overflow (like a terminal scrollback
+/// cap). 256 KiB comfortably holds a few screens of scrollback for line-oriented
+/// programs while bounding per-session memory.
+pub const PTY_RING_CAPACITY: usize = 256 * 1024;
+
+/// The shared output sink for a PTY's **persistent drain reader** (v3b).
+///
+/// A single long-lived reader thread copies PTY master output here for the whole
+/// life of the session. This sink:
+///
+/// - **always** appends bytes to a bounded ring buffer (so detached PTYs keep
+///   draining — a full kernel pty buffer would otherwise block the child — and
+///   so a re-attach can replay recent context); and
+/// - **when attached**, also writes the bytes straight to the real terminal
+///   `stdout` (so the attached user sees live output).
+///
+/// Routing (the attached check + ring append + optional `stdout` write) happens
+/// under a single `parking_lot::Mutex`, and detach flips `attached` under that
+/// **same** lock. This closes the v3a invariant precisely: once detach has set
+/// `attached = false`, the reader's *next* write observes it; a write already
+/// in-flight completes its `stdout` write before detach can flip the flag (they
+/// serialize on the mutex). So the reader is guaranteed to have stopped writing
+/// `stdout` by the time detach returns — before the `PtyHandoffGuard` resumes the
+/// chat render loop. Synchronous `parking_lot` only; never held across `.await`.
+#[derive(Debug)]
+struct SinkInner {
+    /// Whether the session is currently attached (reader should mirror to
+    /// `stdout`). Guarded by the same lock as the ring so flip + write serialize.
+    attached: bool,
+    /// Bounded raw-byte scrollback ring. `VecDeque` for O(1) push-back /
+    /// pop-front; capped at [`PTY_RING_CAPACITY`].
+    ring: std::collections::VecDeque<u8>,
+}
+
+/// Handle to a PTY's drain sink, shared between the drain reader and the session.
+///
+/// Cloning shares the same `Arc<Mutex<SinkInner>>`.
+#[derive(Clone, Debug)]
+struct PtySink(Arc<Mutex<SinkInner>>);
+
+impl PtySink {
+    /// A fresh, detached sink with an empty ring.
+    fn new() -> Self {
+        Self(Arc::new(Mutex::new(SinkInner {
+            attached: false,
+            ring: std::collections::VecDeque::with_capacity(8192),
+        })))
+    }
+
+    /// Mark the sink attached (reader will mirror to `stdout`). Returns the
+    /// current ring contents so the caller can replay them to restore context.
+    fn attach_and_snapshot(&self) -> Vec<u8> {
+        let mut inner = self.0.lock();
+        inner.attached = true;
+        inner.ring.iter().copied().collect()
+    }
+
+    /// Mark the sink detached (reader stops mirroring to `stdout`, keeps draining
+    /// into the ring). Taking the lock here serializes with any in-flight reader
+    /// write, so after this returns the reader will not touch `stdout` again until
+    /// re-attached — the v3a "no stdout writes after the render loop resumes"
+    /// invariant.
+    fn detach(&self) {
+        self.0.lock().attached = false;
+    }
+}
+
+impl std::io::Write for PtySink {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Hold the lock across BOTH the routing decision and the `stdout` write so
+        // a concurrent `detach()` (which flips `attached` under the same lock)
+        // cannot interleave: the reader either completes this `stdout` write or
+        // observes `attached == false` on its next call — never writes `stdout`
+        // after detach has returned. The `stdout` write is brief (a single PTY
+        // read chunk, ≤ 8 KiB) so holding the lock over it is bounded.
+        let mut inner = self.0.lock();
+        // Always append to the ring, trimming the oldest bytes past the cap.
+        inner.ring.extend(buf.iter().copied());
+        let overflow = inner.ring.len().saturating_sub(PTY_RING_CAPACITY);
+        if overflow > 0 {
+            inner.ring.drain(0..overflow);
+        }
+        if inner.attached {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(buf);
+            let _ = out.flush();
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        // `stdout` is flushed inline in `write`; nothing buffered here.
+        Ok(())
+    }
+}
+
+/// The long-lived runtime state of a *live* PTY session (v3b).
+///
+/// Unlike v3a — where the reader/writer ([`PtyIo`]) were owned transiently by a
+/// single passthrough and dropped on detach — v3b keeps these alive for the whole
+/// session so a detached PTY can be re-attached. The persistent drain reader runs
+/// from spawn until the session dies; the writer is borrowed (under a lock) by
+/// whichever attach is currently active.
+///
+/// Held behind an `Arc` inside [`PtyShellSession`] so the cheap-clone session
+/// handle in the registry carries the live runtime with it.
+pub struct PtyLiveRuntime {
+    /// The PTY writer (real terminal `stdin` → PTY child). Borrowed per-attach;
+    /// `parking_lot::Mutex` so the attach's stdin loop and teardown serialize.
+    /// Never held across `.await` (the stdin loop is synchronous).
+    writer: Mutex<Option<Box<dyn std::io::Write + Send>>>,
+    /// Shared sink the drain reader writes to (ring + optional `stdout` mirror).
+    sink: PtySink,
+    /// Stop flag for the persistent drain reader. Set only on teardown
+    /// (`/kill` / chat exit / explicit reap) — NOT on detach.
+    reader_stop: Arc<ReaderStop>,
+    /// Set true once the drain reader observes EOF (the child genuinely exited).
+    child_done: Arc<AtomicBool>,
+    /// Join handle for the drain reader, taken on teardown for a bounded join.
+    reader_handle: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for PtyLiveRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PtyLiveRuntime")
+            .field("child_done", &self.child_done.load(Ordering::Acquire))
+            .field("reader_stopped", &self.reader_stop.is_stopped())
+            .finish_non_exhaustive()
+    }
+}
+
 /// An interactive PTY shell session: the master side of a pseudo-terminal plus
 /// the spawned child's bookkeeping.
 ///
-/// The session owns the PTY master (for resize) and the child handle (for
-/// `kill`/`wait`); the master *reader* and *writer* are returned alongside it at
-/// spawn time as a [`PtyIo`] for the handoff passthrough.
+/// The session owns the PTY master (for resize), the child handle (for
+/// `kill`/`wait`), and (v3b) a [`PtyLiveRuntime`] holding the persistent drain
+/// reader, the writer, and the replay ring so a detached PTY can be re-attached.
 ///
 /// Cloning is cheap (shared `Arc`s) so the chat registry can hold a handle while
-/// the passthrough holds the byte streams.
+/// an attach borrows the byte streams.
 #[derive(Clone)]
 pub struct PtyShellSession {
     /// Stable id (a fresh UUID, distinct from agent run / non-interactive shell
@@ -311,31 +452,16 @@ pub struct PtyShellSession {
     /// Process-group id (== child pid on Unix, since the PTY child is a session
     /// leader). `None` on non-Unix / if the pid was unavailable.
     pgid: Option<i32>,
-}
-
-/// The reader + writer halves of a PTY, plus a resize handle, handed to the
-/// terminal-handoff passthrough. Separated from [`PtyShellSession`] so the
-/// blocking passthrough owns the byte streams while the session handle remains
-/// usable for `/sessions`, `/kill`, and resize.
-pub struct PtyIo {
-    /// PTY output → write straight to the real terminal `stdout`.
-    pub reader: Box<dyn std::io::Read + Send>,
-    /// Real terminal `stdin` bytes → write here to reach the PTY child.
-    pub writer: Box<dyn std::io::Write + Send>,
-    /// Raw fd of the PTY **master** (Unix only) so the passthrough's reader
-    /// thread can `poll` it with a timeout and stay interruptible via a stop
-    /// flag — it must NOT depend on EOF, since a backgrounded grandchild
-    /// (`sleep 300 &`, reparented to init, killpg can't reach it) can hold the
-    /// slave open indefinitely and wedge a blocking `read()`. `None` on non-Unix
-    /// or if the backend did not expose an fd; the reader then falls back to a
-    /// plain blocking read (documented platform limitation).
-    #[cfg(unix)]
-    pub master_fd: Option<std::os::fd::RawFd>,
+    /// The long-lived drain reader + writer + replay ring (v3b).
+    runtime: Arc<PtyLiveRuntime>,
 }
 
 impl PtyShellSession {
     /// Spawn an interactive command inside a fresh PTY of `size`, returning the
-    /// session handle and its [`PtyIo`] (reader/writer for the passthrough).
+    /// live session handle. (v3b: unlike v3a there is no separate `PtyIo` handed
+    /// out — the reader/writer are owned by the session's [`PtyLiveRuntime`], and a
+    /// persistent drain reader is started here so the PTY can be detached and
+    /// re-attached.)
     ///
     /// Security: the command is authorized through the **same**
     /// [`SideEffectGate`] the interactive shell tool uses, so high-risk commands
@@ -343,7 +469,7 @@ impl PtyShellSession {
     /// the operator typed `/pty`. The child runs in the workspace directory with
     /// a hardened `PATH` + the same safe-env allow-list as the v2 background
     /// shell (no secrets leak into the PTY).
-    pub fn spawn(command: &str, security: &Arc<SecurityPolicy>, size: PtySize) -> Result<(Self, PtyIo)> {
+    pub fn spawn(command: &str, security: &Arc<SecurityPolicy>, size: PtySize) -> Result<Self> {
         // 1. Security gate — identical policy to the shell tool. We never bypass
         //    the gate just because `/pty` was typed interactively.
         if security.is_rate_limited() {
@@ -409,23 +535,142 @@ impl PtyShellSession {
         // the child exits.
         drop(pair.slave);
 
-        let session = Self {
+        // 6. Start the persistent drain reader (v3b). A single long-lived thread
+        //    copies PTY master output into the shared sink for the WHOLE life of
+        //    the session: it always fills the replay ring (so a detached PTY's
+        //    output never blocks the child on a full kernel buffer) and mirrors to
+        //    `stdout` only while attached. It stops only on teardown
+        //    (`reader_stop`), never on detach, and never blocks unboundedly (it
+        //    polls `master_fd` and re-checks the stop flag each cycle).
+        let sink = PtySink::new();
+        let reader_stop = Arc::new(ReaderStop::new());
+        let child_done = Arc::new(AtomicBool::new(false));
+        let reader_handle = {
+            let mut reader = reader;
+            let mut sink = sink.clone();
+            let reader_stop = Arc::clone(&reader_stop);
+            let child_done = Arc::clone(&child_done);
+            // `master_fd` is a `Copy` `RawFd`; the closure captures it by copy.
+            std::thread::spawn(move || {
+                let outcome = read_pty_to_stdout(
+                    reader.as_mut(),
+                    &mut sink,
+                    &reader_stop,
+                    #[cfg(unix)]
+                    master_fd,
+                    std::time::Duration::from_millis(100),
+                );
+                // EOF means the child genuinely exited; a Stopped outcome is a
+                // teardown signal, not a child-exit signal.
+                if outcome == ReaderOutcome::Eof {
+                    child_done.store(true, Ordering::Release);
+                }
+            })
+        };
+
+        let runtime = Arc::new(PtyLiveRuntime {
+            writer: Mutex::new(Some(writer)),
+            sink,
+            reader_stop,
+            child_done,
+            reader_handle: Mutex::new(Some(reader_handle)),
+        });
+
+        Ok(Self {
             id,
             command: command.to_string(),
             started_at: chrono::Utc::now(),
             master: Arc::new(Mutex::new(pair.master)),
             child: Arc::new(Mutex::new(child)),
             pgid,
+            runtime,
+        })
+    }
+
+    /// Whether this session can be (re-)attached: it is still live (the drain
+    /// reader has not seen EOF / the child has not exited) and still owns its
+    /// writer. A dead PTY is terminal and cannot be attached.
+    #[must_use]
+    pub fn is_attachable(&self) -> bool {
+        !self.runtime.child_done.load(Ordering::Acquire) && !self.has_exited() && self.runtime.writer.lock().is_some()
+    }
+
+    /// Whether the persistent drain reader observed the child exit (EOF). Used by
+    /// the attach loop to end promptly when the child exits while attached.
+    #[must_use]
+    pub fn child_done_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.runtime.child_done)
+    }
+
+    /// Begin an attach: mark the sink attached (the drain reader resumes
+    /// mirroring PTY output to `stdout`) and return the current ring contents so
+    /// the caller can replay them to restore on-screen context.
+    ///
+    /// Idempotent-ish: calling while already attached just re-snapshots. The
+    /// caller is responsible for ensuring only one attach is active at a time
+    /// (the chat main loop is single-threaded, so this holds).
+    #[must_use]
+    pub fn attach(&self) -> Vec<u8> {
+        self.runtime.sink.attach_and_snapshot()
+    }
+
+    /// End an attach: stop mirroring PTY output to `stdout` (the drain reader
+    /// keeps filling the ring). Serializes with the reader under the sink lock so
+    /// no `stdout` write races the chat render loop's resume (v3a invariant).
+    /// Does **not** kill the child — the PTY stays alive for re-attach.
+    pub fn detach(&self) {
+        self.runtime.sink.detach();
+    }
+
+    /// Forward a single input byte to the PTY child (real terminal `stdin` → PTY).
+    /// Returns an error (never panics) if the writer has been torn down.
+    pub fn write_input(&self, byte: u8) -> Result<()> {
+        use std::io::Write as _;
+        let mut guard = self.runtime.writer.lock();
+        let writer = guard.as_mut().ok_or_else(|| anyhow!("PTY writer already closed"))?;
+        writer
+            .write_all(&[byte])
+            .and_then(|()| writer.flush())
+            .map_err(|e| anyhow!("PTY write failed: {e}"))
+    }
+
+    /// Send a redraw nudge to a full-screen child after a re-attach: toggle the
+    /// PTY size (shrink one row then restore) so curses/readline programs receive
+    /// `SIGWINCH` and repaint the whole screen, covering any artefacts left by the
+    /// raw-byte ring replay (v3b-a画面恢复 scheme (a)+(c)). Best-effort: a resize
+    /// failure is logged, never fatal. `size` is the current host geometry to
+    /// settle on.
+    pub fn nudge_redraw(&self, size: PtySize) {
+        // A transient smaller size, then the real size, produces two SIGWINCH
+        // deliveries — the jitter most programs need to trigger a full repaint.
+        let jitter = PtySize {
+            rows: size.rows.saturating_sub(1).max(1),
+            cols: size.cols,
+            pixel_width: 0,
+            pixel_height: 0,
         };
-        Ok((
-            session,
-            PtyIo {
-                reader,
-                writer,
-                #[cfg(unix)]
-                master_fd,
-            },
-        ))
+        if let Err(e) = self.resize(jitter) {
+            tracing::debug!(error = %e, "PTY redraw nudge (jitter resize) failed");
+        }
+        if let Err(e) = self.resize(size) {
+            tracing::debug!(error = %e, "PTY redraw nudge (restore resize) failed");
+        }
+    }
+
+    /// Tear down the persistent drain reader: request it to stop, drop the writer
+    /// (so the slave observes EOF), and bounded-join the reader thread. Idempotent
+    /// and never panics. Called from the kill paths (`/kill`, chat exit) and when
+    /// reaping a dead PTY, so no drain thread outlives the session.
+    pub fn reap_reader(&self) {
+        self.runtime.reader_stop.stop();
+        // Drop the writer so the slave end can observe EOF.
+        let _ = self.runtime.writer.lock().take();
+        // Detach the sink defensively so nothing mirrors to stdout during teardown.
+        self.runtime.sink.detach();
+        let handle = self.runtime.reader_handle.lock().take();
+        if let Some(handle) = handle {
+            let _ = handle.join();
+        }
     }
 
     /// Resize the PTY to match the host terminal. Cheap, synchronous, never
@@ -511,6 +756,9 @@ impl PtyShellSession {
     /// a no-op (`killpg` returns `ESRCH`, mapped to `Ok` by
     /// [`super::shell::kill_process_group`]).
     pub async fn kill(&self) -> Result<()> {
+        // v3b: stop the persistent drain reader and join it (bounded) before/while
+        // we kill the group, so no drain thread or writer fd outlives the session.
+        self.reap_reader();
         #[cfg(unix)]
         {
             if let Some(pgid) = self.pgid {
@@ -1049,39 +1297,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn pty_echoes_input_and_exits_cleanly() {
+        // v3b: the persistent drain reader fills the ring; write via the session
+        // and observe the echo via an attach snapshot of the ring.
         let sec = auto_security();
-        let (session, mut io) =
-            PtyShellSession::spawn("cat", &sec, PtySize::default()).expect("test: spawn cat in a PTY");
+        let session = PtyShellSession::spawn("cat", &sec, PtySize::default()).expect("test: spawn cat in a PTY");
 
-        // Write a line; `cat` echoes it back through the PTY.
-        io.writer.write_all(b"hello-pty\n").expect("test: write to PTY");
-        io.writer.flush().expect("test: flush PTY writer");
+        // Write a line; `cat` echoes it back through the PTY → the drain reader
+        // appends it to the ring.
+        for &b in b"hello-pty\n" {
+            session.write_input(b).expect("test: write to PTY");
+        }
 
-        // Read until we see the echoed text (run the blocking read off-thread so
-        // the test's tokio runtime is not blocked).
-        let saw = tokio::task::spawn_blocking(move || {
-            use std::io::Read as _;
-            let mut buf = [0u8; 1024];
-            let mut acc = String::new();
-            for _ in 0..50 {
-                match io.reader.read(&mut buf) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        acc.push_str(&String::from_utf8_lossy(buf.get(..n).unwrap_or(&buf)));
-                        if acc.contains("hello-pty") {
-                            return true;
-                        }
-                    }
-                    Err(_) => break,
-                }
+        // Poll the ring (via attach snapshot) until the echo appears.
+        let mut saw = false;
+        for _ in 0..50 {
+            let ring = session.attach();
+            if String::from_utf8_lossy(&ring).contains("hello-pty") {
+                saw = true;
+                break;
             }
-            acc.contains("hello-pty")
-        })
-        .await
-        .expect("test: reader task joins");
-        assert!(saw, "PTY echoed the written line back");
+            session.detach();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw, "PTY echoed the written line back into the ring");
 
-        // Terminating the group exits `cat` cleanly; kill is idempotent.
+        // Terminating the group exits `cat` cleanly; kill is idempotent and reaps
+        // the drain reader.
         session.kill().await.expect("test: kill PTY group");
         for _ in 0..50 {
             if session.has_exited() {
@@ -1097,7 +1338,7 @@ mod tests {
     #[tokio::test]
     async fn pty_resize_is_accepted() {
         let sec = auto_security();
-        let (session, _io) =
+        let session =
             PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn sleeper in a PTY");
         session
             .resize(PtySize {
@@ -1110,71 +1351,161 @@ mod tests {
         session.kill().await.expect("test: cleanup kill");
     }
 
+    // ── v3b: detach keeps the PTY alive; the drain reader persists ────────────
+
     #[cfg(unix)]
     #[tokio::test]
-    async fn reader_detach_is_bounded_even_with_orphan_holding_slave() {
-        // P0-A end-to-end-ish: spawn a shell that backgrounds a long sleeper into
-        // its OWN session (`setsid`), so killing the PTY child's group does NOT
-        // reap the orphan; the orphan keeps the slave PTY open, so the master
-        // NEVER sees EOF. Prove the interruptible reader against the real master
-        // fd still stops (bounded) on the flag — this is exactly the detach path
-        // that used to freeze the chat.
+    async fn detach_keeps_pty_alive_and_attachable() {
+        // The headline v3b behaviour: detaching must NOT kill the child; the
+        // session stays attachable.
         let sec = auto_security();
-        let (session, io) = PtyShellSession::spawn(
-            // `setsid sleep 300` detaches into a new session/group; if setsid is
-            // unavailable the plain `&` background still reparents on shell exit.
-            "(setsid sleep 300 >/dev/null 2>&1 &) ; exit",
+        let session = PtyShellSession::spawn("cat", &sec, PtySize::default()).expect("test: spawn cat in a PTY");
+
+        // Attach then detach (simulating Ctrl-]). The child must remain alive.
+        let _ = session.attach();
+        session.detach();
+        // Give any (wrong) teardown a chance to land.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!session.has_exited(), "detach must NOT kill the PTY child");
+        assert!(session.is_attachable(), "a detached live PTY must remain attachable");
+
+        // It is still functional: a re-attach + write still echoes.
+        let _ = session.attach();
+        for &b in b"after-detach\n" {
+            session.write_input(b).expect("test: write after re-attach");
+        }
+        let mut saw = false;
+        for _ in 0..50 {
+            if String::from_utf8_lossy(&session.attach()).contains("after-detach") {
+                saw = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(saw, "PTY still echoes after a detach/re-attach cycle");
+
+        session.kill().await.expect("test: cleanup kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drain_reader_keeps_filling_ring_while_detached() {
+        // The drain reader must keep reading the master while detached — otherwise
+        // a chatty child fills the kernel pty buffer and blocks. We spawn a child
+        // that emits a burst, never attach (stay detached the whole time), and
+        // assert the ring captured the output (proof the reader drained it).
+        let sec = auto_security();
+        let session = PtyShellSession::spawn(
+            "for i in $(seq 1 200); do echo line-$i; done; sleep 5",
             &sec,
             PtySize::default(),
         )
-        .expect("test: spawn shell that orphans a sleeper");
+        .expect("test: spawn chatty child");
 
-        let crate::chat::sessions::pty::PtyIo {
-            mut reader,
-            writer,
-            master_fd,
-        } = io;
-        drop(writer); // we won't write; just exercise the reader
-
-        let stop = Arc::new(ReaderStop::new());
-        let stop_thread = Arc::clone(&stop);
-        let handle = std::thread::spawn(move || {
-            let mut sink: Vec<u8> = Vec::new();
-            read_pty_to_stdout(
-                reader.as_mut(),
-                &mut sink,
-                &stop_thread,
-                master_fd,
-                std::time::Duration::from_millis(50),
-            )
-        });
-
-        // Give the shell time to spawn the orphan and exit; the orphan now holds
-        // the slave open so no EOF will arrive. Kill the child's group (mirrors
-        // detach's `kill_now`) — this must NOT reap the orphan.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        session.kill_now();
-
-        // Request stop — the reader must exit within a bounded window EVEN THOUGH
-        // EOF never comes (orphan holds the slave). Without the interruptible
-        // poll+flag design this join would hang forever and freeze the chat.
-        stop.stop();
-        let start = std::time::Instant::now();
-        loop {
-            if handle.is_finished() {
+        // Never attach. Poll the ring (snapshot peeks the buffer; we re-detach so
+        // we never actually mirror to stdout in the test).
+        let mut captured = String::new();
+        for _ in 0..100 {
+            let ring = session.attach();
+            session.detach();
+            captured = String::from_utf8_lossy(&ring).into_owned();
+            if captured.contains("line-200") {
                 break;
             }
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(5),
-                "reader did not stop after detach with an orphan holding the slave — chat would freeze"
-            );
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let outcome = handle.join().expect("test: reader joins");
-        // It stopped via the flag (the whole point) — not by a fortuitous EOF.
         assert!(
-            matches!(outcome, ReaderOutcome::Stopped | ReaderOutcome::Eof),
-            "reader returned a teardown outcome, got {outcome:?}"
+            captured.contains("line-200"),
+            "drain reader did not capture detached output — child would block: {:?}",
+            &captured.get(captured.len().saturating_sub(80)..)
+        );
+
+        session.kill().await.expect("test: cleanup kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ring_replays_recent_context_on_attach() {
+        // Re-attach replay: after the child produces output, an attach snapshot
+        // returns that output (the bytes a re-attach would replay to the screen).
+        let sec = auto_security();
+        let session = PtyShellSession::spawn("echo replay-marker; sleep 5", &sec, PtySize::default())
+            .expect("test: spawn echo child");
+
+        let mut snapshot = Vec::new();
+        for _ in 0..50 {
+            snapshot = session.attach();
+            session.detach();
+            if String::from_utf8_lossy(&snapshot).contains("replay-marker") {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            String::from_utf8_lossy(&snapshot).contains("replay-marker"),
+            "attach snapshot must replay recent ring context"
+        );
+
+        session.kill().await.expect("test: cleanup kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn child_done_flag_set_when_child_exits() {
+        // The drain reader observes EOF and sets child_done when the child exits on
+        // its own, so the attach loop ends promptly.
+        let sec = auto_security();
+        let session =
+            PtyShellSession::spawn("exit 0", &sec, PtySize::default()).expect("test: spawn fast-exiting child");
+        let child_done = session.child_done_flag();
+        let mut done = false;
+        for _ in 0..100 {
+            if child_done.load(Ordering::Acquire) {
+                done = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            done,
+            "child_done must be set after the child exits (drain reader saw EOF)"
+        );
+        assert!(!session.is_attachable(), "an exited PTY is not attachable");
+        session.kill().await.expect("test: idempotent cleanup");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reap_reader_is_bounded_even_with_orphan_holding_slave() {
+        // P0-A end-to-end: spawn a shell that backgrounds a long sleeper into its
+        // OWN session (`setsid`), so killing the PTY child's group does NOT reap
+        // the orphan; the orphan keeps the slave PTY open, so the master NEVER sees
+        // EOF. Prove the persistent drain reader still stops (bounded) on teardown
+        // via `reap_reader` — this is exactly the detach-then-kill path that must
+        // never freeze the chat.
+        let sec = auto_security();
+        let session = PtyShellSession::spawn("(setsid sleep 300 >/dev/null 2>&1 &) ; exit", &sec, PtySize::default())
+            .expect("test: spawn shell that orphans a sleeper");
+
+        // Give the shell time to spawn the orphan and exit; the orphan now holds
+        // the slave open so no EOF will arrive at the master.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        session.kill_now(); // mirror the kill path; must NOT reap the orphan
+
+        // `reap_reader` must return within a bounded window EVEN THOUGH EOF never
+        // comes (orphan holds the slave). It runs on a blocking thread so the test
+        // runtime is free.
+        let session_for_reap = session.clone();
+        let reaped = tokio::task::spawn_blocking(move || {
+            let start = std::time::Instant::now();
+            session_for_reap.reap_reader();
+            start.elapsed()
+        })
+        .await
+        .expect("test: reap task joins");
+        assert!(
+            reaped < std::time::Duration::from_secs(5),
+            "reap_reader did not return within bound — chat would freeze, took {reaped:?}"
         );
 
         // Best-effort cleanup of the orphan so the test box isn't littered.
