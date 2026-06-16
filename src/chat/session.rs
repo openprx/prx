@@ -55,6 +55,13 @@ pub struct ChatSession {
     pub updated_at: DateTime<Utc>,
     /// Ordered conversation turns
     pub turns: Vec<ChatTurn>,
+    /// Summaries of background sessions (agent / shell / pty) that ran during
+    /// this chat session (v4). Persisted so a reloaded chat session can show
+    /// what its background tasks produced. Reload restores **summaries only** —
+    /// it never revives a process, sub-agent, or PTY. `#[serde(default)]` keeps
+    /// older session blobs (written before v4) loadable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
     /// Active interaction mode (plan/edit/auto). Not persisted to JSON so
     /// resumed sessions always start back in the default mode — the user
     /// re-issues `/plan` if they want it.
@@ -75,6 +82,7 @@ impl ChatSession {
             created_at: now,
             updated_at: now,
             turns: Vec::new(),
+            background_sessions: Vec::new(),
             mode: ChatMode::default(),
         }
     }
@@ -114,6 +122,19 @@ impl ChatSession {
     /// Number of turns in this session.
     pub const fn turn_count(&self) -> usize {
         self.turns.len()
+    }
+
+    /// Upsert a background-session summary (v4), dedup by id. A later record for
+    /// the same id replaces the earlier one. Records **summary only** — never
+    /// revives a process / sub-agent / PTY. Mirrors the Redux reducer's
+    /// `reduce_background_session_recorded` so the legacy (non-TUI) persistence
+    /// path stores the same data.
+    pub fn record_background_session(&mut self, summary: crate::chat::sessions::PersistedSessionSummary) {
+        if let Some(existing) = self.background_sessions.iter_mut().find(|s| s.id == summary.id) {
+            *existing = summary;
+        } else {
+            self.background_sessions.push(summary);
+        }
     }
 
     /// Memory key for storing this session.
@@ -222,5 +243,75 @@ mod tests {
         let key = session.memory_key();
         assert!(key.starts_with("chat_session:"));
         assert!(key.len() > "chat_session:".len());
+    }
+
+    fn sample_summary(id: &str, status: &str) -> crate::chat::sessions::PersistedSessionSummary {
+        crate::chat::sessions::PersistedSessionSummary {
+            id: id.to_string(),
+            seq: 1,
+            kind: "agent".to_string(),
+            origin: "user".to_string(),
+            status: status.to_string(),
+            title: "do the thing".to_string(),
+            summary: "all done".to_string(),
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn background_sessions_round_trip() {
+        let mut session = ChatSession::new("p", "m");
+        session.record_background_session(sample_summary("run-1", "completed"));
+        session.record_background_session(sample_summary("run-2", "failed"));
+
+        let json = session.to_json().expect("test: serialize");
+        let restored = ChatSession::from_json(&json).expect("test: deserialize");
+        assert_eq!(restored.background_sessions.len(), 2);
+        assert_eq!(restored.background_sessions[0].id, "run-1");
+        assert_eq!(restored.background_sessions[0].status, "completed");
+        assert_eq!(restored.background_sessions[1].status, "failed");
+    }
+
+    #[test]
+    fn old_format_without_background_sessions_still_loads() {
+        // A pre-v4 blob has no `background_sessions` key at all. `#[serde(default)]`
+        // must let it deserialize with an empty vec rather than failing.
+        let legacy = r#"{
+            "id": "abc",
+            "schema_version": 1,
+            "title": "old",
+            "provider": "p",
+            "model": "m",
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+            "turns": []
+        }"#;
+        let restored = ChatSession::from_json(legacy).expect("test: legacy blob must load");
+        assert_eq!(restored.id, "abc");
+        assert!(restored.background_sessions.is_empty());
+    }
+
+    #[test]
+    fn empty_background_sessions_are_not_serialized() {
+        // skip_serializing_if keeps the wire format identical to pre-v4 when no
+        // background sessions ran, so nothing changes for the common case.
+        let session = ChatSession::new("p", "m");
+        let json = session.to_json().expect("test: serialize");
+        assert!(!json.contains("background_sessions"));
+    }
+
+    #[test]
+    fn record_background_session_upserts_by_id() {
+        let mut session = ChatSession::new("p", "m");
+        session.record_background_session(sample_summary("run-1", "running"));
+        // A later record for the same id replaces the earlier one (e.g. a
+        // terminal status superseding an interim one). No duplicate is added.
+        let mut updated = sample_summary("run-1", "completed");
+        updated.summary = "finished cleanly".to_string();
+        session.record_background_session(updated);
+
+        assert_eq!(session.background_sessions.len(), 1);
+        assert_eq!(session.background_sessions[0].status, "completed");
+        assert_eq!(session.background_sessions[0].summary, "finished cleanly");
     }
 }

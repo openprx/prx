@@ -77,7 +77,7 @@ impl ChatMode {
 
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
-pub(crate) enum ToolCallNotification {
+pub enum ToolCallNotification {
     /// A tool call is about to be executed.
     Started { name: String, args_summary: String },
     /// A tool call has finished executing.
@@ -88,6 +88,71 @@ pub(crate) enum ToolCallNotification {
     },
     /// Progress indication for multi-iteration tool loops.
     Progress { iteration: usize, max_iterations: usize },
+}
+
+/// A neutral, crate-library-level sink that provisions the per-run event
+/// streams for a background sub-agent (used by `tools::sessions_spawn`).
+///
+/// The actual wiring (middle channel + drainer + chat ring buffers) lives in the
+/// binary crate (`chat::sessions::event`), but `sessions_spawn` is a *library*
+/// module and must not depend on `chat`. So the binary constructs a
+/// [`SpawnEventSink`] from a closure that, given a run id, creates the run's
+/// `on_delta` / `on_tool_call` senders (and spawns its drainer); the library
+/// only ever invokes that closure. This inverts the dependency without pulling
+/// `chat` into the library crate.
+#[derive(Clone)]
+pub struct SpawnEventSink {
+    #[allow(clippy::type_complexity)]
+    factory: Arc<
+        dyn Fn(
+                &str,
+            ) -> (
+                tokio::sync::mpsc::Sender<String>,
+                tokio::sync::mpsc::Sender<ToolCallNotification>,
+            ) + Send
+            + Sync,
+    >,
+}
+
+impl SpawnEventSink {
+    /// Build a sink from a per-run stream factory.
+    ///
+    /// `factory(run_id)` must return the `(on_delta, on_tool_call)` senders for
+    /// that run and arrange for them to be drained (the chat side spawns the
+    /// drainer there). It is called exactly once per spawned task-mode run.
+    pub fn new<F>(factory: F) -> Self
+    where
+        F: Fn(
+                &str,
+            ) -> (
+                tokio::sync::mpsc::Sender<String>,
+                tokio::sync::mpsc::Sender<ToolCallNotification>,
+            ) + Send
+            + Sync
+            + 'static,
+    {
+        Self {
+            factory: Arc::new(factory),
+        }
+    }
+
+    /// Provision the `(on_delta, on_tool_call)` senders for one run.
+    #[must_use]
+    pub fn streams_for(
+        &self,
+        run_id: &str,
+    ) -> (
+        tokio::sync::mpsc::Sender<String>,
+        tokio::sync::mpsc::Sender<ToolCallNotification>,
+    ) {
+        (self.factory)(run_id)
+    }
+}
+
+impl std::fmt::Debug for SpawnEventSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SpawnEventSink")
+    }
 }
 
 /// Context for scope-based tool access control.
@@ -3003,6 +3068,36 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
                 RiskLevel::Low,
             ))
         }
+        "sessions_spawn" => {
+            // Mirror SessionsSpawnTool::execute's per-action gate op-id + risk
+            // verbatim, or the v2 no-escalation check rejects an approved call:
+            //   spawn (default/unknown)     → sessions_spawn:spawn,           Medium
+            //   kill                        → sessions_spawn:kill:<run_id>,   Medium
+            //   steer                       → sessions_spawn:steer:<run_id>,  Low
+            //   list / history (no gate)    → None
+            // run_id is trimmed to match the tool, which trims it before
+            // building the op-id (see execute_kill / execute_steer callers).
+            let action = string_arg("action").unwrap_or("spawn");
+            let run_id = string_arg("run_id").unwrap_or_default().trim();
+            match action {
+                "kill" => Some(GrantOp::ResourceExact(
+                    format!("sessions_spawn:kill:{run_id}"),
+                    RiskLevel::Medium,
+                )),
+                "steer" => Some(GrantOp::ResourceExact(
+                    format!("sessions_spawn:steer:{run_id}"),
+                    RiskLevel::Low,
+                )),
+                // list / history are read-only and the tool gates neither.
+                "list" | "history" => None,
+                // Default and any unrecognized action fall through to spawn,
+                // exactly as the tool's `_ => {}` arm does.
+                _ => Some(GrantOp::ResourceExact(
+                    "sessions_spawn:spawn".to_string(),
+                    RiskLevel::Medium,
+                )),
+            }
+        }
         "subagents" => {
             let action = string_arg("action").unwrap_or("list");
             let run_id = string_arg("run_id").unwrap_or_default();
@@ -5822,6 +5917,63 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn grant_op_for_sessions_spawn_matches_tool_gate() {
+        use crate::acl::approval_grant::RiskLevel;
+
+        // spawn (explicit) → exact `sessions_spawn:spawn`, Medium.
+        match grant_op_for_call("sessions_spawn", &serde_json::json!({"action": "spawn"})) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:spawn");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact spawn grant"),
+        }
+
+        // default (no action) also derives the spawn grant.
+        match grant_op_for_call("sessions_spawn", &serde_json::json!({"task": "do it"})) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:spawn");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact spawn grant for default action"),
+        }
+
+        // kill → exact `sessions_spawn:kill:<run_id>`, Medium (run_id trimmed).
+        match grant_op_for_call(
+            "sessions_spawn",
+            &serde_json::json!({"action": "kill", "run_id": "  run-1  "}),
+        ) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:kill:run-1");
+                assert_eq!(risk, RiskLevel::Medium);
+            }
+            _ => panic!("expected exact kill grant"),
+        }
+
+        // steer → exact `sessions_spawn:steer:<run_id>`, Low.
+        match grant_op_for_call(
+            "sessions_spawn",
+            &serde_json::json!({"action": "steer", "run_id": "run-2", "message": "hi"}),
+        ) {
+            Some(GrantOp::ResourceExact(op, risk)) => {
+                assert_eq!(op, "sessions_spawn:steer:run-2");
+                assert_eq!(risk, RiskLevel::Low);
+            }
+            _ => panic!("expected exact steer grant"),
+        }
+
+        // Read-only actions are not gated by the tool, so derive no grant.
+        assert!(grant_op_for_call("sessions_spawn", &serde_json::json!({"action": "list"})).is_none());
+        assert!(
+            grant_op_for_call(
+                "sessions_spawn",
+                &serde_json::json!({"action": "history", "run_id": "x"})
+            )
+            .is_none()
+        );
+    }
 
     fn tools_to_openai_format(tools_registry: &[Box<dyn Tool>]) -> Vec<serde_json::Value> {
         tools_registry

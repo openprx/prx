@@ -57,6 +57,7 @@ pub mod dispatcher;
 pub mod error;
 pub mod sanitize;
 pub mod session;
+pub mod sessions;
 pub mod state;
 pub mod terminal_proto;
 
@@ -289,6 +290,62 @@ fn print_fallback_chat_output(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
+/// Format the recap of background sessions restored from a reloaded chat
+/// session (v4). Pure string builder (no I/O, no lock) so it is trivially
+/// unit-testable. Each line shows the kind, display seq `#N`, terminal status,
+/// title/command, and (when present) the completion summary. The header makes
+/// it explicit that these are historical results — nothing has been revived.
+fn format_reloaded_background_sessions(sessions: &[crate::chat::sessions::PersistedSessionSummary]) -> String {
+    let mut out = String::new();
+    out.push_str("[previous session — background task results (not resumed)]");
+    for s in sessions {
+        let summary = s.summary.trim();
+        // v5: tag model-spawned sessions so the recap distinguishes them from
+        // operator-initiated ones. User-initiated sessions stay untagged to keep
+        // the common case quiet (origin defaults to "user" for legacy blobs).
+        let origin_tag = if s.origin == "model" { " [model]" } else { "" };
+        if summary.is_empty() {
+            out.push_str(&format!(
+                "\n  · {} #{}{} {} — {}",
+                s.kind, s.seq, origin_tag, s.status, s.title
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n  · {} #{}{} {} — {}: {}",
+                s.kind, s.seq, origin_tag, s.status, s.title, summary
+            ));
+        }
+    }
+    out
+}
+
+/// Surface a background-session system message into the chat (v1b reflow).
+///
+/// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
+/// timer-tick branch — which runs inside the `select!` header, before the
+/// closure is in scope — can use it. Behaviour mirrors `emit_chat_output`:
+/// route through the dispatcher (single source, reaches both render paths) and
+/// nudge the renderer on the TUI path; fall back to plain stdout otherwise.
+#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
+fn surface_session_message(dispatcher: &dispatcher::ChatDispatcher, redraw_tx: Option<&mpsc::Sender<()>>, text: &str) {
+    #[cfg(feature = "terminal-tui")]
+    {
+        let _ = dispatcher.dispatch_or_log(
+            crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
+            "chat.system_message_session",
+        );
+        if let Some(tx) = redraw_tx {
+            let _ = tx.try_send(());
+        } else {
+            print_fallback_chat_output(text);
+        }
+    }
+    #[cfg(not(feature = "terminal-tui"))]
+    {
+        print_fallback_chat_output(text);
+    }
+}
+
 fn format_fallback_chat_output_for(text: &str, stdout_is_terminal: bool) -> String {
     if !stdout_is_terminal {
         let mut out = String::with_capacity(text.len() + 1);
@@ -467,6 +524,13 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::Cancelled => "Cancelled",
         tui::KeyDispatch::Consumed => "Consumed",
         tui::KeyDispatch::Ignored => "Ignored",
+        // v1.1b switcher/focus control flow — treated as consumed-equivalent for
+        // the legacy redux-diff comparison (they neither submit nor quit).
+        tui::KeyDispatch::SwitcherOpened { .. } => "SwitcherOpened",
+        tui::KeyDispatch::SwitcherMoved { .. } => "SwitcherMoved",
+        tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
+        tui::KeyDispatch::AttachSession { .. } => "AttachSession",
+        tui::KeyDispatch::RequestDetach => "RequestDetach",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -504,7 +568,12 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::InterruptTurn
         | tui::KeyDispatch::Cancelled
         | tui::KeyDispatch::Consumed
-        | tui::KeyDispatch::Ignored => new_has_quit,
+        | tui::KeyDispatch::Ignored
+        | tui::KeyDispatch::SwitcherOpened { .. }
+        | tui::KeyDispatch::SwitcherMoved { .. }
+        | tui::KeyDispatch::SwitcherClosed
+        | tui::KeyDispatch::AttachSession { .. }
+        | tui::KeyDispatch::RequestDetach => new_has_quit,
     };
 
     if is_diff {
@@ -1003,13 +1072,19 @@ pub async fn run(
     }
 
     // ── Tools ────────────────────────────────────────────────────
-    // The Interactive profile built the tool registry inside the bootstrap
-    // (security + runtime + memory all ready); take it explicitly. The bootstrap
-    // uses the identical `all_tools_with_runtime` call with the same arguments.
-    let tools_registry: Arc<Vec<Box<dyn Tool>>> = ctx
-        .tools
-        .clone()
-        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for chat"))?;
+    // The Interactive profile built the base tool registry inside the bootstrap
+    // (security + runtime + memory all ready) and handed it to chat as an *owned*
+    // `Vec` in `base_tools` (so chat can append its session tools after the
+    // provider + TerminalChannel exist). Take it exactly once; we wrap it in
+    // `Arc` ourselves once the chat session tools are appended (see "Chat session
+    // runtime" below).
+    let mut base_tools_vec: Vec<Box<dyn Tool>> = ctx
+        .base_tools
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("bootstrap did not build the tool registry for chat"))?
+        .lock()
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("chat base tool registry was already taken"))?;
 
     // ── Resolve provider ─────────────────────────────────────────
     let provider_name = provider_override
@@ -1081,6 +1156,101 @@ pub async fn run(
 
     // ── Create TerminalChannel (Arc-wrapped for sharing with streaming tasks) ──
     let terminal: Arc<TerminalChannel> = Arc::new(TerminalChannel::new(plain_mode));
+
+    // ── Chat session runtime (v1a registry wiring) ──────────────────
+    // The single source of truth for the chat background-session runtime: one
+    // `active_runs` registry, owned here, shared by reference (Arc clones) with
+    // the four session tools (sessions_spawn/list/status/send) and the chat-side
+    // `ChatSessionsHandle` used by `/sessions` and `/kill`. This is the v1a
+    // "step 0" foundation (see chat-background-runtime-v1-execution-plan.md §C.0).
+    //
+    // Built here — after provider + TerminalChannel exist — because
+    // `SessionsSpawnTool::new_with_registry` requires both; the generic tool
+    // factory (`all_tools_with_runtime`) runs in bootstrap before either is
+    // available, so chat appends these tools to its owned base registry instead.
+    let active_runs: Arc<tokio::sync::RwLock<Vec<crate::tools::sessions_spawn::SubAgentRun>>> =
+        Arc::new(tokio::sync::RwLock::new(Vec::new()));
+    let sessions_workspace_id = config.workspace_dir.to_string_lossy().to_string();
+    // Event bridge (v1.1a): the chat main loop owns the single `SessionEvent`
+    // receiver; the spawn tool gets the matching library-level sink so task-mode
+    // `/bg` sub-agents stream incremental output + tool calls (via a per-session
+    // drainer) into per-session ring buffers for live read-only `/attach`.
+    let (session_event_sink, mut session_event_rx) = crate::chat::sessions::SessionEventSink::channel();
+    // Keep a clone for background `/shell` sessions (v2): they stream stdout/
+    // stderr through the same event bridge / per-session drainer that agents use,
+    // so live `/attach` and `/logs` work uniformly across both kinds. The other
+    // clone is consumed by the spawn tool's `into_spawn_sink` below.
+    let shell_event_sink = session_event_sink.clone();
+    let spawn_tool = crate::tools::SessionsSpawnTool::new_with_registry(
+        Arc::clone(&terminal) as Arc<dyn Channel>,
+        Arc::clone(&provider),
+        provider_name,
+        model_name,
+        temperature,
+        security.clone(),
+        config.workspace_dir.clone(),
+        config.multimodal.clone(),
+        config.agent.compaction.clone(),
+        config.agents.clone(),
+        config.api_key.clone(),
+        provider_runtime_options.clone(),
+        config.sessions_spawn.clone(),
+        Arc::clone(&active_runs),
+    )
+    .with_shared_memory(Arc::clone(&mem))
+    .with_event_recording(config.memory.event_recording_config())
+    .with_event_sink(session_event_sink.into_spawn_sink());
+    let spawn_tools_handle = spawn_tool.tools_handle();
+
+    // Sibling tools share the same single-source registry (only the v1a four;
+    // `subagents`/`sessions_history` are intentionally not registered in chat —
+    // see plan §C.0 blocker 4).
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionsListTool::new(Arc::clone(&active_runs))
+            .with_shared_memory(Arc::clone(&mem), sessions_workspace_id.clone()),
+    ));
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionsSendTool::with_security(Arc::clone(&active_runs), security.clone())
+            .with_shared_memory(Arc::clone(&mem))
+            .with_event_recording(config.memory.event_recording_config()),
+    ));
+    base_tools_vec.push(Box::new(
+        crate::tools::SessionStatusTool::new(
+            Arc::clone(&active_runs),
+            provider_name,
+            model_name,
+            vec![terminal.name().to_string()],
+        )
+        .with_shared_memory(Arc::clone(&mem), sessions_workspace_id),
+    ));
+    base_tools_vec.push(Box::new(spawn_tool));
+
+    // Wrap the now-complete registry in `Arc`, then inject it back into
+    // sessions_spawn's tools OnceLock so spawned sub-agents can use the full tool
+    // set (resolves the spawn-tool-needs-the-tool-table chicken-and-egg; mirrors
+    // the channels path).
+    let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(base_tools_vec);
+    // Re-inject the completed registry into sessions_spawn's OnceLock. A failure
+    // here means the handle was already set (the spawn tool's tool table never got
+    // this full registry) — spawned sub-agents would then run with an incomplete
+    // tool set, so surface it instead of swallowing silently.
+    if spawn_tools_handle.set(Arc::clone(&tools_registry)).is_err() {
+        tracing::warn!(
+            "sessions_spawn tools registry was already initialized; spawned sub-agents may have an incomplete tool set"
+        );
+    }
+
+    // Chat-side handle over the same single-source registry for `/sessions` and
+    // `/kill` (side-channel — same Arc, no type erasure / downcast).
+    let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(Arc::clone(&active_runs));
+
+    // v3a: coordination handle for interactive PTY terminal handoff. Shared with
+    // the unified TUI render loop (which parks while a PTY is attached) and the
+    // main loop's `/pty` handler (which pauses/resumes it around the passthrough).
+    // Only the TUI path performs the handoff; the non-TUI fallback has no render
+    // loop to suspend.
+    #[cfg(feature = "terminal-tui")]
+    let pty_handoff = Arc::new(crate::chat::sessions::pty::HandoffControl::new());
 
     // ── Session: resume or create new ───────────────────────────
     let mut chat_session = match session_id.as_deref() {
@@ -1401,6 +1571,7 @@ pub async fn run(
                         Arc::clone(&last_ctrlc_ms),
                         chat_dispatcher.clone(),
                         snapshot_rx_for_tui.clone(),
+                        Arc::clone(&pty_handoff),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -1552,10 +1723,211 @@ pub async fn run(
     // `/provider <name>` 时用新 provider 重建并替换此 Arc，同步 set 进 provider_slot（Redux 路径）。
     let mut provider = provider;
 
+    // ── Background-session observation state (v1b) ────────────────
+    // Owned by the main loop (single-threaded), per the iron law that runtime
+    // state is only written here — the detached spawn tasks only mutate the
+    // shared registry, never this. `reported_sessions` dedups the one-shot
+    // summary reflow; `last_sessions_summary` dedups the persistent status-line
+    // action so we only dispatch on change. The 1s timer is a read-only poll of
+    // the registry (no event bus until v1.1).
+    let mut reported_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut last_sessions_summary: String = String::new();
+    let mut sessions_tick = tokio::time::interval(Duration::from_secs(1));
+    sessions_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // ── Event bridge state (v1.1a) ────────────────────────────────
+    // Per-session ring buffers, written ONLY here (single consumer; iron law:
+    // the ring is never written by the background agent or the drainer). Live
+    // `/attach` follows one session at a time: when `attached_follow` matches an
+    // incoming event's session, its delta/tool lines are streamed inline to the
+    // existing scrollback (read-only — no input routing; that is v1.1b).
+    let mut session_rings: std::collections::HashMap<
+        crate::chat::sessions::id::SessionId,
+        crate::chat::sessions::SessionRing,
+    > = std::collections::HashMap::new();
+    let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
+    // Display sequence `#N` of the currently-followed session, kept in lock-step
+    // with `attached_follow`. Used purely to reconstruct the *previous* focus
+    // target when an optimistic attach must be rolled back (v1.1b review P0): on
+    // attach failure the key thread has already pointed the prompt at the new
+    // seq, so the main loop restores `Main` (when None) or `Session { seq }`.
+    let mut attached_follow_seq: Option<u64> = None;
+    // Sessions for which the live follow has already surfaced an `[output
+    // truncated]` notice, so the marker (P1) is shown at most once per session
+    // while following. Cleared on `/attach` (a fresh follow re-evaluates).
+    let mut attach_truncated_shown: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
+        std::collections::HashSet::new();
+    // Guards the event-drain select arm: once the event channel closes (only at
+    // shutdown — the sender lives as long as the tool registry) we disable the
+    // arm so a closed channel does not busy-spin returning `None`.
+    let mut session_events_open = true;
+    // Renderer nudge handle, available in both feature configs (the TUI-only
+    // `redraw_tx_for_main` is `Some` only on the TUI path; `None` otherwise so
+    // the helpers fall back to plain stdout).
+    #[cfg(feature = "terminal-tui")]
+    let sessions_redraw_handle: Option<mpsc::Sender<()>> = redraw_tx_for_main.clone();
+    #[cfg(not(feature = "terminal-tui"))]
+    let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
+
+    // ── Reload notice: historical background sessions (v4) ────────
+    // If this chat session was resumed and carried persisted background-session
+    // summaries, surface a one-shot recap so the user sees what their previous
+    // background tasks produced. These are **summaries only** — no process,
+    // sub-agent, or PTY is revived (those belonged to the prior process and are
+    // long gone); any session that was still running at last exit shows as
+    // `interrupted`.
+    if !chat_session.background_sessions.is_empty() {
+        let recap = format_reloaded_background_sessions(&chat_session.background_sessions);
+        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &recap);
+    }
+
     // ── Main message loop ────────────────────────────────────────
-    while let Some(msg) = tokio::select! {
-        msg = input_rx.recv() => msg,
-        _ = shutdown.cancelled() => None,
+    //
+    // The inner `loop` lets a timer tick do background-session work (summary
+    // reflow + status-line refresh) without producing a message or ending the
+    // outer loop: it only `break`s with a real input message (or `None` on
+    // shutdown). On a tick we poll the registry and surface results via the
+    // dispatcher (single source, reaches both render paths), then keep waiting.
+    while let Some(msg) = loop {
+        tokio::select! {
+            msg = input_rx.recv() => break msg,
+            _ = shutdown.cancelled() => break None,
+            _ = sessions_tick.tick() => {
+                // 1) Summary reflow: surface each newly-finished session once,
+                //    carrying its `#N` + status (plan §v1b). No auto-focus.
+                let finished = chat_sessions.poll_finished(&mut reported_sessions).await;
+                // 2) Persistent status line: recompute and dispatch only on change.
+                let views = chat_sessions.snapshot().await;
+                for fin in &finished {
+                    let summary = fin.summary.trim();
+                    let kind = fin.kind.as_str();
+                    let line = if summary.is_empty() {
+                        format!("[{kind} session #{} {}]", fin.seq, fin.status.as_str())
+                    } else {
+                        format!("[{kind} session #{} {}] {summary}", fin.seq, fin.status.as_str())
+                    };
+                    surface_session_message(
+                        &chat_dispatcher,
+                        sessions_redraw_handle.as_ref(),
+                        &line,
+                    );
+                    // v4: persist a summary of this finished background session
+                    // into the chat session so a reload can show what it
+                    // produced. Title / created_at come from the live view (the
+                    // finished record itself only carries seq/status/summary);
+                    // if the view is already gone we still record with the
+                    // finished record's own fields so nothing is lost.
+                    let persisted = views
+                        .iter()
+                        .find(|v| v.id.as_str() == fin.run_id)
+                        .map_or_else(
+                            || crate::chat::sessions::PersistedSessionSummary {
+                                id: fin.run_id.clone(),
+                                seq: fin.seq,
+                                kind: fin.kind.as_str().to_string(),
+                                origin: fin.origin.as_str().to_string(),
+                                status: fin.status.as_str().to_string(),
+                                title: String::new(),
+                                summary: fin.summary.clone(),
+                                created_at: chrono::Utc::now(),
+                            },
+                            |view| crate::chat::sessions::PersistedSessionSummary::from_view(view, fin.summary.clone()),
+                        );
+                    // Legacy (non-TUI) persistence path serializes `chat_session`
+                    // directly, so mirror the record there too. The Redux/TUI
+                    // path persists from SessionState, fed by the dispatched
+                    // action below. Both write the same backward-compatible field.
+                    chat_session.record_background_session(persisted.clone());
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+                        "chat.bg_session_recorded",
+                    );
+                }
+                // v1.1b: refresh the switcher cache the key thread reads on Ctrl+G
+                // (it cannot run async registry queries itself). Display staleness
+                // is harmless: switcher Enter re-resolves the seq via /attach.
+                #[cfg(feature = "terminal-tui")]
+                {
+                    let entries = crate::chat::sessions::focus::switcher_entries(&views);
+                    chat_mirror.lock().sessions_cache = entries;
+                }
+                let new_summary = crate::chat::sessions::status_summary(&views);
+                if new_summary != last_sessions_summary {
+                    last_sessions_summary = new_summary.clone();
+                    let _ = chat_dispatcher.dispatch_or_log(
+                        crate::chat::action::Action::SessionsStatusUpdated { summary: new_summary },
+                        "chat.sessions_status",
+                    );
+                    if let Some(tx) = sessions_redraw_handle.as_ref() {
+                        let _ = tx.try_send(());
+                    }
+                }
+                // Keep waiting (do not break the inner loop / produce a message).
+                continue;
+            }
+            maybe_event = session_event_rx.recv(), if session_events_open => {
+                // Drain one background-session event: append it to that session's
+                // ring (single-consumer write, no lock) and, if we are currently
+                // following that session, stream the new line(s) inline.
+                let Some(event) = maybe_event else {
+                    // Sender side closed (chat shutting down). Disable this arm so
+                    // a closed channel does not busy-spin; other arms drive exit.
+                    session_events_open = false;
+                    continue;
+                };
+                let sid = event.session_id().clone();
+                let ring = session_rings
+                    .entry(sid.clone())
+                    .or_insert_with(|| crate::chat::sessions::SessionRing::with_capacity(
+                        crate::chat::sessions::event::DEFAULT_RING_CAPACITY,
+                    ));
+                // A `Truncated` marker carries no output line; it only flags the
+                // ring so `/attach` shows `[output truncated]` for events the
+                // drainer had to drop on a full channel (P1 fix). Delta/ToolCall
+                // append their text as a new ring line.
+                let line = match &event {
+                    crate::chat::sessions::SessionEvent::Delta { text, .. } => Some(text.clone()),
+                    crate::chat::sessions::SessionEvent::ToolCall { summary, .. } => Some(summary.clone()),
+                    crate::chat::sessions::SessionEvent::Truncated { .. } => {
+                        ring.mark_truncated();
+                        None
+                    }
+                };
+                if let Some(line) = line {
+                    ring.push(line);
+                }
+                if attached_follow.as_ref() == Some(&sid) {
+                    // Follow mode: surface only the newly-appended lines inline.
+                    let new_lines = ring.drain_new();
+                    // Show `[output truncated]` once per truncation: either riding
+                    // along with new output, or on its own when a `Truncated`
+                    // marker (P1) arrives with no accompanying line.
+                    let show_truncated =
+                        ring.is_truncated() && !attach_truncated_shown.contains(&sid);
+                    if !new_lines.is_empty() || show_truncated {
+                        let mut out = String::new();
+                        for l in &new_lines {
+                            out.push_str(l);
+                            if !l.ends_with('\n') {
+                                out.push('\n');
+                            }
+                        }
+                        if show_truncated {
+                            out.push_str("[output truncated]\n");
+                            attach_truncated_shown.insert(sid.clone());
+                        }
+                        let trimmed = out.trim_end();
+                        if !trimmed.is_empty() {
+                            surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                trimmed,
+                            );
+                        }
+                    }
+                }
+                continue;
+            }
+        }
     } {
         let user_input = msg.content.clone();
 
@@ -1945,7 +2317,611 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     emit_chat_output(msg);
                     continue;
                 }
-                commands::CommandResult::NotACommand => {}
+                commands::CommandResult::SessionAction(action) => {
+                    use crate::chat::sessions::SessionCommand;
+                    match action {
+                        SessionCommand::Bg { task } => {
+                            // Spawn a background agent via sessions_spawn, passing
+                            // the *current* provider/model (read from the main-loop
+                            // strings, which `/provider` and `/model` keep in sync)
+                            // so a hot switch is honoured (plan §C.0 blocker 3).
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    let mut args = serde_json::json!({
+                                        "task": task,
+                                        "provider": current_provider_owned,
+                                        "model": current_model_owned,
+                                    });
+                                    // Spawning is a Medium-risk side effect; under
+                                    // supervised autonomy the gate requires a grant
+                                    // bound to `sessions_spawn:spawn`. The operator
+                                    // typed `/bg`, so issue the matching grant here
+                                    // (same op name the gate authorizes), mirroring
+                                    // `/kill` and `/steer` and how the agent loop
+                                    // grants after operator approval.
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        "sessions_spawn:spawn",
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize spawn approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Failed to start background agent: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Sessions => {
+                            let views = chat_sessions.snapshot().await;
+                            if views.is_empty() {
+                                emit_chat_output("No background sessions.");
+                            } else {
+                                let mut out = String::from("Background sessions:\n");
+                                for v in &views {
+                                    // v5 (§17): tag origin (user `/bg` vs model
+                                    // self-spawn) so both kinds of session are
+                                    // visible in one unified list, distinguishable.
+                                    out.push_str(&format!(
+                                        "  #{} {} {} {} {}\n",
+                                        v.seq,
+                                        v.kind.as_str(),
+                                        v.origin.as_str(),
+                                        v.status.as_str(),
+                                        v.title
+                                    ));
+                                }
+                                emit_chat_output(out.trim_end());
+                            }
+                            continue;
+                        }
+                        SessionCommand::Kill { seq } => {
+                            // Unified kill: shells terminate their process group via
+                            // the shell registry; agents delegate to the
+                            // sessions_spawn tool's `kill` action (shared semantics).
+                            match chat_sessions.kind_for_seq(seq).await {
+                                Ok(crate::chat::sessions::model::ManagedKind::Shell) => {
+                                    match chat_sessions.kill_shell(seq).await {
+                                        Ok(()) => emit_chat_output(&format!(
+                                            "Killed background shell #{seq} (process group terminated)."
+                                        )),
+                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                    }
+                                    continue;
+                                }
+                                Ok(crate::chat::sessions::model::ManagedKind::Pty) => {
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        match chat_sessions.kill_pty(seq).await {
+                                            Ok(()) => emit_chat_output(&format!(
+                                                "Killed interactive PTY session #{seq} (process group terminated)."
+                                            )),
+                                            Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                        }
+                                    }
+                                    continue;
+                                }
+                                Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
+                                Err(e) => {
+                                    emit_chat_output(&format!("Kill failed: {e}"));
+                                    continue;
+                                }
+                            }
+                            // Agent path: resolve `#N` -> run UUID (refreshing the
+                            // seq map so a just-`/bg`-ed run is addressable), then
+                            // delegate the actual kill to the `sessions_spawn` tool's
+                            // `kill` action. Routing through the tool — instead of
+                            // mutating the registry here — keeps the shared kill
+                            // semantics: side-effect gate authorization,
+                            // completed/failed status check (no overwriting a
+                            // finished run), `task.killed` event, `steer_tx`
+                            // cleanup, and the channel announcement.
+                            let run_id = match chat_sessions.resolve_run_id(seq).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    emit_chat_output(&format!("Kill failed: {e}"));
+                                    continue;
+                                }
+                            };
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    // The kill operation is Medium-risk; under
+                                    // supervised autonomy the gate requires a grant
+                                    // bound to `sessions_spawn:kill:<run_id>`. The
+                                    // operator typed `/kill`, so issue the matching
+                                    // grant here (same op name the gate authorizes),
+                                    // mirroring how the agent loop grants after
+                                    // operator approval.
+                                    let operation_name = format!("sessions_spawn:kill:{run_id}");
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        &operation_name,
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    let mut args = serde_json::json!({
+                                        "action": "kill",
+                                        "run_id": run_id,
+                                    });
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize kill approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Steer { seq, message } => {
+                            // v5: steer only applies to agent sessions (it appends
+                            // an instruction to a running sub-agent's steer
+                            // channel). Shells and PTYs have no steer channel —
+                            // resolving their seq would yield a non-agent id that
+                            // the sessions_spawn tool can't address, producing a
+                            // cryptic "run not found". Guard with a clear message
+                            // up front, mirroring `/kill`'s kind dispatch.
+                            match chat_sessions.kind_for_seq(seq).await {
+                                Ok(kind) => {
+                                    if let Some(msg) =
+                                        crate::chat::sessions::command::steer_unsupported_message(kind, seq)
+                                    {
+                                        emit_chat_output(&msg);
+                                        continue;
+                                    }
+                                    // Agent: fall through to the steer delegation.
+                                }
+                                Err(e) => {
+                                    emit_chat_output(&format!("Steer failed: {e}"));
+                                    continue;
+                                }
+                            }
+                            // Resolve `#N` -> run UUID, then delegate to the
+                            // sessions_spawn tool's `steer` action so the shared
+                            // semantics apply uniformly (Low-risk side-effect gate
+                            // op `sessions_spawn:steer:<run_id>`, running-status
+                            // check, steer_tx delivery). Mirrors `/kill`.
+                            let run_id = match chat_sessions.resolve_run_id(seq).await {
+                                Ok(id) => id,
+                                Err(e) => {
+                                    emit_chat_output(&format!("Steer failed: {e}"));
+                                    continue;
+                                }
+                            };
+                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                                Some(tool) => {
+                                    let operation_name = format!("sessions_spawn:steer:{run_id}");
+                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                        "sessions_spawn",
+                                        &operation_name,
+                                        "chat-operator",
+                                        None,
+                                    );
+                                    let mut args = serde_json::json!({
+                                        "action": "steer",
+                                        "run_id": run_id,
+                                        "message": message,
+                                    });
+                                    match serde_json::to_value(&grant) {
+                                        Ok(grant_value) => {
+                                            if let Some(obj) = args.as_object_mut() {
+                                                obj.insert(
+                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                    grant_value,
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "Failed to serialize steer approval grant; proceeding without it"
+                                            );
+                                        }
+                                    }
+                                    match tool.execute_named("sessions_spawn", args).await {
+                                        Ok(result) => {
+                                            let out = if result.output.is_empty() {
+                                                result
+                                                    .error
+                                                    .filter(|e| !e.is_empty())
+                                                    .unwrap_or_else(|| "(no output)".to_string())
+                                            } else {
+                                                result.output
+                                            };
+                                            emit_chat_output(&out);
+                                        }
+                                        Err(e) => emit_chat_output(&format!("Steer failed: {e}")),
+                                    }
+                                }
+                                None => emit_chat_output("Background sessions are not available in this session."),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Attach { seq } => {
+                            // v1.1a `/attach` is a live read-only follow: it
+                            // streams the session's new incremental output + tool
+                            // calls inline to the existing scrollback. It still
+                            // does NOT route input or take over the screen (input
+                            // routing is v1.1b). Stop following with `/detach`.
+                            //
+                            // v5: PTY sessions are interactive terminal handoffs,
+                            // not line-streamed output, so a read-only follow makes
+                            // no sense for them. The Ctrl+G switcher routes Enter
+                            // through this same `/attach <seq>` path for every kind,
+                            // so guard PTYs here with a clear redirect rather than
+                            // silently starting an empty follow. (A live PTY can be
+                            // re-entered with `/pty`; an exited one is terminal.)
+                            #[cfg(feature = "terminal-tui")]
+                            if matches!(
+                                chat_sessions.kind_for_seq(seq).await,
+                                Ok(crate::chat::sessions::model::ManagedKind::Pty)
+                            ) {
+                                let exited = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
+                                if exited {
+                                    emit_chat_output(&format!(
+                                        "Interactive PTY session #{seq} has exited — nothing to attach to. \
+                                         Start a new one with /pty <command>."
+                                    ));
+                                } else {
+                                    emit_chat_output(&format!(
+                                        "Session #{seq} is an interactive PTY, not a streamed session. \
+                                         Use /pty <command> to open an interactive terminal (live read-only follow does not apply to PTYs)."
+                                    ));
+                                }
+                                // Restore the prompt/focus the switcher may have set
+                                // optimistically (it pointed at this seq before we
+                                // declined the follow), so perception matches routing.
+                                let prev_focus = crate::chat::sessions::focus::rollback_focus(attached_follow_seq);
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
+                                    "chat.session_focus_attach_pty_decline",
+                                );
+                                chat_mirror.lock().focus = prev_focus;
+                                if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                    let _ = tx.try_send(());
+                                }
+                                continue;
+                            }
+                            const ATTACH_TAIL_LINES: usize = 20;
+                            match chat_sessions.resolve_run_id(seq).await {
+                                Ok(run_id) => {
+                                    let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    // P2 fix — dedup attach replay. A terminal
+                                    // session's final answer already lives in the
+                                    // registry history (printed as the tail below)
+                                    // *and* was captured in the live ring via
+                                    // `on_delta`. Printing both duplicates it, so
+                                    // for terminal sessions we print only the
+                                    // history tail and skip ring replay. Running
+                                    // sessions still replay the retained ring +
+                                    // live-follow new lines so incremental output
+                                    // remains visible.
+                                    let is_terminal = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
+                                    // Print the historical tail (registry history)
+                                    // once for context, then start the live follow.
+                                    match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
+                                        Ok(lines) if !lines.is_empty() => {
+                                            let mut out =
+                                                format!("Session #{seq} (last {} lines, read-only):\n", lines.len());
+                                            for l in &lines {
+                                                out.push_str(&format!("  [{}] {}\n", l.role, l.content));
+                                            }
+                                            emit_chat_output(out.trim_end());
+                                        }
+                                        Ok(_) => {}
+                                        Err(e) => emit_chat_output(&format!("Attach tail failed: {e}")),
+                                    }
+                                    // Fresh follow: re-evaluate the one-shot
+                                    // truncation notice for this session.
+                                    attach_truncated_shown.remove(&sid);
+                                    if let Some(ring) = session_rings.get_mut(&sid) {
+                                        if is_terminal {
+                                            // Skip ring replay (would duplicate the
+                                            // history tail); align the drained
+                                            // cursor to the end so a later re-attach
+                                            // does not replay stale lines either.
+                                            let _ = ring.drain_new();
+                                        } else {
+                                            // Running: replay any retained
+                                            // live-stream lines captured before this
+                                            // attach, then follow new ones.
+                                            ring.rewind();
+                                            let retained = ring.drain_new();
+                                            if !retained.is_empty() {
+                                                let mut out = String::new();
+                                                for l in &retained {
+                                                    out.push_str(l);
+                                                    if !l.ends_with('\n') {
+                                                        out.push('\n');
+                                                    }
+                                                }
+                                                emit_chat_output(out.trim_end());
+                                            }
+                                        }
+                                    }
+                                    attached_follow = Some(sid);
+                                    attached_follow_seq = Some(seq);
+                                    // v1.1b: route plain input to this session as
+                                    // a steer and reflect the target in the prompt
+                                    // (colour+glyph). Update both the render
+                                    // snapshot (Action) and the key thread's
+                                    // mirror (read by `resolve_esc`). When the
+                                    // attach was triggered from the switcher the
+                                    // key thread already set this optimistically;
+                                    // re-affirming it here is idempotent and also
+                                    // covers the typed `/attach N` path.
+                                    let focus = crate::chat::sessions::FocusTarget::Session { seq };
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::SessionFocusChanged { focus },
+                                        "chat.session_focus_attach",
+                                    );
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        chat_mirror.lock().focus = focus;
+                                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                            let _ = tx.try_send(());
+                                        }
+                                    }
+                                    emit_chat_output(&format!(
+                                        "Following session #{seq} (live, routing input as steer). Type /detach or press Esc to stop."
+                                    ));
+                                }
+                                Err(e) => {
+                                    // P0 race fix: the switcher key thread may have
+                                    // optimistically pointed the prompt + Esc
+                                    // judgment at `seq` before this attach ran. The
+                                    // attach failed (seq no longer resolves / the
+                                    // session is gone), so `attached_follow` is
+                                    // unchanged — restore the prompt to the *actual*
+                                    // current target so perception cannot diverge
+                                    // from routing. (A typed `/attach N` that fails
+                                    // has no optimistic set, but restoring the same
+                                    // unchanged focus is an idempotent no-op there.)
+                                    let prev_focus = crate::chat::sessions::focus::rollback_focus(attached_follow_seq);
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
+                                        "chat.session_focus_attach_rollback",
+                                    );
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        chat_mirror.lock().focus = prev_focus;
+                                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                            let _ = tx.try_send(());
+                                        }
+                                    }
+                                    emit_chat_output(&format!("Attach failed: {e}"));
+                                }
+                            }
+                            continue;
+                        }
+                        SessionCommand::Detach => {
+                            let was_following = attached_follow.take().is_some();
+                            attached_follow_seq = None;
+                            if was_following {
+                                // v1.1b: reset input routing back to main and clear
+                                // the prompt target indicator (snapshot + mirror).
+                                let focus = crate::chat::sessions::FocusTarget::Main;
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::SessionFocusChanged { focus },
+                                    "chat.session_focus_detach",
+                                );
+                                #[cfg(feature = "terminal-tui")]
+                                {
+                                    chat_mirror.lock().focus = focus;
+                                    if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                        let _ = tx.try_send(());
+                                    }
+                                }
+                                emit_chat_output("Detached. Input routes to main chat again.");
+                            } else {
+                                emit_chat_output("Not currently following any session.");
+                            }
+                            continue;
+                        }
+                        SessionCommand::Shell { command } => {
+                            // v2: run a non-interactive command in the background.
+                            // Reuses the shell tool's SideEffectGate (high-risk
+                            // commands still blocked), workspace cwd, hardened env,
+                            // and the v1.1 event bridge for live `/attach`/`/logs`.
+                            match crate::chat::sessions::shell::spawn_shell(&command, &security, &shell_event_sink) {
+                                Ok(session) => {
+                                    let seq = chat_sessions.add_shell(session);
+                                    emit_chat_output(&format!("Started background shell #{seq}: {command}"));
+                                }
+                                Err(e) => {
+                                    emit_chat_output(&format!("Failed to start background shell: {e}"));
+                                }
+                            }
+                            continue;
+                        }
+                        SessionCommand::Logs { seq } => {
+                            // v2: dump a session's accumulated output buffer (the
+                            // per-session ring) — applies to both agents and
+                            // shells. Resolving the seq first refreshes the map so a
+                            // just-spawned session is addressable.
+                            const LOGS_MAX_LINES: usize = 200;
+                            match chat_sessions.resolve_run_id(seq).await {
+                                Ok(run_id) => {
+                                    let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    match session_rings.get(&sid) {
+                                        Some(ring) => {
+                                            // Replay the full retained window without
+                                            // disturbing the live-follow drained
+                                            // cursor: snapshot via a temporary rewind.
+                                            let lines = ring.recent_lines(LOGS_MAX_LINES);
+                                            if lines.is_empty() {
+                                                emit_chat_output(&format!(
+                                                    "Session #{seq} has no buffered output yet."
+                                                ));
+                                            } else {
+                                                let mut out =
+                                                    format!("Session #{seq} logs (last {} lines):\n", lines.len());
+                                                if ring.is_truncated() {
+                                                    out.push_str("  [output truncated]\n");
+                                                }
+                                                for l in &lines {
+                                                    out.push_str("  ");
+                                                    out.push_str(l);
+                                                    out.push('\n');
+                                                }
+                                                emit_chat_output(out.trim_end());
+                                            }
+                                        }
+                                        None => {
+                                            emit_chat_output(&format!("Session #{seq} has no buffered output yet."))
+                                        }
+                                    }
+                                }
+                                Err(e) => emit_chat_output(&format!("Logs failed: {e}")),
+                            }
+                            continue;
+                        }
+                        SessionCommand::Pty { command } => {
+                            // v3a: interactive PTY shell with a full terminal
+                            // handoff. The chat ratatui render loop is suspended
+                            // and the real terminal is wired straight to the PTY
+                            // for the duration; Ctrl-] detaches, Ctrl-C/Ctrl-D
+                            // pass through. Restoration is guaranteed by the RAII
+                            // `PtyHandoffGuard` regardless of how the passthrough
+                            // ends (detach, child exit, error, or panic).
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                handle_pty_command(
+                                    &command,
+                                    &security,
+                                    &mut chat_sessions,
+                                    &pty_handoff,
+                                    sessions_redraw_handle.as_ref(),
+                                    &emit_chat_output,
+                                )
+                                .await;
+                            }
+                            #[cfg(not(feature = "terminal-tui"))]
+                            {
+                                let _ = &command;
+                                emit_chat_output("Interactive PTY sessions require the terminal UI.");
+                            }
+                            continue;
+                        }
+                    }
+                }
+                commands::CommandResult::NotACommand => {
+                    // v1.1b input routing (head footgun: input-target ambiguity).
+                    // When a background session is attached, plain text + Enter is
+                    // routed as a *steer* to that session instead of starting a
+                    // main-chat turn. The prompt's colour+glyph indicator already
+                    // shows the target, and `/detach` (or Esc) returns to main.
+                    // We never auto-switch focus — only an explicit /attach or the
+                    // switcher changes the routing target.
+                    if let Some(sid) = attached_follow.clone() {
+                        let run_id = sid.as_str().to_string();
+                        match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
+                            Some(tool) => {
+                                // Same Low-risk steer path as `/steer`: delegate to
+                                // the sessions_spawn tool with the matching grant so
+                                // the shared side-effect gate + running-status check
+                                // + steer_tx delivery all apply uniformly.
+                                let operation_name = format!("sessions_spawn:steer:{run_id}");
+                                let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+                                    "sessions_spawn",
+                                    &operation_name,
+                                    "chat-operator",
+                                    None,
+                                );
+                                let mut args = serde_json::json!({
+                                    "action": "steer",
+                                    "run_id": run_id,
+                                    "message": user_input,
+                                });
+                                match serde_json::to_value(&grant) {
+                                    Ok(grant_value) => {
+                                        if let Some(obj) = args.as_object_mut() {
+                                            obj.insert(
+                                                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                                                grant_value,
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            error = %e,
+                                            "Failed to serialize steer approval grant; proceeding without it"
+                                        );
+                                    }
+                                }
+                                match tool.execute_named("sessions_spawn", args).await {
+                                    Ok(result) => {
+                                        let out = if result.output.is_empty() {
+                                            result
+                                                .error
+                                                .filter(|e| !e.is_empty())
+                                                .unwrap_or_else(|| "(steered)".to_string())
+                                        } else {
+                                            result.output
+                                        };
+                                        emit_chat_output(&out);
+                                    }
+                                    Err(e) => emit_chat_output(&format!("Steer failed: {e}")),
+                                }
+                            }
+                            None => emit_chat_output("Background sessions are not available in this session."),
+                        }
+                        continue;
+                    }
+                }
             }
         }
 
@@ -2347,11 +3323,25 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
             // S2.5 P1-A: 显式分支处理 dispatch_result（StartLLMTurn 失败必须 fall-through
             // 否则 notify_fut 永挂）；dispatch_or_log 同时埋点 + warn，无需重复 tracing.
+            // D8-4 (redux path real fix): seed the turn-root spawn execution
+            // context for this turn and hand it to the driver via StartLLMTurn →
+            // Effect::StartTurn. This is the redux mirror of the legacy
+            // `SPAWN_EXECUTION_CONTEXT.scope(seed_turn_context(turn_run_id, ..))`
+            // wrapper applied below at the legacy `run_tool_call_loop_traced` call
+            // — the redux path `continue`s before reaching it, so the seed must
+            // travel with the effect. Same `turn_run_id` + `chat_session_key`
+            // source as the legacy path (single source of truth) so a sub-agent
+            // spawned inside this turn inherits `parent_run_id = turn_run_id`.
+            let redux_turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+                turn_run_id.clone(),
+                chat_session_key.clone(),
+            );
             let dispatch_result = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StartLLMTurn {
                     draft_id: d_id.clone(),
                     history: history.clone(),
                     cancel: cancellation.clone(),
+                    turn_spawn_ctx: Some(redux_turn_spawn_ctx),
                 },
                 "chat.start_llm_turn",
             );
@@ -3004,6 +3994,74 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
     }
 
+    // ── Persist background-session summaries on exit (v4) ─────────
+    // Snapshot every background session (agent / shell / pty) still tracked at
+    // exit and record a summary so a future reload of this chat session can show
+    // what its background tasks were. `from_view` maps any session still in a
+    // live state (Running / NeedsInput) to the terminal `interrupted` sentinel:
+    // its process is about to be killed below and can never be revived — reload
+    // must present it as a non-revivable terminal state, never as "running".
+    // Sessions that already finished during the loop were recorded in the poll
+    // path; recording again here is an idempotent upsert (dedup by id).
+    {
+        use crate::chat::sessions::model::ManagedStatus;
+        let exit_views = chat_sessions.snapshot().await;
+        for view in &exit_views {
+            // Only record sessions still live at exit: terminal sessions already
+            // recorded their (richer) summary text during the poll loop, and
+            // re-recording with an empty summary here would clobber it. A live
+            // session has no captured summary anyway — `from_view` maps it to the
+            // `interrupted` terminal sentinel, the load-bearing fact for reload.
+            if !matches!(view.status, ManagedStatus::Running | ManagedStatus::NeedsInput) {
+                continue;
+            }
+            let persisted = crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new());
+            chat_session.record_background_session(persisted.clone());
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+                "chat.bg_session_recorded_exit",
+            );
+        }
+    }
+
+    // ── Background shell cleanup (v2) ─────────────────────────────
+    // On chat exit, terminate every **still-running** background shell's whole
+    // process group so no child (e.g. a `sleep` forked by `sh -c`) is left
+    // orphaned. We skip already-terminal shells (v2 review fix 1④): their pgid
+    // may have been recycled by the OS, so signalling them could mis-kill an
+    // unrelated process group. `kill()` is async (graceful SIGTERM → SIGKILL) and
+    // idempotent.
+    {
+        let shells = chat_sessions.shell_registry();
+        let to_kill: Vec<_> = shells.lock().clone();
+        for shell in &to_kill {
+            if shell.is_terminal() {
+                continue;
+            }
+            if let Err(e) = shell.kill().await {
+                tracing::warn!(error = %e, "Failed to terminate background shell process group on exit");
+            }
+        }
+    }
+
+    // ── Interactive PTY cleanup (v3a) ─────────────────────────────
+    // Same rationale as the background shell cleanup: terminate every PTY
+    // session's process group on chat exit so no interactive shell (or anything
+    // it backgrounded) is left orphaned. Skip already-exited sessions.
+    #[cfg(feature = "terminal-tui")]
+    {
+        let ptys = chat_sessions.pty_registry();
+        let to_kill: Vec<_> = ptys.lock().clone();
+        for pty in &to_kill {
+            if pty.has_exited() {
+                continue;
+            }
+            if let Err(e) = pty.kill().await {
+                tracing::warn!(error = %e, "Failed to terminate PTY process group on exit");
+            }
+        }
+    }
+
     // Give the reducer-owned turn persistence path a bounded chance to finish
     // before shutdown cancellation drains the dispatcher. This closes the
     // piped-stdin race where a successful response followed immediately by
@@ -3284,6 +4342,7 @@ fn spawn_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     chat_dispatcher: dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
+    handoff: Arc<crate::chat::sessions::pty::HandoffControl>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -3295,11 +4354,458 @@ fn spawn_tui_unified_loop(
             last_ctrlc_ms,
             &chat_dispatcher,
             snapshot_rx,
+            &handoff,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
         }
     });
+}
+
+/// Send a synthetic slash command from the TUI key thread to the async main
+/// loop, reusing the same `input_tx` channel as real user submissions (v1.1b).
+///
+/// Used for switcher Enter (`/attach <seq>`) and Esc-detach (`/detach`) so the
+/// attach/detach logic stays in the single async owner (`attached_follow` lives
+/// in the main loop) rather than being duplicated in the synchronous key thread.
+/// Returns `Err(())` if the receiver has been dropped (chat tearing down).
+#[cfg(feature = "terminal-tui")]
+fn send_synthetic_command(
+    input_tx: &mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    command: &str,
+) -> Result<(), ()> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let msg = crate::channels::traits::ChannelMessage {
+        id: uuid::Uuid::new_v4().to_string(),
+        sender: "user".to_string(),
+        reply_target: "user".to_string(),
+        content: command.to_string(),
+        channel: "terminal".to_string(),
+        timestamp,
+        thread_ts: None,
+        mentioned_uuids: vec![],
+    };
+    input_tx.blocking_send(msg).map_err(|_| ())
+}
+
+/// Optimistically apply an input-routing focus change from the synchronous TUI
+/// key thread, keeping the three authorities that decide "where the next
+/// submittable input goes" consistent at the *same instant* the synthetic
+/// `/attach` / `/detach` is enqueued (v1.1b review P0 — close the attach/detach
+/// TOCTOU race):
+///
+/// 1. **`mirror.focus`** — read by [`tui::dispatch_global_key`]'s `resolve_esc`
+///    in this same key thread, so the very next Esc judgment matches.
+/// 2. **`Action::SessionFocusChanged`** — drives the reducer-owned `UiSnapshot`
+///    the prompt indicator (colour+glyph) is rendered from, so the prompt the
+///    user sees matches before they can type the next character.
+/// 3. The caller then sends the synthetic command on the **same FIFO
+///    `input_tx`** as real submissions, so the actual main-loop routing of any
+///    immediately-following input lands on the same target the prompt shows.
+///
+/// The main loop remains the sole owner of the authoritative `attached_follow`
+/// and rolls this optimistic focus back if the attach ultimately fails.
+#[cfg(feature = "terminal-tui")]
+fn apply_optimistic_focus(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+    focus: crate::chat::sessions::FocusTarget,
+) {
+    mirror.lock().focus = focus;
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged { focus },
+        "chat.optimistic_focus",
+    );
+    // Nudge the renderer so the prompt repaints with the new target without
+    // waiting for the idle poll.
+    let _ = redraw_tx.try_send(());
+}
+
+/// Handle `/pty <command>` (v3a): spawn an interactive PTY shell and hand the
+/// terminal over to it for the duration of an attach.
+///
+/// Flow:
+/// 1. Spawn the PTY session (security-gated, hardened env) at the host
+///    terminal's current size.
+/// 2. Register it so `/sessions` / `/kill` can see / terminate it.
+/// 3. Acquire a [`PtyHandoffGuard`] — this pauses the chat render loop and
+///    blocks until it has parked, so we can take over `stdin`/`stdout` without a
+///    keystroke-stealing race. The guard's `Drop` restores the chat TUI on
+///    **every** exit path.
+/// 4. Run the byte passthrough on blocking threads until detach (`Ctrl-]`) or
+///    child exit.
+/// 5. The guard drops here, restoring the chat TUI (resume render loop + force a
+///    full redraw to wipe PTY residue).
+#[cfg(feature = "terminal-tui")]
+async fn handle_pty_command(
+    command: &str,
+    security: &Arc<crate::security::SecurityPolicy>,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    redraw_handle: Option<&mpsc::Sender<()>>,
+    emit_chat_output: &impl Fn(&str),
+) {
+    use crate::chat::sessions::pty::{PtyHandoffGuard, PtyShellSession};
+    use portable_pty::PtySize;
+
+    // Host terminal size → PTY winsize (fall back to a sane 80x24).
+    let size = crossterm::terminal::size().map_or(
+        PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+        |(cols, rows)| PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    );
+
+    let (session, io) = match PtyShellSession::spawn(command, security, size) {
+        Ok(pair) => pair,
+        Err(e) => {
+            emit_chat_output(&format!("Failed to start interactive PTY session: {e}"));
+            return;
+        }
+    };
+    let seq = chat_sessions.add_pty(session.clone());
+    emit_chat_output(&format!(
+        "Interactive PTY session #{seq}: {command} — Ctrl-] to detach (Ctrl-C/Ctrl-D pass through to the shell)."
+    ));
+
+    // Build a redraw nudge for the guard so the chat TUI repaints the instant we
+    // resume (rather than waiting out the render loop's idle poll).
+    let redraw_nudge: Option<Box<dyn Fn() + Send>> = redraw_handle.cloned().map(|tx| {
+        let f: Box<dyn Fn() + Send> = Box::new(move || {
+            let _ = tx.try_send(());
+        });
+        f
+    });
+
+    // Run the passthrough on a blocking thread. The `PtyHandoffGuard` is acquired
+    // *inside* that thread (pausing the render loop + waiting for its ack) and
+    // dropped when the closure returns — on detach, child exit, error, OR panic —
+    // so the chat TUI is always restored. We move the session in for resize and
+    // post-exit reaping.
+    let handoff = Arc::clone(handoff);
+    let session_for_passthrough = session.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        // Acquire the handoff guard: this pauses the render loop and waits for it
+        // to acknowledge it has parked. If the ack times out we do NOT proceed —
+        // running the passthrough while the render loop might still touch the
+        // terminal would corrupt the screen. `acquire` returns `None` after
+        // having already un-paused the render loop, so we just report the abort.
+        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
+            return Ok(PtyOutcome::AttachAborted);
+        };
+        run_pty_passthrough(io, &session_for_passthrough).map(PtyOutcome::Exited)
+        // `_guard` drops here → terminal modes restored, then render loop resumes
+        //  + full redraw forced.
+    })
+    .await;
+
+    // Best-effort: terminate the child's process group so a detach (Ctrl-]) does
+    // not leave an interactive shell running headless with no way to see it.
+    // (If the child already exited this is a no-op.) Skipped when the attach was
+    // aborted before any handoff — but a harmless no-op even then.
+    if let Err(e) = session.kill().await {
+        tracing::warn!(error = %e, seq, "failed to terminate PTY group after detach");
+    }
+
+    match outcome {
+        Ok(Ok(PtyOutcome::Exited(PtyExit::Detached))) => {
+            emit_chat_output(&format!("Detached from PTY session #{seq}."));
+        }
+        Ok(Ok(PtyOutcome::Exited(PtyExit::ChildExited))) => {
+            emit_chat_output(&format!("Interactive PTY session #{seq} exited."));
+        }
+        Ok(Ok(PtyOutcome::AttachAborted)) => {
+            // The render loop never acked the pause, so we refused the handoff to
+            // avoid two threads fighting over the terminal. The session was
+            // killed above; tell the user why nothing happened.
+            tracing::warn!(seq, "PTY attach aborted: render loop did not park in time");
+            emit_chat_output(&format!(
+                "Could not enter PTY session #{seq}: the chat renderer did not pause in time (terminal unchanged)."
+            ));
+        }
+        Ok(Err(e)) => emit_chat_output(&format!("PTY session #{seq} error: {e}")),
+        Err(e) => {
+            // The passthrough task panicked; the guard's Drop still ran during
+            // unwind, so the terminal is restored. Surface the fault.
+            tracing::error!(error = %e, seq, "PTY passthrough task panicked");
+            emit_chat_output(&format!("PTY session #{seq} ended unexpectedly; terminal restored."));
+        }
+    }
+}
+
+/// The result of an attempted `/pty` attach: either the passthrough ran and
+/// ended ([`PtyExit`]), or the handoff was refused because the render loop never
+/// acknowledged the pause (so the terminal was left untouched).
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyOutcome {
+    /// The passthrough ran and ended this way.
+    Exited(PtyExit),
+    /// The handoff was aborted before takeover (render loop did not park).
+    AttachAborted,
+}
+
+/// How an interactive PTY passthrough ended.
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PtyExit {
+    /// The user pressed `Ctrl-]`.
+    Detached,
+    /// The PTY child process exited on its own.
+    ChildExited,
+}
+
+/// Drive the raw terminal ⇄ PTY byte passthrough until detach or child exit.
+///
+/// Runs on a `spawn_blocking` thread with the chat render loop parked (the
+/// [`PtyHandoffGuard`] owned by the caller guarantees that). It owns the real
+/// terminal's `stdin`/`stdout` for the duration:
+///
+/// - a dedicated **reader thread** copies PTY output → `stdout` (so curses
+///   programs draw normally), signalling `child_done` on EOF (child exit);
+/// - this thread reads raw `stdin` with a short poll timeout, classifies each
+///   byte ([`crate::chat::sessions::pty::classify_input_byte`]) — `Ctrl-]`
+///   detaches, everything else (including `Ctrl-C`/`Ctrl-D`) is forwarded to the
+///   PTY writer — and rechecks `child_done` between polls so a child that exits
+///   while the user is idle still ends the passthrough promptly.
+///
+/// Never panics: all I/O errors are returned as `Err` (the guard still restores
+/// the terminal). The PTY writer is owned solely by this thread (synchronous
+/// `Write`, no lock, never across an `.await`).
+#[cfg(feature = "terminal-tui")]
+fn run_pty_passthrough(
+    io: crate::chat::sessions::pty::PtyIo,
+    session: &crate::chat::sessions::pty::PtyShellSession,
+) -> Result<PtyExit> {
+    use crate::chat::sessions::pty::{InputByte, ReaderOutcome, ReaderStop, classify_input_byte, read_pty_to_stdout};
+    use std::io::Write as _;
+
+    #[cfg(unix)]
+    let crate::chat::sessions::pty::PtyIo {
+        mut reader,
+        writer,
+        master_fd,
+    } = io;
+    #[cfg(not(unix))]
+    let crate::chat::sessions::pty::PtyIo { mut reader, writer } = io;
+
+    // Clear the screen + home the cursor so the PTY child starts on a clean
+    // surface (the chat inline chrome was drawn at the bottom before the
+    // handoff). Best-effort: a failure here is non-fatal (the child will repaint
+    // its own UI), and the guard's post-handoff full redraw cleans up either way.
+    {
+        let mut out = std::io::stdout();
+        let _ = out.write_all(b"\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
+
+    // ── Reader thread: PTY output → stdout (interruptible) ────────────────────
+    //
+    // The reader does NOT wait for EOF: a backgrounded grandchild (e.g.
+    // `sleep 300 &`, reparented to init so `killpg` cannot reach it) can hold the
+    // slave PTY open forever. Instead the reader `poll`s the master fd with a
+    // 100 ms timeout and checks `reader_stop` each cycle, so on detach we set the
+    // stop flag and the `join` below is always bounded — the chat can never
+    // freeze waiting on an orphan.
+    let reader_stop = Arc::new(ReaderStop::new());
+    // `child_done` records that the reader observed EOF (true child exit), so the
+    // stdin loop can end the passthrough promptly when the child exits while the
+    // user is idle.
+    let child_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let reader_stop_thread = Arc::clone(&reader_stop);
+    let child_done_thread = Arc::clone(&child_done);
+    let reader_handle = std::thread::spawn(move || {
+        let mut out = std::io::stdout();
+        let outcome = read_pty_to_stdout(
+            reader.as_mut(),
+            &mut out,
+            &reader_stop_thread,
+            #[cfg(unix)]
+            master_fd,
+            std::time::Duration::from_millis(100),
+        );
+        // Only EOF means the child genuinely exited; a Stopped/StdoutGone outcome
+        // is a teardown signal, not a child-exit signal.
+        if outcome == ReaderOutcome::Eof {
+            child_done_thread.store(true, Ordering::Release);
+        }
+    });
+
+    // RAII cleanup: runs on EVERY exit path of the stdin loop — `Ok`, `?`
+    // early-return, or panic unwind — so the reader thread is always stopped and
+    // joined (bounded) and the child group is killed before the `PtyHandoffGuard`
+    // resumes the chat render loop. Without this, an error in the stdin/writer
+    // loop would skip cleanup and the reader could keep scribbling on `stdout`
+    // over the restored TUI (Codex P0-B).
+    struct PassthroughCleanup<'a> {
+        session: &'a crate::chat::sessions::pty::PtyShellSession,
+        reader_stop: Arc<ReaderStop>,
+        reader_handle: Option<std::thread::JoinHandle<()>>,
+        writer: Option<Box<dyn std::io::Write + Send>>,
+    }
+    impl Drop for PassthroughCleanup<'_> {
+        fn drop(&mut self) {
+            // Terminate the child's group synchronously (no async grace) so the
+            // master closes and an orphan can't keep us alive. Idempotent / a
+            // no-op if the child already exited.
+            self.session.kill_now();
+            // Ask the reader thread to stop at its next poll cycle (it does NOT
+            // wait for EOF, so this is what guarantees a bounded join).
+            self.reader_stop.stop();
+            // Drop our writer so the slave end observes EOF too.
+            self.writer.take();
+            // Bounded join: the reader exits within one poll cycle (~100 ms) of
+            // the stop flag, so by the time the guard resumes the render loop no
+            // other thread is writing to `stdout`.
+            if let Some(handle) = self.reader_handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    // Move the writer into the cleanup guard so it is owned in exactly one place
+    // and dropped during cleanup. We forward bytes to it through the guard.
+    let mut cleanup = PassthroughCleanup {
+        session,
+        reader_stop: Arc::clone(&reader_stop),
+        reader_handle: Some(reader_handle),
+        writer: Some(writer),
+    };
+
+    // ── This thread: stdin → PTY writer, watching for detach + child exit ─────
+    // The result is captured (not `?`-propagated directly) so `cleanup`'s Drop
+    // runs on success AND error before we return. (Drop also runs on panic.)
+    //
+    // v5: forward host terminal resizes to the PTY. The chat render loop is
+    // parked during the handoff, so crossterm `Resize` events go unconsumed;
+    // instead we poll the host size each loop tick (≤100 ms) and push a `resize`
+    // to the PTY master whenever it changes, so full-screen curses programs
+    // (vim, htop, …) re-flow. `resize` is cheap, synchronous and non-panicking
+    // (errors are logged, never fatal — a failed resize just leaves the old
+    // geometry). We seed `last_size` from the spawn-time geometry so the first
+    // real change is detected.
+    let mut last_size: Option<(u16, u16)> = crossterm::terminal::size().ok();
+    let on_tick = || {
+        if let Ok((cols, rows)) = crossterm::terminal::size() {
+            if last_size != Some((cols, rows)) {
+                last_size = Some((cols, rows));
+                if let Err(e) = session.resize(portable_pty::PtySize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                }) {
+                    tracing::warn!(error = %e, cols, rows, "PTY resize forward failed");
+                }
+            }
+        }
+    };
+    let result = pty_stdin_loop(&child_done, on_tick, |byte| {
+        match classify_input_byte(byte) {
+            InputByte::Detach => Ok(true), // stop the loop (detach)
+            InputByte::Forward => {
+                let w = cleanup
+                    .writer
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("PTY writer already closed"))?;
+                w.write_all(&[byte]).and_then(|()| w.flush())?;
+                Ok(false)
+            }
+        }
+    });
+
+    // `cleanup` drops at end of scope (kill_now + stop reader + drop writer +
+    // bounded join) regardless of whether `result` is Ok or Err.
+    drop(cleanup);
+    result
+}
+
+/// Read raw `stdin` byte-by-byte, invoking `on_byte` for each, until `on_byte`
+/// returns `Ok(true)` (detach) or `child_done` is observed (child exit).
+///
+/// Uses `libc::poll` on fd 0 with a 100 ms timeout so a child that exits while
+/// the user is idle ends the passthrough promptly (a blocking `read` alone would
+/// hang until the next keystroke). On non-Unix targets, where this `poll` is
+/// unavailable, it falls back to a plain blocking read (the child-exit-while-idle
+/// case is handled when the reader thread closes `stdin`'s peer; documented
+/// platform limitation, plan §v3 risk 3).
+///
+/// `on_byte` returns `Ok(true)` to stop (detach), `Ok(false)` to continue, or an
+/// `Err` to abort the passthrough (surfaced to the caller; the guard still
+/// restores the terminal).
+#[cfg(feature = "terminal-tui")]
+#[allow(unsafe_code)]
+fn pty_stdin_loop(
+    child_done: &Arc<std::sync::atomic::AtomicBool>,
+    mut on_tick: impl FnMut(),
+    mut on_byte: impl FnMut(u8) -> Result<bool>,
+) -> Result<PtyExit> {
+    use std::io::Read as _;
+
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 1024];
+
+    loop {
+        if child_done.load(Ordering::Acquire) {
+            return Ok(PtyExit::ChildExited);
+        }
+
+        // Per-iteration housekeeping that must run even while the user is idle
+        // (the poll below wakes at least every 100 ms). Used to forward host
+        // terminal resizes to the PTY so curses programs re-flow. The render
+        // loop is parked during the handoff, so crossterm `Resize` events are
+        // not being consumed elsewhere — polling the size here is the
+        // self-contained way to track it.
+        on_tick();
+
+        // Wait (bounded) for stdin to be readable so we can re-check child exit.
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd as _;
+            let mut pfd = libc::pollfd {
+                fd: stdin.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: `poll` reads/writes exactly the one `pollfd` we pass
+            // (`nfds = 1`); the pointer is to a live local, valid for the call.
+            // It dereferences nothing else and has no memory-safety
+            // preconditions. A 100 ms timeout bounds the wait.
+            let rc = unsafe { libc::poll(&raw mut pfd, 1, 100) };
+            if rc <= 0 {
+                // Timeout (0) or EINTR (<0): loop to re-check `child_done`.
+                continue;
+            }
+            if pfd.revents & (libc::POLLHUP | libc::POLLERR) != 0 && pfd.revents & libc::POLLIN == 0 {
+                // stdin hung up with no data: treat as child-exit-equivalent.
+                return Ok(PtyExit::ChildExited);
+            }
+        }
+
+        let n = match stdin.read(&mut buf) {
+            Ok(0) => return Ok(PtyExit::ChildExited), // stdin EOF
+            Ok(n) => n,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::anyhow!("PTY stdin read failed: {e}")),
+        };
+        for &byte in buf.get(..n).unwrap_or(&buf) {
+            if on_byte(byte)? {
+                return Ok(PtyExit::Detached);
+            }
+        }
+    }
 }
 
 /// Inner body of [`spawn_tui_unified_loop`].
@@ -3323,6 +4829,7 @@ fn run_tui_unified_loop(
     last_ctrlc_ms: Arc<AtomicU64>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
+    handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
@@ -3385,6 +4892,51 @@ fn run_tui_unified_loop(
                 frame.render_widget(ratatui::widgets::Clear, area);
             });
             return Ok(());
+        }
+
+        // ── 0. PTY terminal handoff (v3a) ─────────────────────────────
+        // While an interactive PTY session is attached, the chat owns NONE
+        // of the terminal: the main loop has handed raw stdin/stdout to the
+        // PTY passthrough. We must not touch `crossterm` (poll/read) or
+        // `terminal.draw`/`insert_before` here, or we would corrupt the
+        // PTY's full-screen output and steal its keystrokes. We park,
+        // acknowledge the park (so the handoff can deterministically know
+        // we are out of the way before it takes stdin), and re-check shortly.
+        if handoff.is_paused() {
+            handoff.ack_paused();
+            std::thread::sleep(Duration::from_millis(10));
+            continue;
+        }
+        // Just resumed from a handoff: the PTY scribbled over the whole
+        // screen, so force a full clear + repaint to wipe its residue before
+        // resuming normal inline rendering.
+        //
+        // P2-B (render stability across repeated PTY enter/exit): order matters
+        // here. We must (a) clear the screen, (b) re-push the FULL conversation
+        // history via `insert_before` (sections 1), and only THEN (c) draw the
+        // bottom chrome once (section 2) so the status bar + input box land at
+        // the bottom and are not scrolled away by a later `insert_before`. The
+        // previous code drew the chrome *before* re-pushing history, so each
+        // `insert_before` shoved that freshly-drawn chrome up; after a few
+        // enter/exit cycles the title/input bar drifted out of the viewport.
+        //
+        // So here we ONLY clear + reset the push cursor, and we clear
+        // `skip_next_draw` so section 2 is guaranteed to repaint the chrome this
+        // iteration after history has been flushed. No chrome draw happens in
+        // this block.
+        if handoff.take_force_redraw() {
+            if let Err(e) = terminal.clear() {
+                tracing::warn!(error = %e, "post-PTY terminal clear failed");
+            }
+            // Everything in scrollback was wiped by the PTY; re-push from the
+            // start so the conversation history is visible again. Section 1
+            // (below) does the actual `insert_before`, then section 2 draws the
+            // chrome at the bottom — this fixed ordering keeps the chrome stable
+            // across repeated enter/exit.
+            last_pushed_idx = 0;
+            // Guarantee the chrome is (re)drawn this iteration even if no redraw
+            // wakeup is pending, so the bottom bar is never left blank.
+            skip_next_draw = false;
         }
 
         // ── 1. Flush newly-finalised conversation lines to scrollback ──
@@ -3588,6 +5140,72 @@ fn run_tui_unified_loop(
                             crate::chat::action::Action::CancelRequested,
                             "chat.cancel_tui_single_ctrlc",
                         );
+                    }
+                    tui::KeyDispatch::SwitcherOpened { entries } => {
+                        // v1.1b: mirror the just-opened switcher into the render
+                        // snapshot (the mirror was already mutated in place).
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherOpened { entries },
+                            "chat.switcher_opened",
+                        );
+                    }
+                    tui::KeyDispatch::SwitcherMoved { selected } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherMoved { selected },
+                            "chat.switcher_moved",
+                        );
+                    }
+                    tui::KeyDispatch::SwitcherClosed => {
+                        let _ = chat_dispatcher
+                            .dispatch_or_log(crate::chat::action::Action::SwitcherClosed, "chat.switcher_closed");
+                    }
+                    tui::KeyDispatch::AttachSession { seq } => {
+                        // Close the switcher in the snapshot, then route a
+                        // synthetic `/attach <seq>` through the same input channel
+                        // user submissions use, so the async main loop performs
+                        // the attach via its existing handler (single owner of
+                        // `attached_follow`; no async work in the key thread).
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherClosed,
+                            "chat.switcher_closed_attach",
+                        );
+                        // P0 race fix: optimistically point the prompt + Esc
+                        // judgment at the new target *before* enqueuing the
+                        // synthetic command, so any input the user types
+                        // immediately afterwards is perceived to go where FIFO
+                        // ordering will actually route it. The main loop rolls
+                        // this back if the attach fails.
+                        apply_optimistic_focus(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            crate::chat::sessions::focus::optimistic_focus(
+                                crate::chat::sessions::focus::RoutingIntent::Attach { seq },
+                            ),
+                        );
+                        if send_synthetic_command(&input_tx, &format!("/attach {seq}")).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    tui::KeyDispatch::RequestDetach => {
+                        // Esc on empty input while a session is focused → route a
+                        // synthetic `/detach` so the main loop clears
+                        // `attached_follow` + focus via its existing handler.
+                        // P0 race fix: optimistically reset routing to main first
+                        // so the prompt + next-input perception match the FIFO
+                        // detach that is about to be processed. Detach never
+                        // fails (it is a local clear), so no rollback is needed.
+                        apply_optimistic_focus(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            crate::chat::sessions::focus::optimistic_focus(
+                                crate::chat::sessions::focus::RoutingIntent::Detach,
+                            ),
+                        );
+                        if send_synthetic_command(&input_tx, "/detach").is_err() {
+                            return Ok(());
+                        }
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }
@@ -4202,9 +5820,12 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     println!("Saved sessions:\n");
     for s in &sessions {
         let title = if s.title.is_empty() { "(untitled)" } else { &s.title };
+        // B2 (v4 review): print the FULL session id. The previous 8-char
+        // truncation could not be passed back to `--session`, which requires
+        // the complete UUID — copy/pasting a listed id now resumes correctly.
         println!(
             "  {} | {} | {} turns | {}",
-            &s.id[..8.min(s.id.len())],
+            s.id,
             title,
             s.turn_count(),
             s.updated_at.format("%Y-%m-%d %H:%M")
@@ -5105,5 +6726,72 @@ mod wave8_routing_failure_trace_tests {
         );
         assert_eq!(outcome.final_provider, "test-provider");
         assert_eq!(outcome.final_model, "test-model");
+    }
+}
+
+#[cfg(test)]
+mod v4_reload_recap_tests {
+    use super::format_reloaded_background_sessions;
+    use crate::chat::sessions::PersistedSessionSummary;
+
+    fn summary(id: &str, status: &str, title: &str, body: &str) -> PersistedSessionSummary {
+        PersistedSessionSummary {
+            id: id.to_string(),
+            seq: 2,
+            kind: "agent".to_string(),
+            origin: "user".to_string(),
+            status: status.to_string(),
+            title: title.to_string(),
+            summary: body.to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn recap_has_not_resumed_header_and_one_line_per_session() {
+        let sessions = vec![
+            summary("a", "completed", "build report", "report ready"),
+            summary("b", "interrupted", "long crawl", ""),
+        ];
+        let out = format_reloaded_background_sessions(&sessions);
+        assert!(out.contains("not resumed"), "header must signal nothing was revived");
+        assert!(out.contains("completed"));
+        assert!(out.contains("build report"));
+        assert!(out.contains("report ready"));
+        // Interrupted (was-running) session shows as terminal, not running.
+        assert!(out.contains("interrupted"));
+        assert!(!out.contains("running"));
+        // One header line + two session lines.
+        assert_eq!(out.lines().count(), 3);
+    }
+
+    #[test]
+    fn recap_omits_empty_summary_body() {
+        let sessions = vec![summary("a", "cancelled", "task", "")];
+        let out = format_reloaded_background_sessions(&sessions);
+        // No trailing ": " when there is no summary body.
+        assert!(out.contains("cancelled — task"));
+        assert!(!out.contains("task: "));
+    }
+
+    #[test]
+    fn recap_tags_model_origin_and_leaves_user_untagged() {
+        // Bug-V5-2: the persisted origin must be visible on reload so the
+        // operator can tell which sessions the model started for itself.
+        let mut user = summary("a", "completed", "user task", "done");
+        user.origin = "user".to_string();
+        user.seq = 1;
+        let mut model = summary("b", "completed", "model task", "done");
+        model.origin = "model".to_string();
+        model.seq = 2;
+        let out = format_reloaded_background_sessions(&[user, model]);
+        assert!(
+            out.contains("#1 completed — user task"),
+            "user line stays untagged: {out}"
+        );
+        assert!(
+            out.contains("#2 [model] completed — model task"),
+            "model line is tagged: {out}"
+        );
     }
 }

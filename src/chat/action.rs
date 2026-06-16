@@ -103,6 +103,17 @@ pub enum Action {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        /// D8-4 (redux path): the turn-root spawn execution context seeded by
+        /// `chat::run` for this turn. Threaded through the reducer into
+        /// `Effect::StartTurn` so the Redux driver can `SPAWN_EXECUTION_CONTEXT
+        /// .scope(...)` its tool-call loop. Without this, sub-agents spawned via
+        /// `sessions_spawn` on the redux path see `parent_run_id = None` and are
+        /// mislabeled as user-originated instead of model-originated.
+        ///
+        /// `None` means "no turn-root context" (e.g. tests, or callers that do
+        /// not originate a chat turn) — sub-agents then fall back to user origin,
+        /// which is correct for non-turn paths such as the `/bg` slash command.
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     },
     /// 收到一个 streaming 增量块
     StreamChunkReceived {
@@ -209,6 +220,32 @@ pub enum Action {
     /// 到 ui.conversation_lines。legacy 模式由 chat_mirror.push_user_message 承担，
     /// Pure 模式守卫跳过 mirror 写后用此 Action 让 reducer 单源接管 echo。
     UserMessageEchoed(String),
+    /// 后台会话常驻状态行更新（v1b）。`summary` 为空表示无后台会话（隐藏该行）。
+    /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
+    /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
+    SessionsStatusUpdated { summary: String },
+    /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
+    /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
+    /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
+    /// `session.background_sessions`，随下次 `SaveSession` 落盘，reload 后展示。
+    /// **只记录摘要，绝不重建进程/sub-agent/PTY**。
+    BackgroundSessionRecorded {
+        summary: crate::chat::sessions::PersistedSessionSummary,
+    },
+    /// 输入路由目标变更（v1.1b）。由 chat 主循环在 `/attach` / `/detach` 时
+    /// dispatch（它独占权威 `attached_follow`），reducer 写入 `ui.focus`，经快照
+    /// 驱动提示符的颜色+字形目标指示。`None` 等价 `FocusTarget::Main`。
+    SessionFocusChanged { focus: crate::chat::sessions::FocusTarget },
+    /// Ctrl+G 打开 session switcher 弹层（v1.1b）。`entries` 为打开时的会话快照
+    /// （来自 1s 轮询缓存）。reducer 写入 `ui.switcher = Some(..)`。
+    SwitcherOpened {
+        entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    },
+    /// switcher 选中行移动（v1.1b）。`selected` 为新的高亮索引（已被 key 线程
+    /// 钳制到有效范围）。reducer 更新 `ui.switcher` 的 selected。
+    SwitcherMoved { selected: usize },
+    /// 关闭 switcher 弹层（v1.1b）。reducer 写入 `ui.switcher = None`。
+    SwitcherClosed,
 
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
@@ -263,6 +300,12 @@ impl Action {
             Self::RedrawRequested => "RedrawRequested",
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
+            Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
+            Self::BackgroundSessionRecorded { .. } => "BackgroundSessionRecorded",
+            Self::SessionFocusChanged { .. } => "SessionFocusChanged",
+            Self::SwitcherOpened { .. } => "SwitcherOpened",
+            Self::SwitcherMoved { .. } => "SwitcherMoved",
+            Self::SwitcherClosed => "SwitcherClosed",
             Self::CancelRequested => "CancelRequested",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",

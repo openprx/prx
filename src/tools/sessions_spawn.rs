@@ -9,7 +9,9 @@
 //! - `steer` action: inject a message into a running sub-agent's context
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{
+    DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig, run_tool_call_loop,
+};
 use crate::channels::build_identity_prompt;
 use crate::channels::traits::{Channel, SendMessage};
 use crate::config::{AgentCompactionConfig, DelegateAgentConfig, MultimodalConfig, SessionsSpawnConfig};
@@ -32,7 +34,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 /// Default timeout for sub-agent runs (10 minutes).
-const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 0;
+///
+/// A value of `0` means "no timeout" (run until natural completion), matching
+/// the session-worker semantics in `session_worker/runner.rs`.
+const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 600;
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
@@ -303,10 +308,22 @@ pub struct SessionsSpawnTool {
     /// Shared memory backend for normalized spawn lifecycle events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
+    /// Optional event bridge sink. When set (chat `/bg` path), a task-mode
+    /// sub-agent streams its incremental output + tool calls through a
+    /// per-session drainer (provisioned by the chat side) into the chat UI's
+    /// ring buffers (v1.1a). When `None` (channels/gateway path), spawns stay
+    /// silent — zero behaviour change for those callers.
+    event_sink: Option<SpawnEventSink>,
 }
 
 impl SessionsSpawnTool {
     /// Create a new `SessionsSpawnTool` with the given channel and provider.
+    ///
+    /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
+    /// `active_runs` registry owned solely by this tool. Behaviour is identical to
+    /// the previous inline construction (channels/gateway call sites are
+    /// unaffected).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         channel: Arc<dyn Channel>,
         provider: Arc<dyn Provider>,
@@ -322,6 +339,49 @@ impl SessionsSpawnTool {
         provider_runtime_options: providers::ProviderRuntimeOptions,
         spawn_config: SessionsSpawnConfig,
     ) -> Self {
+        Self::new_with_registry(
+            channel,
+            provider,
+            provider_name,
+            model,
+            temperature,
+            security,
+            workspace_dir,
+            multimodal_config,
+            compaction_config,
+            agents,
+            fallback_api_key,
+            provider_runtime_options,
+            spawn_config,
+            Arc::new(RwLock::new(Vec::new())),
+        )
+    }
+
+    /// Create a new `SessionsSpawnTool` backed by a caller-provided `active_runs`
+    /// registry.
+    ///
+    /// Identical to [`Self::new`] except the `active_runs` registry is injected
+    /// rather than freshly minted, letting a single owner (e.g. chat) build one
+    /// `Arc<RwLock<Vec<SubAgentRun>>>` and share it across `sessions_spawn`,
+    /// `sessions_list`, `sessions_send`, `session_status`, and a side-channel
+    /// handle — the single-source-of-truth registry for the chat session runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_registry(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn Provider>,
+        provider_name: impl Into<String>,
+        model: impl Into<String>,
+        temperature: f64,
+        security: Arc<SecurityPolicy>,
+        workspace_dir: PathBuf,
+        multimodal_config: MultimodalConfig,
+        compaction_config: AgentCompactionConfig,
+        agents: HashMap<String, DelegateAgentConfig>,
+        fallback_api_key: Option<String>,
+        provider_runtime_options: providers::ProviderRuntimeOptions,
+        spawn_config: SessionsSpawnConfig,
+        active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
+    ) -> Self {
         Self {
             channel,
             provider,
@@ -330,7 +390,7 @@ impl SessionsSpawnTool {
             temperature,
             security,
             default_recipient: Arc::new(RwLock::new(None)),
-            active_runs: Arc::new(RwLock::new(Vec::new())),
+            active_runs,
             tools: Arc::new(OnceLock::new()),
             workspace_dir,
             multimodal_config,
@@ -341,7 +401,20 @@ impl SessionsSpawnTool {
             spawn_config,
             memory: None,
             event_recording: MemoryEventRecording::default(),
+            event_sink: None,
         }
+    }
+
+    /// Attach a [`SpawnEventSink`] so task-mode sub-agents spawned by this tool
+    /// stream their incremental output and tool-call notifications to the chat UI
+    /// (live read-only attach, v1.1a).
+    ///
+    /// Only the chat `/bg` path sets this; channels/gateway leave it `None` and
+    /// keep spawning silently (zero behaviour change for those callers).
+    #[must_use]
+    pub fn with_event_sink(mut self, sink: SpawnEventSink) -> Self {
+        self.event_sink = Some(sink);
+        self
     }
 
     /// Return a shareable handle to the default-recipient slot so callers can
@@ -1172,6 +1245,12 @@ impl Tool for SessionsSpawnTool {
         };
         let active_runs = self.active_runs.clone();
         let rid = run_id.clone();
+        // Event bridge (v1.1a): if a chat-side sink is attached, create this
+        // session's middle channels + drainer up front (run_id is already
+        // minted, so the drainer is tagged with the correct id — no race). The
+        // background agent only ever `.send().await`s onto these; the drainer
+        // continuously empties them, so the agent never back-pressures.
+        let run_event_streams = self.event_sink.as_ref().map(|sink| sink.streams_for(&run_id));
         let task_owned = task.to_string();
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
@@ -1228,28 +1307,40 @@ impl Tool for SessionsSpawnTool {
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(timeout_secs),
-                run_sub_agent_task(
-                    &task_owned,
-                    provider,
-                    &provider_name,
-                    &model,
-                    temperature,
-                    filtered_tools,
-                    &system_prompt,
-                    &workspace_dir,
-                    security,
-                    &multimodal_config,
-                    &compaction_config,
-                    max_iterations,
-                    steer_rx,
-                    history_arc,
-                    task_scope,
-                    task_memory,
-                ),
-            )
-            .await;
+            let (run_on_delta, run_on_tool) = match run_event_streams {
+                Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
+                None => (None, None),
+            };
+            let run_future = run_sub_agent_task(
+                &task_owned,
+                provider,
+                &provider_name,
+                &model,
+                temperature,
+                filtered_tools,
+                &system_prompt,
+                &workspace_dir,
+                security,
+                &multimodal_config,
+                &compaction_config,
+                max_iterations,
+                steer_rx,
+                history_arc,
+                task_scope,
+                task_memory,
+                run_on_delta,
+                run_on_tool,
+            );
+            // `timeout_secs == 0` means "no timeout" — run until natural
+            // completion. This matches the session-worker semantics in
+            // `session_worker/runner.rs`. A non-zero value wraps the run in a
+            // `tokio::time::timeout`. `Ok(_)` => ran to completion (no timeout
+            // or finished in time), `Err(_)` => elapsed.
+            let result = if timeout_secs == 0 {
+                Ok(run_future.await)
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
+            };
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
             let (status, result_text) = match result {
@@ -1966,12 +2057,22 @@ async fn run_sub_agent_task(
     history_out: Arc<RwLock<Vec<HistoryEntry>>>,
     scope: Option<SpawnScope>,
     memory: Option<Arc<dyn Memory>>,
+    on_delta: Option<tokio::sync::mpsc::Sender<String>>,
+    on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
         let response = provider
             .chat_with_system(Some(system_prompt), task, model, temperature)
             .await?;
+        // No incremental loop output exists on this path (single completion);
+        // surface the final response as one delta so an attached follower sees
+        // it (best-effort; dropped on a full/closed channel).
+        if let Some(ref tx) = on_delta
+            && !response.trim().is_empty()
+        {
+            let _ = tx.try_send(response.clone());
+        }
         let history = vec![
             HistoryEntry {
                 role: "user".into(),
@@ -2013,6 +2114,18 @@ async fn run_sub_agent_task(
         let security = security.clone();
         let scope_owned = scope.clone();
         let memory_owned = memory.clone();
+        // Clone the event-bridge senders per iteration so they survive across
+        // steer-driven loop restarts (the inner spawn consumes its clones; the
+        // originals stay owned by this outer loop). When `None`, the loop runs
+        // silently exactly as before (channels/gateway behaviour unchanged).
+        //
+        // NOTE: the agent stays `silent = true` regardless. `silent` only gates
+        // the loop's *direct* `print!` to stdout (loop_.rs); a background
+        // sub-agent must never print to the chat's terminal (it would corrupt
+        // the TUI). The `on_delta` / `on_tool_call` channel sends are NOT gated
+        // by `silent`, so the event bridge streams to the drainer either way.
+        let on_delta_iter = on_delta.clone();
+        let on_tool_call_iter = on_tool_call.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
@@ -2038,7 +2151,7 @@ async fn run_sub_agent_task(
                 &provider_name_owned,
                 &model_name,
                 temperature_value,
-                true, // silent — no streaming output
+                true, // silent — never print to the chat terminal (see note above)
                 None, // no approval manager
                 "sessions_spawn",
                 &multimodal_config_owned,
@@ -2058,10 +2171,10 @@ async fn run_sub_agent_task(
                 },
                 Some(&compaction_config_owned),
                 Some(cancel_token_owned),
-                None, // no streaming sender
+                on_delta_iter, // chat event bridge: incremental loop output (v1.1a)
                 scope_ctx.as_ref(),
-                None,
-                None, // spawned sessions do not use tool tiering
+                on_tool_call_iter, // chat event bridge: tool-call notifications (v1.1a)
+                None,              // spawned sessions do not use tool tiering
                 scope_ctx.as_ref().and_then(|ctx| {
                     memory_owned
                         .as_ref()
@@ -2325,7 +2438,17 @@ async fn run_sub_agent_process(
         stdin.flush().await?;
     }
 
-    let parent_timeout = std::time::Duration::from_secs(timeout_secs.max(1));
+    // `timeout_secs == 0` means "no timeout" — the child (see
+    // `session_worker/runner.rs`) runs until natural completion, so the parent
+    // must not kill it prematurely. We use a far-future cap (30 days) as an
+    // effectively-unbounded parent timeout, which keeps the existing
+    // `tokio::time::timeout` wrapping intact while avoiding timer overflow.
+    const NO_TIMEOUT_PARENT_CAP_SECS: u64 = 30 * 24 * 60 * 60;
+    let parent_timeout = if timeout_secs == 0 {
+        std::time::Duration::from_secs(NO_TIMEOUT_PARENT_CAP_SECS)
+    } else {
+        std::time::Duration::from_secs(timeout_secs)
+    };
     let stdout_stream = child
         .stdout
         .take()
@@ -2640,6 +2763,38 @@ mod tests {
         assert!(!tool.description().is_empty());
         assert!(tool.description().contains("history"));
         assert!(tool.description().contains("steer"));
+    }
+
+    #[test]
+    fn default_sub_agent_timeout_is_ten_minutes() {
+        // Regression: the constant was 0 (instant timeout in task mode) while
+        // its doc claimed "10 minutes". It must now be 600s.
+        assert_eq!(DEFAULT_SUB_AGENT_TIMEOUT_SECS, 600);
+    }
+
+    #[tokio::test]
+    async fn task_mode_zero_timeout_does_not_elapse_immediately() {
+        // Mirrors the task-mode timeout-wrapping logic at the spawn site:
+        // `timeout_secs == 0` must run the future to completion (no timeout),
+        // rather than wrapping it in `tokio::time::timeout(ZERO, ..)` which
+        // would elapse on the first poll. Use a future with a real (small)
+        // delay so a ZERO-duration timeout would observably fail.
+        async fn wrap_like_task_mode(timeout_secs: u64) -> Result<&'static str, tokio::time::error::Elapsed> {
+            let run_future = async {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                "done"
+            };
+            if timeout_secs == 0 {
+                Ok(run_future.await)
+            } else {
+                tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), run_future).await
+            }
+        }
+
+        // 0 => no timeout => runs to completion.
+        assert_eq!(wrap_like_task_mode(0).await, Ok("done"));
+        // Non-zero generous timeout also completes.
+        assert_eq!(wrap_like_task_mode(60).await, Ok("done"));
     }
 
     #[test]
@@ -3120,6 +3275,64 @@ mod tests {
         let runs = tool.active_runs_snapshot().await;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].task, "Some task");
+    }
+
+    /// Bug-V5-1 regression: a `sessions_spawn` call made *inside* a turn-root
+    /// `SPAWN_EXECUTION_CONTEXT` scope (i.e. the model invoking the tool mid-turn)
+    /// must capture the per-turn run id as the child's `parent_run_id`. The
+    /// capture is synchronous — read at the top of `execute`, **before** any
+    /// `tokio::spawn` — so the task-local is always present when read and never
+    /// lost across the spawn boundary. The chat `/sessions` projection reads this
+    /// `Some(parent)` as model-origin (see `SessionOrigin::from_parent_run_id`,
+    /// asserted in the chat-side `model.rs` tests, which can reach that module).
+    #[tokio::test]
+    async fn model_spawn_within_turn_scope_captures_parent_run_id() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        let result = SPAWN_EXECUTION_CONTEXT
+            .scope(
+                SpawnExecutionContext::seed_turn_context("turn-run-xyz".to_string(), "chat:session-1".to_string()),
+                async { tool.execute(with_spawn_grant(json!({"task": "model child"}))).await },
+            )
+            .await
+            .unwrap();
+        assert!(result.success, "spawn inside a turn scope must succeed");
+
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(
+            child.parent_run_id.as_deref(),
+            Some("turn-run-xyz"),
+            "child captured the per-turn run id as parent before the spawn boundary (=> model origin)"
+        );
+    }
+
+    /// Bug-V5-1 complement: a `sessions_spawn` call made with **no**
+    /// `SPAWN_EXECUTION_CONTEXT` in scope (the operator `/bg` slash-command path,
+    /// dispatched outside the turn tool-loop scope) carries no `parent_run_id`,
+    /// which the chat projection reads as user-origin.
+    #[tokio::test]
+    async fn user_spawn_without_scope_has_no_parent_run_id() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        tool.set_default_recipient(Some("test-recipient".to_string())).await;
+
+        // No `.scope(...)` wrapper: the task-local is absent, exactly as on the
+        // operator slash-command path.
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "operator child"})))
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let runs = tool.active_runs_snapshot().await;
+        let child = runs.first().expect("the spawned child run must be registered");
+        assert_eq!(
+            child.parent_run_id, None,
+            "no spawn-execution context means no parent_run_id (=> user origin)"
+        );
     }
 
     #[tokio::test]

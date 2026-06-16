@@ -86,6 +86,14 @@ pub enum Effect {
         /// tools when in [`ChatMode::Plan`] and feed back a simulated
         /// "[plan mode] would call X" result instead of executing them.
         chat_mode: ChatMode,
+        /// D8-4 (redux path): the turn-root spawn execution context for this
+        /// turn (forwarded from `Action::StartLLMTurn`). The `EffectExecutor`
+        /// wraps `drive_start_turn_stream` in `SPAWN_EXECUTION_CONTEXT.scope(..)`
+        /// with this value so `sessions_spawn` tool calls inside the turn inherit
+        /// `parent_run_id = turn run_id` → origin = Model, mirroring the legacy
+        /// `run_tool_call_loop_traced` wrapper in `chat::run`. `None` → no scope
+        /// (sub-agents fall back to user origin, correct for non-turn callers).
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -187,6 +195,11 @@ pub struct SessionState {
     pub history: Vec<ChatMessage>,
     /// 会话创建时间（首次 RecordUserTurn 时延迟初始化；build_session_snapshot 不再覆盖）
     pub created_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// 本会话内运行过的后台 session（agent/shell/pty）摘要（v4）。仅持久化摘要，
+    /// reload 时还原用于展示——绝不重建进程/sub-agent/PTY。由主循环经
+    /// `Action::BackgroundSessionRecorded` 写入（去重 by id），随
+    /// `build_session_snapshot` 落盘，`reduce_session_loaded` 还原。
+    pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
 }
 
 /// TUI UI 临时状态（退出即弃，不持久化）.
@@ -210,6 +223,18 @@ pub struct UiState {
     /// 最近一次输入提交（reducer 内 KeyPressed::Enter 时由 reduce 自身派生
     /// `Action::InputSubmitted`；该字段用于测试断言双写期最后一次提交内容）
     pub last_submitted: Option<String>,
+    /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
+    /// 仅由 chat 主循环经 `Action::SessionsStatusUpdated` 写入；后台 spawn 任务
+    /// 绝不触碰（铁律：state 只在主循环写）。
+    pub sessions_status: String,
+    /// 当前输入路由目标（v1.1b）。`Main` = 主 chat；`Session{seq}` = 已 attach
+    /// 的后台 session（输入作为 steer）。由 chat 主循环经
+    /// `Action::SessionFocusChanged` 在 /attach//detach 时写入；驱动提示符的
+    /// 颜色+字形目标指示。
+    pub focus: crate::chat::sessions::FocusTarget,
+    /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
+    /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
+    pub switcher: Option<crate::chat::sessions::SwitcherState>,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -246,6 +271,12 @@ pub struct UiSnapshot {
     pub streaming: Option<StreamingDraft>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
+    /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
+    pub sessions_status: Arc<str>,
+    /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
+    pub focus: crate::chat::sessions::FocusTarget,
+    /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
+    pub switcher: Option<crate::chat::sessions::SwitcherState>,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -265,6 +296,9 @@ impl UiSnapshot {
             conversation_generation: 0,
             streaming: None,
             input: TuiInput::new(),
+            sessions_status: Arc::from(""),
+            focus: crate::chat::sessions::FocusTarget::Main,
+            switcher: None,
         }
     }
 }
@@ -332,6 +366,7 @@ impl ChatState {
                 turns: Vec::new(),
                 history: Vec::new(),
                 created_at: None,
+                background_sessions: Vec::new(),
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
@@ -341,6 +376,9 @@ impl ChatState {
                 ascii_fallback: false,
                 last_ctrlc_ms: 0,
                 last_submitted: None,
+                sessions_status: String::new(),
+                focus: crate::chat::sessions::FocusTarget::Main,
+                switcher: None,
             },
             stream: StreamState {
                 draft: None,
@@ -400,6 +438,9 @@ impl ChatState {
             conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
+            sessions_status: Arc::from(self.ui.sessions_status.as_str()),
+            focus: self.ui.focus,
+            switcher: self.ui.switcher.clone(),
         }
     }
 
@@ -528,7 +569,8 @@ impl ChatState {
                 draft_id,
                 history,
                 cancel,
-            } => self.reduce_start_llm_turn(draft_id, history, cancel),
+                turn_spawn_ctx,
+            } => self.reduce_start_llm_turn(draft_id, history, cancel, turn_spawn_ctx),
             Action::StreamChunkReceived {
                 draft_id,
                 delta,
@@ -578,6 +620,12 @@ impl ChatState {
             Action::RedrawRequested => vec![Effect::RequestRedraw],
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
+            Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
+            Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
+            Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
+            Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
+            Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
+            Action::SwitcherClosed => self.reduce_switcher_closed(),
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
@@ -874,6 +922,7 @@ impl ChatState {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -895,6 +944,7 @@ impl ChatState {
                 history,
                 cancel,
                 chat_mode,
+                turn_spawn_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -906,6 +956,7 @@ impl ChatState {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         cancel: CancellationToken,
+        turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -927,6 +978,7 @@ impl ChatState {
                 history,
                 cancel,
                 chat_mode,
+                turn_spawn_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -1406,6 +1458,11 @@ impl ChatState {
         self.session.model = Arc::from(loaded.model.as_str());
         self.session.mode = loaded.mode;
         self.session.turns = loaded.turns;
+        // v4: restore persisted background-session summaries (display only —
+        // the live processes are gone and are never revived). Carrying them in
+        // SessionState means the next save_session snapshot re-persists them, so
+        // they survive across multiple reload cycles.
+        self.session.background_sessions = loaded.background_sessions;
         // S4-B T4-B-6: 保留原 session 的 created_at，避免下次 save_session 覆盖
         self.session.created_at = Some(loaded.created_at);
         // history 从 turns 重建（仅 user/assistant 角色进 LLM context）
@@ -1482,6 +1539,7 @@ impl ChatState {
             created_at: self.session.created_at.unwrap_or(now),
             updated_at: now,
             turns: self.session.turns.clone(),
+            background_sessions: self.session.background_sessions.clone(),
             mode: self.session.mode,
         }
     }
@@ -1620,6 +1678,107 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     #[allow(clippy::needless_pass_by_ref_mut)]
     fn reduce_user_message_echoed(&mut self, _text: String) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SessionsStatusUpdated` — replace the persistent background-session
+    /// status line (v1b). The main loop already dedups (only dispatches when the
+    /// summary changed), but we still no-op an identical write so a stray
+    /// duplicate cannot mark the UI dirty for nothing.
+    fn reduce_sessions_status_updated(&mut self, summary: String) -> Vec<Effect> {
+        if self.ui.sessions_status == summary {
+            return Vec::new();
+        }
+        self.ui.sessions_status = summary;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
+    /// summary into `session.background_sessions` and **immediately emit
+    /// `Effect::SaveSession`** so the summary is durably persisted to the memory
+    /// backend (the only write path; `dispatcher.rs` `Effect::SaveSession`).
+    ///
+    /// Why emit SaveSession here (P0, v4 review): under `terminal-tui` (now the
+    /// default) the legacy exit-save path is disabled (`mod.rs`
+    /// `legacy_exit_save_enabled=false`), and no other action snapshots after a
+    /// background session reaches a terminal state. Without this effect the
+    /// summary lived only in memory and was lost on exit → reload recap broke.
+    /// Emitting SaveSession **after** the upsert guarantees the snapshot
+    /// (`build_session_snapshot`, which clones `self.session.background_sessions`)
+    /// already contains this record, eliminating the prior race where a snapshot
+    /// taken before the action could miss it.
+    ///
+    /// Dedup is by session id: a later record for the same id replaces the
+    /// earlier one (e.g. an `interrupted` entry written at exit, or a terminal
+    /// summary superseding a placeholder). This records **summary only** — it
+    /// never spawns or revives a process / sub-agent / PTY.
+    ///
+    /// No save storm: a background session reaching a terminal state is a
+    /// low-frequency event, and an unchanged re-record short-circuits to
+    /// `Vec::new()` before emitting any effect. `Effect::SaveSession` is a pure
+    /// persistence sink (it never dispatches a new action), so there is no
+    /// SaveSession → BackgroundSessionRecorded feedback loop.
+    fn reduce_background_session_recorded(
+        &mut self,
+        summary: crate::chat::sessions::PersistedSessionSummary,
+    ) -> Vec<Effect> {
+        if let Some(existing) = self.session.background_sessions.iter_mut().find(|s| s.id == summary.id) {
+            if *existing == summary {
+                return Vec::new();
+            }
+            *existing = summary;
+        } else {
+            self.session.background_sessions.push(summary);
+        }
+        // Persist the updated snapshot now (state already mutated above).
+        vec![Effect::SaveSession(self.build_session_snapshot())]
+    }
+
+    /// `Action::SessionFocusChanged` (v1.1b) — record the current input-routing
+    /// target so the snapshot prompt indicator (colour+glyph) reflects it.
+    /// Idempotent: an unchanged focus is a no-op (no needless redraw).
+    fn reduce_session_focus_changed(&mut self, focus: crate::chat::sessions::FocusTarget) -> Vec<Effect> {
+        if self.ui.focus == focus {
+            return Vec::new();
+        }
+        self.ui.focus = focus;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherOpened` (v1.1b) — open the Ctrl+G switcher overlay over
+    /// the supplied session snapshot, highlighting the first row.
+    fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
+        self.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(entries));
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherMoved` (v1.1b) — update the highlighted row. The index is
+    /// clamped to a valid row by the key thread; we clamp again defensively so a
+    /// stale snapshot can never index out of range. No-op (no redraw) when the
+    /// switcher is closed or the selection is unchanged.
+    fn reduce_switcher_moved(&mut self, selected: usize) -> Vec<Effect> {
+        let Some(switcher) = self.ui.switcher.as_mut() else {
+            return Vec::new();
+        };
+        let clamped = if switcher.entries.is_empty() {
+            0
+        } else {
+            selected.min(switcher.entries.len().saturating_sub(1))
+        };
+        if switcher.selected == clamped {
+            return Vec::new();
+        }
+        switcher.selected = clamped;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SwitcherClosed` (v1.1b) — close the switcher overlay. No-op (no
+    /// redraw) when already closed.
+    fn reduce_switcher_closed(&mut self) -> Vec<Effect> {
+        if self.ui.switcher.is_none() {
+            return Vec::new();
+        }
+        self.ui.switcher = None;
         vec![Effect::RequestRedraw]
     }
 
@@ -1818,12 +1977,26 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. } => false,
+        // v4: BackgroundSessionRecorded only upserts session.background_sessions
+        // (a persistence field, not a snapshot/UI field) → no UI dirty.
+        Action::BackgroundSessionRecorded { .. } => false,
 
         // UI 镜像账本 / 历史清空 / Pure 模式用户 echo：直接动 conversation_lines → dirty
         Action::SystemMessageAdded { .. }
         | Action::HistoryCleared
         | Action::HistoryClearedWithNotice { .. }
         | Action::UserMessageEchoed(_) => true,
+        // v1b: writes ui.sessions_status (a snapshot field) → dirty. The main
+        // loop only dispatches this when the summary actually changed, and the
+        // reducer also no-ops identical writes, so this never churns frames.
+        Action::SessionsStatusUpdated { .. } => true,
+        // v1.1b: focus + switcher are snapshot fields driving the prompt
+        // indicator and switcher overlay → dirty. Each reducer no-ops identical
+        // writes so unchanged state never churns frames.
+        Action::SessionFocusChanged { .. }
+        | Action::SwitcherOpened { .. }
+        | Action::SwitcherMoved { .. }
+        | Action::SwitcherClosed => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -1887,6 +2060,110 @@ mod tests {
         let state = make_state();
         assert!(state.stream.draft.is_none());
         assert!(state.stream.pending_tool_cards.is_empty());
+    }
+
+    /// v1b: SessionsStatusUpdated 写入 ui.sessions_status 并经快照反映；相同内容 no-op.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_status_updated_writes_and_dedups() {
+        let mut state = make_state();
+        assert!(state.ui.sessions_status.is_empty());
+
+        let effects = state.reduce(Action::SessionsStatusUpdated {
+            summary: "bg: 1 running".to_string(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.sessions_status, "bg: 1 running");
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(&*snap.sessions_status, "bg: 1 running");
+
+        // Identical write is a no-op (no redraw effect).
+        let effects = state.reduce(Action::SessionsStatusUpdated {
+            summary: "bg: 1 running".to_string(),
+        });
+        assert!(effects.is_empty(), "identical status must not emit an effect");
+
+        // Clearing hides the row (empty string flows through).
+        let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.sessions_status.is_empty());
+    }
+
+    /// v1.1b: SessionFocusChanged writes ui.focus + flows to the snapshot; an
+    /// identical focus is a no-op.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn session_focus_changed_writes_and_dedups() {
+        use crate::chat::sessions::FocusTarget;
+        let mut state = make_state();
+        assert_eq!(state.ui.focus, FocusTarget::Main);
+
+        let focus = FocusTarget::Session { seq: 2 };
+        let effects = state.reduce(Action::SessionFocusChanged { focus });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.focus, focus);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.focus, focus);
+
+        // Identical focus → no-op.
+        let effects = state.reduce(Action::SessionFocusChanged { focus });
+        assert!(effects.is_empty(), "identical focus must not emit an effect");
+
+        // Back to main.
+        let effects = state.reduce(Action::SessionFocusChanged {
+            focus: FocusTarget::Main,
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.focus, FocusTarget::Main);
+    }
+
+    /// v1.1b: switcher open/move/close lifecycle through the reducer.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn switcher_open_move_close_lifecycle() {
+        use crate::chat::sessions::SwitcherEntry;
+        let mut state = make_state();
+        assert!(state.ui.switcher.is_none());
+
+        let entries = vec![
+            SwitcherEntry {
+                seq: 1,
+                kind: "agent",
+                origin: "user",
+                status: "running",
+                title: "a".into(),
+            },
+            SwitcherEntry {
+                seq: 2,
+                kind: "agent",
+                origin: "model",
+                status: "completed",
+                title: "b".into(),
+            },
+        ];
+        let effects = state.reduce(Action::SwitcherOpened { entries });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let sw = state.ui.switcher.as_ref().expect("test: switcher open");
+        assert_eq!(sw.len(), 2);
+        assert_eq!(sw.selected, 0);
+        // Snapshot carries it.
+        assert!(state.build_ui_snapshot(1).switcher.is_some());
+
+        // Move to row 1.
+        let effects = state.reduce(Action::SwitcherMoved { selected: 1 });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.switcher.as_ref().expect("test").selected, 1);
+        // Out-of-range selection is clamped to the last row, not a panic.
+        let _ = state.reduce(Action::SwitcherMoved { selected: 99 });
+        assert_eq!(state.ui.switcher.as_ref().expect("test").selected, 1);
+
+        // Close.
+        let effects = state.reduce(Action::SwitcherClosed);
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.switcher.is_none());
+        // Closing again is a no-op.
+        let effects = state.reduce(Action::SwitcherClosed);
+        assert!(effects.is_empty());
     }
 
     /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）
@@ -3038,6 +3315,152 @@ mod tests {
             assert!(has_log_trace(&effects), "应含 LogTrace");
         }
 
+        fn bg_summary(id: &str, status: &str) -> crate::chat::sessions::PersistedSessionSummary {
+            crate::chat::sessions::PersistedSessionSummary {
+                id: id.to_string(),
+                seq: 1,
+                kind: "agent".to_string(),
+                origin: "user".to_string(),
+                status: status.to_string(),
+                title: "task".to_string(),
+                summary: String::new(),
+                created_at: chrono::Utc::now(),
+            }
+        }
+
+        /// v4: BackgroundSessionRecorded upserts into session.background_sessions
+        /// (dedup by id) and emits SaveSession so the summary is persisted.
+        #[test]
+        fn test_redux_background_session_recorded_upserts() {
+            let mut state = s();
+            let e1 = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-1", "running"),
+            });
+            // P0 (v4 review): a record that changed state must emit SaveSession
+            // (the only durable write path). It must NOT redraw — a background
+            // summary write is invisible to the live conversation surface.
+            assert_eq!(e1.len(), 1, "exactly one effect: SaveSession");
+            assert!(
+                matches!(e1.first(), Some(Effect::SaveSession(_))),
+                "changed record must emit SaveSession, got {e1:?}"
+            );
+            assert_eq!(state.session.background_sessions.len(), 1);
+
+            // Same id again with a terminal status replaces, does not duplicate,
+            // and still emits a fresh SaveSession (state changed). Reuse the same
+            // value for the no-op check below (bg_summary stamps a fresh
+            // created_at per call, which would otherwise count as a change).
+            let completed = bg_summary("run-1", "completed");
+            let e2 = state.reduce(Action::BackgroundSessionRecorded {
+                summary: completed.clone(),
+            });
+            assert!(matches!(e2.first(), Some(Effect::SaveSession(_))));
+            assert_eq!(state.session.background_sessions.len(), 1);
+            assert_eq!(
+                state.session.background_sessions.first().map(|s| s.status.as_str()),
+                Some("completed")
+            );
+
+            // An identical re-record is a no-op: no state change, no effect, no
+            // save storm.
+            let e_dup = state.reduce(Action::BackgroundSessionRecorded { summary: completed });
+            assert!(
+                e_dup.is_empty(),
+                "unchanged re-record must short-circuit with no SaveSession (no save storm)"
+            );
+
+            // A different id appends and saves.
+            let e3 = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-2", "failed"),
+            });
+            assert!(matches!(e3.first(), Some(Effect::SaveSession(_))));
+            assert_eq!(state.session.background_sessions.len(), 2);
+        }
+
+        /// B1 (P0, v4 review): dispatching BackgroundSessionRecorded must emit a
+        /// SaveSession whose snapshot ALREADY contains the just-recorded summary.
+        /// This is the regression guard: previously the reducer returned no
+        /// effect, so the terminal-summary never reached the memory backend
+        /// (legacy exit-save is disabled under terminal-tui), breaking reload
+        /// recap. Round-trip: capture the SaveSession snapshot → reload it into a
+        /// fresh state → the background summary is present.
+        #[test]
+        fn test_redux_background_session_recorded_emits_savesession_with_summary() {
+            let mut state = s();
+            let effects = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-42", "completed"),
+            });
+            let snapshot = effects
+                .iter()
+                .find_map(|e| match e {
+                    Effect::SaveSession(session) => Some(session.clone()),
+                    _ => None,
+                })
+                .expect("BackgroundSessionRecorded must emit Effect::SaveSession");
+            // The emitted snapshot must already carry the recorded summary —
+            // proving the save happens AFTER the upsert (no race where the
+            // snapshot predates the state mutation).
+            assert_eq!(
+                snapshot.background_sessions.len(),
+                1,
+                "SaveSession snapshot must contain the just-recorded background session"
+            );
+            let recorded = snapshot
+                .background_sessions
+                .first()
+                .expect("snapshot background session present");
+            assert_eq!(recorded.id, "run-42");
+            assert_eq!(recorded.status, "completed");
+
+            // Round-trip: reloading that snapshot into a fresh state restores it,
+            // confirming the persisted blob is sufficient for reload recap.
+            let mut reloaded = s();
+            let _ = reloaded.reduce(Action::SessionLoaded(snapshot));
+            assert_eq!(reloaded.session.background_sessions.len(), 1);
+            assert_eq!(
+                reloaded.session.background_sessions.first().map(|s| s.id.as_str()),
+                Some("run-42")
+            );
+        }
+
+        /// v4: a recorded background session must survive a save→load round trip
+        /// through the reducer (snapshot persists it, SessionLoaded restores it),
+        /// and a still-running session is never restored as a live one.
+        #[test]
+        fn test_redux_background_sessions_survive_snapshot_and_reload() {
+            let mut state = s();
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-1", "completed"),
+            });
+            // An interrupted entry stands in for "was running at last exit".
+            let _ = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-2", crate::chat::sessions::model::STATUS_INTERRUPTED),
+            });
+
+            // The snapshot the SaveSession effect would persist must carry them.
+            let snapshot = state.build_session_snapshot();
+            assert_eq!(snapshot.background_sessions.len(), 2);
+
+            // Reloading that snapshot into a fresh state restores the summaries.
+            let mut fresh = s();
+            let _ = fresh.reduce(Action::SessionLoaded(snapshot));
+            assert_eq!(fresh.session.background_sessions.len(), 2);
+            // None of the restored entries is a live status — reload never
+            // resurrects a running process.
+            for bg in &fresh.session.background_sessions {
+                assert_ne!(bg.status, "running");
+                assert_ne!(bg.status, "needs-input");
+            }
+            let statuses: Vec<&str> = fresh
+                .session
+                .background_sessions
+                .iter()
+                .map(|s| s.status.as_str())
+                .collect();
+            assert!(statuses.contains(&"completed"));
+            assert!(statuses.contains(&crate::chat::sessions::model::STATUS_INTERRUPTED));
+        }
+
         /// Step4-5b: SessionLoaded 含 system prompt — history 中保留 user/assistant，
         /// system turn 不进 LLM history（turns 里 role=system 不过滤进 history）
         #[test]
@@ -3427,6 +3850,7 @@ mod tests {
                 draft_id: "draft-1".to_string(),
                 history,
                 cancel,
+                turn_spawn_ctx: None,
             });
 
             // 状态变更：draft + active_cancel + generating
@@ -3461,6 +3885,7 @@ mod tests {
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
                 cancel: cancel.clone(),
+                turn_spawn_ctx: None,
             });
             // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
             cancel.cancel();
@@ -3557,6 +3982,7 @@ mod tests {
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
                 cancel,
+                turn_spawn_ctx: None,
             });
             assert!(state.control.generating);
 

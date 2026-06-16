@@ -147,6 +147,11 @@ crossterm = { version = "0.28", default-features = false, features = ["events", 
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "scrolling-regions"] }
 syntect = { version = "5.2", optional = true, default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "html", "plist-load", "dump-load", "dump-create", "regex-fancy"] }
 unicode-width = { version = "0.2", optional = true }
+# Interactive PTY shell sessions (v3 of the chat session runtime). Cross-platform
+# pseudo-terminal: openpty on Unix, ConPTY on Windows. Gated behind terminal-tui
+# because the interactive PTY is a full-screen terminal handoff of the chat TUI
+# (the non-TUI reedline path never enters PTY handoff and so does not need it).
+portable-pty = { version = "0.9", optional = true }
 
 # Binary discovery (init system detection)
 which = "7.0"
@@ -220,7 +225,7 @@ landlock = { version = "0.4", optional = true }
 libc = "0.2"
 
 [features]
-default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock"]
+default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock", "terminal-tui"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
 # Browser backend feature alias used by cfg(feature = "browser-native")
@@ -239,8 +244,9 @@ whatsapp-web = ["dep:wa-rs", "dep:wa-rs-core", "dep:wa-rs-binary", "dep:wa-rs-pr
 # WASM plugin system (wasmtime + Component Model)
 wasm-plugins = ["dep:wasmtime", "dep:wasmtime-wasi"]
 llm-router = ["dep:skillratings", "dep:tiktoken-rs"]
-# Terminal TUI advanced features (Phase 3): ratatui layout, syntect highlighting, CJK width
-terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width"]
+# Terminal TUI advanced features (Phase 3): ratatui layout, syntect highlighting,
+# CJK width, and interactive PTY shell sessions (v3 terminal handoff).
+terminal-tui = ["dep:ratatui", "dep:syntect", "dep:unicode-width", "dep:portable-pty"]
 # test-mock = expose an in-process MockProvider as the `"mock"` provider name so
 # PTY end-to-end tests can drive `prx chat` without hitting any real LLM.
 # Implementation: src/providers/router.rs + src/providers/mod.rs (factory match).

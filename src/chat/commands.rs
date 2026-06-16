@@ -41,6 +41,11 @@ pub enum CommandResult {
     /// stays out of this module's `CommandContext` (which only carries
     /// immutable borrows).
     SetMode(ChatMode),
+    /// /bg, /sessions, /kill (and later session commands) — `dispatch` only
+    /// parses these; the chat main loop executes them because it owns the
+    /// mutable session runtime state (registry handle + provider/model strings),
+    /// which the immutable [`CommandContext`] cannot touch.
+    SessionAction(super::sessions::SessionCommand),
 }
 
 /// Context passed to command handlers (borrows from the main loop).
@@ -66,6 +71,14 @@ const HELP_TEXT: &str = "Available commands:
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
   /auto              Switch to auto mode (no approval prompts)
+  /bg <task>         Run a task as a background agent session
+  /sessions          List background sessions
+  /shell <command>   Run a command as a background shell session
+  /pty <command>     Open an interactive PTY shell (full terminal handoff)
+  /attach <id>       Show a background session's recent output (read-only)
+  /logs <id>         Dump a background session's buffered output (last 200 lines)
+  /steer <id> <msg>  Send a steering instruction to a background session
+  /kill <id>         Stop a background session
   /quit /exit        Exit chat";
 
 /// Dispatch a slash command. Returns `CommandResult`.
@@ -148,6 +161,16 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/theme" => CommandResult::HandledWithOutput(
             "Available themes: dark (default), light, monokai\nSet via: PRX_CHAT_THEME=monokai prx chat".to_string(),
         ),
+        // Session runtime commands (/bg, /sessions, /kill, …). MUST come before
+        // the generic unknown-slash fallback so they are not swallowed as
+        // "unknown command". Parsing only here; execution happens in the chat
+        // main loop (it owns the mutable session runtime state).
+        _ if super::sessions::parse_session_command(input).is_some() => {
+            // The guard already confirmed `Some`; on the (unreachable) `None`
+            // path fall through safely rather than panic.
+            super::sessions::parse_session_command(input)
+                .map_or(CommandResult::NotACommand, CommandResult::SessionAction)
+        }
         _ if input.starts_with('/') => {
             CommandResult::HandledWithOutput(format!("Unknown command: {input}. Type /help for available commands."))
         }
@@ -485,6 +508,29 @@ mod mode_tests {
         match r {
             CommandResult::HandledWithOutput(s) => assert_eq!(s, "hello"),
             _ => panic!("expected HandledWithOutput variant"),
+        }
+    }
+
+    #[test]
+    fn help_text_lists_session_commands_including_logs() {
+        // v5 regression: `/logs` and `/pty` are implemented and parsed but were
+        // missing from `/help`, leading an operator to believe `/logs` did not
+        // exist. The help surface must advertise the full session command family.
+        for cmd in [
+            "/bg",
+            "/sessions",
+            "/shell",
+            "/pty",
+            "/attach",
+            "/logs",
+            "/steer",
+            "/kill",
+        ] {
+            assert!(
+                super::HELP_TEXT.contains(cmd),
+                "/help must list {cmd}: {}",
+                super::HELP_TEXT
+            );
         }
     }
 

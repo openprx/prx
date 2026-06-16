@@ -709,6 +709,7 @@ impl EffectExecutor {
                 history,
                 cancel,
                 chat_mode,
+                turn_spawn_ctx,
             } => {
                 // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
                 // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
@@ -756,7 +757,7 @@ impl EffectExecutor {
                         }
                         return;
                     }
-                    drive_start_turn_stream(
+                    let driver = drive_start_turn_stream(
                         provider,
                         history,
                         model,
@@ -769,8 +770,28 @@ impl EffectExecutor {
                         approval_router,
                         approval_manager,
                         chat_mode,
-                    )
-                    .await;
+                    );
+                    // D8-4 (redux path real fix): mirror the legacy
+                    // `run_tool_call_loop_traced` wrapper in `chat::run` — seed the
+                    // turn-root spawn execution context so any `sessions_spawn`
+                    // tool call executed inside this turn's tool loop reads
+                    // `SPAWN_EXECUTION_CONTEXT.try_with(..)` = Ok → `parent_run_id =
+                    // turn run_id` → origin = Model. The legacy path scoped this at
+                    // `chat::run`, but the redux driver `continue`s before reaching
+                    // it, so the scope must be applied here (the redux turn's actual
+                    // tool-execution site). When `turn_spawn_ctx` is `None` (e.g.
+                    // non-turn callers / tests / the `/bg` slash command which never
+                    // dispatches `StartLLMTurn`), the driver runs unscoped and
+                    // spawned sub-agents fall back to user origin — the correct
+                    // behavior for those paths.
+                    match turn_spawn_ctx {
+                        Some(ctx) => {
+                            crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                                .scope(ctx, driver)
+                                .await;
+                        }
+                        None => driver.await,
+                    }
                 });
             }
             Effect::SaveSession(session) => {
@@ -3114,6 +3135,7 @@ mod integration_tests {
                 history: Vec::new(),
                 cancel: token.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             },
             Effect::CancelToken(token),
         ];
@@ -3535,6 +3557,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -3781,6 +3804,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
         // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
@@ -3843,6 +3867,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -3929,6 +3954,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -4059,6 +4085,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -4151,6 +4178,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -4870,6 +4898,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -4996,6 +5025,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -5148,6 +5178,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -5205,6 +5236,174 @@ mod real_mode_tests {
             *captured_tool_counts.lock(),
             vec![1, 1],
             "driver must pass registered tool specs to each streaming request"
+        );
+    }
+
+    /// **D8-4 redux-path real fix regression**: a tool executed *inside* the
+    /// redux driver (`Effect::StartTurn` → spawn → `drive_start_turn_stream` →
+    /// `tool.execute`) must observe the turn-root `SPAWN_EXECUTION_CONTEXT`
+    /// seeded via `Effect::StartTurn { turn_spawn_ctx, .. }`.
+    ///
+    /// This drives the *real* dispatcher execution path (not a hand-rolled
+    /// `tool.execute()` with a manual `.scope()` wrapper — the mistake the
+    /// previous "fix" made, which passed while the production redux path still
+    /// dropped the context). If the executor stops wrapping the driver future in
+    /// `SPAWN_EXECUTION_CONTEXT.scope(..)`, `try_with` returns `Err` and the
+    /// captured `parent_run_id` is `None`, failing this test — exactly the
+    /// observable cause of model-spawned sub-agents being mislabeled `user`.
+    ///
+    /// The `None` (no-scope) leg — which keeps the `/bg` slash-command path on
+    /// user origin — is already covered by every other driver test in this file
+    /// (they all pass `turn_spawn_ctx: None`); this test asserts the `Some` leg.
+    #[tokio::test]
+    async fn driver_seeds_spawn_execution_context_for_tool_calls() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult, ToolCallChunk,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex as PMutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        // Tool that records what the spawn execution context looked like at the
+        // moment it executed — i.e. whether the driver scoped the task-local.
+        // `executed` distinguishes "tool never ran" from "ran but saw no scope".
+        struct CtxProbeTool {
+            executed: Arc<std::sync::atomic::AtomicBool>,
+            seen_run_id: Arc<PMutex<Option<String>>>,
+        }
+        #[async_trait]
+        impl crate::tools::Tool for CtxProbeTool {
+            fn name(&self) -> &str {
+                "ctx-probe"
+            }
+            fn description(&self) -> &str {
+                "records the spawn execution context's run_id"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({"type": "object", "properties": {}})
+            }
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                // `try_with` is Ok only when the driver scoped the task-local;
+                // None here means an unscoped task → sub-agents fall back to user.
+                let observed = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                    .try_with(|ctx| ctx.run_id.clone())
+                    .ok();
+                *self.seen_run_id.lock() = observed;
+                self.executed.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: "probed".to_string(),
+                    error: None,
+                })
+            }
+        }
+
+        struct ToolThenTextProvider {
+            counter: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for ToolThenTextProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temp: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
+                if n == 0 {
+                    let calls = vec![ToolCallChunk::new("tc-1", "ctx-probe", "{}", 0)];
+                    stream::iter(vec![
+                        Ok(StreamChunk::tool_call_chunk(calls)),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                } else {
+                    stream::iter(vec![Ok(StreamChunk::delta("done")), Ok(StreamChunk::final_chunk())]).boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ToolThenTextProvider {
+            counter: Arc::new(AtomicUsize::new(0)),
+        });
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen_run_id = Arc::new(PMutex::new(None));
+        deps.tools_registry = Some(Arc::new(vec![Box::new(CtxProbeTool {
+            executed: Arc::clone(&executed),
+            seen_run_id: Arc::clone(&seen_run_id),
+        }) as Box<dyn crate::tools::Tool>]));
+        deps.max_tool_iterations = 4;
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let turn_run_id = "turn-run-id-xyz".to_string();
+        let seed = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            turn_run_id.clone(),
+            "chat:test-scope".to_string(),
+        );
+
+        let cancel = CancellationToken::new();
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-ctx-probe".to_string(),
+                history: Vec::new(),
+                cancel,
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: Some(seed),
+            })
+            .await;
+
+        // Drain until completion so the spawned driver task has finished the tool.
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver should respond within 2s per action")
+                .expect("action must arrive");
+            if matches!(action, Action::StreamCompleted { .. } | Action::StreamFailed { .. }) {
+                break;
+            }
+        }
+
+        assert!(
+            executed.load(std::sync::atomic::Ordering::SeqCst),
+            "ctx-probe tool must have executed inside the driver"
+        );
+        let observed = seen_run_id.lock().clone();
+        assert_eq!(
+            observed,
+            Some(turn_run_id),
+            "redux driver must scope SPAWN_EXECUTION_CONTEXT so the in-turn tool sees the turn run_id \
+             (None here means model-spawned sub-agents would be mislabeled as user)"
         );
     }
 
@@ -5294,6 +5493,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -5435,6 +5635,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -5543,6 +5744,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -5580,6 +5782,7 @@ mod real_mode_tests {
             draft_id: "d1".to_string(),
             history: Vec::new(),
             cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
         });
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
@@ -5923,6 +6126,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6060,6 +6264,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6175,6 +6380,7 @@ mod real_mode_tests {
                 }],
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6266,6 +6472,7 @@ mod real_mode_tests {
                 }],
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6435,6 +6642,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6620,6 +6828,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -6972,6 +7181,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
@@ -7066,6 +7276,7 @@ mod real_mode_tests {
                 history: Vec::new(),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
             })
             .await;
 
