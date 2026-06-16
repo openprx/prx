@@ -246,21 +246,39 @@ impl Drop for PtyHandoffGuard {
     fn drop(&mut self) {
         // ORDER MATTERS. While we restore the host terminal's modes the render
         // loop must still be parked, otherwise it could `draw()` (writing its
-        // own control sequences to `stdout`) concurrently with the
-        // `enable_raw_mode` / `EnableBracketedPaste` below, or step into
-        // crossterm `poll`/`read` before raw mode is re-asserted. So:
+        // own control sequences to `stdout`) concurrently with the mode-reset
+        // escape sequences / `enable_raw_mode` / `EnableBracketedPaste` below, or
+        // step into crossterm `poll`/`read` before raw mode is re-asserted. So:
         //
-        //   1. restore terminal modes  (render loop STILL paused)
-        //   2. arm force_redraw
-        //   3. unpause                  (render loop may now draw)
-        //   4. nudge
+        //   1a. reset the host terminal modes the PTY child clobbered
+        //   1b. re-assert chat's raw mode + bracketed paste
+        //   2.  arm force_redraw
+        //   3.  unpause                  (render loop may now draw)
+        //   4.  nudge
         //
         // After step 3 we write NO further stdout control sequences.
 
-        // 1. Defensively re-assert the chat terminal modes the PTY child may
-        //    have clobbered, while the render loop is still parked so we are the
-        //    sole writer of these escape/kernel operations. Best-effort — we are
-        //    on the restoration path and have no caller to surface errors to.
+        // 1a. A PTY child (vim/htop/less/…) may have switched the terminal into
+        //     modes the chat TUI never uses — mouse tracking, the application
+        //     cursor/keypad modes, a hidden cursor, the alternate screen buffer —
+        //     and on a normal `Ctrl-]` detach the child is NOT killed, so it never
+        //     emits the corresponding "off" sequences. Left as-is, the chat would
+        //     resume with mouse events escaping as garbage, arrow/keypad keys
+        //     misbehaving (DECCKM), the cursor invisible, or the screen stuck in a
+        //     leftover alt-buffer. Write a host-mode reset to pull the terminal
+        //     back to chat's baseline. These sequences are idempotent and are the
+        //     normal chat state anyway, so re-sending them is harmless even when no
+        //     PTY child touched them (and in the no-TUI fallback path). Best-effort
+        //     — we are on the restoration path with no caller to surface errors to.
+        //     Done while the render loop is still parked so we are the sole writer.
+        {
+            let mut out = std::io::stdout();
+            write_host_mode_reset(&mut out);
+        }
+
+        // 1b. Defensively re-assert the chat terminal modes the PTY child may
+        //     have clobbered, while the render loop is still parked so we are the
+        //     sole writer of these escape/kernel operations. Best-effort.
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
@@ -275,6 +293,45 @@ impl Drop for PtyHandoffGuard {
         if let Some(nudge) = &self.redraw_nudge {
             nudge();
         }
+    }
+}
+
+/// Escape sequences that pull the host terminal back to the chat TUI's baseline
+/// after a PTY child (vim/htop/less/…) may have changed its modes.
+///
+/// Emitted on **every** PTY detach path (normal `Ctrl-]` detach, child exit,
+/// error, panic — all funnel through [`PtyHandoffGuard::drop`]), where the child
+/// is typically NOT killed and so never sends its own "off" sequences. Each is
+/// idempotent and matches the modes the chat TUI itself uses, so re-sending them
+/// when nothing changed (or in the no-TUI fallback path) is harmless. Order is
+/// irrelevant (independent modes); grouped by concern:
+///
+/// - `?1000l ?1002l ?1003l ?1005l ?1006l` — disable every X10/button/any-motion
+///   mouse tracking mode and the UTF-8/SGR extended-coordinate encodings, so a
+///   program that enabled mouse reporting (htop, vim with `set mouse=a`) can no
+///   longer make the terminal spew mouse escape bursts into chat's stdin.
+/// - `?1l` — DECCKM off: cursor keys send the normal `ESC [ A` form rather than
+///   the application `ESC O A` form, so arrow keys behave in the chat line editor.
+/// - `ESC >` (DECKPNM) — numeric keypad mode, undoing a child's application
+///   keypad (`ESC =`).
+/// - `?25h` — show the cursor, undoing a full-screen program that hid it.
+/// - `?1049l` then `?47l` — leave the alternate screen buffer (both the modern
+///   1049 and the legacy 47 variants) so no alt-buffer residue is left behind.
+const HOST_MODE_RESET: &[u8] =
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>\x1b[?25h\x1b[?1049l\x1b[?47l";
+
+/// Write the [`HOST_MODE_RESET`] baseline sequences to `out` and flush.
+///
+/// Factored out (taking `&mut dyn Write`) so a unit test can assert the reset is
+/// actually emitted on detach by injecting a capturing sink; production passes the
+/// real `stdout`. Best-effort: write/flush errors are logged, never propagated —
+/// the caller ([`PtyHandoffGuard::drop`]) is an infallible restoration path. The
+/// I/O is a single bounded write of a small constant (terminal-only assumption,
+/// like the rest of this module's stdout writes), so logging the error is the
+/// right boundary rather than a larger async rework.
+fn write_host_mode_reset(out: &mut dyn std::io::Write) {
+    if let Err(e) = out.write_all(HOST_MODE_RESET).and_then(|()| out.flush()) {
+        tracing::warn!(error = %e, "PTY detach: failed to write host terminal mode reset");
     }
 }
 
@@ -424,8 +481,16 @@ impl PtySink {
         // SGR + input modes) — exactly what restores vim/htop correctly on
         // re-attach without waiting for the child to repaint.
         let redraw = inner.parser.screen().state_formatted();
-        let _ = out.write_all(&redraw);
-        let _ = out.flush();
+        // Held-lock I/O boundary: the write/flush happen under the sink lock so the
+        // redraw cannot interleave with the drain reader's live mirror (same lock).
+        // This is sound because the target is the terminal only — a single bounded
+        // write of one screen of escape codes; a wedged stdout would block the
+        // reader, but there is no `.await` here so no async deadlock, and a "one
+        // screen redraw" stall is acceptable. We `warn` on failure rather than
+        // swallow it so a broken terminal is at least diagnosable.
+        if let Err(e) = out.write_all(&redraw).and_then(|()| out.flush()) {
+            tracing::warn!(error = %e, "PTY re-attach redraw write to terminal failed");
+        }
     }
 
     /// Resize the emulator's screen grid to match the PTY geometry. Called whenever
@@ -482,9 +547,18 @@ impl std::io::Write for PtySink {
             inner.ring.drain(0..overflow);
         }
         if inner.attached {
+            // Held-lock I/O boundary: this stdout write happens under the sink lock
+            // (so a concurrent `detach()`/`attach_and_render` serializes with it).
+            // The boundary is acceptable because the target is the terminal only —
+            // a single PTY read chunk (≤ 8 KiB) per call; a stuck stdout would
+            // block the reader/resize/detach, but there is no `.await` under the
+            // lock so no async deadlock, and terminal stalls are bounded in
+            // practice. `warn` on failure instead of silently dropping output so a
+            // broken terminal mirror is diagnosable.
             let mut out = std::io::stdout();
-            let _ = out.write_all(buf);
-            let _ = out.flush();
+            if let Err(e) = out.write_all(buf).and_then(|()| out.flush()) {
+                tracing::warn!(error = %e, "PTY live mirror write to terminal failed");
+            }
         }
         Ok(buf.len())
     }
@@ -1375,6 +1449,78 @@ mod tests {
         // the chrome rather than leaving PTY residue / a blank viewport).
         assert!(!control.is_paused(), "guard drop must unpause");
         assert!(control.take_force_redraw(), "force_redraw must be set on resume");
+    }
+
+    // ── v3b-b review P1: host terminal mode reset on detach ──────────────────
+
+    #[test]
+    fn host_mode_reset_emits_all_baseline_sequences() {
+        // The detach reset must turn OFF every mode a PTY child (vim/htop/less)
+        // could have left the terminal in: mouse tracking, application cursor
+        // (DECCKM), application keypad, hidden cursor, and the alternate screen.
+        // We assert each specific escape sequence is present in what gets written,
+        // so a regression that drops one (re-introducing the residual-mode bug)
+        // fails loudly.
+        let mut captured: Vec<u8> = Vec::new();
+        write_host_mode_reset(&mut captured);
+        let s = String::from_utf8(captured).expect("test: reset is valid utf-8");
+
+        // Mouse tracking off (X10 / button / any-motion / utf8 / sgr coords).
+        for seq in [
+            "\x1b[?1000l",
+            "\x1b[?1002l",
+            "\x1b[?1003l",
+            "\x1b[?1005l",
+            "\x1b[?1006l",
+        ] {
+            assert!(s.contains(seq), "host mode reset missing mouse-off seq {seq:?}: {s:?}");
+        }
+        // Normal cursor keys (DECCKM off).
+        assert!(s.contains("\x1b[?1l"), "host mode reset missing DECCKM-off: {s:?}");
+        // Numeric keypad (DECKPNM), undoing application keypad.
+        assert!(s.contains("\x1b>"), "host mode reset missing keypad-numeric: {s:?}");
+        // Cursor visible.
+        assert!(s.contains("\x1b[?25h"), "host mode reset missing show-cursor: {s:?}");
+        // Leave alternate screen (modern + legacy).
+        assert!(
+            s.contains("\x1b[?1049l"),
+            "host mode reset missing alt-screen-off (1049): {s:?}"
+        );
+        assert!(
+            s.contains("\x1b[?47l"),
+            "host mode reset missing alt-screen-off (47): {s:?}"
+        );
+    }
+
+    #[test]
+    fn host_mode_reset_is_idempotent_constant() {
+        // Re-sending is harmless: the function must always emit the SAME bytes
+        // (these are chat's baseline modes, sent on every detach regardless of
+        // whether a child actually changed them, including the no-TUI path).
+        let mut a: Vec<u8> = Vec::new();
+        let mut b: Vec<u8> = Vec::new();
+        write_host_mode_reset(&mut a);
+        write_host_mode_reset(&mut b);
+        assert_eq!(a, b, "host mode reset must be a deterministic constant");
+        assert_eq!(a, HOST_MODE_RESET, "writer must emit exactly HOST_MODE_RESET");
+    }
+
+    #[test]
+    fn host_mode_reset_write_error_does_not_panic() {
+        // The reset is on the infallible restoration path: a failing sink must be
+        // logged, never panic (iron law: never panic on the detach/Drop path).
+        struct FailingSink;
+        impl std::io::Write for FailingSink {
+            fn write(&mut self, _b: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+        }
+        let mut sink = FailingSink;
+        // Must return normally (no panic) despite the write error.
+        write_host_mode_reset(&mut sink);
     }
 
     // ── Interruptible reader (P0-A: bounded stop, no EOF dependency) ──────────
