@@ -641,7 +641,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
         "gemini" => "gemini-2.5-pro".into(),
-        "kimi-code" => "kimi2.6".into(),
+        "kimi-code" => "kimi-k2.7-code".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
@@ -838,6 +838,14 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "kimi-code" => vec![
+            (
+                "kimi-k2.7-code".to_string(),
+                "Kimi K2.7 Code (latest, recommended)".to_string(),
+            ),
+            (
+                "kimi-k2.7-code-highspeed".to_string(),
+                "Kimi K2.7 Code Highspeed (faster inference)".to_string(),
+            ),
             (
                 "kimi2.6".to_string(),
                 "Kimi 2.6 (Kimi Code subscription model)".to_string(),
@@ -4951,7 +4959,7 @@ mod tests {
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("kimi-code"), "kimi2.6");
+        assert_eq!(default_model_for_provider("kimi-code"), "kimi-k2.7-code");
         assert_eq!(
             default_model_for_provider("bedrock"),
             "anthropic.claude-sonnet-4-5-20250929-v1:0"
@@ -5083,6 +5091,8 @@ mod tests {
         assert!(ids.contains(&"kimi-for-coding".to_string()));
         assert!(ids.contains(&"kimi2.6".to_string()));
         assert!(ids.contains(&"kimi-k2.5".to_string()));
+        assert!(ids.contains(&"kimi-k2.7-code".to_string()));
+        assert!(ids.contains(&"kimi-k2.7-code-highspeed".to_string()));
     }
 
     #[test]
