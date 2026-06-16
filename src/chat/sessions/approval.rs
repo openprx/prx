@@ -213,6 +213,17 @@ impl Drop for ApprovalCleanupGuard {
         //     `AwaitingInput` -> `Running`; never clobber a terminal state set by
         //     a concurrent kill/failure. If the lock is contended right now,
         //     skip: whoever holds it is mutating the run already.
+        //
+        //     NOTE: this is a *fallback* only. `Drop` cannot `.await`, so this
+        //     `try_write` is skipped under contention — which previously left a
+        //     zombie `AwaitingInput` run that was in fact running again. The
+        //     authoritative, contention-proof restore now lives on the async
+        //     cancel-and-resume path (`run_sub_agent_task::restore_running`,
+        //     `tools/sessions_spawn.rs`), which always re-runs after the resolver
+        //     future is dropped on cancel. This `try_write` is retained as a
+        //     harmless, idempotent best-effort for any path that wakes the banner
+        //     before that async restore runs; both only do `AwaitingInput` ->
+        //     `Running`, so they can never conflict or double-apply.
         if let Ok(mut runs) = self.active_runs.try_write() {
             if let Some(run) = runs.iter_mut().find(|r| r.id == self.run_id) {
                 if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {

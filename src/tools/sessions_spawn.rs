@@ -1338,6 +1338,15 @@ impl Tool for SessionsSpawnTool {
         // do not suspend) and `always_ask`. Empty when no factory is attached.
         let run_approval_auto_approve = self.approval_auto_approve.clone();
         let run_approval_always_ask = self.approval_always_ask.clone();
+        // NeedsInput: when (and only when) an approval resolver is attached, hand
+        // the loop the run registry + id so it can deterministically restore
+        // `AwaitingInput` -> `Running` on cancel-and-resume (steer). `None`
+        // elsewhere — without a resolver no run can ever suspend.
+        let (restore_active_runs, restore_run_id) = if run_approval_resolver.is_some() {
+            (Some(self.active_runs.clone()), Some(run_id.clone()))
+        } else {
+            (None, None)
+        };
         let task_owned = task.to_string();
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
@@ -1420,6 +1429,8 @@ impl Tool for SessionsSpawnTool {
                 run_approval_resolver,
                 run_approval_auto_approve,
                 run_approval_always_ask,
+                restore_active_runs,
+                restore_run_id,
             );
             // `timeout_secs == 0` means "no timeout" — run until natural
             // completion. This matches the session-worker semantics in
@@ -2142,6 +2153,23 @@ fn chat_messages_to_history(messages: &[ChatMessage]) -> Vec<HistoryEntry> {
 /// - History: `history_out` is updated after each significant state change
 ///
 /// Falls back to a single-turn completion when no tools are registered.
+///
+/// Deterministically restore a single run from a suspended approval back to
+/// [`SubAgentStatus::Running`].
+///
+/// Downgrades **only** `AwaitingInput` -> `Running`; any terminal state
+/// (`Completed` / `Failed` / `Cancelled`) — e.g. one set by a concurrent kill or
+/// timeout — is left untouched, so a killed run that already moved to `Failed` is
+/// never resurrected to `Running`. A no-op if the run id is absent. Idempotent.
+fn restore_run_to_running(runs: &mut [SubAgentRun], run_id: &str) {
+    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
+        && matches!(run.status, SubAgentStatus::AwaitingInput { .. })
+    {
+        run.status = SubAgentStatus::Running;
+        tracing::debug!(run_id = %run_id, "restored sub-agent to Running after approval suspension ended");
+    }
+}
+
 async fn run_sub_agent_task(
     task: &str,
     provider: Arc<dyn Provider>,
@@ -2164,6 +2192,16 @@ async fn run_sub_agent_task(
     approval_resolver: Option<Arc<dyn crate::agent::loop_::ApprovalResolver>>,
     approval_auto_approve: std::collections::HashSet<String>,
     approval_always_ask: std::collections::HashSet<String>,
+    // NeedsInput: the shared run registry + this run's id, used to
+    // deterministically restore `AwaitingInput` -> `Running` whenever the loop
+    // leaves a suspended approval to continue running (steer / cancel-and-resume).
+    // The resolver's own `Drop` only does a best-effort `try_write` restore that
+    // is skipped under lock contention, so this async path is the authoritative
+    // guarantee that no run is left as a zombie `AwaitingInput` while it is in
+    // fact running again. `None` when there is no approval resolver attached
+    // (channels / gateway), where suspension can never happen.
+    active_runs: Option<Arc<RwLock<Vec<SubAgentRun>>>>,
+    run_id: Option<String>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -2200,6 +2238,22 @@ async fn run_sub_agent_task(
 
     // --- Agentic loop with steering support ---
     let mut history: Vec<ChatMessage> = vec![ChatMessage::system(system_prompt), ChatMessage::user(task)];
+
+    // NeedsInput: deterministically restore a suspended run to `Running` before
+    // re-entering the loop. Called on every path that *continues* running after a
+    // possible approval suspension (steer-driven cancel-and-resume). Downgrades
+    // `AwaitingInput` -> `Running` only; it never clobbers a terminal state
+    // (Completed / Failed / Cancelled) set concurrently by a kill / timeout, so
+    // a killed run that already moved to `Failed` is left untouched. This runs in
+    // a proper async context (`.write().await`), so unlike the resolver's `Drop`
+    // best-effort `try_write` it can never be skipped under lock contention.
+    let restore_running = || async {
+        let (Some(runs_arc), Some(rid)) = (active_runs.as_ref(), run_id.as_ref()) else {
+            return;
+        };
+        let mut runs = runs_arc.write().await;
+        restore_run_to_running(&mut runs, rid);
+    };
 
     loop {
         let cancel_token = CancellationToken::new();
@@ -2338,6 +2392,15 @@ async fn run_sub_agent_task(
                         // Wait for the task to acknowledge cancellation and return history
                         let (returned_history, _cancelled_result) = loop_handle.await?;
                         history = returned_history;
+                        // NeedsInput: the cancelled inner loop may have been parked
+                        // on a suspended approval (`resolve()` future dropped on
+                        // cancel). Its registry status can be a zombie
+                        // `AwaitingInput` if the resolver's `Drop` `try_write`
+                        // restore was skipped under contention. We are about to
+                        // re-run the loop, so deterministically restore `Running`
+                        // here (async, authoritative) — never clobbering a terminal
+                        // state set by a concurrent kill / timeout.
+                        restore_running().await;
                         // Inject the steering message as a user turn
                         tracing::info!("Sub-agent steering: injecting message");
                         history.push(ChatMessage::user(format!(
@@ -4000,5 +4063,79 @@ mod tests {
     fn isolated_memory_prefixes_key() {
         assert_eq!(memory_key_prefix("alpha", "plan"), "alpha:plan");
         assert_eq!(memory_key_prefix("alpha", "alpha:plan"), "alpha:plan");
+    }
+
+    /// Build a bare `SubAgentRun` with the given id and status for unit-testing
+    /// the deterministic approval-suspension restore logic.
+    fn restore_test_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
+        SubAgentRun {
+            id: id.to_string(),
+            task: "t".to_string(),
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
+            started_at: Utc::now(),
+            status,
+            recipient: None,
+            abort_handle: None,
+            history: Arc::new(RwLock::new(Vec::new())),
+            steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: "s".to_string(),
+            spawn_depth: 0,
+        }
+    }
+
+    /// NeedsInput: after a cancel/steer ends a suspended approval, the run must be
+    /// deterministically restored from `AwaitingInput` back to `Running` (no
+    /// zombie `AwaitingInput` left behind once it is running again).
+    #[test]
+    fn restore_run_downgrades_awaiting_input_to_running() {
+        let mut runs = vec![restore_test_run(
+            "r1",
+            SubAgentStatus::AwaitingInput {
+                prompt: "shell(rm -rf /tmp/x)".to_string(),
+            },
+        )];
+        restore_run_to_running(&mut runs, "r1");
+        assert!(
+            matches!(runs[0].status, SubAgentStatus::Running),
+            "AwaitingInput must be restored to Running on resume"
+        );
+    }
+
+    /// NeedsInput: a kill that already moved the run to a terminal `Failed` state
+    /// must NOT be resurrected to `Running` by the resume restore (terminal wins).
+    #[test]
+    fn restore_run_does_not_resurrect_terminal_failed() {
+        let mut runs = vec![restore_test_run("r2", SubAgentStatus::Failed("killed".to_string()))];
+        restore_run_to_running(&mut runs, "r2");
+        assert!(
+            matches!(runs[0].status, SubAgentStatus::Failed(ref m) if m == "killed"),
+            "a terminal Failed (kill) state must never be overwritten by Running"
+        );
+    }
+
+    /// NeedsInput: a completed run must likewise stay terminal.
+    #[test]
+    fn restore_run_does_not_resurrect_terminal_completed() {
+        let mut runs = vec![restore_test_run("r3", SubAgentStatus::Completed("ok".to_string()))];
+        restore_run_to_running(&mut runs, "r3");
+        assert!(
+            matches!(runs[0].status, SubAgentStatus::Completed(ref m) if m == "ok"),
+            "a terminal Completed state must never be overwritten by Running"
+        );
+    }
+
+    /// NeedsInput: an already-Running run is left as-is (idempotent), and an
+    /// unknown run id is a harmless no-op.
+    #[test]
+    fn restore_run_is_idempotent_and_ignores_unknown_id() {
+        let mut runs = vec![restore_test_run("r4", SubAgentStatus::Running)];
+        restore_run_to_running(&mut runs, "r4");
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
+        // Unknown id: no panic, no change.
+        restore_run_to_running(&mut runs, "does-not-exist");
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
     }
 }

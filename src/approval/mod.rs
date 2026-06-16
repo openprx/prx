@@ -407,7 +407,7 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let always_ask: HashSet<String> = ["shell"].iter().map(|s| (*s).to_string()).collect();
+        let always_ask: HashSet<String> = std::iter::once("shell".to_string()).collect();
         let mgr = ApprovalManager::from_autonomy_level_with_lists(AutonomyLevel::Supervised, auto_approve, always_ask);
         // Auto-approved read-only tools: no suspension under supervised.
         assert!(!mgr.needs_approval("file_read"));
