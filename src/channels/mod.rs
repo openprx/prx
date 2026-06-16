@@ -28,6 +28,7 @@ pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
+pub mod pre_gate;
 pub mod qq;
 pub mod signal;
 pub mod signal_native;
@@ -279,6 +280,10 @@ struct ChannelRuntimeContext {
     /// Per-group cooldown tracker for proactive (non-@) smart replies, to avoid
     /// the bot dominating a busy group. Keyed by `channel:group_id`.
     smart_reply_cooldown: Arc<parking_lot::Mutex<HashMap<String, std::time::Instant>>>,
+    /// Smart group-reply pre-gate config (heuristics + cheap-tier classifier).
+    /// Only consulted on smart-mode group turns where the bot was NOT explicitly
+    /// @-mentioned (the token-saving triage that runs before the agent loop).
+    smart_group: crate::config::SmartGroupConfig,
     /// Whether the configured provider supports native tool calling. Drives the
     /// non-native-only per-turn `stay_silent` instruction append on the static
     /// (skill-RAG-off) prompt path; native providers advertise it via filtered
@@ -2776,6 +2781,37 @@ async fn process_channel_message(
             tracing::debug!(channel = %msg.channel, "smart: skip proactive reply (within cooldown window)");
             return;
         }
+
+        // ── Token-saving pre-gate (Tier 1 heuristic + Tier 2 cheap classifier) ─
+        // Runs ONLY here: smart-mode + group + NOT @-mentioned. @-mentions, DMs,
+        // and non-smart modes never reach this branch, so they never pay the
+        // pre-gate cost and are never suppressed by it (invariant). Fail-open:
+        // any classifier fault enters the loop.
+        let pre_gate_outcome = run_smart_pre_gate(
+            ctx.as_ref(),
+            &history_key,
+            &user_text_for_mention,
+            route.provider.as_str(),
+            route.model.as_str(),
+            &active_provider,
+        )
+        .await;
+        tracing::debug!(
+            channel = %msg.channel,
+            path = pre_gate_outcome.path.as_str(),
+            enter_loop = pre_gate_outcome.should_enter_loop(),
+            "smart pre-gate decision"
+        );
+        if !pre_gate_outcome.should_enter_loop() {
+            // Stay silent: do not enter the loop, do not send, do not write an
+            // assistant turn (equivalent to the MVP-B Silent outcome). The
+            // inbound user turn was already persisted above; we leave it.
+            println!(
+                "  🤫 Smart pre-gate: staying silent (no LLM loop) [{}]",
+                pre_gate_outcome.path.as_str()
+            );
+            return;
+        }
     }
 
     let signal_vision_context = match run_signal_vision_preflight(
@@ -3478,6 +3514,132 @@ fn record_smart_proactive_reply(ctx: &ChannelRuntimeContext, msg: &traits::Chann
     let mut guard = ctx.smart_reply_cooldown.lock();
     guard.retain(|_, last| now.duration_since(*last) < window);
     guard.insert(key, now);
+}
+
+/// Number of recent turns scanned to decide whether the bot was "recently
+/// active" in this group (topic-continuation signal for the heuristic).
+const SMART_RECENT_ACTIVITY_SCAN: usize = 6;
+
+/// Gather the recent-history signals the pre-gate needs:
+///   - `recent_context`: up to `max_context` recent turns rendered as short
+///     `role: text` lines for the Tier-2 classifier prompt,
+///   - `bot_recently_active`: whether any of the last few turns was an assistant
+///     turn (the bot participated → topic-continuation bias toward replying).
+///
+/// Reads the canonical ∪ legacy union exactly like the loop's history rebuild.
+fn gather_pre_gate_history(
+    ctx: &ChannelRuntimeContext,
+    history_key: &ConversationKey,
+    max_context: usize,
+) -> (Vec<String>, bool) {
+    let turns = merged_history(&ctx.conversation_histories.lock(), history_key);
+    let bot_recently_active = turns
+        .iter()
+        .rev()
+        .take(SMART_RECENT_ACTIVITY_SCAN)
+        .any(|turn| turn.role == "assistant" && !turn.content.trim().is_empty());
+
+    let recent_context: Vec<String> = if max_context == 0 {
+        Vec::new()
+    } else {
+        turns
+            .iter()
+            .rev()
+            .take(max_context)
+            .rev()
+            .map(|turn| {
+                let role = if turn.role == "assistant" { "assistant" } else { "user" };
+                let body = strip_channel_metadata(&turn.content);
+                format!("{role}: {}", truncate_with_ellipsis(body.trim(), 200))
+            })
+            .collect()
+    };
+    (recent_context, bot_recently_active)
+}
+
+/// Resolve the (provider, model) the pre-gate Tier-2 classifier should use.
+///
+/// Preference order: explicit `smart_group.classifier_provider/model` config →
+/// the channel's already-resolved route provider+model (no extra construction).
+/// Returns the shared provider `Arc` plus the model id to use.
+async fn resolve_pre_gate_classifier(
+    ctx: &ChannelRuntimeContext,
+    route_provider: &str,
+    route_model: &str,
+    fallback_provider: &Arc<dyn Provider>,
+) -> (Arc<dyn Provider>, String) {
+    let cfg = &ctx.smart_group;
+    let model = if cfg.classifier_model.trim().is_empty() {
+        route_model.to_string()
+    } else {
+        cfg.classifier_model.trim().to_string()
+    };
+
+    if cfg.classifier_provider.trim().is_empty() || cfg.classifier_provider.trim() == route_provider {
+        // Reuse the channel's routed provider instance.
+        return (Arc::clone(fallback_provider), model);
+    }
+
+    match get_or_create_provider(ctx, cfg.classifier_provider.trim()).await {
+        Ok(provider) => (provider, model),
+        Err(err) => {
+            tracing::warn!(
+                provider = %cfg.classifier_provider,
+                "pre-gate classifier provider unavailable; reusing channel route provider: {err}"
+            );
+            (Arc::clone(fallback_provider), model)
+        }
+    }
+}
+
+/// Run the smart-group pre-gate for a non-@ group message: a cheap two-tier
+/// triage that decides whether to spend a full agent loop on this message.
+///
+/// 🔴 Invariant: this is only ever called for `smart_group && !mentioned` turns;
+/// the caller guarantees @-mentions / DMs / non-smart never reach here.
+/// 🔴 Fail-open: any classifier fault enters the loop (see `pre_gate` module).
+async fn run_smart_pre_gate(
+    ctx: &ChannelRuntimeContext,
+    history_key: &ConversationKey,
+    user_text: &str,
+    route_provider: &str,
+    route_model: &str,
+    active_provider: &Arc<dyn Provider>,
+) -> pre_gate::PreGateOutcome {
+    let cfg = &ctx.smart_group;
+    if !cfg.enabled {
+        return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::Disabled);
+    }
+
+    let (recent_context, bot_recently_active) =
+        gather_pre_gate_history(ctx, history_key, cfg.classifier_max_context_messages);
+
+    let heuristic = pre_gate::classify_heuristic(user_text, &ctx.bot_names, bot_recently_active);
+
+    // Decisive heuristic buckets short-circuit (0 tokens). Only the genuinely
+    // uncertain bucket consults the cheap classifier — that is the token-saving
+    // sweet spot: obvious-relevant and obvious-noise never pay for a model call.
+    match heuristic {
+        pre_gate::Heuristic::EnterLoop => pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::HeuristicEnter),
+        pre_gate::Heuristic::Skip => pre_gate::PreGateOutcome::skip(pre_gate::PreGatePath::HeuristicSkip),
+        pre_gate::Heuristic::Uncertain => {
+            if !cfg.classifier_enabled {
+                // Classifier off → err toward entering the loop (fail-open).
+                return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen);
+            }
+            let (provider, model) =
+                resolve_pre_gate_classifier(ctx, route_provider, route_model, active_provider).await;
+            pre_gate::classify_with_model(
+                provider.as_ref(),
+                &model,
+                cfg,
+                &recent_context,
+                user_text,
+                &ctx.bot_names,
+            )
+            .await
+        }
+    }
 }
 
 async fn run_message_dispatch_loop(
@@ -5154,6 +5316,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         mention_only_by_channel,
         group_reply_mode_by_channel,
         smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+        smart_group: config.smart_group.clone(),
         native_tools,
         skill_rag_ctx,
         #[cfg(test)]
@@ -5286,6 +5449,168 @@ mod tests {
         assert!(
             !modes.contains_key("slack"),
             "non-smart-capable channels are not registered"
+        );
+    }
+
+    /// Provider that returns a fixed string, recording how many classifier calls
+    /// were made — lets the pre-gate "token path" tests assert that the cheap
+    /// model is consulted ONLY for the uncertain bucket.
+    struct CountingProvider {
+        answer: String,
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for CountingProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.answer.clone())
+        }
+    }
+
+    fn pre_gate_history_key() -> ConversationKey {
+        ConversationKey {
+            canonical: "channel:telegram:alice:teamchat".to_string(),
+            legacy: "telegram_alice".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_gate_disabled_always_enters_loop() {
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.smart_group.enabled = false;
+        let provider: Arc<dyn Provider> = Arc::new(CountingProvider {
+            answer: "NO".into(),
+            calls: AtomicUsize::new(0),
+        });
+        // Even obvious noise enters the loop when the pre-gate is off.
+        let outcome = run_smart_pre_gate(
+            &ctx,
+            &pre_gate_history_key(),
+            "lol",
+            "test-provider",
+            "test-model",
+            &provider,
+        )
+        .await;
+        assert!(outcome.should_enter_loop());
+        assert_eq!(outcome.path, pre_gate::PreGatePath::Disabled);
+    }
+
+    #[tokio::test]
+    async fn pre_gate_heuristic_skip_never_calls_model() {
+        // Token path: obvious noise is skipped by the 0-token heuristic; the cheap
+        // classifier is NEVER invoked.
+        let ctx = ctx_with_histories(HashMap::new());
+        let counting = Arc::new(CountingProvider {
+            answer: "YES".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let provider: Arc<dyn Provider> = counting.clone();
+        let outcome = run_smart_pre_gate(
+            &ctx,
+            &pre_gate_history_key(),
+            "😂😂",
+            "test-provider",
+            "test-model",
+            &provider,
+        )
+        .await;
+        assert!(!outcome.should_enter_loop(), "pure emoji must be skipped");
+        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicSkip);
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            0,
+            "heuristic skip must not consult the classifier (token saving)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_gate_heuristic_enter_never_calls_model() {
+        // Token path: a clear question enters the loop via the heuristic with no
+        // classifier call.
+        let ctx = ctx_with_histories(HashMap::new());
+        let counting = Arc::new(CountingProvider {
+            answer: "NO".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let provider: Arc<dyn Provider> = counting.clone();
+        let outcome = run_smart_pre_gate(
+            &ctx,
+            &pre_gate_history_key(),
+            "what is the deploy status?",
+            "test-provider",
+            "test-model",
+            &provider,
+        )
+        .await;
+        assert!(outcome.should_enter_loop());
+        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicEnter);
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            0,
+            "heuristic enter must not consult the classifier (token saving)"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_gate_uncertain_consults_classifier_and_can_skip() {
+        // Token path: only the genuinely uncertain bucket pays for the cheap model.
+        let ctx = ctx_with_histories(HashMap::new());
+        let counting = Arc::new(CountingProvider {
+            answer: "NO".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let provider: Arc<dyn Provider> = counting.clone();
+        let outcome = run_smart_pre_gate(
+            &ctx,
+            &pre_gate_history_key(),
+            "the deploy went out an hour ago to all prod servers",
+            "test-provider",
+            "test-model",
+            &provider,
+        )
+        .await;
+        assert!(!outcome.should_enter_loop(), "classifier NO should skip");
+        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierSkip);
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            1,
+            "uncertain bucket consults the classifier exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_gate_uncertain_with_classifier_disabled_fails_open() {
+        // Fail-open: classifier off => uncertain enters the loop, no model call.
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.smart_group.classifier_enabled = false;
+        let counting = Arc::new(CountingProvider {
+            answer: "NO".into(),
+            calls: AtomicUsize::new(0),
+        });
+        let provider: Arc<dyn Provider> = counting.clone();
+        let outcome = run_smart_pre_gate(
+            &ctx,
+            &pre_gate_history_key(),
+            "the deploy went out an hour ago to all prod servers",
+            "test-provider",
+            "test-model",
+            &provider,
+        )
+        .await;
+        assert!(outcome.should_enter_loop(), "classifier disabled must fail open");
+        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierFailOpen);
+        assert_eq!(
+            counting.calls.load(Ordering::SeqCst),
+            0,
+            "classifier disabled => no call"
         );
     }
 
@@ -5454,6 +5779,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
@@ -5527,6 +5853,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
@@ -5904,6 +6231,7 @@ mod tests {
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             native_tools: false,
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
@@ -6627,6 +6955,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6712,6 +7041,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6797,6 +7127,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6884,6 +7215,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -6970,6 +7302,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7062,6 +7395,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7182,6 +7516,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7275,6 +7610,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7385,6 +7721,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7519,6 +7856,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7605,6 +7943,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -7858,6 +8197,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8211,6 +8551,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8342,6 +8683,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
@@ -8742,6 +9084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8852,6 +9195,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -8975,6 +9319,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9081,6 +9426,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9598,6 +9944,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9710,6 +10057,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
@@ -9815,6 +10163,7 @@ BTC is currently around $65,000 based on latest tool output."#
             mention_only_by_channel: HashMap::new(),
             group_reply_mode_by_channel: HashMap::new(),
             smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
+            smart_group: crate::config::SmartGroupConfig::default(),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
             security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
