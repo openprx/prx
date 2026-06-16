@@ -33,6 +33,23 @@ pub enum SessionCommand {
     Pty { command: String },
 }
 
+/// Parse a session display sequence argument (`N`) robustly.
+///
+/// v3b-a minor fix: `/kill N` was occasionally reported as "Unknown command"
+/// because the argument seen by the parser was not a bare integer. The two
+/// realistic causes are (a) the operator typing the displayed form `/kill #3`
+/// (sessions are shown as `#N`), and (b) stray surrounding whitespace from how
+/// the input line is assembled. Neither is a hard parser bug, but both are easy
+/// to tolerate: we trim whitespace, accept an optional leading `#`, and take the
+/// first whitespace-delimited token so a trailing comment / accidental extra
+/// token does not break the command. Returns `None` if no integer is present
+/// (so a genuinely malformed command still falls through cleanly).
+fn parse_seq_arg(arg: &str) -> Option<u64> {
+    let token = arg.split_whitespace().next()?;
+    let digits = token.strip_prefix('#').unwrap_or(token);
+    digits.parse::<u64>().ok()
+}
+
 /// Parse a chat session command from raw input.
 ///
 /// Returns `None` for anything that is not a recognised session command (the
@@ -85,22 +102,22 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
 
     // `/kill <seq>`
     if let Some(rest) = trimmed.strip_prefix("/kill") {
-        let arg = rest.strip_prefix(char::is_whitespace)?.trim();
-        let seq = arg.parse::<u64>().ok()?;
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Kill { seq });
     }
 
     // `/attach <seq>` (v1b)
     if let Some(rest) = trimmed.strip_prefix("/attach") {
-        let arg = rest.strip_prefix(char::is_whitespace)?.trim();
-        let seq = arg.parse::<u64>().ok()?;
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Attach { seq });
     }
 
     // `/logs <seq>` (v2)
     if let Some(rest) = trimmed.strip_prefix("/logs") {
-        let arg = rest.strip_prefix(char::is_whitespace)?.trim();
-        let seq = arg.parse::<u64>().ok()?;
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Logs { seq });
     }
 
@@ -108,7 +125,7 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
     if let Some(rest) = trimmed.strip_prefix("/steer") {
         let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
         let (seq_str, message) = rest.split_once(char::is_whitespace)?;
-        let seq = seq_str.parse::<u64>().ok()?;
+        let seq = parse_seq_arg(seq_str)?;
         let message = message.trim();
         if message.is_empty() {
             return None;
@@ -187,6 +204,42 @@ mod tests {
     fn kill_requires_numeric_seq() {
         assert_eq!(parse_session_command("/kill abc"), None);
         assert_eq!(parse_session_command("/kill"), None);
+    }
+
+    #[test]
+    fn kill_tolerates_hash_and_whitespace() {
+        // v3b-a minor fix: the displayed form `#N` and stray surrounding
+        // whitespace must parse, not fall through to "Unknown command".
+        assert_eq!(parse_session_command("/kill #2"), Some(SessionCommand::Kill { seq: 2 }));
+        assert_eq!(
+            parse_session_command("/kill   3"),
+            Some(SessionCommand::Kill { seq: 3 })
+        );
+        assert_eq!(
+            parse_session_command("  /kill 4  "),
+            Some(SessionCommand::Kill { seq: 4 })
+        );
+        // A trailing extra token is ignored (first token wins) rather than
+        // rejecting the whole command.
+        assert_eq!(
+            parse_session_command("/kill 5 extra"),
+            Some(SessionCommand::Kill { seq: 5 })
+        );
+        // The same tolerance applies to the sibling seq commands.
+        assert_eq!(
+            parse_session_command("/attach #7"),
+            Some(SessionCommand::Attach { seq: 7 })
+        );
+        assert_eq!(parse_session_command("/logs #9"), Some(SessionCommand::Logs { seq: 9 }));
+        assert_eq!(
+            parse_session_command("/steer #3 do it"),
+            Some(SessionCommand::Steer {
+                seq: 3,
+                message: "do it".to_string()
+            })
+        );
+        // A bare `#` with no digits is still rejected.
+        assert_eq!(parse_session_command("/kill #"), None);
     }
 
     #[test]

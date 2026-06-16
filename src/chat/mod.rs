@@ -2609,25 +2609,38 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 chat_sessions.kind_for_seq(seq).await,
                                 Ok(crate::chat::sessions::model::ManagedKind::Pty)
                             ) {
-                                let exited = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
-                                if exited {
-                                    emit_chat_output(&format!(
-                                        "Interactive PTY session #{seq} has exited — nothing to attach to. \
-                                         Start a new one with /pty <command>."
-                                    ));
-                                } else {
-                                    emit_chat_output(&format!(
-                                        "Session #{seq} is an interactive PTY, not a streamed session. \
-                                         Use /pty <command> to open an interactive terminal (live read-only follow does not apply to PTYs)."
-                                    ));
+                                // v3b: a live PTY can be RE-ATTACHED — the detach
+                                // path keeps the child running, so `/attach #N`
+                                // (and the Ctrl+G switcher's synthetic /attach)
+                                // hands the terminal back to it. An exited PTY is
+                                // terminal and cannot be attached.
+                                let pty = chat_sessions.pty_for_seq_public(seq);
+                                match pty {
+                                    Some(session) if session.is_attachable() => {
+                                        reattach_pty(
+                                            &session,
+                                            seq,
+                                            &pty_handoff,
+                                            sessions_redraw_handle.as_ref(),
+                                            &emit_chat_output,
+                                        )
+                                        .await;
+                                    }
+                                    _ => {
+                                        emit_chat_output(&format!(
+                                            "Interactive PTY session #{seq} has exited — nothing to attach to. \
+                                             Start a new one with /pty <command>."
+                                        ));
+                                    }
                                 }
                                 // Restore the prompt/focus the switcher may have set
-                                // optimistically (it pointed at this seq before we
-                                // declined the follow), so perception matches routing.
+                                // optimistically (it pointed at this seq before the
+                                // handoff), so the chat prompt is not left targeting
+                                // the detached PTY for steering.
                                 let prev_focus = crate::chat::sessions::focus::rollback_focus(attached_follow_seq);
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
-                                    "chat.session_focus_attach_pty_decline",
+                                    "chat.session_focus_attach_pty_done",
                                 );
                                 chat_mirror.lock().focus = prev_focus;
                                 if let Some(tx) = sessions_redraw_handle.as_ref() {
@@ -4449,7 +4462,7 @@ async fn handle_pty_command(
     redraw_handle: Option<&mpsc::Sender<()>>,
     emit_chat_output: &impl Fn(&str),
 ) {
-    use crate::chat::sessions::pty::{PtyHandoffGuard, PtyShellSession};
+    use crate::chat::sessions::pty::PtyShellSession;
     use portable_pty::PtySize;
 
     // Host terminal size → PTY winsize (fall back to a sane 80x24).
@@ -4468,8 +4481,19 @@ async fn handle_pty_command(
         },
     );
 
-    let (session, io) = match PtyShellSession::spawn(command, security, size) {
-        Ok(pair) => pair,
+    // v3b: enforce the live-PTY cap before spawning. Detached PTYs stay alive
+    // (each holds a drain thread + ring + fds), so refuse a new one past the limit
+    // with a hint to `/kill` an existing session.
+    if chat_sessions.live_pty_count() >= crate::chat::sessions::pty::MAX_LIVE_PTYS {
+        emit_chat_output(&format!(
+            "Too many live PTY sessions (limit {}). Detach and /kill one before opening another.",
+            crate::chat::sessions::pty::MAX_LIVE_PTYS
+        ));
+        return;
+    }
+
+    let session = match PtyShellSession::spawn(command, security, size) {
+        Ok(session) => session,
         Err(e) => {
             emit_chat_output(&format!("Failed to start interactive PTY session: {e}"));
             return;
@@ -4480,6 +4504,37 @@ async fn handle_pty_command(
         "Interactive PTY session #{seq}: {command} — Ctrl-] to detach (Ctrl-C/Ctrl-D pass through to the shell)."
     ));
 
+    // First `/pty` goes straight through the unified re-attach entry point, so the
+    // spawn path and a later `/attach` share exactly one passthrough code path.
+    reattach_pty(&session, seq, handoff, redraw_handle, emit_chat_output).await;
+}
+
+/// Re-attach (or first-attach) to a live PTY session: hand the terminal to it,
+/// replay recent context, drive the stdin↔PTY passthrough, and on detach restore
+/// the chat TUI **without killing the PTY** (v3b).
+///
+/// This is the single entry point for both `/pty <cmd>` (right after spawn) and
+/// `/attach <seq>` of an already-live PTY. It reuses every v3a safety mechanism:
+///
+/// - [`PtyHandoffGuard::acquire`] pauses the render loop and refuses the attach
+///   (returning the terminal untouched) if the loop never acks the pause; and
+/// - the guard's `Drop` restores terminal modes + forces a full redraw on every
+///   exit path (detach, child exit, error, panic).
+///
+/// Unlike v3a, the persistent drain reader and the writer live in the session's
+/// runtime and survive detach: this function only *borrows* them for the attach.
+/// Detach flips the sink off `stdout` (under the sink lock, so no byte races the
+/// render loop's resume) and leaves the child running.
+#[cfg(feature = "terminal-tui")]
+async fn reattach_pty(
+    session: &crate::chat::sessions::pty::PtyShellSession,
+    seq: u64,
+    handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    redraw_handle: Option<&mpsc::Sender<()>>,
+    emit_chat_output: &impl Fn(&str),
+) {
+    use crate::chat::sessions::pty::PtyHandoffGuard;
+
     // Build a redraw nudge for the guard so the chat TUI repaints the instant we
     // resume (rather than waiting out the render loop's idle poll).
     let redraw_nudge: Option<Box<dyn Fn() + Send>> = redraw_handle.cloned().map(|tx| {
@@ -4489,56 +4544,47 @@ async fn handle_pty_command(
         f
     });
 
-    // Run the passthrough on a blocking thread. The `PtyHandoffGuard` is acquired
-    // *inside* that thread (pausing the render loop + waiting for its ack) and
-    // dropped when the closure returns — on detach, child exit, error, OR panic —
-    // so the chat TUI is always restored. We move the session in for resize and
-    // post-exit reaping.
     let handoff = Arc::clone(handoff);
     let session_for_passthrough = session.clone();
     let outcome = tokio::task::spawn_blocking(move || {
-        // Acquire the handoff guard: this pauses the render loop and waits for it
-        // to acknowledge it has parked. If the ack times out we do NOT proceed —
-        // running the passthrough while the render loop might still touch the
-        // terminal would corrupt the screen. `acquire` returns `None` after
-        // having already un-paused the render loop, so we just report the abort.
+        // Acquire the handoff guard: pause the render loop and wait for its ack. If
+        // the ack times out we do NOT proceed (running while the render loop might
+        // still touch the terminal would corrupt the screen). `acquire` un-pauses
+        // the render loop itself on timeout, so we just report the abort.
         let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
-            return Ok(PtyOutcome::AttachAborted);
+            return PtyOutcome::AttachAborted;
         };
-        run_pty_passthrough(io, &session_for_passthrough).map(PtyOutcome::Exited)
-        // `_guard` drops here → terminal modes restored, then render loop resumes
-        //  + full redraw forced.
+        PtyOutcome::Exited(run_pty_attach(&session_for_passthrough))
+        // `_guard` drops here → terminal modes restored, render loop resumes +
+        // full redraw forced. The PTY child stays alive (no kill on detach).
     })
     .await;
 
-    // Best-effort: terminate the child's process group so a detach (Ctrl-]) does
-    // not leave an interactive shell running headless with no way to see it.
-    // (If the child already exited this is a no-op.) Skipped when the attach was
-    // aborted before any handoff — but a harmless no-op even then.
-    if let Err(e) = session.kill().await {
-        tracing::warn!(error = %e, seq, "failed to terminate PTY group after detach");
-    }
-
     match outcome {
-        Ok(Ok(PtyOutcome::Exited(PtyExit::Detached))) => {
-            emit_chat_output(&format!("Detached from PTY session #{seq}."));
+        Ok(PtyOutcome::Exited(PtyExit::Detached)) => {
+            emit_chat_output(&format!(
+                "Detached from PTY session #{seq} (still running — /attach #{seq} to return, /kill #{seq} to stop)."
+            ));
         }
-        Ok(Ok(PtyOutcome::Exited(PtyExit::ChildExited))) => {
+        Ok(PtyOutcome::Exited(PtyExit::ChildExited)) => {
+            // The child exited; reap the drain thread so it does not linger.
+            session.reap_reader();
             emit_chat_output(&format!("Interactive PTY session #{seq} exited."));
         }
-        Ok(Ok(PtyOutcome::AttachAborted)) => {
-            // The render loop never acked the pause, so we refused the handoff to
-            // avoid two threads fighting over the terminal. The session was
-            // killed above; tell the user why nothing happened.
+        Ok(PtyOutcome::AttachAborted) => {
+            // The render loop never acked the pause; we refused the handoff to
+            // avoid two threads fighting over the terminal. The PTY is untouched
+            // and still attachable later.
             tracing::warn!(seq, "PTY attach aborted: render loop did not park in time");
             emit_chat_output(&format!(
                 "Could not enter PTY session #{seq}: the chat renderer did not pause in time (terminal unchanged)."
             ));
         }
-        Ok(Err(e)) => emit_chat_output(&format!("PTY session #{seq} error: {e}")),
         Err(e) => {
             // The passthrough task panicked; the guard's Drop still ran during
-            // unwind, so the terminal is restored. Surface the fault.
+            // unwind, so the terminal is restored. The session detaches defensively
+            // (it stays alive for a later attempt). Surface the fault.
+            session.detach();
             tracing::error!(error = %e, seq, "PTY passthrough task panicked");
             emit_chat_output(&format!("PTY session #{seq} ended unexpectedly; terminal restored."));
         }
@@ -4567,135 +4613,117 @@ enum PtyExit {
     ChildExited,
 }
 
-/// Drive the raw terminal ⇄ PTY byte passthrough until detach or child exit.
+/// Drive the raw terminal ⇄ PTY byte passthrough for an attach until detach or
+/// child exit (v3b).
 ///
 /// Runs on a `spawn_blocking` thread with the chat render loop parked (the
-/// [`PtyHandoffGuard`] owned by the caller guarantees that). It owns the real
-/// terminal's `stdin`/`stdout` for the duration:
+/// [`PtyHandoffGuard`] owned by the caller guarantees that). Unlike v3a it does
+/// **not** spawn a per-attach reader or own the writer: the session's persistent
+/// drain reader is already running, and this function only:
 ///
-/// - a dedicated **reader thread** copies PTY output → `stdout` (so curses
-///   programs draw normally), signalling `child_done` on EOF (child exit);
-/// - this thread reads raw `stdin` with a short poll timeout, classifies each
-///   byte ([`crate::chat::sessions::pty::classify_input_byte`]) — `Ctrl-]`
-///   detaches, everything else (including `Ctrl-C`/`Ctrl-D`) is forwarded to the
-///   PTY writer — and rechecks `child_done` between polls so a child that exits
-///   while the user is idle still ends the passthrough promptly.
+/// 1. syncs the PTY + emulator to the current host size, clears the screen, and
+///    renders the in-process emulator's current screen so the user sees the exact
+///    on-screen state (re-attach restore, v3b-b — correct for vim/htop, not just a
+///    raw byte replay);
+/// 2. marks the sink attached so the drain reader mirrors live PTY output to
+///    `stdout` while we are here;
+/// 3. nudges the child with a `SIGWINCH` size jitter as a secondary safeguard so a
+///    program tracking its own size also re-flows (v3b-b);
+/// 4. reads raw `stdin`, classifying each byte
+///    ([`crate::chat::sessions::pty::classify_input_byte`]) — `Ctrl-]` detaches,
+///    everything else (incl. `Ctrl-C`/`Ctrl-D`) is forwarded to the PTY child —
+///    and rechecks the child-done flag each tick so a child that exits while the
+///    user is idle ends the attach promptly.
 ///
-/// Never panics: all I/O errors are returned as `Err` (the guard still restores
-/// the terminal). The PTY writer is owned solely by this thread (synchronous
-/// `Write`, no lock, never across an `.await`).
+/// On **every** exit path (detach, child exit, error, panic) the local RAII
+/// `AttachScope` detaches the sink — under the sink lock, so the drain reader is
+/// guaranteed to have stopped writing `stdout` before the `PtyHandoffGuard`
+/// resumes the chat render loop (the v3a invariant). The child is **not** killed:
+/// the PTY stays alive for a later re-attach. Never panics: I/O errors end the
+/// attach and the guard still restores the terminal.
 #[cfg(feature = "terminal-tui")]
-fn run_pty_passthrough(
-    io: crate::chat::sessions::pty::PtyIo,
-    session: &crate::chat::sessions::pty::PtyShellSession,
-) -> Result<PtyExit> {
-    use crate::chat::sessions::pty::{InputByte, ReaderOutcome, ReaderStop, classify_input_byte, read_pty_to_stdout};
+fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyExit {
+    use crate::chat::sessions::pty::{InputByte, classify_input_byte};
     use std::io::Write as _;
 
-    #[cfg(unix)]
-    let crate::chat::sessions::pty::PtyIo {
-        mut reader,
-        writer,
-        master_fd,
-    } = io;
-    #[cfg(not(unix))]
-    let crate::chat::sessions::pty::PtyIo { mut reader, writer } = io;
+    // Current host geometry (for resize-forward seed + redraw nudge). Fall back to
+    // a sane 80x24 if crossterm cannot read it.
+    let host_size = || {
+        crossterm::terminal::size().map_or(
+            portable_pty::PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            |(cols, rows)| portable_pty::PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+    };
 
-    // Clear the screen + home the cursor so the PTY child starts on a clean
-    // surface (the chat inline chrome was drawn at the bottom before the
-    // handoff). Best-effort: a failure here is non-fatal (the child will repaint
-    // its own UI), and the guard's post-handoff full redraw cleans up either way.
+    // RAII: detach the sink on EVERY exit path (incl. panic unwind) so the drain
+    // reader stops mirroring to `stdout` before the chat render loop resumes.
+    struct AttachScope<'a> {
+        session: &'a crate::chat::sessions::pty::PtyShellSession,
+    }
+    impl Drop for AttachScope<'_> {
+        fn drop(&mut self) {
+            // Under the sink lock: after this returns the reader will not write
+            // `stdout` again until re-attached (v3a invariant). Does NOT kill the
+            // child — the PTY survives detach for re-attach.
+            self.session.detach();
+        }
+    }
+    let _scope = AttachScope { session };
+
+    // 0. Sync the PTY + emulator to the CURRENT host geometry BEFORE rendering the
+    //    restore. The host may have been resized while this PTY was detached; if we
+    //    rendered the emulator's old-size screen it would be offset / wrapped wrong.
+    //    `resize` updates the emulator grid and the PTY master together (v3b-b), so
+    //    the subsequent `attach()` redraw is laid out for the real terminal. Cheap,
+    //    synchronous, non-fatal.
+    if let Err(e) = session.resize(host_size()) {
+        tracing::debug!(error = %e, "PTY resize-to-host before re-attach redraw failed");
+    }
+
+    // 1. Clear the screen + home the cursor, then attach. `attach()` flips the sink
+    //    to `attached` AND renders the emulator's CURRENT screen to `stdout`
+    //    atomically under the sink lock (v3b-b): because the drain reader's
+    //    live-mirror `write()` (which also feeds the emulator) contends for that
+    //    same lock, the screen-restore escape codes can never interleave with live
+    //    bytes — the restore completes first, then live bytes follow in order.
+    //    Rendering from the emulator (`state_formatted`) rather than replaying the
+    //    raw ring means full-screen programs (vim/htop) re-appear correct on the
+    //    first frame instead of being scrambled by spliced-in cursor sequences.
     {
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[2J\x1b[H");
         let _ = out.flush();
     }
+    session.attach();
 
-    // ── Reader thread: PTY output → stdout (interruptible) ────────────────────
-    //
-    // The reader does NOT wait for EOF: a backgrounded grandchild (e.g.
-    // `sleep 300 &`, reparented to init so `killpg` cannot reach it) can hold the
-    // slave PTY open forever. Instead the reader `poll`s the master fd with a
-    // 100 ms timeout and checks `reader_stop` each cycle, so on detach we set the
-    // stop flag and the `join` below is always bounded — the chat can never
-    // freeze waiting on an orphan.
-    let reader_stop = Arc::new(ReaderStop::new());
-    // `child_done` records that the reader observed EOF (true child exit), so the
-    // stdin loop can end the passthrough promptly when the child exits while the
-    // user is idle.
-    let child_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let reader_stop_thread = Arc::clone(&reader_stop);
-    let child_done_thread = Arc::clone(&child_done);
-    let reader_handle = std::thread::spawn(move || {
-        let mut out = std::io::stdout();
-        let outcome = read_pty_to_stdout(
-            reader.as_mut(),
-            &mut out,
-            &reader_stop_thread,
-            #[cfg(unix)]
-            master_fd,
-            std::time::Duration::from_millis(100),
-        );
-        // Only EOF means the child genuinely exited; a Stopped/StdoutGone outcome
-        // is a teardown signal, not a child-exit signal.
-        if outcome == ReaderOutcome::Eof {
-            child_done_thread.store(true, Ordering::Release);
-        }
-    });
-
-    // RAII cleanup: runs on EVERY exit path of the stdin loop — `Ok`, `?`
-    // early-return, or panic unwind — so the reader thread is always stopped and
-    // joined (bounded) and the child group is killed before the `PtyHandoffGuard`
-    // resumes the chat render loop. Without this, an error in the stdin/writer
-    // loop would skip cleanup and the reader could keep scribbling on `stdout`
-    // over the restored TUI (Codex P0-B).
-    struct PassthroughCleanup<'a> {
-        session: &'a crate::chat::sessions::pty::PtyShellSession,
-        reader_stop: Arc<ReaderStop>,
-        reader_handle: Option<std::thread::JoinHandle<()>>,
-        writer: Option<Box<dyn std::io::Write + Send>>,
-    }
-    impl Drop for PassthroughCleanup<'_> {
-        fn drop(&mut self) {
-            // Terminate the child's group synchronously (no async grace) so the
-            // master closes and an orphan can't keep us alive. Idempotent / a
-            // no-op if the child already exited.
-            self.session.kill_now();
-            // Ask the reader thread to stop at its next poll cycle (it does NOT
-            // wait for EOF, so this is what guarantees a bounded join).
-            self.reader_stop.stop();
-            // Drop our writer so the slave end observes EOF too.
-            self.writer.take();
-            // Bounded join: the reader exits within one poll cycle (~100 ms) of
-            // the stop flag, so by the time the guard resumes the render loop no
-            // other thread is writing to `stdout`.
-            if let Some(handle) = self.reader_handle.take() {
-                let _ = handle.join();
-            }
-        }
-    }
-
-    // Move the writer into the cleanup guard so it is owned in exactly one place
-    // and dropped during cleanup. We forward bytes to it through the guard.
-    let mut cleanup = PassthroughCleanup {
-        session,
-        reader_stop: Arc::clone(&reader_stop),
-        reader_handle: Some(reader_handle),
-        writer: Some(writer),
-    };
+    // 3. Secondary safeguard (v3b-b): the emulator already restored the picture, but
+    //    nudge the child with a SIGWINCH size jitter so a program tracking its own
+    //    size also re-flows. Harmless to streaming programs.
+    session.nudge_redraw(host_size());
 
     // ── This thread: stdin → PTY writer, watching for detach + child exit ─────
-    // The result is captured (not `?`-propagated directly) so `cleanup`'s Drop
-    // runs on success AND error before we return. (Drop also runs on panic.)
     //
-    // v5: forward host terminal resizes to the PTY. The chat render loop is
-    // parked during the handoff, so crossterm `Resize` events go unconsumed;
-    // instead we poll the host size each loop tick (≤100 ms) and push a `resize`
-    // to the PTY master whenever it changes, so full-screen curses programs
-    // (vim, htop, …) re-flow. `resize` is cheap, synchronous and non-panicking
-    // (errors are logged, never fatal — a failed resize just leaves the old
-    // geometry). We seed `last_size` from the spawn-time geometry so the first
-    // real change is detected.
+    // The session's drain reader owns child-done detection; we borrow its flag so
+    // the stdin loop ends promptly when the child exits while the user is idle.
+    let child_done = session.child_done_flag();
+
+    // v5: forward host terminal resizes to the PTY. The chat render loop is parked
+    // during the handoff, so crossterm `Resize` events go unconsumed; instead we
+    // poll the host size each loop tick (≤100 ms) and push a `resize` to the PTY
+    // master whenever it changes, so full-screen curses programs (vim, htop, …)
+    // re-flow. `resize` is cheap, synchronous and non-panicking. We seed
+    // `last_size` from the geometry we just nudged to so the first real change is
+    // detected.
     let mut last_size: Option<(u16, u16)> = crossterm::terminal::size().ok();
     let on_tick = || {
         if let Ok((cols, rows)) = crossterm::terminal::size() {
@@ -4716,20 +4744,27 @@ fn run_pty_passthrough(
         match classify_input_byte(byte) {
             InputByte::Detach => Ok(true), // stop the loop (detach)
             InputByte::Forward => {
-                let w = cleanup
-                    .writer
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("PTY writer already closed"))?;
-                w.write_all(&[byte]).and_then(|()| w.flush())?;
+                // Forward to the session writer. If the writer is gone the child
+                // has exited / been reaped — treat as child exit (stop the loop)
+                // rather than erroring, so detach stays clean.
+                if session.write_input(byte).is_err() {
+                    return Ok(true);
+                }
                 Ok(false)
             }
         }
     });
 
-    // `cleanup` drops at end of scope (kill_now + stop reader + drop writer +
-    // bounded join) regardless of whether `result` is Ok or Err.
-    drop(cleanup);
-    result
+    // `_scope` drops here (detach sink) regardless of how the loop ended. Map any
+    // stdin-loop error to a child-exit-equivalent terminal outcome — the PTY is
+    // left alive and re-attachable; the guard restores the terminal.
+    match result {
+        Ok(exit) => exit,
+        Err(e) => {
+            tracing::warn!(error = %e, "PTY attach stdin loop ended with error; detaching");
+            PtyExit::Detached
+        }
+    }
 }
 
 /// Read raw `stdin` byte-by-byte, invoking `on_byte` for each, until `on_byte`
