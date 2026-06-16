@@ -14,7 +14,7 @@ use crate::router::automix::{ConfidenceChecker, is_cheap_model_target, should_es
 use crate::runtime::control_ladder::{ControlLadderSnapshot, ControlLadderTrace, append_control_ladder_trace};
 #[cfg(feature = "llm-router")]
 use crate::self_system::SELF_SYSTEM_SESSION_ID;
-use crate::tools::Tool;
+use crate::tools::{Tool, filter_tool_specs_for_exposure};
 use anyhow::Result;
 #[cfg(feature = "llm-router")]
 use chrono::Utc;
@@ -885,7 +885,7 @@ impl Agent {
                     }),
                 )
                 .await;
-            let dynamic_tool_specs: Vec<_> = if self.tool_tiering.enabled {
+            let mut dynamic_tool_specs: Vec<_> = if self.tool_tiering.enabled {
                 // Extract last user message for intent classification
                 let last_user_msg = self
                     .history
@@ -910,6 +910,9 @@ impl Agent {
             } else {
                 self.tools.iter().flat_map(|tool| tool.specs()).collect()
             };
+            // Agent::turn is never a smart-group-reply turn; stay_silent must not be
+            // advertised to the model on this path (expose_stay_silent = false).
+            filter_tool_specs_for_exposure(&mut dynamic_tool_specs, false);
             #[allow(unused_mut)]
             let mut response = match self
                 .provider
