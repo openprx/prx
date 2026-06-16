@@ -2050,7 +2050,13 @@ fn canonical_provider_info(provider_name: &str) -> Option<ProviderInfo> {
     })
 }
 
-const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &["kimi2.6", "kimi-for-coding", "kimi-k2.5"];
+const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &[
+    "kimi2.6",
+    "kimi-for-coding",
+    "kimi-k2.5",
+    "kimi-k2.7-code",
+    "kimi-k2.7-code-highspeed",
+];
 
 /// Validate model IDs that PRX can safely validate locally.
 ///
@@ -3406,6 +3412,8 @@ mod tests {
     fn validate_provider_model_rejects_unknown_kimi_code_model() {
         assert!(validate_provider_model("kimi-code", "kimi2.6").is_ok());
         assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code-highspeed").is_ok());
 
         let err = validate_provider_model("kimi-code", "definitely-not-a-real-model")
             .expect_err("unknown Kimi Code model should fail local validation")
