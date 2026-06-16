@@ -343,12 +343,50 @@ impl PtySink {
         })))
     }
 
-    /// Mark the sink attached (reader will mirror to `stdout`). Returns the
-    /// current ring contents so the caller can replay them to restore context.
-    fn attach_and_snapshot(&self) -> Vec<u8> {
+    /// Mark the sink attached **and** replay the ring to `stdout` atomically under
+    /// the sink lock, so the replayed scrollback can never interleave with live
+    /// bytes from the drain reader.
+    ///
+    /// v3b-a blocker-1 fix: previously the caller snapshotted the ring under the
+    /// lock, returned, then replayed *outside* the lock — leaving a window where
+    /// the (already `attached`) drain reader's `write()` could mirror live bytes to
+    /// `stdout` interleaved with the replay, corrupting full-screen escape
+    /// sequences. By flipping `attached` and writing the replay under the **same**
+    /// lock the reader's `write()` contends for, the replay completes before any
+    /// live byte reaches `stdout`; bytes the child produced *during* the replay are
+    /// read by the drain reader only after this unlocks and are then mirrored in
+    /// order, right after the replay. No byte is lost, none is reordered.
+    ///
+    /// The `stdout` write is bounded (the ring is capped at [`PTY_RING_CAPACITY`] =
+    /// 256 KiB) and synchronous — the same locking discipline `PtySink::write`
+    /// already uses for live mirroring, so this introduces no new lock-hold class.
+    /// `parking_lot`, never held across `.await`.
+    fn attach_and_replay(&self) {
+        let mut out = std::io::stdout();
+        self.attach_and_replay_to(&mut out);
+    }
+
+    /// Inner implementation of [`attach_and_replay`] with the replay target
+    /// injected, so tests can assert the under-lock ordering against a capturing
+    /// sink instead of the real terminal. Production always passes `stdout`.
+    ///
+    /// Holds the sink lock across the `attached = true` flip AND the replay write,
+    /// so the drain reader's [`PtySink::write`] (which takes the same lock) cannot
+    /// interleave live bytes with the replay.
+    fn attach_and_replay_to(&self, out: &mut dyn std::io::Write) {
         let mut inner = self.0.lock();
         inner.attached = true;
-        inner.ring.iter().copied().collect()
+        if inner.ring.is_empty() {
+            return;
+        }
+        // `VecDeque` may be split across two contiguous slices; write both in
+        // order so the replay is byte-exact.
+        let (front, back) = inner.ring.as_slices();
+        let _ = out.write_all(front);
+        if !back.is_empty() {
+            let _ = out.write_all(back);
+        }
+        let _ = out.flush();
     }
 
     /// Mark the sink detached (reader stops mirroring to `stdout`, keeps draining
@@ -358,6 +396,13 @@ impl PtySink {
     /// invariant.
     fn detach(&self) {
         self.0.lock().attached = false;
+    }
+
+    /// Test-only: snapshot the ring contents without touching `stdout` or the
+    /// `attached` flag, so unit tests can inspect what the reader buffered.
+    #[cfg(test)]
+    fn attach_and_snapshot_vec_for_test(&self) -> Vec<u8> {
+        self.0.lock().ring.iter().copied().collect()
     }
 }
 
@@ -602,16 +647,28 @@ impl PtyShellSession {
         Arc::clone(&self.runtime.child_done)
     }
 
-    /// Begin an attach: mark the sink attached (the drain reader resumes
-    /// mirroring PTY output to `stdout`) and return the current ring contents so
-    /// the caller can replay them to restore on-screen context.
+    /// Begin an attach: under the sink lock, mark the sink attached (the drain
+    /// reader resumes mirroring PTY output to `stdout`) **and** replay the current
+    /// ring to `stdout` to restore on-screen context — atomically, so the replay
+    /// never interleaves with the reader's live mirror (v3b-a blocker-1).
     ///
-    /// Idempotent-ish: calling while already attached just re-snapshots. The
-    /// caller is responsible for ensuring only one attach is active at a time
-    /// (the chat main loop is single-threaded, so this holds).
+    /// Idempotent-ish: calling while already attached just re-replays the ring. The
+    /// caller is responsible for ensuring only one attach is active at a time (the
+    /// chat main loop is single-threaded, so this holds).
+    pub fn attach(&self) {
+        self.runtime.sink.attach_and_replay();
+    }
+
+    /// Mark the sink attached and return the current ring contents WITHOUT writing
+    /// them to `stdout`. Test-only: lets unit tests peek the ring (and assert the
+    /// drain reader filled it) without touching the real terminal. Production
+    /// attach uses [`PtyShellSession::attach`], which replays under the lock.
+    #[cfg(test)]
     #[must_use]
-    pub fn attach(&self) -> Vec<u8> {
-        self.runtime.sink.attach_and_snapshot()
+    pub fn attach_snapshot_for_test(&self) -> Vec<u8> {
+        let mut inner = self.runtime.sink.0.lock();
+        inner.attached = true;
+        inner.ring.iter().copied().collect()
     }
 
     /// End an attach: stop mirroring PTY output to `stdout` (the drain reader
@@ -657,19 +714,36 @@ impl PtyShellSession {
         }
     }
 
+    /// Maximum time [`reap_reader`] will wait for the drain-reader thread to finish
+    /// before giving up and detaching it (v3b-a blocker-2: a truly bounded join).
+    const REAP_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+
     /// Tear down the persistent drain reader: request it to stop, drop the writer
-    /// (so the slave observes EOF), and bounded-join the reader thread. Idempotent
-    /// and never panics. Called from the kill paths (`/kill`, chat exit) and when
-    /// reaping a dead PTY, so no drain thread outlives the session.
+    /// (so the slave observes EOF), and **bounded**-join the reader thread.
+    /// Idempotent and never panics. Called from the kill paths (`/kill`, chat exit)
+    /// and when reaping a dead PTY, so no drain thread outlives the session.
+    ///
+    /// v3b-a blocker-2: the previous `handle.join()` was unbounded despite the
+    /// "bounded" claim — if the reader were stuck (a backgrounded grandchild
+    /// reparented to init holds the slave open so no EOF arrives, or the non-Unix
+    /// blocking-read fallback is parked on an idle orphan), `join()` could hang the
+    /// whole chat. We now poll [`std::thread::JoinHandle::is_finished`] up to
+    /// [`Self::REAP_JOIN_DEADLINE`]; past the deadline we detach the (already
+    /// stopped) thread and `warn`, so the chat main path never blocks. The reader
+    /// is flagged to stop and will exit at its next poll cycle (≤ its poll
+    /// timeout), so the detached thread is a parked, short-lived leak at worst.
     pub fn reap_reader(&self) {
+        // 1. Ask the reader to stop at its next poll cycle.
         self.runtime.reader_stop.stop();
-        // Drop the writer so the slave end can observe EOF.
+        // 2. Drop the writer so the slave end can observe EOF.
         let _ = self.runtime.writer.lock().take();
-        // Detach the sink defensively so nothing mirrors to stdout during teardown.
+        // 3. Detach the sink defensively so nothing mirrors to stdout during
+        //    teardown.
         self.runtime.sink.detach();
+        // 4. Bounded join: never block the chat path on a stuck reader.
         let handle = self.runtime.reader_handle.lock().take();
         if let Some(handle) = handle {
-            let _ = handle.join();
+            bounded_join(handle, Self::REAP_JOIN_DEADLINE);
         }
     }
 
@@ -756,18 +830,41 @@ impl PtyShellSession {
     /// a no-op (`killpg` returns `ESRCH`, mapped to `Ok` by
     /// [`super::shell::kill_process_group`]).
     pub async fn kill(&self) -> Result<()> {
-        // v3b: stop the persistent drain reader and join it (bounded) before/while
-        // we kill the group, so no drain thread or writer fd outlives the session.
-        self.reap_reader();
-        #[cfg(unix)]
-        {
-            if let Some(pgid) = self.pgid {
-                return super::shell::kill_process_group(pgid).await;
+        // v3b-a blocker-2: SIGNAL THE CHILD FIRST, then reap the reader.
+        //
+        // The old order (reap_reader → kill_process_group) could hang: if the
+        // reader were stuck waiting on a slave fd held open by a reparented
+        // grandchild, the (then-unbounded) join blocked *before* we ever killed the
+        // group. Killing the group first makes the master hit EOF promptly, so the
+        // reader's poll returns and its (now bounded) join completes fast; even in
+        // the pathological case the bounded join in `reap_reader` guarantees we
+        // never block the chat path.
+        let kill_result: Result<()> = {
+            #[cfg(unix)]
+            {
+                if let Some(pgid) = self.pgid {
+                    super::shell::kill_process_group(pgid).await
+                } else {
+                    // No pgid: fall back to the direct child killer. Bind the
+                    // result so the `MutexGuard` is dropped before the `?`/return.
+                    let r = self.child.lock().kill();
+                    r.map_err(|e| anyhow!("PTY child kill failed: {e}"))
+                }
             }
-        }
-        // No pgid (non-Unix, or pid unavailable): fall back to the child killer.
-        let mut child = self.child.lock();
-        child.kill().map_err(|e| anyhow!("PTY child kill failed: {e}"))
+            #[cfg(not(unix))]
+            {
+                let r = self.child.lock().kill();
+                r.map_err(|e| anyhow!("PTY child kill failed: {e}"))
+            }
+        };
+
+        // Now stop the persistent drain reader and bounded-join it, dropping the
+        // writer fd. The child is already signalled, so the master is at (or
+        // racing toward) EOF and the reader stops promptly. Reaping is best-effort
+        // teardown: do it even if the kill signal errored so no thread/fd leaks,
+        // then surface the kill error.
+        self.reap_reader();
+        kill_result
     }
 }
 
@@ -897,6 +994,36 @@ pub enum ReaderOutcome {
     Stopped,
     /// `stdout` could not be written (terminal gone); nothing more to do.
     StdoutGone,
+}
+
+/// Join a thread within a bounded deadline, returning `true` if it finished (and
+/// was joined) and `false` if the deadline expired (the handle is dropped, which
+/// detaches the thread).
+///
+/// v3b-a blocker-2: the drain-reader teardown must never block the chat main path
+/// indefinitely. The reader is always *flagged* to stop before this is called, so
+/// it normally finishes near-instantly; this guard exists purely so a
+/// pathologically stuck reader (e.g. a reparented grandchild holding the slave PTY
+/// open on a platform without the poll-interruptible path) cannot freeze chat —
+/// we give up and let the OS reap the parked thread when the process exits.
+///
+/// Pure (no chat state) and never panics, so it is unit-testable on its own.
+fn bounded_join(handle: std::thread::JoinHandle<()>, deadline: std::time::Duration) -> bool {
+    let start = std::time::Instant::now();
+    while !handle.is_finished() {
+        if start.elapsed() >= deadline {
+            tracing::warn!(
+                "PTY drain reader did not stop within {:?}; detaching thread to avoid blocking chat (it is flagged to stop and will exit shortly)",
+                deadline
+            );
+            // Drop `handle` without joining: detaches the thread.
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    // Finished within the deadline: join is now non-blocking.
+    let _ = handle.join();
+    true
 }
 
 /// Copy PTY output → `out` until EOF, a stop request, or a `stdout` write
@@ -1282,6 +1409,161 @@ mod tests {
         assert_eq!(outcome, ReaderOutcome::Stopped);
     }
 
+    // ── v3b-a blocker-2: bounded join must never hang on a stuck reader ───────
+
+    #[test]
+    fn bounded_join_returns_true_when_thread_finishes_in_time() {
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        });
+        let start = std::time::Instant::now();
+        let joined = bounded_join(handle, std::time::Duration::from_millis(500));
+        assert!(joined, "thread that finishes in time must be joined");
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(400),
+            "bounded_join should return shortly after the thread finishes"
+        );
+    }
+
+    #[test]
+    fn bounded_join_gives_up_within_deadline_on_stuck_thread() {
+        // A thread that ignores any stop request and parks well past the deadline,
+        // modelling a stuck drain reader. `bounded_join` MUST return within the
+        // deadline (plus a small slop) instead of blocking until the thread ends.
+        let release = Arc::new(AtomicBool::new(false));
+        let release_thread = Arc::clone(&release);
+        let handle = std::thread::spawn(move || {
+            // Park until released (or a hard ceiling) — far longer than the join
+            // deadline below, so the join is forced to give up.
+            for _ in 0..400 {
+                if release_thread.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        });
+        let deadline = std::time::Duration::from_millis(150);
+        let start = std::time::Instant::now();
+        let joined = bounded_join(handle, deadline);
+        let elapsed = start.elapsed();
+        // Let the parked thread exit so the test process does not linger on it.
+        release.store(true, Ordering::Release);
+        assert!(!joined, "a stuck thread must NOT report as joined");
+        assert!(
+            elapsed < deadline + std::time::Duration::from_millis(150),
+            "bounded_join must give up within ~deadline (took {elapsed:?}, deadline {deadline:?}) — \
+             otherwise /kill / chat-exit could freeze"
+        );
+    }
+
+    // ── v3b-a blocker-1: re-attach replay must not interleave with live mirror ─
+
+    /// A `Write` sink that records everything written to it and can be told to
+    /// sleep at the *start* of its first write — used to widen the window in which
+    /// a concurrent live-mirror `write()` could (wrongly) interleave, so the test
+    /// reliably catches a missing lock instead of relying on luck.
+    #[derive(Clone)]
+    struct RecordingSink {
+        buf: Arc<Mutex<Vec<u8>>>,
+        first_write_delay: std::time::Duration,
+        first_write_done: Arc<AtomicBool>,
+    }
+    impl std::io::Write for RecordingSink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if !self.first_write_done.swap(true, Ordering::AcqRel) && !self.first_write_delay.is_zero() {
+                std::thread::sleep(self.first_write_delay);
+            }
+            self.buf.lock().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn attach_replay_serializes_under_lock_no_interleave() {
+        // Blocker-1 invariant: when an attach replays the ring under the sink lock,
+        // the drain reader's live-mirror `write()` (same lock) cannot interleave —
+        // the replayed bytes must all land BEFORE any live byte. We pre-fill the
+        // ring with a replay marker, then race a slow replay against a live write
+        // and assert the captured stream is `<replay><live>`, never interleaved.
+        use std::io::Write as _;
+
+        let sink = PtySink::new();
+        // Pre-fill the ring with the "scrollback" the attach will replay.
+        let replay_marker = b"REPLAY-SCROLLBACK-AAAA";
+        {
+            let mut s = sink.clone();
+            s.write_all(replay_marker).expect("test: seed ring");
+            // Note: not attached yet, so this only filled the ring (no stdout).
+        }
+
+        let captured = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let mut recorder = RecordingSink {
+            buf: Arc::clone(&captured),
+            // Sleep mid-replay so a live write, if it could interleave, would.
+            first_write_delay: std::time::Duration::from_millis(150),
+            first_write_done: Arc::new(AtomicBool::new(false)),
+        };
+
+        // Thread 1: the attach — replays the ring to the recorder under the lock.
+        let sink_attach = sink.clone();
+        let attach_thread = std::thread::spawn(move || {
+            sink_attach.attach_and_replay_to(&mut recorder);
+        });
+
+        // Give the attach a moment to acquire the lock and begin its (slow) replay.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        // Thread 2: the drain reader mirrors a live byte sequence. Because the sink
+        // is now `attached`, `write()` would mirror to... the SAME captured buffer
+        // only if it shared the recorder — it does not; the live mirror writes to
+        // real stdout. So to observe interleave we instead route the live write
+        // through the recorder by mirroring manually under the public `write` path
+        // is not possible. Instead we assert the *lock* is held: the live `write`
+        // must block until the replay finishes. We prove that by timing: the live
+        // write cannot complete before the replay's 150ms sleep elapses.
+        let live_marker = b"LIVE-BYTES-BBBB";
+        let start = std::time::Instant::now();
+        {
+            let mut s = sink.clone();
+            // This contends for the sink lock held by the in-flight replay.
+            s.write_all(live_marker).expect("test: live write");
+        }
+        let live_write_elapsed = start.elapsed();
+
+        attach_thread.join().expect("test: attach thread joins");
+
+        // 1. The live write was blocked by the replay's lock hold: it could not
+        //    return until the 150ms replay sleep (started ~30ms before) completed.
+        assert!(
+            live_write_elapsed >= std::time::Duration::from_millis(90),
+            "live mirror write returned too fast ({live_write_elapsed:?}) — it was NOT \
+             serialized behind the under-lock replay (interleave possible)"
+        );
+
+        // 2. The replay captured exactly the ring scrollback, contiguous and whole
+        //    (no live bytes spliced in — the recorder only ever saw the replay).
+        let got = captured.lock().clone();
+        assert_eq!(
+            got, replay_marker,
+            "replay output was not the contiguous ring scrollback"
+        );
+
+        // 3. The live bytes did make it into the ring (no loss) after the replay.
+        let ring_after = sink.attach_and_snapshot_vec_for_test();
+        let ring_str = String::from_utf8_lossy(&ring_after);
+        assert!(
+            ring_str.contains("LIVE-BYTES-BBBB"),
+            "live bytes lost from ring after replay: {ring_str:?}"
+        );
+        // And the live bytes come AFTER the replay marker in the ring order.
+        let rpos = ring_str.find("REPLAY-SCROLLBACK").expect("test: replay marker in ring");
+        let lpos = ring_str.find("LIVE-BYTES").expect("test: live marker in ring");
+        assert!(rpos < lpos, "live bytes must follow replayed scrollback in order");
+    }
+
     // ── PTY spawn + interaction (Unix; needs a real /dev/ptmx) ───────────────
 
     #[cfg(unix)]
@@ -1311,7 +1593,7 @@ mod tests {
         // Poll the ring (via attach snapshot) until the echo appears.
         let mut saw = false;
         for _ in 0..50 {
-            let ring = session.attach();
+            let ring = session.attach_snapshot_for_test();
             if String::from_utf8_lossy(&ring).contains("hello-pty") {
                 saw = true;
                 break;
@@ -1332,6 +1614,48 @@ mod tests {
         }
         assert!(session.has_exited(), "PTY child terminated after kill");
         session.kill().await.expect("test: idempotent kill");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn kill_is_bounded_even_with_orphan_holding_slave() {
+        // Blocker-2: `kill()` signals the group FIRST, then bounded-joins the drain
+        // reader, so it must return within a bound even when a backgrounded
+        // grandchild keeps the slave PTY fd open (so the master would never EOF on
+        // its own). The poll-interruptible reader stops on the flag regardless, and
+        // the bounded join caps any residual wait.
+        let sec = auto_security();
+        // The child backgrounds a long sleep that inherits the slave PTY, then the
+        // foreground shell keeps running too. Killing the *group* reaches the
+        // backgrounded sleep here (same pgid), but the bound must hold even if it
+        // did not.
+        let session = PtyShellSession::spawn("sleep 600 & sleep 600", &sec, PtySize::default())
+            .expect("test: spawn child with backgrounded sleeper");
+
+        // Let the child settle so its fds are open.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // `kill()` must complete well within a generous bound. The reap deadline is
+        // 1s; with the SIGTERM grace (~300ms) plus join, 5s is a safe ceiling that
+        // still fails loudly if `kill` ever blocks unboundedly.
+        let start = std::time::Instant::now();
+        let killed = tokio::time::timeout(std::time::Duration::from_secs(5), session.kill()).await;
+        let elapsed = start.elapsed();
+        assert!(
+            killed.is_ok(),
+            "kill() did not return within 5s — it blocked (orphan / unbounded join regression)"
+        );
+        killed.expect("test: kill within bound").expect("test: kill succeeds");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "kill() took too long ({elapsed:?})"
+        );
+
+        // Idempotent re-kill is also bounded.
+        let re = tokio::time::timeout(std::time::Duration::from_secs(5), session.kill()).await;
+        assert!(re.is_ok(), "idempotent kill() must also be bounded");
+        re.expect("test: re-kill within bound")
+            .expect("test: idempotent kill succeeds");
     }
 
     #[cfg(unix)]
@@ -1362,7 +1686,9 @@ mod tests {
         let session = PtyShellSession::spawn("cat", &sec, PtySize::default()).expect("test: spawn cat in a PTY");
 
         // Attach then detach (simulating Ctrl-]). The child must remain alive.
-        let _ = session.attach();
+        // Use the test snapshot path so we don't write the ring to the real
+        // terminal during the test.
+        let _ = session.attach_snapshot_for_test();
         session.detach();
         // Give any (wrong) teardown a chance to land.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1370,13 +1696,13 @@ mod tests {
         assert!(session.is_attachable(), "a detached live PTY must remain attachable");
 
         // It is still functional: a re-attach + write still echoes.
-        let _ = session.attach();
+        let _ = session.attach_snapshot_for_test();
         for &b in b"after-detach\n" {
             session.write_input(b).expect("test: write after re-attach");
         }
         let mut saw = false;
         for _ in 0..50 {
-            if String::from_utf8_lossy(&session.attach()).contains("after-detach") {
+            if String::from_utf8_lossy(&session.attach_snapshot_for_test()).contains("after-detach") {
                 saw = true;
                 break;
             }
@@ -1406,7 +1732,7 @@ mod tests {
         // we never actually mirror to stdout in the test).
         let mut captured = String::new();
         for _ in 0..100 {
-            let ring = session.attach();
+            let ring = session.attach_snapshot_for_test();
             session.detach();
             captured = String::from_utf8_lossy(&ring).into_owned();
             if captured.contains("line-200") {
@@ -1434,7 +1760,7 @@ mod tests {
 
         let mut snapshot = Vec::new();
         for _ in 0..50 {
-            snapshot = session.attach();
+            snapshot = session.attach_snapshot_for_test();
             session.detach();
             if String::from_utf8_lossy(&snapshot).contains("replay-marker") {
                 break;

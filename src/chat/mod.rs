@@ -4678,21 +4678,19 @@ fn run_pty_attach(session: &crate::chat::sessions::pty::PtyShellSession) -> PtyE
     }
     let _scope = AttachScope { session };
 
-    // 1. Clear the screen + home the cursor, then mark attached and replay the
-    //    ring so the user sees recent context. Order: clear → snapshot+attach →
-    //    replay. We snapshot under the sink lock (inside `attach`) so no live byte
-    //    is lost between the snapshot and the mirror turning on.
+    // 1. Clear the screen + home the cursor, then attach. `attach()` flips the
+    //    sink to `attached` AND replays the ring to `stdout` atomically under the
+    //    sink lock (v3b-a blocker-1): because the drain reader's live-mirror
+    //    `write()` contends for that same lock, the replayed scrollback can never
+    //    interleave with live bytes — the replay completes first, then live bytes
+    //    follow in order. No separate out-of-lock replay write (which was the
+    //    source of escape-sequence corruption for full-screen programs).
     {
         let mut out = std::io::stdout();
         let _ = out.write_all(b"\x1b[2J\x1b[H");
         let _ = out.flush();
     }
-    let replay = session.attach();
-    if !replay.is_empty() {
-        let mut out = std::io::stdout();
-        let _ = out.write_all(&replay);
-        let _ = out.flush();
-    }
+    session.attach();
 
     // 3. Nudge full-screen programs to repaint over any replay artefacts
     //    (SIGWINCH size jitter). Harmless to streaming programs.
