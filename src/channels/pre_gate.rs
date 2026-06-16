@@ -285,10 +285,16 @@ pub fn classify_heuristic(text: &str, bot_names: &[String], bot_recently_active:
 }
 
 /// System prompt for the Tier-2 cheap classifier. Deliberately tiny.
+///
+/// The prompt explicitly requests `YES`/`NO` only to reduce the chance that a
+/// model replying in the user's language (e.g. Chinese) produces a verbose
+/// answer. The parser in [`parse_classifier_answer`] also recognises Chinese
+/// decisive tokens as a robust fallback.
 const CLASSIFIER_SYSTEM_PROMPT: &str = "You are a fast relevance gate for a group-chat assistant. \
 Given recent group messages and the latest message, decide whether the assistant should reply to the \
 latest message. Reply ONLY with a single word: YES if the assistant should reply, NO if it should stay \
-silent. The assistant is one participant among humans; it should reply when addressed, asked a question, \
+silent. Do NOT reply in any language other than this single word. \
+The assistant is one participant among humans; it should reply when addressed, asked a question, \
 or able to genuinely help, and stay silent for casual chatter between others. When unsure, answer YES.";
 
 /// Build the user prompt for the classifier from recent context + latest text.
@@ -317,12 +323,40 @@ fn build_classifier_prompt(recent_context: &[String], latest: &str, bot_names: &
 ///
 /// Returns `Some(true)` for an affirmative, `Some(false)` for a negative, and
 /// `None` if the answer is unparseable (caller fails open).
+///
+/// Recognises both English (`YES`/`NO`) and Chinese decisive tokens so that
+/// models that reply in Chinese (e.g. Kimi) are handled without falling through
+/// to the fail-open path:
+/// - Affirmative: `是`、`回应`、`回复`
+/// - Negative:    `否`、`不`、`沉默`、`不回`
 fn parse_classifier_answer(answer: &str) -> Option<bool> {
-    let lower = answer.trim().to_lowercase();
-    if lower.is_empty() {
+    let trimmed = answer.trim();
+    if trimmed.is_empty() {
         return None;
     }
-    // Match on the first decisive token to be robust against extra words.
+    let lower = trimmed.to_lowercase();
+
+    // ── Chinese decisive tokens (checked before ASCII splitting, which would
+    //    fragment multi-byte CJK characters into empty or garbled tokens). ───
+    //
+    // Negative tokens are checked FIRST, and longer/more-specific patterns
+    // before shorter ones, so that `不回复` / `不需要回复` are correctly
+    // identified as negative even though they contain the substring `回复`.
+    //
+    // Negative: 沉默 / 不回 (covers 不回复/不回答) / 否 / 不
+    // Affirmative: 回应 / 回复 (longer first) / 是
+    for zh_no in &["沉默", "不回", "否", "不"] {
+        if lower.contains(zh_no) {
+            return Some(false);
+        }
+    }
+    for zh_yes in &["回应", "回复", "是"] {
+        if lower.contains(zh_yes) {
+            return Some(true);
+        }
+    }
+
+    // ── ASCII / Latin tokens: split on non-alphanumeric, take first match. ──
     for token in lower.split(|c: char| !c.is_alphanumeric()).filter(|t| !t.is_empty()) {
         match token {
             "yes" | "y" | "true" | "reply" | "respond" => return Some(true),
@@ -481,6 +515,42 @@ mod tests {
         assert_eq!(parse_classifier_answer("reply"), Some(true));
         assert_eq!(parse_classifier_answer(""), None);
         assert_eq!(parse_classifier_answer("maybe perhaps"), None);
+    }
+
+    #[test]
+    fn parse_answer_chinese_affirmative() {
+        // Bare affirmative tokens.
+        assert_eq!(parse_classifier_answer("是"), Some(true));
+        assert_eq!(parse_classifier_answer("回应"), Some(true));
+        assert_eq!(parse_classifier_answer("回复"), Some(true));
+        // Embedded in a phrase (kimi-style verbose reply).
+        assert_eq!(parse_classifier_answer("应该回应这条消息"), Some(true));
+        assert_eq!(parse_classifier_answer("助手需要回复用户"), Some(true));
+    }
+
+    #[test]
+    fn parse_answer_chinese_negative() {
+        // Bare negative tokens.
+        assert_eq!(parse_classifier_answer("否"), Some(false));
+        assert_eq!(parse_classifier_answer("不"), Some(false));
+        assert_eq!(parse_classifier_answer("沉默"), Some(false));
+        assert_eq!(parse_classifier_answer("不回"), Some(false));
+        // Embedded in a phrase.
+        assert_eq!(parse_classifier_answer("助手应该沉默"), Some(false));
+        assert_eq!(parse_classifier_answer("不需要回复"), Some(false));
+    }
+
+    #[test]
+    fn parse_answer_chinese_unparseable_returns_none() {
+        // A Chinese reply that contains none of the decisive tokens.
+        assert_eq!(parse_classifier_answer("这个问题比较复杂"), None);
+        assert_eq!(parse_classifier_answer("也许可以考虑一下"), None);
+    }
+
+    #[test]
+    fn parse_answer_chinese_affirmative_wins_over_spurious_negative_substring() {
+        // "回应" contains no negative token; must parse as affirmative.
+        assert_eq!(parse_classifier_answer("回应"), Some(true));
     }
 
     // ── heuristic_only_outcome (classifier-disabled path) ───────────────────
