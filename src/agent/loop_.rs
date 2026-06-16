@@ -3737,10 +3737,28 @@ async fn execute_tool_call_serial(
             // path runs unchanged: interactive CLI prompt on the `cli` channel,
             // implicit deny everywhere else.
             let (decision, runtime_grant) = if let Some(resolver) = approval_resolver {
-                match resolver.resolve(&request, channel_name).await {
-                    ApprovalDecision::Allow => (ApprovalResponse::Yes, false),
-                    ApprovalDecision::Grant => (ApprovalResponse::Yes, true),
-                    ApprovalDecision::Deny => (ApprovalResponse::No, false),
+                // An `ApprovalResolver` may *suspend* (the chat `/bg` NeedsInput
+                // path awaits an operator decision, up to a 300s timeout). Race
+                // it against the cancellation token so a steer / send / kill that
+                // cancels the run does not stay pinned on a suspended approval:
+                // on cancel we drop the resolver future (its RAII guard clears
+                // the pending waiter + restores run status) and treat the call as
+                // denied (No, no grant) so the loop unwinds cleanly without a
+                // zombie `AwaitingInput` run.
+                let resolved = match cancellation_token {
+                    Some(token) => {
+                        tokio::select! {
+                            biased;
+                            () = token.cancelled() => None,
+                            decision = resolver.resolve(&request, channel_name) => Some(decision),
+                        }
+                    }
+                    None => Some(resolver.resolve(&request, channel_name).await),
+                };
+                match resolved {
+                    Some(ApprovalDecision::Allow) => (ApprovalResponse::Yes, false),
+                    Some(ApprovalDecision::Grant) => (ApprovalResponse::Yes, true),
+                    Some(ApprovalDecision::Deny) | None => (ApprovalResponse::No, false),
                 }
             } else if channel_name == "cli" {
                 (mgr.prompt_cli(&request), true)

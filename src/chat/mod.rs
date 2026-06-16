@@ -1212,7 +1212,11 @@ pub async fn run(
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
-    .with_approval_resolver_factory(approval_resolver_factory);
+    .with_approval_resolver_factory(approval_resolver_factory)
+    .with_approval_lists(
+        config.autonomy.auto_approve.iter().cloned().collect(),
+        config.autonomy.always_ask.iter().cloned().collect(),
+    );
     let spawn_tools_handle = spawn_tool.tools_handle();
 
     // Sibling tools share the same single-source registry (only the v1a four;

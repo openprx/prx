@@ -79,7 +79,13 @@ impl PendingApprovals {
     }
 
     /// Remove the waiter for `run_id` (resolver cleanup after it wakes).
-    fn remove(&self, run_id: &str) {
+    ///
+    /// Safe to call from a `Drop` impl: it only takes the `parking_lot` lock for
+    /// a non-`await` critical section, never panics, and is idempotent (a no-op
+    /// if the entry was already removed by `/approve` / `/deny` / re-register).
+    /// Dropping the removed sender (if present) closes the channel, so any waiter
+    /// still parked on the receiver wakes with the safe-deny fallback.
+    pub fn remove(&self, run_id: &str) {
         self.inner.lock().remove(run_id);
     }
 
@@ -165,6 +171,62 @@ impl SuspendingApprovalResolver {
     }
 }
 
+/// RAII cleanup guard for a suspended approval.
+///
+/// Created right after the resolver registers its pending waiter. On `Drop` —
+/// whether the resolver returns normally, its `await` is cancelled by the loop's
+/// cancellation token, or the whole spawned task is `abort()`ed / dropped — it:
+///
+/// 1. removes the run's entry from [`PendingApprovals`] (drops the sender,
+///    closing the channel — no stale waiter is ever left in the registry), and
+/// 2. best-effort restores the run's registry status from `AwaitingInput` back
+///    to `Running` so no zombie "needs-input" run is left behind, and
+/// 3. best-effort emits a [`SessionEvent::Resumed`] so the suspend banner clears.
+///
+/// Step 1 is the leak fix (`PendingApprovals` can never retain a stale sender).
+/// Steps 2–3 are best-effort because `Drop` cannot `.await`: the status restore
+/// uses `try_write()` on the async registry lock (skipped if contended — a
+/// concurrent kill/teardown is already mutating it to a terminal state, which we
+/// must not clobber), and the event send uses the non-blocking `try_send`.
+struct ApprovalCleanupGuard {
+    run_id: String,
+    session_id: SessionId,
+    pending: PendingApprovals,
+    active_runs: Arc<tokio::sync::RwLock<Vec<SubAgentRun>>>,
+    event_tx: mpsc::Sender<SessionEvent>,
+    /// Set to `true` once the resolver has performed its own async cleanup on the
+    /// normal decision path, so `Drop` only needs to guarantee the pending entry
+    /// is gone (the status / event were already handled with full `.await`).
+    handled: bool,
+}
+
+impl Drop for ApprovalCleanupGuard {
+    fn drop(&mut self) {
+        // (1) Always clear the pending entry — the core leak fix. Idempotent.
+        self.pending.remove(&self.run_id);
+        if self.handled {
+            // Normal path already restored status + emitted Resumed with full
+            // `.await`; nothing more to do.
+            return;
+        }
+        // (2) Best-effort status restore without awaiting. Only downgrade
+        //     `AwaitingInput` -> `Running`; never clobber a terminal state set by
+        //     a concurrent kill/failure. If the lock is contended right now,
+        //     skip: whoever holds it is mutating the run already.
+        if let Ok(mut runs) = self.active_runs.try_write() {
+            if let Some(run) = runs.iter_mut().find(|r| r.id == self.run_id) {
+                if matches!(run.status, SubAgentStatus::AwaitingInput { .. }) {
+                    run.status = SubAgentStatus::Running;
+                }
+            }
+        }
+        // (3) Best-effort resume banner clear.
+        let _ = self.event_tx.try_send(SessionEvent::Resumed {
+            id: self.session_id.clone(),
+        });
+    }
+}
+
 /// Build a short, human-readable prompt from an approval request: the tool name
 /// plus a compact, truncated argument digest.
 fn summarize_request(request: &ApprovalRequest) -> String {
@@ -192,6 +254,21 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         //    after the NeedsInput banner always finds a live waiter.
         let rx = self.pending.register(&self.run_id);
 
+        // 1b. Install the RAII cleanup guard immediately. From here on, no early
+        //     return / cancellation / task-abort can leak the pending entry or
+        //     leave a zombie `AwaitingInput` run: the guard's `Drop` clears them.
+        //     Crucially, if the surrounding `resolve()` future is *dropped* (the
+        //     loop `select!`s it against its cancellation token, or the spawned
+        //     task is `abort()`ed mid-await), this guard still runs.
+        let mut guard = ApprovalCleanupGuard {
+            run_id: self.run_id.clone(),
+            session_id: self.session_id.clone(),
+            pending: self.pending.clone(),
+            active_runs: Arc::clone(&self.active_runs),
+            event_tx: self.event_tx.clone(),
+            handled: false,
+        };
+
         // 2. Flip registry status -> AwaitingInput (drives the `❓` glyph + the
         //    status-line `needs-input` counter via `project_status`).
         self.mark_awaiting(&prompt).await;
@@ -210,6 +287,9 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         // 4. Await the operator decision, bounded by the approval timeout. A
         //    timeout or a dropped sender (kill/teardown) is treated as a safe
         //    deny so the run can never hang forever holding a concurrency slot.
+        //    Cancellation (steer / send / kill) is handled one level up by the
+        //    loop, which `select!`s this whole future against its cancellation
+        //    token and drops it on cancel — the guard above performs cleanup.
         let decision = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(decision)) => decision,
             Ok(Err(_recv_closed)) => {
@@ -222,14 +302,16 @@ impl ApprovalResolver for SuspendingApprovalResolver {
             }
         };
 
-        // 5. Cleanup: drop any registry entry (no-op if `/approve` already
-        //    removed it), restore Running status, and signal resume so the
-        //    suspend banner clears.
+        // 5. Normal-path cleanup with full `.await`: remove the registry entry
+        //    (no-op if `/approve` already took it), restore Running status, and
+        //    signal resume so the suspend banner clears. Mark the guard handled
+        //    so its `Drop` only needs to guarantee the pending entry is gone.
         self.pending.remove(&self.run_id);
         self.mark_running().await;
         let _ = self.event_tx.try_send(SessionEvent::Resumed {
             id: self.session_id.clone(),
         });
+        guard.handled = true;
 
         decision
     }
@@ -356,6 +438,80 @@ mod tests {
         // No leaked waiter; status restored.
         assert!(!pending.is_pending("r3"));
         assert!(matches!(first_status(&runs).await, SubAgentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn cancellation_drops_resolver_and_clears_pending_without_timeout() {
+        // Fix #1+#2: when the loop races the (suspended) resolver future against
+        // its cancellation token and cancels, dropping the future must run the
+        // RAII guard — clearing the pending waiter and restoring Running status
+        // PROMPTLY (not after the 300s timeout). We use a long timeout so a leak
+        // would visibly hang the test rather than self-heal via timeout.
+        use tokio_util::sync::CancellationToken;
+
+        let runs = Arc::new(RwLock::new(vec![make_run("rc")]));
+        let pending = PendingApprovals::new();
+        let (r, mut events) = resolver(
+            "rc",
+            Arc::clone(&runs),
+            pending.clone(),
+            Duration::from_secs(300), // long: only cancellation can wake us
+        );
+        let req = request();
+        let token = CancellationToken::new();
+
+        // Mirror the loop call site: select! resolver future vs cancellation.
+        let token_for_task = token.clone();
+        let handle = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = token_for_task.cancelled() => None,
+                decision = r.resolve(&req, "sessions_spawn") => Some(decision),
+            }
+        });
+
+        // Wait until suspended (NeedsInput emitted, pending registered).
+        let evt = events.recv().await.expect("test: needs-input");
+        assert!(matches!(evt, SessionEvent::NeedsInput { .. }));
+        assert!(pending.is_pending("rc"));
+        assert!(matches!(
+            first_status(&runs).await,
+            SubAgentStatus::AwaitingInput { .. }
+        ));
+
+        // Cancel — the resolver future is dropped; its guard must clean up.
+        token.cancel();
+        let out = handle.await.expect("test: join");
+        assert!(out.is_none(), "cancelled select! yields None");
+
+        // No leaked waiter and status restored — promptly, well under the 300s
+        // timeout (the test would hang here if cleanup depended on the timeout).
+        assert!(!pending.is_pending("rc"));
+        assert!(matches!(first_status(&runs).await, SubAgentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn abort_runs_drop_guard_and_clears_pending() {
+        // Fix #2: kill -> `abort_handle.abort()` drops the spawned task while it
+        // is parked on `resolve()`. The RAII guard must still fire, leaving no
+        // stale sender in `PendingApprovals` (the leak this guards against).
+        let runs = Arc::new(RwLock::new(vec![make_run("ra")]));
+        let pending = PendingApprovals::new();
+        let (r, mut events) = resolver("ra", Arc::clone(&runs), pending.clone(), Duration::from_secs(300));
+        let req = request();
+        let handle = tokio::spawn(async move { r.resolve(&req, "sessions_spawn").await });
+
+        // Wait until suspended.
+        let _ = events.recv().await.expect("test: needs-input");
+        assert!(pending.is_pending("ra"));
+
+        // Abort the task (kill path). Joining an aborted task yields a JoinError.
+        handle.abort();
+        let join = handle.await;
+        assert!(join.is_err(), "aborted task should not complete normally");
+
+        // The guard's Drop cleared the pending entry — no leaked sender.
+        assert!(!pending.is_pending("ra"));
     }
 
     #[test]

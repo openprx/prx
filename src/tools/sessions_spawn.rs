@@ -334,6 +334,14 @@ pub struct SessionsSpawnTool {
     /// auto-failing. When `None` (channels/gateway path, or chat without the
     /// factory) the historical auto-fail-on-gate semantics are preserved.
     approval_resolver_factory: Option<crate::agent::loop_::SpawnApprovalResolverFactory>,
+    /// Config-inherited `auto_approve` allowlist for the NeedsInput suspend path.
+    /// When the resolver factory is attached (chat `/bg`), the per-run
+    /// `ApprovalManager` is built with these lists so config-trusted / read-only
+    /// tools never suspend. Empty otherwise (channels/gateway never suspend).
+    approval_auto_approve: std::collections::HashSet<String>,
+    /// Config-inherited `always_ask` override list for the NeedsInput suspend
+    /// path (mirrors [`Self::approval_auto_approve`]).
+    approval_always_ask: std::collections::HashSet<String>,
 }
 
 impl SessionsSpawnTool {
@@ -423,6 +431,8 @@ impl SessionsSpawnTool {
             event_recording: MemoryEventRecording::default(),
             event_sink: None,
             approval_resolver_factory: None,
+            approval_auto_approve: std::collections::HashSet::new(),
+            approval_always_ask: std::collections::HashSet::new(),
         }
     }
 
@@ -454,6 +464,29 @@ impl SessionsSpawnTool {
         factory: crate::agent::loop_::SpawnApprovalResolverFactory,
     ) -> Self {
         self.approval_resolver_factory = Some(factory);
+        self
+    }
+
+    /// Inherit the live [`AutonomyConfig`](crate::config::AutonomyConfig)
+    /// `auto_approve` / `always_ask` lists for the NeedsInput suspend path.
+    ///
+    /// Only meaningful alongside [`Self::with_approval_resolver_factory`] (chat
+    /// `/bg`): the per-run supervised `ApprovalManager` is built with these
+    /// lists so config-trusted / read-only tools (e.g. `file_read`,
+    /// `memory_recall`) never suspend, and `always_ask` tools always do —
+    /// matching foreground chat approval semantics. Without this builder the
+    /// lists are empty (every non-read-only tool suspends under supervised).
+    // Called only by the binary crate's `chat::run`; not part of a `--lib`
+    // build.
+    #[allow(dead_code)]
+    #[must_use]
+    pub(crate) fn with_approval_lists(
+        mut self,
+        auto_approve: std::collections::HashSet<String>,
+        always_ask: std::collections::HashSet<String>,
+    ) -> Self {
+        self.approval_auto_approve = auto_approve;
+        self.approval_always_ask = always_ask;
         self
     }
 
@@ -1300,6 +1333,11 @@ impl Tool for SessionsSpawnTool {
             .approval_resolver_factory
             .as_ref()
             .map(|factory| factory.resolver_for(&run_id));
+        // NeedsInput: clone the config-inherited approval lists so the inner
+        // supervised `ApprovalManager` honours `auto_approve` (read-only tools
+        // do not suspend) and `always_ask`. Empty when no factory is attached.
+        let run_approval_auto_approve = self.approval_auto_approve.clone();
+        let run_approval_always_ask = self.approval_always_ask.clone();
         let task_owned = task.to_string();
         let tools = self.tools.get().cloned();
         let workspace_dir = self.workspace_dir.clone();
@@ -1380,6 +1418,8 @@ impl Tool for SessionsSpawnTool {
                 run_on_delta,
                 run_on_tool,
                 run_approval_resolver,
+                run_approval_auto_approve,
+                run_approval_always_ask,
             );
             // `timeout_secs == 0` means "no timeout" — run until natural
             // completion. This matches the session-worker semantics in
@@ -2122,6 +2162,8 @@ async fn run_sub_agent_task(
     on_delta: Option<tokio::sync::mpsc::Sender<String>>,
     on_tool_call: Option<tokio::sync::mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
     approval_resolver: Option<Arc<dyn crate::agent::loop_::ApprovalResolver>>,
+    approval_auto_approve: std::collections::HashSet<String>,
+    approval_always_ask: std::collections::HashSet<String>,
 ) -> anyhow::Result<String> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
@@ -2195,6 +2237,8 @@ async fn run_sub_agent_task(
         // When absent (channels/gateway), no manager + no resolver = the
         // historical auto-fail-on-gate path (zero behaviour change).
         let approval_resolver_iter = approval_resolver.clone();
+        let approval_auto_approve_iter = approval_auto_approve.clone();
+        let approval_always_ask_iter = approval_always_ask.clone();
 
         let mut loop_handle = tokio::spawn(async move {
             let observer = NoopObserver;
@@ -2215,9 +2259,13 @@ async fn run_sub_agent_task(
             // manager's `needs_approval` (supervised: flags act-tools) is what
             // routes a call into the resolver suspend path. Built from the live
             // policy's autonomy level so `Full` / `ReadOnly` never suspend.
-            let approval_manager = approval_resolver_iter
-                .as_ref()
-                .map(|_| crate::approval::ApprovalManager::from_autonomy_level(security.autonomy));
+            let approval_manager = approval_resolver_iter.as_ref().map(|_| {
+                crate::approval::ApprovalManager::from_autonomy_level_with_lists(
+                    security.autonomy,
+                    approval_auto_approve_iter,
+                    approval_always_ask_iter,
+                )
+            });
             let loop_outcome = crate::agent::loop_::run_tool_call_loop_outcome(
                 provider_instance.as_ref(),
                 &mut task_history,

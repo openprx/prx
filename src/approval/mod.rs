@@ -95,9 +95,29 @@ impl ApprovalManager {
     /// suspension occurs (matching the policy).
     #[must_use]
     pub fn from_autonomy_level(level: AutonomyLevel) -> Self {
+        Self::from_autonomy_level_with_lists(level, HashSet::new(), HashSet::new())
+    }
+
+    /// Create a manager driven by an [`AutonomyLevel`] **plus** explicit
+    /// `auto_approve` / `always_ask` lists inherited from the live
+    /// [`AutonomyConfig`].
+    ///
+    /// Used by the background sub-agent NeedsInput path so that a supervised
+    /// sub-agent honours the operator's configured `auto_approve` allowlist
+    /// (read-only / explicitly trusted tools such as `file_read` /
+    /// `memory_recall` do **not** suspend) and `always_ask` override, matching
+    /// the foreground chat approval semantics. Only tools that genuinely
+    /// [`needs_approval`](Self::needs_approval) under these lists trigger a
+    /// NeedsInput suspension.
+    #[must_use]
+    pub fn from_autonomy_level_with_lists(
+        level: AutonomyLevel,
+        auto_approve: HashSet<String>,
+        always_ask: HashSet<String>,
+    ) -> Self {
         Self {
-            auto_approve: HashSet::new(),
-            always_ask: HashSet::new(),
+            auto_approve,
+            always_ask,
             autonomy_level: level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
@@ -376,6 +396,26 @@ mod tests {
         assert!(!full.needs_approval("shell"));
         let read_only = ApprovalManager::from_autonomy_level(AutonomyLevel::ReadOnly);
         assert!(!read_only.needs_approval("shell"));
+    }
+
+    #[test]
+    fn from_autonomy_level_with_lists_inherits_auto_approve_and_always_ask() {
+        // Fix #3: the background NeedsInput supervised manager must inherit the
+        // config `auto_approve` / `always_ask` lists so config-trusted / read-only
+        // tools do NOT suspend, while `always_ask` tools always do.
+        let auto_approve: HashSet<String> = ["file_read", "memory_recall"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let always_ask: HashSet<String> = ["shell"].iter().map(|s| (*s).to_string()).collect();
+        let mgr = ApprovalManager::from_autonomy_level_with_lists(AutonomyLevel::Supervised, auto_approve, always_ask);
+        // Auto-approved read-only tools: no suspension under supervised.
+        assert!(!mgr.needs_approval("file_read"));
+        assert!(!mgr.needs_approval("memory_recall"));
+        // always_ask override: still suspends.
+        assert!(mgr.needs_approval("shell"));
+        // A tool in neither list under supervised: default-suspends.
+        assert!(mgr.needs_approval("file_write"));
     }
 
     #[test]
