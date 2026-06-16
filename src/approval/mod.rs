@@ -84,6 +84,47 @@ impl ApprovalManager {
         }
     }
 
+    /// Create a manager driven solely by an [`AutonomyLevel`], with no
+    /// config-level `auto_approve` / `always_ask` lists.
+    ///
+    /// Used by the background sub-agent NeedsInput path, which only knows the
+    /// effective autonomy level (from the live [`crate::security::SecurityPolicy`])
+    /// and wants the default supervised behaviour: every non-read-only tool call
+    /// is flagged for approval so the suspend resolver can gate it. Under
+    /// `ReadOnly` / `Full` autonomy `needs_approval` returns `false`, so no
+    /// suspension occurs (matching the policy).
+    #[must_use]
+    pub fn from_autonomy_level(level: AutonomyLevel) -> Self {
+        Self::from_autonomy_level_with_lists(level, HashSet::new(), HashSet::new())
+    }
+
+    /// Create a manager driven by an [`AutonomyLevel`] **plus** explicit
+    /// `auto_approve` / `always_ask` lists inherited from the live
+    /// [`AutonomyConfig`].
+    ///
+    /// Used by the background sub-agent NeedsInput path so that a supervised
+    /// sub-agent honours the operator's configured `auto_approve` allowlist
+    /// (read-only / explicitly trusted tools such as `file_read` /
+    /// `memory_recall` do **not** suspend) and `always_ask` override, matching
+    /// the foreground chat approval semantics. Only tools that genuinely
+    /// [`needs_approval`](Self::needs_approval) under these lists trigger a
+    /// NeedsInput suspension.
+    #[must_use]
+    pub fn from_autonomy_level_with_lists(
+        level: AutonomyLevel,
+        auto_approve: HashSet<String>,
+        always_ask: HashSet<String>,
+    ) -> Self {
+        Self {
+            auto_approve,
+            always_ask,
+            autonomy_level: level,
+            session_allowlist: Mutex::new(HashSet::new()),
+            audit_log: Mutex::new(Vec::new()),
+            generated_grants: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Check whether a tool call requires interactive approval.
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
@@ -341,6 +382,40 @@ mod tests {
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(mgr.needs_approval("file_write"));
         assert!(mgr.needs_approval("http_request"));
+    }
+
+    #[test]
+    fn from_autonomy_level_gates_per_level() {
+        // Supervised: every non-explicitly-allowed tool needs approval (drives
+        // the background NeedsInput suspend path).
+        let supervised = ApprovalManager::from_autonomy_level(AutonomyLevel::Supervised);
+        assert!(supervised.needs_approval("shell"));
+        assert!(supervised.needs_approval("file_write"));
+        // Full / ReadOnly: never flagged, so no suspension occurs for backgrounded runs.
+        let full = ApprovalManager::from_autonomy_level(AutonomyLevel::Full);
+        assert!(!full.needs_approval("shell"));
+        let read_only = ApprovalManager::from_autonomy_level(AutonomyLevel::ReadOnly);
+        assert!(!read_only.needs_approval("shell"));
+    }
+
+    #[test]
+    fn from_autonomy_level_with_lists_inherits_auto_approve_and_always_ask() {
+        // Fix #3: the background NeedsInput supervised manager must inherit the
+        // config `auto_approve` / `always_ask` lists so config-trusted / read-only
+        // tools do NOT suspend, while `always_ask` tools always do.
+        let auto_approve: HashSet<String> = ["file_read", "memory_recall"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let always_ask: HashSet<String> = std::iter::once("shell".to_string()).collect();
+        let mgr = ApprovalManager::from_autonomy_level_with_lists(AutonomyLevel::Supervised, auto_approve, always_ask);
+        // Auto-approved read-only tools: no suspension under supervised.
+        assert!(!mgr.needs_approval("file_read"));
+        assert!(!mgr.needs_approval("memory_recall"));
+        // always_ask override: still suspends.
+        assert!(mgr.needs_approval("shell"));
+        // A tool in neither list under supervised: default-suspends.
+        assert!(mgr.needs_approval("file_write"));
     }
 
     #[test]

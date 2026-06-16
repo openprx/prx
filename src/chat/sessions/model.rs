@@ -91,8 +91,9 @@ impl SessionOrigin {
 
 /// UI-facing status of a managed session.
 ///
-/// `NeedsInput` is retained as a reserved variant for the v1.1 event bridge but
-/// is never produced by [`project_status`] in v1a/v1b.
+/// `NeedsInput` is produced by [`project_status`] when a background sub-agent
+/// suspends awaiting an operator approval decision
+/// ([`SubAgentStatus::AwaitingInput`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedStatus {
     Running,
@@ -225,6 +226,10 @@ impl PersistedSessionSummary {
 pub fn project_status(status: &SubAgentStatus) -> ManagedStatus {
     match status {
         SubAgentStatus::Running => ManagedStatus::Running,
+        // A run suspended awaiting an operator approval decision surfaces as
+        // NeedsInput (the `❓` glyph + status-line counter), the reversible
+        // non-terminal state that drives the chat approval UX.
+        SubAgentStatus::AwaitingInput { .. } => ManagedStatus::NeedsInput,
         SubAgentStatus::Completed(_) => ManagedStatus::Completed,
         SubAgentStatus::Failed(msg) if msg == KILLED_BY_USER => ManagedStatus::Cancelled,
         SubAgentStatus::Failed(_) => ManagedStatus::Failed,
@@ -513,8 +518,19 @@ mod tests {
     }
 
     #[test]
-    fn never_projects_needs_input() {
-        // Exhaustively over the underlying variants: none yields NeedsInput.
+    fn awaiting_input_projects_needs_input() {
+        // The suspend-on-approval state is the sole source of NeedsInput.
+        assert_eq!(
+            project_status(&SubAgentStatus::AwaitingInput {
+                prompt: "shell rm -rf".into()
+            }),
+            ManagedStatus::NeedsInput
+        );
+    }
+
+    #[test]
+    fn non_awaiting_states_never_project_needs_input() {
+        // Every other underlying variant must avoid the NeedsInput bucket.
         for status in [
             SubAgentStatus::Running,
             SubAgentStatus::Completed("x".into()),

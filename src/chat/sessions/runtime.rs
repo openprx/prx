@@ -212,6 +212,19 @@ impl ChatSessionsHandle {
         self.seq_map.iter().find(|(mapped, _)| *mapped == seq).map(|(_, id)| id)
     }
 
+    /// Resolve a [`SessionId`] to its display sequence `#N`, refreshing the seq
+    /// map first so a freshly spawned (or freshly suspended) session always has a
+    /// number. Returns `None` only if the id is not in either live registry.
+    ///
+    /// Used by the NeedsInput main-loop branch to label the `/approve <N>` hint.
+    pub async fn seq_for_id(&mut self, id: &SessionId) -> Option<u64> {
+        self.refresh_seqs().await;
+        self.seq_map
+            .iter()
+            .find(|(_, mapped)| mapped == id)
+            .map(|(seq, _)| *seq)
+    }
+
     /// Refresh the `#N` -> session-id mapping from **both** live registries,
     /// assigning a new sequence to any session not seen before. Agents are
     /// enumerated first, then shells, in first-seen order, so display numbers stay
@@ -312,7 +325,9 @@ impl ChatSessionsHandle {
             let seq = self.seq_for(&SessionId::from_run_id(&run.id));
             let summary = match &run.status {
                 SubAgentStatus::Completed(s) | SubAgentStatus::Failed(s) => s.clone(),
-                SubAgentStatus::Running => String::new(),
+                // Non-terminal states are filtered out above; reached only
+                // defensively, so they carry no completion summary.
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => String::new(),
             };
             finished.push(FinishedSession {
                 seq,
@@ -508,20 +523,23 @@ pub fn status_summary(views: &[ManagedSessionView]) -> String {
     if views.is_empty() {
         return String::new();
     }
-    let (mut running, mut completed, mut failed, mut cancelled) = (0usize, 0usize, 0usize, 0usize);
+    let (mut running, mut needs_input, mut completed, mut failed, mut cancelled) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
     for v in views {
         match v.status {
             ManagedStatus::Running => running += 1,
+            ManagedStatus::NeedsInput => needs_input += 1,
             ManagedStatus::Completed => completed += 1,
             ManagedStatus::Failed => failed += 1,
             ManagedStatus::Cancelled => cancelled += 1,
-            // No underlying source in v1b; never produced by `project_status`.
-            ManagedStatus::NeedsInput => {}
         }
     }
-    let mut parts: Vec<String> = Vec::with_capacity(4);
+    let mut parts: Vec<String> = Vec::with_capacity(5);
     if running > 0 {
         parts.push(format!("{running} running"));
+    }
+    if needs_input > 0 {
+        parts.push(format!("{needs_input} needs-input"));
     }
     if completed > 0 {
         parts.push(format!("{completed} completed"));
@@ -533,7 +551,6 @@ pub fn status_summary(views: &[ManagedSessionView]) -> String {
         parts.push(format!("{cancelled} cancelled"));
     }
     if parts.is_empty() {
-        // All sessions are in the (unreachable in v1b) NeedsInput bucket.
         return String::new();
     }
     format!("bg: {}", parts.join(" \u{00B7} "))

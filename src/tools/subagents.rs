@@ -113,6 +113,9 @@ impl SubagentsTool {
             .map(|r| {
                 let status = match &r.status {
                     SubAgentStatus::Running => "running".to_string(),
+                    SubAgentStatus::AwaitingInput { prompt } => {
+                        format!("awaiting approval: {prompt}")
+                    }
                     SubAgentStatus::Completed(msg) => {
                         let preview = msg.chars().take(60).collect::<String>();
                         let ellipsis = if msg.len() > 60 { "…" } else { "" };
@@ -148,7 +151,7 @@ impl SubagentsTool {
         };
 
         match &run.status {
-            SubAgentStatus::Running => {
+            SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                 let operation_name = format!("subagents:kill:{run_id}");
                 if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
                     self.name(),
@@ -208,7 +211,7 @@ impl SubagentsTool {
             };
 
             match &run.status {
-                SubAgentStatus::Running => {
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
                     if let Some(ref tx) = run.steer_tx {
                         let operation_name = format!("subagents:steer:{run_id}");
                         if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
@@ -270,6 +273,7 @@ impl SubagentsTool {
 const fn status_label(status: &SubAgentStatus) -> &'static str {
     match status {
         SubAgentStatus::Running => "running",
+        SubAgentStatus::AwaitingInput { .. } => "awaiting-input",
         SubAgentStatus::Completed(_) => "completed",
         SubAgentStatus::Failed(_) => "failed",
     }

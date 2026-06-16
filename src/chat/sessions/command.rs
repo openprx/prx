@@ -31,6 +31,12 @@ pub enum SessionCommand {
     Logs { seq: u64 },
     /// `/pty <command>` — interactive PTY shell with full terminal handoff (v3).
     Pty { command: String },
+    /// `/approve <seq>` — approve a background session suspended on the approval
+    /// gate (NeedsInput), injecting a runtime grant so the gated tool can proceed.
+    Approve { seq: u64 },
+    /// `/deny <seq>` — deny a background session suspended on the approval gate
+    /// (NeedsInput); the gated tool is reported as denied to the sub-agent.
+    Deny { seq: u64 },
 }
 
 /// Parse a session display sequence argument (`N`) robustly.
@@ -119,6 +125,20 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         let arg = rest.strip_prefix(char::is_whitespace)?;
         let seq = parse_seq_arg(arg)?;
         return Some(SessionCommand::Logs { seq });
+    }
+
+    // `/approve <seq>` (NeedsInput)
+    if let Some(rest) = trimmed.strip_prefix("/approve") {
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        let seq = parse_seq_arg(arg)?;
+        return Some(SessionCommand::Approve { seq });
+    }
+
+    // `/deny <seq>` (NeedsInput)
+    if let Some(rest) = trimmed.strip_prefix("/deny") {
+        let arg = rest.strip_prefix(char::is_whitespace)?;
+        let seq = parse_seq_arg(arg)?;
+        return Some(SessionCommand::Deny { seq });
     }
 
     // `/steer <seq> <message>` (v1b)
