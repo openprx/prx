@@ -3884,7 +3884,7 @@ pub enum GroupReplyMode {
     MentionOnly,
     /// Read every group message and let the model decide whether to reply or
     /// stay silent (via the `stay_silent` tool). Only honored for channels that
-    /// support smart group-reply (currently Telegram and Discord).
+    /// support smart group-reply (currently Telegram, Discord, and WhatsApp).
     Smart,
 }
 
