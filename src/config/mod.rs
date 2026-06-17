@@ -20,7 +20,7 @@ pub use schema::{
     SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
     TaskRoutingRule, TelegramConfig, ToolPolicyConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig,
-    WebSearchConfig, WebhookConfig, apply_runtime_proxy_to_builder, build_runtime_proxy_client,
+    WebSearchConfig, WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
 };
 

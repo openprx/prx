@@ -591,8 +591,8 @@ fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
 }
 
 /// Collect the effective group reply mode for channels that support smart
-/// group-reply (currently Telegram and Discord). Other channels are absent and
-/// fall back to their `mention_only`-derived behavior unchanged.
+/// group-reply (currently Telegram, Discord, and WhatsApp). Other channels are
+/// absent and fall back to their `mention_only`-derived behavior unchanged.
 fn collect_group_reply_mode_by_channel(config: &Config) -> HashMap<String, crate::config::GroupReplyMode> {
     let mut modes = HashMap::new();
     if let Some(telegram) = config.channels_config.telegram.as_ref() {
@@ -605,6 +605,12 @@ fn collect_group_reply_mode_by_channel(config: &Config) -> HashMap<String, crate
         modes.insert(
             "discord".to_string(),
             crate::config::GroupReplyMode::resolve(discord.group_reply_mode, discord.mention_only),
+        );
+    }
+    if let Some(whatsapp) = config.channels_config.whatsapp.as_ref() {
+        modes.insert(
+            "whatsapp".to_string(),
+            crate::config::GroupReplyMode::resolve(whatsapp.group_reply_mode, whatsapp.mention_only),
         );
     }
     modes
@@ -5423,8 +5429,8 @@ mod tests {
 
     #[test]
     fn collect_group_reply_mode_resolves_smart_capable_channels() {
-        // The collector only registers smart-capable channels (telegram/discord)
-        // and resolves their effective mode from explicit + mention_only.
+        // The collector only registers smart-capable channels (telegram/discord/
+        // whatsapp) and resolves their effective mode from explicit + mention_only.
         let mut config = Config::default();
         config.channels_config.telegram = Some(crate::config::TelegramConfig {
             bot_token: "t".into(),
@@ -5443,13 +5449,178 @@ mod tests {
             mention_only: true,
             group_reply_mode: None, // derive => MentionOnly
         });
+        config.channels_config.whatsapp = Some(crate::config::WhatsAppConfig {
+            allowed_numbers: vec!["*".into()],
+            group_reply_mode: Some(crate::config::GroupReplyMode::Smart),
+            ..Default::default()
+        });
         let modes = collect_group_reply_mode_by_channel(&config);
         assert_eq!(modes.get("telegram"), Some(&crate::config::GroupReplyMode::Smart));
         assert_eq!(modes.get("discord"), Some(&crate::config::GroupReplyMode::MentionOnly));
+        assert_eq!(modes.get("whatsapp"), Some(&crate::config::GroupReplyMode::Smart));
         assert!(
             !modes.contains_key("slack"),
             "non-smart-capable channels are not registered"
         );
+    }
+
+    /// WhatsApp without an explicit `group_reply_mode` derives the legacy
+    /// `mention_only`-based mode, so existing configs are byte-for-byte unchanged.
+    #[test]
+    fn collect_group_reply_mode_whatsapp_derives_from_mention_only() {
+        let mut config = Config::default();
+        config.channels_config.whatsapp = Some(crate::config::WhatsAppConfig {
+            allowed_numbers: vec!["*".into()],
+            mention_only: true,
+            group_reply_mode: None,
+            ..Default::default()
+        });
+        let modes = collect_group_reply_mode_by_channel(&config);
+        assert_eq!(
+            modes.get("whatsapp"),
+            Some(&crate::config::GroupReplyMode::MentionOnly),
+            "mention_only=true + None => MentionOnly (legacy behavior preserved)"
+        );
+
+        config.channels_config.whatsapp = Some(crate::config::WhatsAppConfig {
+            allowed_numbers: vec!["*".into()],
+            mention_only: false,
+            group_reply_mode: None,
+            ..Default::default()
+        });
+        let modes = collect_group_reply_mode_by_channel(&config);
+        assert_eq!(
+            modes.get("whatsapp"),
+            Some(&crate::config::GroupReplyMode::Off),
+            "mention_only=false + None => Off (legacy behavior preserved)"
+        );
+    }
+
+    /// Mirror of the central smart-gate decision for a WhatsApp `@g.us` group
+    /// message: with whatsapp registered as Smart, `group_reply_mode_for` yields
+    /// Smart and the `@g.us` reply_target makes it a group, so `smart_group` is
+    /// true and the bot reads every message (model decides via stay_silent).
+    #[test]
+    fn whatsapp_group_message_triggers_smart_gate() {
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.group_reply_mode_by_channel
+            .insert("whatsapp".to_string(), crate::config::GroupReplyMode::Smart);
+
+        let msg = traits::ChannelMessage {
+            channel: "whatsapp".to_string(),
+            sender: "+123".to_string(),
+            reply_target: "120363000000000000@g.us".to_string(),
+            content: "anyone around?".to_string(),
+            ..Default::default()
+        };
+
+        let mode = group_reply_mode_for(&ctx, &msg.channel);
+        assert!(mode.is_smart(), "whatsapp resolves to Smart mode");
+
+        // Central group detection: `@g.us` reply_target => group.
+        let is_group = msg.reply_target.starts_with("group:") || msg.reply_target.ends_with("@g.us");
+        assert!(is_group, "@g.us reply_target is recognized as a group");
+
+        let in_group_for_smart = is_group || msg.is_group_hint;
+        let smart_group = mode.is_smart() && in_group_for_smart && !is_system_message(&msg);
+        assert!(smart_group, "smart gate is active for whatsapp @g.us group");
+    }
+
+    /// "@ always answers": an explicit @-mention in a WhatsApp group is detected
+    /// by the central mention path (here via the channel-layer `mentioned` hint
+    /// that WhatsApp Web sets from `context_info.mentioned_jid`), bypassing the
+    /// proactive pre-gate/cooldown.
+    #[test]
+    fn whatsapp_group_at_mention_is_detected() {
+        let ctx = ctx_with_histories(HashMap::new());
+        let msg = traits::ChannelMessage {
+            channel: "whatsapp".to_string(),
+            sender: "+123".to_string(),
+            reply_target: "120363000000000000@g.us".to_string(),
+            content: "@bot please summarize".to_string(),
+            mentioned: true, // set by whatsapp_web from mentioned_jid
+            is_group_hint: true,
+            ..Default::default()
+        };
+        let user_text = strip_channel_metadata(&msg.content);
+        let mentioned = msg.mentioned || is_bot_mentioned(&ctx, &msg, &user_text);
+        assert!(mentioned, "channel-layer @-mention hint marks the bot as addressed");
+
+        // Text-based fallback also works when the body names the bot.
+        let msg2 = traits::ChannelMessage {
+            channel: "whatsapp".to_string(),
+            reply_target: "120363000000000000@g.us".to_string(),
+            content: "hey prx what's up".to_string(),
+            ..Default::default()
+        };
+        let user_text2 = strip_channel_metadata(&msg2.content);
+        assert!(
+            msg2.mentioned || is_bot_mentioned(&ctx, &msg2, &user_text2),
+            "text bot-name fallback still detects mention (bot_names = [\"prx\"])"
+        );
+    }
+
+    /// Non-smart WhatsApp behavior is unchanged: when whatsapp is absent from the
+    /// smart map (or mention_only-derived), `group_reply_mode_for` is NOT smart,
+    /// so `smart_group` is false and the legacy mention_only drop path governs.
+    #[test]
+    fn whatsapp_non_smart_behavior_unchanged() {
+        // No whatsapp entry at all => fall back to mention_only-derived mode.
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.mention_only_by_channel.insert("whatsapp".to_string(), true);
+        let mode = group_reply_mode_for(&ctx, "whatsapp");
+        assert_eq!(
+            mode,
+            crate::config::GroupReplyMode::MentionOnly,
+            "absent + mention_only=true => MentionOnly, not Smart"
+        );
+        assert!(!mode.is_smart(), "non-smart whatsapp never enters the smart gate");
+
+        // Explicit MentionOnly registration is likewise not smart.
+        ctx.group_reply_mode_by_channel
+            .insert("whatsapp".to_string(), crate::config::GroupReplyMode::MentionOnly);
+        assert!(!group_reply_mode_for(&ctx, "whatsapp").is_smart());
+    }
+
+    /// A WhatsApp DM (no `@g.us`, no group hint) can never be smart, so the bot
+    /// is never silenced and `stay_silent` is never exposed — even when whatsapp
+    /// is configured Smart.
+    #[test]
+    fn whatsapp_dm_is_never_smart_silent() {
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.group_reply_mode_by_channel
+            .insert("whatsapp".to_string(), crate::config::GroupReplyMode::Smart);
+        let msg = traits::ChannelMessage {
+            channel: "whatsapp".to_string(),
+            sender: "+123".to_string(),
+            reply_target: "+123".to_string(), // DM: a bare number, not @g.us
+            content: "hi".to_string(),
+            ..Default::default()
+        };
+        let is_group = msg.reply_target.starts_with("group:") || msg.reply_target.ends_with("@g.us");
+        let in_group_for_smart = is_group || msg.is_group_hint;
+        let mode = group_reply_mode_for(&ctx, &msg.channel);
+        let smart_group = mode.is_smart() && in_group_for_smart && !is_system_message(&msg);
+        assert!(!smart_group, "DMs are never smart => never silenced");
+    }
+
+    /// Signal (also `@g.us`-agnostic but using its own paths) is unaffected by
+    /// extending smart to whatsapp: registering whatsapp Smart leaves signal's
+    /// effective mode entirely mention_only-derived.
+    #[test]
+    fn signal_unaffected_by_whatsapp_smart() {
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.group_reply_mode_by_channel
+            .insert("whatsapp".to_string(), crate::config::GroupReplyMode::Smart);
+        ctx.mention_only_by_channel.insert("signal".to_string(), true);
+        // signal has no smart registration => derived from mention_only.
+        let signal_mode = group_reply_mode_for(&ctx, "signal");
+        assert_eq!(
+            signal_mode,
+            crate::config::GroupReplyMode::MentionOnly,
+            "signal stays mention_only-derived; whatsapp smart does not bleed over"
+        );
+        assert!(!signal_mode.is_smart(), "signal is never smart here");
     }
 
     /// Provider that returns a fixed string, recording how many classifier calls
