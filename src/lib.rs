@@ -141,7 +141,6 @@ pub use config::Config;
 // Re-export security types for integration tests.
 pub use security::pairing::{PairingGuard, constant_time_eq};
 pub use security::policy::{ActionTracker, AutonomyLevel, SecurityPolicy};
-pub use security::policy_pipeline::{EvalContext, PolicyPipeline};
 
 // Re-export HookManager for integration tests (gateway AppState requires it).
 pub use hooks::HookManager;

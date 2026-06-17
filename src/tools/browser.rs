@@ -2408,7 +2408,6 @@ mod tests {
     fn supervised_browser() -> BrowserTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::Supervised,
-            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         });
         BrowserTool::new(security, vec!["*".into()], None)
@@ -2433,10 +2432,11 @@ mod tests {
         );
     }
 
-    /// With the default high-risk hard-block, any browser side-effect action is
-    /// denied outright even with a grant.
+    /// Phase 1: the high-risk hard-block was removed. A valid matching grant now
+    /// lets a High-risk browser action traverse the side-effect gate (it may
+    /// still fail downstream, but never with a gate denial).
     #[tokio::test]
-    async fn open_blocked_by_high_risk_policy_even_with_grant() {
+    async fn open_allowed_through_gate_with_grant() {
         let security = Arc::new(SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::Supervised,
             ..SecurityPolicy::default()
@@ -2453,15 +2453,10 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("high-risk operation is disallowed"),
-            "high-risk block must deny even with grant, got: {:?}",
-            result.error
+            !error.contains("high-risk operation is disallowed") && !error.contains("requires runtime approval grant"),
+            "grant must let the op pass the gate, got: {error:?}"
         );
     }
 

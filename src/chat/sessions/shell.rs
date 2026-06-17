@@ -516,15 +516,13 @@ mod tests {
     use crate::security::AutonomyLevel;
 
     fn auto_security() -> Arc<SecurityPolicy> {
-        // Full autonomy + a permissive command allowlist (`*`) so the gate
-        // admits the ordinary test commands (`sleep`, `exit`, …) — the
-        // operator-typed `/shell` analogue. High-risk *patterns* (rm -rf /, …)
-        // are still blocked by `command_risk_level` independently of the
-        // allowlist; this only widens the base-command allowlist.
+        // Full autonomy so the gate admits the ordinary test commands (`sleep`,
+        // `exit`, …) — the operator-typed `/shell` analogue. High-risk *patterns*
+        // (rm -rf /, …) are still blocked by `command_risk_level` independently.
+        // Phase 1: per-command allowlist removed.
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["*".into()],
             ..SecurityPolicy::default()
         })
     }

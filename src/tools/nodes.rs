@@ -518,7 +518,6 @@ mod tests {
             autonomy: level,
             max_actions_per_hour: 1000,
             workspace_dir: std::env::temp_dir(),
-            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         });
         NodesTool::new(new_shared(config), security)

@@ -415,7 +415,6 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             max_actions_per_hour: 100,
-            block_high_risk_commands: false,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
@@ -437,31 +436,10 @@ mod tests {
         );
     }
 
-    /// With the default high-risk hard-block, pushover is denied outright even
-    /// with a grant.
-    #[tokio::test]
-    async fn notify_blocked_by_high_risk_policy_even_with_grant() {
-        let tool = PushoverTool::new(test_security(AutonomyLevel::Supervised, 100), PathBuf::from("/tmp"));
-        let op = op_id::op_id("pushover", "notify", &[]);
-        let result = tool
-            .execute(json!({
-                "message": "hello",
-                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
-                    ApprovalGrant::for_resource_operation("pushover", &op, "test", None),
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("high-risk operation is disallowed"),
-            "high-risk block must deny even with grant, got: {:?}",
-            result.error
-        );
-    }
+    // Phase 1: the former `notify_blocked_by_high_risk_policy_even_with_grant`
+    // test was removed — the high-risk hard-block no longer exists, and the
+    // grant-traverses-gate behavior it now would assert is already fully covered
+    // by `notify_allowed_with_matching_grant` below.
 
     #[tokio::test]
     async fn notify_allowed_with_matching_grant() {
@@ -472,7 +450,6 @@ mod tests {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             max_actions_per_hour: 100,
-            block_high_risk_commands: false,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });

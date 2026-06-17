@@ -91,7 +91,6 @@ use crate::memory::{
 use crate::observability::ObserverEvent;
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::security::PolicyPipeline;
 use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -1212,11 +1211,7 @@ pub async fn run(
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
-    .with_approval_resolver_factory(approval_resolver_factory)
-    .with_approval_lists(
-        config.autonomy.auto_approve.iter().cloned().collect(),
-        config.autonomy.always_ask.iter().cloned().collect(),
-    );
+    .with_approval_resolver_factory(approval_resolver_factory);
     let spawn_tools_handle = spawn_tool.tools_handle();
 
     // Sibling tools share the same single-source registry (only the v1a four;
@@ -3304,8 +3299,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
             "tui_mirror initialized"
         );
 
-        // ── Policy Pipeline for tool access control ──────────────
-        let policy_pipeline = PolicyPipeline::from_config(&config);
+        // ── Unified tool authorization (permission-model Phase 1) ──
+        // Tool access is governed solely by `[autonomy]` via
+        // `SecurityPolicy::decide`; the former PolicyPipeline is removed.
         let scope_owner_id = runtime_envelope.resolved_owner_id();
         let scope_ctx = ScopeContext {
             policy: &security,
@@ -3317,7 +3313,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
             topic_id: runtime_envelope.topic_id.as_deref(),
             task_id: runtime_envelope.resolved_task_id(),
             source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
-            policy_pipeline: Some(&policy_pipeline),
         };
 
         // ── Timeout budget ───────────────────────────────────────

@@ -548,7 +548,6 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
                     topic_id: manifest.topic_id.as_deref(),
                     task_id: manifest.parent_task_id.as_deref(),
                     source_message_event_id: manifest.source_message_event_id.as_deref(),
-                    policy_pipeline: None,
                 })
             }
             _ => None,

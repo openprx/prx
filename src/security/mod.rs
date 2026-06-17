@@ -30,13 +30,11 @@ pub mod landlock;
 pub mod op_id;
 pub mod pairing;
 pub mod policy;
-pub mod policy_pipeline;
 pub mod secrets;
 pub mod traits;
 
 pub use detect::{create_sandbox_with_workspace, create_sandbox_with_workspace_and_dirs};
 pub use policy::{AutonomyLevel, SecurityPolicy, SideEffectGate};
-pub use policy_pipeline::{EvalContext, PolicyPipeline};
 pub use secrets::SecretStore;
 
 /// Resolve operator-configured `extra_path_dirs` (Bug #2 shell-toolchain opt-in)

@@ -216,10 +216,6 @@ pub(crate) struct ScopeContext<'a> {
     pub topic_id: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub source_message_event_id: Option<&'a str>,
-    /// Optional multi-layer tool policy pipeline (P3-1).
-    /// When set, tool calls are additionally evaluated against the pipeline
-    /// before execution. A denial from the pipeline blocks the tool call.
-    pub policy_pipeline: Option<&'a crate::security::PolicyPipeline>,
 }
 
 #[derive(Clone)]
@@ -3655,58 +3651,45 @@ fn classify_tool_priority(name: &str, schedule: &ReadOnlyToolScheduleConfig) -> 
     }
 }
 
+/// Read-only classification for the parallel scheduler.
+///
+/// Permission-model Phase 1: this delegates to the single source of truth
+/// [`crate::security::policy::is_read_only_tool`] so the scheduler's read-only
+/// fast path and [`SecurityPolicy::decide`] can never disagree about which
+/// tools have no side effects.
 fn is_read_only_tool_name(name: &str) -> bool {
-    matches!(
-        name,
-        "file_read"
-            | "memory_get"
-            | "memory_recall"
-            | "memory_search"
-            | "document_search"
-            | "document_get_chunk"
-            | "web_fetch"
-            | "web_search_tool"
-            | "image_info"
-            | "session_status"
-            | "sessions_list"
-            | "sessions_history"
-            | "cron_list"
-            | "cron_runs"
-            | "agents_list"
-            | "hardware_board_info"
-            | "hardware_memory_map"
-            | "hardware_memory_read"
-    )
+    crate::security::policy::is_read_only_tool(name)
 }
 
-fn scope_or_pipeline_denial(call: &ParsedToolCall, scope_ctx: Option<&ScopeContext<'_>>) -> Option<String> {
-    let ctx = scope_ctx?;
-    if !ctx
-        .policy
-        .is_tool_allowed(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
-    {
-        return Some(format!(
-            "Error: Tool '{}' is not permitted for this user/channel context.",
-            call.name
-        ));
-    }
+/// Permission-model Phase 1: resolve the unified [`ToolDecision`] for a call.
+///
+/// When no scope context is present (callers that do not gate, e.g. internal
+/// sub-agent paths) the call is allowed. Otherwise the single
+/// [`SecurityPolicy::decide`] entry point governs the outcome.
+fn decide_tool_call(
+    call: &ParsedToolCall,
+    scope_ctx: Option<&ScopeContext<'_>>,
+) -> crate::security::policy::ToolDecision {
+    scope_ctx.map_or(crate::security::policy::ToolDecision::Allow, |ctx| {
+        ctx.policy.decide(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
+    })
+}
 
-    if let Some(pipeline) = ctx.policy_pipeline {
-        let eval_ctx = crate::security::EvalContext {
-            channel: ctx.channel.to_string(),
-            chat_type: ctx.chat_type.to_string(),
-            sender: ctx.sender.to_string(),
-        };
-        let decision = pipeline.evaluate(&call.name, &eval_ctx);
-        if !decision.allowed {
-            return Some(format!(
-                "Error: Tool '{}' blocked by policy pipeline: {}",
-                call.name, decision.reason
-            ));
-        }
-    }
+/// Whether a tool call would require interactive approval (`decide` → `Ask`).
+///
+/// Used by the parallel scheduler to keep approval-gated calls off the
+/// unattended read-only fast path. When no scope context is present the call is
+/// not gated (matches [`decide_tool_call`] returning `Allow`).
+fn requires_approval(call: &ParsedToolCall, scope_ctx: Option<&ScopeContext<'_>>) -> bool {
+    decide_tool_call(call, scope_ctx) == crate::security::policy::ToolDecision::Ask
+}
 
-    None
+/// Denial message returned to the model when [`decide_tool_call`] yields `Deny`.
+fn scope_denial_message(call: &ParsedToolCall) -> String {
+    format!(
+        "Error: Tool '{}' is not permitted under the current autonomy policy / user context.",
+        call.name
+    )
 }
 
 async fn execute_tool_call_serial(
@@ -3720,12 +3703,46 @@ async fn execute_tool_call_serial(
     chat_mode: ChatMode,
     approval_resolver: Option<&Arc<dyn ApprovalResolver>>,
 ) -> Result<String> {
-    if let Some(denied) = scope_or_pipeline_denial(call, scope_ctx) {
-        return Ok(denied);
+    // Permission-model Phase 1: single unified decision point.
+    use crate::security::policy::ToolDecision;
+    let decision = decide_tool_call(call, scope_ctx);
+    if decision == ToolDecision::Deny {
+        return Ok(scope_denial_message(call));
     }
 
-    if let Some(mgr) = approval {
-        if mgr.needs_approval(&call.name) {
+    // `Ask` routes through the approval flow (manager + grant). `Allow` falls
+    // through to direct execution below.
+    if decision == ToolDecision::Ask {
+        // P0 fail-closed: `decide` demands approval but no `ApprovalManager` is
+        // wired to satisfy it (non-CLI channel / session-worker / gateway paths
+        // that pass `approval = None` while carrying a scope under supervised
+        // autonomy). Executing here would silently bypass the approval gate, so
+        // deny instead of falling through to direct execution.
+        let Some(mgr) = approval else {
+            return Ok(format!(
+                "Denied: tool '{}' requires approval but no approval resolver is available in this context.",
+                call.name
+            ));
+        };
+
+        // P2-a: preserve the session "Always" allowlist. A tool previously
+        // approved with "Always" within this session executes immediately with a
+        // runtime grant, without re-prompting.
+        if mgr.is_session_allowlisted(&call.name) {
+            return execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                observer,
+                cancellation_token,
+                scope_ctx,
+                true,
+                chat_mode,
+            )
+            .await;
+        }
+
+        {
             let request = ApprovalRequest {
                 tool_name: call.name.clone(),
                 arguments: call.arguments.clone(),
@@ -3736,7 +3753,7 @@ async fn execute_tool_call_serial(
             // When `None` (every current caller) the historical synchronous
             // path runs unchanged: interactive CLI prompt on the `cli` channel,
             // implicit deny everywhere else.
-            let (decision, runtime_grant) = if let Some(resolver) = approval_resolver {
+            let (approval_decision, runtime_grant) = if let Some(resolver) = approval_resolver {
                 // An `ApprovalResolver` may *suspend* (the chat `/bg` NeedsInput
                 // path awaits an operator decision, up to a 300s timeout). Race
                 // it against the cancellation token so a steer / send / kill that
@@ -3766,9 +3783,9 @@ async fn execute_tool_call_serial(
                 (ApprovalResponse::No, true)
             };
 
-            mgr.record_decision(&call.name, &call.arguments, decision, channel_name);
+            mgr.record_decision(&call.name, &call.arguments, approval_decision, channel_name);
 
-            if decision == ApprovalResponse::No {
+            if approval_decision == ApprovalResponse::No {
                 return Ok("Denied by user.".to_string());
             }
 
@@ -3816,8 +3833,10 @@ async fn execute_read_only_batch(
 
     let mut indexed_results: Vec<(usize, String)> = stream::iter(batch_calls.into_iter().enumerate())
         .map(|(idx, call)| async move {
-            if let Some(denied) = scope_or_pipeline_denial(&call, scope_ctx) {
-                return Ok((idx, denied));
+            // Read-only batch: only a scope/autonomy `Deny` blocks. Read-only
+            // tools never yield `Ask`, so `Allow`/`Ask` both proceed here.
+            if decide_tool_call(&call, scope_ctx) == crate::security::policy::ToolDecision::Deny {
+                return Ok((idx, scope_denial_message(&call)));
             }
 
             let execute_future = execute_one_tool(
@@ -3919,7 +3938,7 @@ async fn execute_tools_with_policy(
 
         let index = ordered_indices[cursor];
         let call = &tool_calls[index];
-        let approval_required = approval.is_some_and(|mgr| mgr.needs_approval(&call.name));
+        let approval_required = requires_approval(call, scope_ctx);
 
         if classify_tool_call(&call.name) == ToolSchedulingClass::ReadOnly
             && !approval_required
@@ -3930,7 +3949,7 @@ async fn execute_tools_with_policy(
             while batch_end < ordered_indices.len() {
                 let next_index = ordered_indices[batch_end];
                 let next_call = &tool_calls[next_index];
-                let next_approval = approval.is_some_and(|mgr| mgr.needs_approval(&next_call.name));
+                let next_approval = requires_approval(next_call, scope_ctx);
                 if classify_tool_call(&next_call.name) != ToolSchedulingClass::ReadOnly || next_approval {
                     break;
                 }
@@ -7723,6 +7742,188 @@ mod tests {
             .expect("execution order lock should be valid")
             .clone();
         assert_eq!(observed_order, vec!["file_read", "sessions_spawn"]);
+    }
+
+    /// P0 fail-closed regression: the non-CLI-channel / session-worker shape —
+    /// a scope context is present (so `decide` runs) under `supervised`, but no
+    /// `ApprovalManager` is wired (`approval = None`). A low-risk side-effecting
+    /// (`Act`) tool such as `delegate` resolves to `Ask`; with no approver to
+    /// satisfy it, the tool loop MUST deny rather than silently execute. Prior to
+    /// the fix it fell through to direct execution, bypassing approval entirely.
+    #[tokio::test]
+    async fn supervised_act_tool_without_approval_manager_is_denied_not_executed() {
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+            name: "delegate".to_string(),
+            execution_order: Arc::clone(&execution_order),
+        })];
+
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..crate::security::SecurityPolicy::default()
+        };
+        let scope_ctx = ScopeContext {
+            policy: &policy,
+            sender: "user@example.com",
+            channel: "telegram",
+            chat_type: "private",
+            chat_id: "chat-1",
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+        };
+
+        let call = ParsedToolCall {
+            name: "delegate".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = execute_tool_call_serial(
+            &call,
+            &tools_registry,
+            &NoopObserver,
+            None, // no ApprovalManager — the fail-closed condition
+            "telegram",
+            None,
+            Some(&scope_ctx),
+            ChatMode::default(),
+            None,
+        )
+        .await
+        .expect("serial execution should return a denial string, not error");
+
+        assert!(
+            result.starts_with("Denied:"),
+            "expected fail-closed denial, got: {result}"
+        );
+        assert!(
+            execution_order
+                .lock()
+                .expect("execution order lock should be valid")
+                .is_empty(),
+            "the Act tool must NOT have executed under fail-closed denial"
+        );
+    }
+
+    /// Companion to the fail-closed test: under the SAME conditions (supervised,
+    /// scope present, no `ApprovalManager`) a genuinely read-only tool resolves
+    /// to `Allow` and still executes — the fix denies side effects without
+    /// over-blocking observational tools.
+    #[tokio::test]
+    async fn supervised_read_only_tool_without_approval_manager_still_executes() {
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+            name: "file_read".to_string(),
+            execution_order: Arc::clone(&execution_order),
+        })];
+
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..crate::security::SecurityPolicy::default()
+        };
+        let scope_ctx = ScopeContext {
+            policy: &policy,
+            sender: "user@example.com",
+            channel: "telegram",
+            chat_type: "private",
+            chat_id: "chat-1",
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+        };
+
+        let call = ParsedToolCall {
+            name: "file_read".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = execute_tool_call_serial(
+            &call,
+            &tools_registry,
+            &NoopObserver,
+            None,
+            "telegram",
+            None,
+            Some(&scope_ctx),
+            ChatMode::default(),
+            None,
+        )
+        .await
+        .expect("serial execution of read-only tool should succeed");
+
+        assert_eq!(result, "file_read");
+        assert_eq!(
+            execution_order
+                .lock()
+                .expect("execution order lock should be valid")
+                .as_slice(),
+            ["file_read"],
+            "read-only tool must still execute under supervised + no approver"
+        );
+    }
+
+    /// P2-a: a tool on the session "Always" allowlist executes immediately under
+    /// `supervised` without re-prompting, even when an `ApprovalManager` is wired
+    /// — the "Always" shortcut survived the move to the unified `decide` gate.
+    #[tokio::test]
+    async fn supervised_session_allowlisted_act_tool_executes_without_reprompt() {
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+            name: "delegate".to_string(),
+            execution_order: Arc::clone(&execution_order),
+        })];
+
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..crate::security::SecurityPolicy::default()
+        };
+        let scope_ctx = ScopeContext {
+            policy: &policy,
+            sender: "user@example.com",
+            channel: "telegram",
+            chat_type: "private",
+            chat_id: "chat-1",
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+        };
+
+        // Seed the session "Always" allowlist for `delegate`.
+        let mgr = ApprovalManager::from_autonomy_level(crate::security::AutonomyLevel::Supervised);
+        mgr.record_decision("delegate", &serde_json::json!({}), ApprovalResponse::Always, "telegram");
+        assert!(mgr.is_session_allowlisted("delegate"));
+
+        let call = ParsedToolCall {
+            name: "delegate".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let result = execute_tool_call_serial(
+            &call,
+            &tools_registry,
+            &NoopObserver,
+            Some(&mgr),
+            "telegram",
+            None,
+            Some(&scope_ctx),
+            ChatMode::default(),
+            None, // no resolver: a non-allowlisted Act tool would deny on this channel
+        )
+        .await
+        .expect("allowlisted tool should execute");
+
+        assert_eq!(result, "delegate");
+        assert_eq!(
+            execution_order
+                .lock()
+                .expect("execution order lock should be valid")
+                .as_slice(),
+            ["delegate"],
+            "session-allowlisted Act tool must execute without a prompt"
+        );
     }
 
     #[tokio::test]

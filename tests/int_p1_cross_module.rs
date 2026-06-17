@@ -603,17 +603,16 @@ async fn int_gcw_02_webhook_group_filtering_noise() {
 /// Sandbox auto-detection falls back gracefully when no specific backend is available.
 #[tokio::test]
 async fn int_tr_05_sandbox_selection_cascade_fallback() {
-    use openprx::config::{SandboxBackend, SandboxConfig, SecurityConfig};
+    use openprx::config::{SandboxBackend, SandboxConfig};
     use openprx::security::detect::create_sandbox;
 
-    // Explicitly disabled sandbox returns NoopSandbox
-    let disabled_config = SecurityConfig {
-        sandbox: SandboxConfig {
-            enabled: Some(false),
-            backend: SandboxBackend::None,
-            firejail_args: Vec::new(),
-            extra_path_dirs: Vec::new(),
-        },
+    // Phase 1: sandbox config moved out of `SecurityConfig` into
+    // `autonomy.sandbox`; the creation fns now take a `&SandboxConfig` directly.
+
+    // Explicitly disabled sandbox returns NoopSandbox.
+    let disabled_config = SandboxConfig {
+        enabled: Some(false),
+        backend: SandboxBackend::None,
         ..Default::default()
     };
     let sandbox = create_sandbox(&disabled_config);
@@ -625,13 +624,9 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
     assert!(sandbox.is_available(), "test: NoopSandbox should always be available");
 
     // Auto-detection should return some sandbox (at least NoopSandbox)
-    let auto_config = SecurityConfig {
-        sandbox: SandboxConfig {
-            enabled: None,
-            backend: SandboxBackend::Auto,
-            firejail_args: Vec::new(),
-            extra_path_dirs: Vec::new(),
-        },
+    let auto_config = SandboxConfig {
+        enabled: None,
+        backend: SandboxBackend::Auto,
         ..Default::default()
     };
     let auto_sandbox = create_sandbox(&auto_config);
@@ -642,57 +637,87 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INT-CS-03: PolicyPipeline layer precedence (Global < Group < Tool)
+// INT-CS-03: Unified tool-authorization decision layering (scope ACL × autonomy)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Tool-level policy overrides group-level deny.
+/// Permission-model Phase 1 replaced the multi-layer `PolicyPipeline` with a
+/// single `SecurityPolicy::decide()` entry point. This cross-module test
+/// preserves the original intent — "tool authorization layering works across
+/// modules" — by exercising the two layers that now compose the decision:
+///   1. identity scope ACL (config `ScopeRule`s), which can `Deny` independently
+///      of autonomy, and
+///   2. the autonomy level, which maps a side-effecting tool to Allow / Ask / Deny.
 #[tokio::test]
-async fn int_cs_03_policy_pipeline_layer_precedence() {
-    use openprx::config::schema::ToolPolicyConfig;
-    use openprx::security::policy_pipeline::{EvalContext, PolicyLayer, PolicyPipeline};
-    use std::collections::HashMap;
+async fn int_cs_03_decide_layers_scope_and_autonomy() {
+    use openprx::security::policy::{AutonomyLevel, ToolDecision};
 
-    let mut groups = HashMap::new();
-    groups.insert("sessions".to_string(), "deny".to_string());
-
-    let mut tools = HashMap::new();
-    tools.insert("sessions_spawn".to_string(), "allow".to_string());
-
-    let pipeline = PolicyPipeline::new(ToolPolicyConfig {
-        default: "allow".to_string(),
-        groups,
-        tools,
-    });
-
-    // sessions_spawn: group=deny, tool=allow -> tool wins -> allowed
-    let decision = pipeline.evaluate("sessions_spawn", &EvalContext::default());
-    assert!(
-        decision.allowed,
-        "test: sessions_spawn should be ALLOWED (tool override beats group deny)"
+    // Layer 1: a scope deny rule overrides autonomy entirely. Even under Full
+    // autonomy, `shell` denied for telegram resolves to Deny.
+    let scoped = SecurityPolicy {
+        autonomy: AutonomyLevel::Full,
+        scope_rules: vec![ScopeRule {
+            user: None,
+            channel: Some("telegram".into()),
+            chat_type: None,
+            tools_allow: Vec::new(),
+            tools_deny: vec!["shell".into()],
+        }],
+        scope_default_allow: true,
+        ..SecurityPolicy::default()
+    };
+    assert_eq!(
+        scoped.decide("shell", "alice", "telegram", "direct"),
+        ToolDecision::Deny,
+        "test: scope deny rule must force Deny even under Full autonomy"
     );
-    assert!(
-        decision.layers_applied.contains(&PolicyLayer::Tool),
-        "test: Tool layer should be in layers_applied"
-    );
-    assert!(
-        decision.layers_applied.contains(&PolicyLayer::Group),
-        "test: Group layer should be in layers_applied"
-    );
-    assert!(
-        decision.layers_applied.contains(&PolicyLayer::Global),
-        "test: Global layer should be in layers_applied"
+    // Same policy, different channel: no rule matches → autonomy (Full) governs.
+    assert_eq!(
+        scoped.decide("shell", "alice", "signal", "direct"),
+        ToolDecision::Allow,
+        "test: Full autonomy should Allow a side-effecting tool on an unscoped channel"
     );
 
-    // sessions_list: group=deny, no tool override -> denied
-    let decision2 = pipeline.evaluate("sessions_list", &EvalContext::default());
-    assert!(
-        !decision2.allowed,
-        "test: sessions_list should be DENIED (group deny, no tool override)"
+    // Layer 2: with no scope restrictions, the autonomy level alone decides for a
+    // side-effecting tool (`shell`).
+    let full = SecurityPolicy {
+        autonomy: AutonomyLevel::Full,
+        ..SecurityPolicy::default()
+    };
+    assert_eq!(
+        full.decide("shell", "alice", "signal", "direct"),
+        ToolDecision::Allow,
+        "test: Full + side-effecting tool → Allow"
     );
 
-    // shell: no group, no tool -> global allow
-    let decision3 = pipeline.evaluate("shell", &EvalContext::default());
-    assert!(decision3.allowed, "test: shell should be ALLOWED (global default)");
+    let supervised = SecurityPolicy {
+        autonomy: AutonomyLevel::Supervised,
+        ..SecurityPolicy::default()
+    };
+    assert_eq!(
+        supervised.decide("shell", "alice", "signal", "direct"),
+        ToolDecision::Ask,
+        "test: Supervised + side-effecting tool → Ask"
+    );
+
+    let read_only = SecurityPolicy {
+        autonomy: AutonomyLevel::ReadOnly,
+        ..SecurityPolicy::default()
+    };
+    assert_eq!(
+        read_only.decide("shell", "alice", "signal", "direct"),
+        ToolDecision::Deny,
+        "test: ReadOnly + side-effecting tool → Deny"
+    );
+
+    // Read-only tools (e.g. `file_read`) are always Allow, in every autonomy
+    // level, regardless of the side-effecting rules above.
+    for policy in [&full, &supervised, &read_only] {
+        assert_eq!(
+            policy.decide("file_read", "alice", "signal", "direct"),
+            ToolDecision::Allow,
+            "test: read-only tool must Allow in every autonomy level"
+        );
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -545,59 +545,61 @@ mod tests {
     // `is_command_allowed`, which skipped the risk-gate layer entirely. The
     // tests below exercise the `handle_command` → `SideEffectGate` path and
     // confirm that:
-    //   (a) allowlist-permitted low-risk commands are accepted regardless of
-    //       `block_high_risk_commands` / `require_approval_for_medium_risk`,
-    //   (b) commands outside the allowlist are always rejected (consistent with
-    //       the old behaviour, now routed through the gate for audit logging),
-    //   (c) allowlist-permitted medium-risk commands are blocked under the
-    //       default strict config (Supervised + require_approval_for_medium_risk)
-    //       but pass when that flag is disabled — proving the gate's stricter
-    //       logic is reached on the `cron update` path,
+    //   (a) low-risk commands are accepted regardless of the autonomy level,
+    //   (b) Phase 1: the per-command allowlist was removed, so commands are no
+    //       longer rejected by base name; structurally-unsafe commands are still
+    //       rejected under Supervised but authorized under Full,
+    //   (c) medium-risk commands are blocked under the strict (Supervised) config
+    //       without a grant but pass under the relaxed (Full) config — proving the
+    //       gate's level-keyed logic is reached on the `cron update` path,
     //   (d) the scheduler-execution gate (scheduler.rs SideEffectGate) and the
     //       update-time gate both follow the same SecurityPolicy semantics, so a
     //       command accepted at update time will not be rejected by the scheduler
     //       (and vice-versa) due to a policy mismatch.
     //
     // Note: SideEffectGate.authorize_command_execution itself is exhaustively
-    // tested in security/policy.rs (medium-risk grant requirements, high-risk
-    // block_high_risk_commands, approval-grant binding, etc.). These tests only
-    // confirm that the `cron update` CLI path is wired to the gate rather than
-    // the old bare `is_command_allowed`.
+    // tested in security/policy.rs (medium/high-risk grant requirements,
+    // approval-grant binding, etc.). These tests only confirm that the `cron
+    // update` CLI path is wired to the gate rather than the old bare
+    // `is_command_allowed`.
 
-    /// Helper: build a Config whose autonomy section has the given flags.
-    fn config_with_autonomy(
-        tmp: &TempDir,
-        require_approval_for_medium_risk: bool,
-        block_high_risk_commands: bool,
-    ) -> Config {
+    /// Helper: build a Config whose autonomy level reflects the desired strictness.
+    ///
+    /// Phase 1: the per-command allowlist and the `require_approval_for_medium_risk`
+    /// / `block_high_risk_commands` flags were removed; medium/high-risk gating now
+    /// keys off the autonomy LEVEL. `strict == true` maps to `Supervised` (gates
+    /// medium/high commands without a grant); `strict == false` maps to `Full`
+    /// (authorizes every command unconditionally).
+    fn config_with_autonomy(tmp: &TempDir, strict: bool) -> Config {
         use crate::config::AutonomyConfig;
         use crate::security::AutonomyLevel;
+        let level = if strict {
+            AutonomyLevel::Supervised
+        } else {
+            AutonomyLevel::Full
+        };
         Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             autonomy: AutonomyConfig {
-                level: AutonomyLevel::Supervised,
-                require_approval_for_medium_risk,
-                block_high_risk_commands,
-                // Keep the default allowlist (includes git, echo, etc.)
+                level,
                 ..AutonomyConfig::default()
             },
             ..Config::default()
         }
     }
 
-    /// (a) Low-risk, allowlist-permitted command (`echo`) must be accepted
-    /// regardless of the strict-config flags — both under the default strict
-    /// profile and under the relaxed init-template profile.
+    /// (a) Low-risk command (`echo`) must be accepted regardless of strictness —
+    /// both under the strict (Supervised) profile and the relaxed (Full) profile.
     #[test]
     fn cron_update_via_gate_allows_low_risk_allowlisted_command_strict_config() {
         let tmp = TempDir::new().unwrap();
-        // Default strict config: block_high_risk=true, require_approval_medium=true
-        let config = config_with_autonomy(&tmp, true, true);
+        // Strict config maps to Supervised.
+        let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
-        // `echo updated` is Low-risk and allowlist-permitted → gate allows
+        // `echo updated` is Low-risk → gate allows even under Supervised.
         let result = run_update(&config, &job.id, None, None, Some("echo updated"), None);
         assert!(result.is_ok(), "low-risk echo should be allowed (strict): {result:?}");
     }
@@ -605,8 +607,8 @@ mod tests {
     #[test]
     fn cron_update_via_gate_allows_low_risk_allowlisted_command_relaxed_config() {
         let tmp = TempDir::new().unwrap();
-        // Relaxed (init-template) config: both flags disabled
-        let config = config_with_autonomy(&tmp, false, false);
+        // Relaxed config maps to Full.
+        let config = config_with_autonomy(&tmp, false);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
@@ -614,17 +616,21 @@ mod tests {
         assert!(result.is_ok(), "low-risk echo should be allowed (relaxed): {result:?}");
     }
 
-    /// (b) A command not in the allowlist (`agent -m foo`) must always be
-    /// rejected — under both config profiles.
+    /// (b) Phase 1: the per-command allowlist was removed, so the gate no longer
+    /// rejects a command merely for its base name. Structural-safety violations
+    /// (here, an output redirect) are still rejected under the strict (Supervised)
+    /// profile, while the relaxed (Full) profile disables structural gates and
+    /// authorizes the command — proving the gate's level-keyed logic is reached.
     #[test]
-    fn cron_update_via_gate_rejects_non_allowlisted_command_strict() {
+    fn cron_update_via_gate_rejects_structurally_unsafe_command_strict() {
         let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, true, true);
+        let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
-        let result = run_update(&config, &job.id, None, None, Some("agent -m gpt4"), None);
-        assert!(result.is_err(), "non-allowlisted command must be denied (strict)");
+        // Output redirect is a structural-safety violation under Supervised.
+        let result = run_update(&config, &job.id, None, None, Some("echo pwn > /etc/crontab"), None);
+        assert!(result.is_err(), "structurally-unsafe command must be denied (strict)");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("blocked by security policy"),
@@ -633,26 +639,31 @@ mod tests {
     }
 
     #[test]
-    fn cron_update_via_gate_rejects_non_allowlisted_command_relaxed() {
+    fn cron_update_via_gate_allows_command_under_relaxed_full() {
         let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, false, false);
+        let config = config_with_autonomy(&tmp, false);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
-        let result = run_update(&config, &job.id, None, None, Some("agent -m gpt4"), None);
-        assert!(result.is_err(), "non-allowlisted command must be denied (relaxed)");
+        // Phase 1: Full autonomy authorizes every command unconditionally, including
+        // one with an output redirect that Supervised would reject structurally.
+        let result = run_update(&config, &job.id, None, None, Some("echo pwn > /tmp/out.txt"), None);
+        assert!(
+            result.is_ok(),
+            "Full autonomy must allow the command (relaxed): {result:?}"
+        );
     }
 
-    /// (c) KEY REGRESSION: medium-risk command (`git commit`) is allowlist-
-    /// permitted but now blocked under Supervised + require_approval_for_medium_risk=true
-    /// (the new gate behaviour). Under the relaxed config (flag=false) it passes.
-    /// `is_command_allowed` alone would have allowed it in both cases — this test
-    /// verifies the gate's stricter logic is actually reached.
+    /// (c) KEY REGRESSION: a medium-risk command (`git commit`) is blocked under the
+    /// strict (Supervised) profile without a runtime grant (Phase 1: medium/high
+    /// gating keys off the autonomy level). Under the relaxed (Full) profile it
+    /// passes. `is_command_allowed` alone would allow it in both cases — this test
+    /// verifies the gate's stricter level-keyed logic is actually reached.
     #[test]
     fn cron_update_via_gate_blocks_medium_risk_command_under_strict_config() {
         let tmp = TempDir::new().unwrap();
-        // Strict config: Supervised + require_approval_for_medium_risk=true, no grant
-        let config = config_with_autonomy(&tmp, true, true);
+        // Strict config maps to Supervised; medium-risk commands need a grant.
+        let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
@@ -673,16 +684,16 @@ mod tests {
     #[test]
     fn cron_update_via_gate_allows_medium_risk_command_under_relaxed_config() {
         let tmp = TempDir::new().unwrap();
-        // Relaxed config: require_approval_for_medium_risk=false means medium-risk
-        // commands (like `git commit`) are allowed without an explicit grant.
-        let config = config_with_autonomy(&tmp, false, false);
+        // Relaxed config maps to Full: medium-risk commands (like `git commit`) are
+        // authorized unconditionally without an explicit grant.
+        let config = config_with_autonomy(&tmp, false);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
         let result = run_update(&config, &job.id, None, None, Some("git commit -m msg"), None);
         assert!(
             result.is_ok(),
-            "medium-risk git commit should be allowed when require_approval_for_medium_risk=false: {result:?}"
+            "medium-risk git commit should be allowed under Full autonomy: {result:?}"
         );
     }
 
@@ -694,7 +705,7 @@ mod tests {
     #[test]
     fn cron_update_and_scheduler_gate_agree_on_allowed_command() {
         let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, true, true);
+        let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
 
         // The same policy used by `handle_command` (cron update):
@@ -716,7 +727,7 @@ mod tests {
     #[test]
     fn cron_update_and_scheduler_gate_agree_on_blocked_command() {
         let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, true, true);
+        let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
 
         let security = crate::runtime::bootstrap::build_security_policy(&config);

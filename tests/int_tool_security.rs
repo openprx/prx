@@ -81,11 +81,9 @@ async fn int_ts_02_risk_classification_low_executes() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
         p.workspace_dir = std::env::temp_dir();
-        p.block_high_risk_commands = true;
-        p.require_approval_for_medium_risk = true;
     });
 
-    // ls /tmp is Low risk and in default allowed_commands
+    // ls /tmp is Low risk; under Supervised, low-risk commands run without a grant
     assert_eq!(
         security.command_risk_level("ls /tmp"),
         CommandRiskLevel::Low,
@@ -105,9 +103,6 @@ async fn int_ts_02_risk_classification_medium_needs_approval() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
         p.workspace_dir = std::env::temp_dir();
-        p.allowed_commands = vec!["touch".into()];
-        p.block_high_risk_commands = true;
-        p.require_approval_for_medium_risk = true;
     });
 
     assert_eq!(
@@ -136,9 +131,6 @@ async fn int_ts_02_risk_classification_high_blocked() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
         p.workspace_dir = std::env::temp_dir();
-        p.allowed_commands = vec!["rm".into()];
-        p.block_high_risk_commands = true;
-        p.require_approval_for_medium_risk = true;
     });
 
     assert_eq!(
@@ -152,11 +144,13 @@ async fn int_ts_02_risk_classification_high_blocked() {
         .execute(json!({"command": "rm -rf /"}))
         .await
         .expect("test: high-risk command should return ToolResult");
-    assert!(!result.success, "High-risk 'rm -rf /' must be blocked");
+    // Phase 1: under Supervised, a high-risk command without a runtime approval
+    // grant is denied via the grant gate (no per-command allowlist anymore).
+    assert!(!result.success, "High-risk 'rm -rf /' must be blocked under Supervised");
     let err = result.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("high-risk") || err.contains("not allowed"),
-        "test: expected high-risk denial, got: {err}"
+        err.contains("runtime approval grant"),
+        "test: expected runtime approval grant denial, got: {err}"
     );
 }
 
@@ -575,7 +569,6 @@ async fn int_ts_10_env_sanitization_excludes_api_keys() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
-        p.allowed_commands = vec!["env".into(), "printenv".into()];
     });
 
     let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
@@ -610,7 +603,6 @@ async fn int_ts_10_env_preserves_safe_vars() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
-        p.allowed_commands = vec!["echo".into()];
     });
 
     let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
@@ -643,7 +635,6 @@ async fn int_ts_10_env_path_override_is_safe() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
-        p.allowed_commands = vec!["echo".into()];
     });
 
     let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
@@ -712,14 +703,17 @@ fn int_ts_02_direct_risk_classification() {
 }
 
 #[test]
-fn int_ts_02_pip_install_is_not_in_default_allowlist() {
+fn int_ts_02_pip_install_passes_command_gate() {
+    // Phase 1: per-command allowlist removed. The structural-safety gate
+    // (`is_command_allowed`) no longer rejects a base command merely because it
+    // is not on a curated list; only subshell/redirect/tee/single-`&`/dangerous
+    // args block in non-full modes. `pip install foo` has none of those, so it
+    // now passes the gate (default autonomy is Supervised).
     let policy = SecurityPolicy::default();
 
-    // pip is not in the default allowed_commands list, so it should be blocked
-    // by the allowlist check before risk classification matters.
     assert!(
-        !policy.is_command_allowed("pip install foo"),
-        "test: 'pip install foo' should not be in default allowlist"
+        policy.is_command_allowed("pip install foo"),
+        "test: 'pip install foo' should pass the structural command gate now that the per-command allowlist is gone"
     );
 }
 

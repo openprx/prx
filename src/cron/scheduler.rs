@@ -704,8 +704,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_times_out() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["sleep".into()];
+        let config = test_config(&tmp).await;
         let job = test_job("sleep 1");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -725,22 +724,21 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["echo".into()];
+        let config = test_config(&tmp).await;
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
         assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("Command not allowed"));
+        // Phase 1: per-command allowlist removed. A network command like `curl`
+        // under Supervised is risk-gated and denied without a runtime approval grant.
+        assert!(output.contains("runtime approval grant"), "{output}");
     }
 
     #[tokio::test]
     async fn run_job_command_blocks_medium_risk_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["touch".into()];
+        let config = test_config(&tmp).await;
         let job = test_job("touch cron-medium-risk");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -753,8 +751,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_allows_medium_risk_with_persisted_scheduler_grant() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["touch".into()];
+        let config = test_config(&tmp).await;
         let command = "touch cron-persisted-approval";
         let mut job = test_job(command);
         job.approval_grant_json = Some(
@@ -777,8 +774,7 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_forbidden_path_argument() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp).await;
-        config.autonomy.allowed_commands = vec!["cat".into()];
+        let config = test_config(&tmp).await;
         let job = test_job("cat /etc/passwd");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -823,7 +819,6 @@ mod tests {
         let mut config = test_config(&tmp).await;
         config.reliability.scheduler_retries = 1;
         config.reliability.provider_backoff_ms = 1;
-        config.autonomy.allowed_commands = vec!["sh".into()];
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         tokio::fs::write(

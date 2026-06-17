@@ -1070,7 +1070,6 @@ mod tests {
         // Full autonomy → no medium-risk approval requirement, commit authorized.
         let policy = Arc::new(SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::Full,
-            require_approval_for_medium_risk: false,
             ..SecurityPolicy::default()
         });
         let pipeline = gated_pipeline(dir.path(), policy).await;

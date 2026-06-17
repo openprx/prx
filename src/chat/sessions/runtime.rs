@@ -588,7 +588,6 @@ mod tests {
         Arc::new(crate::security::SecurityPolicy {
             autonomy: crate::security::AutonomyLevel::Full,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["*".into()],
             ..crate::security::SecurityPolicy::default()
         })
     }

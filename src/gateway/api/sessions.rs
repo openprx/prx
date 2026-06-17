@@ -7,7 +7,6 @@ use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
 use crate::providers::ChatMessage;
 use crate::runtime::envelope::RuntimeEnvelope;
-use crate::security::PolicyPipeline;
 use crate::security::policy::ResourceRiskLevel;
 use axum::{
     Json,
@@ -283,7 +282,6 @@ async fn run_console_runtime_turn(
     // `config_snapshot` is already the hot SharedConfig (D) snapshot (see above), so
     // a reloaded autonomy / security.audit gates this console turn without a restart.
     let security = crate::runtime::bootstrap::build_security_policy(&config_snapshot);
-    let policy_pipeline = PolicyPipeline::from_config(&config_snapshot);
     let scope_owner_id = envelope.resolved_owner_id();
     let scope_ctx = ScopeContext {
         policy: security.as_ref(),
@@ -295,7 +293,6 @@ async fn run_console_runtime_turn(
         topic_id: envelope.topic_id.as_deref(),
         task_id: envelope.resolved_task_id(),
         source_message_event_id: envelope.source_message_event_id.as_deref(),
-        policy_pipeline: Some(&policy_pipeline),
     };
     let noop_observer = NoopObserver;
 

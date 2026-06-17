@@ -3340,14 +3340,23 @@ impl Default for ScopeConfig {
 ///
 /// Controls what the agent is allowed to do: shell commands, filesystem access,
 /// risk approval gates, and per-policy budgets.
+///
+/// Permission-model Phase 1: a single `[autonomy]` section is the sole
+/// permission knob. `level` (read_only / supervised / full) drives the unified
+/// `SecurityPolicy::decide` decision point. The legacy `[security.tool_policy]`
+/// pipeline and the per-tool `auto_approve` / `always_ask` / `allowed_commands`
+/// lists have been removed; coarse risk presets are governed entirely by
+/// `level`. Fine-grained per-risk classification is deferred to Phase 2.
+///
+/// The sandbox configuration now lives under `[autonomy.sandbox]` (folded in
+/// from the former top-level `[security.sandbox]`) and is disabled by default
+/// (NoopSandbox); Phase 2 may re-enable it per risk level.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
     /// Restrict file writes and command paths to the workspace directory. Default: `true`.
     pub workspace_only: bool,
-    /// Allowlist of executable names permitted for shell execution.
-    pub allowed_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -3355,33 +3364,24 @@ pub struct AutonomyConfig {
     /// Maximum cost per day in cents per policy. Default: `1000`.
     pub max_cost_per_day_cents: u32,
 
-    /// Require explicit approval for medium-risk shell commands.
-    #[serde(default = "default_true")]
-    pub require_approval_for_medium_risk: bool,
-
-    /// Block high-risk shell commands even if allowlisted.
-    #[serde(default = "default_true")]
-    pub block_high_risk_commands: bool,
-
-    /// Tools that never require approval (e.g. read-only tools).
-    #[serde(default = "default_auto_approve")]
-    pub auto_approve: Vec<String>,
-
-    /// Tools that always require interactive approval, even after "Always".
-    #[serde(default = "default_always_ask")]
-    pub always_ask: Vec<String>,
-
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
     #[serde(default)]
     pub scopes: ScopeConfig,
+
+    /// Sandbox configuration (folded in from the former `[security.sandbox]`).
+    /// Disabled by default in Phase 1 (NoopSandbox → commands run un-isolated).
+    #[serde(default = "default_disabled_sandbox")]
+    pub sandbox: SandboxConfig,
 }
 
-fn default_auto_approve() -> Vec<String> {
-    vec!["file_read".into(), "memory_recall".into()]
-}
-
-const fn default_always_ask() -> Vec<String> {
-    vec![]
+/// Phase 1 default: sandbox disabled (NoopSandbox). The backend implementations
+/// are retained so Phase 2 can re-enable per-risk sandboxing by flipping
+/// `enabled`.
+fn default_disabled_sandbox() -> SandboxConfig {
+    SandboxConfig {
+        enabled: Some(false),
+        ..SandboxConfig::default()
+    }
 }
 
 impl Default for AutonomyConfig {
@@ -3389,20 +3389,6 @@ impl Default for AutonomyConfig {
         Self {
             level: AutonomyLevel::Supervised,
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-            ],
             forbidden_paths: vec![
                 "/etc".into(),
                 "/root".into(),
@@ -3425,11 +3411,8 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
-            auto_approve: default_auto_approve(),
-            always_ask: default_always_ask(),
             scopes: ScopeConfig::default(),
+            sandbox: default_disabled_sandbox(),
         }
     }
 }
@@ -4931,68 +4914,13 @@ pub struct LarkConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
-/// Tool policy configuration (`[security.tool_policy]` section).
+/// Security configuration for resource limits and audit logging.
 ///
-/// Defines multi-layer allow/deny policies for tool execution.
-///
-/// Example:
-/// ```toml
-/// [security.tool_policy]
-/// default = "supervised"
-///
-/// [security.tool_policy.groups]
-/// hardware = "deny"
-/// sessions = "allow"
-///
-/// [security.tool_policy.tools]
-/// shell = "supervised"
-/// gateway = "allow"
-/// ```
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct ToolPolicyConfig {
-    /// Default policy when no more-specific rule matches.
-    /// "supervised" (default), "allow", or "deny".
-    #[serde(default = "default_tool_policy_default")]
-    pub default: String,
-
-    /// Group-level policies: maps group name → policy string.
-    /// Known groups: sessions, automation, ui, hardware.
-    #[serde(default)]
-    pub groups: std::collections::HashMap<String, String>,
-
-    /// Per-tool policies: maps tool name → policy string.
-    #[serde(default)]
-    pub tools: std::collections::HashMap<String, String>,
-}
-
-fn default_tool_policy_default() -> String {
-    "supervised".into()
-}
-
-impl ToolPolicyConfig {
-    /// Returns `true` when the global default permits execution.
-    pub fn default_allow(&self) -> bool {
-        !matches!(self.default.trim().to_ascii_lowercase().as_str(), "deny")
-    }
-}
-
-impl Default for ToolPolicyConfig {
-    fn default() -> Self {
-        Self {
-            default: default_tool_policy_default(),
-            groups: std::collections::HashMap::new(),
-            tools: std::collections::HashMap::new(),
-        }
-    }
-}
-
-/// Security configuration for sandboxing, resource limits, and audit logging
+/// Permission-model Phase 1: the former `[security.sandbox]` section moved to
+/// `[autonomy.sandbox]`, and the `[security.tool_policy]` pipeline was removed
+/// entirely (tool authorization is now driven solely by `[autonomy]`).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
-    /// Sandbox configuration
-    #[serde(default)]
-    pub sandbox: SandboxConfig,
-
     /// Resource limits
     #[serde(default)]
     pub resources: ResourceLimitsConfig,
@@ -5000,10 +4928,6 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
-
-    /// Tool policy pipeline configuration (`[security.tool_policy]`).
-    #[serde(default)]
-    pub tool_policy: ToolPolicyConfig,
 }
 
 /// Tool tiering configuration — controls which tools are surfaced to the LLM based on intent.
@@ -6129,13 +6053,9 @@ mod tests {
         let a = AutonomyConfig::default();
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
-        assert!(a.allowed_commands.contains(&"git".to_string()));
-        assert!(a.allowed_commands.contains(&"cargo".to_string()));
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, 20);
         assert_eq!(a.max_cost_per_day_cents, 500);
-        assert!(a.require_approval_for_medium_risk);
-        assert!(a.block_high_risk_commands);
     }
 
     #[test]
@@ -6294,15 +6214,11 @@ min_chars = 12
             autonomy: AutonomyConfig {
                 level: AutonomyLevel::Full,
                 workspace_only: false,
-                allowed_commands: vec!["docker".into()],
                 forbidden_paths: vec!["/secret".into()],
                 max_actions_per_hour: 50,
                 max_cost_per_day_cents: 1000,
-                require_approval_for_medium_risk: false,
-                block_high_risk_commands: true,
-                auto_approve: vec!["file_read".into()],
-                always_ask: vec![],
                 scopes: ScopeConfig::default(),
+                ..AutonomyConfig::default()
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),

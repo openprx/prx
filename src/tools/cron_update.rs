@@ -204,12 +204,11 @@ mod tests {
     #[tokio::test]
     async fn blocks_disallowed_command_updates() {
         let tmp = TempDir::new().unwrap();
-        let mut config = Config {
+        let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
         tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         let cfg_snap = Arc::new(config.clone());
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();
@@ -224,7 +223,9 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        // Phase 1: per-command allowlist removed. Updating to a network command
+        // like `curl` under Supervised is risk-gated and denied without a grant.
+        assert!(result.error.unwrap_or_default().contains("runtime approval grant"));
     }
 
     #[tokio::test]
@@ -262,7 +263,6 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["echo".into(), "touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg_snap = Arc::new(config.clone());
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo ok").unwrap();

@@ -693,7 +693,6 @@ mod tests {
     fn test_tool(dir: &std::path::Path) -> GitOperationsTool {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         });
         GitOperationsTool::new(security, dir.to_path_buf())

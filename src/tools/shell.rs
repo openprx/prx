@@ -44,7 +44,7 @@ impl ShellTool {
     /// Construct a shell tool with opt-in extra PATH directories (Bug #2).
     ///
     /// `extra_path_dirs` should be the already-resolved (tilde-expanded, existing)
-    /// directories from `[security.sandbox] extra_path_dirs`, identical to the set
+    /// directories from `[autonomy.sandbox] extra_path_dirs`, identical to the set
     /// granted execute access by the Landlock sandbox so PATH and the sandbox stay
     /// in lockstep.
     pub fn with_extra_path_dirs(
@@ -351,8 +351,14 @@ mod tests {
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
+        // Phase 1: the per-command allowlist + high-risk hard-block were removed.
+        // A High-risk command under Supervised without a grant is now denied by
+        // the runtime-approval-grant requirement instead.
         let error = result.error.as_deref().unwrap_or("");
-        assert!(error.contains("not allowed") || error.contains("high-risk"));
+        assert!(
+            error.contains("runtime approval grant"),
+            "expected grant-required denial, got: {error:?}"
+        );
     }
 
     #[tokio::test]
@@ -421,7 +427,6 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["env".into(), "echo".into()],
             ..SecurityPolicy::default()
         })
     }
@@ -500,7 +505,6 @@ mod tests {
     async fn shell_requires_approval_for_medium_risk_command() {
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["touch".into()],
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         });

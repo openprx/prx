@@ -783,24 +783,25 @@ fn security_template(spec: Spec) -> String {
         Spec::Minimal => String::new(),
 
         Spec::Server => r#"# Security configuration (server)
-# Autonomy limits, sandboxing, and secret management
+# Permission model: a single [autonomy] section is the sole permission knob.
+# level (read_only | supervised | full) drives the unified decision point.
 
 [autonomy]
 level = "supervised"
 workspace_only = true
 max_actions_per_hour = 100
 max_cost_per_day_cents = 500
-allowed_commands = ["git", "ls", "cat", "grep", "find", "head", "tail", "wc"]
 forbidden_paths = []                   # no extra path denylist
+
+# Sandbox (folded in from the former [security.sandbox]); disabled by default.
+[autonomy.sandbox]
+enabled = false
+# backend = "auto"                     # auto | landlock | firejail | bubblewrap | docker | none
 
 [secrets]
 encrypt = true
 
 [security]
-[security.sandbox]
-enabled = false
-# backend = "native"
-
 [security.resources]
 max_memory_mb = 512
 max_cpu_time_seconds = 300
@@ -809,26 +810,25 @@ max_subprocesses = 10
         .into(),
 
         Spec::Full => r#"# Security configuration (full)
-# Autonomy policy, sandboxing, resource limits, audit, and secrets
+# Permission model: a single [autonomy] section is the sole permission knob.
+# level = "full" grants maximum autonomy; the sandbox is disabled by default.
 
 [autonomy]
 level = "full"                         # read_only | supervised | full
 workspace_only = false
-allowed_commands = []                  # empty = all commands allowed
 forbidden_paths = []                   # no extra path denylist
 max_actions_per_hour = 4294967295
 max_cost_per_day_cents = 4294967295
-require_approval_for_medium_risk = false
-block_high_risk_commands = false
+
+# Sandbox (folded in from the former [security.sandbox]); disabled by default.
+[autonomy.sandbox]
+enabled = false
+# backend = "auto"                    # auto | landlock | firejail | bubblewrap | docker | none
 
 [secrets]
 encrypt = true
 
 [security]
-[security.sandbox]
-enabled = false
-# backend = "native"                  # native | docker | bubblewrap
-
 [security.resources]
 max_memory_mb = 512
 max_cpu_time_seconds = 300
@@ -839,13 +839,6 @@ enabled = true
 log_path = "audit.log"
 max_size_mb = 100
 # sign_events = false
-
-# Tool-level policy overrides
-# [security.tool_policy]
-# default = "supervised"             # supervised | allow | deny
-# [security.tool_policy.tools]
-# shell = "supervised"
-# file_write = "supervised"
 "#
         .into(),
     }
@@ -1505,10 +1498,11 @@ mod tests {
         let content = security_template(Spec::Full);
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = false"));
-        assert!(content.contains("allowed_commands = []"));
         assert!(content.contains("forbidden_paths = []"));
-        assert!(content.contains("require_approval_for_medium_risk = false"));
-        assert!(content.contains("block_high_risk_commands = false"));
+        // Phase 1: the per-command allowlist / approval flags were removed from the
+        // template; the autonomy level + sandbox section are now the permission knobs.
+        assert!(content.contains("[autonomy.sandbox]"));
+        assert!(content.contains("enabled = false"));
     }
 
     #[test]

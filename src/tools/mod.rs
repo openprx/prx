@@ -314,14 +314,16 @@ pub fn all_tools_with_runtime_ext(
     // hand the very same Vec to both consumers — the Landlock sandbox allow-list
     // and the shell tool's PATH. A single resolution means a config edit can never
     // land a path in one but not the other (no time-of-check/time-of-use drift).
-    let shell_extra_path_dirs = crate::security::resolve_extra_path_dirs(&root_config.security.sandbox.extra_path_dirs);
+    let shell_extra_path_dirs = crate::security::resolve_extra_path_dirs(&root_config.autonomy.sandbox.extra_path_dirs);
 
-    // Create a sandbox from the security configuration for shell command isolation.
-    // Pass the workspace so the Landlock backend grants it read/write access —
-    // this keeps the shell tool and file_write on a single shared host FS view —
-    // and the already-resolved extra dirs so the sandbox allow-list matches PATH.
+    // Create a sandbox from the autonomy sandbox config for shell command
+    // isolation (permission-model Phase 1: moved from `[security.sandbox]`,
+    // disabled by default → NoopSandbox). Pass the workspace so the Landlock
+    // backend grants it read/write access — this keeps the shell tool and
+    // file_write on a single shared host FS view — and the already-resolved
+    // extra dirs so the sandbox allow-list matches PATH.
     let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox_with_workspace_and_dirs(
-        &root_config.security,
+        &root_config.autonomy.sandbox,
         Some(workspace_dir),
         &shell_extra_path_dirs,
     );

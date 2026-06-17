@@ -383,8 +383,8 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
 
             println!();
             println!("Security:");
+            println!("  Autonomy level:    {:?}", config.autonomy.level);
             println!("  Workspace only:    {}", config.autonomy.workspace_only);
-            println!("  Allowed commands:  {}", config.autonomy.allowed_commands.join(", "));
             println!("  Max actions/hour:  {}", config.autonomy.max_actions_per_hour);
             println!(
                 "  Max cost/day:      ${:.2}",

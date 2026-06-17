@@ -49,15 +49,17 @@ pub struct ApprovalLogEntry {
 
 /// Manages the interactive approval workflow.
 ///
-/// - Checks config-level `auto_approve` / `always_ask` lists
-/// - Maintains a session-scoped "always" allowlist
-/// - Records an audit trail of all decisions
+/// Permission-model Phase 1: the per-tool `auto_approve` / `always_ask` lists
+/// were removed. Whether a tool call requires approval is now decided by the
+/// unified [`crate::security::SecurityPolicy::decide`] entry point (the tool-call
+/// loop only constructs an approval request when `decide` returns `Ask`). The
+/// manager is now purely the UI / audit / grant-minting layer:
+///
+/// - Maintains a session-scoped "always" allowlist (skips re-prompting).
+/// - Records an audit trail of all decisions.
+/// - Mints single-use `ApprovalGrantV2` capability grants for the gate runtime.
 pub struct ApprovalManager {
-    /// Tools that never need approval (from config).
-    auto_approve: HashSet<String>,
-    /// Tools that always need approval, ignoring session allowlist.
-    always_ask: HashSet<String>,
-    /// Autonomy level from config.
+    /// Autonomy level from config (retained for audit / context).
     autonomy_level: AutonomyLevel,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
@@ -74,50 +76,18 @@ pub struct ApprovalManager {
 impl ApprovalManager {
     /// Create from autonomy config.
     pub fn from_config(config: &AutonomyConfig) -> Self {
-        Self {
-            auto_approve: config.auto_approve.iter().cloned().collect(),
-            always_ask: config.always_ask.iter().cloned().collect(),
-            autonomy_level: config.level,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
-            generated_grants: Mutex::new(Vec::new()),
-        }
+        Self::from_autonomy_level(config.level)
     }
 
-    /// Create a manager driven solely by an [`AutonomyLevel`], with no
-    /// config-level `auto_approve` / `always_ask` lists.
+    /// Create a manager driven solely by an [`AutonomyLevel`].
     ///
     /// Used by the background sub-agent NeedsInput path, which only knows the
-    /// effective autonomy level (from the live [`crate::security::SecurityPolicy`])
-    /// and wants the default supervised behaviour: every non-read-only tool call
-    /// is flagged for approval so the suspend resolver can gate it. Under
-    /// `ReadOnly` / `Full` autonomy `needs_approval` returns `false`, so no
-    /// suspension occurs (matching the policy).
+    /// effective autonomy level (from the live [`crate::security::SecurityPolicy`]).
+    /// Whether a given call suspends for approval is decided upstream by
+    /// `SecurityPolicy::decide`; this manager only services the resulting `Ask`.
     #[must_use]
     pub fn from_autonomy_level(level: AutonomyLevel) -> Self {
-        Self::from_autonomy_level_with_lists(level, HashSet::new(), HashSet::new())
-    }
-
-    /// Create a manager driven by an [`AutonomyLevel`] **plus** explicit
-    /// `auto_approve` / `always_ask` lists inherited from the live
-    /// [`AutonomyConfig`].
-    ///
-    /// Used by the background sub-agent NeedsInput path so that a supervised
-    /// sub-agent honours the operator's configured `auto_approve` allowlist
-    /// (read-only / explicitly trusted tools such as `file_read` /
-    /// `memory_recall` do **not** suspend) and `always_ask` override, matching
-    /// the foreground chat approval semantics. Only tools that genuinely
-    /// [`needs_approval`](Self::needs_approval) under these lists trigger a
-    /// NeedsInput suspension.
-    #[must_use]
-    pub fn from_autonomy_level_with_lists(
-        level: AutonomyLevel,
-        auto_approve: HashSet<String>,
-        always_ask: HashSet<String>,
-    ) -> Self {
         Self {
-            auto_approve,
-            always_ask,
             autonomy_level: level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
@@ -125,38 +95,40 @@ impl ApprovalManager {
         }
     }
 
-    /// Check whether a tool call requires interactive approval.
+    /// The autonomy level this manager was built with.
+    #[must_use]
+    pub const fn autonomy_level(&self) -> AutonomyLevel {
+        self.autonomy_level
+    }
+
+    /// Whether `tool_name` is on the session "Always" allowlist (skips a prompt).
     ///
-    /// Returns `true` if the call needs a prompt, `false` if it can proceed.
+    /// Permission-model Phase 1: the binary "does this need approval?" decision
+    /// moved to [`crate::security::SecurityPolicy::decide`]; this only reports the
+    /// session-scoped "Always" shortcut so a previously-approved tool is not
+    /// re-prompted within the session.
+    #[must_use]
+    pub fn is_session_allowlisted(&self, tool_name: &str) -> bool {
+        self.session_allowlist.lock().contains(tool_name)
+    }
+
+    /// Whether a tool call requires interactive approval under the unified
+    /// permission model (`decide` → `Ask`), for call sites that have no
+    /// `SecurityPolicy`/scope context (the chat dispatcher's terminal path).
+    ///
+    /// Mirrors [`crate::security::SecurityPolicy::decide`] for the no-scope case:
+    /// read-only tools never prompt; `full` / `read_only` never prompt
+    /// (`read_only` blocks side-effecting tools elsewhere); only `supervised`
+    /// side-effecting tools prompt, unless already session-allowlisted.
+    #[must_use]
     pub fn needs_approval(&self, tool_name: &str) -> bool {
-        // ReadOnly blocks everything — handled elsewhere; no prompt needed.
-        if self.autonomy_level == AutonomyLevel::ReadOnly {
+        if crate::security::policy::is_read_only_tool(tool_name) {
             return false;
         }
-
-        // always_ask is an explicit safety override, even in Full autonomy.
-        if self.always_ask.contains(tool_name) {
-            return true;
-        }
-
-        // Full autonomy skips prompts unless always_ask matched above.
-        if self.autonomy_level == AutonomyLevel::Full {
+        if self.autonomy_level != AutonomyLevel::Supervised {
             return false;
         }
-
-        // auto_approve skips the prompt.
-        if self.auto_approve.contains(tool_name) {
-            return false;
-        }
-
-        // Session allowlist (from prior "Always" responses).
-        let allowlist = self.session_allowlist.lock();
-        if allowlist.contains(tool_name) {
-            return false;
-        }
-
-        // Default: supervised mode requires approval.
-        true
+        !self.is_session_allowlisted(tool_name)
     }
 
     /// Record an approval decision and update session state.
@@ -349,8 +321,6 @@ mod tests {
     fn supervised_config() -> AutonomyConfig {
         AutonomyConfig {
             level: AutonomyLevel::Supervised,
-            auto_approve: vec!["file_read".into(), "memory_recall".into()],
-            always_ask: vec!["shell".into()],
             ..AutonomyConfig::default()
         }
     }
@@ -365,14 +335,16 @@ mod tests {
     // ── needs_approval ───────────────────────────────────────
 
     #[test]
-    fn auto_approve_tools_skip_prompt() {
+    fn read_only_tools_skip_prompt_under_supervised() {
+        // Phase 1: read-only tools never require approval, regardless of level.
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
     }
 
     #[test]
-    fn always_ask_tools_always_prompt() {
+    fn side_effecting_tools_prompt_under_supervised() {
+        // Phase 1: a non-read-only tool prompts under Supervised.
         let mgr = ApprovalManager::from_config(&supervised_config());
         assert!(mgr.needs_approval("shell"));
     }
@@ -399,43 +371,28 @@ mod tests {
     }
 
     #[test]
-    fn from_autonomy_level_with_lists_inherits_auto_approve_and_always_ask() {
-        // Fix #3: the background NeedsInput supervised manager must inherit the
-        // config `auto_approve` / `always_ask` lists so config-trusted / read-only
-        // tools do NOT suspend, while `always_ask` tools always do.
-        let auto_approve: HashSet<String> = ["file_read", "memory_recall"]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-        let always_ask: HashSet<String> = std::iter::once("shell".to_string()).collect();
-        let mgr = ApprovalManager::from_autonomy_level_with_lists(AutonomyLevel::Supervised, auto_approve, always_ask);
-        // Auto-approved read-only tools: no suspension under supervised.
+    fn supervised_level_gates_side_effecting_but_not_read_only_tools() {
+        // Permission-model Phase 1: the per-tool auto_approve/always_ask lists are
+        // gone. `needs_approval` now keys off the read-only classification + level.
+        // Under Supervised, read-only tools never suspend while side-effecting tools
+        // do (driving the background NeedsInput suspend path).
+        let mgr = ApprovalManager::from_autonomy_level(AutonomyLevel::Supervised);
+        // Read-only tools: no suspension under supervised.
         assert!(!mgr.needs_approval("file_read"));
         assert!(!mgr.needs_approval("memory_recall"));
-        // always_ask override: still suspends.
+        // Side-effecting tools under supervised: default-suspends.
         assert!(mgr.needs_approval("shell"));
-        // A tool in neither list under supervised: default-suspends.
         assert!(mgr.needs_approval("file_write"));
     }
 
     #[test]
-    fn full_autonomy_skips_non_always_ask_prompts() {
+    fn full_autonomy_never_prompts() {
+        // Permission-model Phase 1: under Full autonomy no tool requires interactive
+        // approval (the always_ask list was removed); side-effecting tools included.
         let mgr = ApprovalManager::from_config(&full_config());
         assert!(!mgr.needs_approval("shell"));
         assert!(!mgr.needs_approval("file_write"));
         assert!(!mgr.needs_approval("anything"));
-    }
-
-    #[test]
-    fn full_autonomy_honors_always_ask() {
-        let config = AutonomyConfig {
-            level: AutonomyLevel::Full,
-            always_ask: vec!["shell".into()],
-            ..AutonomyConfig::default()
-        };
-        let mgr = ApprovalManager::from_config(&config);
-        assert!(mgr.needs_approval("shell"));
-        assert!(!mgr.needs_approval("file_write"));
     }
 
     #[test]
@@ -467,10 +424,14 @@ mod tests {
     }
 
     #[test]
-    fn always_ask_overrides_session_allowlist() {
+    fn always_response_allowlists_side_effecting_tool() {
+        // Permission-model Phase 1: the always_ask override is gone, so an "Always"
+        // decision now session-allowlists even a side-effecting tool like shell.
         let mgr = ApprovalManager::from_config(&supervised_config());
 
-        // Even after "Always" for shell, it should still prompt.
+        // Under Supervised, shell prompts before any "Always" decision.
+        assert!(mgr.needs_approval("shell"));
+
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
@@ -478,8 +439,8 @@ mod tests {
             "cli",
         );
 
-        // shell is in always_ask, so it still needs approval.
-        assert!(mgr.needs_approval("shell"));
+        // After "Always", shell is session-allowlisted and no longer prompts.
+        assert!(!mgr.needs_approval("shell"));
     }
 
     #[test]

@@ -637,7 +637,7 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
     // ShellTool path (tools/shell.rs). The Sandbox trait mutates the inner
     // std::process::Command, reached here via tokio's `as_std_mut`. A fail-closed
     // backend (UnavailableSandbox) blocks execution rather than running unsandboxed.
-    let sandbox = crate::security::create_sandbox_with_workspace(&config.security, Some(&config.workspace_dir));
+    let sandbox = crate::security::create_sandbox_with_workspace(&config.autonomy.sandbox, Some(&config.workspace_dir));
     if let Err(e) = sandbox.wrap_command(command.as_std_mut()) {
         return (
             false,
@@ -690,8 +690,8 @@ mod tests {
         // would auto-detect whatever heavy isolation backend (docker/firejail) the
         // host happens to expose and wrap `sh -lc`, which is not what these tests
         // exercise. Production still honours the operator's real sandbox config.
-        config.security.sandbox.backend = crate::config::SandboxBackend::None;
-        config.security.sandbox.enabled = Some(false);
+        config.autonomy.sandbox.backend = crate::config::SandboxBackend::None;
+        config.autonomy.sandbox.enabled = Some(false);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
     }
@@ -764,8 +764,8 @@ mod tests {
         // Request docker but force unavailability is environment-dependent; instead
         // request a backend that is not available so create_sandbox returns the
         // fail-closed UnavailableSandbox. Firejail is not installed in CI.
-        config.security.sandbox.backend = crate::config::SandboxBackend::Firejail;
-        config.security.sandbox.enabled = Some(true);
+        config.autonomy.sandbox.backend = crate::config::SandboxBackend::Firejail;
+        config.autonomy.sandbox.enabled = Some(true);
         config.autonomy.level = crate::security::AutonomyLevel::Full;
 
         let new = NewXinTask {
@@ -829,9 +829,7 @@ mod tests {
     #[tokio::test]
     async fn execute_shell_task_blocks_medium_risk_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["touch".into()];
-
+        let config = test_config(&tmp);
         let new = NewXinTask {
             owner_id: None,
             topic_id: None,
@@ -861,8 +859,7 @@ mod tests {
     #[tokio::test]
     async fn execute_shell_task_allows_medium_risk_with_persisted_runner_grant() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.autonomy.allowed_commands = vec!["touch".into()];
+        let config = test_config(&tmp);
         let command = "touch xin-persisted-approval";
 
         let new = NewXinTask {

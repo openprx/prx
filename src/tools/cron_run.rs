@@ -238,7 +238,6 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg_snap = Arc::new(config.clone());
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "touch cron-run-approval").unwrap();

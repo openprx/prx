@@ -6633,11 +6633,11 @@ mod real_mode_tests {
             }
         }
 
-        // ApprovalManager 配置：Supervised + always_ask=[shell] → needs_approval(shell)=true.
+        // ApprovalManager 配置：Supervised + 非只读工具 `shell` → needs_approval(shell)=true.
+        // Phase 1: per-tool auto_approve/always_ask lists were removed; the gate now
+        // keys off the read-only classification + autonomy level.
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Supervised,
-            auto_approve: Vec::new(),
-            always_ask: vec!["shell".to_string()],
             ..Default::default()
         };
         let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
@@ -6823,10 +6823,10 @@ mod real_mode_tests {
             }
         }
 
+        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
+        // Supervised the non-read-only `danger` tool still triggers needs_approval.
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Supervised,
-            auto_approve: Vec::new(),
-            always_ask: vec!["danger".to_string()],
             ..Default::default()
         };
         let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
@@ -6946,10 +6946,10 @@ mod real_mode_tests {
             }
         }
 
+        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
+        // Supervised the non-read-only `danger` tool still triggers needs_approval.
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Supervised,
-            auto_approve: Vec::new(),
-            always_ask: vec!["danger".to_string()],
             ..Default::default()
         };
         let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
@@ -7050,10 +7050,10 @@ mod real_mode_tests {
             }
         }
 
+        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
+        // Supervised the non-read-only `danger` tool still triggers needs_approval.
         let approval_cfg = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Supervised,
-            auto_approve: Vec::new(),
-            always_ask: vec!["danger".to_string()],
             ..Default::default()
         };
         let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));

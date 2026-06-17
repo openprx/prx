@@ -45,6 +45,74 @@ pub enum ToolOperation {
     Act,
 }
 
+/// Unified tool-authorization decision produced by [`SecurityPolicy::decide`].
+///
+/// Permission-model Phase 1: this is the single decision point that replaces the
+/// former scattered logic (PolicyPipeline + ApprovalManager lists +
+/// SideEffectGate allowlists). `decide` returns one of three coarse outcomes
+/// driven solely by the autonomy level and a read-only/side-effect split:
+///
+/// * `Allow` — run immediately, no prompt, no grant.
+/// * `Ask`   — route through the [`crate::approval::ApprovalManager`] + a
+///   single-use `ApprovalGrantV2` (supervised side-effecting tools).
+/// * `Deny`  — reject (scope ACL denial, or read_only blocking a side-effecting
+///   tool).
+///
+/// Phase 2 will replace the binary read/side-effect split with a 4-tier risk
+/// classification + per-risk action table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolDecision {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// Phase 1 read-only tool name list — the **single source of truth** for the
+/// "no side effects" classification.
+///
+/// These tools have no side effects, so they are always `Allow`ed (even under
+/// `read_only`) and never require approval. Both the unified [`decide`] entry
+/// point (via [`is_read_only_tool`]) and the agent loop's parallel scheduler
+/// classify read-only tools through this one list, so the two can never drift.
+/// Phase 2 replaces this hard-coded list with the dynamic
+/// [`ToolOperation::Read`] / risk classification driven by the `Tool` trait.
+/// Keep this conservative: only genuinely observational tools belong here, and
+/// every entry must be a real registered tool name.
+///
+/// [`decide`]: SecurityPolicy::decide
+pub const READ_ONLY_TOOLS: &[&str] = &[
+    // Filesystem / memory reads.
+    "file_read",
+    "memory_recall",
+    "memory_search",
+    "memory_get",
+    // Document retrieval (RAG) reads.
+    "document_search",
+    "document_get_chunk",
+    // Web reads.
+    "web_fetch",
+    "web_search_tool",
+    // Media inspection (metadata only, no mutation).
+    "image_info",
+    // Session / cron / agent introspection.
+    "sessions_list",
+    "sessions_history",
+    "session_status",
+    "cron_list",
+    "cron_runs",
+    "agents_list",
+    // Hardware introspection (read board info / memory / registers only).
+    "hardware_board_info",
+    "hardware_memory_map",
+    "hardware_memory_read",
+];
+
+/// Returns `true` when `tool_name` is a Phase 1 read-only (no-side-effect) tool.
+#[must_use]
+pub fn is_read_only_tool(tool_name: &str) -> bool {
+    READ_ONLY_TOOLS.contains(&tool_name)
+}
+
 /// Runtime-only tool argument injected after an approval manager grants a call.
 ///
 /// User/model supplied copies of this field must be stripped by the tool-call
@@ -635,13 +703,12 @@ impl<'a> SideEffectGate<'a> {
         let result = (|| {
             self.policy.enforce_tool_operation(ToolOperation::Act, operation_name)?;
 
-            if risk == ResourceRiskLevel::High && self.policy.block_high_risk_commands {
-                return Err("Resource operation blocked: high-risk operation is disallowed by policy".into());
-            }
-
+            // Permission-model Phase 1: `full` authorizes every resource op
+            // unconditionally; `supervised` requires a runtime grant for
+            // medium/high-risk ops; `read_only` was already rejected by
+            // `enforce_tool_operation` above.
             if matches!(risk, ResourceRiskLevel::Medium | ResourceRiskLevel::High)
                 && self.policy.autonomy == AutonomyLevel::Supervised
-                && self.policy.require_approval_for_medium_risk
             {
                 let now = chrono::Utc::now().timestamp();
                 approved =
@@ -797,12 +864,9 @@ pub struct SecurityPolicy {
     pub autonomy: AutonomyLevel,
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
-    pub allowed_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
-    pub require_approval_for_medium_risk: bool,
-    pub block_high_risk_commands: bool,
     pub tracker: ActionTracker,
     /// Scope-based per-user/channel/chat_type tool access rules.
     pub scope_rules: Vec<crate::config::ScopeRule>,
@@ -822,21 +886,6 @@ impl Default for SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
-            allowed_commands: vec![
-                "git".into(),
-                "npm".into(),
-                "cargo".into(),
-                "ls".into(),
-                "cat".into(),
-                "grep".into(),
-                "find".into(),
-                "echo".into(),
-                "pwd".into(),
-                "wc".into(),
-                "head".into(),
-                "tail".into(),
-                "date".into(),
-            ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
                 "/etc".into(),
@@ -861,8 +910,6 @@ impl Default for SecurityPolicy {
             ],
             max_actions_per_hour: 20,
             max_cost_per_day_cents: 500,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
             tracker: ActionTracker::new(),
             scope_rules: Vec::new(),
             scope_default_allow: true,
@@ -1210,15 +1257,16 @@ impl SecurityPolicy {
     }
 
     // ── Command Execution Policy Gate ──────────────────────────────────────
-    // Validation follows a strict precedence order:
-    //   1. Allowlist check (is the base command permitted at all?)
-    //   2. Risk classification (high / medium / low)
-    //   3. Policy flags (block_high_risk_commands, require_approval_for_medium_risk)
-    //   4. Autonomy level × approval status (supervised requires explicit approval)
-    // This ordering ensures deny-by-default: unknown commands are rejected
-    // before any risk or autonomy logic runs.
+    // Permission-model Phase 1 semantics (governed solely by autonomy level):
+    //   * `read_only` → all commands denied (structural gate below + `decide`).
+    //   * `full`      → every command authorized; no allowlist, no risk block.
+    //   * `supervised`→ medium/high-risk commands require a runtime approval
+    //                   grant (issued via the `decide → Ask → grant` path); low
+    //                   risk runs freely.
+    // `command_risk_level` is retained for Phase 2 risk grading; in Phase 1 it
+    // only chooses whether supervised needs a grant.
 
-    /// Validate full command execution policy (allowlist + risk gate).
+    /// Validate full command execution policy under the active autonomy level.
     pub fn validate_command_execution(
         &self,
         command: &str,
@@ -1235,21 +1283,18 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
-        if risk == CommandRiskLevel::High {
-            if self.block_high_risk_commands {
-                return Err("Command blocked: high-risk command is disallowed by policy".into());
-            }
-            if self.autonomy == AutonomyLevel::Supervised && !runtime_approval_granted {
-                return Err("Command requires runtime approval grant: high-risk operation".into());
-            }
+        // Full autonomy authorizes every command unconditionally (Phase 1: full
+        // =真·全开). Risk grading is preserved in the return value for callers.
+        if self.autonomy == AutonomyLevel::Full {
+            return Ok(risk);
         }
 
-        if risk == CommandRiskLevel::Medium
+        // Supervised: medium/high-risk commands require an explicit runtime grant.
+        if matches!(risk, CommandRiskLevel::Medium | CommandRiskLevel::High)
             && self.autonomy == AutonomyLevel::Supervised
-            && self.require_approval_for_medium_risk
             && !runtime_approval_granted
         {
-            return Err("Command requires runtime approval grant: medium-risk operation".into());
+            return Err("Command requires runtime approval grant: risky operation".into());
         }
 
         Ok(risk)
@@ -1322,11 +1367,10 @@ impl SecurityPolicy {
                 continue;
             }
 
-            // Empty list or ["*"] means all commands are allowed
-            let all_allowed = self.allowed_commands.is_empty() || self.allowed_commands.iter().any(|c| c == "*");
-            if !all_allowed && !self.allowed_commands.iter().any(|allowed| allowed == base_cmd) {
-                return false;
-            }
+            // Permission-model Phase 1: the per-command allowlist was removed; the
+            // base command is no longer gated here. Structural safety (subshell /
+            // redirection / dangerous args) below still applies to non-full modes,
+            // and supervised risk gating happens in `validate_command_execution`.
 
             // Validate arguments for the command unless full autonomy is selected.
             // In full mode, argument-level safety gates are intentionally disabled.
@@ -1503,12 +1547,9 @@ impl SecurityPolicy {
             autonomy: autonomy_config.level,
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
-            allowed_commands: autonomy_config.allowed_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
-            require_approval_for_medium_risk: autonomy_config.require_approval_for_medium_risk,
-            block_high_risk_commands: autonomy_config.block_high_risk_commands,
             tracker: ActionTracker::new(),
             scope_rules: autonomy_config.scopes.rules.clone(),
             scope_default_allow: autonomy_config.scopes.default.to_lowercase() != "deny",
@@ -1560,6 +1601,43 @@ impl SecurityPolicy {
 
         // No rule matched — use default.
         self.scope_default_allow
+    }
+
+    /// Unified tool-authorization decision point (permission-model Phase 1).
+    ///
+    /// This is the single entry point that replaces the former scattered
+    /// authorization logic. Evaluation order:
+    ///
+    /// 1. **Identity scope ACL** — [`is_tool_allowed`](Self::is_tool_allowed)
+    ///    (per user / channel / chat_type). A scope denial is `Deny`,
+    ///    independent of autonomy level.
+    /// 2. **Autonomy level**:
+    ///    * `full`        → `Allow` (全放行; no prompt, no grant).
+    ///    * `read_only`   → read-only tools `Allow`, everything else `Deny`.
+    ///    * `supervised`  → read-only tools `Allow`, everything else `Ask`
+    ///      (routes through `ApprovalManager` + `ApprovalGrantV2`).
+    ///
+    /// The non-CLI-channel fail-closed behaviour (an `Ask` with no approval
+    /// resolver becomes a `Deny`) is enforced at the call site in the tool-call
+    /// loop, not here.
+    #[must_use]
+    pub fn decide(&self, tool_name: &str, sender: &str, channel: &str, chat_type: &str) -> ToolDecision {
+        // 1. Identity scope ACL — independent of autonomy level.
+        if !self.is_tool_allowed(tool_name, sender, channel, chat_type) {
+            return ToolDecision::Deny;
+        }
+
+        // Read-only tools are always allowed (no side effects).
+        if is_read_only_tool(tool_name) {
+            return ToolDecision::Allow;
+        }
+
+        // 2. Autonomy level governs side-effecting tools.
+        match self.autonomy {
+            AutonomyLevel::Full => ToolDecision::Allow,
+            AutonomyLevel::ReadOnly => ToolDecision::Deny,
+            AutonomyLevel::Supervised => ToolDecision::Ask,
+        }
     }
 }
 
@@ -1681,11 +1759,13 @@ mod tests {
 
     #[test]
     fn authorize_command_execution_redacts_secrets_in_disallowed_error() {
-        // BUG-D1-02: a command rejected by the allowlist surfaces the raw command
+        // BUG-D1-02: a command rejected by the policy surfaces the raw command
         // in the returned Err (propagated via `?` to stderr). Redact the secrets.
+        // Phase 1: the per-command allowlist is gone, so to exercise the
+        // "not allowed by security policy" deny path we use read-only mode, which
+        // rejects every command outright.
         let p = SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            allowed_commands: vec!["ls".into()],
+            autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&p);
@@ -1706,7 +1786,6 @@ mod tests {
         // can carry credentials, so the returned Err must be redacted.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&p);
@@ -1742,8 +1821,6 @@ mod tests {
     fn side_effect_gate_requires_matching_approval_grant_for_medium_risk_command() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&p);
@@ -1771,8 +1848,6 @@ mod tests {
     fn approval_grant_command_hash_binds_to_command_content() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&p);
@@ -1806,7 +1881,6 @@ mod tests {
 
         let supervised = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let supervised_gate = SideEffectGate::new(&supervised);
@@ -1851,22 +1925,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn side_effect_gate_blocks_high_risk_resource_when_policy_blocks_high() {
-        let policy = SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            block_high_risk_commands: true,
-            ..SecurityPolicy::default()
-        };
-        let gate = SideEffectGate::new(&policy);
-        let grant = ApprovalGrant::for_resource_operation("nodes", "nodes:exec:n1", "test", None);
-
-        let denied = gate
-            .authorize_resource_operation("nodes", "nodes:exec:n1", ResourceRiskLevel::High, Some(&grant))
-            .unwrap_err();
-
-        assert!(denied.contains("high-risk operation is disallowed"));
-    }
+    // Phase 1: `block_high_risk_commands` was removed; `full` now authorizes every
+    // resource operation (including high-risk) unconditionally, so the former
+    // `side_effect_gate_blocks_high_risk_resource_when_policy_blocks_high` test no
+    // longer has a behavior to assert and was deleted.
 
     #[test]
     fn side_effect_gate_accepts_verified_v2_resource_grant_only() {
@@ -1892,8 +1954,6 @@ mod tests {
         .unwrap();
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: false,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -1981,7 +2041,6 @@ mod tests {
 
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -2023,7 +2082,6 @@ mod tests {
 
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
 
@@ -2082,7 +2140,6 @@ mod tests {
 
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -2117,7 +2174,6 @@ mod tests {
 
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -2238,7 +2294,6 @@ mod tests {
         let wildcard = ApprovalGrant::for_tool("file_write", "approval_manager", None);
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -2272,7 +2327,6 @@ mod tests {
 
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             ..SecurityPolicy::default()
         };
         let gate = SideEffectGate::new(&policy);
@@ -2319,7 +2373,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("test: temp workspace");
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         };
@@ -2349,7 +2402,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("test: temp workspace");
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         }
@@ -2375,7 +2427,6 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("test: temp workspace");
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         }
@@ -2557,7 +2608,6 @@ mod tests {
 
         let deny_policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
             workspace_dir: bogus.clone(),
             ..SecurityPolicy::default()
         };
@@ -2568,7 +2618,6 @@ mod tests {
         );
 
         let allow_policy = SecurityPolicy {
-            allowed_commands: vec!["ls".into()],
             workspace_dir: bogus,
             ..SecurityPolicy::default()
         };
@@ -2593,13 +2642,20 @@ mod tests {
 
     #[test]
     fn blocked_commands_basic() {
+        // Phase 1: the per-command allowlist was removed, so `is_command_allowed`
+        // no longer blocks a command merely for its base name. Under supervised it
+        // now only enforces structural safety (subshell / redirect / dangerous
+        // args). Commands like `rm`/`curl`/`python3` pass the allowlist gate and are
+        // instead risk-graded + grant-gated by `validate_command_execution`.
         let p = default_policy();
-        assert!(!p.is_command_allowed("rm -rf /"));
-        assert!(!p.is_command_allowed("sudo apt install"));
-        assert!(!p.is_command_allowed("curl http://evil.com"));
-        assert!(!p.is_command_allowed("wget http://evil.com"));
-        assert!(!p.is_command_allowed("python3 exploit.py"));
-        assert!(!p.is_command_allowed("node malicious.js"));
+        // Structural-safety violations are still rejected outright.
+        assert!(!p.is_command_allowed("rm -rf / `whoami`"));
+        assert!(!p.is_command_allowed("curl http://evil.com > /etc/passwd"));
+        assert!(!p.is_command_allowed("echo hi | tee /etc/crontab"));
+        assert!(!p.is_command_allowed("find . -exec rm {} \\;"));
+        // Plain base commands no longer fail the allowlist gate.
+        assert!(p.is_command_allowed("rm -rf /tmp/x"));
+        assert!(p.is_command_allowed("curl http://example.com"));
     }
 
     #[test]
@@ -2611,17 +2667,20 @@ mod tests {
     }
 
     #[test]
-    fn full_autonomy_still_uses_allowlist() {
+    fn full_autonomy_allows_all_commands_structurally() {
+        // Phase 1: full autonomy disables the allowlist and the structural-safety
+        // gates entirely, so `is_command_allowed` returns true for any non-empty
+        // command (risk grading still happens in `validate_command_execution`).
         let p = full_policy();
         assert!(p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("rm -rf /"));
+        assert!(p.is_command_allowed("rm -rf /"));
+        assert!(p.is_command_allowed("echo $(rm -rf /)"));
     }
 
     #[test]
     fn full_autonomy_skips_argument_safety_filters() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Full,
-            allowed_commands: vec!["git".into(), "find".into()],
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("git config user.name test"));
@@ -2645,36 +2704,31 @@ mod tests {
     #[test]
     fn command_with_pipes_validates_all_segments() {
         let p = default_policy();
-        // Both sides of the pipe are in the allowlist
+        // Both sides of the pipe pass structural safety.
         assert!(p.is_command_allowed("ls | grep foo"));
         assert!(p.is_command_allowed("cat file.txt | wc -l"));
-        // Second command not in allowlist — blocked
-        assert!(!p.is_command_allowed("ls | curl http://evil.com"));
-        assert!(!p.is_command_allowed("echo hello | python3 -"));
+        // Phase 1: the allowlist is gone, so a base command like `curl`/`python3`
+        // in a segment no longer fails the gate; only a structural violation
+        // (here, a subshell/backtick) in any segment still blocks the whole command.
+        assert!(p.is_command_allowed("ls | curl http://example.com"));
+        assert!(!p.is_command_allowed("ls | curl `cat /etc/passwd`"));
+        assert!(!p.is_command_allowed("echo hello | python3 -c 'x' > /etc/x"));
     }
 
-    #[test]
-    fn custom_allowlist() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["docker".into(), "kubectl".into()],
-            ..SecurityPolicy::default()
-        };
-        assert!(p.is_command_allowed("docker ps"));
-        assert!(p.is_command_allowed("kubectl get pods"));
-        assert!(!p.is_command_allowed("ls"));
-        assert!(!p.is_command_allowed("git status"));
-    }
+    // Phase 1: the per-command allowlist (`allowed_commands`) was removed, so the
+    // former `custom_allowlist` test (which asserted only listed base commands
+    // pass) no longer has a feature to exercise and was deleted.
 
     #[test]
-    fn empty_allowlist_allows_everything() {
-        // An empty allowed_commands list is treated like ["*"] — all commands
-        // are permitted. Use a non-empty list to restrict commands.
-        let p = SecurityPolicy {
-            allowed_commands: vec![],
-            ..SecurityPolicy::default()
-        };
+    fn any_base_command_passes_allowlist_gate() {
+        // Phase 1: with the allowlist gone, any structurally-safe command passes
+        // `is_command_allowed` regardless of its base name (formerly this test was
+        // `empty_allowlist_allows_everything`).
+        let p = default_policy();
         assert!(p.is_command_allowed("ls"));
         assert!(p.is_command_allowed("echo hello"));
+        assert!(p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("kubectl get pods"));
     }
 
     #[test]
@@ -2686,10 +2740,7 @@ mod tests {
 
     #[test]
     fn command_risk_medium_for_mutating_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["git".into(), "touch".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default();
         assert_eq!(
             p.command_risk_level("git reset --hard HEAD~1"),
             CommandRiskLevel::Medium
@@ -2699,10 +2750,7 @@ mod tests {
 
     #[test]
     fn command_risk_high_for_dangerous_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["rm".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default();
         assert_eq!(p.command_risk_level("rm -rf /tmp/test"), CommandRiskLevel::High);
     }
 
@@ -2710,8 +2758,6 @@ mod tests {
     fn validate_command_requires_approval_for_medium_risk() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
             ..SecurityPolicy::default()
         };
 
@@ -2725,24 +2771,27 @@ mod tests {
     }
 
     #[test]
-    fn validate_command_blocks_high_risk_by_default() {
+    fn validate_command_high_risk_requires_grant_under_supervised() {
+        // Phase 1: `block_high_risk_commands` was removed. Under supervised a
+        // high-risk command is gated like any medium/high op — denied without a
+        // runtime grant, allowed (graded High) with one.
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["rm".into()],
             ..SecurityPolicy::default()
         };
 
-        let result = p.validate_command_execution("rm -rf /tmp/test", true);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("high-risk"));
+        let denied = p.validate_command_execution("rm -rf /tmp/test", false);
+        assert!(denied.is_err());
+        assert!(denied.unwrap_err().contains("runtime approval grant"));
+
+        let allowed = p.validate_command_execution("rm -rf /tmp/test", true);
+        assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
     }
 
     #[test]
     fn validate_command_full_mode_skips_medium_risk_approval_gate() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Full,
-            require_approval_for_medium_risk: true,
-            allowed_commands: vec!["touch".into()],
             ..SecurityPolicy::default()
         };
 
@@ -2827,25 +2876,21 @@ mod tests {
         let autonomy_config = crate::config::AutonomyConfig {
             level: AutonomyLevel::Full,
             workspace_only: false,
-            allowed_commands: vec!["docker".into()],
             forbidden_paths: vec!["/secret".into()],
             max_actions_per_hour: 100,
             max_cost_per_day_cents: 1000,
-            require_approval_for_medium_risk: false,
-            block_high_risk_commands: false,
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test-workspace");
         let policy = SecurityPolicy::from_config(&autonomy_config, &workspace);
 
+        // Phase 1: allowed_commands / require_approval_for_medium_risk /
+        // block_high_risk_commands were removed; only the surviving fields map.
         assert_eq!(policy.autonomy, AutonomyLevel::Full);
         assert!(!policy.workspace_only);
-        assert_eq!(policy.allowed_commands, vec!["docker"]);
         assert_eq!(policy.forbidden_paths, vec!["/secret"]);
         assert_eq!(policy.max_actions_per_hour, 100);
         assert_eq!(policy.max_cost_per_day_cents, 1000);
-        assert!(!policy.require_approval_for_medium_risk);
-        assert!(!policy.block_high_risk_commands);
         assert_eq!(policy.workspace_dir, PathBuf::from("/tmp/test-workspace"));
     }
 
@@ -2856,12 +2901,9 @@ mod tests {
         let p = SecurityPolicy::default();
         assert_eq!(p.autonomy, AutonomyLevel::Supervised);
         assert!(p.workspace_only);
-        assert!(!p.allowed_commands.is_empty());
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
         assert!(p.max_cost_per_day_cents > 0);
-        assert!(p.require_approval_for_medium_risk);
-        assert!(p.block_high_risk_commands);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────
@@ -2932,25 +2974,20 @@ mod tests {
     // ── Edge cases: command injection ────────────────────────
 
     #[test]
-    fn command_injection_semicolon_blocked() {
+    fn semicolon_splits_into_validated_segments() {
+        // Phase 1: the allowlist is gone, so a `;`-chained command is no longer
+        // blocked merely because a later segment's base command is "dangerous";
+        // each segment is split out and validated structurally. A plain chain is
+        // now allowed, but a structurally-unsafe segment still blocks the whole.
         let p = default_policy();
-        // First word is "ls;" (with semicolon) — doesn't match "ls" in allowlist.
-        // This is a safe default: chained commands are blocked.
-        assert!(!p.is_command_allowed("ls; rm -rf /"));
-    }
-
-    #[test]
-    fn command_injection_semicolon_no_space() {
-        let p = default_policy();
-        assert!(!p.is_command_allowed("ls;rm -rf /"));
+        assert!(p.is_command_allowed("ls; rm -rf /tmp/x"));
+        assert!(p.is_command_allowed("ls;echo done"));
+        assert!(!p.is_command_allowed("ls; rm -rf `cat /etc/passwd`"));
     }
 
     #[test]
     fn quoted_semicolons_do_not_split_sqlite_command() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["sqlite3".into()],
-            ..SecurityPolicy::default()
-        };
+        let p = SecurityPolicy::default();
         assert!(p.is_command_allowed(
             "sqlite3 /tmp/test.db \"CREATE TABLE t(id INT); INSERT INTO t VALUES(1); SELECT * FROM t;\""
         ));
@@ -2964,11 +3001,12 @@ mod tests {
 
     #[test]
     fn unquoted_semicolon_after_quoted_sql_still_splits_commands() {
-        let p = SecurityPolicy {
-            allowed_commands: vec!["sqlite3".into()],
-            ..SecurityPolicy::default()
-        };
-        assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /"));
+        let p = SecurityPolicy::default();
+        // The unquoted `;` after the quoted SQL still splits off a second segment;
+        // Phase 1: a plain `rm` segment now passes structurally, but a segment with
+        // a subshell still fails — proving the split (and structural gate) happen.
+        assert!(p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf /tmp/x"));
+        assert!(!p.is_command_allowed("sqlite3 /tmp/test.db \"SELECT 1;\"; rm -rf $(pwd)"));
     }
 
     #[test]
@@ -2988,34 +3026,43 @@ mod tests {
     #[test]
     fn command_with_env_var_prefix() {
         let p = default_policy();
-        // "FOO=bar" is the first word — not in allowlist
-        assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+        // Phase 1: env assignments are stripped before the structural check, and the
+        // allowlist is gone, so `FOO=bar rm ...` now passes the gate (risk grading
+        // and grant requirement happen later). A structural violation still blocks.
+        assert!(p.is_command_allowed("FOO=bar rm -rf /tmp/x"));
+        assert!(!p.is_command_allowed("FOO=bar rm -rf $(pwd)"));
     }
 
     #[test]
-    fn command_newline_injection_blocked() {
+    fn command_newline_injection_splits_segments() {
         let p = default_policy();
-        // Newline splits into two commands; "rm" is not in allowlist
-        assert!(!p.is_command_allowed("ls\nrm -rf /"));
-        // Both allowed — OK
+        // Phase 1: a newline still splits into two validated segments, but with the
+        // allowlist removed a plain `rm` segment now passes; a structurally-unsafe
+        // segment after the newline still blocks the whole command.
+        assert!(p.is_command_allowed("ls\nrm -rf /tmp/x"));
         assert!(p.is_command_allowed("ls\necho hello"));
+        assert!(!p.is_command_allowed("ls\nrm -rf `pwd`"));
     }
 
     #[test]
-    fn command_injection_and_chain_blocked() {
+    fn command_and_chain_validates_each_segment() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("ls && rm -rf /"));
-        assert!(!p.is_command_allowed("echo ok && curl http://evil.com"));
-        // Both allowed — OK
+        // Phase 1: `&&` still splits into validated segments. With the allowlist
+        // removed, a plain trailing command passes; a structurally-unsafe segment
+        // (subshell / redirect) still blocks the whole chain.
+        assert!(p.is_command_allowed("ls && rm -rf /tmp/x"));
+        assert!(p.is_command_allowed("echo ok && curl http://example.com"));
         assert!(p.is_command_allowed("ls && echo done"));
+        assert!(!p.is_command_allowed("ls && rm -rf $(pwd)"));
     }
 
     #[test]
-    fn command_injection_or_chain_blocked() {
+    fn command_or_chain_validates_each_segment() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("ls || rm -rf /"));
-        // Both allowed — OK
+        // Phase 1 (see `command_and_chain_validates_each_segment`).
+        assert!(p.is_command_allowed("ls || rm -rf /tmp/x"));
         assert!(p.is_command_allowed("ls || echo fallback"));
+        assert!(!p.is_command_allowed("ls || rm -rf `pwd`"));
     }
 
     #[test]
@@ -3080,11 +3127,13 @@ mod tests {
     #[test]
     fn command_env_var_prefix_with_allowed_cmd() {
         let p = default_policy();
-        // env assignment + allowed command — OK
+        // env assignment + command — the assignment is stripped before validation.
         assert!(p.is_command_allowed("FOO=bar ls"));
         assert!(p.is_command_allowed("LANG=C grep pattern file"));
-        // env assignment + disallowed command — blocked
-        assert!(!p.is_command_allowed("FOO=bar rm -rf /"));
+        // Phase 1: with the allowlist gone, env-prefixed `rm` passes the gate too;
+        // only a structural violation after the assignment still blocks.
+        assert!(p.is_command_allowed("FOO=bar rm -rf /tmp/x"));
+        assert!(!p.is_command_allowed("FOO=bar rm -rf `pwd`"));
     }
 
     // ── Edge cases: path traversal ──────────────────────────
@@ -3176,7 +3225,6 @@ mod tests {
     fn readonly_blocks_even_safe_commands() {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
-            allowed_commands: vec!["ls".into(), "cat".into()],
             ..SecurityPolicy::default()
         };
         assert!(!p.is_command_allowed("ls"));
@@ -3185,14 +3233,18 @@ mod tests {
     }
 
     #[test]
-    fn supervised_allows_listed_commands() {
+    fn supervised_passes_structurally_safe_commands() {
+        // Phase 1: under supervised the allowlist no longer gates base commands, so
+        // any structurally-safe command passes `is_command_allowed` (the supervised
+        // medium/high grant requirement is enforced by `validate_command_execution`).
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
-            allowed_commands: vec!["git".into()],
             ..SecurityPolicy::default()
         };
         assert!(p.is_command_allowed("git status"));
-        assert!(!p.is_command_allowed("docker ps"));
+        assert!(p.is_command_allowed("docker ps"));
+        // A structural violation is still rejected.
+        assert!(!p.is_command_allowed("docker ps > /etc/x"));
     }
 
     #[test]
@@ -3366,12 +3418,9 @@ mod tests {
         let autonomy_config = crate::config::AutonomyConfig {
             level: AutonomyLevel::Full,
             workspace_only: false,
-            allowed_commands: vec![],
             forbidden_paths: vec![],
             max_actions_per_hour: 10,
             max_cost_per_day_cents: 100,
-            require_approval_for_medium_risk: true,
-            block_high_risk_commands: true,
             ..crate::config::AutonomyConfig::default()
         };
         let workspace = PathBuf::from("/tmp/test");

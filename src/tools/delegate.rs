@@ -800,7 +800,6 @@ impl DelegateTool {
             topic_id: scope.topic_id.as_deref(),
             task_id: scope.task_id.as_deref(),
             source_message_event_id: scope.source_message_event_id.as_deref(),
-            policy_pipeline: None,
         });
 
         let result = tokio::time::timeout(

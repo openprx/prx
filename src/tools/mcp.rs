@@ -1192,13 +1192,10 @@ mod tests {
 
     // ── SideEffectGate coverage (design d03 / P0-C, largest un-gated surface) ──
 
-    /// Policy with the high-risk hard-block disabled, so a *matching* grant can
-    /// actually traverse the gate (mcp:call is High-risk).
+    /// Default (Supervised) policy: a *matching* runtime grant lets a High-risk
+    /// `mcp:call` traverse the gate (Phase 1: no separate high-risk hard-block).
     fn mcp_gate_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy {
-            block_high_risk_commands: false,
-            ..SecurityPolicy::default()
-        })
+        Arc::new(SecurityPolicy::default())
     }
 
     /// Under the default Supervised policy, an MCP `call` without a runtime
@@ -1219,10 +1216,11 @@ mod tests {
         );
     }
 
-    /// With the high-risk hard-block enabled (the default), any mcp:call is
-    /// denied outright regardless of grant — the strongest protection.
+    /// Phase 1: the high-risk hard-block was removed. A valid matching grant now
+    /// lets the High-risk mcp:call traverse the gate (it then fails downstream
+    /// because the server does not exist, but never with a gate denial).
     #[tokio::test]
-    async fn call_blocked_by_high_risk_policy_even_with_grant() {
+    async fn call_allowed_through_gate_with_grant() {
         let tool = McpTool::new(
             Arc::new(SecurityPolicy::default()),
             McpConfig::default(),
@@ -1238,15 +1236,10 @@ mod tests {
             }))
             .await
             .unwrap();
-        assert!(!result.success);
+        let error = result.error.as_deref().unwrap_or("");
         assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .contains("high-risk operation is disallowed"),
-            "high-risk block must deny even with grant, got: {:?}",
-            result.error
+            !error.contains("high-risk operation is disallowed") && !error.contains("requires runtime approval grant"),
+            "grant must let the op pass the gate, got: {error:?}"
         );
     }
 
@@ -1325,12 +1318,9 @@ mod tests {
         let mut cfg = McpConfig::default();
         cfg.enabled = false;
         // The SideEffectGate now precedes the downstream call. To reach the
-        // "disabled/not found" path we must pass the High-risk gate first, so the
-        // policy disables the high-risk block and we present a matching grant.
-        let security = Arc::new(SecurityPolicy {
-            block_high_risk_commands: false,
-            ..SecurityPolicy::default()
-        });
+        // "disabled/not found" path we must pass the High-risk gate first by
+        // presenting a matching runtime grant (Phase 1: default Supervised policy).
+        let security = Arc::new(SecurityPolicy::default());
         let tool = McpTool::new(security, cfg, std::env::temp_dir());
         let op = op_id::op_id(MCP_ROOT_NAME, "call", &["s", "t"]);
         let result = tool

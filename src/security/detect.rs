@@ -1,16 +1,22 @@
 //! Auto-detection of available security features
 
-use crate::config::{SandboxBackend, SecurityConfig};
+use crate::config::{SandboxBackend, SandboxConfig};
 use crate::security::traits::{Sandbox, UnavailableSandbox};
 use std::sync::Arc;
 
 /// Create a sandbox based on auto-detection or explicit config.
 ///
+/// Permission-model Phase 1: the sandbox config moved from `[security.sandbox]`
+/// to `[autonomy.sandbox]`, so these functions take the [`SandboxConfig`]
+/// directly (callers pass `&config.autonomy.sandbox`). The default config has
+/// `enabled = Some(false)` → [`NoopSandbox`] (commands run un-isolated); the
+/// backend implementations are retained for Phase 2 re-enablement.
+///
 /// This is the workspace-agnostic entry point.  Prefer
 /// [`create_sandbox_with_workspace`] when a workspace directory is known so the
 /// Landlock backend can grant read/write access to it (otherwise shell commands
 /// would be unable to touch the same files that `file_write` operates on).
-pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
+pub fn create_sandbox(config: &SandboxConfig) -> Arc<dyn Sandbox> {
     create_sandbox_with_workspace(config, None)
 }
 
@@ -23,7 +29,7 @@ pub fn create_sandbox(config: &SecurityConfig) -> Arc<dyn Sandbox> {
 /// file created by the shell inside the workspace is immediately visible to
 /// `file_read`/`file_write`, and vice versa.
 pub fn create_sandbox_with_workspace(
-    config: &SecurityConfig,
+    config: &SandboxConfig,
     workspace_dir: Option<&std::path::Path>,
 ) -> Arc<dyn Sandbox> {
     // Self-contained callers (xin runner, tests) that do not also build a
@@ -31,7 +37,7 @@ pub fn create_sandbox_with_workspace(
     // with a ShellTool (see `all_tools_with_runtime_ext`) must instead resolve
     // ONCE and call [`create_sandbox_with_workspace_and_dirs`] so PATH and the
     // sandbox allow-list come from a single resolution (Bug #3 time-of-check fix).
-    let extra_exec_dirs = super::resolve_extra_path_dirs(&config.sandbox.extra_path_dirs);
+    let extra_exec_dirs = super::resolve_extra_path_dirs(&config.extra_path_dirs);
     create_sandbox_with_workspace_and_dirs(config, workspace_dir, &extra_exec_dirs)
 }
 
@@ -45,14 +51,15 @@ pub fn create_sandbox_with_workspace(
 /// and `ShellTool::with_extra_path_dirs` (→ PATH), so a config edit between two
 /// resolutions can no longer make PATH and the sandbox grant disagree.
 pub fn create_sandbox_with_workspace_and_dirs(
-    config: &SecurityConfig,
+    config: &SandboxConfig,
     workspace_dir: Option<&std::path::Path>,
     extra_exec_dirs: &[std::path::PathBuf],
 ) -> Arc<dyn Sandbox> {
-    let backend = &config.sandbox.backend;
+    let backend = &config.backend;
 
-    // If explicitly disabled, return noop
-    if matches!(backend, SandboxBackend::None) || config.sandbox.enabled == Some(false) {
+    // If explicitly disabled, return noop. Phase 1 default is `enabled=Some(false)`,
+    // so this is the live path until Phase 2 re-enables sandboxing per risk.
+    if matches!(backend, SandboxBackend::None) || config.enabled == Some(false) {
         return Arc::new(super::traits::NoopSandbox);
     }
 
@@ -178,7 +185,7 @@ fn detect_best_sandbox(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{SandboxConfig, SecurityConfig};
+    use crate::config::SandboxConfig;
 
     #[test]
     fn detect_best_sandbox_returns_something() {
@@ -196,17 +203,14 @@ mod tests {
     #[test]
     fn resolved_dirs_are_shared_between_path_and_sandbox() {
         let tmp = tempfile::tempdir().expect("test: tmpdir");
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: None,
-                backend: SandboxBackend::Auto,
-                firejail_args: Vec::new(),
-                extra_path_dirs: vec![tmp.path().to_string_lossy().to_string()],
-            },
-            ..Default::default()
+        let config = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+            extra_path_dirs: vec![tmp.path().to_string_lossy().to_string()],
         };
         // Single resolution — this is the one `all_tools_with_runtime_ext` performs.
-        let resolved = super::super::resolve_extra_path_dirs(&config.sandbox.extra_path_dirs);
+        let resolved = super::super::resolve_extra_path_dirs(&config.extra_path_dirs);
         assert_eq!(resolved, vec![tmp.path().to_path_buf()], "tmpdir resolves to itself");
         // The sandbox consumes the SAME slice (no second resolution inside).
         let sandbox = create_sandbox_with_workspace_and_dirs(&config, None, &resolved);
@@ -219,14 +223,11 @@ mod tests {
 
     #[test]
     fn explicit_none_returns_noop() {
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: Some(false),
-                backend: SandboxBackend::None,
-                firejail_args: Vec::new(),
-                extra_path_dirs: Vec::new(),
-            },
-            ..Default::default()
+        let config = SandboxConfig {
+            enabled: Some(false),
+            backend: SandboxBackend::None,
+            firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         };
         let sandbox = create_sandbox(&config);
         assert_eq!(sandbox.name(), "none");
@@ -234,14 +235,11 @@ mod tests {
 
     #[test]
     fn auto_mode_detects_something() {
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: None, // Auto-detect
-                backend: SandboxBackend::Auto,
-                firejail_args: Vec::new(),
-                extra_path_dirs: Vec::new(),
-            },
-            ..Default::default()
+        let config = SandboxConfig {
+            enabled: None, // Auto-detect
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         };
         let sandbox = create_sandbox(&config);
         // Should return some sandbox (at least NoopSandbox)
@@ -258,14 +256,11 @@ mod tests {
         if !landlock_available {
             return; // kernel too old or Landlock disabled by policy; skip
         }
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: None,
-                backend: SandboxBackend::Auto,
-                firejail_args: Vec::new(),
-                extra_path_dirs: Vec::new(),
-            },
-            ..Default::default()
+        let config = SandboxConfig {
+            enabled: None,
+            backend: SandboxBackend::Auto,
+            firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         };
         let workspace = std::env::temp_dir();
         let sandbox = create_sandbox_with_workspace(&config, Some(&workspace));
@@ -289,14 +284,11 @@ mod tests {
             return;
         }
 
-        let config = SecurityConfig {
-            sandbox: SandboxConfig {
-                enabled: Some(true),
-                backend: SandboxBackend::Firejail,
-                firejail_args: Vec::new(),
-                extra_path_dirs: Vec::new(),
-            },
-            ..Default::default()
+        let config = SandboxConfig {
+            enabled: Some(true),
+            backend: SandboxBackend::Firejail,
+            firejail_args: Vec::new(),
+            extra_path_dirs: Vec::new(),
         };
         let sandbox = create_sandbox(&config);
         assert_eq!(sandbox.name(), "firejail");

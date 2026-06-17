@@ -1273,7 +1273,6 @@ mod tests {
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: std::env::temp_dir(),
-            allowed_commands: vec!["*".into()],
             ..SecurityPolicy::default()
         })
     }

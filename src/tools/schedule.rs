@@ -593,7 +593,6 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["echo".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));
@@ -608,7 +607,15 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or_default().contains("not allowed"));
+        // Phase 1: per-command allowlist removed. A network command like `curl`
+        // under Supervised is risk-gated and denied without a runtime approval grant.
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("runtime approval grant")
+        );
     }
 
     #[tokio::test]
@@ -620,7 +627,6 @@ mod tests {
             ..Config::default()
         };
         config.autonomy.level = AutonomyLevel::Supervised;
-        config.autonomy.allowed_commands = vec!["touch".into()];
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
         let tool = ScheduleTool::new(security, crate::config::new_shared(config));

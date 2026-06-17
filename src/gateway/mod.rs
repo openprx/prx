@@ -1265,6 +1265,33 @@ async fn run_gateway_chat_with_multimodal(
 
     let noop_observer = NoopObserver;
 
+    // P1-a: route the webhook agent loop through the unified `SecurityPolicy::decide`
+    // gate instead of leaving `scope_ctx = None` (which short-circuits to `Allow`
+    // and bypasses both the scope ACL and the autonomy level entirely).
+    //
+    // Webhook turns are Bearer-token authenticated (`handle_webhook` rejects
+    // unauthenticated requests), so the request is a trusted principal and we can
+    // construct a `ScopeContext` from the gateway identity. This makes every tool
+    // call honour the configured autonomy level: under `supervised`, side-effecting
+    // tools resolve to `Ask`, and with no `ApprovalManager` wired on this path the
+    // tool loop fail-closes (deny) — only genuinely read-only tools run. Under
+    // `full` autonomy the behaviour is unchanged (everything allowed).
+    let gateway_policy =
+        crate::security::SecurityPolicy::from_config(&config_snapshot.autonomy, &config_snapshot.workspace_dir);
+    let gateway_scope_ctx = crate::agent::loop_::ScopeContext {
+        policy: &gateway_policy,
+        sender: fabric_ctx.sender.as_str(),
+        channel: fabric_ctx.channel.as_str(),
+        // Gateway/webhook turns are 1:1 (no group semantics); use a stable
+        // chat_type so scope rules can target the gateway surface.
+        chat_type: "gateway",
+        chat_id: fabric_ctx.session_key.as_str(),
+        owner_id: None,
+        topic_id: None,
+        task_id: None,
+        source_message_event_id: None,
+    };
+
     let response = run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
@@ -1295,10 +1322,10 @@ async fn run_gateway_chat_with_multimodal(
             rollback_error_rate_threshold: config_snapshot.agent.concurrency_rollback_error_rate_threshold,
         },
         None,
-        None, // no cancellation token
-        None, // no streaming delta sender
-        None, // no scope context for webhooks
-        None, // no tool call notifications
+        None,                     // no cancellation token
+        None,                     // no streaming delta sender
+        Some(&gateway_scope_ctx), // P1-a: gateway turns now route through decide()
+        None,                     // no tool call notifications
         Some(&config_snapshot.tool_tiering),
         Some(DocumentIngestRuntime::from_envelope(
             state.mem.clone(),

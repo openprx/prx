@@ -404,7 +404,6 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["echo".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
         tokio::fs::create_dir_all(&config.workspace_dir).await.unwrap();
         let cfg = new_shared(config);
@@ -421,7 +420,9 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("not allowed"));
+        // Phase 1: per-command allowlist removed. A network command like `curl`
+        // under Supervised is risk-gated and denied without a runtime approval grant.
+        assert!(result.error.unwrap_or_default().contains("runtime approval grant"));
     }
 
     #[tokio::test]
@@ -460,7 +461,6 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.autonomy.allowed_commands = vec!["touch".into()];
         config.autonomy.level = AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg = new_shared(config);

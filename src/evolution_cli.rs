@@ -341,7 +341,7 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
     };
 
     // FIX-P0-40: the side-effect gate may have denied this commit (e.g. Supervised
-    // autonomy with `require_approval_for_medium_risk` and no runtime grant). The
+    // autonomy gating a medium/high-risk op with no runtime grant). The
     // one-shot CLI has no interactive approval manager to issue a grant, so the
     // only correct behaviour is to surface the denial clearly and exit non-zero —
     // never silently report a "completed" trigger that actually applied nothing.
@@ -395,9 +395,6 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
         println!("         Current autonomy level is `{autonomy_level}`, which gates self-modifications.");
         println!("how to allow:");
         println!("         - Raise the autonomy level to `full` in config ([autonomy] level = \"full\"),");
-        println!(
-            "           or disable approval-for-medium-risk ([autonomy] require_approval_for_medium_risk = false),"
-        );
         println!("           then re-run `prx evolution trigger`.");
         println!("         - The daemon scheduler applies the same gate; this denial is by design (fail-closed).");
         return Err(gate_denied_error(&autonomy_level));
@@ -413,8 +410,8 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
 fn gate_denied_error(autonomy_level: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "evolution trigger blocked by autonomy side-effect gate (autonomy level `{autonomy_level}`); \
-         no change was applied. Raise autonomy to `full` or set \
-         `require_approval_for_medium_risk = false` to allow manual evolution."
+         no change was applied. Raise autonomy to `full` ([autonomy] level = \"full\") to allow \
+         manual evolution."
     )
 }
 
@@ -570,8 +567,9 @@ mod tests {
     use tempfile::TempDir;
 
     /// Build a minimal `Config` whose workspace points into `tmp`. The default
-    /// autonomy level is `Supervised` with `require_approval_for_medium_risk`,
-    /// which is exactly the policy that must DENY a manual evolution trigger.
+    /// autonomy level is `Supervised`, under which medium/high-risk side effects
+    /// require a runtime grant — exactly the policy that must DENY a manual
+    /// evolution trigger (the one-shot CLI has no approval manager to issue one).
     fn supervised_config(tmp: &TempDir) -> Config {
         let config = Config {
             workspace_dir: tmp.path().join("workspace"),
