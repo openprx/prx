@@ -4511,7 +4511,7 @@ impl SignalConfig {
 /// WhatsApp channel configuration (Cloud API or Web mode).
 ///
 /// Set `phone_number_id` for Cloud API mode, or `session_path` for Web mode.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct WhatsAppConfig {
     /// Access token from Meta Business Suite (Cloud API mode)
     #[serde(default)]
@@ -4556,6 +4556,12 @@ pub struct WhatsAppConfig {
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,
+    /// Group reply decision mode. When `None` (default), derived from
+    /// `mention_only` for backward compatibility (`true => MentionOnly`,
+    /// `false => Off`). Set to `smart` to let the model decide per-message
+    /// whether to reply or stay silent in WhatsApp group chats (`@g.us`).
+    #[serde(default)]
+    pub group_reply_mode: Option<GroupReplyMode>,
 
     /// WebSocket URL override (replaces WHATSAPP_WS_URL)
     #[serde(default)]
@@ -7151,6 +7157,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            group_reply_mode: None,
             ws_url: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
@@ -7176,6 +7183,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            group_reply_mode: None,
             ws_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -7206,6 +7214,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            group_reply_mode: None,
             ws_url: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
@@ -7228,6 +7237,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            group_reply_mode: None,
             ws_url: None,
         };
         assert!(wc.is_ambiguous_config());
@@ -7249,6 +7259,7 @@ channel_id = "C123"
             group_policy: GroupPolicy::default(),
             group_allow_from: vec![],
             mention_only: false,
+            group_reply_mode: None,
             ws_url: None,
         };
         assert!(!wc.is_ambiguous_config());
@@ -7280,6 +7291,7 @@ channel_id = "C123"
                 group_policy: GroupPolicy::default(),
                 group_allow_from: vec![],
                 mention_only: false,
+                group_reply_mode: None,
                 ws_url: None,
             }),
             wacli: None,

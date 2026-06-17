@@ -3145,6 +3145,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         group_policy: crate::config::schema::GroupPolicy::default(),
                         group_allow_from: Vec::new(),
                         mention_only: false,
+                        // Group smart-reply: default (None) derives MentionOnly/Off
+                        // from `mention_only`. Set `group_reply_mode = "smart"` in
+                        // config.toml to enable model-decided group replies.
+                        group_reply_mode: None,
                         ws_url: None,
                     });
 
@@ -3233,6 +3237,10 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     group_policy: crate::config::schema::GroupPolicy::default(),
                     group_allow_from: Vec::new(),
                     mention_only: false,
+                    // Group smart-reply: default (None) derives MentionOnly/Off
+                    // from `mention_only`. Set `group_reply_mode = "smart"` in
+                    // config.toml to enable model-decided group replies.
+                    group_reply_mode: None,
                     ws_url: None,
                 });
             }

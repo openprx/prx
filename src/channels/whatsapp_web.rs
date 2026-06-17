@@ -151,6 +151,64 @@ impl WhatsAppWebChannel {
     }
 }
 
+/// Return true when the bot's own account (phone-number or LID JID) appears in
+/// the message's `context_info.mentioned_jid` list, i.e. the bot was explicitly
+/// @-mentioned. WhatsApp @-mentions are JID-based, so this is the authoritative
+/// signal (text bot-name matching alone misses `@<number>` style mentions).
+///
+/// Only the text-bearing message variants that can carry inline @-mentions are
+/// inspected (plain/extended text plus media captions); other variants never
+/// hold a user mention relevant to "@ the bot".
+#[cfg(feature = "whatsapp-web")]
+async fn bot_is_mentioned(base: &wa_rs_proto::whatsapp::Message, client: &wa_rs::Client) -> bool {
+    use wa_rs_binary::jid::JidExt as _;
+
+    // Gather mentioned JIDs from the variants that can carry inline @-mentions.
+    let mut mentioned: Vec<&str> = Vec::new();
+    if let Some(ext) = base.extended_text_message.as_ref() {
+        if let Some(ctx) = ext.context_info.as_ref() {
+            mentioned.extend(ctx.mentioned_jid.iter().map(String::as_str));
+        }
+    }
+    if let Some(img) = base.image_message.as_ref() {
+        if let Some(ctx) = img.context_info.as_ref() {
+            mentioned.extend(ctx.mentioned_jid.iter().map(String::as_str));
+        }
+    }
+    if let Some(vid) = base.video_message.as_ref() {
+        if let Some(ctx) = vid.context_info.as_ref() {
+            mentioned.extend(ctx.mentioned_jid.iter().map(String::as_str));
+        }
+    }
+    if let Some(doc) = base.document_message.as_ref() {
+        if let Some(ctx) = doc.context_info.as_ref() {
+            mentioned.extend(ctx.mentioned_jid.iter().map(String::as_str));
+        }
+    }
+
+    if mentioned.is_empty() {
+        return false;
+    }
+
+    // The bot is addressed by either its phone-number JID (`pn`) or its LID
+    // (`lid`); newer WhatsApp groups may surface mentions under either.
+    let own_users: Vec<String> = [client.get_pn().await, client.get_lid().await]
+        .into_iter()
+        .flatten()
+        .map(|jid| jid.user().to_string())
+        .collect();
+    if own_users.is_empty() {
+        return false;
+    }
+
+    mentioned.iter().any(|raw| {
+        // mentioned_jid entries are full JIDs ("<user>@<server>"); compare the
+        // user (number/LID) part only, matching `JidExt::is_same_user_as`.
+        let user = raw.split('@').next().unwrap_or(raw);
+        own_users.iter().any(|own| own == user)
+    })
+}
+
 #[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
@@ -237,7 +295,7 @@ impl Channel for WhatsAppWebChannel {
             .with_backend(backend)
             .with_transport_factory(transport_factory)
             .with_http_client(http_client)
-            .on_event(move |event, _client| {
+            .on_event(move |event, client| {
                 let tx_inner = tx_clone.clone();
                 let allowed_numbers = allowed_numbers.clone();
                 async move {
@@ -247,6 +305,7 @@ impl Channel for WhatsAppWebChannel {
                             let text = msg.text_content().unwrap_or("");
                             let sender = info.source.sender.user().to_string();
                             let chat = info.source.chat.to_string();
+                            let is_group = info.source.is_group;
 
                             tracing::info!("WhatsApp Web message from {} in {}: {}", sender, chat, text);
 
@@ -267,6 +326,16 @@ impl Channel for WhatsAppWebChannel {
                                     return;
                                 }
 
+                                // Detect explicit @-mention of the bot in groups. WhatsApp
+                                // @-mentions are JID-based (the body shows "@<number>"),
+                                // so text bot-name matching alone misses them. Walk the
+                                // message's `context_info.mentioned_jid` list and compare
+                                // each entry against the bot's own pn/lid JID. This drives
+                                // the central "@ always answers" invariant for WhatsApp
+                                // groups; mention detection is irrelevant for DMs (the
+                                // central pipeline never silences DMs regardless).
+                                let mentioned = is_group && bot_is_mentioned(msg.get_base_message(), &client).await;
+
                                 if let Err(e) = tx_inner
                                     .send(ChannelMessage {
                                         id: uuid::Uuid::new_v4().to_string(),
@@ -278,8 +347,8 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         mentioned_uuids: vec![],
-                                        mentioned: false,
-                                        is_group_hint: false,
+                                        mentioned,
+                                        is_group_hint: is_group,
                                         sender_is_bot: false,
                                     })
                                     .await
