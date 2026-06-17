@@ -591,7 +591,7 @@ fn collect_mention_only_by_channel(config: &Config) -> HashMap<String, bool> {
 }
 
 /// Collect the effective group reply mode for channels that support smart
-/// group-reply (currently Telegram, Discord, and WhatsApp). Other channels are
+/// group-reply (currently Telegram, Discord, WhatsApp, and wacli). Other channels are
 /// absent and fall back to their `mention_only`-derived behavior unchanged.
 fn collect_group_reply_mode_by_channel(config: &Config) -> HashMap<String, crate::config::GroupReplyMode> {
     let mut modes = HashMap::new();
@@ -611,6 +611,12 @@ fn collect_group_reply_mode_by_channel(config: &Config) -> HashMap<String, crate
         modes.insert(
             "whatsapp".to_string(),
             crate::config::GroupReplyMode::resolve(whatsapp.group_reply_mode, whatsapp.mention_only),
+        );
+    }
+    if let Some(wacli) = config.channels_config.wacli.as_ref() {
+        modes.insert(
+            "wacli".to_string(),
+            crate::config::GroupReplyMode::resolve(wacli.group_reply_mode, wacli.mention_only),
         );
     }
     modes
@@ -2754,8 +2760,7 @@ async fn process_channel_message(
         let mention_only = is_mention_only_enabled(ctx.as_ref(), &msg.channel);
         // Non-smart mention_only behavior is byte-identical to before. Smart mode
         // never drops here (it lets the model decide via stay_silent).
-        if mention_only && !group_reply_mode.is_smart() && !is_bot_mentioned(ctx.as_ref(), &msg, &user_text_for_mention)
-        {
+        if mention_only && !group_reply_mode.is_smart() && !mentioned {
             println!("  ⏭️ Group message stored but skipped (no mention)");
             return;
         }
@@ -4926,11 +4931,18 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
 
     if let Some(ref wc) = config.channels_config.wacli {
         if wc.enabled {
-            channels.push(Arc::new(WacliChannel::with_params(
-                wc.host.clone(),
-                wc.port,
-                wc.allowed_from.clone(),
-            )));
+            channels.push(Arc::new(WacliChannel::new(wacli::WacliChannelConfig {
+                webhook_listen: wc.webhook_listen.clone(),
+                webhook_path: wc.webhook_path.clone(),
+                webhook_secret: wc.webhook_secret.clone(),
+                allow_unsigned_loopback: wc.allow_unsigned_loopback,
+                allowed_from: wc.allowed_from.clone(),
+                cli_path: wc.cli_path.clone(),
+                store_dir: wc.store_dir.clone(),
+                bot_jid: wc.bot_jid.clone(),
+                bot_number: wc.bot_number.clone(),
+                bot_lid: wc.bot_lid.clone(),
+            })));
         } else {
             tracing::debug!("wacli channel configured but not enabled (set enabled = true to activate)");
         }
@@ -5454,10 +5466,17 @@ mod tests {
             group_reply_mode: Some(crate::config::GroupReplyMode::Smart),
             ..Default::default()
         });
+        config.channels_config.wacli = Some(crate::config::WacliConfig {
+            enabled: true,
+            group_reply_mode: Some(crate::config::GroupReplyMode::Smart),
+            bot_jid: Some("123@s.whatsapp.net".into()),
+            ..Default::default()
+        });
         let modes = collect_group_reply_mode_by_channel(&config);
         assert_eq!(modes.get("telegram"), Some(&crate::config::GroupReplyMode::Smart));
         assert_eq!(modes.get("discord"), Some(&crate::config::GroupReplyMode::MentionOnly));
         assert_eq!(modes.get("whatsapp"), Some(&crate::config::GroupReplyMode::Smart));
+        assert_eq!(modes.get("wacli"), Some(&crate::config::GroupReplyMode::Smart));
         assert!(
             !modes.contains_key("slack"),
             "non-smart-capable channels are not registered"

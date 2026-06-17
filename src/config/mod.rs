@@ -19,7 +19,7 @@ pub use schema::{
     RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig,
     SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
     StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
-    TaskRoutingRule, TelegramConfig, ToolPolicyConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig,
+    TaskRoutingRule, TelegramConfig, ToolPolicyConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig, WacliConfig,
     WebSearchConfig, WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder, build_runtime_proxy_client,
     build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
 };

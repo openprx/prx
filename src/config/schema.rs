@@ -4637,52 +4637,97 @@ impl WhatsAppConfig {
     }
 }
 
-/// wacli JSON-RPC daemon channel configuration.
+/// wacli (official) channel configuration.
 ///
-/// Connect OpenPRX to WhatsApp via the `wacli` daemon (JSON-RPC over TCP).
-/// The daemon must be running before OpenPRX starts.
+/// Connect OpenPRX to WhatsApp via the **official** `steipete/wacli` real-time
+/// interface: inbound via `sync --webhook` (signed HTTP POST) and outbound via
+/// the `wacli send` CLI. The legacy self-maintained JSON-RPC daemon (`host` /
+/// `port`) is no longer supported.
+///
+/// Deployment (run alongside PRX, e.g. a systemd user service):
+/// ```text
+/// wacli sync --follow \
+///   --webhook http://127.0.0.1:16868/wacli \
+///   --webhook-secret <SECRET> \
+///   --store ~/.wacli
+/// ```
 ///
 /// Example TOML:
 /// ```toml
 /// [channels_config.wacli]
 /// enabled = true
-/// host = "127.0.0.1"
-/// port = 16867
+/// webhook_listen = "127.0.0.1:16868"
+/// webhook_path = "/wacli"
+/// webhook_secret = "<SECRET>"     # must match --webhook-secret
+/// store_dir = "/home/ck/.wacli"
+/// bot_jid = "1234567890@s.whatsapp.net"
+/// bot_number = "1234567890"
 /// allowed_from = ["*"]
+/// group_reply_mode = "smart"
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WacliConfig {
     /// Enable the wacli channel.
     #[serde(default)]
     pub enabled: bool,
-    /// Host where the wacli daemon listens (default: "127.0.0.1").
-    #[serde(default = "default_wacli_host")]
-    pub host: String,
-    /// Port for the wacli daemon's JSON-RPC TCP listener (default: 16867).
-    #[serde(default = "default_wacli_port")]
-    pub port: u16,
+    /// Address the inbound webhook server binds to (default: "127.0.0.1:16868").
+    #[serde(default = "default_wacli_webhook_listen")]
+    pub webhook_listen: String,
+    /// HTTP path the webhook server serves (default: "/wacli").
+    #[serde(default = "default_wacli_webhook_path")]
+    pub webhook_path: String,
+    /// HMAC-SHA256 secret shared with `wacli sync --webhook-secret`. Required
+    /// when `enabled` is true unless `allow_unsigned_loopback` is set.
+    #[serde(default)]
+    pub webhook_secret: Option<String>,
+    /// Allow processing unsigned requests when bound to a loopback address.
+    /// Defaults to false (signature verification required).
+    #[serde(default)]
+    pub allow_unsigned_loopback: bool,
     /// Sender JID allowlist. Use `["*"]` to accept all senders.
     /// JIDs look like `1234567890@s.whatsapp.net` for individuals or
     /// `1234567890-1234567890@g.us` for groups.
     #[serde(default = "default_wacli_allowed_from")]
     pub allowed_from: Vec<String>,
-    /// Path to the `wacli` binary (for future auto-start support).
+    /// Path to the `wacli` binary used for outbound sends. When `None`, `wacli`
+    /// is resolved from `PATH`.
     #[serde(default)]
     pub cli_path: Option<String>,
-    /// Path to the wacli store directory (for future auto-start support).
+    /// wacli store directory passed as `--store` on outbound sends.
     #[serde(default)]
     pub store_dir: Option<String>,
+    /// Bot's own JID, used for reply-to-bot mention detection.
+    #[serde(default)]
+    pub bot_jid: Option<String>,
+    /// Bot's own phone number (digits), used for `@<number>` mention detection.
+    #[serde(default)]
+    pub bot_number: Option<String>,
+    /// Bot 的 WhatsApp LID（群内 @mention 时使用）。
+    /// 可填裸数字 `263767598346470` 或完整形式 `263767598346470@lid`。
+    /// 设备后缀（`:3` 等）会自动去除。
+    #[serde(default)]
+    pub bot_lid: Option<String>,
     /// When true, only process group messages that mention the bot.
     #[serde(default)]
     pub mention_only: bool,
+    /// Smart group-reply mode. When `None`, derived from `mention_only`.
+    #[serde(default)]
+    pub group_reply_mode: Option<GroupReplyMode>,
+    /// REMOVED: legacy JSON-RPC daemon host. Retained only to detect and reject
+    /// stale configs with a clear migration error in [`WacliConfig::validate`].
+    #[serde(default, skip_serializing)]
+    pub host: Option<String>,
+    /// REMOVED: legacy JSON-RPC daemon port. See `host`.
+    #[serde(default, skip_serializing)]
+    pub port: Option<u16>,
 }
 
-fn default_wacli_host() -> String {
-    "127.0.0.1".to_string()
+fn default_wacli_webhook_listen() -> String {
+    "127.0.0.1:16868".to_string()
 }
 
-const fn default_wacli_port() -> u16 {
-    16867
+fn default_wacli_webhook_path() -> String {
+    "/wacli".to_string()
 }
 
 fn default_wacli_allowed_from() -> Vec<String> {
@@ -4693,13 +4738,115 @@ impl Default for WacliConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            host: default_wacli_host(),
-            port: default_wacli_port(),
+            webhook_listen: default_wacli_webhook_listen(),
+            webhook_path: default_wacli_webhook_path(),
+            webhook_secret: None,
+            allow_unsigned_loopback: false,
             allowed_from: default_wacli_allowed_from(),
             cli_path: None,
             store_dir: None,
+            bot_jid: None,
+            bot_number: None,
+            bot_lid: None,
             mention_only: false,
+            group_reply_mode: None,
+            host: None,
+            port: None,
         }
+    }
+}
+
+impl WacliConfig {
+    /// Validate wacli channel settings (only meaningful when `enabled`).
+    ///
+    /// Detects removed JSON-RPC fields, enforces secure-by-default HMAC, and
+    /// warns when mention/smart modes lack the bot identity needed for `@`
+    /// detection.
+    pub fn validate(&self) -> Result<()> {
+        // Reject stale JSON-RPC daemon configs regardless of `enabled` so the
+        // operator gets a clear migration error instead of silent no-op.
+        if self.host.is_some() || self.port.is_some() {
+            anyhow::bail!(
+                "channels_config.wacli: the wacli daemon JSON-RPC config (host/port) is no \
+                 longer supported; use webhook_listen/webhook_path/webhook_secret with the \
+                 official `wacli sync --webhook` interface"
+            );
+        }
+
+        if !self.enabled {
+            return Ok(());
+        }
+
+        // Address must be parseable so the listener can bind.
+        self.webhook_listen
+            .parse::<std::net::SocketAddr>()
+            .with_context(|| format!("invalid channels_config.wacli.webhook_listen: {}", self.webhook_listen))?;
+
+        // webhook_path must be non-empty, start with '/', and contain no axum
+        // capture/wildcard syntax ({}, *, or /:param segments).
+        let path = self.webhook_path.trim();
+        if path.is_empty() {
+            anyhow::bail!("channels_config.wacli.webhook_path must not be empty");
+        }
+        if !path.starts_with('/') {
+            anyhow::bail!("channels_config.wacli.webhook_path must start with '/' (got {path:?})");
+        }
+        if path.contains('{') || path.contains('}') || path.contains('*') {
+            anyhow::bail!(
+                "channels_config.wacli.webhook_path must not contain axum capture/wildcard syntax \
+                 ('{{', '}}', '*') (got {path:?})"
+            );
+        }
+        // Reject path segments that start with ':' (e.g. "/:foo" axum named params).
+        if path.split('/').any(|seg| seg.starts_with(':')) {
+            anyhow::bail!(
+                "channels_config.wacli.webhook_path must not contain ':param' segments \
+                 (got {path:?})"
+            );
+        }
+
+        // Secure-by-default: a secret is mandatory unless unsigned-loopback is
+        // explicitly opted into.
+        let has_secret = self
+            .webhook_secret
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty());
+        if !has_secret && !self.allow_unsigned_loopback {
+            anyhow::bail!(
+                "channels_config.wacli.webhook_secret is required when enabled \
+                 (set allow_unsigned_loopback = true only for loopback testing)"
+            );
+        }
+        if self.allow_unsigned_loopback && !has_secret {
+            let bind: std::net::SocketAddr = self
+                .webhook_listen
+                .parse()
+                .with_context(|| format!("invalid channels_config.wacli.webhook_listen: {}", self.webhook_listen))?;
+            if !bind.ip().is_loopback() {
+                anyhow::bail!(
+                    "channels_config.wacli.allow_unsigned_loopback = true requires a loopback \
+                     webhook_listen address (got {bind})"
+                );
+            }
+        }
+
+        // mention / smart modes need a bot identity to detect `@`s. The official
+        // payload has no mentionedJids, so without bot_jid/bot_number every
+        // mention would be missed. Warn rather than hard-fail (smart still works
+        // via the LLM gate; mentions just degrade).
+        let smart = matches!(self.group_reply_mode, Some(GroupReplyMode::Smart));
+        let needs_identity = self.mention_only || smart;
+        let has_identity = self.bot_jid.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+            || self.bot_number.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+        if needs_identity && !has_identity {
+            tracing::warn!(
+                "channels_config.wacli: mention_only/smart enabled but neither bot_jid nor \
+                 bot_number is set; @-mention detection will not work (set bot_jid)"
+            );
+        }
+
+        Ok(())
     }
 }
 
@@ -5715,6 +5862,11 @@ impl Config {
 
         // Smart group-reply pre-gate numeric ranges.
         self.smart_group.validate()?;
+
+        // wacli channel (webhook + CLI) settings.
+        if let Some(wacli) = self.channels_config.wacli.as_ref() {
+            wacli.validate().context("invalid channels_config.wacli")?;
+        }
 
         Ok(())
     }
@@ -8393,5 +8545,135 @@ classifier_timeout_secs = 8
         "#;
         let cfg: DiscordConfig = toml::from_str(toml).expect("parse discord config");
         assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
+    }
+
+    #[test]
+    async fn wacli_config_defaults_webhook() {
+        let cfg = WacliConfig::default();
+        assert_eq!(cfg.webhook_listen, "127.0.0.1:16868");
+        assert_eq!(cfg.webhook_path, "/wacli");
+        assert!(cfg.webhook_secret.is_none());
+        assert!(!cfg.allow_unsigned_loopback);
+        assert!(cfg.host.is_none() && cfg.port.is_none());
+        // Disabled by default => validation is a no-op.
+        cfg.validate().expect("default wacli config validates");
+    }
+
+    #[test]
+    async fn wacli_config_parses_official_webhook_toml() {
+        let toml = r#"
+            enabled = true
+            webhook_listen = "127.0.0.1:16868"
+            webhook_path = "/wacli"
+            webhook_secret = "s3cr3t"
+            store_dir = "/home/ck/.wacli"
+            bot_jid = "123@s.whatsapp.net"
+            group_reply_mode = "smart"
+        "#;
+        let cfg: WacliConfig = toml::from_str(toml).expect("parse wacli config");
+        assert!(cfg.enabled);
+        assert_eq!(cfg.webhook_secret.as_deref(), Some("s3cr3t"));
+        assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
+        cfg.validate().expect("valid wacli config");
+    }
+
+    #[test]
+    async fn wacli_config_requires_secret_when_enabled() {
+        let cfg = WacliConfig {
+            enabled: true,
+            webhook_secret: None,
+            ..WacliConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "enabled without secret must fail");
+    }
+
+    #[test]
+    async fn wacli_config_unsigned_loopback_ok() {
+        let cfg = WacliConfig {
+            enabled: true,
+            webhook_secret: None,
+            allow_unsigned_loopback: true,
+            webhook_listen: "127.0.0.1:16868".into(),
+            ..WacliConfig::default()
+        };
+        cfg.validate().expect("unsigned loopback is allowed on 127.0.0.1");
+    }
+
+    #[test]
+    async fn wacli_config_unsigned_non_loopback_rejected() {
+        let cfg = WacliConfig {
+            enabled: true,
+            webhook_secret: None,
+            allow_unsigned_loopback: true,
+            webhook_listen: "0.0.0.0:16868".into(),
+            ..WacliConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "unsigned non-loopback must fail");
+    }
+
+    #[test]
+    async fn wacli_config_rejects_legacy_jsonrpc_fields() {
+        // Stale daemon config (host/port) must produce a clear migration error.
+        let toml = r#"
+            enabled = true
+            host = "127.0.0.1"
+            port = 16867
+            webhook_secret = "s"
+        "#;
+        let cfg: WacliConfig = toml::from_str(toml).expect("parse legacy wacli config");
+        let err = cfg.validate().expect_err("legacy host/port must be rejected");
+        assert!(
+            err.to_string().contains("no longer supported"),
+            "error should guide migration: {err}"
+        );
+    }
+
+    #[test]
+    async fn wacli_webhook_path_must_start_with_slash() {
+        let cfg = WacliConfig {
+            enabled: true,
+            webhook_secret: Some("s3cr3t".into()),
+            webhook_path: "wacli".into(), // missing leading slash
+            ..WacliConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "path without leading slash must fail");
+    }
+
+    #[test]
+    async fn wacli_webhook_path_must_not_be_empty() {
+        let cfg = WacliConfig {
+            enabled: true,
+            webhook_secret: Some("s3cr3t".into()),
+            webhook_path: "".into(),
+            ..WacliConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "empty path must fail");
+    }
+
+    #[test]
+    async fn wacli_webhook_path_must_not_contain_axum_capture_syntax() {
+        for bad_path in &["/wacli/{id}", "/wacli/*rest", "/:foo"] {
+            let cfg = WacliConfig {
+                enabled: true,
+                webhook_secret: Some("s3cr3t".into()),
+                webhook_path: bad_path.to_string(),
+                ..WacliConfig::default()
+            };
+            assert!(cfg.validate().is_err(), "path with axum syntax must fail: {bad_path}");
+        }
+    }
+
+    #[test]
+    async fn wacli_webhook_path_valid_paths_pass() {
+        for good_path in &["/wacli", "/wacli/inbound", "/webhook/v2"] {
+            let cfg = WacliConfig {
+                enabled: true,
+                webhook_secret: Some("s3cr3t".into()),
+                webhook_path: good_path.to_string(),
+                ..WacliConfig::default()
+            };
+            cfg.validate()
+                .unwrap_or_else(|e| panic!("valid path {good_path} must pass: {e}"));
+        }
     }
 }
