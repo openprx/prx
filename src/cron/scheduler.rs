@@ -190,7 +190,10 @@ async fn run_agent_job(config: &Config, security: &SecurityPolicy, job: &CronJob
     let model_override = job.model.clone();
 
     // Cap tool iterations for cron jobs to prevent runaway context growth.
-    const CRON_MAX_TOOL_ITERATIONS: usize = 30;
+    // Behavior-limits Phase 1: raised 30 -> 100.
+    // 0-semantics note: on this CRON path `0` (or >cap) clamps to this value, NOT
+    // to the main-agent `0 -> default` fallback in `agent/loop_.rs`.
+    const CRON_MAX_TOOL_ITERATIONS: usize = 100;
     let mut cron_config = config.clone();
     if cron_config.agent.max_tool_iterations == 0 || cron_config.agent.max_tool_iterations > CRON_MAX_TOOL_ITERATIONS {
         cron_config.agent.max_tool_iterations = CRON_MAX_TOOL_ITERATIONS;

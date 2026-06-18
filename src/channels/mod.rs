@@ -103,11 +103,13 @@ use tokio_util::sync::CancellationToken;
 /// Per-sender conversation history for channel messages.
 type ConversationHistoryMap = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
 /// Maximum history messages to keep per sender.
-const MAX_CHANNEL_HISTORY: usize = 50;
+/// 🟡 Behavior-limits Phase 1: raised 50 -> 200 (4x).
+const MAX_CHANNEL_HISTORY: usize = 200;
 /// Maximum number of persisted sessions to hydrate at startup.
 const MAX_HYDRATED_SESSIONS: usize = 100;
 /// Maximum characters per injected workspace file (matches `OpenClaw` default).
-const BOOTSTRAP_MAX_CHARS: usize = 20_000;
+/// 🟡 Behavior-limits Phase 1: raised 20K -> 60K (3x).
+const BOOTSTRAP_MAX_CHARS: usize = 60_000;
 
 const DEFAULT_CHANNEL_INITIAL_BACKOFF_SECS: u64 = 2;
 const DEFAULT_CHANNEL_MAX_BACKOFF_SECS: u64 = 60;
@@ -123,15 +125,20 @@ const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
+/// 🟡 Behavior-limits Phase 1: raised 4 -> 16 (4x).
 #[allow(dead_code)]
-const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
+const MEMORY_CONTEXT_MAX_ENTRIES: usize = 16;
+/// 🟡 Behavior-limits Phase 1: raised 800 -> 3200 (4x).
 #[allow(dead_code)]
-const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
+const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 3_200;
+/// 🟡 Behavior-limits Phase 1: raised 4000 -> 16000 (4x).
 #[allow(dead_code)]
-const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
+const MEMORY_CONTEXT_MAX_CHARS: usize = 16_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 8;
-const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 320;
-const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 2400;
+/// 🟡 Behavior-limits Phase 1: raised 320 -> 1280 (4x).
+const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 1_280;
+/// 🟡 Behavior-limits Phase 1: raised 2400 -> 9600 (4x).
+const CHANNEL_HISTORY_COMPACT_TOTAL_CHARS: usize = 9_600;
 const SIGNAL_IMAGE_UNCERTAINTY_FALLBACK: &str = "无法确认，请提供更清晰图片或补充说明";
 const SIGNAL_VISION_PREFLIGHT_CONFIDENCE_THRESHOLD: f64 = 0.60;
 const SIGNAL_VISION_PREFLIGHT_TIMEOUT_SECS: u64 = 45;

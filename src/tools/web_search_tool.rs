@@ -23,7 +23,9 @@ impl WebSearchTool {
         Self {
             provider: provider.trim().to_lowercase(),
             brave_api_key,
-            max_results: max_results.clamp(1, 10),
+            // Behavior-limits Phase 1: ceiling raised 10 -> 20 to leave headroom
+            // above the schema default (15). Still a finite clamp (never 0).
+            max_results: max_results.clamp(1, 20),
             timeout_secs: timeout_secs.max(1),
         }
     }
@@ -295,6 +297,24 @@ mod tests {
         "#;
         let result = tool.parse_duckduckgo_results(html, "test").unwrap();
         assert!(result.contains("Example Title"));
+
+        // Behavior-limits Phase 1: lower bound stays 1 (0 -> 1), upper ceiling
+        // raised 10 -> 20 to leave headroom above the schema default (15).
+        assert_eq!(
+            WebSearchTool::new("duckduckgo".to_string(), None, 0, 1).max_results,
+            1,
+            "max_results must clamp up to the floor of 1"
+        );
+        assert_eq!(
+            WebSearchTool::new("duckduckgo".to_string(), None, 15, 1).max_results,
+            15,
+            "schema default (15) must pass through unclamped"
+        );
+        assert_eq!(
+            WebSearchTool::new("duckduckgo".to_string(), None, 1000, 1).max_results,
+            20,
+            "max_results must clamp down to the Phase 1 ceiling of 20"
+        );
     }
 
     #[tokio::test]

@@ -12,8 +12,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const DEFAULT_MAX_RESULTS: usize = 5;
-const MAX_RESULTS_LIMIT: usize = 100;
+// Behavior-limits Phase 1: DEFAULT 5 -> 10, MAX 100 -> 500 (fuller recall).
+const DEFAULT_MAX_RESULTS: usize = 10;
+const MAX_RESULTS_LIMIT: usize = 500;
 
 static OBSERVE_TOTAL_QUERIES: AtomicU64 = AtomicU64::new(0);
 static OBSERVE_WOULD_DENY_QUERIES: AtomicU64 = AtomicU64::new(0);

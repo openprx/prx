@@ -789,8 +789,10 @@ fn security_template(spec: Spec) -> String {
 [autonomy]
 level = "supervised"
 workspace_only = true
-max_actions_per_hour = 100
-max_cost_per_day_cents = 500
+# Behavior-limits Phase 1: rate/cost caps opened to u32::MAX (high-position
+# billing/runaway safeguards). NOTE: 0 means "blocked", NOT "unlimited".
+max_actions_per_hour = 4294967295
+max_cost_per_day_cents = 4294967295
 forbidden_paths = []                   # no extra path denylist
 
 # Sandbox (folded in from the former [security.sandbox]); disabled by default.
@@ -904,28 +906,45 @@ enabled = false
 fn agent_template(spec: Spec) -> String {
     match spec {
         Spec::Minimal => r#"# Agent configuration (minimal)
+# Behavior-limits Phase 1: opened defaults (long-task iterations + history).
 
 [agent]
-max_tool_iterations = 10
-max_history_messages = 50
+max_tool_iterations = 200
+max_history_messages = 300
+
+# OS-paging (non-destructive history eviction + semantic recall) on by default so
+# the agent "remembers" long conversations instead of hard-dropping old messages.
+[agent.compaction]
+mode = "safeguard"                     # off | safeguard | aggressive (safeguard backstops overflow)
+[agent.compaction.os_paging]
+enabled = true
+max_recalled_pages = 10
 "#
         .into(),
 
         Spec::Server => r#"# Agent configuration (server)
-# Orchestration, session spawning, and self-system
+# Orchestration, session spawning, and self-system.
+# Behavior-limits Phase 1: opened defaults.
 
 [agent]
-max_tool_iterations = 10
-max_history_messages = 50
+max_tool_iterations = 200
+max_history_messages = 300
 
 [agent.compaction]
 mode = "safeguard"                     # off | safeguard | aggressive
 max_context_tokens = 100000
+# OS-paging: non-destructive eviction + semantic recall of paged-out history.
+[agent.compaction.os_paging]
+enabled = true
+max_recalled_pages = 10
 
 [sessions_spawn]
 enabled = false
 # process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private | hybrid
-# max_concurrent = 4
+# 🔴 fork-bomb safeguards (high-position; never set to 0):
+# max_concurrent = 64
+# max_spawn_depth = 8
+# max_children_per_agent = 32
 
 [self_system]
 enabled = false
@@ -933,21 +952,29 @@ enabled = false
         .into(),
 
         Spec::Full => r#"# Agent configuration (full)
-# Agent orchestration, sessions, self-system, causal tree, and delegates
+# Agent orchestration, sessions, self-system, causal tree, and delegates.
+# Behavior-limits Phase 1: opened defaults.
 
 [agent]
-max_tool_iterations = 10
-max_history_messages = 50
+max_tool_iterations = 200
+max_history_messages = 300
 
-# Context compaction to manage long conversations
+# Context compaction to manage long conversations.
 [agent.compaction]
 mode = "safeguard"                    # off | safeguard | aggressive
 max_context_tokens = 100000
+# OS-paging: non-destructive eviction + semantic recall of paged-out history.
+[agent.compaction.os_paging]
+enabled = true
+max_recalled_pages = 10
 
-# Session spawning for parallel task execution
+# Session spawning for parallel task execution.
+# 🔴 fork-bomb safeguards kept at high positions (never 0).
 [sessions_spawn]
 enabled = false
-max_concurrent = 4
+max_concurrent = 64
+max_spawn_depth = 8
+max_children_per_agent = 32
 process_memory_strategy = "shared_fabric"
 # timeout_secs = 300
 
@@ -968,7 +995,7 @@ enabled = false
 # model = "claude-sonnet-4-6"
 # system_prompt = "You are a research assistant."
 # agentic = true
-# max_iterations = 20
+# max_iterations = 100
 # allowed_tools = ["web_search", "read_file"]
 "#
         .into(),
@@ -1125,7 +1152,7 @@ auto_discover = true
 
 [skill_rag]
 enabled = false
-# max_results = 5
+# max_results = 15
 "#
         .into(),
     }

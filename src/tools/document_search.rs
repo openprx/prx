@@ -5,8 +5,9 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-const DEFAULT_LIMIT: usize = 5;
-const MAX_LIMIT: usize = 50;
+// Behavior-limits Phase 1: DEFAULT 5 -> 10, MAX 50 -> 200 (fuller recall).
+const DEFAULT_LIMIT: usize = 10;
+const MAX_LIMIT: usize = 200;
 
 pub struct DocumentSearchTool {
     workspace_dir: PathBuf,

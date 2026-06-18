@@ -1224,6 +1224,22 @@ fn build_dispatcher_tool_specs(
     specs
 }
 
+/// Resolve the effective max-tool-iterations for the Redux/TUI driver.
+///
+/// Directly reuses `agent::loop_`'s public constants so the driver and the main
+/// agent loop share one source of truth (Phase 1 behavior-limits: 200 default /
+/// 2000 finite cap) and can never silently drift apart again. A finite cap is
+/// always preserved (never 0 / never `usize::MAX`): a configured `0` falls back
+/// to the shared default, and any larger value is clamped to the shared cap.
+fn resolve_driver_max_iterations(max_tool_iterations: usize) -> usize {
+    use crate::agent::loop_::{DEFAULT_MAX_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CAP};
+    if max_tool_iterations == 0 {
+        DEFAULT_MAX_TOOL_ITERATIONS
+    } else {
+        max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -1246,15 +1262,7 @@ async fn drive_start_turn_stream(
     approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
     chat_mode: crate::agent::loop_::ChatMode,
 ) {
-    // 默认 / 上限：与 `agent::loop_::DEFAULT_MAX_TOOL_ITERATIONS` 概念对齐，
-    // 但 driver 内部独立维护防止意外 0 走入死循环。
-    const DEFAULT_MAX_ITERATIONS: usize = 16;
-    const ABSOLUTE_MAX_ITERATIONS: usize = 64;
-    let max_iterations = if max_tool_iterations == 0 {
-        DEFAULT_MAX_ITERATIONS
-    } else {
-        max_tool_iterations.min(ABSOLUTE_MAX_ITERATIONS)
-    };
+    let max_iterations = resolve_driver_max_iterations(max_tool_iterations);
 
     let mut version: u64 = 0;
     let mut accumulated = String::new();
@@ -2486,6 +2494,38 @@ mod tests {
     use super::*;
     use crate::chat::action::Action;
     use crate::providers::router::MockEnvProvider;
+
+    /// P1-1 regression: the Redux/TUI driver must NOT clamp the configured
+    /// `max_tool_iterations` down to the old 64 ceiling. `AgentConfig::default()`
+    /// (Phase 1: 200) must survive the driver clamp with its full effective value.
+    #[test]
+    fn redux_driver_does_not_clamp_default_max_iterations_to_64() {
+        use crate::agent::loop_::{DEFAULT_MAX_TOOL_ITERATIONS, MAX_TOOL_ITERATIONS_CAP};
+
+        let cfg_default = crate::config::AgentConfig::default().max_tool_iterations;
+        assert_eq!(
+            cfg_default, DEFAULT_MAX_TOOL_ITERATIONS,
+            "AgentConfig default must match loop_ shared default (Phase 1: 200)"
+        );
+
+        let effective = resolve_driver_max_iterations(cfg_default);
+        // The whole point of P1-1: the new default is not silently dropped to 64.
+        assert!(
+            effective >= 200,
+            "driver clamped default {cfg_default} down to {effective} (regression: old 64 ceiling)"
+        );
+        assert_eq!(
+            effective, cfg_default,
+            "default value (<= cap) must pass through the driver unchanged"
+        );
+
+        // 0 falls back to the shared default (finite, never 0).
+        assert_eq!(resolve_driver_max_iterations(0), DEFAULT_MAX_TOOL_ITERATIONS);
+        // Oversized values are clamped to the shared finite cap (never usize::MAX).
+        assert_eq!(resolve_driver_max_iterations(usize::MAX), MAX_TOOL_ITERATIONS_CAP);
+        // A value already under the cap passes through verbatim.
+        assert_eq!(resolve_driver_max_iterations(500), 500);
+    }
 
     #[test]
     fn dispatcher_tool_specs_never_include_stay_silent() {

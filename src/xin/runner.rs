@@ -23,7 +23,11 @@ use tokio_util::sync::CancellationToken;
 
 const XIN_COMPONENT: &str = "xin";
 const SHELL_TIMEOUT_SECS: u64 = 120;
-const AGENT_MAX_TOOL_ITERATIONS: usize = 20;
+// Sub-agent (xin runner) tool-iteration hard clamp. Behavior-limits Phase 1:
+// raised 20 -> 100 to align with `sub_agent.max_iterations` default.
+// 0-semantics note: on this path `0` (or >cap) clamps to this value, NOT to the
+// main-agent fallback in `agent/loop_.rs:DEFAULT_MAX_TOOL_ITERATIONS`.
+const AGENT_MAX_TOOL_ITERATIONS: usize = 100;
 /// Floor for the heartbeat interval so very short leases still renew sanely.
 const MIN_HEARTBEAT_SECS: u64 = 5;
 

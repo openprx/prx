@@ -514,11 +514,17 @@ pub struct DelegateAgentConfig {
 }
 
 const fn default_max_depth() -> u32 {
-    3
+    // Behavior-limits Phase 1: raised 3 -> 8. Deeper delegation chains are
+    // allowed; worst case is slower/costlier, not a crash (each level is a
+    // synchronous call, not a fork). Fork-bomb safety lives in `sessions_spawn`.
+    8
 }
 
 const fn default_max_tool_iterations() -> usize {
-    50
+    // Sub-agent agentic loop cap (`sub_agent.max_iterations`).
+    // Behavior-limits Phase 1: raised 50 -> 100. Paired hard clamp lives in
+    // `xin/runner.rs:AGENT_MAX_TOOL_ITERATIONS` (also raised to 100).
+    100
 }
 
 const fn default_router_alpha() -> f32 {
@@ -912,11 +918,12 @@ pub struct AgentConfig {
     /// When true: bootstrap_max_chars=6000, rag_chunk_limit=2. Use for 13B or smaller models.
     #[serde(default)]
     pub compact_context: bool,
-    /// Maximum tool-call loop turns per user message. Default: `10`.
-    /// Setting to `0` falls back to the safe default of `10`.
+    /// Maximum tool-call loop turns per user message. Default: `200`.
+    /// Setting to `0` falls back to the safe default (`DEFAULT_MAX_TOOL_ITERATIONS`
+    /// in `agent/loop_.rs`). Hard-capped by `MAX_TOOL_ITERATIONS_CAP`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
-    /// Maximum conversation history messages retained per session. Default: `50`.
+    /// Maximum conversation history messages retained per session. Default: `300`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
     /// Enable parallel tool execution within a single iteration. Default: `false`.
@@ -1003,10 +1010,10 @@ pub struct AgentCompactionConfig {
     pub max_context_tokens: usize,
     /// Letta/MemGPT-style OS-paging controls (`[agent.compaction.os_paging]`).
     ///
-    /// Disabled by default for backward compatibility. When enabled, oldest
-    /// messages are evicted to the durable document store (non-destructively,
-    /// preserving full content) and semantically recalled on later turns,
-    /// instead of being collapsed into a lossy summary.
+    /// Enabled by default (Phase 1). When enabled, oldest messages are evicted
+    /// to the durable document store (non-destructively, preserving full
+    /// content) and semantically recalled on later turns, instead of being
+    /// collapsed into a lossy summary.
     #[serde(default)]
     pub os_paging: OsPagingConfig,
 }
@@ -1037,14 +1044,16 @@ pub enum RetrievalInjectionRole {
 
 /// Letta/MemGPT-style OS-paging configuration (`[agent.compaction.os_paging]`).
 ///
-/// OS-paging is an opt-in, additive layer on top of the existing compaction
-/// pipeline. When `enabled = false` (the default) the agent runs the legacy
-/// `apply_configurable_compaction` path unchanged.
+/// OS-paging is an additive layer on top of the existing compaction pipeline.
+/// Enabled by default (Phase 1). When `enabled = false` the agent runs the
+/// legacy `apply_configurable_compaction` path unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OsPagingConfig {
-    /// Enable OS-paging. When `false`, the agent falls back to legacy
-    /// compaction with no behavioral change (backward compatible default).
-    #[serde(default)]
+    /// Enable OS-paging (Letta/MemGPT-style non-destructive eviction + recall).
+    /// Behavior-limits Phase 1: default flipped `false` -> `true` so the agent
+    /// "remembers" via semantic recall of paged-out history instead of hard
+    /// dropping old messages. `safeguard` compaction still backstops overflow.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Token capacity ratio (0.0-1.0, relative to `max_context_tokens`) above
     /// which eviction is triggered. Letta recommends ~0.70; the legacy
@@ -1070,7 +1079,8 @@ pub struct OsPagingConfig {
 impl Default for OsPagingConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            // Behavior-limits Phase 1: on by default (see field docs above).
+            enabled: true,
             eviction_threshold: default_os_paging_eviction_threshold(),
             proactive_retrieval: true,
             max_recalled_pages: default_os_paging_max_recalled_pages(),
@@ -1085,7 +1095,9 @@ const fn default_os_paging_eviction_threshold() -> f64 {
 }
 
 const fn default_os_paging_max_recalled_pages() -> usize {
-    3
+    // Behavior-limits Phase 1: raised 3 -> 10 to recall more paged-out history
+    // per turn now that os_paging is on by default.
+    10
 }
 
 const fn default_os_paging_keep_recent_messages() -> usize {
@@ -1152,15 +1164,19 @@ const fn default_sessions_spawn_cleanup_on_complete() -> bool {
 }
 
 const fn default_sessions_spawn_max_concurrent() -> usize {
-    4
+    // 🔴 Anti fork-bomb safeguard (NOT removed). Behavior-limits Phase 1 raises
+    // 4 -> 64 to a high position. Never set to 0 (0 blocks all spawns).
+    64
 }
 
 const fn default_sessions_spawn_max_spawn_depth() -> usize {
-    2
+    // 🔴 Anti fork-bomb safeguard (NOT removed). Raised 2 -> 8. Never 0.
+    8
 }
 
 const fn default_sessions_spawn_max_children_per_agent() -> usize {
-    5
+    // 🔴 Anti fork-bomb safeguard (NOT removed). Raised 5 -> 32. Never 0.
+    32
 }
 
 /// Self-system experimental automation config (`[self_system]`).
@@ -1211,11 +1227,18 @@ impl Default for SelfSystemConfig {
 }
 
 const fn default_agent_max_tool_iterations() -> usize {
-    50
+    // Main-agent tool loop cap (`agent.max_tool_iterations`).
+    // Behavior-limits Phase 1: raised 50 -> 200 so the agent can finish long
+    // tasks. Still bounded by the anti-runaway `MAX_TOOL_ITERATIONS_CAP` in
+    // `agent/loop_.rs` (high-position safeguard, not removed).
+    200
 }
 
 const fn default_agent_max_history_messages() -> usize {
-    50
+    // Behavior-limits Phase 1: raised 50 -> 300 so the agent retains more
+    // context. For truly long sessions the recommended path is os_paging
+    // (`[agent.compaction.os_paging] enabled = true`), now on by default.
+    300
 }
 
 fn default_agent_tool_dispatcher() -> String {
@@ -2295,7 +2318,7 @@ pub struct WebSearchConfig {
     /// Brave Search API key (required if provider is "brave")
     #[serde(default)]
     pub brave_api_key: Option<String>,
-    /// Maximum results per search (1-10)
+    /// Maximum results per search (1-20)
     #[serde(default = "default_web_search_max_results")]
     pub max_results: usize,
     /// Request timeout in seconds
@@ -2314,7 +2337,8 @@ fn default_web_search_provider() -> String {
 }
 
 const fn default_web_search_max_results() -> usize {
-    5
+    // Behavior-limits Phase 1: raised 5 -> 15 to return more search results.
+    15
 }
 
 const fn default_web_search_timeout_secs() -> u64 {
@@ -2326,7 +2350,9 @@ const fn default_web_fetch_enabled() -> bool {
 }
 
 const fn default_web_fetch_max_chars() -> usize {
-    10_000
+    // Behavior-limits Phase 1: raised 10K -> 50K so web_fetch returns more of a
+    // page. Still a finite OOM guard (not removed).
+    50_000
 }
 
 impl Default for WebSearchConfig {
@@ -3359,9 +3385,10 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `100`.
+    /// Maximum actions allowed per hour per policy. Default: `u32::MAX` (open).
+    /// Note: `0` means "blocked", NOT "unlimited" — use a large value to open.
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `1000`.
+    /// Maximum cost per day in cents per policy. Default: `u32::MAX` (open).
     pub max_cost_per_day_cents: u32,
 
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
@@ -3409,8 +3436,11 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
+            // 🔴 Behavior-limits Phase 1: opened to u32::MAX (NOT 0 — 0 would
+            // trip the `count >= limit` rate-limiter and block ALL actions).
+            // Field retained as a high-position billing/runaway safeguard.
+            max_actions_per_hour: u32::MAX,
+            max_cost_per_day_cents: u32::MAX,
             scopes: ScopeConfig::default(),
             sandbox: default_disabled_sandbox(),
         }
@@ -6054,8 +6084,9 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Supervised);
         assert!(a.workspace_only);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        assert_eq!(a.max_actions_per_hour, 20);
-        assert_eq!(a.max_cost_per_day_cents, 500);
+        // Behavior-limits Phase 1: opened to u32::MAX (high-position safeguard).
+        assert_eq!(a.max_actions_per_hour, u32::MAX);
+        assert_eq!(a.max_cost_per_day_cents, u32::MAX);
     }
 
     #[test]
@@ -6425,8 +6456,14 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        assert_eq!(cfg.max_tool_iterations, 50);
-        assert_eq!(cfg.max_history_messages, 50);
+        // Behavior-limits Phase 1: os_paging flipped on by default.
+        assert!(
+            cfg.compaction.os_paging.enabled,
+            "Phase 1: os_paging must be enabled by default"
+        );
+        // Behavior-limits Phase 1: raised defaults (200 / 300).
+        assert_eq!(cfg.max_tool_iterations, 200);
+        assert_eq!(cfg.max_history_messages, 300);
         assert!(!cfg.parallel_tools);
         assert_eq!(cfg.tool_dispatcher, "auto");
         assert_eq!(cfg.read_only_tool_concurrency_window, 2);
@@ -6441,6 +6478,22 @@ reasoning_enabled = false
         assert!((cfg.concurrency_rollback_timeout_rate_threshold - 0.2).abs() < f64::EPSILON);
         assert!((cfg.concurrency_rollback_cancel_rate_threshold - 0.2).abs() < f64::EPSILON);
         assert!((cfg.concurrency_rollback_error_rate_threshold - 0.2).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    async fn empty_agent_compaction_section_keeps_os_paging_enabled() {
+        // Phase 1: an empty `[agent.compaction]` table (no `os_paging` key) must
+        // still deserialize with os_paging enabled, because the field's
+        // `#[serde(default)]` resolves to `OsPagingConfig::default()` (enabled = true).
+        let raw = r#"
+default_temperature = 0.7
+[agent.compaction]
+"#;
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert!(
+            parsed.agent.compaction.os_paging.enabled,
+            "empty [agent.compaction] must deserialize with os_paging enabled (Phase 1 default)"
+        );
     }
 
     #[test]

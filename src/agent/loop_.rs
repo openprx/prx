@@ -320,17 +320,27 @@ impl Default for ToolConcurrencyGovernanceConfig {
 }
 
 /// Default maximum agentic tool-use iterations per user message to prevent runaway loops.
-/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
-const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
+/// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero
+/// (MAIN-AGENT path: this `0 -> default` fallback is distinct from the sub-agent
+/// runner and cron paths, where `0` clamps to their own per-path caps — see
+/// `xin/runner.rs:AGENT_MAX_TOOL_ITERATIONS` and `cron/scheduler.rs:CRON_MAX_TOOL_ITERATIONS`).
+/// Behavior-limits Phase 1: aligned 10 -> 200 with `default_agent_max_tool_iterations`.
+///
+/// `pub` so the Redux/TUI driver (`chat::dispatcher::drive_start_turn_stream`) can
+/// reuse the exact same default instead of maintaining a divergent local constant.
+pub const DEFAULT_MAX_TOOL_ITERATIONS: usize = 200;
 
 const TOOL_PARSE_LOG_PREVIEW_CHARS: usize = 200;
 
 /// Maximum inline characters allowed for a single tool result before it is
 /// represented as a document-ingest reference in model history.
-const MAX_TOOL_RESULT_INLINE_CHARS: usize = 8_000;
+/// 🟡 Behavior-limits Phase 1: raised 8K -> 48K (6x) so medium tool outputs stay
+/// directly visible to the agent instead of needing a second search.
+const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
 
 /// Approximate chunk size for large tool-output document references.
-const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 2_048;
+/// 🟡 Behavior-limits Phase 1: raised 2048 -> 4096 (fewer chunks per big output).
+const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
 
 /// Timeout (seconds) for apply_configurable_compaction before falling back to aggressive trim.
 const COMPACTION_TIMEOUT_SECS: u64 = 300;
@@ -340,14 +350,22 @@ const MAX_OVERFLOW_RETRIES: usize = 3;
 
 /// Hard cap on `max_tool_iterations` to prevent unbounded tool-call loops
 /// even when the user passes an unreasonably large config value.
-const MAX_TOOL_ITERATIONS_CAP: usize = 1000;
+/// 🔴 Anti-runaway safeguard (NOT removed). Behavior-limits Phase 1 raises the
+/// ceiling 1000 -> 2000. On hit the loop returns `Err` (bail!), never panics.
+///
+/// `pub` so the Redux/TUI driver (`chat::dispatcher::drive_start_turn_stream`) can
+/// reuse the exact same finite cap instead of maintaining a divergent local constant.
+pub const MAX_TOOL_ITERATIONS_CAP: usize = 2000;
 
 /// Fraction of `max_context_tokens` above which a pre-turn memory flush is triggered.
 const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
 
 /// Fallback count-based safety net: if history grows beyond this many messages
 /// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
-const HISTORY_SAFETY_NET_LIMIT: usize = 200;
+/// 🟡 Behavior-limits Phase 1: raised 200 -> 1000 (5x). With os_paging on by
+/// default, long history is primarily managed by non-destructive paging; this
+/// remains a finite safety net for the no-compaction-config path.
+const HISTORY_SAFETY_NET_LIMIT: usize = 1000;
 
 #[allow(clippy::expect_used)]
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
@@ -457,7 +475,8 @@ pub(crate) fn redact_sensitive_json_keys(value: &serde_json::Value) -> serde_jso
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
-const DEFAULT_MAX_HISTORY_MESSAGES: usize = 50;
+/// 🟡 Behavior-limits Phase 1: raised 50 -> 300 to match `default_agent_max_history_messages`.
+const DEFAULT_MAX_HISTORY_MESSAGES: usize = 300;
 
 /// Keep this many most-recent non-system messages after compaction.
 const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
@@ -466,21 +485,27 @@ const COMPACTION_KEEP_RECENT_MESSAGES: usize = 20;
 const COMPACTION_MAX_SOURCE_CHARS: usize = 12_000;
 
 /// Max characters retained in stored compaction summary.
-const COMPACTION_MAX_SUMMARY_CHARS: usize = 2_000;
-const MEMORY_FLUSH_MAX_CHARS: usize = 800;
+/// 🟡 Behavior-limits Phase 1: raised 2000 -> 8000 (4x).
+const COMPACTION_MAX_SUMMARY_CHARS: usize = 8_000;
+/// 🟡 Behavior-limits Phase 1: raised 800 -> 3200 (4x).
+const MEMORY_FLUSH_MAX_CHARS: usize = 3_200;
 
 /// Maximum bytes for the total memory context preamble injected into prompts.
-const MAX_MEMORY_PREAMBLE_BYTES: usize = 4096;
+/// 🟡 Behavior-limits Phase 1: raised 4096 -> 24576 (6x).
+const MAX_MEMORY_PREAMBLE_BYTES: usize = 24_576;
 
 /// Maximum bytes for a single memory entry within the preamble.
-const MAX_MEMORY_ENTRY_BYTES: usize = 512;
+/// 🟡 Behavior-limits Phase 1: raised 512 -> 3072 (6x).
+const MAX_MEMORY_ENTRY_BYTES: usize = 3_072;
 
 /// Maximum bytes for recent shared message events injected into prompts.
+/// 🟡 Behavior-limits Phase 1: raised 2048 -> 12288 (6x).
 #[allow(dead_code)]
-const MAX_SHARED_EVENTS_PREAMBLE_BYTES: usize = 2048;
+const MAX_SHARED_EVENTS_PREAMBLE_BYTES: usize = 12_288;
 
 /// Maximum bytes for document evidence injected into prompts.
-const MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES: usize = 2048;
+/// 🟡 Behavior-limits Phase 1: raised 2048 -> 12288 (6x).
+const MAX_DOCUMENT_CONTEXT_PREAMBLE_BYTES: usize = 12_288;
 
 pub(crate) struct RecalledMemoryContext {
     pub(crate) preamble: String,
@@ -6755,11 +6780,11 @@ mod tests {
     /// call with oversized output and asserts a single copy of each.
     #[tokio::test]
     async fn run_tool_call_loop_native_mode_persists_each_tool_output_once() {
-        let large_output = format!(
-            "{}\n{}",
-            "needle native dedup marker",
-            "large native payload ".repeat(600)
-        );
+        // Size the payload off the constant so it stays "large" regardless of
+        // Behavior-limits Phase 1 raising MAX_TOOL_RESULT_INLINE_CHARS.
+        let segment = "large native payload ";
+        let repeats = MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100;
+        let large_output = format!("{}\n{}", "needle native dedup marker", segment.repeat(repeats));
         assert!(large_output.len() > MAX_TOOL_RESULT_INLINE_CHARS);
 
         let provider = NativeScriptedProvider::new(vec![
@@ -7523,11 +7548,11 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_call_loop_persists_large_tool_output_documents() {
-        let large_output = format!(
-            "{}\n{}",
-            "needle source evidence marker",
-            "large document payload ".repeat(600)
-        );
+        // Size the payload off the constant so it stays "large" regardless of
+        // Behavior-limits Phase 1 raising MAX_TOOL_RESULT_INLINE_CHARS.
+        let segment = "large document payload ";
+        let repeats = MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100;
+        let large_output = format!("{}\n{}", "needle source evidence marker", segment.repeat(repeats));
         assert!(large_output.len() > MAX_TOOL_RESULT_INLINE_CHARS);
         let provider = ScriptedProvider::from_text_responses(vec![
             r#"<tool_call>
@@ -8749,7 +8774,10 @@ ls -la
 
     #[test]
     fn extract_document_ingest_refs_parses_large_output_markers() {
-        let large = "document reference body ".repeat(600);
+        // Size off the constant so it exceeds MAX_TOOL_RESULT_INLINE_CHARS after
+        // Behavior-limits Phase 1 raised it.
+        let segment = "document reference body ";
+        let large = segment.repeat(MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100);
         let marker = compact_tool_result_for_history_with_status(
             "shell",
             &large,
@@ -8838,9 +8866,16 @@ ls -la
         let provider = SystemSummaryProvider {
             response: "## Decisions\n- keep source anchors\n## Open TODOs\n- verify compaction\n## Critical Context\n- path /tmp/a and task run-compact-1".to_string(),
         };
+        // Size off the constant so it exceeds MAX_TOOL_RESULT_INLINE_CHARS after
+        // Behavior-limits Phase 1 raised it (otherwise it stays inline and no
+        // document_id ref is emitted).
+        let large_evidence = {
+            let segment = "large output source evidence ";
+            segment.repeat(MAX_TOOL_RESULT_INLINE_CHARS / segment.len() + 100)
+        };
         let large_ref = compact_tool_result_for_history_with_status(
             "shell",
-            &"large output source evidence ".repeat(700),
+            &large_evidence,
             MAX_TOOL_RESULT_INLINE_CHARS,
             "persisted_document_backend",
         );
@@ -9649,7 +9684,9 @@ Done."#;
 
     const _: () = {
         assert!(DEFAULT_MAX_TOOL_ITERATIONS > 0);
-        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= 100);
+        // Behavior-limits Phase 1: default raised to 200; keep a sane ceiling and
+        // ensure it never exceeds the anti-runaway hard cap.
+        assert!(DEFAULT_MAX_TOOL_ITERATIONS <= MAX_TOOL_ITERATIONS_CAP);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES > 0);
         assert!(DEFAULT_MAX_HISTORY_MESSAGES <= 1000);
     };

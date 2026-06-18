@@ -11,8 +11,9 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+// Behavior-limits Phase 1: MAX 2000 -> 10000 (read more memory lines per key).
 const DEFAULT_LINE_COUNT: usize = 50;
-const MAX_LINE_COUNT: usize = 2000;
+const MAX_LINE_COUNT: usize = 10_000;
 
 static OBSERVE_TOTAL_QUERIES: AtomicU64 = AtomicU64::new(0);
 static OBSERVE_WOULD_DENY_QUERIES: AtomicU64 = AtomicU64::new(0);

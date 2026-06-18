@@ -48,18 +48,20 @@ fn config_default_temperature_positive() {
 #[test]
 fn agent_config_default_max_tool_iterations() {
     let agent = AgentConfig::default();
+    // Behavior-limits Phase 1: default raised 50 -> 200.
     assert_eq!(
-        agent.max_tool_iterations, 50,
-        "default max_tool_iterations should be 50"
+        agent.max_tool_iterations, 200,
+        "default max_tool_iterations should be 200"
     );
 }
 
 #[test]
 fn agent_config_default_max_history_messages() {
     let agent = AgentConfig::default();
+    // Behavior-limits Phase 1: default raised 50 -> 300.
     assert_eq!(
-        agent.max_history_messages, 50,
-        "default max_history_messages should be 50"
+        agent.max_history_messages, 300,
+        "default max_history_messages should be 300"
     );
 }
 
@@ -210,7 +212,8 @@ default_temperature = 0.7
         parsed.agent.max_tool_iterations,
         AgentConfig::default().max_tool_iterations
     );
-    assert_eq!(parsed.agent.max_history_messages, 50);
+    // Behavior-limits Phase 1: default raised to 300.
+    assert_eq!(parsed.agent.max_history_messages, 300);
     assert!(!parsed.agent.compact_context);
 }
 
@@ -227,8 +230,8 @@ compact_context = true
 
     assert_eq!(parsed.agent.max_tool_iterations, 3);
     assert!(parsed.agent.compact_context);
-    // max_history_messages should still use default
-    assert_eq!(parsed.agent.max_history_messages, 50);
+    // max_history_messages should still use default (Phase 1: 300)
+    assert_eq!(parsed.agent.max_history_messages, 300);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
