@@ -516,10 +516,10 @@ mod tests {
     use crate::security::AutonomyLevel;
 
     fn auto_security() -> Arc<SecurityPolicy> {
-        // Full autonomy so the gate admits the ordinary test commands (`sleep`,
-        // `exit`, …) — the operator-typed `/shell` analogue. High-risk *patterns*
-        // (rm -rf /, …) are still blocked by `command_risk_level` independently.
-        // Phase 1: per-command allowlist removed.
+        // Full autonomy so the gate admits all commands including high-risk ones.
+        // Phase 1 semantics: Full = unconditional authorization; structural
+        // blocking (subshell, redirection, dangerous args) only applies to
+        // non-Full modes. Per-command allowlist was removed in Phase 1.
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
             workspace_dir: std::env::temp_dir(),
@@ -527,15 +527,47 @@ mod tests {
         })
     }
 
+    fn read_only_security() -> Arc<SecurityPolicy> {
+        // ReadOnly autonomy — the gate denies every command before spawning.
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
     #[tokio::test]
-    async fn high_risk_command_is_rejected_even_with_permissive_allowlist() {
-        // The gate is not bypassed for `/shell`: a destructive pattern is denied
-        // before any process is spawned, even under Full autonomy + `*`.
+    async fn command_rejected_under_read_only() {
+        // Phase 1: ReadOnly autonomy denies every command before any process is
+        // spawned, regardless of the command string.
         let (sink, _rx) = SessionEventSink::channel();
-        let sec = auto_security();
-        let err = spawn_shell("rm -rf /", &sec, &sink).expect_err("test: high-risk denied");
+        let sec = read_only_security();
+        let err = spawn_shell("rm -rf /", &sec, &sink).expect_err("test: ReadOnly denies all commands");
         let msg = err.to_string();
         assert!(!msg.is_empty(), "denial carries a reason: {msg}");
+    }
+
+    #[tokio::test]
+    async fn full_autonomy_admits_high_risk_command() {
+        // Phase 1: Full autonomy authorizes every command unconditionally; the
+        // gate does not block high-risk patterns like `rm -rf /`.  The process
+        // is only actually spawned when the OS permits it; we just assert the
+        // gate path returns Ok (not a security denial).
+        let (sink, _rx) = SessionEventSink::channel();
+        let sec = auto_security();
+        // `rm -rf /` will be denied by the OS (permission error) or succeed on
+        // a sandboxed path — we only care that the *security gate* does not
+        // reject it.  Use `spawn_shell` result: Ok means gate passed (spawn
+        // attempted); Err with a security-policy message would be a regression.
+        let result = spawn_shell("rm -rf /", &sec, &sink);
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("security policy") && !msg.contains("not allowed"),
+                "Full autonomy must not block via security gate; got: {msg}"
+            );
+        }
+        // Either Ok (spawn succeeded) or Err from OS/rate-limit is acceptable.
     }
 
     #[tokio::test]

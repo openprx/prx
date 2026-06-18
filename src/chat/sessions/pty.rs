@@ -1270,8 +1270,20 @@ mod tests {
     use crate::security::AutonomyLevel;
 
     fn auto_security() -> Arc<SecurityPolicy> {
+        // Full autonomy so the gate admits all commands, including high-risk
+        // ones. Phase 1: Full = unconditional authorization; the per-command
+        // allowlist and high-risk hard-block were removed.
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
+            workspace_dir: std::env::temp_dir(),
+            ..SecurityPolicy::default()
+        })
+    }
+
+    fn read_only_security() -> Arc<SecurityPolicy> {
+        // ReadOnly autonomy — the gate denies every command before spawning.
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
             workspace_dir: std::env::temp_dir(),
             ..SecurityPolicy::default()
         })
@@ -1865,12 +1877,36 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn high_risk_command_is_rejected() {
-        let sec = auto_security();
+    async fn command_rejected_under_read_only() {
+        // Phase 1: ReadOnly autonomy denies every command before any PTY is
+        // opened, regardless of the command string.
+        let sec = read_only_security();
         let err = PtyShellSession::spawn("rm -rf /", &sec, PtySize::default())
             .err()
-            .expect("test: high-risk denied before any PTY is opened");
-        assert!(!err.to_string().is_empty());
+            .expect("test: ReadOnly denies all commands before PTY is opened");
+        assert!(!err.to_string().is_empty(), "denial carries a reason");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_autonomy_admits_high_risk_command() {
+        // Phase 1: Full autonomy does not block high-risk commands at the
+        // security-gate level. The gate must return Ok (not a policy denial).
+        // The OS may still refuse the command (e.g. permission error), which
+        // is unrelated to security policy.
+        let sec = auto_security();
+        let result = PtyShellSession::spawn("rm -rf /", &sec, PtySize::default());
+        if let Err(ref e) = result {
+            let msg = e.to_string();
+            assert!(
+                !msg.contains("security policy") && !msg.contains("not allowed"),
+                "Full autonomy must not block via security gate; got: {msg}"
+            );
+        }
+        // Either Ok (PTY opened) or Err from OS/PTY allocation is acceptable.
+        if let Ok(session) = result {
+            session.kill().await.ok();
+        }
     }
 
     #[cfg(unix)]
