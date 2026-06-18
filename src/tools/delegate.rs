@@ -822,11 +822,7 @@ impl DelegateTool {
                 2,
                 30,
                 false,
-                vec![
-                    "sessions_spawn".to_string(),
-                    "delegate".to_string(),
-                    "cron_run".to_string(),
-                ],
+                vec!["sessions_spawn".to_string(), "delegate".to_string(), "cron".to_string()],
                 ToolConcurrencyGovernanceConfig {
                     rollout_stage: "full".to_string(),
                     ..ToolConcurrencyGovernanceConfig::default()

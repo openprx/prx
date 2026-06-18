@@ -1254,7 +1254,12 @@ const fn default_read_only_tool_timeout_secs() -> u64 {
 }
 
 fn default_agent_low_priority_tools() -> Vec<String> {
-    vec!["sessions_spawn", "delegate", "cron_run"]
+    // NOTE: `cron` is intentionally NOT in this list. Low-priority classification
+    // is matched by tool NAME only (it cannot see the `action` argument), so
+    // listing the whole `cron` tool would wrongly demote every action
+    // (add/remove/update/pause/resume), not just the previously-demoted forced
+    // `run`. Until the classifier can match `cron`+`action=run`, omit it entirely.
+    vec!["sessions_spawn", "delegate"]
         .into_iter()
         .map(str::to_string)
         .collect()

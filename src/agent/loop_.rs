@@ -2889,8 +2889,7 @@ fn tool_barrier_key(name: &str) -> Option<&'static str> {
         // Workspace mutations / command execution.
         "file_write" | "shell" | "git_operations" => Some("workspace_write"),
         // Shared runtime configuration / scheduler state.
-        "config_reload" | "cron" | "cron_add" | "cron_update" | "cron_remove" | "cron_run" | "schedule"
-        | "proxy_config" => Some("runtime_config"),
+        "config_reload" | "cron" | "proxy_config" => Some("runtime_config"),
         // Shared long-term memory writes.
         "memory_store" | "memory_forget" | "memory_reindex" => Some("memory_write"),
         // Background session lifecycle operations.
@@ -3008,8 +3007,6 @@ fn is_write_tool(name: &str) -> bool {
             | "memory_get"
             | "document_search"
             | "document_get_chunk"
-            | "cron_list"
-            | "cron_runs"
             | "sessions_list"
             | "sessions_history"
             | "session_status"
@@ -3063,9 +3060,6 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
     let string_arg = |name: &str| args.get(name).and_then(serde_json::Value::as_str);
     match tool_name {
         "shell" => string_arg("command").map(|command| GrantOp::Command(command.to_string())),
-        "schedule" | "cron_add" | "cron_update" => {
-            string_arg("command").map(|command| GrantOp::Command(command.to_string()))
-        }
         "cron" => {
             let action = string_arg("action").unwrap_or_default();
             let command = if action == "update" {
@@ -5438,20 +5432,12 @@ pub async fn run(
         ),
     ];
     tool_descs.push((
-        "cron_add",
-        "Create a cron job. Supports schedule kinds: cron, at, every; and job types: shell or agent.",
+        "cron",
+        "Unified scheduler. Set `action`: add/schedule (create job — shell via expression+command, \
+         or agent via schedule object + payload/job_type/prompt), once (one-shot via delay/run_at), \
+         list, get, remove/cancel, update/patch, run (force-run now), runs/history, events, pause, \
+         resume, status.",
     ));
-    tool_descs.push(("cron_list", "List all cron jobs with schedule, status, and metadata."));
-    tool_descs.push(("cron_remove", "Remove a cron job by job_id."));
-    tool_descs.push((
-        "cron_update",
-        "Patch a cron job (schedule, enabled, command/prompt, model, delivery, session_target).",
-    ));
-    tool_descs.push((
-        "cron_run",
-        "Force-run a cron job immediately and record a run history entry.",
-    ));
-    tool_descs.push(("cron_runs", "Show recent run history for a cron job."));
     tool_descs.push((
         "screenshot",
         "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
@@ -5472,10 +5458,6 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
     }
-    tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
-    ));
     if !config.agents.is_empty() {
         tool_descs.push((
             "delegate",
@@ -8080,8 +8062,6 @@ mod tests {
             "memory_get",
             "document_search",
             "document_get_chunk",
-            "cron_list",
-            "cron_runs",
             "sessions_list",
             "sessions_history",
             "session_status",
@@ -8111,11 +8091,7 @@ mod tests {
             "sessions_send",
             "delegate",
             "subagents",
-            "cron_add",
-            "cron_update",
-            "cron_remove",
-            "cron_run",
-            "schedule",
+            "cron",
             "config_reload",
             "proxy_config",
             "browser_open",
@@ -9720,12 +9696,12 @@ Done."#;
     #[test]
     fn parse_tool_call_value_accepts_top_level_parameters_alias() {
         let value = serde_json::json!({
-            "name": "schedule",
-            "parameters": {"action": "create", "message": "test"}
+            "name": "cron",
+            "parameters": {"action": "list", "message": "test"}
         });
         let result = parse_tool_call_value(&value).expect("tool call should parse");
-        assert_eq!(result.name, "schedule");
-        assert_eq!(result.arguments.get("action").and_then(|v| v.as_str()), Some("create"));
+        assert_eq!(result.name, "cron");
+        assert_eq!(result.arguments.get("action").and_then(|v| v.as_str()), Some("list"));
     }
 
     #[test]

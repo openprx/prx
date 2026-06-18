@@ -4690,8 +4690,9 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         ));
     }
     tool_descs.push((
-        "schedule",
-        "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
+        "cron",
+        "Unified scheduler. Set `action`: add/schedule (create job), once (one-shot via delay/run_at), \
+         list, get, remove/cancel, update/patch, run, runs/history, events, pause, resume, status.",
     ));
     tool_descs.push((
         "pushover",
@@ -10395,12 +10396,12 @@ Mon Feb 20
     #[test]
     fn strip_isolated_tool_json_artifacts_removes_tool_calls_and_results() {
         let mut known_tools = HashSet::new();
-        known_tools.insert("schedule".to_string());
+        known_tools.insert("cron".to_string());
 
-        let input = r#"{"name":"schedule","parameters":{"action":"create","message":"test"}}
-{"name":"schedule","parameters":{"action":"cancel","task_id":"test"}}
+        let input = r#"{"name":"cron","parameters":{"action":"once","message":"test"}}
+{"name":"cron","parameters":{"action":"cancel","task_id":"test"}}
 Let me create the reminder properly:
-{"name":"schedule","parameters":{"action":"create","message":"Go to sleep"}}
+{"name":"cron","parameters":{"action":"once","message":"Go to sleep"}}
 {"result":{"task_id":"abc","status":"scheduled"}}
 Done reminder set for 1:38 AM."#;
 

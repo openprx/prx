@@ -73,7 +73,9 @@ read_only_tool_timeout_secs = 30
 # Enable priority scheduling so foreground tools run before background batches.
 priority_scheduling_enabled = false
 # Optional list of low-priority/background tools.
-low_priority_tools = ["sessions_spawn", "delegate", "cron_run"]
+# NOTE: priority is matched by tool name only (not by action), so `cron` is not
+# listed here — adding it would demote every cron action, not just background runs.
+low_priority_tools = ["sessions_spawn", "delegate"]
 # Rollout stage: off | stage_a | stage_b | stage_c | full
 concurrency_rollout_stage = "off"
 # Optional sample percent (0 means stage default)

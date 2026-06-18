@@ -98,8 +98,6 @@ pub const READ_ONLY_TOOLS: &[&str] = &[
     "sessions_list",
     "sessions_history",
     "session_status",
-    "cron_list",
-    "cron_runs",
     "agents_list",
     // Hardware introspection (read board info / memory / registers only).
     "hardware_board_info",
@@ -1828,7 +1826,7 @@ mod tests {
         let denied = gate.authorize_command_execution("shell", "touch file.txt", None);
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
-        let wrong_tool = ApprovalGrant::for_tool("cron_run", "test", None);
+        let wrong_tool = ApprovalGrant::for_tool("cron", "test", None);
         let denied = gate.authorize_command_execution("shell", "touch file.txt", Some(&wrong_tool));
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 

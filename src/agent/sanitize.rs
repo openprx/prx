@@ -165,8 +165,8 @@ mod tests {
 
     #[test]
     fn isolated_tool_json_is_stripped() {
-        let tools = names(&["schedule"]);
-        let input = "{\"name\":\"schedule\",\"parameters\":{\"action\":\"create\",\"message\":\"test\"}}";
+        let tools = names(&["cron"]);
+        let input = "{\"name\":\"cron\",\"parameters\":{\"action\":\"once\",\"message\":\"test\"}}";
         let out = sanitize_stream_chunk(input, &tools);
         assert!(matches!(out, Cow::Owned(_)));
         assert!(out.as_ref().trim().is_empty(), "expected empty, got {out:?}");

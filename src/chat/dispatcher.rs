@@ -1574,8 +1574,6 @@ fn is_plan_intercepted_write_tool(name: &str) -> bool {
             | "memory_get"
             | "document_search"
             | "document_get_chunk"
-            | "cron_list"
-            | "cron_runs"
             | "sessions_list"
             | "sessions_history"
             | "session_status"

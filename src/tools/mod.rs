@@ -22,12 +22,6 @@ pub mod canvas;
 pub mod composio;
 pub mod config_reload;
 pub mod cron;
-pub mod cron_add;
-pub mod cron_list;
-pub mod cron_remove;
-pub mod cron_run;
-pub mod cron_runs;
-pub mod cron_update;
 pub mod delegate;
 pub mod document_get_chunk;
 pub mod document_search;
@@ -52,7 +46,6 @@ pub mod message_send;
 pub mod nodes;
 pub mod proxy_config;
 pub mod pushover;
-pub mod schedule;
 pub mod schema;
 pub mod screenshot;
 pub mod session_status;
@@ -77,12 +70,6 @@ pub use canvas::CanvasTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
-pub use cron_add::CronAddTool;
-pub use cron_list::CronListTool;
-pub use cron_remove::CronRemoveTool;
-pub use cron_run::CronRunTool;
-pub use cron_runs::CronRunsTool;
-pub use cron_update::CronUpdateTool;
 pub use delegate::DelegateTool;
 pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_search::DocumentSearchTool;
@@ -105,7 +92,6 @@ pub use message_send::MessageSendTool;
 pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use schedule::ScheduleTool;
 pub use screenshot::ScreenshotTool;
 pub use session_status::SessionStatusTool;
 pub use sessions_history::SessionsHistoryTool;
@@ -343,10 +329,6 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
         Arc::new(CanvasTool::new(security.clone())),
-        Arc::new(ScheduleTool::new(
-            security.clone(),
-            Arc::new(arc_swap::ArcSwap::from_pointee(root_config.clone())),
-        )),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
@@ -361,18 +343,18 @@ pub fn all_tools_with_runtime_ext(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // ── Scheduler module gates cron and xin tools ──
+    // ── Scheduler tools ──
+    // The unified `cron` tool is ALWAYS registered (matching the legacy `schedule`
+    // tool's always-on availability). Whether scheduled jobs actually fire in the
+    // background is governed separately by the scheduler module / `cron.enabled`
+    // and the background scheduler loop — registering the tool only makes the
+    // surface available to the model, it does not start any execution.
+    tool_arcs.push(Arc::new(CronTool::new(shared_config.clone(), security.clone())));
+    // The `xin` engine tool remains gated behind the scheduler module.
     if modules.scheduler {
-        tool_arcs.push(Arc::new(CronTool::new(shared_config.clone(), security.clone())));
-        tool_arcs.push(Arc::new(CronAddTool::new(shared_config.clone(), security.clone())));
-        tool_arcs.push(Arc::new(CronListTool::new(shared_config.clone())));
-        tool_arcs.push(Arc::new(CronRemoveTool::new(shared_config.clone(), security.clone())));
-        tool_arcs.push(Arc::new(CronUpdateTool::new(shared_config.clone(), security.clone())));
-        tool_arcs.push(Arc::new(CronRunTool::new(shared_config.clone(), security.clone())));
-        tool_arcs.push(Arc::new(CronRunsTool::new(shared_config.clone())));
         tool_arcs.push(Arc::new(XinTool::new(shared_config.clone(), security.clone())));
     } else {
-        tracing::debug!("Scheduler module disabled, skipping cron/xin tool registration");
+        tracing::debug!("Scheduler module disabled, skipping xin tool registration");
     }
 
     // ── Memory module gates memory tools ──
@@ -644,6 +626,7 @@ mod tests {
             config_path: tmp.path().join("config.toml"),
             modules: ModulesConfig {
                 tools: true,
+                scheduler: true,
                 ..ModulesConfig::default()
             },
             ..Config::default()
@@ -691,7 +674,23 @@ mod tests {
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert!(!names.contains(&"browser_open"));
-        assert!(names.contains(&"schedule"));
+        assert!(names.contains(&"cron"));
+        // The seven legacy single-purpose scheduler tools are fully consolidated
+        // into `cron` and must no longer be registered.
+        for removed in [
+            "schedule",
+            "cron_add",
+            "cron_list",
+            "cron_remove",
+            "cron_run",
+            "cron_runs",
+            "cron_update",
+        ] {
+            assert!(
+                !names.contains(&removed),
+                "removed tool `{removed}` is still registered"
+            );
+        }
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
     }

@@ -10,7 +10,7 @@
 | **Memory** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget` |
 | **Messaging** | `message_send`, `tts` (text-to-speech) |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
-| **Scheduling** | `cron_add`, `cron_list`, `cron_update`, `cron_remove`, `cron_run`, `cron_runs`, `schedule` |
+| **Scheduling** | `cron` (unified — actions: add/schedule, once, list, get, remove/cancel, update/patch, run, runs/history, events, pause, resume, status) |
 | **Images** | `image`, `image_info` |
 | **MCP** | `mcp` (Model Context Protocol client — connect to any MCP server) |
 | **Remote Nodes** | `nodes` (control paired devices — camera, screen, location, run commands) |
