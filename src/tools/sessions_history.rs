@@ -234,6 +234,7 @@ mod tests {
             started_at: Utc::now(),
             status,
             recipient: None,
+            channel_name: None,
             abort_handle: None,
             history: Arc::new(RwLock::new(entries)),
             steer_tx: None,

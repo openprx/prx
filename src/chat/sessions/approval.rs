@@ -355,6 +355,7 @@ mod tests {
             started_at: chrono::Utc::now(),
             status: SubAgentStatus::Running,
             recipient: None,
+            channel_name: None,
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,

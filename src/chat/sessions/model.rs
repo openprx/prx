@@ -370,6 +370,7 @@ mod tests {
             started_at: Utc::now(),
             status: SubAgentStatus::Running,
             recipient: None,
+            channel_name: None,
             abort_handle: None,
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
             steer_tx: None,

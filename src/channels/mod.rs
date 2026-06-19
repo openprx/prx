@@ -5050,6 +5050,17 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     // Also extract the active_runs Arc so sessions_list, sessions_send,
     // subagents, and session_status can share the same run registry without duplication.
     let spawn_tools_handle = if let Some(first_channel) = channels.first().cloned() {
+        // Per-turn announce/kill routing registry: every configured channel keyed
+        // by name. sessions_spawn binds the *originating* channel name to each run
+        // (from the launching message's scope) and resolves the channel object
+        // from here at announce/kill time — so concurrent message processing can
+        // never mis-route a sub-agent result to the wrong channel.
+        let spawn_channels_by_name = Arc::new(
+            channels
+                .iter()
+                .map(|ch| (ch.name().to_string(), Arc::clone(ch)))
+                .collect::<HashMap<_, _>>(),
+        );
         let spawn_tool = tools::SessionsSpawnTool::new(
             first_channel,
             Arc::clone(&provider),
@@ -5065,6 +5076,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
+        .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool.with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();

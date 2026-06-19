@@ -630,11 +630,48 @@ pub async fn run_gateway(
         )));
     }
 
+    // Linq channel (if configured). Built here (ahead of the spawn tool) so it can
+    // join the sessions_spawn per-turn announce/kill routing registry below.
+    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
+        Arc::new(LinqChannel::new(
+            lq.api_token.clone(),
+            lq.from_phone.clone(),
+            lq.allowed_senders.clone(),
+        ))
+    });
+
+    // Nextcloud Talk channel (if configured). Built here (ahead of the spawn tool)
+    // so it can join the sessions_spawn per-turn announce/kill routing registry.
+    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
+        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
+            Arc::new(NextcloudTalkChannel::new(
+                nc.base_url.clone(),
+                nc.app_token.clone(),
+                nc.allowed_users.clone(),
+            ))
+        });
+
     // Register sessions_spawn tool backed by Signal (if configured) so the LLM can
     // fire off async sub-agent tasks that announce their results when complete.
     // Keep the OnceLock handle so we can inject the full tools_registry post-wrap.
     let spawn_tools_handle = if let Some(ref sc) = signal_channel {
         let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
+        // Per-turn announce/kill routing registry: every configured gateway channel
+        // keyed by name. A webhook turn stamps its originating channel into the
+        // tool's per-turn scope; sessions_spawn binds that name to each run and
+        // resolves the channel object from here at announce/kill time, so a result
+        // is never mis-routed to the wrong channel under concurrent webhooks.
+        let mut spawn_channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        spawn_channels_by_name.insert(sc.name().to_string(), sc.clone() as Arc<dyn Channel>);
+        if let Some(ref wa) = whatsapp_channel {
+            spawn_channels_by_name.insert(wa.name().to_string(), wa.clone() as Arc<dyn Channel>);
+        }
+        if let Some(ref lq) = linq_channel {
+            spawn_channels_by_name.insert(lq.name().to_string(), lq.clone() as Arc<dyn Channel>);
+        }
+        if let Some(ref nc) = nextcloud_talk_channel {
+            spawn_channels_by_name.insert(nc.name().to_string(), nc.clone() as Arc<dyn Channel>);
+        }
         let spawn_tool = tools::SessionsSpawnTool::new(
             sc.clone() as Arc<dyn Channel>,
             Arc::clone(&provider),
@@ -650,6 +687,7 @@ pub async fn run_gateway(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
+        .with_channels(Arc::new(spawn_channels_by_name))
         .with_shared_memory(Arc::clone(&mem))
         .with_event_recording(config.memory.event_recording_config());
         let handle = spawn_tool.tools_handle();
@@ -737,16 +775,8 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
-    // Linq channel (if configured)
-    let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
-        Arc::new(LinqChannel::new(
-            lq.api_token.clone(),
-            lq.from_phone.clone(),
-            lq.allowed_senders.clone(),
-        ))
-    });
-
-    // Linq signing secret for webhook signature verification (from config)
+    // Linq signing secret for webhook signature verification (from config).
+    // (The `linq_channel` object itself is built earlier, ahead of the spawn tool.)
     let linq_signing_secret: Option<Arc<str>> = config
         .channels_config
         .linq
@@ -760,17 +790,8 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
-    // Nextcloud Talk channel (if configured)
-    let nextcloud_talk_channel: Option<Arc<NextcloudTalkChannel>> =
-        config.channels_config.nextcloud_talk.as_ref().map(|nc| {
-            Arc::new(NextcloudTalkChannel::new(
-                nc.base_url.clone(),
-                nc.app_token.clone(),
-                nc.allowed_users.clone(),
-            ))
-        });
-
-    // Nextcloud Talk webhook secret for signature verification (from config)
+    // Nextcloud Talk webhook secret for signature verification (from config).
+    // (The `nextcloud_talk_channel` object is built earlier, ahead of the spawn tool.)
     let nextcloud_talk_webhook_secret: Option<Arc<str>> = config
         .channels_config
         .nextcloud_talk
