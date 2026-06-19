@@ -30,9 +30,42 @@ fn ensure_https(url: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// In-memory wrapper for the Composio API key.
+///
+/// Defensive hardening for the secret-in-memory surface:
+/// - `Debug` is hand-written to print `[REDACTED]`, so the key can never leak
+///   through a derived `Debug`, `{:?}` formatting, a tracing event, or an error
+///   that happens to capture an enclosing struct.
+///
+/// NOTE: we deliberately do *not* attempt a best-effort in-place zeroize on
+/// drop. Without the `zeroize` crate (volatile write + compiler barrier) such a
+/// loop is near-worthless — the optimiser may elide it, and the allocator/OS may
+/// already hold copies (reallocations, swap, core dumps, `reqwest` header
+/// buffers). It would only buy an `unsafe` block (`as_mut_vec`) for negligible
+/// benefit, violating the "minimise unsafe" rule. The real fix is migrating
+/// Composio to a managed MCP credential source (tracked separately).
+struct ApiKey(String);
+
+impl ApiKey {
+    fn new(value: &str) -> Self {
+        Self(value.to_string())
+    }
+
+    /// Expose the raw key for outbound use (HTTPS `x-api-key` header only).
+    fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ApiKey([REDACTED])")
+    }
+}
+
 /// A tool that proxies actions to the Composio managed tool platform.
 pub struct ComposioTool {
-    api_key: String,
+    api_key: ApiKey,
     default_entity_id: String,
     security: Arc<SecurityPolicy>,
     recent_connected_accounts: RwLock<HashMap<String, String>>,
@@ -41,7 +74,7 @@ pub struct ComposioTool {
 impl ComposioTool {
     pub fn new(api_key: &str, default_entity_id: Option<&str>, security: Arc<SecurityPolicy>) -> Self {
         Self {
-            api_key: api_key.to_string(),
+            api_key: ApiKey::new(api_key),
             default_entity_id: normalize_entity_id(default_entity_id.unwrap_or("default")),
             security,
             recent_connected_accounts: RwLock::new(HashMap::new()),
@@ -80,7 +113,7 @@ impl ComposioTool {
         let req = self
             .client()
             .get(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .query(&Self::build_list_actions_v3_query(app_name));
 
         let resp = req.send().await?;
@@ -105,7 +138,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .get(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .send()
             .await?;
 
@@ -128,7 +161,7 @@ impl ComposioTool {
         entity_id: Option<&str>,
     ) -> anyhow::Result<Vec<ComposioConnectedAccount>> {
         let url = format!("{COMPOSIO_API_BASE_V3}/connected_accounts");
-        let mut req = self.client().get(&url).header("x-api-key", &self.api_key);
+        let mut req = self.client().get(&url).header("x-api-key", self.api_key.expose());
 
         req = req.query(&[
             ("limit", "50"),
@@ -321,7 +354,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .json(&body)
             .send()
             .await?;
@@ -359,7 +392,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .json(&body)
             .send()
             .await?;
@@ -424,7 +457,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .json(&body)
             .send()
             .await?;
@@ -457,7 +490,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .post(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .json(&body)
             .send()
             .await?;
@@ -485,7 +518,7 @@ impl ComposioTool {
         let resp = self
             .client()
             .get(&url)
-            .header("x-api-key", &self.api_key)
+            .header("x-api-key", self.api_key.expose())
             .query(&[("toolkit_slug", app_name), ("show_disabled", "true"), ("limit", "25")])
             .send()
             .await?;
@@ -1114,6 +1147,26 @@ mod tests {
     fn composio_tool_has_correct_name() {
         let tool = ComposioTool::new("test-key", None, test_security());
         assert_eq!(tool.name(), "composio");
+    }
+
+    // ── API key secret hardening ──────────────────────────────
+
+    #[test]
+    fn api_key_debug_is_redacted() {
+        let key = ApiKey::new("super-secret-value-123");
+        let rendered = format!("{key:?}");
+        assert!(
+            !rendered.contains("super-secret-value-123"),
+            "Debug must not leak the raw key, got: {rendered}"
+        );
+        assert!(rendered.contains("[REDACTED]"), "Debug should mark the value redacted");
+    }
+
+    #[test]
+    fn api_key_expose_returns_real_value_for_header_use() {
+        // The outbound HTTPS header path must still receive the true key.
+        let key = ApiKey::new("real-key");
+        assert_eq!(key.expose(), "real-key");
     }
 
     #[test]
