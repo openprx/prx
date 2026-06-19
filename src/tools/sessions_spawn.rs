@@ -79,6 +79,14 @@ pub struct SubAgentRun {
     pub started_at: DateTime<Utc>,
     pub status: SubAgentStatus,
     pub recipient: Option<String>,
+    /// Name of the channel this run must announce/kill-notify back on.
+    ///
+    /// Captured **per-turn** from the originating message's scope at spawn time
+    /// (atomic with `recipient`), so announce/kill always route to the channel +
+    /// recipient of the message that launched this run — never to a shared
+    /// "active channel" that a concurrently-processed message may have
+    /// overwritten. `None` falls back to the construction-time active channel.
+    pub channel_name: Option<String>,
     /// Handle to abort the spawned tokio task (supports kill action).
     pub abort_handle: Option<tokio::task::AbortHandle>,
     /// Accumulated conversation history from the sub-agent's execution.
@@ -285,7 +293,25 @@ const fn status_label(status: &SubAgentStatus) -> &'static str {
 /// when the sub-agent completes.
 pub struct SessionsSpawnTool {
     /// Channel for announcing sub-agent results.
-    channel: Arc<dyn Channel>,
+    ///
+    /// Wrapped in an `RwLock` and updated per-message via
+    /// [`Tool::set_active_channel`] (driven by the channel/gateway loop) — exactly
+    /// like `MessageSendTool`/`TtsTool` — so that a sub-agent's result is announced
+    /// back on the *originating* channel (e.g. wacli for a WhatsApp group message)
+    /// rather than the single fixed channel this tool was constructed with (which,
+    /// in a multi-channel deployment, was a default such as Signal). Each spawn
+    /// snapshots the active channel at request time, so the announcement routes to
+    /// whichever channel launched the run.
+    channel: Arc<RwLock<Arc<dyn Channel>>>,
+    /// Registry of every configured channel, keyed by [`Channel::name`].
+    ///
+    /// announce/kill resolve the *originating* channel object from here using the
+    /// `channel_name` captured per-turn on the [`SubAgentRun`] — the channel and
+    /// recipient then both come from the same launching message's scope, atomic
+    /// and immune to the shared-`channel` overwrite race that concurrent message
+    /// processing (the channels JoinSet) would otherwise cause. Empty in unit
+    /// tests / single-channel paths, where the shared `channel` fallback applies.
+    channels: Arc<HashMap<String, Arc<dyn Channel>>>,
     /// Provider for sub-agent LLM calls.
     provider: Arc<dyn Provider>,
     /// Provider name (for logging/display).
@@ -403,7 +429,8 @@ impl SessionsSpawnTool {
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
         Self {
-            channel,
+            channel: Arc::new(RwLock::new(channel)),
+            channels: Arc::new(HashMap::new()),
             provider,
             provider_name: provider_name.into(),
             model: model.into(),
@@ -485,6 +512,20 @@ impl SessionsSpawnTool {
         self.active_runs.clone()
     }
 
+    /// Attach the full set of configured channels, keyed by [`Channel::name`].
+    ///
+    /// This is the per-turn routing registry: announce/kill resolve the launching
+    /// message's channel object from here via the `channel_name` recorded on each
+    /// [`SubAgentRun`], so routing is bound atomically to the originating message
+    /// rather than to the shared "active channel" (which a concurrently-processed
+    /// message can overwrite). Channels not found here fall back to the shared
+    /// active channel.
+    #[must_use]
+    pub fn with_channels(mut self, channels: Arc<HashMap<String, Arc<dyn Channel>>>) -> Self {
+        self.channels = channels;
+        self
+    }
+
     /// Attach shared memory so spawned runs are visible in the live fabric.
     pub fn with_shared_memory(mut self, memory: Arc<dyn Memory>) -> Self {
         self.memory = Some(memory);
@@ -494,6 +535,29 @@ impl SessionsSpawnTool {
     pub const fn with_event_recording(mut self, event_recording: MemoryEventRecording) -> Self {
         self.event_recording = event_recording;
         self
+    }
+
+    /// Resolve the channel a run must announce/kill-notify on.
+    ///
+    /// Prefers the run's per-turn `channel_name` (captured atomically from the
+    /// launching message's scope) looked up in the channel registry. Falls back
+    /// to the shared active channel when the name is absent (single-channel /
+    /// unit-test paths) or not found in the registry (warns), so routing never
+    /// panics — at worst it degrades to the previous shared-channel behaviour.
+    async fn resolve_announce_channel(&self, channel_name: Option<&str>) -> Arc<dyn Channel> {
+        if let Some(name) = channel_name {
+            if let Some(channel) = self.channels.get(name) {
+                return Arc::clone(channel);
+            }
+            if !self.channels.is_empty() {
+                tracing::warn!(
+                    channel = %name,
+                    "sessions_spawn: originating channel not found in registry; \
+                     falling back to active channel for announcement"
+                );
+            }
+        }
+        self.channel.read().await.clone()
     }
 }
 
@@ -752,6 +816,15 @@ impl Tool for SessionsSpawnTool {
         *self.default_recipient.write().await = Some(recipient.to_string());
     }
 
+    /// Route sub-agent result announcements back on the channel the triggering
+    /// message arrived on (wacli/Signal/Telegram/…). The channel/gateway loop
+    /// calls this before each turn; each subsequent spawn snapshots the active
+    /// channel, fixing the bug where results were always announced over the
+    /// construction-time default channel (Signal) regardless of origin.
+    async fn set_active_channel(&self, channel: Arc<dyn Channel>) {
+        *self.channel.write().await = channel;
+    }
+
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
         let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
@@ -983,11 +1056,27 @@ impl Tool for SessionsSpawnTool {
             None => None,
         };
 
-        // Resolve the recipient: explicit arg > default_recipient
+        // Resolve the announce recipient + channel atomically from this turn.
+        //
+        // Precedence: explicit `recipient` arg > per-turn scope `chat_id` >
+        // shared `default_recipient`. The per-turn scope (parsed from the trusted
+        // `_zc_scope` injected for *this* execution) is atomic — it travels with
+        // the launching message — whereas `default_recipient`/`channel` are shared
+        // and a concurrently-processed message can overwrite them between this
+        // turn entering the LLM loop and the spawn actually executing. Binding
+        // both `recipient` and `channel_name` from the same scope eliminates the
+        // A-channel + B-recipient cross-wiring (cross-channel privacy leak).
         let recipient = match explicit_recipient {
             Some(r) => Some(r),
-            None => self.default_recipient.read().await.clone(),
+            None => match spawn_scope.as_ref().map(|scope| scope.chat_id.clone()) {
+                Some(chat_id) => Some(chat_id),
+                None => self.default_recipient.read().await.clone(),
+            },
         };
+        // Channel name bound to the *originating* message (atomic with recipient).
+        // `None` (no trusted scope) falls back at announce time to the shared
+        // active channel, preserving single-channel / legacy behaviour.
+        let run_channel_name = spawn_scope.as_ref().map(|scope| scope.channel.clone());
 
         let resolved_provider_name = provider_override.unwrap_or_else(|| {
             selected_agent
@@ -1066,6 +1155,7 @@ impl Tool for SessionsSpawnTool {
                     started_at: Utc::now(),
                     status: SubAgentStatus::Running,
                     recipient: recipient.clone(),
+                    channel_name: run_channel_name.clone(),
                     abort_handle: None,
                     history: history_arc,
                     steer_tx: None,
@@ -1096,7 +1186,11 @@ impl Tool for SessionsSpawnTool {
                 })
                 .unwrap_or_else(|| self.workspace_dir.join("workers"));
             let active_runs = self.active_runs.clone();
-            let channel = self.channel.clone();
+            // Resolve the announce channel from the *per-turn* channel name bound
+            // to this run (the launching message's scope), not the shared active
+            // channel — so a concurrently-processed message cannot mis-route this
+            // run's result. Falls back to the active channel when no scope name.
+            let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
             let keep_workspace = !self.spawn_config.cleanup_on_complete;
             let allowed_tools = selected_agent
                 .as_ref()
@@ -1246,6 +1340,7 @@ impl Tool for SessionsSpawnTool {
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 recipient: recipient.clone(),
+                channel_name: run_channel_name.clone(),
                 abort_handle: None,
                 history: history_arc.clone(),
                 steer_tx: Some(steer_tx),
@@ -1255,8 +1350,12 @@ impl Tool for SessionsSpawnTool {
             });
         }
 
-        // Clone everything the spawned task needs
-        let channel = self.channel.clone();
+        // Clone everything the spawned task needs.
+        // Resolve the announce channel from the *per-turn* channel name bound to
+        // this run (the launching message's scope), not the shared active channel
+        // — so a concurrently-processed message cannot mis-route this run's
+        // result. Falls back to the active channel when no scope name is present.
+        let channel = self.resolve_announce_channel(run_channel_name.as_deref()).await;
         let provider_name = resolved_provider_name;
         let model = resolved_model;
         let temperature = resolved_temperature;
@@ -1554,7 +1653,7 @@ impl SessionsSpawnTool {
 
     /// Kill a running sub-agent by its run ID.
     async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
-        let (recipient_opt, rid, killed_run) = {
+        let (recipient_opt, channel_name_opt, rid, killed_run) = {
             let mut runs = self.active_runs.write().await;
             if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
                 match &run.status {
@@ -1579,10 +1678,14 @@ impl SessionsSpawnTool {
                             ah.abort();
                         }
                         let recipient = run.recipient.clone();
+                        // Per-turn channel bound at spawn time — kill-notify routes
+                        // to the same channel + recipient as the launching message,
+                        // not the shared active channel (avoids cross-channel leak).
+                        let channel_name = run.channel_name.clone();
                         let rid = run.id.clone();
                         run.status = SubAgentStatus::Failed("killed by user".into());
                         run.steer_tx = None;
-                        (recipient, rid, run.clone())
+                        (recipient, channel_name, rid, run.clone())
                     }
                     SubAgentStatus::Completed(_) => {
                         return Ok(ToolResult {
@@ -1614,7 +1717,8 @@ impl SessionsSpawnTool {
         if let Some(target) = recipient_opt {
             let msg_text = format!("🤖 Sub-agent `{rid}` was killed by user.");
             let msg = SendMessage::new(&msg_text, &target);
-            if let Err(error) = self.channel.send(&msg).await {
+            let channel = self.resolve_announce_channel(channel_name_opt.as_deref()).await;
+            if let Err(error) = channel.send(&msg).await {
                 tracing::error!(run_id = %rid, "Failed to announce sub-agent kill: {error}");
             }
         } else {
@@ -2795,6 +2899,41 @@ mod tests {
         }
     }
 
+    /// A provider that sleeps before responding, so a spawned run stays in the
+    /// `Running` state long enough for a kill test to act on it deterministically.
+    struct SleepyProvider {
+        delay_ms: u64,
+        response: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for SleepyProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(self.response.clone())
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            Ok(crate::providers::ChatResponse {
+                text: Some(self.response.clone()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
     struct EchoSystemProvider;
 
     #[async_trait::async_trait]
@@ -3029,6 +3168,257 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("Sub-agent"));
         assert!(messages[0].contains("chicken"));
+    }
+
+    /// A channel that records both its name and the messages it sent, so a test
+    /// can assert *which* channel a sub-agent result was announced on.
+    struct NamedRecordingChannel {
+        name: &'static str,
+        sent: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl NamedRecordingChannel {
+        fn new(name: &'static str) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let sent = Arc::new(Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    name,
+                    sent: sent.clone(),
+                }),
+                sent,
+            )
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for NamedRecordingChannel {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.lock().await.push(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(&self, _tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Regression for the cross-channel mis-routing bug: a sub-agent spawned from
+    /// wacli (a `@g.us` group recipient) must announce its result back on the
+    /// wacli channel — not on the construction-time default channel (which, in a
+    /// multi-channel deployment, was Signal). The channel/gateway loop calls
+    /// `set_active_channel` per message; this test simulates that switch and
+    /// asserts the announcement lands only on the active (wacli) channel.
+    #[tokio::test]
+    async fn announce_routes_to_active_channel_not_construction_default() {
+        // Tool is built with a "signal" default channel (mirrors the deployment
+        // default that caused the bug).
+        let (signal_ch, signal_sent) = NamedRecordingChannel::new("signal");
+        let tool = make_tool(
+            signal_ch,
+            Arc::new(EchoProvider {
+                response: "sub-agent done".into(),
+            }),
+        );
+
+        // A wacli group message arrives: the gateway switches the active channel
+        // and recipient before the spawn turn (exactly as channels/mod.rs does).
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        tool.set_active_channel(wacli_ch as Arc<dyn Channel>).await;
+        tool.set_active_recipient("120363000000000000@g.us").await;
+
+        let result = tool
+            .execute(with_spawn_grant(json!({"task": "do the thing"})))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn should succeed: {:?}", result.error);
+
+        // Wait for the fire-and-forget sub-agent to finish and announce.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let on_wacli = wacli_sent.lock().await;
+        let on_signal = signal_sent.lock().await;
+        assert_eq!(
+            on_wacli.len(),
+            1,
+            "result must be announced on the originating (wacli) channel"
+        );
+        assert!(on_wacli[0].contains("sub-agent done"));
+        assert!(
+            on_signal.is_empty(),
+            "result must NOT be announced on the construction-time default (signal) channel"
+        );
+    }
+
+    /// Build a tool whose announce/kill routing registry knows several named
+    /// channels, so a test can assert a run resolves the *originating* channel by
+    /// name from its per-turn scope rather than from shared "active" state.
+    fn make_tool_with_channels(
+        default_channel: Arc<dyn Channel>,
+        provider: Arc<dyn crate::providers::Provider>,
+        registry: Vec<Arc<dyn Channel>>,
+    ) -> SessionsSpawnTool {
+        let channels: HashMap<String, Arc<dyn Channel>> =
+            registry.into_iter().map(|ch| (ch.name().to_string(), ch)).collect();
+        make_tool(default_channel, provider).with_channels(Arc::new(channels))
+    }
+
+    /// Build a trusted per-turn spawn scope arg pinning the originating channel
+    /// and chat_id (recipient) — mirrors the `_zc_scope` the agent loop injects
+    /// for the message currently being processed.
+    fn with_scope(mut args: serde_json::Value, channel: &str, chat_id: &str) -> serde_json::Value {
+        if let Some(obj) = args.as_object_mut() {
+            obj.insert("_zc_scope_trusted".to_string(), json!(true));
+            obj.insert(
+                "_zc_scope".to_string(),
+                json!({
+                    "sender": "alice",
+                    "channel": channel,
+                    "chat_type": "group",
+                    "chat_id": chat_id,
+                }),
+            );
+        }
+        args
+    }
+
+    /// P0 concurrency race: announce must route by the run's *per-turn* channel +
+    /// recipient (captured atomically from the launching message's scope), NOT by
+    /// the shared "active" channel/recipient that a concurrently-processed message
+    /// can overwrite between the spawning turn entering the LLM loop and the spawn
+    /// actually executing.
+    ///
+    /// Scenario: message A arrives on `wacli` and begins a turn; before A's spawn
+    /// executes, message B (on `signal`) overwrites the shared active
+    /// channel/recipient (the gateway loop calls `set_active_*` per message). With
+    /// the old shared-state model A's result would leak onto signal+B's recipient
+    /// (cross-channel privacy leak). The fix binds A's announce to A's own scope.
+    #[tokio::test]
+    async fn announce_uses_per_turn_channel_not_shared_state() {
+        let (signal_ch, signal_sent) = NamedRecordingChannel::new("signal");
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels(
+            signal_ch.clone(),
+            Arc::new(EchoProvider {
+                response: "A's private result".into(),
+            }),
+            vec![signal_ch, wacli_ch],
+        );
+
+        // Message B (signal) has already overwritten the shared active state — this
+        // is the racing message whose values would corrupt A under the old model.
+        tool.set_active_channel({
+            let (b_ch, _) = NamedRecordingChannel::new("signal");
+            b_ch as Arc<dyn Channel>
+        })
+        .await;
+        tool.set_active_recipient("B-signal-recipient").await;
+
+        // A's spawn now executes, carrying A's own per-turn scope (wacli + A's
+        // recipient). No explicit `recipient` arg, so it must come from the scope.
+        let result = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "do A's work"}),
+                "wacli",
+                "A-wacli-recipient",
+            )))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn should succeed: {:?}", result.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        let on_wacli = wacli_sent.lock().await;
+        let on_signal = signal_sent.lock().await;
+        assert_eq!(
+            on_wacli.len(),
+            1,
+            "A's result must announce on its own (wacli) channel, not the shared active (signal) one"
+        );
+        assert!(on_wacli[0].contains("A's private result"));
+        assert!(
+            on_signal.is_empty(),
+            "A's result must NOT leak onto signal (the racing message B's channel)"
+        );
+
+        // And the recipient must be A's scope chat_id, not B's shared recipient.
+        let runs = tool.active_runs_snapshot().await;
+        let a_run = runs.first().expect("one run registered");
+        assert_eq!(a_run.recipient.as_deref(), Some("A-wacli-recipient"));
+        assert_eq!(a_run.channel_name.as_deref(), Some("wacli"));
+    }
+
+    /// P0 concurrency race (kill variant): killing a run must notify on the run's
+    /// per-turn channel + recipient bound at spawn time — never the shared active
+    /// channel that a later, concurrently-processed message may have overwritten.
+    #[tokio::test]
+    async fn kill_uses_per_turn_channel_not_shared_state() {
+        let (signal_ch, signal_sent) = NamedRecordingChannel::new("signal");
+        let (wacli_ch, wacli_sent) = NamedRecordingChannel::new("wacli");
+        let tool = make_tool_with_channels(
+            signal_ch.clone(),
+            // A long-lived run so it is still Running when we kill it.
+            Arc::new(SleepyProvider {
+                delay_ms: 5_000,
+                response: "never reached".into(),
+            }),
+            vec![signal_ch, wacli_ch],
+        );
+
+        // Spawn A on wacli (its scope), in task mode so the abort handle exists.
+        let result = tool
+            .execute(with_spawn_grant(with_scope(
+                json!({"task": "long A work", "mode": "task"}),
+                "wacli",
+                "A-wacli-recipient",
+            )))
+            .await
+            .unwrap();
+        assert!(result.success, "spawn should succeed: {:?}", result.error);
+        let run_id = {
+            let runs = tool.active_runs_snapshot().await;
+            runs.first().expect("one run registered").id.clone()
+        };
+
+        // A concurrent message B (signal) overwrites the shared active channel
+        // *before* the kill — exactly the race the fix must defeat.
+        tool.set_active_channel({
+            let (b_ch, _) = NamedRecordingChannel::new("signal");
+            b_ch as Arc<dyn Channel>
+        })
+        .await;
+        tool.set_active_recipient("B-signal-recipient").await;
+
+        let kill_grant = serde_json::to_value(ApprovalGrant::for_resource_operation(
+            "sessions_spawn",
+            &format!("sessions_spawn:kill:{run_id}"),
+            "test",
+            None,
+        ))
+        .unwrap();
+        let kill = tool
+            .execute(json!({
+                "action": "kill",
+                "run_id": run_id,
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG: kill_grant,
+            }))
+            .await
+            .unwrap();
+        assert!(kill.success, "kill should succeed: {:?}", kill.error);
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let on_wacli = wacli_sent.lock().await;
+        let on_signal = signal_sent.lock().await;
+        assert_eq!(on_wacli.len(), 1, "kill notice must route to A's own (wacli) channel");
+        assert!(on_wacli[0].contains("killed"));
+        assert!(
+            on_signal.is_empty(),
+            "kill notice must NOT leak onto signal (the racing message B's channel)"
+        );
     }
 
     /// FIX-P0-37: spawning is a Medium-risk side effect. Under the default
@@ -3526,6 +3916,7 @@ mod tests {
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 recipient: None,
+                channel_name: None,
                 abort_handle: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: None,
@@ -3693,6 +4084,7 @@ mod tests {
                 started_at: Utc::now(),
                 status: SubAgentStatus::Running,
                 recipient: None,
+                channel_name: None,
                 abort_handle: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: Some(steer_tx),
@@ -4025,6 +4417,7 @@ mod tests {
             started_at: Utc::now(),
             status,
             recipient: None,
+            channel_name: None,
             abort_handle: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
