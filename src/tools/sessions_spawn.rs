@@ -296,7 +296,7 @@ pub struct SessionsSpawnTool {
     ///
     /// Wrapped in an `RwLock` and updated per-message via
     /// [`Tool::set_active_channel`] (driven by the channel/gateway loop) — exactly
-    /// like `MessageSendTool`/`TtsTool` — so that a sub-agent's result is announced
+    /// like `MessageSendTool` — so that a sub-agent's result is announced
     /// back on the *originating* channel (e.g. wacli for a WhatsApp group message)
     /// rather than the single fixed channel this tool was constructed with (which,
     /// in a multi-channel deployment, was a default such as Signal). Each spawn

@@ -2346,6 +2346,11 @@ fn find_json_end(input: &str) -> Option<usize> {
 /// - `browser_open/url>https://example.com`
 /// - `shell/command>ls -la`
 /// - `http_request/url>https://api.example.com`
+///
+/// The `browser_open`/`browser` aliases are retained even though the dedicated
+/// browser tools were removed: GLM-family models still emit those hallucinated
+/// tool names, and routing them to a `shell` curl invocation keeps that quirk
+/// working through the agent's general shell capability.
 fn map_glm_tool_alias(tool_name: &str) -> &str {
     match tool_name {
         "browser_open" | "browser" | "web_search" | "shell" | "bash" => "shell",
@@ -5439,19 +5444,9 @@ pub async fn run(
          resume, status.",
     ));
     tool_descs.push((
-        "screenshot",
-        "Capture a screenshot of the current screen. Returns file path and base64-encoded PNG. Use when: visual verification, UI inspection, debugging displays.",
-    ));
-    tool_descs.push((
         "image_info",
         "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
     ));
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
     if config.composio.enabled {
         tool_descs.push((
             "composio",
@@ -6132,12 +6127,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
-        ("screenshot", "Capture a screenshot."),
         ("image_info", "Read image metadata."),
     ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved URLs in browser."));
-    }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
@@ -8094,13 +8085,9 @@ mod tests {
             "cron",
             "config_reload",
             "proxy_config",
-            "browser_open",
-            "screenshot",
             "http_request",
-            "tts",
             "pushover",
             "message_send",
-            "canvas",
             "composio",
             "mcp",
         ] {

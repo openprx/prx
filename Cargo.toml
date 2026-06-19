@@ -70,14 +70,11 @@ tracing-appender = "0.2"
 # Observability - Prometheus metrics
 prometheus = { version = "0.14", default-features = false }
 
-# Base64 encoding (screenshots, image data)
+# Base64 encoding (image data)
 base64 = "0.22"
 
 # URL encoding for web search
 urlencoding = "2.1"
-
-# Optional Rust-native browser automation backend
-fantoccini = { version = "0.22.0", optional = true, default-features = false, features = ["rustls-tls"] }
 
 # Error handling
 anyhow = "1.0"
@@ -234,10 +231,6 @@ libc = "0.2"
 default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock", "terminal-tui"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
-# Browser backend feature alias used by cfg(feature = "browser-native")
-browser-native = ["dep:fantoccini"]
-# Backward-compatible alias for older invocations
-fantoccini = ["browser-native"]
 # Sandbox feature aliases used by cfg(feature = "sandbox-*")
 sandbox-landlock = ["dep:landlock"]
 sandbox-bubblewrap = []

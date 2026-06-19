@@ -32,7 +32,7 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
         .replace('\n', " ")
         .replace('\r', "");
 
-    // Sanitise voice the same way — it is user-controlled in TtsTool and must
+    // Sanitise voice the same way — it is user-controlled and must
     // not be able to break out of the JS single-quoted string literal.
     let safe_voice = voice
         .replace('\\', "\\\\")
@@ -87,7 +87,7 @@ pub struct MessageSendTool {
     /// Active channel — updated per-message via `set_active_channel` so that
     /// replies are always routed back on the same channel the message arrived on
     /// (e.g., wacli instead of signal for WhatsApp messages).
-    /// Uses a `RwLock` identical to `TtsTool` for the same reason.
+    /// Uses a `RwLock` so the active channel can be swapped per-message.
     active_channel: Arc<tokio::sync::RwLock<Arc<dyn Channel>>>,
     /// Optional Signal channel reference for reaction support.
     signal: Option<Arc<SignalChannel>>,

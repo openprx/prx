@@ -2623,7 +2623,7 @@ async fn process_channel_message(
     println!("  ⏳ Processing message...");
 
     // Set active recipient on tools that support proactive messaging (message_send, sessions_spawn).
-    // Also update the active channel so tools like tts route replies back on the correct channel
+    // Also update the active channel so channel-aware tools route replies back on the correct channel
     // (e.g., wacli for WhatsApp messages, not always Signal).
     for tool in ctx.tools_registry.iter() {
         tool.set_active_recipient(&msg.reply_target).await;
@@ -4585,7 +4585,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     // former local construction (gateway uses the same helper).
     //
     // D2-2 boundary: this startup `Arc<SecurityPolicy>` is the snapshot captured by
-    // channel-aware tools (message_send/tts/sessions_spawn/sessions_send/subagents/
+    // channel-aware tools (message_send/sessions_spawn/sessions_send/subagents/
     // gateway via `security.clone()` below). Those tools remain **restart-only** in
     // this increment — they keep this fixed snapshot and do NOT observe config
     // hot-reload, matching the gateway D2-1 boundary. Only the channel's own gates
@@ -4673,16 +4673,6 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         ),
     ];
 
-    if config.browser.enabled {
-        tool_descs.push((
-            "browser_open",
-            "Open approved HTTPS URLs in Brave Browser (allowlist-only, no scraping)",
-        ));
-    }
-    tool_descs.push((
-        "canvas",
-        "Manage an in-memory canvas session. Actions: present, hide, navigate, eval, snapshot. Current implementation is a stub backend.",
-    ));
     if config.composio.enabled {
         tool_descs.push((
             "composio",
@@ -5023,24 +5013,11 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
             sig.data_dir.clone(),
             sig.storm_protection.clone(),
         ));
-        let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan.clone(), security.clone());
-        let dr_handle = msg_send_tool.default_recipient_handle();
+        let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan, security.clone());
         tools_list.push(Box::new(msg_send_tool));
-        // Also register standalone tts tool sharing the same channel + recipient slot.
-        tools_list.push(Box::new(tools::TtsTool::new(
-            sig_chan as Arc<dyn Channel>,
-            dr_handle,
-            security.clone(),
-        )));
     } else if let Some(first_channel) = channels.first().cloned() {
-        let msg_send_tool = tools::MessageSendTool::new(first_channel.clone(), security.clone());
-        let dr_handle = msg_send_tool.default_recipient_handle();
+        let msg_send_tool = tools::MessageSendTool::new(first_channel, security.clone());
         tools_list.push(Box::new(msg_send_tool));
-        tools_list.push(Box::new(tools::TtsTool::new(
-            first_channel,
-            dr_handle,
-            security.clone(),
-        )));
     }
 
     // Register sessions_spawn tool backed by the first available channel.
@@ -5331,7 +5308,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         // ArcSwap so the stamp-change branch of maybe_apply_runtime_config_update can
         // hot-swap it atomically for the channel gates. Both halves come from the
         // same startup `config` parse, so they form one coherent generation.
-        // Channel-aware tools (message_send/tts/sessions_*) keep their own restart-
+        // Channel-aware tools (message_send/sessions_*) keep their own restart-
         // only `security` snapshot (captured above), matching the gateway D2-1
         // boundary — this increment only makes the channel's own gates hot.
         security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {

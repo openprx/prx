@@ -2178,106 +2178,29 @@ impl Default for AuthConfig {
 
 /// Computer-use sidecar configuration (`[browser.computer_use]` section).
 ///
-/// Delegates OS-level mouse, keyboard, and screenshot actions to a local sidecar.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// The computer-use / agent-browser automation tools were removed (agents use
+/// `shell` instead). Only `api_key` is retained, because the config secret
+/// encryption/migration path still references it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BrowserComputerUseConfig {
-    /// Sidecar endpoint for computer-use actions (OS-level mouse/keyboard/screenshot)
-    #[serde(default = "default_browser_computer_use_endpoint")]
-    pub endpoint: String,
-    /// Optional bearer token for computer-use sidecar
+    /// Optional bearer token (retained only for config secret handling).
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Per-action request timeout in milliseconds
-    #[serde(default = "default_browser_computer_use_timeout_ms")]
-    pub timeout_ms: u64,
-    /// Allow remote/public endpoint for computer-use sidecar (default: false)
-    #[serde(default)]
-    pub allow_remote_endpoint: bool,
-    /// Optional window title/process allowlist forwarded to sidecar policy
-    #[serde(default)]
-    pub window_allowlist: Vec<String>,
-    /// Optional X-axis boundary for coordinate-based actions
-    #[serde(default)]
-    pub max_coordinate_x: Option<i64>,
-    /// Optional Y-axis boundary for coordinate-based actions
-    #[serde(default)]
-    pub max_coordinate_y: Option<i64>,
 }
 
-fn default_browser_computer_use_endpoint() -> String {
-    "http://127.0.0.1:8787/v1/actions".into()
-}
-
-const fn default_browser_computer_use_timeout_ms() -> u64 {
-    15_000
-}
-
-impl Default for BrowserComputerUseConfig {
-    fn default() -> Self {
-        Self {
-            endpoint: default_browser_computer_use_endpoint(),
-            api_key: None,
-            timeout_ms: default_browser_computer_use_timeout_ms(),
-            allow_remote_endpoint: false,
-            window_allowlist: Vec::new(),
-            max_coordinate_x: None,
-            max_coordinate_y: None,
-        }
-    }
-}
-
-/// Browser automation configuration (`[browser]` section).
+/// Browser configuration (`[browser]` section).
 ///
-/// Controls the `browser_open` tool and browser automation backends.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// The `browser` / `browser_open` automation tools were removed. This section
+/// now only carries `allowed_domains`, consumed by the `web_fetch` tool for
+/// domain validation; `computer_use.api_key` is kept for config secret handling.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct BrowserConfig {
-    /// Enable `browser_open` tool (opens URLs in Brave without scraping)
-    #[serde(default)]
-    pub enabled: bool,
-    /// Allowed domains for `browser_open` (exact or subdomain match)
+    /// Allowed domains for `web_fetch` (exact or subdomain match).
     #[serde(default)]
     pub allowed_domains: Vec<String>,
-    /// Browser session name (for agent-browser automation)
-    #[serde(default)]
-    pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
-    #[serde(default = "default_browser_backend")]
-    pub backend: String,
-    /// Headless mode for rust-native backend
-    #[serde(default = "default_true")]
-    pub native_headless: bool,
-    /// WebDriver endpoint URL for rust-native backend (e.g. http://127.0.0.1:9515)
-    #[serde(default = "default_browser_webdriver_url")]
-    pub native_webdriver_url: String,
-    /// Optional Chrome/Chromium executable path for rust-native backend
-    #[serde(default)]
-    pub native_chrome_path: Option<String>,
-    /// Computer-use sidecar configuration
+    /// Computer-use sidecar config (retained only for `api_key` secret handling).
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
-}
-
-fn default_browser_backend() -> String {
-    "agent_browser".into()
-}
-
-fn default_browser_webdriver_url() -> String {
-    "http://127.0.0.1:9515".into()
-}
-
-impl Default for BrowserConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            allowed_domains: Vec::new(),
-            session_name: None,
-            backend: default_browser_backend(),
-            native_headless: default_true(),
-            native_webdriver_url: default_browser_webdriver_url(),
-            native_chrome_path: None,
-            computer_use: BrowserComputerUseConfig::default(),
-        }
-    }
 }
 
 // ── HTTP request tool ───────────────────────────────────────────
@@ -7663,66 +7586,29 @@ default_temperature = 0.7
         assert!(c.auth.codex_auth_json_auto_import);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
-        assert!(!c.browser.enabled);
         assert!(c.browser.allowed_domains.is_empty());
     }
 
     #[test]
-    async fn browser_config_default_disabled() {
+    async fn browser_config_default_minimal() {
         let b = BrowserConfig::default();
-        assert!(!b.enabled);
         assert!(b.allowed_domains.is_empty());
-        assert_eq!(b.backend, "agent_browser");
-        assert!(b.native_headless);
-        assert_eq!(b.native_webdriver_url, "http://127.0.0.1:9515");
-        assert!(b.native_chrome_path.is_none());
-        assert_eq!(b.computer_use.endpoint, "http://127.0.0.1:8787/v1/actions");
-        assert_eq!(b.computer_use.timeout_ms, 15_000);
-        assert!(!b.computer_use.allow_remote_endpoint);
-        assert!(b.computer_use.window_allowlist.is_empty());
-        assert!(b.computer_use.max_coordinate_x.is_none());
-        assert!(b.computer_use.max_coordinate_y.is_none());
+        assert!(b.computer_use.api_key.is_none());
     }
 
     #[test]
     async fn browser_config_serde_roundtrip() {
         let b = BrowserConfig {
-            enabled: true,
             allowed_domains: vec!["example.com".into(), "docs.example.com".into()],
-            session_name: None,
-            backend: "auto".into(),
-            native_headless: false,
-            native_webdriver_url: "http://localhost:4444".into(),
-            native_chrome_path: Some("/usr/bin/chromium".into()),
             computer_use: BrowserComputerUseConfig {
-                endpoint: "https://computer-use.example.com/v1/actions".into(),
                 api_key: Some("test-token".into()),
-                timeout_ms: 8_000,
-                allow_remote_endpoint: true,
-                window_allowlist: vec!["Chrome".into(), "Visual Studio Code".into()],
-                max_coordinate_x: Some(3840),
-                max_coordinate_y: Some(2160),
             },
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
         assert_eq!(parsed.allowed_domains.len(), 2);
         assert_eq!(parsed.allowed_domains[0], "example.com");
-        assert_eq!(parsed.backend, "auto");
-        assert!(!parsed.native_headless);
-        assert_eq!(parsed.native_webdriver_url, "http://localhost:4444");
-        assert_eq!(parsed.native_chrome_path.as_deref(), Some("/usr/bin/chromium"));
-        assert_eq!(
-            parsed.computer_use.endpoint,
-            "https://computer-use.example.com/v1/actions"
-        );
         assert_eq!(parsed.computer_use.api_key.as_deref(), Some("test-token"));
-        assert_eq!(parsed.computer_use.timeout_ms, 8_000);
-        assert!(parsed.computer_use.allow_remote_endpoint);
-        assert_eq!(parsed.computer_use.window_allowlist.len(), 2);
-        assert_eq!(parsed.computer_use.max_coordinate_x, Some(3840));
-        assert_eq!(parsed.computer_use.max_coordinate_y, Some(2160));
     }
 
     #[test]
@@ -7733,7 +7619,6 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.browser.enabled);
         assert!(parsed.browser.allowed_domains.is_empty());
     }
 

@@ -620,14 +620,7 @@ pub async fn run_gateway(
     // reaction support so the tool is still available for text/file messages.
     if let Some(ref sc) = signal_channel {
         let msg_send_tool = tools::MessageSendTool::new_signal(sc.clone(), security.clone());
-        let dr_handle = msg_send_tool.default_recipient_handle();
         tools_list.push(Box::new(msg_send_tool));
-        // Also register standalone tts tool sharing the same channel + recipient slot.
-        tools_list.push(Box::new(tools::TtsTool::new(
-            sc.clone() as Arc<dyn crate::channels::traits::Channel>,
-            dr_handle,
-            security.clone(),
-        )));
     }
 
     // Linq channel (if configured). Built here (ahead of the spawn tool) so it can

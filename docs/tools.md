@@ -1,14 +1,13 @@
 # Tools
 
-43 built-in tools organized by category.
+38 built-in tools organized by category.
 
 | Category | Tools |
 |----------|-------|
 | **Shell & Files** | `shell`, `file_read`, `file_write`, `git_operations` |
 | **Web** | `web_search`, `web_fetch`, `http_request` |
-| **Browser** | `browser` (automation), `browser_open`, `screenshot`, `canvas` |
 | **Memory** | `memory_store`, `memory_recall`, `memory_search`, `memory_get`, `memory_forget` |
-| **Messaging** | `message_send`, `tts` (text-to-speech) |
+| **Messaging** | `message_send` |
 | **Sessions** | `sessions_spawn`, `sessions_send`, `sessions_list`, `sessions_history`, `session_status`, `subagents`, `delegate` |
 | **Scheduling** | `cron` (unified — actions: add/schedule, once, list, get, remove/cancel, update/patch, run, runs/history, events, pause, resume, status) |
 | **Images** | `image`, `image_info` |

@@ -10,7 +10,7 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 - **LLM Router** — heuristic routing (capability + Elo + cost + latency), KNN semantic routing (cold-start guard + 100ms timeout fallback), and Automix low-confidence auto-upgrade
 - **Causal Tree Engine** — speculative multi-branch prediction with rehearsal, scoring, and circuit breaker; opt-in via `causal_tree.enabled` (disabled by default)
 - **19 messaging channels** — Signal, WhatsApp, Telegram, Discord, Slack, Matrix, and more
-- **43+ built-in tools** — shell, browser, MCP, memory, scheduling, remote nodes
+- **38+ built-in tools** — shell, MCP, memory, scheduling, remote nodes
 - **Xin (心) task engine** — autonomous heartbeat scheduler with 3 execution modes (Rust/LLM/Shell), 5 built-in system tasks, SQLite persistence
 - **Web Console** — browser-based management interface (`console/`)
 - **Remote Nodes** — control macOS/Linux/Pi devices via `prx-node` agent
@@ -67,7 +67,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 ## Architecture
 
 ```
-         Channels (19)          Tools (43+)           Remote Nodes
+         Channels (19)          Tools (38+)           Remote Nodes
     Signal · WA · TG · ...    Shell · MCP · ...     macOS · Pi · ...
               │                      │                     │
               ▼                      ▼                     ▼
@@ -86,7 +86,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 |-------|-------------|
 | [Providers](docs/providers.md) | 9 LLM providers, fallback chains, token refresh |
 | [Channels](docs/channels.md) | 19 messaging platforms, DM/group policies |
-| [Tools](docs/tools.md) | 43 built-in tools, hooks system, webhooks |
+| [Tools](docs/tools.md) | 38 built-in tools, hooks system, webhooks |
 | [Remote Nodes](docs/remote-nodes.md) | `prx-node` agent, device pairing, JSON-RPC |
 | [Web Console](docs/web-console.md) | Browser-based management interface |
 | [Evolution](docs/evolution.md) | Self-improvement pipeline |

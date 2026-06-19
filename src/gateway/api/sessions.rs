@@ -202,9 +202,6 @@ fn console_tool_descriptions(config: &crate::config::Config) -> Vec<(&'static st
         ("document_search", "Search stored document chunks with source anchors"),
         ("document_get_chunk", "Read a stored document chunk by id"),
     ];
-    if config.browser.enabled {
-        tool_descs.push(("browser_open", "Open approved HTTPS URLs in Brave Browser"));
-    }
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute configured Composio app actions"));
     }

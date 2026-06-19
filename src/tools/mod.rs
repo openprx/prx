@@ -6,7 +6,7 @@
 //! `execute` method returning a structured [`ToolResult`].
 //!
 //! Tools are assembled into registries by [`default_tools`] (shell, file read/write)
-//! and [`all_tools`] (full set including memory, browser, cron, HTTP, delegation,
+//! and [`all_tools`] (full set including memory, cron, HTTP, delegation,
 //! and optional integrations). Security policy enforcement is injected via
 //! [`SecurityPolicy`](crate::security::SecurityPolicy) at construction time.
 //!
@@ -16,9 +16,6 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_list;
-pub mod browser;
-pub mod browser_open;
-pub mod canvas;
 pub mod composio;
 pub mod config_reload;
 pub mod cron;
@@ -47,7 +44,6 @@ pub mod nodes;
 pub mod proxy_config;
 pub mod pushover;
 pub mod schema;
-pub mod screenshot;
 pub mod session_status;
 pub mod sessions_history;
 pub mod sessions_list;
@@ -58,15 +54,11 @@ pub mod shell;
 pub mod stay_silent;
 pub mod subagents;
 pub mod traits;
-pub mod tts;
 pub mod web_fetch;
 pub mod web_search_tool;
 pub mod xin;
 
 pub use agents_list::AgentsListTool;
-pub use browser::{BrowserTool, ComputerUseConfig};
-pub use browser_open::BrowserOpenTool;
-pub use canvas::CanvasTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
@@ -92,7 +84,6 @@ pub use message_send::MessageSendTool;
 pub use nodes::NodesTool;
 pub use proxy_config::ProxyConfigTool;
 pub use pushover::PushoverTool;
-pub use screenshot::ScreenshotTool;
 pub use session_status::SessionStatusTool;
 pub use sessions_history::SessionsHistoryTool;
 pub use sessions_list::SessionsListTool;
@@ -103,7 +94,6 @@ pub use stay_silent::{STAY_SILENT_TOOL_NAME, StaySilentTool};
 pub use subagents::SubagentsTool;
 pub use traits::Tool;
 pub use traits::{ToolCategory, ToolResult, ToolSpec, ToolTier};
-pub use tts::TtsTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use xin::XinTool;
@@ -328,7 +318,6 @@ pub fn all_tools_with_runtime_ext(
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),
-        Arc::new(CanvasTool::new(security.clone())),
         Arc::new(ProxyConfigTool::new(shared_config.clone(), security.clone())),
         Arc::new(GitOperationsTool::new(security.clone(), workspace_dir.to_path_buf())),
         Arc::new(PushoverTool::new(security.clone(), workspace_dir.to_path_buf())),
@@ -340,7 +329,6 @@ pub fn all_tools_with_runtime_ext(
     ];
 
     // Vision tools are always available
-    tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
     // ── Scheduler tools ──
@@ -428,36 +416,7 @@ pub fn all_tools_with_runtime_ext(
         tracing::debug!("Integrations module disabled, skipping Composio tool registration");
     }
 
-    // ── Tools module gates browser, http_request, web_search, web_fetch ──
-    if modules.tools && browser_config.enabled {
-        // Add legacy browser_open tool for simple URL opening
-        tool_arcs.push(Arc::new(BrowserOpenTool::new(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-        )));
-        // Add full browser automation tool (pluggable backend)
-        tool_arcs.push(Arc::new(BrowserTool::new_with_backend(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-            browser_config.session_name.clone(),
-            browser_config.backend.clone(),
-            browser_config.native_headless,
-            browser_config.native_webdriver_url.clone(),
-            browser_config.native_chrome_path.clone(),
-            ComputerUseConfig {
-                endpoint: browser_config.computer_use.endpoint.clone(),
-                api_key: browser_config.computer_use.api_key.clone(),
-                timeout_ms: browser_config.computer_use.timeout_ms,
-                allow_remote_endpoint: browser_config.computer_use.allow_remote_endpoint,
-                window_allowlist: browser_config.computer_use.window_allowlist.clone(),
-                max_coordinate_x: browser_config.computer_use.max_coordinate_x,
-                max_coordinate_y: browser_config.computer_use.max_coordinate_y,
-            },
-        )));
-    } else if !modules.tools {
-        tracing::debug!("Tools module disabled, skipping browser tool registration");
-    }
-
+    // ── Tools module gates http_request, web_search, web_fetch ──
     if modules.tools && http_config.enabled {
         tool_arcs.push(Arc::new(HttpRequestTool::new(
             security.clone(),
@@ -651,9 +610,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig {
-            enabled: false,
             allowed_domains: vec!["example.com".into()],
-            session_name: None,
             ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
@@ -696,7 +653,10 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_includes_browser_when_enabled() {
+    fn all_tools_never_registers_removed_shell_shim_tools() {
+        // The five thin-shim tools (canvas/screenshot/browser/tts/browser_open)
+        // were removed in favour of the agent driving shell directly. They must
+        // never be registered, even with browser support enabled in config.
         let tmp = TempDir::new().unwrap();
         let security = Arc::new(SecurityPolicy::default());
         let mem_cfg = MemoryConfig {
@@ -706,9 +666,7 @@ mod tests {
         let mem: Arc<dyn Memory> = Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
 
         let browser = BrowserConfig {
-            enabled: true,
             allowed_domains: vec!["example.com".into()],
-            session_name: None,
             ..BrowserConfig::default()
         };
         let http = crate::config::HttpRequestConfig::default();
@@ -728,7 +686,14 @@ mod tests {
             &cfg,
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        assert!(names.contains(&"browser_open"));
+        for removed in ["canvas", "screenshot", "browser", "tts", "browser_open"] {
+            assert!(
+                !names.contains(&removed),
+                "removed shell-shim tool `{removed}` is still registered"
+            );
+        }
+        // The surviving native tools are unaffected by the removal.
+        assert!(names.contains(&"image_info"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
     }

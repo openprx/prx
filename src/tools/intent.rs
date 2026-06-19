@@ -40,7 +40,6 @@ impl IntentClassifier {
             ("push", ToolCategory::Communication),
             ("notify", ToolCategory::Communication),
             ("message", ToolCategory::Communication),
-            ("tts", ToolCategory::Communication),
             ("\u{8bed}\u{97f3}", ToolCategory::Communication),
             ("telegram", ToolCategory::Communication),
             ("discord", ToolCategory::Communication),
@@ -63,9 +62,7 @@ impl IntentClassifier {
             // Media
             ("\u{56fe}\u{7247}", ToolCategory::Media),
             ("image", ToolCategory::Media),
-            ("screenshot", ToolCategory::Media),
             ("\u{622a}\u{56fe}", ToolCategory::Media),
-            ("canvas", ToolCategory::Media),
             ("photo", ToolCategory::Media),
             // System / Automation
             ("session", ToolCategory::System),

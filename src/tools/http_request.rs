@@ -322,7 +322,7 @@ impl Tool for HttpRequestTool {
     }
 }
 
-// Helper functions similar to browser_open.rs
+// Helper functions for HTTP domain validation
 
 fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
     let mut normalized = domains

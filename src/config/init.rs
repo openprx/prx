@@ -1089,8 +1089,7 @@ fn tools_template(spec: Spec) -> String {
 # Browser, HTTP, web search, media, and skills
 
 [browser]
-enabled = false
-# headless = true
+# allowed_domains = []   # domains the web_fetch tool is allowed to fetch
 
 [http_request]
 enabled = true
@@ -1119,12 +1118,7 @@ auto_discover = true
 # Browser automation, HTTP requests, web search, media, skills, and skill RAG
 
 [browser]
-enabled = false
-# headless = true
-# [browser.computer_use]
-# enabled = false
-# display_width = 1280
-# display_height = 720
+# allowed_domains = []   # domains the web_fetch tool is allowed to fetch
 
 [http_request]
 enabled = true
