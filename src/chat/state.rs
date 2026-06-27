@@ -233,6 +233,9 @@ pub struct UiState {
     /// P2 active line-session viewport snapshot. `None` when the main chat or a
     /// PTY handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// Effective context window used by status bar budget display. This is a
+    /// UI hint denominator only; P5 owns hard tokenizer budgeting.
+    pub context_window_tokens: Option<usize>,
     /// 当前输入路由目标（v1.1b）。`Main` = 主 chat；`Session{seq}` = 已 attach
     /// 的后台 session（输入作为 steer）。由 chat 主循环经
     /// `Action::SessionFocusChanged` 在 /attach//detach 时写入；驱动提示符的
@@ -283,6 +286,8 @@ pub struct UiSnapshot {
     pub sessions_entries: Arc<Vec<crate::chat::sessions::SwitcherEntry>>,
     /// P2 active line-session viewport snapshot.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// Effective context window for UI-only status budget display.
+    pub context_window_tokens: Option<usize>,
     /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
@@ -309,6 +314,7 @@ impl UiSnapshot {
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
             active_session_view: None,
+            context_window_tokens: None,
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
         }
@@ -391,6 +397,7 @@ impl ChatState {
                 sessions_status: String::new(),
                 sessions_entries: Vec::new(),
                 active_session_view: None,
+                context_window_tokens: None,
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
             },
@@ -455,6 +462,7 @@ impl ChatState {
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
             active_session_view: self.ui.active_session_view.clone(),
+            context_window_tokens: self.ui.context_window_tokens,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
         }
@@ -499,7 +507,7 @@ impl ChatState {
     /// 内容字节级变化敏感（如 streaming chunk 累积）— streaming 的内容变化由
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
-    fn snapshot_dirty_fields(&self) -> (usize, u64, bool, u64, usize) {
+    fn snapshot_dirty_fields(&self) -> (usize, u64, bool, u64, usize, Option<usize>) {
         let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
         (
             self.ui.conversation_lines.len(),
@@ -507,6 +515,7 @@ impl ChatState {
             self.stream.draft.is_some(),
             draft_ver,
             self.ui.input.lines.len(),
+            self.ui.context_window_tokens,
         )
     }
 
@@ -639,6 +648,9 @@ impl ChatState {
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
             Action::SessionsEntriesUpdated { entries } => self.reduce_sessions_entries_updated(entries),
             Action::ActiveSessionViewUpdated { view } => self.reduce_active_session_view_updated(view),
+            Action::ContextWindowUpdated { max_context_tokens } => {
+                self.reduce_context_window_updated(max_context_tokens)
+            }
             Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
@@ -1735,6 +1747,14 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    fn reduce_context_window_updated(&mut self, max_context_tokens: Option<usize>) -> Vec<Effect> {
+        if self.ui.context_window_tokens == max_context_tokens {
+            return Vec::new();
+        }
+        self.ui.context_window_tokens = max_context_tokens;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
     /// summary into `session.background_sessions` and **immediately emit
     /// `Effect::SaveSession`** so the summary is durably persisted to the memory
@@ -2033,7 +2053,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // identical writes, so this never churns frames.
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
-        | Action::ActiveSessionViewUpdated { .. } => true,
+        | Action::ActiveSessionViewUpdated { .. }
+        | Action::ContextWindowUpdated { .. } => true,
         // v1.1b: focus + switcher are snapshot fields driving the prompt
         // indicator and switcher overlay → dirty. Each reducer no-ops identical
         // writes so unchanged state never churns frames.
@@ -2195,6 +2216,34 @@ mod tests {
         let effects = state.reduce(Action::ActiveSessionViewUpdated { view: None });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.active_session_view.is_none());
+    }
+
+    /// P4c: ContextWindowUpdated writes status-bar window metadata to both the
+    /// live UI state and UiSnapshot, with identical writes deduped.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn context_window_updated_writes_snapshot_and_dedups() {
+        let mut state = make_state();
+        assert_eq!(state.ui.context_window_tokens, None);
+
+        let effects = state.reduce(Action::ContextWindowUpdated {
+            max_context_tokens: Some(10_000_000),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_window_tokens, Some(10_000_000));
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.context_window_tokens, Some(10_000_000));
+
+        let effects = state.reduce(Action::ContextWindowUpdated {
+            max_context_tokens: Some(10_000_000),
+        });
+        assert!(effects.is_empty(), "identical context window must not redraw");
+
+        let effects = state.reduce(Action::ContextWindowUpdated {
+            max_context_tokens: None,
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_window_tokens, None);
     }
 
     /// v1.1b: SessionFocusChanged writes ui.focus + flows to the snapshot; an

@@ -190,6 +190,28 @@ fn estimate_chat_history_tokens(history: &[ChatMessage]) -> usize {
         / 4
 }
 
+fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    let has_system = history.first().is_some_and(|msg| msg.role == "system");
+    let start = if has_system { 1 } else { 0 };
+    let mut source = Vec::new();
+    if let Some(system) = history.first().filter(|_| has_system) {
+        source.push(ChatMessage::system(truncate_with_ellipsis(
+            &system.content,
+            COMPACT_CONTENT_CHARS,
+        )));
+    }
+    let non_system = history.len().saturating_sub(start);
+    let keep_start = start + non_system.saturating_sub(COMPACT_KEEP_MESSAGES);
+    for msg in history.iter().skip(keep_start) {
+        let content = truncate_with_ellipsis(&msg.content, COMPACT_CONTENT_CHARS);
+        source.push(ChatMessage {
+            role: msg.role.clone(),
+            content,
+        });
+    }
+    source
+}
+
 async fn persist_legacy_chat_compaction_audit(
     mem: &dyn Memory,
     envelope: &RuntimeEnvelope,
@@ -3349,6 +3371,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
             &config.model_routes,
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+        #[cfg(feature = "terminal-tui")]
+        if redraw_tx_for_main.is_some() {
+            let context_window_tokens = Some(effective_compaction.config.max_context_tokens);
+            chat_mirror.lock().context_window_tokens = context_window_tokens;
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::ContextWindowUpdated {
+                    max_context_tokens: context_window_tokens,
+                },
+                "chat.context_window_updated",
+            );
+        }
 
         let route_decision = RouteDecision::from_model_routes_for_context(
             provider_name,
@@ -3711,7 +3744,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
                     // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
                     // 重试会拿同一份未压缩的 history 二次失败。
-                    let source_history = history.clone();
+                    let source_history = bounded_legacy_chat_compaction_audit_source(&history);
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::HistoryCompacted {
                             reason: crate::chat::action::CompactReason::ContextOverflow,
@@ -6164,6 +6197,27 @@ mod legacy_chat_compaction_audit_tests {
     use super::*;
     use crate::memory::SqliteMemory;
     use tempfile::TempDir;
+
+    #[test]
+    fn legacy_chat_compaction_audit_source_is_bounded() {
+        let mut source_history = vec![ChatMessage::system("system rules ".repeat(200))];
+        for idx in 0..20 {
+            source_history.push(ChatMessage::user(format!("turn {idx} {}", "payload ".repeat(200))));
+        }
+
+        let bounded = bounded_legacy_chat_compaction_audit_source(&source_history);
+        assert_eq!(bounded.first().map(|msg| msg.role.as_str()), Some("system"));
+        assert!(
+            bounded.len() <= COMPACT_KEEP_MESSAGES + 1,
+            "audit projection should not retain every historical turn"
+        );
+        assert!(
+            bounded
+                .iter()
+                .all(|msg| msg.content.chars().count() <= COMPACT_CONTENT_CHARS + 3),
+            "audit projection should truncate each retained message"
+        );
+    }
 
     #[tokio::test]
     async fn legacy_chat_compaction_persists_run_and_summary_memory() {

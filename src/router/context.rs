@@ -1,5 +1,7 @@
 use crate::config::{AgentCompactionConfig, ModelRouteConfig, RouterConfig, RouterModelConfig};
 
+pub const KERNEL_SUPPORTED_CONTEXT_TOKENS: usize = 10_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContextWindowSource {
     AgentCompactionOverride,
@@ -13,6 +15,9 @@ pub struct EffectiveCompactionConfig {
     pub config: AgentCompactionConfig,
     pub max_context_source: ContextWindowSource,
     pub model_context_tokens: Option<usize>,
+    pub requested_context_tokens: Option<usize>,
+    pub kernel_supported_tokens: usize,
+    pub kernel_capped: bool,
     pub selected_provider: String,
     pub selected_model: String,
 }
@@ -27,10 +32,15 @@ pub fn resolve_effective_compaction_config(
     let (selected_provider, selected_model) = resolve_selected_model(provider, model, model_routes);
 
     if base.max_context_tokens_explicit {
+        let capped = cap_to_kernel(base.max_context_tokens);
+        let mut config = base.clone();
+        config.max_context_tokens = capped.effective;
         return resolved(
-            base.clone(),
+            config,
             ContextWindowSource::AgentCompactionOverride,
-            Some(base.max_context_tokens),
+            Some(capped.effective),
+            Some(capped.requested),
+            capped.kernel_capped,
             selected_provider,
             selected_model,
         );
@@ -61,6 +71,8 @@ pub fn resolve_effective_compaction_config(
         base.clone(),
         ContextWindowSource::FallbackDefault,
         None,
+        None,
+        false,
         selected_provider,
         selected_model,
     )
@@ -71,6 +83,9 @@ pub fn trace_effective_compaction_resolution(resolution: &EffectiveCompactionCon
         provider = resolution.selected_provider.as_str(),
         model = resolution.selected_model.as_str(),
         max_context_tokens = resolution.config.max_context_tokens,
+        requested_context_tokens = resolution.requested_context_tokens,
+        kernel_supported_tokens = resolution.kernel_supported_tokens,
+        kernel_capped = resolution.kernel_capped,
         source = ?resolution.max_context_source,
         override_honored = matches!(
             resolution.max_context_source,
@@ -87,22 +102,46 @@ fn with_model_context(
     selected_provider: String,
     selected_model: String,
 ) -> EffectiveCompactionConfig {
+    let capped = cap_to_kernel(max_context_tokens);
     let mut config = base.clone();
-    config.max_context_tokens = max_context_tokens;
+    config.max_context_tokens = capped.effective;
     config.max_context_tokens_explicit = false;
     resolved(
         config,
         source,
-        Some(max_context_tokens),
+        Some(capped.effective),
+        Some(capped.requested),
+        capped.kernel_capped,
         selected_provider,
         selected_model,
     )
+}
+
+struct CappedContext {
+    requested: usize,
+    effective: usize,
+    kernel_capped: bool,
+}
+
+const fn cap_to_kernel(tokens: usize) -> CappedContext {
+    let effective = if tokens > KERNEL_SUPPORTED_CONTEXT_TOKENS {
+        KERNEL_SUPPORTED_CONTEXT_TOKENS
+    } else {
+        tokens
+    };
+    CappedContext {
+        requested: tokens,
+        effective,
+        kernel_capped: tokens > KERNEL_SUPPORTED_CONTEXT_TOKENS,
+    }
 }
 
 const fn resolved(
     config: AgentCompactionConfig,
     max_context_source: ContextWindowSource,
     model_context_tokens: Option<usize>,
+    requested_context_tokens: Option<usize>,
+    kernel_capped: bool,
     selected_provider: String,
     selected_model: String,
 ) -> EffectiveCompactionConfig {
@@ -110,6 +149,9 @@ const fn resolved(
         config,
         max_context_source,
         model_context_tokens,
+        requested_context_tokens,
+        kernel_supported_tokens: KERNEL_SUPPORTED_CONTEXT_TOKENS,
+        kernel_capped,
         selected_provider,
         selected_model,
     }
@@ -195,6 +237,39 @@ mod tests {
         assert_eq!(result.config.max_context_tokens, 1_000_000);
         assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
         assert_eq!(result.model_context_tokens, Some(1_000_000));
+        assert_eq!(result.requested_context_tokens, Some(1_000_000));
+        assert_eq!(result.kernel_supported_tokens, 10_000_000);
+        assert!(!result.kernel_capped);
+    }
+
+    #[test]
+    fn resolves_10m_configured_router_model() {
+        let router = router_with_model("openrouter", "ten-m", 10_000_000);
+        let result =
+            resolve_effective_compaction_config(&AgentCompactionConfig::default(), "openrouter", "ten-m", &router, &[]);
+        assert_eq!(result.config.max_context_tokens, 10_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
+        assert_eq!(result.model_context_tokens, Some(10_000_000));
+        assert_eq!(result.requested_context_tokens, Some(10_000_000));
+        assert!(!result.kernel_capped);
+    }
+
+    #[test]
+    fn caps_context_windows_at_kernel_limit() {
+        let router = router_with_model("openrouter", "too-wide", 20_000_000);
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "openrouter",
+            "too-wide",
+            &router,
+            &[],
+        );
+        assert_eq!(result.config.max_context_tokens, 10_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
+        assert_eq!(result.model_context_tokens, Some(10_000_000));
+        assert_eq!(result.requested_context_tokens, Some(20_000_000));
+        assert_eq!(result.kernel_supported_tokens, 10_000_000);
+        assert!(result.kernel_capped);
     }
 
     #[test]
@@ -209,6 +284,25 @@ mod tests {
         assert_eq!(result.config.max_context_tokens, 128_000);
         assert_eq!(result.max_context_source, ContextWindowSource::AgentCompactionOverride);
         assert_eq!(result.model_context_tokens, Some(128_000));
+        assert_eq!(result.requested_context_tokens, Some(128_000));
+        assert!(!result.kernel_capped);
+    }
+
+    #[test]
+    fn caps_explicit_override_at_kernel_limit_preserving_source() {
+        let router = router_with_model("openrouter", "small", 128_000);
+        let mut base = AgentCompactionConfig {
+            max_context_tokens: 20_000_000,
+            ..AgentCompactionConfig::default()
+        };
+        base.max_context_tokens_explicit = true;
+        let result = resolve_effective_compaction_config(&base, "openrouter", "small", &router, &[]);
+        assert_eq!(result.config.max_context_tokens, 10_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::AgentCompactionOverride);
+        assert_eq!(result.model_context_tokens, Some(10_000_000));
+        assert_eq!(result.requested_context_tokens, Some(20_000_000));
+        assert_eq!(result.kernel_supported_tokens, 10_000_000);
+        assert!(result.kernel_capped);
     }
 
     #[test]
@@ -299,5 +393,7 @@ mod tests {
         );
         assert_eq!(result.max_context_source, ContextWindowSource::FallbackDefault);
         assert_eq!(result.model_context_tokens, None);
+        assert_eq!(result.requested_context_tokens, None);
+        assert!(!result.kernel_capped);
     }
 }

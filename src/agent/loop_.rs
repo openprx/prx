@@ -821,6 +821,34 @@ fn build_compaction_transcript(messages: &[ChatMessage]) -> String {
     }
 }
 
+fn bounded_compaction_projection(messages: &[ChatMessage]) -> Vec<ChatMessage> {
+    let mut projected = Vec::new();
+    let mut retained_chars = 0usize;
+    for msg in messages {
+        if retained_chars >= COMPACTION_MAX_SOURCE_CHARS {
+            break;
+        }
+        let remaining = COMPACTION_MAX_SOURCE_CHARS.saturating_sub(retained_chars);
+        let role_chars = msg.role.chars().count();
+        let content_budget = remaining.saturating_sub(role_chars.saturating_add(4));
+        if content_budget == 0 {
+            break;
+        }
+        let content = if msg.content.chars().count() > content_budget {
+            truncate_with_ellipsis(&msg.content, content_budget)
+        } else {
+            msg.content.clone()
+        };
+        retained_chars =
+            retained_chars.saturating_add(role_chars.saturating_add(content.chars().count()).saturating_add(4));
+        projected.push(ChatMessage {
+            role: msg.role.clone(),
+            content,
+        });
+    }
+    projected
+}
+
 fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compact_end: usize, summary: &str) {
     let summary_msg = ChatMessage::assistant(format!("[Compaction summary]\n{}", summary.trim()));
     history.splice(start..compact_end, std::iter::once(summary_msg));
@@ -1087,13 +1115,19 @@ async fn apply_configurable_compaction(
         return Ok(false);
     }
     let compact_end = start + compact_count;
-    let to_compact = history.get(start..compact_end).map(|s| s.to_vec()).unwrap_or_default();
+    let source_projection = history
+        .get(start..compact_end)
+        .map(bounded_compaction_projection)
+        .unwrap_or_default();
+    if source_projection.is_empty() {
+        return Ok(false);
+    }
     let timestamp = chrono::Utc::now().to_rfc3339();
 
     if config.memory_flush {
         let flush_prompt = format!(
             "Write a concise memory flush message (max 6 bullets) capturing durable facts, decisions, and unresolved tasks from this history:\n\n{}",
-            build_compaction_transcript(&to_compact)
+            build_compaction_transcript(&source_projection)
         );
         let flush_note = provider
             .chat_with_system(
@@ -1115,7 +1149,7 @@ async fn apply_configurable_compaction(
 
     let summary = match config.mode {
         crate::config::AgentCompactionMode::Safeguard => {
-            let transcript = build_compaction_transcript(&to_compact);
+            let transcript = build_compaction_transcript(&source_projection);
             let structured_prompt = format!(
                 "Summarize this conversation into a structured context summary. \
                  You MUST include ALL of these sections (use ## headers):\n\
@@ -1189,7 +1223,7 @@ async fn apply_configurable_compaction(
                 "Aggressive compaction removed {} older messages; retained {} recent messages.",
                 compact_count, keep_recent
             );
-            if let Some(last_user) = to_compact.iter().rev().find(|m| m.role == "user") {
+            if let Some(last_user) = source_projection.iter().rev().find(|m| m.role == "user") {
                 summary.push_str(" Last preserved user intent: ");
                 summary.push_str(&truncate_with_ellipsis(&last_user.content, 240));
             }
@@ -1197,8 +1231,16 @@ async fn apply_configurable_compaction(
         }
         crate::config::AgentCompactionMode::Off => return Ok(false),
     };
-    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, &to_compact);
-    persist_compaction_audit(audit, trigger, &config.mode, &to_compact, &summary, fidelity_status).await;
+    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, &source_projection);
+    persist_compaction_audit(
+        audit,
+        trigger,
+        &config.mode,
+        &source_projection,
+        &summary,
+        fidelity_status,
+    )
+    .await;
 
     history.splice(
         start..compact_end,
@@ -1296,16 +1338,16 @@ async fn apply_os_paging(
         return Ok(false);
     }
     let evict_end = start + evict_count;
-    let to_evict = history
-        .get(start..evict_end)
-        .map(<[ChatMessage]>::to_vec)
-        .unwrap_or_default();
+    let Some(to_evict) = history.get(start..evict_end) else {
+        return Ok(false);
+    };
     if to_evict.is_empty() {
         return Ok(false);
     }
 
-    let transcript = build_page_transcript(&to_evict);
-    let token_count = estimate_history_tokens(&to_evict);
+    let transcript = build_page_transcript(to_evict);
+    let token_count = estimate_history_tokens(to_evict);
+    let evicted_message_count = to_evict.len();
     let timestamp = chrono::Utc::now().to_rfc3339();
     let session_key = runtime.session_key.clone().unwrap_or_else(|| "session".to_string());
     // Stable, content-addressed page id so identical evictions are idempotent.
@@ -1334,7 +1376,7 @@ async fn apply_os_paging(
         source_message_event_id: runtime.source_message_event_id.clone(),
         source_kind: OS_PAGING_SOURCE_KIND.to_string(),
         source_uri: Some(format!("context-page:{session_key}")),
-        title: Some(format!("Paged context ({} messages)", to_evict.len())),
+        title: Some(format!("Paged context ({evicted_message_count} messages)")),
         content: transcript,
         mime_type: Some("text/plain".to_string()),
         visibility: runtime.visibility.clone(),
@@ -1345,7 +1387,7 @@ async fn apply_os_paging(
         Ok(document) => {
             tracing::info!(
                 document_id = %document.document_id,
-                messages = to_evict.len(),
+                messages = evicted_message_count,
                 token_count,
                 "os-paging: evicted cold context to document store"
             );
@@ -1371,7 +1413,7 @@ async fn apply_os_paging(
         std::iter::once(ChatMessage::assistant(format!(
             "{OS_PAGING_EVICT_MARKER} {timestamp}. {} older messages moved to durable page store \
              (id: {document_id}); relevant excerpts are recalled automatically when needed.]",
-            to_evict.len()
+            evicted_message_count
         ))),
     );
 
@@ -1556,12 +1598,20 @@ async fn auto_compact_history(
     }
 
     let compact_end = start + compact_count;
-    let to_compact: Vec<ChatMessage> = history.get(start..compact_end).map(|s| s.to_vec()).unwrap_or_default();
+    let source_projection = history
+        .get(start..compact_end)
+        .map(bounded_compaction_projection)
+        .unwrap_or_default();
+    if source_projection.is_empty() {
+        return Ok(false);
+    }
 
     // Pre-compaction flush: extract and persist key facts before they are lost.
-    pre_compaction_flush(&to_compact, mem, provider, model).await.ok(); // soft failure — never block compaction
+    pre_compaction_flush(&source_projection, mem, provider, model)
+        .await
+        .ok(); // soft failure — never block compaction
 
-    let transcript = build_compaction_transcript(&to_compact);
+    let transcript = build_compaction_transcript(&source_projection);
 
     let summarizer_system = "You are a conversation compaction engine. Summarize older chat history into concise context for future turns. Preserve: user preferences, commitments, decisions, unresolved tasks, key facts. Omit: filler, repeated chit-chat, verbose tool logs. Output plain text bullet points only.";
 
@@ -8772,6 +8822,38 @@ ls -la
                 .is_some_and(|value| value.len() == 64)
         );
         assert!(refs[0]["chunks"].as_u64().unwrap_or_default() >= 1);
+    }
+
+    #[test]
+    fn bounded_compaction_projection_caps_large_source_before_summary() {
+        let huge = "large-context ".repeat(COMPACTION_MAX_SOURCE_CHARS);
+        let messages = vec![
+            ChatMessage::user(huge.clone()),
+            ChatMessage::assistant(huge.clone()),
+            ChatMessage::user(huge),
+        ];
+
+        let projected = bounded_compaction_projection(&messages);
+        assert!(!projected.is_empty(), "projection should retain bounded context");
+        let projected_chars: usize = projected
+            .iter()
+            .map(|message| message.role.chars().count() + message.content.chars().count() + 4)
+            .sum();
+        assert!(
+            projected_chars <= COMPACTION_MAX_SOURCE_CHARS + 16,
+            "projection must stay bounded before provider/audit prompts, got {projected_chars}"
+        );
+        assert!(
+            projected
+                .iter()
+                .map(|message| message.content.chars().count())
+                .sum::<usize>()
+                < messages
+                    .iter()
+                    .map(|message| message.content.chars().count())
+                    .sum::<usize>(),
+            "projection must not retain a full clone of the source history"
+        );
     }
 
     #[tokio::test]

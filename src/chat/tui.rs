@@ -115,6 +115,8 @@ pub struct TuiState {
     /// P2 active line-session viewport snapshot. `None` when main chat or PTY
     /// handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// Effective context window for UI-only status budget display.
+    pub context_window_tokens: Option<usize>,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -1037,6 +1039,7 @@ impl TuiState {
             switcher: None,
             sessions_cache: Vec::new(),
             active_session_view: None,
+            context_window_tokens: None,
         }
     }
 
@@ -1630,6 +1633,8 @@ pub trait BottomChromeView {
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
     /// Focused line-session viewport (P2), if any.
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
+    /// Effective context window for UI-only status budget display.
+    fn context_window_tokens(&self) -> Option<usize>;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
     /// target indicator (`main >` vs `agent #N ▸`).
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
@@ -1670,6 +1675,9 @@ impl BottomChromeView for TuiState {
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
+    }
+    fn context_window_tokens(&self) -> Option<usize> {
+        self.context_window_tokens
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -1712,6 +1720,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
+    }
+    fn context_window_tokens(&self) -> Option<usize> {
+        self.context_window_tokens
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -2255,30 +2266,52 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
     };
 
     let token_estimate = estimate_visible_token_usage(state);
+    let budget = render_token_budget(token_estimate, state.context_window_tokens());
     let full = format!(
-        " PRX Chat | {}/{} | {} | {} turns | ~{} tok ",
+        " PRX Chat | {}/{} | {} | {} turns | {budget} ",
         state.provider(),
         state.model(),
         title,
         state.turn_count(),
-        token_estimate
     );
     if full.chars().count() <= usize::from(width) {
         return full;
     }
 
-    let compact = format!(
-        " PRX Chat | {}/{} | ~{} tok ",
-        state.provider(),
-        state.model(),
-        token_estimate
-    );
+    let compact = format!(" PRX Chat | {}/{} | {budget} ", state.provider(), state.model());
     if compact.chars().count() <= usize::from(width) {
         return compact;
     }
 
-    let minimal = format!(" PRX | ~{} tok ", token_estimate);
+    let minimal = format!(" PRX | {budget} ");
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
+}
+
+fn render_token_budget(used_tokens: usize, window_tokens: Option<usize>) -> String {
+    let Some(window) = window_tokens.filter(|tokens| *tokens > 0) else {
+        return format!("~{used_tokens} tok");
+    };
+    let clamped_used = used_tokens.min(window);
+    let percent = clamped_used
+        .saturating_mul(100)
+        .saturating_add(window.saturating_sub(1))
+        / window;
+    format!(
+        "~{} / {} tok ({}%)",
+        format_token_count(used_tokens),
+        format_token_count(window),
+        percent.min(100)
+    )
+}
+
+fn format_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 /// Rough current-token estimate for the TUI status bar.
@@ -5478,6 +5511,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn status_bar_renders_context_window_percentage() {
+        let mut state = TuiState::new("provider", "model");
+        state.session_title = "budget".to_string();
+        state.context_window_tokens = Some(1_000_000);
+        state.push_user_message(&"x".repeat(80_000));
+
+        let line = render_status_bar_text(&state, 120);
+        assert!(
+            line.contains("~20k / 1M tok (2%)"),
+            "status should include used/window percentage: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_10m_window_without_raw_integer() {
+        let mut state = TuiState::new("provider", "model");
+        state.context_window_tokens = Some(10_000_000);
+        state.push_user_message(&"x".repeat(40_000));
+
+        let line = render_status_bar_text(&state, 120);
+        assert!(line.contains("/ 10M tok"), "10M window should be compact: {line}");
+        assert!(
+            !line.contains("10000000"),
+            "10M window must not render as a raw integer: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_context_window_percentage_is_panic_safe() {
+        assert_eq!(render_token_budget(42, Some(0)), "~42 tok");
+        assert_eq!(render_token_budget(2_000_000, Some(1_000_000)), "~2M / 1M tok (100%)");
+        assert_eq!(render_token_budget(42, None), "~42 tok");
+    }
+
     // ── CJK / wide-char rendering regression tests ───────────────────────
     //
     // These tests guard against the phantom-space bug that appeared in TUI
@@ -5698,6 +5766,7 @@ mod tests {
                 title: "non-empty parity session".to_string(),
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
+            state.ui.context_window_tokens = Some(10_000_000);
             let active_view = crate::chat::sessions::ActiveSessionView {
                 seq: 7,
                 kind: "agent".to_string(),
@@ -5718,6 +5787,7 @@ mod tests {
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
             tui.active_session_view = Some(active_view);
+            tui.context_window_tokens = Some(10_000_000);
 
             assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
             assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
@@ -5752,6 +5822,10 @@ mod tests {
             assert_eq!(
                 BottomChromeView::active_session_view(&tui),
                 BottomChromeView::active_session_view(&snap)
+            );
+            assert_eq!(
+                BottomChromeView::context_window_tokens(&tui),
+                BottomChromeView::context_window_tokens(&snap)
             );
         }
 

@@ -649,6 +649,10 @@ fn test_chat_plain_mode_no_ansi() {
         !captured.contains("PRX Chat |") && !captured.contains("Ctrl+G sessions") && !captured.contains("attached #"),
         "--plain must not render TUI chrome or child viewport headers; captured:\n{captured}"
     );
+    assert!(
+        !captured.contains("/ 1M tok") && !captured.contains("/ 10M tok"),
+        "--plain must not render status-bar context window chrome; captured:\n{captured}"
+    );
 
     session.send("/exit\r").expect("send /exit");
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
