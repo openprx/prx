@@ -69,7 +69,8 @@ pub mod tui;
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
     build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, run_tool_call_loop_traced, select_prompt_skills,
+    is_tool_loop_cancelled, measure_history_tokens, plan_context_budget, run_tool_call_loop_traced,
+    select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -183,11 +184,42 @@ fn compact_chat_history(history: &mut Vec<ChatMessage>) {
 }
 
 fn estimate_chat_history_tokens(history: &[ChatMessage]) -> usize {
-    history
-        .iter()
-        .map(|msg| msg.role.chars().count() + msg.content.chars().count() + 12)
-        .sum::<usize>()
-        / 4
+    measure_history_tokens(history)
+}
+
+fn format_compact_token_count(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_compact_feedback(
+    turns_before: usize,
+    turns_after: usize,
+    tokens_before: usize,
+    tokens_after: usize,
+    model_window_tokens: usize,
+) -> String {
+    let reclaimed = tokens_before.saturating_sub(tokens_after);
+    let reclaim_pct = if tokens_before == 0 {
+        0
+    } else {
+        reclaimed.saturating_mul(100).saturating_div(tokens_before).min(100)
+    };
+    let window = format_compact_token_count(model_window_tokens);
+    if turns_before == turns_after && tokens_before == tokens_after {
+        format!(
+            "Context already compact: {turns_after} turns / ~{tokens_after} tokens / {window} window (nothing to drop)."
+        )
+    } else {
+        format!(
+            "Compacted context: {turns_before} -> {turns_after} turns, ~{tokens_before} -> ~{tokens_after} tokens / {window} window; reclaimed ~{reclaimed} tokens ({reclaim_pct}%)."
+        )
+    }
 }
 
 fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -447,6 +479,19 @@ mod compact_command_tests {
         // A 1-turn history is already compact — nothing to drop.
         assert_eq!(history.len(), 2);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn compact_command_reports_window_and_reclaim_delta() {
+        let text = format_compact_feedback(20, 12, 10_000, 4_000, 1_000_000);
+
+        assert!(text.contains("20 -> 12 turns"), "turn delta missing: {text}");
+        assert!(text.contains("~10000 -> ~4000 tokens"), "token delta missing: {text}");
+        assert!(text.contains("1M window"), "model window missing: {text}");
+        assert!(
+            text.contains("reclaimed ~6000 tokens (60%)"),
+            "reclaim delta missing: {text}"
+        );
     }
 }
 
@@ -2331,6 +2376,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // automatic compaction stay byte-for-byte identical. Reports the turn /
         // token delta so the user can see the effect on the context window.
         if matches!(user_input.as_str(), "/compact") {
+            let compact_context = crate::router::resolve_effective_compaction_config(
+                &config.agent.compaction,
+                provider_name,
+                model_name,
+                &config.router,
+                &config.model_routes,
+            );
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
@@ -2346,13 +2398,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 "chat.history_compacted_manual",
             );
 
-            let msg = if turns_before == turns_after && tokens_before == tokens_after {
-                format!("Context already compact: {turns_after} turns / ~{tokens_after} tokens (nothing to drop).")
-            } else {
-                format!(
-                    "Compacted context: {turns_before} → {turns_after} turns, ~{tokens_before} → ~{tokens_after} tokens."
-                )
-            };
+            let msg = format_compact_feedback(
+                turns_before,
+                turns_after,
+                tokens_before,
+                tokens_after,
+                compact_context.config.max_context_tokens,
+            );
             emit_chat_output(&msg);
             continue;
         }
@@ -3381,6 +3433,21 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 },
                 "chat.context_window_updated",
             );
+            let budget = plan_context_budget(
+                &history,
+                &effective_compaction.config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            if budget.over_warning {
+                let warning = format!(
+                    "Context budget warning: ~{} / {} tokens used (window {}, reserve {}).",
+                    budget.used_tokens, budget.available_input_tokens, budget.max_context_tokens, budget.reserve_tokens
+                );
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::SystemMessageAdded { text: warning },
+                    "chat.context_budget_warning",
+                );
+            }
         }
 
         let route_decision = RouteDecision::from_model_routes_for_context(
@@ -3501,6 +3568,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 crate::chat::action::Action::StartLLMTurn {
                     draft_id: d_id.clone(),
                     history: history.clone(),
+                    compaction_config: Some(effective_compaction.config.clone()),
                     cancel: cancellation.clone(),
                     turn_spawn_ctx: Some(redux_turn_spawn_ctx),
                 },

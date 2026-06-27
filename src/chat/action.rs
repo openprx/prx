@@ -102,6 +102,9 @@ pub enum Action {
     StartLLMTurn {
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
+        /// P5 proactive budgeting: resolved context budget for this turn.
+        /// `None` keeps tests and non-chat callers budget-neutral.
+        compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         /// D8-4 (redux path): the turn-root spawn execution context seeded by
         /// `chat::run` for this turn. Threaded through the reducer into

@@ -80,6 +80,9 @@ pub enum Effect {
     StartTurn {
         draft_id: String,
         history: Vec<ChatMessage>,
+        /// P5 proactive budgeting config resolved from the selected model
+        /// window. The streaming driver uses it for preflight/mid-turn trims.
+        compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         /// BUG-09: the interactive chat mode in effect for this turn. The driver
         /// (`drive_start_turn_stream`) uses it to intercept write/shell/git
@@ -593,9 +596,10 @@ impl ChatState {
             Action::StartLLMTurn {
                 draft_id,
                 history,
+                compaction_config,
                 cancel,
                 turn_spawn_ctx,
-            } => self.reduce_start_llm_turn(draft_id, history, cancel, turn_spawn_ctx),
+            } => self.reduce_start_llm_turn(draft_id, history, compaction_config, cancel, turn_spawn_ctx),
             Action::StreamChunkReceived {
                 draft_id,
                 delta,
@@ -951,6 +955,7 @@ impl ChatState {
         &mut self,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
+        compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
@@ -972,6 +977,7 @@ impl ChatState {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_config,
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
@@ -985,6 +991,7 @@ impl ChatState {
         &mut self,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
+        compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
     ) -> Vec<Effect> {
@@ -1006,6 +1013,7 @@ impl ChatState {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_config,
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
@@ -4006,6 +4014,7 @@ mod tests {
             let effects = state.reduce(Action::StartLLMTurn {
                 draft_id: "draft-1".to_string(),
                 history,
+                compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
             });
@@ -4041,6 +4050,7 @@ mod tests {
             let effects = state.reduce(Action::StartLLMTurn {
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
+                compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
             });
@@ -4052,6 +4062,37 @@ mod tests {
             });
             let tok = cancel_in_effect.expect("StartTurn 必须携带 cancel");
             assert!(tok.is_cancelled(), "StartTurn 中的 cancel 应与原 token 共享");
+        }
+
+        #[test]
+        fn start_llm_turn_carries_compaction_config_to_effect() {
+            let mut state = s();
+            let compaction_config = crate::config::AgentCompactionConfig {
+                max_context_tokens: 120,
+                reserve_tokens: 10,
+                max_context_tokens_explicit: true,
+                memory_flush: false,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+
+            let effects = state.reduce(Action::StartLLMTurn {
+                draft_id: "d-budget".to_string(),
+                history: vec![ChatMessage::user("x")],
+                compaction_config: Some(compaction_config),
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+            });
+
+            let carried = effects.iter().find_map(|effect| match effect {
+                Effect::StartTurn {
+                    compaction_config: Some(config),
+                    ..
+                } => Some(config),
+                _ => None,
+            });
+            let config = carried.expect("StartTurn effect must carry compaction config");
+            assert_eq!(config.max_context_tokens, 120);
+            assert_eq!(config.reserve_tokens, 10);
         }
 
         /// Phase A-3: TurnStarted（旧 Action）保持原行为 — 不发射 Effect::StartTurn
@@ -4138,6 +4179,7 @@ mod tests {
             let _ = state.reduce(Action::StartLLMTurn {
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
+                compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
             });

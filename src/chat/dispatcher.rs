@@ -707,6 +707,7 @@ impl EffectExecutor {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_config,
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
@@ -762,6 +763,7 @@ impl EffectExecutor {
                         history,
                         model,
                         temperature,
+                        compaction_config,
                         cancel,
                         draft_id,
                         action_tx,
@@ -1253,6 +1255,7 @@ async fn drive_start_turn_stream(
     mut history: Vec<crate::providers::traits::ChatMessage>,
     model: String,
     temperature: f64,
+    compaction_config: Option<crate::config::AgentCompactionConfig>,
     cancel: CancellationToken,
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
@@ -1290,6 +1293,48 @@ async fn drive_start_turn_stream(
                 tracing::debug!(error = %e, "StartTurn: action_tx closed on max-iter exceeded");
             }
             return;
+        }
+
+        if let Some(config) = compaction_config.as_ref() {
+            let budget = crate::agent::loop_::plan_context_budget(
+                &history,
+                config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            if budget.over_hard_limit {
+                crate::chat::state::compact_history_in_place(&mut history);
+                let after_compact = crate::agent::loop_::plan_context_budget(
+                    &history,
+                    config,
+                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                );
+                if after_compact.over_hard_limit {
+                    let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
+                    tracing::warn!(
+                        before_used_tokens = budget.used_tokens,
+                        after_compact_tokens = after_compact.used_tokens,
+                        hard_limit = after_compact.available_input_tokens,
+                        trimmed,
+                        "redux driver context budget preflight used compact-in-place/token-aware trim; summary parity deferred as ISS-011"
+                    );
+                }
+                if let Err(e) = action_tx
+                    .send(Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                    })
+                    .await
+                {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on budget-preflight-compact");
+                    return;
+                }
+            } else if budget.over_warning {
+                tracing::info!(
+                    used_tokens = budget.used_tokens,
+                    warning_threshold = budget.warning_threshold_tokens,
+                    hard_limit = budget.available_input_tokens,
+                    "redux driver context budget warning threshold crossed"
+                );
+            }
         }
 
         // ── 单轮 stream 执行 + backoff retry ──────────────────────────
@@ -1427,6 +1472,7 @@ async fn drive_start_turn_stream(
                         approval_router.as_ref(),
                         approval_manager.as_ref(),
                         &mut history,
+                        compaction_config.as_ref(),
                         chat_mode,
                     )
                     .await;
@@ -1450,6 +1496,22 @@ async fn drive_start_turn_stream(
                             }
                         }
                         ToolExecOutcome::Cancelled | ToolExecOutcome::SenderClosed => return,
+                    }
+                }
+                if let Some(config) = compaction_config.as_ref() {
+                    let budget = crate::agent::loop_::plan_context_budget(
+                        &history,
+                        config,
+                        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                    );
+                    if budget.over_hard_limit {
+                        let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
+                        tracing::warn!(
+                            used_tokens = budget.used_tokens,
+                            hard_limit = budget.available_input_tokens,
+                            trimmed,
+                            "redux driver mid-turn context budget trim after tool results; summary parity deferred as ISS-011"
+                        );
                     }
                 }
                 // BUG-03: if a permanently-blocked call was retried, fail the turn
@@ -1614,6 +1676,7 @@ async fn execute_single_tool_call(
     approval_router: Option<&Arc<ApprovalRouter>>,
     approval_manager: Option<&Arc<crate::approval::ApprovalManager>>,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
+    compaction_config: Option<&crate::config::AgentCompactionConfig>,
     chat_mode: crate::agent::loop_::ChatMode,
 ) -> ToolExecOutcome {
     // 0) BUG-09: plan mode is read-only. Intercept write/shell/git tools BEFORE
@@ -1828,6 +1891,9 @@ async fn execute_single_tool_call(
                     .clone()
                     .unwrap_or_else(|| "tool failed with no output".to_string())
             };
+            let max_inline_chars =
+                crate::agent::loop_::tool_result_inline_budget_for_history(history, compaction_config);
+            let content = crate::agent::loop_::compact_tool_result_for_budget(&call.name, &content, max_inline_chars);
             let payload = serde_json::json!({
                 "tool_call_id": call.id,
                 "content": content,
@@ -3220,6 +3286,7 @@ mod integration_tests {
             Effect::StartTurn {
                 draft_id: "shadow-d".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: token.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -3642,6 +3709,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-fixB-B5".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -3889,6 +3957,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-real".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -3952,6 +4021,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-cancelled".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -4039,6 +4109,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-stream".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -4170,6 +4241,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-fail".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -4263,6 +4335,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-mid-cancel".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -4983,6 +5056,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-params".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5110,6 +5184,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-no-registry".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5263,6 +5338,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-tool-happy".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5464,6 +5540,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-ctx-probe".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: Some(seed),
@@ -5578,6 +5655,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-max-iter".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5720,6 +5798,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-unrecoverable".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5829,6 +5908,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-cancel-mid".to_string(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -5868,6 +5948,7 @@ mod real_mode_tests {
         let result = dispatcher.try_dispatch(Action::StartLLMTurn {
             draft_id: "d1".to_string(),
             history: Vec::new(),
+            compaction_config: None,
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
         });
@@ -6211,6 +6292,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-t31-streaming".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -6349,6 +6431,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-reasoning-tool-history".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -6465,6 +6548,7 @@ mod real_mode_tests {
                     role: "user".into(),
                     content: "hello".into(),
                 }],
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -6497,6 +6581,112 @@ mod real_mode_tests {
         }
         assert!(saw_compacted, "must emit HistoryCompacted on overflow");
         assert!(saw_completion, "must complete after compact+retry");
+    }
+
+    #[tokio::test]
+    async fn redux_driver_preflight_trims_before_stream_request_when_over_hard_limit() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct BudgetCaptureProvider {
+            first_tokens: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for BudgetCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                self.first_tokens
+                    .compare_exchange(
+                        0,
+                        crate::agent::loop_::measure_history_tokens(messages),
+                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::SeqCst,
+                    )
+                    .ok();
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("budget-ok")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let first_tokens = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(BudgetCaptureProvider {
+            first_tokens: Arc::clone(&first_tokens),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Aggressive,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..24 {
+            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-budget-preflight".into(),
+                history,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            if let Action::StreamCompleted { final_text, .. } = action {
+                assert!(final_text.contains("budget-ok"));
+                break;
+            }
+        }
+        assert!(
+            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
+            "redux first provider call must be below literal hard limit 110 tokens"
+        );
     }
 
     /// **S3 T3-1 Step 3**: context overflow 重试超 1 次 → StreamFailed.
@@ -6557,6 +6747,7 @@ mod real_mode_tests {
                     role: "user".into(),
                     content: "x".repeat(1000),
                 }],
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -6727,6 +6918,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-approval".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -6913,6 +7105,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-reject".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -7012,6 +7205,7 @@ mod real_mode_tests {
             None,
             Some(&approval_manager),
             &mut history,
+            None,
             crate::agent::loop_::ChatMode::Edit,
         )
         .await;
@@ -7141,6 +7335,7 @@ mod real_mode_tests {
             Some(&approval_router),
             Some(&approval_manager),
             &mut history,
+            None,
             crate::agent::loop_::ChatMode::Edit,
         )
         .await;
@@ -7266,6 +7461,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-flaky".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -7361,6 +7557,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-net-fail".into(),
                 history: Vec::new(),
+                compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
@@ -7843,6 +8040,7 @@ mod s4_a_3 {
             None,
             None,
             &mut history,
+            None,
             crate::agent::loop_::ChatMode::Plan,
         )
         .await;
@@ -7873,6 +8071,87 @@ mod s4_a_3 {
             }
         }
         assert!(saw_finished, "must emit ToolFinished for the simulated call");
+    }
+
+    #[tokio::test]
+    async fn redux_tool_result_is_budgeted_and_trimmed_after_insertion() {
+        struct LargeOutputTool;
+        #[async_trait::async_trait]
+        impl crate::tools::Tool for LargeOutputTool {
+            fn name(&self) -> &str {
+                "shell"
+            }
+            fn description(&self) -> &str {
+                "large output"
+            }
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({})
+            }
+            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                Ok(crate::tools::ToolResult {
+                    success: true,
+                    output: format!("START-LARGE-OUTPUT\n{}", "payload ".repeat(20_000)),
+                    error: None,
+                })
+            }
+        }
+
+        let registry = Arc::new(vec![Box::new(LargeOutputTool) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-large".into(),
+            name: "shell".into(),
+            args: "{}".into(),
+        };
+        let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Aggressive,
+            reserve_tokens: 100,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 1_000,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![
+            crate::providers::traits::ChatMessage::system("sys"),
+            crate::providers::traits::ChatMessage::user("run the large command"),
+        ];
+
+        let outcome = execute_single_tool_call(
+            &registry,
+            &call,
+            &CancellationToken::new(),
+            &action_tx,
+            "draft-large",
+            None,
+            None,
+            &mut history,
+            Some(&config),
+            crate::agent::loop_::ChatMode::Edit,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done { .. }));
+        let tool_msg = history.last().expect("tool result pushed to history");
+        let payload: serde_json::Value = serde_json::from_str(&tool_msg.content).expect("tool payload JSON");
+        let content = payload
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            content.contains("[document_ingest_ref]"),
+            "large redux tool result must be document-referenced, got {} chars",
+            content.len()
+        );
+        assert!(
+            !content.contains(&"payload ".repeat(1_000)),
+            "large redux tool result must not insert the full output"
+        );
+        crate::agent::loop_::trim_history_to_context_budget(&mut history, &config);
+        assert!(
+            crate::agent::loop_::measure_history_tokens(&history) <= 900,
+            "final redux tool history must be below literal hard limit 900 tokens"
+        );
     }
 
     #[tokio::test]
@@ -7918,6 +8197,7 @@ mod s4_a_3 {
             None,
             None,
             &mut history,
+            None,
             crate::agent::loop_::ChatMode::Edit,
         )
         .await;
@@ -7985,6 +8265,7 @@ mod s4_a_3 {
             None,
             None,
             &mut history,
+            None,
             crate::agent::loop_::ChatMode::Edit,
         )
         .await;

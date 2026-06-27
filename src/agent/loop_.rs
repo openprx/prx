@@ -358,7 +358,11 @@ const MAX_OVERFLOW_RETRIES: usize = 3;
 pub const MAX_TOOL_ITERATIONS_CAP: usize = 2000;
 
 /// Fraction of `max_context_tokens` above which a pre-turn memory flush is triggered.
-const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
+pub(crate) const PRE_TURN_FLUSH_THRESHOLD: f64 = 0.85;
+
+/// Safety multiplier used when the real tokenizer is unavailable and the
+/// fallback char heuristic is the only available measurement.
+const TOKEN_HEURISTIC_BUDGET_MULTIPLIER: usize = 2;
 
 /// Fallback count-based safety net: if history grows beyond this many messages
 /// and no compaction config is available, trim back to `DEFAULT_MAX_HISTORY_MESSAGES`.
@@ -754,6 +758,27 @@ fn compact_tool_result_for_history(tool_name: &str, content: &str, max_inline_ch
     compact_tool_result_for_history_with_status(tool_name, content, max_inline_chars, "pending_document_backend")
 }
 
+#[allow(dead_code)]
+pub(crate) fn compact_tool_result_for_budget(tool_name: &str, content: &str, max_inline_chars: usize) -> String {
+    compact_tool_result_for_history_with_status(tool_name, content, max_inline_chars, "pending_document_backend")
+}
+
+pub(crate) fn tool_result_inline_budget_for_history(
+    history: &[ChatMessage],
+    config: Option<&crate::config::AgentCompactionConfig>,
+) -> usize {
+    let Some(config) = config else {
+        return MAX_TOOL_RESULT_INLINE_CHARS;
+    };
+    let budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+    let remaining_tokens = budget.available_input_tokens.saturating_sub(budget.used_tokens);
+    // Token-derived character guard. The final safety condition is enforced by
+    // remeasuring history after insertion, so this conversion is deliberately
+    // conservative and bounded by the absolute resident-memory guard.
+    let token_derived_chars = remaining_tokens.saturating_mul(3).saturating_div(4);
+    token_derived_chars.min(MAX_TOOL_RESULT_INLINE_CHARS)
+}
+
 fn compact_tool_result_for_history_with_status(
     tool_name: &str,
     content: &str,
@@ -855,13 +880,95 @@ fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compac
 }
 
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
+    estimate_history_tokens_with_source(history).tokens
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TokenMeasurementSource {
+    RealTokenizer,
+    Heuristic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TokenMeasurement {
+    pub tokens: usize,
+    pub source: TokenMeasurementSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ContextBudgetSnapshot {
+    pub used_tokens: usize,
+    pub measured_tokens: usize,
+    pub max_context_tokens: usize,
+    pub reserve_tokens: usize,
+    pub available_input_tokens: usize,
+    pub warning_threshold_tokens: usize,
+    pub over_warning: bool,
+    pub over_hard_limit: bool,
+    pub measurement_source: TokenMeasurementSource,
+}
+
+fn estimate_history_tokens_with_source(history: &[ChatMessage]) -> TokenMeasurement {
     // Per-message framing overhead (role marker, separators) approximated as a
     // small constant added on top of the tokenized role and content.
     const PER_MESSAGE_FRAMING_TOKENS: usize = 3;
-    history
-        .iter()
-        .map(|msg| count_tokens(&msg.role) + count_tokens(&msg.content) + PER_MESSAGE_FRAMING_TOKENS)
-        .sum()
+    let mut source = TokenMeasurementSource::RealTokenizer;
+    let tokens = history.iter().fold(0usize, |total, msg| {
+        let role = count_tokens_with_source(&msg.role);
+        let content = count_tokens_with_source(&msg.content);
+        if matches!(role.source, TokenMeasurementSource::Heuristic)
+            || matches!(content.source, TokenMeasurementSource::Heuristic)
+        {
+            source = TokenMeasurementSource::Heuristic;
+        }
+        total
+            .saturating_add(role.tokens)
+            .saturating_add(content.tokens)
+            .saturating_add(PER_MESSAGE_FRAMING_TOKENS)
+    });
+    TokenMeasurement { tokens, source }
+}
+
+pub(crate) fn measure_history_tokens(history: &[ChatMessage]) -> usize {
+    estimate_history_tokens(history)
+}
+
+pub(crate) fn plan_context_budget(
+    history: &[ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    warning_ratio: f64,
+) -> ContextBudgetSnapshot {
+    let measured = estimate_history_tokens_with_source(history);
+    let used_tokens = match measured.source {
+        TokenMeasurementSource::RealTokenizer => measured.tokens,
+        TokenMeasurementSource::Heuristic => measured.tokens.saturating_mul(TOKEN_HEURISTIC_BUDGET_MULTIPLIER),
+    };
+    let available_input_tokens = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+    let warning_ratio = warning_ratio.clamp(0.0, 1.0);
+    let warning_threshold_tokens = ((config.max_context_tokens as f64) * warning_ratio) as usize;
+    let warning_threshold_tokens = warning_threshold_tokens.min(available_input_tokens);
+    ContextBudgetSnapshot {
+        used_tokens,
+        measured_tokens: measured.tokens,
+        max_context_tokens: config.max_context_tokens,
+        reserve_tokens: config.reserve_tokens,
+        available_input_tokens,
+        warning_threshold_tokens,
+        over_warning: used_tokens > warning_threshold_tokens,
+        over_hard_limit: used_tokens > available_input_tokens,
+        measurement_source: measured.source,
+    }
+}
+
+pub(crate) fn trim_history_to_context_budget(
+    history: &mut Vec<ChatMessage>,
+    config: &crate::config::AgentCompactionConfig,
+) -> bool {
+    let before_len = history.len();
+    let before_tokens = measure_history_tokens(history);
+    let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+    trim_history_token_aware(history, limit);
+    history.len() != before_len || measure_history_tokens(history) != before_tokens
 }
 
 /// Count the number of tokens in `text`.
@@ -874,6 +981,10 @@ fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
 /// When the feature is disabled it falls back to the classic `chars / 4`
 /// heuristic (rounded up) so the crate still builds and behaves reasonably.
 pub fn count_tokens(text: &str) -> usize {
+    count_tokens_with_source(text).tokens
+}
+
+fn count_tokens_with_source(text: &str) -> TokenMeasurement {
     #[cfg(feature = "llm-router")]
     {
         use std::sync::LazyLock;
@@ -888,13 +999,19 @@ pub fn count_tokens(text: &str) -> usize {
         });
 
         if let Some(bpe) = ENCODER.as_ref() {
-            return bpe.encode_with_special_tokens(text).len();
+            return TokenMeasurement {
+                tokens: bpe.encode_with_special_tokens(text).len(),
+                source: TokenMeasurementSource::RealTokenizer,
+            };
         }
     }
 
     // Heuristic fallback: ~4 characters per token, rounding up so non-empty
     // text never reports zero tokens.
-    text.chars().count().div_ceil(4)
+    TokenMeasurement {
+        tokens: text.chars().count().div_ceil(4),
+        source: TokenMeasurementSource::Heuristic,
+    }
 }
 
 fn compaction_summary_fidelity_status(
@@ -1259,6 +1376,64 @@ async fn apply_configurable_compaction(
     ));
 
     Ok(true)
+}
+
+async fn preflight_context_budget_before_provider_call(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> Result<ContextBudgetSnapshot> {
+    let mut budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_warning {
+        tracing::info!(
+            used_tokens = budget.used_tokens,
+            measured_tokens = budget.measured_tokens,
+            warning_threshold = budget.warning_threshold_tokens,
+            hard_limit = budget.available_input_tokens,
+            source = ?budget.measurement_source,
+            "context budget warning threshold crossed"
+        );
+    }
+    if !budget.over_hard_limit {
+        return Ok(budget);
+    }
+
+    if !matches!(config.mode, crate::config::AgentCompactionMode::Off) {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+            apply_configurable_compaction(history, provider, model, config, audit, trigger),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                tracing::warn!(
+                    "Context budget preflight compaction timed out after {}s; applying token-aware trim",
+                    COMPACTION_TIMEOUT_SECS
+                );
+            }
+        }
+    }
+
+    budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_hard_limit {
+        let trimmed = trim_history_to_context_budget(history, config);
+        let after = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+        tracing::warn!(
+            before_used_tokens = budget.used_tokens,
+            after_used_tokens = after.used_tokens,
+            hard_limit = after.available_input_tokens,
+            trimmed,
+            mode = ?config.mode,
+            "context budget preflight applied token-aware trim"
+        );
+        budget = after;
+    }
+    Ok(budget)
 }
 
 /// Marker prefix used for the short page-summary breadcrumb left in the hot
@@ -4642,30 +4817,19 @@ pub(crate) async fn run_tool_call_loop_outcome(
             return Err(ToolLoopCancelled.into());
         }
 
-        // P0-3: Wrap mid-loop compaction in a safety timeout.
+        // P5: hard budget preflight before every provider call. Summary
+        // compaction is preferred when enabled; token-aware trim is the last
+        // local guard. Overflow retry below remains the provider-side fallback.
         if let Some(config) = compaction_config {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                apply_configurable_compaction(history, provider, model, config, document_ingest.as_ref(), "mid_loop"),
+            let _ = preflight_context_budget_before_provider_call(
+                history,
+                provider,
+                model,
+                config,
+                document_ingest.as_ref(),
+                "pre_provider_call",
             )
-            .await
-            {
-                Ok(Ok(_)) => {}
-                Ok(Err(e)) => return Err(e),
-                Err(_) => {
-                    // TODO: add memory reference to run_tool_call_loop to enable
-                    // pre-flush of recent context before aggressive trim.
-                    tracing::warn!(
-                        history_len = history.len(),
-                        keep_recent = config.keep_recent_messages,
-                        "Compaction timed out after {COMPACTION_TIMEOUT_SECS}s; \
-                         recent context may be lost. Applying aggressive trim \
-                         (keeping last {} messages)",
-                        config.keep_recent_messages,
-                    );
-                    apply_aggressive_trim(history, config.keep_recent_messages);
-                }
-            }
+            .await?;
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
@@ -5097,12 +5261,9 @@ pub(crate) async fn run_tool_call_loop_outcome(
             // FIX-P2-02: record the status so the native-history branch can reuse
             // it without persisting the same document a second time.
             document_statuses.push(document_status);
-            let truncated_result = compact_tool_result_for_history_with_status(
-                &call.name,
-                result,
-                MAX_TOOL_RESULT_INLINE_CHARS,
-                document_status,
-            );
+            let max_inline_chars = tool_result_inline_budget_for_history(history, compaction_config);
+            let truncated_result =
+                compact_tool_result_for_history_with_status(&call.name, result, max_inline_chars, document_status);
             let _ = writeln!(
                 tool_results,
                 "<tool_result name=\"{}\">\n{}{}\n</tool_result>",
@@ -5136,10 +5297,11 @@ pub(crate) async fn run_tool_call_loop_outcome(
                     .get(index)
                     .copied()
                     .unwrap_or("pending_document_backend");
+                let max_inline_chars = tool_result_inline_budget_for_history(history, compaction_config);
                 let truncated_result = compact_tool_result_for_history_with_status(
                     &native_call.name,
                     result,
-                    MAX_TOOL_RESULT_INLINE_CHARS,
+                    max_inline_chars,
                     document_status,
                 );
                 let tool_msg = serde_json::json!({
@@ -6509,6 +6671,44 @@ mod tests {
             Self {
                 responses: Arc::new(Mutex::new(scripted)),
             }
+        }
+    }
+
+    struct RecordingBudgetProvider {
+        first_call_tokens: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Provider for RecordingBudgetProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("summary".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            self.first_call_tokens
+                .compare_exchange(
+                    0,
+                    estimate_history_tokens(request.messages),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                )
+                .ok();
+            Ok(ChatResponse {
+                text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
         }
     }
 
@@ -10263,6 +10463,29 @@ Let me check the result."#;
         assert_ne!(count_tokens("tiktoken"), "tiktoken".chars().count() / 4);
     }
 
+    #[cfg(feature = "llm-router")]
+    #[test]
+    fn plan_context_budget_uses_real_tokenizer_for_hard_budget() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 1,
+            max_context_tokens: 10,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![ChatMessage::user("tiktoken")];
+
+        let budget = plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD);
+
+        assert_eq!(budget.measurement_source, TokenMeasurementSource::RealTokenizer);
+        assert_eq!(count_tokens("tiktoken"), 3);
+        assert!(
+            budget.measured_tokens >= 7,
+            "role + content + framing must be tokenized"
+        );
+        assert_eq!(budget.available_input_tokens, 9);
+    }
+
     #[test]
     fn estimate_history_tokens_scales_with_content() {
         let small = vec![ChatMessage::user("hi")];
@@ -10270,6 +10493,136 @@ Let me check the result."#;
             "this is a substantially longer user message with many more tokens than the small one",
         )];
         assert!(estimate_history_tokens(&large) > estimate_history_tokens(&small));
+    }
+
+    #[tokio::test]
+    async fn preflight_compacts_before_provider_call_when_over_hard_limit() {
+        let first_call_tokens = Arc::new(AtomicUsize::new(0));
+        let provider = RecordingBudgetProvider {
+            first_call_tokens: Arc::clone(&first_call_tokens),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let hooks = HookManager::new(std::env::temp_dir());
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Aggressive,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..24 {
+            history.push(ChatMessage::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            &hooks,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            Some(&config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChatMode::default(),
+        )
+        .await
+        .expect("preflight should keep provider call within budget");
+
+        assert_eq!(result, "done");
+        assert!(
+            first_call_tokens.load(Ordering::SeqCst) <= 110,
+            "first provider call must be below literal hard limit 110 tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn off_mode_preflight_trims_without_silent_summary() {
+        let first_call_tokens = Arc::new(AtomicUsize::new(0));
+        let provider = RecordingBudgetProvider {
+            first_call_tokens: Arc::clone(&first_call_tokens),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let hooks = HookManager::new(std::env::temp_dir());
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..24 {
+            history.push(ChatMessage::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            &hooks,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            4,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            Some(&config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChatMode::default(),
+        )
+        .await
+        .expect("off-mode preflight should trim without summary");
+
+        assert_eq!(result, "done");
+        assert!(
+            first_call_tokens.load(Ordering::SeqCst) <= 110,
+            "off-mode first provider call must be below literal hard limit 110 tokens"
+        );
+        assert!(
+            history
+                .iter()
+                .all(|message| !message.content.contains("[Context compacted at")),
+            "Off mode must not silently insert a compaction summary"
+        );
     }
 
     fn paging_test_config(enabled: bool) -> crate::config::AgentCompactionConfig {
