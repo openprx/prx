@@ -236,6 +236,13 @@ pub const INPUT_MAX_BYTES: usize = 32 * 1024;
 /// Maximum number of submitted entries kept in the history ring.
 pub const INPUT_HISTORY_CAPACITY: usize = 200;
 
+/// Synthetic display id for the read-only transcript child TUI.
+pub const TRANSCRIPT_SESSION_SEQ: u64 = 0;
+
+/// Bounded transcript viewport size. Conversation history remains authoritative
+/// elsewhere; the child TUI is only a scrollable display snapshot.
+pub const TRANSCRIPT_MAX_LINES: usize = 400;
+
 /// Outcome of [`TuiInput::handle_key`].
 ///
 /// Designed so the surrounding event loop can react with a single match
@@ -331,6 +338,10 @@ pub enum KeyDispatch {
     /// P3: switch to an adjacent live child session through the single `/attach`
     /// owner path.
     SwitchSession { seq: u64 },
+    /// P6b1: open the read-only transcript child TUI.
+    OpenTranscriptViewer,
+    /// P6b1: close the read-only transcript child TUI.
+    CloseTranscriptViewer,
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -343,6 +354,124 @@ pub enum FoldableKind {
     Reasoning,
     /// A `ConversationLine::ToolResult` card was flipped.
     ToolResult,
+}
+
+/// Synthetic transcript row shown in the Ctrl+G child TUI switcher.
+#[must_use]
+pub fn transcript_switcher_entry() -> crate::chat::sessions::SwitcherEntry {
+    crate::chat::sessions::SwitcherEntry {
+        seq: TRANSCRIPT_SESSION_SEQ,
+        kind: crate::chat::sessions::model::ManagedKind::Transcript.as_str(),
+        origin: "user",
+        status: "ready",
+        title: "conversation transcript".to_string(),
+    }
+}
+
+fn switcher_entries_with_transcript(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+) -> Vec<crate::chat::sessions::SwitcherEntry> {
+    let mut out = Vec::with_capacity(entries.len().saturating_add(1));
+    out.push(transcript_switcher_entry());
+    out.extend(entries.iter().filter(|entry| !entry.is_transcript()).cloned());
+    out
+}
+
+const fn tool_status_name(status: ToolStatus) -> &'static str {
+    match status {
+        ToolStatus::Running => "running",
+        ToolStatus::Done => "done",
+        ToolStatus::Error => "error",
+    }
+}
+
+fn push_transcript_text(lines: &mut Vec<String>, label: &str, content: &str) {
+    let mut parts = content.lines();
+    if let Some(first) = parts.next() {
+        lines.push(format!("{label}: {first}"));
+        for part in parts {
+            lines.push(format!("  {part}"));
+        }
+    } else {
+        lines.push(format!("{label}:"));
+    }
+}
+
+fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec<String>, bool) {
+    let mut lines = Vec::new();
+    for item in conversation {
+        match item {
+            ConversationLine::User { content } => push_transcript_text(&mut lines, "user", content),
+            ConversationLine::Assistant { content } => push_transcript_text(&mut lines, "assistant", content),
+            ConversationLine::StreamingAssistant { content } => {
+                push_transcript_text(&mut lines, "assistant (streaming)", content);
+            }
+            ConversationLine::System { content } => push_transcript_text(&mut lines, "system", content),
+            ConversationLine::Tool { name, success } => {
+                let status = if *success { "done" } else { "error" };
+                lines.push(format!("tool {name}: {status}"));
+            }
+            ConversationLine::ToolResult {
+                tool_name,
+                args_preview,
+                result,
+                status,
+                ..
+            } => {
+                lines.push(format!(
+                    "tool {tool_name} {}: {args_preview}",
+                    tool_status_name(*status)
+                ));
+                if let Some(result) = result {
+                    push_transcript_text(&mut lines, "  result", result);
+                }
+            }
+            ConversationLine::Reasoning {
+                content,
+                char_count,
+                folded,
+            } => {
+                lines.push(format!("reasoning: {char_count} chars"));
+                if !*folded {
+                    push_transcript_text(&mut lines, "  thought", content);
+                }
+            }
+        }
+    }
+    let truncated = lines.len() > TRANSCRIPT_MAX_LINES;
+    if truncated {
+        let start = lines.len().saturating_sub(TRANSCRIPT_MAX_LINES);
+        lines = lines.split_off(start);
+    }
+    (lines, truncated)
+}
+
+/// Build the read-only transcript child viewport from current conversation lines.
+#[must_use]
+pub fn build_transcript_view(
+    session_title: &str,
+    conversation: &[ConversationLine],
+    scroll_offset: usize,
+) -> crate::chat::sessions::ActiveSessionView {
+    let (mut lines, truncated) = transcript_lines_from_conversation(conversation);
+    if lines.is_empty() {
+        lines.push("(transcript is empty)".to_string());
+    }
+    crate::chat::sessions::ActiveSessionView {
+        seq: TRANSCRIPT_SESSION_SEQ,
+        kind: crate::chat::sessions::model::ManagedKind::Transcript
+            .as_str()
+            .to_string(),
+        title: if session_title.trim().is_empty() {
+            "conversation transcript".to_string()
+        } else {
+            session_title.to_string()
+        },
+        lines,
+        truncated,
+        scroll_offset,
+    }
+    .clamped_for_height(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS))
 }
 
 /// Resolve a [`KeyEvent`] against the global shortcut table layered above the
@@ -376,9 +505,12 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // Never falls through to the input box. Opening an empty switcher is still
     // valid — it shows the "no child TUI sessions" hint with an Esc to close.
     if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL {
-        let entries = state.sessions_cache.clone();
+        let entries = switcher_entries_with_transcript(&state.sessions_cache);
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
         return KeyDispatch::SwitcherOpened { entries };
+    }
+    if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
+        return KeyDispatch::OpenTranscriptViewer;
     }
     // Tab → toggle the most recent foldable card (reasoning OR tool-result,
     // whichever appears later in the conversation). When neither exists Tab
@@ -424,7 +556,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 .map_or(KeyDispatch::Consumed, |seq| KeyDispatch::SwitchSession { seq });
         }
     }
-    if state.focus.is_session() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
+    if state.focus.is_child_view() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
         match key.code {
             KeyCode::Up => return KeyDispatch::ScrollSessionUp,
             KeyCode::Down => return KeyDispatch::ScrollSessionDown,
@@ -446,6 +578,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 return KeyDispatch::Cancelled;
             }
             EscAction::RequestDetach => return KeyDispatch::RequestDetach,
+            EscAction::CloseTranscript => return KeyDispatch::CloseTranscriptViewer,
             EscAction::Cancel => {
                 // Empty buffer + main focus → unchanged legacy cancel semantics.
                 let _ = state.handle_input_key(key);
@@ -454,6 +587,12 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             // Unreachable here (switcher_open=false), but keep the match total.
             EscAction::CloseSwitcher => return KeyDispatch::Cancelled,
         }
+    }
+    if matches!(state.focus, crate::chat::sessions::FocusTarget::Transcript)
+        && key.code == KeyCode::Enter
+        && key.modifiers == KeyModifiers::NONE
+    {
+        return KeyDispatch::Consumed;
     }
     // All other keys → input box.
     match state.handle_input_key(key) {
@@ -491,12 +630,15 @@ fn dispatch_switcher_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     }
     // Enter → attach the highlighted session, then close. Empty list → just close.
     if key.code == KeyCode::Enter {
-        let seq = state.switcher.as_ref().and_then(|s| s.selected_seq());
+        let selected = state.switcher.as_ref().and_then(|s| s.selected_entry().cloned());
         state.switcher = None;
-        return seq.map_or(KeyDispatch::SwitcherClosed, |seq| {
+        return selected.map_or(KeyDispatch::SwitcherClosed, |entry| {
+            if entry.is_transcript() {
+                return KeyDispatch::OpenTranscriptViewer;
+            }
             // The key loop closes the snapshot switcher *and* sends the synthetic
             // `/attach`, so signal the attach here; the close rides along.
-            KeyDispatch::AttachSession { seq }
+            KeyDispatch::AttachSession { seq: entry.seq }
         });
     }
     // Esc → close the switcher (resolve_esc gives CloseSwitcher when open).
@@ -1970,6 +2112,9 @@ const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
 }
 
 fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+    if entry.is_transcript() {
+        return if ascii { "[T]" } else { "T" };
+    }
     if ascii {
         match entry.status {
             "running" => "[~]",
@@ -2076,7 +2221,11 @@ fn render_active_session_view(
     let mut lines: Vec<Line<'_>> = Vec::new();
     let max_width = area.width.saturating_sub(1);
     let marker = if ascii { ">" } else { "\u{25B8}" };
-    let prefix = format!("{marker} attached #{} {} ", view.seq, view.kind);
+    let prefix = if view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str() {
+        format!("{marker} transcript ")
+    } else {
+        format!("{marker} attached #{} {} ", view.seq, view.kind)
+    };
     let suffix = if view.truncated { " [output truncated]" } else { "" };
     let fixed_cols = prefix.chars().count().saturating_add(suffix.chars().count());
     let header = if fixed_cols >= usize::from(max_width) {
@@ -2942,6 +3091,13 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
             let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
             (span, width)
         }
+        crate::chat::sessions::FocusTarget::Transcript => {
+            let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
+            let label = format!("transcript {arrow} ");
+            let width = label.chars().count();
+            let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
+            (span, width)
+        }
     }
 }
 
@@ -3014,7 +3170,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // P1: Ctrl+G is intentionally PRX's sessions switcher for now; Claude Code
     // external-editor parity is deferred to the P3/P6b keybinding pass.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} / for commands \u{00B7} ! for bash \u{00B7} Tab to fold \u{00B7} Esc to cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} / commands \u{00B7} ! bash \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -4595,6 +4751,14 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_ctrl_o_opens_transcript_viewer_without_input_leak() {
+        let mut state = TuiState::new("p", "m");
+        let out = dispatch_global_key(key_mod(KeyCode::Char('o'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(out, KeyDispatch::OpenTranscriptViewer);
+        assert!(state.input.is_empty(), "Ctrl+O must not insert text into input");
+    }
+
+    #[test]
     fn dispatch_typing_and_enter_yields_submission() {
         let mut state = TuiState::new("p", "m");
         for ch in "Hello".chars() {
@@ -4652,7 +4816,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_session_scroll_keys_only_when_session_focus_and_empty_input() {
+    fn dispatch_child_view_scroll_keys_only_when_child_focus_and_empty_input() {
         let mut state = TuiState::new("p", "m");
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
 
@@ -4680,6 +4844,24 @@ mod tests {
             "main focus must not route PgUp into child viewport scrolling"
         );
 
+        state.focus = crate::chat::sessions::FocusTarget::Transcript;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::ScrollSessionUp,
+            "transcript focus must reuse child viewport scrolling"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageDown), &mut state),
+            KeyDispatch::PageSessionDown,
+            "transcript focus must support page scrolling"
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::Consumed,
+            "transcript focus is read-only and must not submit/steer"
+        );
+
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
         assert_eq!(
@@ -4699,6 +4881,16 @@ mod tests {
             KeyDispatch::Consumed,
             "non-empty input keeps edit/history semantics instead of child scroll"
         );
+
+        state.input.clear();
+        state.focus = crate::chat::sessions::FocusTarget::Transcript;
+        dispatch_global_key(key(KeyCode::Char('z')), &mut state);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::Consumed,
+            "transcript+non-empty input also keeps edit/history semantics"
+        );
+        assert_eq!(state.input.text(), "z");
     }
 
     #[test]
@@ -4747,6 +4939,18 @@ mod tests {
         assert_eq!(state.input.cursor, (0, 2));
 
         state.input.clear();
+        state.focus = crate::chat::sessions::FocusTarget::Transcript;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "transcript focus must not switch to real sessions with Right"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "transcript focus must not switch to real sessions with Left"
+        );
+
         dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
         assert!(state.switcher.is_some());
         assert_eq!(
@@ -4981,6 +5185,37 @@ mod tests {
     }
 
     #[test]
+    fn transcript_view_is_bounded_and_handles_empty_history() {
+        let empty = build_transcript_view("", &[], 0);
+        assert_eq!(empty.seq, TRANSCRIPT_SESSION_SEQ);
+        assert_eq!(
+            empty.kind,
+            crate::chat::sessions::model::ManagedKind::Transcript.as_str()
+        );
+        assert_eq!(empty.lines, vec!["(transcript is empty)".to_string()]);
+
+        let long = ConversationLine::Assistant {
+            content: (0..(TRANSCRIPT_MAX_LINES + 25))
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+        let view = build_transcript_view("demo", &[long], usize::MAX);
+        assert_eq!(view.lines.len(), TRANSCRIPT_MAX_LINES);
+        assert!(view.truncated, "long transcript must report truncation");
+        assert_eq!(
+            view.scroll_offset,
+            view.max_scroll_offset(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS)),
+            "oversized offset clamps to the oldest retained visible page"
+        );
+        assert!(
+            view.lines.first().is_some_and(|line| line.contains("line 25")),
+            "oldest lines are trimmed first: {:?}",
+            view.lines.first()
+        );
+    }
+
+    #[test]
     fn active_session_view_render_keeps_viewport_input_and_footer_separate() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5034,6 +5269,47 @@ mod tests {
                 "rendered row must stay inside terminal width: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn transcript_view_header_is_not_attached_seq_zero() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("provider", "model");
+        state.session_title = "demo".to_string();
+        state.focus = crate::chat::sessions::FocusTarget::Transcript;
+        state.conversation_lines.push(ConversationLine::User {
+            content: "hello".to_string(),
+        });
+        state.active_session_view = Some(build_transcript_view(
+            &state.session_title,
+            &state.conversation_lines,
+            0,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(48, 12)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..48).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..12).map(row).collect();
+
+        assert!(
+            rows.iter().any(|r| r.contains("transcript demo")),
+            "transcript header rendered: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("attached #0")),
+            "transcript must not render as fake attached session: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("user: hello")),
+            "transcript body rendered: {rows:?}"
+        );
     }
 
     #[test]
@@ -5099,7 +5375,18 @@ mod tests {
         state.sessions_cache = vec![entry(1), entry(2)];
         let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
         match out {
-            KeyDispatch::SwitcherOpened { entries } => assert_eq!(entries.len(), 2),
+            KeyDispatch::SwitcherOpened { entries } => {
+                assert_eq!(entries.len(), 3);
+                assert!(
+                    entries[0].is_transcript(),
+                    "transcript row is switcher-only first entry"
+                );
+                assert_eq!(
+                    state.sessions_cache.len(),
+                    2,
+                    "transcript row must not enter real-session cache"
+                );
+            }
             other => panic!("expected SwitcherOpened, got {other:?}"),
         }
         assert!(state.switcher.is_some(), "switcher opened in mirror");
@@ -5110,10 +5397,11 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1), entry(2), entry(3)];
         dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
-        // Down twice → select #3.
+        // Transcript is row 0; Down three times → select #3.
         let m1 = dispatch_global_key(key(KeyCode::Down), &mut state);
         assert_eq!(m1, KeyDispatch::SwitcherMoved { selected: 1 });
         dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state);
+        dispatch_global_key(key(KeyCode::Down), &mut state);
         // Enter attaches the highlighted session and closes the switcher.
         let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
         assert_eq!(out, KeyDispatch::AttachSession { seq: 3 });
@@ -5142,15 +5430,15 @@ mod tests {
     }
 
     #[test]
-    fn switcher_empty_enter_just_closes() {
+    fn switcher_transcript_enter_opens_viewer_without_attach_zero() {
         let mut state = TuiState::new("p", "m");
-        // No cached sessions.
+        // No cached real sessions; Ctrl+G still offers the transcript child TUI.
         dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
         let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
         assert_eq!(
             out,
-            KeyDispatch::SwitcherClosed,
-            "empty switcher Enter closes, no attach"
+            KeyDispatch::OpenTranscriptViewer,
+            "transcript row must open the viewer, never /attach 0"
         );
         assert!(state.switcher.is_none());
     }
@@ -5179,6 +5467,10 @@ mod tests {
         let (ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, true);
         assert!(ascii_span.content.contains("agent #4"));
         assert!(!ascii_span.content.contains('\u{25B8}'), "ascii fallback omits ▸");
+        let (transcript_span, transcript_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Transcript, false);
+        assert!(transcript_span.content.contains("transcript"));
+        assert!(transcript_span.content.contains('\u{25B8}'));
+        assert_eq!(transcript_w, transcript_span.content.chars().count());
     }
 
     #[test]
@@ -5827,6 +6119,50 @@ mod tests {
                 BottomChromeView::context_window_tokens(&tui),
                 BottomChromeView::context_window_tokens(&snap)
             );
+        }
+
+        #[test]
+        fn s4_a_2_transcript_view_and_switcher_parity() {
+            let mut state = make_state_with_lines();
+            let transcript_entry = transcript_switcher_entry();
+            let transcript_view = build_transcript_view(&state.session.title, &state.ui.conversation_lines, 0);
+            state.ui.focus = crate::chat::sessions::FocusTarget::Transcript;
+            state.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(vec![
+                transcript_entry.clone(),
+            ]));
+            state.ui.active_session_view = Some(transcript_view.clone());
+            let snap = state.build_ui_snapshot(9);
+
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.session_title = state.session.title.clone();
+            tui.turn_count = state.ui.turn_count;
+            tui.ascii_fallback = state.ui.ascii_fallback;
+            tui.conversation_lines = state.ui.conversation_lines.clone();
+            tui.input = state.ui.input.clone();
+            tui.focus = crate::chat::sessions::FocusTarget::Transcript;
+            tui.switcher = Some(crate::chat::sessions::SwitcherState::new(vec![transcript_entry]));
+            tui.active_session_view = Some(transcript_view);
+
+            assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
+            assert_eq!(
+                BottomChromeView::active_session_view(&tui),
+                BottomChromeView::active_session_view(&snap)
+            );
+            let tui_switcher = BottomChromeView::switcher(&tui).expect("tui transcript switcher");
+            let snap_switcher = BottomChromeView::switcher(&snap).expect("snapshot transcript switcher");
+            let [tui_entry] = tui_switcher.entries.as_slice() else {
+                panic!("TuiState transcript switcher should expose exactly one entry");
+            };
+            let [snap_entry] = snap_switcher.entries.as_slice() else {
+                panic!("UiSnapshot transcript switcher should expose exactly one entry");
+            };
+            assert!(tui_entry.is_transcript());
+            assert_eq!(tui_entry.seq, 0);
+            assert_eq!(tui_entry.seq, snap_entry.seq);
+            assert_eq!(tui_entry.kind, snap_entry.kind);
+            assert_eq!(tui_entry.origin, snap_entry.origin);
+            assert_eq!(tui_entry.status, snap_entry.status);
+            assert_eq!(tui_entry.title, snap_entry.title);
         }
 
         /// Buffer-level parity: 把同一 view 在小 Buffer 上 render，断言两份 buffer 内容一致.

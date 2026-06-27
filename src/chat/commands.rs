@@ -75,6 +75,7 @@ const HELP_TEXT: &str = "Available commands:
   /sessions          List child TUI sessions
   /shell <command>   Run a command as a shell child session
   /pty <command>     Open an interactive PTY shell (full terminal handoff)
+  /transcript        Open the read-only transcript child TUI
   /attach <id>       Show a child session's recent output (read-only)
   /logs <id>         Dump a child session's buffered output (last 200 lines)
   /steer <id> <msg>  Send a steering instruction to a child session

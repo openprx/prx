@@ -25,6 +25,8 @@ pub enum SessionCommand {
     Attach { seq: u64 },
     /// `/detach` — return focus to main (v1.1).
     Detach,
+    /// `/transcript` — open the read-only transcript child TUI (P6b1).
+    Transcript,
     /// `/shell <command>` — background shell session (v2).
     Shell { command: String },
     /// `/logs <seq>` — show a session log (v2).
@@ -70,6 +72,7 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
     match trimmed {
         "/sessions" => return Some(SessionCommand::Sessions),
         "/detach" => return Some(SessionCommand::Detach),
+        "/transcript" => return Some(SessionCommand::Transcript),
         _ => {}
     }
 
@@ -180,6 +183,10 @@ pub fn steer_unsupported_message(kind: super::model::ManagedKind, seq: u64) -> O
             "Steer is not supported for interactive PTY session #{seq}. \
              Re-enter it with /pty to type directly, or /kill #{seq} to stop it."
         )),
+        ManagedKind::Transcript => Some(
+            "Steer is not supported for the read-only transcript viewer. Close it with Esc to return to main chat."
+                .to_string(),
+        ),
     }
 }
 
@@ -213,6 +220,15 @@ mod tests {
     fn parses_sessions() {
         assert_eq!(parse_session_command("/sessions"), Some(SessionCommand::Sessions));
         assert_eq!(parse_session_command("  /sessions  "), Some(SessionCommand::Sessions));
+    }
+
+    #[test]
+    fn parses_transcript() {
+        assert_eq!(parse_session_command("/transcript"), Some(SessionCommand::Transcript));
+        assert_eq!(
+            parse_session_command("  /transcript  "),
+            Some(SessionCommand::Transcript)
+        );
     }
 
     #[test]
@@ -335,7 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn steer_unsupported_message_shell_and_pty_are_clear() {
+    fn steer_unsupported_message_shell_pty_and_transcript_are_clear() {
         use super::super::model::ManagedKind;
         let shell = steer_unsupported_message(ManagedKind::Shell, 2).expect("test: shell msg");
         assert!(shell.contains("shell #2"), "names the shell: {shell}");
@@ -344,5 +360,15 @@ mod tests {
         let pty = steer_unsupported_message(ManagedKind::Pty, 4).expect("test: pty msg");
         assert!(pty.contains("PTY session #4"), "names the pty: {pty}");
         assert!(pty.to_lowercase().contains("not supported"), "states it: {pty}");
+
+        let transcript = steer_unsupported_message(ManagedKind::Transcript, 0).expect("test: transcript msg");
+        assert!(
+            transcript.contains("read-only transcript"),
+            "names transcript: {transcript}"
+        );
+        assert!(
+            transcript.to_lowercase().contains("not supported"),
+            "states it: {transcript}"
+        );
     }
 }

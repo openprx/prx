@@ -624,6 +624,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::PageSessionUp => "PageSessionUp",
         tui::KeyDispatch::PageSessionDown => "PageSessionDown",
         tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
+        tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
+        tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -671,7 +673,9 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::ScrollSessionDown
         | tui::KeyDispatch::PageSessionUp
         | tui::KeyDispatch::PageSessionDown
-        | tui::KeyDispatch::SwitchSession { .. } => new_has_quit,
+        | tui::KeyDispatch::SwitchSession { .. }
+        | tui::KeyDispatch::OpenTranscriptViewer
+        | tui::KeyDispatch::CloseTranscriptViewer => new_has_quit,
     };
 
     if is_diff {
@@ -2554,6 +2558,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
+                        SessionCommand::Transcript => {
+                            attached_follow = None;
+                            attached_follow_seq = None;
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                open_transcript_view(&chat_mirror, &chat_dispatcher, sessions_redraw_handle.as_ref());
+                            }
+                            #[cfg(not(feature = "terminal-tui"))]
+                            emit_chat_output("Transcript viewer is only available in the terminal TUI.");
+                            continue;
+                        }
                         SessionCommand::Kill { seq } => {
                             // Unified kill: shells terminate their process group via
                             // the shell registry; agents delegate to the
@@ -2581,6 +2596,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     continue;
                                 }
                                 Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
+                                Ok(crate::chat::sessions::model::ManagedKind::Transcript) => {
+                                    emit_chat_output("Transcript is a read-only viewer, not a killable child session.");
+                                    continue;
+                                }
                                 Err(e) => {
                                     emit_chat_output(&format!("Kill failed: {e}"));
                                     continue;
@@ -4643,6 +4662,9 @@ fn attach_command_for_seq(seq: u64) -> String {
     format!("/attach {seq}")
 }
 
+#[cfg(feature = "terminal-tui")]
+const TRANSCRIPT_COMMAND: &str = "/transcript";
+
 /// Optimistically apply an input-routing focus change from the synchronous TUI
 /// key thread, keeping the three authorities that decide "where the next
 /// submittable input goes" consistent at the *same instant* the synthetic
@@ -4793,6 +4815,70 @@ fn scroll_active_session_view(
     let _ = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
         "chat.active_session_view_scroll",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
+#[cfg(feature = "terminal-tui")]
+fn open_transcript_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+) {
+    let (view, focus) = {
+        let mut guard = mirror.lock();
+        let previous_offset = guard
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str())
+            .map_or(0, |view| view.scroll_offset);
+        let view = tui::build_transcript_view(&guard.session_title, &guard.conversation_lines, previous_offset);
+        let focus = crate::chat::sessions::FocusTarget::Transcript;
+        guard.focus = focus;
+        guard.active_session_view = Some(view.clone());
+        (view, focus)
+    };
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged { focus },
+        "chat.transcript_focus_open",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
+        "chat.transcript_view_open",
+    );
+    if let Some(tx) = redraw_tx {
+        let _ = tx.try_send(());
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn close_transcript_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+) {
+    {
+        let mut guard = mirror.lock();
+        if !matches!(guard.focus, crate::chat::sessions::FocusTarget::Transcript)
+            && guard
+                .active_session_view
+                .as_ref()
+                .is_none_or(|view| view.kind != crate::chat::sessions::model::ManagedKind::Transcript.as_str())
+        {
+            return;
+        }
+        guard.focus = crate::chat::sessions::FocusTarget::Main;
+        guard.active_session_view = None;
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged {
+            focus: crate::chat::sessions::FocusTarget::Main,
+        },
+        "chat.transcript_focus_close",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+        "chat.transcript_view_close",
     );
     let _ = redraw_tx.try_send(());
 }
@@ -5602,6 +5688,18 @@ fn run_tui_unified_loop(
                         if send_synthetic_command(&input_tx, &command).is_err() {
                             return Ok(());
                         }
+                    }
+                    tui::KeyDispatch::OpenTranscriptViewer => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SwitcherClosed,
+                            "chat.switcher_closed_transcript",
+                        );
+                        if send_synthetic_command(&input_tx, TRANSCRIPT_COMMAND).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    tui::KeyDispatch::CloseTranscriptViewer => {
+                        close_transcript_view(&mirror, chat_dispatcher, &redraw_tx);
                     }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
@@ -7374,6 +7472,45 @@ mod p3_directional_switch_tests {
             emitted, 0,
             "Session->Session directional cycling must not append extra main-history breadcrumbs"
         );
+    }
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+mod p6b1_transcript_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn close_transcript_view_returns_main_focus_and_clears_view() {
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
+        {
+            let mut guard = mirror.lock();
+            guard.focus = crate::chat::sessions::FocusTarget::Transcript;
+            guard.active_session_view = Some(tui::build_transcript_view("", &[], 0));
+        }
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+        let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
+
+        close_transcript_view(&mirror, &dispatcher, &redraw_tx);
+
+        {
+            let guard = mirror.lock();
+            assert_eq!(guard.focus, crate::chat::sessions::FocusTarget::Main);
+            assert!(guard.active_session_view.is_none());
+        }
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Main);
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                assert!(view.is_none());
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
+        assert!(redraw_rx.try_recv().is_ok(), "close should request redraw");
     }
 }
 

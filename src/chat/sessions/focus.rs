@@ -23,7 +23,7 @@
 //! only detaches when the input is empty *and* a session is focused (plan
 //! §v1.1 P0-8).
 
-use super::model::{ManagedSessionView, ManagedStatus};
+use super::model::{ManagedKind, ManagedSessionView, ManagedStatus};
 
 /// Where plain text + Enter is currently routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -33,6 +33,9 @@ pub enum FocusTarget {
     Main,
     /// Input is routed as a *steer* to the attached child TUI session `#seq`.
     Session { seq: u64 },
+    /// Read-only conversation transcript viewer. It reuses the child viewport but
+    /// never routes submitted text as a steer to a managed session.
+    Transcript,
 }
 
 impl FocusTarget {
@@ -42,11 +45,17 @@ impl FocusTarget {
         matches!(self, Self::Session { .. })
     }
 
+    /// Whether any child viewport is currently focused.
+    #[must_use]
+    pub const fn is_child_view(self) -> bool {
+        matches!(self, Self::Session { .. } | Self::Transcript)
+    }
+
     /// The focused session's display sequence `#N`, if any.
     #[must_use]
     pub const fn session_seq(self) -> Option<u64> {
         match self {
-            Self::Main => None,
+            Self::Main | Self::Transcript => None,
             Self::Session { seq } => Some(seq),
         }
     }
@@ -160,6 +169,12 @@ impl SwitcherEntry {
                 || s == ManagedStatus::Cancelled.as_str()
         )
     }
+
+    /// Whether this row is the synthetic read-only transcript viewer.
+    #[must_use]
+    pub fn is_transcript(&self) -> bool {
+        self.kind == ManagedKind::Transcript.as_str()
+    }
 }
 
 /// Directional child-session navigation used by P3 Left/Right switching.
@@ -177,7 +192,10 @@ pub enum SessionDirection {
 /// remain reachable through random access (`Ctrl+G` / `/attach N`).
 #[must_use]
 pub fn adjacent_session_seq(entries: &[SwitcherEntry], current_seq: u64, direction: SessionDirection) -> Option<u64> {
-    let live: Vec<&SwitcherEntry> = entries.iter().filter(|entry| !entry.is_terminal()).collect();
+    let live: Vec<&SwitcherEntry> = entries
+        .iter()
+        .filter(|entry| !entry.is_terminal() && !entry.is_transcript())
+        .collect();
     if live.len() < 2 {
         return None;
     }
@@ -249,6 +267,12 @@ impl SwitcherState {
     pub fn selected_seq(&self) -> Option<u64> {
         self.entries.get(self.selected).map(|e| e.seq)
     }
+
+    /// The currently highlighted row, if any.
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&SwitcherEntry> {
+        self.entries.get(self.selected)
+    }
 }
 
 /// Build switcher entries from a session snapshot (preserving order).
@@ -267,6 +291,8 @@ pub enum EscAction {
     ClearInput,
     /// Input is empty and a session is focused → detach back to main.
     RequestDetach,
+    /// Input is empty and the read-only transcript viewer is focused → close it.
+    CloseTranscript,
     /// Input is empty and focus is main → the existing cancel semantics.
     Cancel,
 }
@@ -278,7 +304,8 @@ pub enum EscAction {
 /// 1. Switcher open → close the switcher.
 /// 2. Input non-empty → clear input (muscle memory preserved).
 /// 3. Input empty + session focused → detach.
-/// 4. Input empty + main focus → cancel (unchanged legacy behaviour).
+/// 4. Input empty + transcript focused → close transcript.
+/// 5. Input empty + main focus → cancel (unchanged legacy behaviour).
 #[must_use]
 pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool) -> EscAction {
     if switcher_open {
@@ -287,8 +314,10 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     if !input_empty {
         return EscAction::ClearInput;
     }
-    if focus.is_session() {
-        return EscAction::RequestDetach;
+    match focus {
+        FocusTarget::Session { .. } => return EscAction::RequestDetach,
+        FocusTarget::Transcript => return EscAction::CloseTranscript,
+        FocusTarget::Main => {}
     }
     EscAction::Cancel
 }
@@ -364,10 +393,15 @@ mod tests {
     #[test]
     fn focus_target_helpers() {
         assert!(!FocusTarget::Main.is_session());
+        assert!(!FocusTarget::Main.is_child_view());
         assert_eq!(FocusTarget::Main.session_seq(), None);
         let f = FocusTarget::Session { seq: 3 };
         assert!(f.is_session());
+        assert!(f.is_child_view());
         assert_eq!(f.session_seq(), Some(3));
+        assert!(!FocusTarget::Transcript.is_session());
+        assert!(FocusTarget::Transcript.is_child_view());
+        assert_eq!(FocusTarget::Transcript.session_seq(), None);
     }
 
     #[test]
@@ -453,6 +487,29 @@ mod tests {
 
         assert_eq!(adjacent_session_seq(&entries, 1, SessionDirection::Next), Some(3));
         assert_eq!(adjacent_session_seq(&entries, 3, SessionDirection::Previous), Some(1));
+    }
+
+    #[test]
+    fn adjacent_session_seq_skips_transcript_entry() {
+        let mut entries = vec![SwitcherEntry {
+            seq: 0,
+            kind: ManagedKind::Transcript.as_str(),
+            origin: "user",
+            status: "ready",
+            title: "conversation transcript".to_string(),
+        }];
+        entries.extend(switcher_entries(&[
+            view(1, ManagedStatus::Running, "left"),
+            view(2, ManagedStatus::Running, "right"),
+        ]));
+
+        assert_eq!(adjacent_session_seq(&entries, 1, SessionDirection::Previous), Some(2));
+        assert_eq!(adjacent_session_seq(&entries, 2, SessionDirection::Next), Some(1));
+        assert_eq!(
+            adjacent_session_seq(&entries, 0, SessionDirection::Next),
+            None,
+            "transcript seq must not be a switchable real session"
+        );
     }
 
     #[test]
@@ -591,6 +648,10 @@ mod tests {
             resolve_esc(false, FocusTarget::Session { seq: 2 }, false),
             EscAction::ClearInput
         );
+        assert_eq!(
+            resolve_esc(false, FocusTarget::Transcript, false),
+            EscAction::ClearInput
+        );
     }
 
     #[test]
@@ -598,6 +659,14 @@ mod tests {
         assert_eq!(
             resolve_esc(true, FocusTarget::Session { seq: 5 }, false),
             EscAction::RequestDetach
+        );
+    }
+
+    #[test]
+    fn resolve_esc_empty_transcript_closes_transcript() {
+        assert_eq!(
+            resolve_esc(true, FocusTarget::Transcript, false),
+            EscAction::CloseTranscript
         );
     }
 

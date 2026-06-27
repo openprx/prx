@@ -22,8 +22,7 @@ use serde::{Deserialize, Serialize};
 /// Sentinel message written by `sessions_spawn` kill, projected to `Cancelled`.
 const KILLED_BY_USER: &str = "killed by user";
 
-/// What kind of session this is. v1a only ever produces `Agent`; `Shell` is
-/// reserved for v2.
+/// What kind of child TUI surface this is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManagedKind {
     /// A background agent session (`/bg`, or a model-spawned sub-agent).
@@ -32,6 +31,8 @@ pub enum ManagedKind {
     Shell,
     /// An interactive PTY shell session (v3; `/pty`).
     Pty,
+    /// Read-only conversation transcript viewer (`Ctrl+O`).
+    Transcript,
 }
 
 impl ManagedKind {
@@ -42,6 +43,7 @@ impl ManagedKind {
             Self::Agent => "agent",
             Self::Shell => "shell",
             Self::Pty => "pty",
+            Self::Transcript => "transcript",
         }
     }
 }
