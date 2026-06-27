@@ -1,4 +1,4 @@
-//! Chat-side view projection of a background session.
+//! Chat-side view projection of a child TUI session.
 //!
 //! This is a *projection* of the live `sessions_spawn` registry entry
 //! ([`crate::tools::sessions_spawn::SubAgentRun`]) onto the minimal shape the
@@ -46,7 +46,7 @@ impl ManagedKind {
     }
 }
 
-/// Who initiated a background session (v5, §17 unification).
+/// Who initiated a child session (v5, §17 unification).
 ///
 /// Both user-initiated `/bg`/`/shell`/`/pty` sessions and model-initiated
 /// sub-agents (the LLM calling `sessions_spawn` mid-turn) share the *same*
@@ -117,7 +117,7 @@ impl ManagedStatus {
     }
 }
 
-/// Minimal chat-side view of a single background session.
+/// Minimal chat-side view of a single child TUI session.
 #[derive(Debug, Clone)]
 pub struct ManagedSessionView {
     pub id: SessionId,
@@ -133,7 +133,7 @@ pub struct ManagedSessionView {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Persisted summary of a background session that ran during a chat session
+/// Persisted summary of a child TUI session that ran during a chat session
 /// (v4).
 ///
 /// This is the **durable** counterpart of [`ManagedSessionView`]: it carries
@@ -173,11 +173,11 @@ pub struct PersistedSessionSummary {
     /// Completion / failure summary body recorded by the run (may be empty).
     #[serde(default)]
     pub summary: String,
-    /// When the background session started.
+    /// When the child session started.
     pub created_at: DateTime<Utc>,
 }
 
-/// The v4 sentinel status for a background session that was still `running` when
+/// The v4 sentinel status for a child session that was still `running` when
 /// its owning chat session was persisted. Reload presents it as a terminal,
 /// non-revivable state (the live process is gone).
 pub const STATUS_INTERRUPTED: &str = "interrupted";

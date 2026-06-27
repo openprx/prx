@@ -1,9 +1,15 @@
-//! Chat-only multi-session runtime (v1a).
+//! Chat-only sessions runtime: the child TUI registry for `prx chat`.
 //!
-//! This module provides the chat-side glue for managing background sessions
-//! (agents now, shells later) **inside `prx chat`**. It does not introduce a
-//! second registry or supervisor: the live run state continues to live in
-//! `sessions_spawn`'s `Arc<RwLock<Vec<SubAgentRun>>>`. Here we only add:
+//! In the product model, every secondary work surface under the main chat TUI is
+//! a **session**: a child TUI entry with a stable display id, kind, origin,
+//! status, output ring, and input-routing target. `agent`, `shell`, and `pty`
+//! are kinds of sessions, not separate architecture names.
+//!
+//! This module provides the chat-side glue for managing those child TUI
+//! sessions **inside `prx chat`**. It does not introduce a second registry or
+//! supervisor: the live run state continues to live in `sessions_spawn`'s
+//! `Arc<RwLock<Vec<SubAgentRun>>>` plus the shell / PTY registries owned by the
+//! chat main loop. Here we only add:
 //!
 //! - [`id::SessionId`] — stable handle over the run UUID.
 //! - [`model::ManagedSessionView`] / [`model::project_run`] — UI projection.

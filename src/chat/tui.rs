@@ -92,15 +92,15 @@ pub struct TuiState {
     /// and the next loop iteration scrolls it permanently into the main
     /// terminal scrollback.
     pub streaming: Option<StreamingDraft>,
-    /// Persistent background-session status line (v1b). Empty when there are
-    /// no background sessions, in which case [`render_bottom_chrome`] omits the
+    /// Persistent child-session status line (v1b). Empty when there are
+    /// no child TUI sessions, in which case [`render_bottom_chrome`] omits the
     /// extra row. Written only by the chat main loop (via
     /// `Action::SessionsStatusUpdated`); the background spawn tasks never touch
     /// it.
     pub sessions_status: String,
     /// Current input-routing target (v1.1b). `Main` routes plain text to the
     /// main chat agent; `Session { seq }` routes it as a steer to the attached
-    /// background session. Drives the prompt's colour+glyph target indicator.
+    /// child TUI session. Drives the prompt's colour+glyph target indicator.
     /// Written by the chat main loop on `/attach` / `/detach` (it owns the
     /// authoritative `attached_follow`); the key thread only reads it.
     pub focus: crate::chat::sessions::FocusTarget,
@@ -311,7 +311,7 @@ pub enum KeyDispatch {
     /// key loop sends a synthetic `/attach <seq>` through the input channel so
     /// the async main loop performs the attach via its existing handler.
     AttachSession { seq: u64 },
-    /// v1.1b: detach the focused background session (Esc on empty input while a
+    /// v1.1b: detach the focused child session (Esc on empty input while a
     /// session is focused). The key loop sends a synthetic `/detach` through the
     /// input channel so the async main loop performs the detach.
     RequestDetach,
@@ -355,7 +355,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     }
     // v1.1b: Ctrl+G opens the session switcher over the cached session list.
     // Never falls through to the input box. Opening an empty switcher is still
-    // valid — it shows the "no background sessions" hint with an Esc to close.
+    // valid — it shows the "no child TUI sessions" hint with an Esc to close.
     if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL {
         let entries = state.sessions_cache.clone();
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
@@ -1114,7 +1114,7 @@ impl TuiState {
         });
     }
 
-    /// Replace the persistent background-session status line (v1b).
+    /// Replace the persistent child-session status line (v1b).
     ///
     /// An empty `summary` hides the extra status row entirely.
     pub fn set_sessions_status(&mut self, summary: &str) {
@@ -1583,7 +1583,7 @@ pub trait BottomChromeView {
     fn conversation_lines(&self) -> &[ConversationLine];
     fn streaming(&self) -> Option<&StreamingDraft>;
     fn input(&self) -> &TuiInput;
-    /// Persistent background-session status line (v1b). Empty hides the row.
+    /// Persistent child-session status line (v1b). Empty hides the row.
     fn sessions_status(&self) -> &str;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
     /// target indicator (`main >` vs `agent #N ▸`).
@@ -1713,16 +1713,16 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     };
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
     let total: u16 = 1u16 // status row
-        .saturating_add(sessions_rows) // background-session status row (v1b)
+        .saturating_add(sessions_rows) // child-session status row (v1b)
         .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1); // footer row
     total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
 }
 
-/// Whether the persistent background-session status row should be shown.
+/// Whether the persistent child-session status row should be shown.
 ///
-/// Hidden when empty (no background sessions). As a narrow/short-terminal
+/// Hidden when empty (no child TUI sessions). As a narrow/short-terminal
 /// degrade rule (plan §v1b), the row is also dropped first when the rest of the
 /// chrome (status + streaming + input + footer) would otherwise meet or exceed
 /// [`BOTTOM_CHROME_MAX_HEIGHT`], so the input box and footer never lose rows to
@@ -1804,7 +1804,7 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),              // Status bar
-            Constraint::Length(sessions_rows),  // Background-session status (0 when none)
+            Constraint::Length(sessions_rows),  // Child-session status (0 when none)
             Constraint::Length(streaming_rows), // Streaming preview (0 when idle)
             Constraint::Length(input_height),   // Input area (dynamic)
             Constraint::Length(1),              // Footer
@@ -1826,7 +1826,7 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
     }
 }
 
-/// Render the persistent background-session status row (v1b).
+/// Render the persistent child-session status row (v1b).
 ///
 /// Single line, distinct dim style from the main status bar. The text is
 /// truncated to the row width so a narrow terminal degrades gracefully rather
@@ -1913,7 +1913,7 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
     let marker = if ascii { ">" } else { "\u{25B8}" }; // ▸
     let block = Block::default()
         .borders(Borders::TOP)
-        .title(" Sessions (Ctrl+G) ")
+        .title(" Sessions - child TUI registry (Ctrl+G) ")
         .border_style(Style::default().fg(Color::Blue));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -1927,7 +1927,7 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
 
     if switcher.is_empty() {
         let empty =
-            Paragraph::new(" No background sessions. Esc to close. ").style(Style::default().fg(Color::DarkGray));
+            Paragraph::new(" No child TUI sessions. Esc to close. ").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty, inner);
         return;
     }
@@ -2014,16 +2014,51 @@ fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect
         title_str
     };
 
+    let token_estimate = estimate_visible_token_usage(state);
     let status_text = format!(
-        " PRX Chat | {}/{} | {} | {} turns ",
+        " PRX Chat | {}/{} | {} | {} turns | ~{} tok ",
         state.provider(),
         state.model(),
         title,
-        state.turn_count()
+        state.turn_count(),
+        token_estimate
     );
 
     let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
     frame.render_widget(status, area);
+}
+
+/// Rough current-token estimate for the TUI status bar.
+///
+/// This mirrors `/cost`'s cheap chars/4 heuristic and uses only data already
+/// present in the render snapshot. It is an operator hint, not a billing
+/// counter.
+fn estimate_visible_token_usage<V: BottomChromeView + ?Sized>(state: &V) -> usize {
+    let mut chars = 0usize;
+    for line in state.conversation_lines() {
+        chars = chars.saturating_add(match line {
+            ConversationLine::User { content }
+            | ConversationLine::Assistant { content }
+            | ConversationLine::StreamingAssistant { content }
+            | ConversationLine::System { content } => content.chars().count(),
+            ConversationLine::Tool { name, .. } => name.chars().count(),
+            ConversationLine::ToolResult {
+                tool_name,
+                args_full,
+                result,
+                ..
+            } => {
+                tool_name.chars().count()
+                    + args_full.chars().count()
+                    + result.as_deref().map_or(0, |r| r.chars().count())
+            }
+            ConversationLine::Reasoning { char_count, .. } => *char_count,
+        });
+    }
+    if let Some(streaming) = state.streaming() {
+        chars = chars.saturating_add(streaming.accumulated.chars().count());
+    }
+    chars / 4
 }
 
 /// Render the in-flight streaming-assistant draft inside the inline
@@ -4789,7 +4824,7 @@ mod tests {
         let idle = bottom_chrome_height(&state);
         assert!(!sessions_status_visible(&state), "empty status row hidden");
 
-        state.set_sessions_status("bg: 1 running");
+        state.set_sessions_status("sessions: 1 running");
         assert!(sessions_status_visible(&state), "non-empty status row shown");
         let with_row = bottom_chrome_height(&state);
         assert_eq!(
@@ -4811,7 +4846,7 @@ mod tests {
         // the 1-row sessions line (=20) still fits under BOTTOM_CHROME_MAX_HEIGHT
         // (24): the row stays visible and the total never exceeds the cap.
         let mut state = TuiState::new("p", "m");
-        state.set_sessions_status("bg: 9 running");
+        state.set_sessions_status("sessions: 9 running");
         state.start_stream("d");
         for _ in 0..(INPUT_MAX_VISIBLE_ROWS + 4) {
             state.input.lines.push(String::new());
@@ -4836,6 +4871,22 @@ mod tests {
         assert!(
             without_sessions < BOTTOM_CHROME_MAX_HEIGHT,
             "guard threshold: row drops once the rest reaches BOTTOM_CHROME_MAX_HEIGHT"
+        );
+    }
+
+    #[test]
+    fn status_token_estimate_tracks_visible_chat_and_streaming_text() {
+        let mut state = TuiState::new("p", "m");
+        state.push_user_message("12345678");
+        state.push_assistant_message("abcd");
+        assert_eq!(estimate_visible_token_usage(&state), 3);
+
+        state.start_stream("d-live");
+        assert!(state.update_stream("d-live", "wxyz", 1));
+        assert_eq!(
+            estimate_visible_token_usage(&state),
+            4,
+            "streaming text contributes to the status-bar estimate"
         );
     }
 

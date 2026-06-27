@@ -9,13 +9,13 @@
 //!
 //! - [`FocusTarget`] — where plain text + Enter is routed. `Main` (the default)
 //!   sends to the main chat agent; `Session { seq }` routes the text as a
-//!   *steer* to the attached background session (head footgun: input target
+//!   *steer* to the attached child session (head footgun: input target
 //!   ambiguity — see plan §0.2.1 A). The target is shown in the prompt with a
 //!   colour **and** a glyph so it is never colour-only (colour-blind / no-color
 //!   safe).
 //!
 //! - [`SwitcherState`] — the Ctrl+G session switcher overlay. A small, bottom-
-//!   chrome popup (never an alternate screen) listing background sessions; the
+//!   chrome popup (never an alternate screen) listing child TUI sessions; the
 //!   user navigates and attaches without typing a command.
 //!
 //! [`resolve_esc`] is the pure decision function for the context-dependent Esc
@@ -31,12 +31,12 @@ pub enum FocusTarget {
     /// Default: input goes to the main chat agent loop.
     #[default]
     Main,
-    /// Input is routed as a *steer* to the attached background session `#seq`.
+    /// Input is routed as a *steer* to the attached child TUI session `#seq`.
     Session { seq: u64 },
 }
 
 impl FocusTarget {
-    /// Whether a background session currently has input focus.
+    /// Whether a child TUI session currently has input focus.
     #[must_use]
     pub const fn is_session(self) -> bool {
         matches!(self, Self::Session { .. })
@@ -116,7 +116,7 @@ impl SwitcherEntry {
 /// switcher is closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitcherState {
-    /// Snapshot of background sessions at open time (refreshed from the cached
+    /// Snapshot of child TUI sessions at open time (refreshed from the cached
     /// 1s poll; the actual attach re-resolves the seq, so display staleness
     /// never causes a wrong attach).
     pub entries: Vec<SwitcherEntry>,

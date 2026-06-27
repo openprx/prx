@@ -1,10 +1,13 @@
-//! Thin chat-side handle over the shared `sessions_spawn` registry.
+//! Thin chat-side handle over the shared sessions registries.
 //!
 //! [`ChatSessionsHandle`] is **not** a supervisor and does **not** own a second
-//! registry. It wraps the single-source `Arc<RwLock<Vec<SubAgentRun>>>` that the
-//! chat main loop builds once and shares with the four sessions tools
-//! (`sessions_spawn`/`sessions_list`/`session_status`/`sessions_send`). The chat
-//! `/sessions` and `/kill` commands read/act through this same Arc.
+//! registry. It is the chat-facing child TUI registry projection: one display
+//! sequence space over agents, shells, and PTYs. It wraps the single-source
+//! `Arc<RwLock<Vec<SubAgentRun>>>` that the chat main loop builds once and
+//! shares with the four sessions tools
+//! (`sessions_spawn`/`sessions_list`/`session_status`/`sessions_send`), plus
+//! chat-owned shell / PTY registries. The chat `/sessions` and `/kill` commands
+//! read/act through these same registries.
 //!
 //! The short display alias `#N` lives only here, in the chat main loop's
 //! single-threaded state (`seq_map`); it is never shared across a lock.
@@ -44,7 +47,7 @@ pub struct TailLine {
     pub content: String,
 }
 
-/// A background session that has just reached a terminal state, surfaced once
+/// A child session that has just reached a terminal state, surfaced once
 /// to the chat main loop for the v1b summary reflow.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FinishedSession {
@@ -267,7 +270,7 @@ impl ChatSessionsHandle {
         self.shells.lock().iter().find(|s| s.id == id).cloned()
     }
 
-    /// Snapshot all background sessions (agents + shells) as chat-side views in a
+    /// Snapshot all child TUI sessions (agents + shells + PTYs) as chat-side views in a
     /// single seq space, assigning/refreshing display sequence numbers.
     pub async fn snapshot(&mut self) -> Vec<ManagedSessionView> {
         let runs = self.refresh_seqs().await;
@@ -457,7 +460,7 @@ impl ChatSessionsHandle {
         ))
     }
 
-    /// Read a read-only tail of a background session's accumulated history.
+    /// Read a read-only tail of a child session's accumulated history.
     ///
     /// v1b `/attach` is a **read-only snapshot** (plan §v1b): it polls the run's
     /// `history` once and returns at most `last_n` most-recent entries. It does
@@ -516,8 +519,7 @@ impl ChatSessionsHandle {
 ///
 /// Returns an empty string when there are no sessions (the chat status row is
 /// then hidden). Otherwise produces a compact `running/completed/failed/
-/// cancelled` count line, e.g. `bg: 2 running · 1 completed`. `NeedsInput` has
-/// no underlying source in v1b and is therefore never counted (plan §C.2 P0-5).
+/// cancelled` count line, e.g. `sessions: 2 running · 1 completed`.
 #[must_use]
 pub fn status_summary(views: &[ManagedSessionView]) -> String {
     if views.is_empty() {
@@ -553,7 +555,7 @@ pub fn status_summary(views: &[ManagedSessionView]) -> String {
     if parts.is_empty() {
         return String::new();
     }
-    format!("bg: {}", parts.join(" \u{00B7} "))
+    format!("sessions: {}", parts.join(" \u{00B7} "))
 }
 
 #[cfg(test)]
@@ -924,7 +926,7 @@ mod tests {
             mk(5, ManagedStatus::Cancelled),
         ];
         let s = status_summary(&views);
-        assert!(s.starts_with("bg: "), "got {s}");
+        assert!(s.starts_with("sessions: "), "got {s}");
         assert!(s.contains("2 running"));
         assert!(s.contains("1 completed"));
         assert!(s.contains("1 failed"));

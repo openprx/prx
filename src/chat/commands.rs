@@ -71,14 +71,14 @@ const HELP_TEXT: &str = "Available commands:
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
   /auto              Switch to auto mode (no approval prompts)
-  /bg <task>         Run a task as a background agent session
-  /sessions          List background sessions
-  /shell <command>   Run a command as a background shell session
+  /bg <task>         Run a task as an agent child session
+  /sessions          List child TUI sessions
+  /shell <command>   Run a command as a shell child session
   /pty <command>     Open an interactive PTY shell (full terminal handoff)
-  /attach <id>       Show a background session's recent output (read-only)
-  /logs <id>         Dump a background session's buffered output (last 200 lines)
-  /steer <id> <msg>  Send a steering instruction to a background session
-  /kill <id>         Stop a background session
+  /attach <id>       Show a child session's recent output (read-only)
+  /logs <id>         Dump a child session's buffered output (last 200 lines)
+  /steer <id> <msg>  Send a steering instruction to a child session
+  /kill <id>         Stop a child session
   /quit /exit        Exit chat";
 
 /// Dispatch a slash command. Returns `CommandResult`.

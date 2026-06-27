@@ -1701,7 +1701,7 @@ impl ChatState {
     /// Why emit SaveSession here (P0, v4 review): under `terminal-tui` (now the
     /// default) the legacy exit-save path is disabled (`mod.rs`
     /// `legacy_exit_save_enabled=false`), and no other action snapshots after a
-    /// background session reaches a terminal state. Without this effect the
+    /// child session reaches a terminal state. Without this effect the
     /// summary lived only in memory and was lost on exit → reload recap broke.
     /// Emitting SaveSession **after** the upsert guarantees the snapshot
     /// (`build_session_snapshot`, which clones `self.session.background_sessions`)
@@ -1713,7 +1713,7 @@ impl ChatState {
     /// summary superseding a placeholder). This records **summary only** — it
     /// never spawns or revives a process / sub-agent / PTY.
     ///
-    /// No save storm: a background session reaching a terminal state is a
+    /// No save storm: a child session reaching a terminal state is a
     /// low-frequency event, and an unchanged re-record short-circuits to
     /// `Vec::new()` before emitting any effect. `Effect::SaveSession` is a pure
     /// persistence sink (it never dispatches a new action), so there is no
@@ -2070,16 +2070,16 @@ mod tests {
         assert!(state.ui.sessions_status.is_empty());
 
         let effects = state.reduce(Action::SessionsStatusUpdated {
-            summary: "bg: 1 running".to_string(),
+            summary: "sessions: 1 running".to_string(),
         });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert_eq!(state.ui.sessions_status, "bg: 1 running");
+        assert_eq!(state.ui.sessions_status, "sessions: 1 running");
         let snap = state.build_ui_snapshot(1);
-        assert_eq!(&*snap.sessions_status, "bg: 1 running");
+        assert_eq!(&*snap.sessions_status, "sessions: 1 running");
 
         // Identical write is a no-op (no redraw effect).
         let effects = state.reduce(Action::SessionsStatusUpdated {
-            summary: "bg: 1 running".to_string(),
+            summary: "sessions: 1 running".to_string(),
         });
         assert!(effects.is_empty(), "identical status must not emit an effect");
 
@@ -3403,12 +3403,12 @@ mod tests {
             assert_eq!(
                 snapshot.background_sessions.len(),
                 1,
-                "SaveSession snapshot must contain the just-recorded background session"
+                "SaveSession snapshot must contain the just-recorded child session"
             );
             let recorded = snapshot
                 .background_sessions
                 .first()
-                .expect("snapshot background session present");
+                .expect("snapshot child session present");
             assert_eq!(recorded.id, "run-42");
             assert_eq!(recorded.status, "completed");
 
@@ -3423,7 +3423,7 @@ mod tests {
             );
         }
 
-        /// v4: a recorded background session must survive a save→load round trip
+        /// v4: a recorded child session must survive a save→load round trip
         /// through the reducer (snapshot persists it, SessionLoaded restores it),
         /// and a still-running session is never restored as a live one.
         #[test]

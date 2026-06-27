@@ -55,7 +55,7 @@ pub struct ChatSession {
     pub updated_at: DateTime<Utc>,
     /// Ordered conversation turns
     pub turns: Vec<ChatTurn>,
-    /// Summaries of background sessions (agent / shell / pty) that ran during
+    /// Summaries of child sessions (agent / shell / pty) that ran during
     /// this chat session (v4). Persisted so a reloaded chat session can show
     /// what its background tasks produced. Reload restores **summaries only** —
     /// it never revives a process, sub-agent, or PTY. `#[serde(default)]` keeps
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn empty_background_sessions_are_not_serialized() {
         // skip_serializing_if keeps the wire format identical to pre-v4 when no
-        // background sessions ran, so nothing changes for the common case.
+        // child sessions ran, so nothing changes for the common case.
         let session = ChatSession::new("p", "m");
         let json = session.to_json().expect("test: serialize");
         assert!(!json.contains("background_sessions"));

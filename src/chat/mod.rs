@@ -289,7 +289,7 @@ fn print_fallback_chat_output(text: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Format the recap of background sessions restored from a reloaded chat
+/// Format the recap of child sessions restored from a reloaded chat
 /// session (v4). Pure string builder (no I/O, no lock) so it is trivially
 /// unit-testable. Each line shows the kind, display seq `#N`, terminal status,
 /// title/command, and (when present) the completion summary. The header makes
@@ -1780,7 +1780,7 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
 
-    // ── Reload notice: historical background sessions (v4) ────────
+    // ── Reload notice: historical child sessions (v4) ────────
     // If this chat session was resumed and carried persisted background-session
     // summaries, surface a one-shot recap so the user sees what their previous
     // background tasks produced. These are **summaries only** — no process,
@@ -1822,7 +1822,7 @@ pub async fn run(
                         sessions_redraw_handle.as_ref(),
                         &line,
                     );
-                    // v4: persist a summary of this finished background session
+                    // v4: persist a summary of this finished child session
                     // into the chat session so a reload can show what it
                     // produced. Title / created_at come from the live view (the
                     // finished record itself only carries seq/status/summary);
@@ -2435,7 +2435,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         SessionCommand::Sessions => {
                             let views = chat_sessions.snapshot().await;
                             if views.is_empty() {
-                                emit_chat_output("No background sessions.");
+                                emit_chat_output("No child TUI sessions.");
                             } else {
                                 let mut out = String::from("Background sessions:\n");
                                 for v in &views {
@@ -2960,7 +2960,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 commands::CommandResult::NotACommand => {
                     // v1.1b input routing (head footgun: input-target ambiguity).
-                    // When a background session is attached, plain text + Enter is
+                    // When a child session is attached, plain text + Enter is
                     // routed as a *steer* to that session instead of starting a
                     // main-chat turn. The prompt's colour+glyph indicator already
                     // shows the target, and `/detach` (or Esc) returns to main.
@@ -4095,7 +4095,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
     }
 
     // ── Persist background-session summaries on exit (v4) ─────────
-    // Snapshot every background session (agent / shell / pty) still tracked at
+    // Snapshot every child session (agent / shell / pty) still tracked at
     // exit and record a summary so a future reload of this chat session can show
     // what its background tasks were. `from_view` maps any session still in a
     // live state (Running / NeedsInput) to the terminal `interrupted` sentinel:

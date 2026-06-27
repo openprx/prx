@@ -49,7 +49,7 @@ pub const EVENT_CHANNEL_CAPACITY: usize = 1024;
 /// Default per-session ring buffer line capacity for attach display.
 pub const DEFAULT_RING_CAPACITY: usize = 500;
 
-/// An event emitted by a background session, tagged with its [`SessionId`] so the
+/// An event emitted by a child session, tagged with its [`SessionId`] so the
 /// chat main loop can route it to the right [`SessionRing`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionEvent {
@@ -63,7 +63,7 @@ pub enum SessionEvent {
     /// `truncated` so `/attach` shows `[output truncated]`. Emitted lazily on the
     /// next successful forward after a drop (the drainer never blocks to send it).
     Truncated { id: SessionId },
-    /// The background session suspended on a tool call that needs an operator
+    /// The child session suspended on a tool call that needs an operator
     /// approval decision (NeedsInput). `prompt` summarises what is awaiting
     /// approval (tool name + a short argument digest). The main loop surfaces a
     /// non-intrusive `/approve` / `/deny` hint and the session's status flips to

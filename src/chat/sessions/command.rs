@@ -15,7 +15,7 @@
 pub enum SessionCommand {
     /// `/bg <task>` — spawn a background agent session.
     Bg { task: String },
-    /// `/sessions` — list background sessions.
+    /// `/sessions` — list child TUI sessions.
     Sessions,
     /// `/kill <seq>` — abort the session with the given display sequence `#N`.
     Kill { seq: u64 },
@@ -31,10 +31,10 @@ pub enum SessionCommand {
     Logs { seq: u64 },
     /// `/pty <command>` — interactive PTY shell with full terminal handoff (v3).
     Pty { command: String },
-    /// `/approve <seq>` — approve a background session suspended on the approval
+    /// `/approve <seq>` — approve a child session suspended on the approval
     /// gate (NeedsInput), injecting a runtime grant so the gated tool can proceed.
     Approve { seq: u64 },
-    /// `/deny <seq>` — deny a background session suspended on the approval gate
+    /// `/deny <seq>` — deny a child session suspended on the approval gate
     /// (NeedsInput); the gated tool is reported as denied to the sub-agent.
     Deny { seq: u64 },
 }
