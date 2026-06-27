@@ -5394,6 +5394,14 @@ pub async fn run(
         model_name,
         &provider_runtime_options,
     )?;
+    let effective_compaction = crate::router::resolve_effective_compaction_config(
+        &config.agent.compaction,
+        provider_name,
+        model_name,
+        &config.router,
+        &config.model_routes,
+    );
+    crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
 
     observer.record_event(&ObserverEvent::AgentStart {
         provider: provider_name.to_string(),
@@ -5637,7 +5645,7 @@ pub async fn run(
                             rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
                             rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
                         },
-                        Some(&config.agent.compaction),
+                        Some(&effective_compaction.config),
                         None,
                         None,
                         None,
@@ -5951,7 +5959,7 @@ pub async fn run(
                             rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
                             rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
                         },
-                        Some(&config.agent.compaction),
+                        Some(&effective_compaction.config),
                         None,
                         None,
                         None,
@@ -8782,6 +8790,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: false,
             max_context_tokens: 50,
+            max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig::default(),
         };
         let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
@@ -8792,6 +8801,49 @@ ls -la
             history
                 .iter()
                 .any(|msg| { msg.content.contains("[Context compacted at") && msg.content.contains("Summary:") })
+        );
+    }
+
+    #[tokio::test]
+    async fn configurable_compaction_1m_window_does_not_compact_above_128k() {
+        let provider = ScriptedProvider::from_text_responses(vec!["should not be called"]);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("wide-context-token ".repeat(150_000)),
+            ChatMessage::assistant("ack"),
+        ];
+        let token_estimate = estimate_history_tokens(&history);
+        assert!(
+            token_estimate > 128_000,
+            "fixture must exceed the old 128K posture, got {token_estimate}"
+        );
+        assert!(
+            token_estimate < 1_000_000usize.saturating_sub(4_096),
+            "fixture must remain below the 1M reserve-adjusted trigger, got {token_estimate}"
+        );
+
+        let before_roles: Vec<String> = history.iter().map(|msg| msg.role.clone()).collect();
+        let before_contents: Vec<String> = history.iter().map(|msg| msg.content.clone()).collect();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 4_096,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 1_000_000,
+            max_context_tokens_explicit: false,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+        let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
+            .await
+            .unwrap();
+        assert!(!compacted);
+        assert_eq!(
+            history.iter().map(|msg| msg.role.clone()).collect::<Vec<_>>(),
+            before_roles
+        );
+        assert_eq!(
+            history.iter().map(|msg| msg.content.clone()).collect::<Vec<_>>(),
+            before_contents
         );
     }
 
@@ -8811,6 +8863,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: true,
             max_context_tokens: 40,
+            max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig::default(),
         };
         let compacted = apply_configurable_compaction(&mut history, &provider, "model", &config, None, "test")
@@ -8858,6 +8911,7 @@ ls -la
             keep_recent_messages: 1,
             memory_flush: false,
             max_context_tokens: 50,
+            max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig::default(),
         };
 
@@ -10081,6 +10135,7 @@ Let me check the result."#;
             keep_recent_messages: 12,
             memory_flush: false,
             max_context_tokens: 50,
+            max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig {
                 enabled,
                 eviction_threshold: 0.70,

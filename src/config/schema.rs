@@ -1005,9 +1005,17 @@ pub struct AgentCompactionConfig {
     /// Run memory flush extraction before compacting.
     #[serde(default = "default_true")]
     pub memory_flush: bool,
-    /// Token threshold that triggers compaction.
+    /// Total model context window in tokens. This uses the same unit as
+    /// `RouterModelConfig.max_context`; runtime trigger thresholds subtract
+    /// `reserve_tokens` from this total window.
     #[serde(default = "default_agent_compaction_max_context_tokens")]
     pub max_context_tokens: usize,
+    /// Internal presence bit populated by `Config::load_from_path`. Serde
+    /// defaults alone cannot distinguish a missing value from an explicit
+    /// operator override equal to the default.
+    #[serde(default, skip_serializing)]
+    #[schemars(skip)]
+    pub max_context_tokens_explicit: bool,
     /// Letta/MemGPT-style OS-paging controls (`[agent.compaction.os_paging]`).
     ///
     /// Enabled by default (Phase 1). When enabled, oldest messages are evicted
@@ -1026,6 +1034,7 @@ impl Default for AgentCompactionConfig {
             keep_recent_messages: default_agent_compaction_keep_recent_messages(),
             memory_flush: true,
             max_context_tokens: default_agent_compaction_max_context_tokens(),
+            max_context_tokens_explicit: false,
             os_paging: OsPagingConfig::default(),
         }
     }
@@ -5560,9 +5569,11 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
 impl Config {
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml_with_gate(config_path)?;
+        let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
         let mut config: Self = merged.try_into().context("Failed to deserialize merged config")?;
         config.config_path = config_path.to_path_buf();
         config.workspace_dir = workspace_dir;
+        config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
 
         let openprx_dir = config_path
             .parent()
@@ -5811,6 +5822,14 @@ impl Config {
         }
         Ok((main, fragments))
     }
+}
+
+fn agent_compaction_max_context_tokens_present(config: &toml::Value) -> bool {
+    config
+        .get("agent")
+        .and_then(|agent| agent.get("compaction"))
+        .and_then(|compaction| compaction.get("max_context_tokens"))
+        .is_some()
 }
 
 pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Result<()> {
@@ -6422,6 +6441,57 @@ default_temperature = 0.7
             parsed.agent.compaction.os_paging.enabled,
             "empty [agent.compaction] must deserialize with os_paging enabled (Phase 1 default)"
         );
+    }
+
+    #[test]
+    async fn load_path_marks_compaction_max_context_presence_only_when_explicit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[agent.compaction]
+mode = "safeguard"
+
+[router]
+enabled = true
+
+[[router.models]]
+model_id = "wide"
+provider = "openrouter"
+max_context = 1000000
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert!(!loaded.agent.compaction.max_context_tokens_explicit);
+
+        std::fs::write(
+            &config_path,
+            r#"
+default_temperature = 0.7
+
+[agent.compaction]
+mode = "safeguard"
+max_context_tokens = 128000
+
+[router]
+enabled = true
+
+[[router.models]]
+model_id = "wide"
+provider = "openrouter"
+max_context = 1000000
+"#,
+        )
+        .unwrap();
+
+        let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
+        assert!(loaded.agent.compaction.max_context_tokens_explicit);
+        assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
     }
 
     #[test]

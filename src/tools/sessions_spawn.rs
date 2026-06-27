@@ -428,6 +428,11 @@ impl SessionsSpawnTool {
         spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
+        tracing::debug!(
+            max_context_tokens = compaction_config.max_context_tokens,
+            max_context_tokens_explicit = compaction_config.max_context_tokens_explicit,
+            "sessions_spawn using base compaction config; per-session context capability resolution deferred to ISS-008"
+        );
         Self {
             channel: Arc::new(RwLock::new(channel)),
             channels: Arc::new(HashMap::new()),

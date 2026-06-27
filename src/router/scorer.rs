@@ -215,12 +215,9 @@ mod tests {
 
         let result = rank_models(&RouterIntent::Code, 500, &models, &config, None);
         assert_eq!(result.chosen_model.as_deref(), Some("wide"));
-        assert!(
-            result
-                .candidates
-                .iter()
-                .any(|candidate| { candidate.model_id == "tiny" && candidate.filtered_reason.is_some() })
-        );
+        assert!(result.candidates.iter().any(|candidate| {
+            candidate.model_id == "tiny" && candidate.filtered_reason.as_deref() == Some("context_exceeded")
+        }));
     }
 
     #[test]

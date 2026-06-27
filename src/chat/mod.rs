@@ -3341,6 +3341,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
             Duration::from_secs(base.saturating_mul(scale))
         };
 
+        let effective_compaction = crate::router::resolve_effective_compaction_config(
+            &config.agent.compaction,
+            provider_name,
+            model_name,
+            &config.router,
+            &config.model_routes,
+        );
+        crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
+
         let route_decision = RouteDecision::from_model_routes_for_context(
             provider_name,
             model_name,
@@ -3635,7 +3644,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
                             rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
                         },
-                        Some(&config.agent.compaction),
+                        Some(&effective_compaction.config),
                         Some(cancellation.clone()),
                         Some(delta_tx.clone()),
                         Some(&scope_ctx),
