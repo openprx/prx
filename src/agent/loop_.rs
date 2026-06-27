@@ -6565,6 +6565,10 @@ mod tests {
         tool_output_ingests: Arc<AtomicUsize>,
     }
 
+    struct FailingIngestMemory {
+        inner: Arc<dyn Memory>,
+    }
+
     #[async_trait]
     impl Memory for CountingIngestMemory {
         fn name(&self) -> &str {
@@ -6581,6 +6585,64 @@ mod tests {
                 self.tool_output_ingests.fetch_add(1, Ordering::SeqCst);
             }
             self.inner.ingest_document(input).await
+        }
+        async fn search_document_chunks(
+            &self,
+            principal: &MemoryPrincipal,
+            query: &str,
+            limit: usize,
+        ) -> anyhow::Result<Vec<DocumentSearchResult>> {
+            self.inner.search_document_chunks(principal, query, limit).await
+        }
+        async fn store(
+            &self,
+            key: &str,
+            content: &str,
+            category: MemoryCategory,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<()> {
+            self.inner.store(key, content, category, session_id).await
+        }
+        async fn recall(
+            &self,
+            query: &str,
+            limit: usize,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.recall(query, limit, session_id).await
+        }
+        async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
+            self.inner.get(key).await
+        }
+        async fn list(
+            &self,
+            category: Option<&MemoryCategory>,
+            session_id: Option<&str>,
+        ) -> anyhow::Result<Vec<MemoryEntry>> {
+            self.inner.list(category, session_id).await
+        }
+        async fn forget(&self, key: &str) -> anyhow::Result<bool> {
+            self.inner.forget(key).await
+        }
+        async fn count(&self) -> anyhow::Result<usize> {
+            self.inner.count().await
+        }
+        async fn health_check(&self) -> bool {
+            self.inner.health_check().await
+        }
+    }
+
+    #[async_trait]
+    impl Memory for FailingIngestMemory {
+        fn name(&self) -> &str {
+            "failing-ingest-memory"
+        }
+        fn supports_document_ingest(&self) -> bool {
+            true
+        }
+        async fn ingest_document(&self, input: DocumentIngestInput) -> anyhow::Result<DocumentRecord> {
+            let _ = input;
+            anyhow::bail!("forced ingest failure")
         }
         async fn search_document_chunks(
             &self,
@@ -10302,6 +10364,39 @@ Let me check the result."#;
             recalled.content.contains("ZEBRA-PANGOLIN-42"),
             "recalled page must preserve full content verbatim, got: {}",
             &recalled.content[..recalled.content.len().min(200)]
+        );
+    }
+
+    #[tokio::test]
+    async fn os_paging_ingest_failure_leaves_history_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().to_string_lossy().to_string();
+        let inner: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let mem: Arc<dyn Memory> = Arc::new(FailingIngestMemory { inner });
+        let envelope = RuntimeEnvelope::agent(workspace, "run-paging-fail");
+        let runtime = DocumentIngestRuntime::from_envelope(mem, &envelope);
+
+        let config = paging_test_config(true);
+        let mut history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("u1 ".repeat(120)),
+            ChatMessage::assistant("a1 ".repeat(120)),
+            ChatMessage::user("u2 ".repeat(120)),
+            ChatMessage::assistant("a2 ".repeat(120)),
+            ChatMessage::user("latest question"),
+        ];
+        let before_roles: Vec<String> = history.iter().map(|msg| msg.role.clone()).collect();
+        let before_contents: Vec<String> = history.iter().map(|msg| msg.content.clone()).collect();
+
+        let evicted = apply_os_paging(&mut history, &config, Some(&runtime)).await.unwrap();
+        assert!(!evicted, "ingest failure must soft-fail without eviction");
+        assert_eq!(
+            history.iter().map(|msg| msg.role.clone()).collect::<Vec<_>>(),
+            before_roles
+        );
+        assert_eq!(
+            history.iter().map(|msg| msg.content.clone()).collect::<Vec<_>>(),
+            before_contents
         );
     }
 

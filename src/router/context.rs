@@ -67,12 +67,15 @@ pub fn resolve_effective_compaction_config(
         );
     }
 
+    let capped = cap_to_kernel(base.max_context_tokens);
+    let mut config = base.clone();
+    config.max_context_tokens = capped.effective;
     resolved(
-        base.clone(),
+        config,
         ContextWindowSource::FallbackDefault,
         None,
-        None,
-        false,
+        Some(capped.requested),
+        capped.kernel_capped,
         selected_provider,
         selected_model,
     )
@@ -387,13 +390,43 @@ mod tests {
             &RouterConfig::default(),
             &[],
         );
-        assert_eq!(
-            result.config.max_context_tokens,
-            AgentCompactionConfig::default().max_context_tokens
-        );
+        assert_eq!(result.config.max_context_tokens, 128_000);
         assert_eq!(result.max_context_source, ContextWindowSource::FallbackDefault);
         assert_eq!(result.model_context_tokens, None);
-        assert_eq!(result.requested_context_tokens, None);
+        assert_eq!(result.requested_context_tokens, Some(128_000));
         assert!(!result.kernel_capped);
+    }
+
+    #[test]
+    fn fallback_default_still_stays_below_kernel_limit() {
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "unknown-provider",
+            "unknown-model",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert!(result.config.max_context_tokens <= KERNEL_SUPPORTED_CONTEXT_TOKENS);
+    }
+
+    #[test]
+    fn caps_fallback_default_at_kernel_limit() {
+        let base = AgentCompactionConfig {
+            max_context_tokens: 20_000_000,
+            max_context_tokens_explicit: false,
+            ..AgentCompactionConfig::default()
+        };
+        let result = resolve_effective_compaction_config(
+            &base,
+            "unknown-provider",
+            "unknown-model",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(result.config.max_context_tokens, 10_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::FallbackDefault);
+        assert_eq!(result.model_context_tokens, None);
+        assert_eq!(result.requested_context_tokens, Some(20_000_000));
+        assert!(result.kernel_capped);
     }
 }
