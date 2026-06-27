@@ -687,6 +687,37 @@ fn test_chat_plain_diff_no_tui_chrome() {
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_file_mention_no_tui_chrome() {
+    let sentinel = "[MOCK-FILE-MENTION-OK]";
+    let guard = new_harness_guard().expect("harness guard");
+    std::fs::write(guard.workspace_dir.join("note.txt"), "file mention body").expect("write mention file");
+    let mut sg = spawn_chat_in(
+        &guard,
+        &["--plain"],
+        &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", sentinel)],
+    );
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session.send("please read @note.txt\r").expect("send mention");
+    let captured = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(captured.contains(sentinel), "mock response should contain `{sentinel}`");
+    assert!(
+        !captured.contains("PRX Chat |")
+            && !captured.contains("Ctrl+G sessions")
+            && !captured.contains("attached #")
+            && !captured.contains("diff workspace diff"),
+        "--plain @path must not render TUI chrome; captured:\n{captured}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
 /// 6. Chinese (CJK) characters in the mock response must appear contiguously
 /// — no phantom space between each character (regression guard for the
 /// `insert_before` wide-char bug fixed by enabling the `scrolling-regions`

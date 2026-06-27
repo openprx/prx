@@ -142,6 +142,197 @@ const EXIT_PERSISTENCE_IDLE_SETTLE_MS: u64 = 50;
 /// Maximum multiplier applied to the base timeout (caps iterations-based scaling).
 const TIMEOUT_MAX_SCALE_FACTOR: u64 = 4;
 
+const FILE_MENTION_MAX_FILES: usize = 5;
+const FILE_MENTION_MAX_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMention {
+    token: String,
+    path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileMentionEnrichment {
+    prompt: String,
+    visible_note: Option<String>,
+}
+
+fn extract_file_mentions(input: &str) -> Vec<FileMention> {
+    let mut mentions = Vec::new();
+    let mut iter = input.char_indices().peekable();
+
+    while let Some((idx, ch)) = iter.next() {
+        if ch != '@' {
+            continue;
+        }
+
+        if idx > 0
+            && input[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(is_file_mention_email_prefix)
+        {
+            continue;
+        }
+
+        let Some(&(start, first)) = iter.peek() else {
+            continue;
+        };
+        if first.is_whitespace() || first == '@' || first == '"' || first == '\'' {
+            continue;
+        }
+
+        let mut end = input.len();
+        let mut saw_char = false;
+        for (next_idx, next_ch) in input[start..].char_indices() {
+            if next_ch.is_whitespace() {
+                end = start + next_idx;
+                break;
+            }
+            saw_char = true;
+        }
+        if !saw_char {
+            continue;
+        }
+
+        let raw_path = &input[start..end];
+        let path = raw_path.trim_end_matches(is_file_mention_trailing_punctuation);
+        if path.is_empty() {
+            continue;
+        }
+
+        mentions.push(FileMention {
+            token: format!("@{path}"),
+            path: path.to_string(),
+        });
+    }
+
+    mentions
+}
+
+const fn is_file_mention_email_prefix(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '+')
+}
+
+const fn is_file_mention_trailing_punctuation(ch: char) -> bool {
+    matches!(ch, ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
+}
+
+async fn enrich_file_mentions_for_prompt(user_input: &str, tools_registry: &[Box<dyn Tool>]) -> FileMentionEnrichment {
+    let mentions = extract_file_mentions(user_input);
+    if mentions.is_empty() {
+        return FileMentionEnrichment {
+            prompt: user_input.to_string(),
+            visible_note: None,
+        };
+    }
+
+    let mut sections = Vec::new();
+    let mut visible_notes = Vec::new();
+    let file_read = tools_registry.iter().find(|tool| tool.supports_name("file_read"));
+
+    for mention in mentions.iter().take(FILE_MENTION_MAX_FILES) {
+        match file_read {
+            Some(tool) => {
+                let args = serde_json::json!({ "path": mention.path });
+                match tool.execute_named("file_read", args).await {
+                    Ok(result) if result.success => {
+                        let (content, truncated) = truncate_utf8_to_byte_cap(&result.output, FILE_MENTION_MAX_BYTES);
+                        let mut section = format!("### {}\nPath: {}\n\n{}", mention.token, mention.path, content);
+                        if truncated {
+                            section.push_str("\n[content truncated: 64 KiB limit]");
+                            visible_notes.push(format!("{}: content truncated to 64 KiB", mention.token));
+                        }
+                        sections.push(section);
+                    }
+                    Ok(result) => {
+                        let note = file_mention_failure_note(&mention.token, result.error.as_deref());
+                        sections.push(format!("### {}\nPath: {}\n\n{note}", mention.token, mention.path));
+                        visible_notes.push(note);
+                    }
+                    Err(e) => {
+                        let note = format!("{}: unavailable ({e})", mention.token);
+                        sections.push(format!("### {}\nPath: {}\n\n{note}", mention.token, mention.path));
+                        visible_notes.push(note);
+                    }
+                }
+            }
+            None => {
+                let note = format!("{}: unavailable (file_read tool is not registered)", mention.token);
+                sections.push(format!("### {}\nPath: {}\n\n{note}", mention.token, mention.path));
+                visible_notes.push(note);
+            }
+        }
+    }
+
+    if mentions.len() > FILE_MENTION_MAX_FILES {
+        let skipped = mentions.len().saturating_sub(FILE_MENTION_MAX_FILES);
+        let note = format!("{skipped} file mention(s) skipped: maximum {FILE_MENTION_MAX_FILES} per message");
+        sections.push(note.clone());
+        visible_notes.push(note);
+    }
+
+    let prompt = if sections.is_empty() {
+        user_input.to_string()
+    } else {
+        format!(
+            "{user_input}\n\n[Attached file context from @path mentions]\n{}\n[End attached file context]",
+            sections.join("\n\n")
+        )
+    };
+
+    let visible_note = if visible_notes.is_empty() {
+        None
+    } else {
+        Some(format!("File mention note: {}", visible_notes.join("; ")))
+    };
+
+    FileMentionEnrichment { prompt, visible_note }
+}
+
+fn file_mention_failure_note(token: &str, error: Option<&str>) -> String {
+    let Some(error) = error else {
+        return format!("{token}: unavailable");
+    };
+
+    if error.contains("not allowed")
+        || error.contains("escapes workspace")
+        || error.contains("Access denied")
+        || error.contains("security policy")
+    {
+        format!("{token}: unavailable (blocked by policy)")
+    } else if error.contains("Failed to resolve")
+        || error.contains("No such file")
+        || error.contains("not found")
+        || error.contains("No such file or directory")
+    {
+        format!("{token}: unavailable (missing or inaccessible)")
+    } else if error.contains("Is a directory") || error.contains("directory") {
+        format!("{token}: unavailable (not a file)")
+    } else if error.contains("File too large") {
+        format!("{token}: unavailable (file too large)")
+    } else {
+        format!("{token}: unavailable")
+    }
+}
+
+fn truncate_utf8_to_byte_cap(input: &str, max_bytes: usize) -> (String, bool) {
+    if input.len() <= max_bytes {
+        return (input.to_string(), false);
+    }
+
+    let mut end = 0usize;
+    for (idx, ch) in input.char_indices() {
+        let next = idx.saturating_add(ch.len_utf8());
+        if next > max_bytes {
+            break;
+        }
+        end = next;
+    }
+
+    (input[..end].to_string(), true)
+}
+
 /// Compact conversation history in-place to fit within context window limits.
 ///
 /// Preserves the system prompt (index 0), keeps the last [`COMPACT_KEEP_MESSAGES`]
@@ -3197,6 +3388,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
         }
 
+        let file_mention_enrichment = enrich_file_mentions_for_prompt(&user_input, tools_registry.as_ref()).await;
+        if let Some(note) = file_mention_enrichment.visible_note.as_deref() {
+            emit_chat_output(note);
+        }
+        let user_input_for_prompt = file_mention_enrichment.prompt;
+
         fabric_turn_seq += 1;
         // D8-2: one run_id per turn, generated at the turn entry and reused by
         // every run_id consumer within this loop iteration (user event, route
@@ -3255,9 +3452,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
         .await;
         let context = mem_context.preamble.clone();
         let enriched = if context.is_empty() {
-            user_input.clone()
+            user_input_for_prompt.clone()
         } else {
-            format!("{context}{user_input}")
+            format!("{context}{user_input_for_prompt}")
         };
 
         // Build system prompt with skill selection
@@ -6948,6 +7145,189 @@ mod legacy_chat_compaction_audit_tests {
         assert!(
             user1.parent_run_id.is_none() && asst1.parent_run_id.is_none() && user2.parent_run_id.is_none(),
             "chat turns must not set parent_run_id (session relation is via session_key)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod file_mention_tests {
+    use super::*;
+    use crate::security::{AutonomyLevel, SecurityPolicy};
+    use crate::tools::FileReadTool;
+    use crate::tools::traits::{ToolCategory, ToolResult, ToolTier};
+    use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct MockReadTool {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl Tool for MockReadTool {
+        fn name(&self) -> &str {
+            "file_read"
+        }
+
+        fn description(&self) -> &str {
+            "mock file read"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            })
+        }
+
+        async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
+            Ok(ToolResult {
+                success: true,
+                output: format!("content for {path}"),
+                error: None,
+            })
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Core
+        }
+
+        fn categories(&self) -> &'static [ToolCategory] {
+            &[ToolCategory::FileSystem]
+        }
+    }
+
+    fn file_read_registry(workspace: &std::path::Path, acl_enabled: bool) -> Vec<Box<dyn Tool>> {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.to_path_buf(),
+            max_actions_per_hour: 100,
+            ..SecurityPolicy::default()
+        });
+        vec![Box::new(FileReadTool::new(security, acl_enabled))]
+    }
+
+    #[test]
+    fn file_mentions_parse_multiple_cjk_and_ignore_email_bare_quote() {
+        let mentions = extract_file_mentions(
+            "read @src/lib.rs and @./README.md 邮件 a@example.com bare @ quoted @\"two words.txt\" @目录/文件.rs",
+        );
+
+        assert_eq!(
+            mentions,
+            vec![
+                FileMention {
+                    token: "@src/lib.rs".to_string(),
+                    path: "src/lib.rs".to_string(),
+                },
+                FileMention {
+                    token: "@./README.md".to_string(),
+                    path: "./README.md".to_string(),
+                },
+                FileMention {
+                    token: "@目录/文件.rs".to_string(),
+                    path: "目录/文件.rs".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn file_mention_success_uses_file_read_tool_and_preserves_original_text() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("note.txt"), "hello from mention").expect("write note");
+        let registry = file_read_registry(temp.path(), false);
+
+        let enriched = enrich_file_mentions_for_prompt("please inspect @note.txt", &registry).await;
+
+        assert!(enriched.prompt.starts_with("please inspect @note.txt"));
+        assert!(enriched.prompt.contains("hello from mention"));
+        assert!(enriched.visible_note.is_none());
+    }
+
+    #[tokio::test]
+    async fn file_mention_security_negatives_are_soft_visible_and_generic() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("memory")).expect("create memory");
+        std::fs::write(temp.path().join("MEMORY.md"), "protected memory").expect("write memory");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let outside = tempfile::tempdir().expect("outside tempdir");
+            std::fs::write(outside.path().join("secret.txt"), "outside secret").expect("write outside");
+            symlink(outside.path().join("secret.txt"), temp.path().join("escape.txt")).expect("symlink escape");
+
+            let registry = file_read_registry(temp.path(), true);
+            let enriched = enrich_file_mentions_for_prompt(
+                "check @../../etc/passwd @/etc/passwd @escape.txt @MEMORY.md @missing.txt",
+                &registry,
+            )
+            .await;
+
+            assert!(enriched.prompt.starts_with("check @../../etc/passwd"));
+            assert!(!enriched.prompt.contains("outside secret"));
+            assert!(!enriched.prompt.contains("protected memory"));
+            let note = enriched.visible_note.expect("visible failure notes");
+            assert!(note.contains("@../../etc/passwd: unavailable (blocked by policy)"));
+            assert!(note.contains("@/etc/passwd: unavailable (blocked by policy)"));
+            assert!(note.contains("@escape.txt: unavailable (blocked by policy)"));
+            assert!(note.contains("@MEMORY.md: unavailable (blocked by policy)"));
+            assert!(note.contains("@missing.txt: unavailable (missing or inaccessible)"));
+        }
+    }
+
+    #[tokio::test]
+    async fn file_mention_directory_is_rejected_softly() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("dir")).expect("create dir");
+        let registry = file_read_registry(temp.path(), false);
+
+        let enriched = enrich_file_mentions_for_prompt("inspect @dir", &registry).await;
+
+        let note = enriched.visible_note.expect("visible directory note");
+        assert!(note.contains("@dir: unavailable"));
+        assert!(enriched.prompt.starts_with("inspect @dir"));
+    }
+
+    #[tokio::test]
+    async fn file_mention_caps_file_count_and_bytes() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let registry: Vec<Box<dyn Tool>> = vec![Box::new(MockReadTool {
+            calls: Arc::clone(&calls),
+        })];
+
+        let enriched = enrich_file_mentions_for_prompt("x @a @b @c @d @e @f", &registry).await;
+
+        assert_eq!(calls.load(Ordering::SeqCst), FILE_MENTION_MAX_FILES);
+        assert!(enriched.prompt.contains("content for a"));
+        assert!(!enriched.prompt.contains("content for f"));
+        assert!(enriched.prompt.contains("1 file mention(s) skipped"));
+        assert!(
+            enriched
+                .visible_note
+                .expect("visible max-files note")
+                .contains("skipped")
+        );
+    }
+
+    #[tokio::test]
+    async fn file_mention_truncates_utf8_on_char_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(temp.path().join("big.txt"), "你".repeat(30_000)).expect("write big");
+        let registry = file_read_registry(temp.path(), false);
+
+        let enriched = enrich_file_mentions_for_prompt("read @big.txt", &registry).await;
+
+        assert!(enriched.prompt.contains("[content truncated: 64 KiB limit]"));
+        assert!(enriched.prompt.is_char_boundary(enriched.prompt.len()));
+        assert!(
+            enriched
+                .visible_note
+                .expect("visible truncation note")
+                .contains("@big.txt: content truncated to 64 KiB")
         );
     }
 }
