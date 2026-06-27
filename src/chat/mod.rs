@@ -222,6 +222,28 @@ fn format_compact_feedback(
     }
 }
 
+fn context_budget_warning_for_tui(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+    terminal_tui_enabled: bool,
+) -> Option<String> {
+    if !terminal_tui_enabled {
+        return None;
+    }
+    let budget = plan_context_budget(
+        history,
+        compaction_config,
+        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+    );
+    if !budget.over_warning {
+        return None;
+    }
+    Some(format!(
+        "Context budget warning: ~{} / {} tokens used (window {}, reserve {}).",
+        budget.used_tokens, budget.available_input_tokens, budget.max_context_tokens, budget.reserve_tokens
+    ))
+}
+
 fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
     let has_system = history.first().is_some_and(|msg| msg.role == "system");
     let start = if has_system { 1 } else { 0 };
@@ -3433,16 +3455,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 },
                 "chat.context_window_updated",
             );
-            let budget = plan_context_budget(
-                &history,
-                &effective_compaction.config,
-                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-            );
-            if budget.over_warning {
-                let warning = format!(
-                    "Context budget warning: ~{} / {} tokens used (window {}, reserve {}).",
-                    budget.used_tokens, budget.available_input_tokens, budget.max_context_tokens, budget.reserve_tokens
-                );
+            if let Some(warning) =
+                context_budget_warning_for_tui(&history, &effective_compaction.config, redraw_tx_for_main.is_some())
+            {
                 let _ = chat_dispatcher.dispatch_or_log(
                     crate::chat::action::Action::SystemMessageAdded { text: warning },
                     "chat.context_budget_warning",
@@ -6725,6 +6740,36 @@ mod terminal_guard_tests {
         assert!(
             !should_enable_terminal_tui(false, false, Some("1")),
             "non-TTY stdin must not enter TUI"
+        );
+    }
+
+    #[test]
+    fn plain_mode_suppresses_context_budget_warning_chrome() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Aggressive,
+            reserve_tokens: 5,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("context pressure ".repeat(400)),
+        ];
+        let budget = plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+        assert!(budget.over_warning, "fixture must cross the warning threshold");
+        let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
+        assert!(
+            context_budget_warning_for_tui(&history, &config, terminal_tui_enabled).is_none(),
+            "--plain must not emit context warning chrome"
+        );
+        assert!(
+            context_budget_warning_for_tui(&history, &config, true)
+                .unwrap_or_default()
+                .contains("Context budget warning:"),
+            "non-plain TUI path should still produce the warning"
         );
     }
 

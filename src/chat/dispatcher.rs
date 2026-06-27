@@ -1302,30 +1302,38 @@ async fn drive_start_turn_stream(
                 crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
             );
             if budget.over_hard_limit {
-                crate::chat::state::compact_history_in_place(&mut history);
-                let after_compact = crate::agent::loop_::plan_context_budget(
-                    &history,
-                    config,
-                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
-                );
-                if after_compact.over_hard_limit {
+                let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
+                let after_compact = if compaction_off {
+                    budget
+                } else {
+                    crate::chat::state::compact_history_in_place(&mut history);
+                    crate::agent::loop_::plan_context_budget(
+                        &history,
+                        config,
+                        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                    )
+                };
+                if compaction_off || after_compact.over_hard_limit {
                     let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
                     tracing::warn!(
                         before_used_tokens = budget.used_tokens,
                         after_compact_tokens = after_compact.used_tokens,
                         hard_limit = after_compact.available_input_tokens,
+                        compaction_off,
                         trimmed,
-                        "redux driver context budget preflight used compact-in-place/token-aware trim; summary parity deferred as ISS-011"
+                        "redux driver context budget preflight remediated with compact-in-place/token-aware trim; summary parity deferred as ISS-011"
                     );
                 }
-                if let Err(e) = action_tx
-                    .send(Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                    })
-                    .await
-                {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on budget-preflight-compact");
-                    return;
+                if !compaction_off {
+                    if let Err(e) = action_tx
+                        .send(Action::HistoryCompacted {
+                            reason: crate::chat::action::CompactReason::ContextOverflow,
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on budget-preflight-compact");
+                        return;
+                    }
                 }
             } else if budget.over_warning {
                 tracing::info!(
@@ -1370,16 +1378,29 @@ async fn drive_start_turn_stream(
                     return;
                 }
                 overflow_retries = overflow_retries.saturating_add(1);
-                // 同步两侧：driver 自己 compact + 通知 reducer compact 自己的 history.
-                crate::chat::state::compact_history_in_place(&mut history);
-                if let Err(e) = action_tx
-                    .send(Action::HistoryCompacted {
-                        reason: crate::chat::action::CompactReason::ContextOverflow,
-                    })
-                    .await
-                {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
-                    return;
+                let compaction_off = compaction_config
+                    .as_ref()
+                    .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Off));
+                if compaction_off {
+                    if let Some(config) = compaction_config.as_ref() {
+                        let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
+                        tracing::warn!(
+                            trimmed,
+                            "redux driver context-overflow retry used trim-only because compaction mode is Off"
+                        );
+                    }
+                } else {
+                    // 同步两侧：driver 自己 compact + 通知 reducer compact 自己的 history.
+                    crate::chat::state::compact_history_in_place(&mut history);
+                    if let Err(e) = action_tx
+                        .send(Action::HistoryCompacted {
+                            reason: crate::chat::action::CompactReason::ContextOverflow,
+                        })
+                        .await
+                    {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
+                        return;
+                    }
                 }
                 // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
                 iteration = iteration.saturating_sub(1);
@@ -6689,6 +6710,132 @@ mod real_mode_tests {
         );
     }
 
+    #[tokio::test]
+    async fn redux_driver_off_mode_preflight_trims_without_history_compacted_action() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct BudgetCaptureProvider {
+            first_tokens: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for BudgetCaptureProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                self.first_tokens
+                    .compare_exchange(
+                        0,
+                        crate::agent::loop_::measure_history_tokens(messages),
+                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::SeqCst,
+                    )
+                    .ok();
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("off-budget-ok")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let first_tokens = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(BudgetCaptureProvider {
+            first_tokens: Arc::clone(&first_tokens),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..24 {
+            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-budget-off-preflight".into(),
+                history,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_history_compacted = false;
+        let mut saw_completion = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::HistoryCompacted { .. } => {
+                    saw_history_compacted = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("off-budget-ok"));
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => {
+                    panic!("driver should trim in Off mode before stream request, not fail: {err}");
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_completion,
+            "driver must complete after Off-mode trim-only preflight"
+        );
+        assert!(
+            !saw_history_compacted,
+            "Off mode must not dispatch HistoryCompacted because reducer compacts lossy"
+        );
+        assert!(
+            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
+            "Off-mode first provider call must be below literal hard limit 110 tokens"
+        );
+    }
+
     /// **S3 T3-1 Step 3**: context overflow 重试超 1 次 → StreamFailed.
     #[tokio::test]
     async fn t31_driver_context_overflow_exhausted_emits_stream_failed() {
@@ -8147,10 +8294,10 @@ mod s4_a_3 {
             !content.contains(&"payload ".repeat(1_000)),
             "large redux tool result must not insert the full output"
         );
-        crate::agent::loop_::trim_history_to_context_budget(&mut history, &config);
+        let tokens_after_tool = crate::agent::loop_::measure_history_tokens(&history);
         assert!(
-            crate::agent::loop_::measure_history_tokens(&history) <= 900,
-            "final redux tool history must be below literal hard limit 900 tokens"
+            tokens_after_tool <= 900,
+            "redux tool result insertion alone must stay below literal hard limit 900 tokens, got {tokens_after_tool}"
         );
     }
 
