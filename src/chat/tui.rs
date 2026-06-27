@@ -2048,12 +2048,20 @@ fn render_active_session_view(
     let mut lines: Vec<Line<'_>> = Vec::new();
     let max_width = area.width.saturating_sub(1);
     let marker = if ascii { ">" } else { "\u{25B8}" };
-    let mut header = format!("{marker} attached #{} {} {}", view.seq, view.kind, view.title);
-    if view.truncated {
-        header.push_str(" [output truncated]");
-    }
+    let prefix = format!("{marker} attached #{} {} ", view.seq, view.kind);
+    let suffix = if view.truncated { " [output truncated]" } else { "" };
+    let fixed_cols = prefix.chars().count().saturating_add(suffix.chars().count());
+    let header = if fixed_cols >= usize::from(max_width) {
+        truncate_chars_with_ellipsis(&format!("{}{}", prefix.trim_end(), suffix), max_width, ascii)
+    } else {
+        let title_budget = u16::try_from(usize::from(max_width).saturating_sub(fixed_cols)).unwrap_or(u16::MAX);
+        format!(
+            "{prefix}{}{suffix}",
+            truncate_chars_with_ellipsis(&view.title, title_budget, ascii)
+        )
+    };
     lines.push(Line::from(Span::styled(
-        truncate_chars_with_ellipsis(&header, max_width, ascii),
+        header,
         Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
     )));
 
@@ -4625,6 +4633,18 @@ mod tests {
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
         assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::Consumed,
+            "non-empty input keeps Up editing/history semantics instead of child scroll"
+        );
+        assert_eq!(state.input.text(), "x");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed,
+            "non-empty input keeps Down editing/history semantics instead of child scroll"
+        );
+        assert_eq!(state.input.text(), "x");
+        assert_eq!(
             dispatch_global_key(key(KeyCode::PageDown), &mut state),
             KeyDispatch::Consumed,
             "non-empty input keeps edit/history semantics instead of child scroll"
@@ -4887,6 +4907,10 @@ mod tests {
             "viewport header rendered: {rows:?}"
         );
         assert!(
+            rows.iter().any(|r| r.contains("[output truncated]")),
+            "truncation marker rendered in viewport header: {rows:?}"
+        );
+        assert!(
             rows.iter()
                 .any(|r| ['包', '含', '中', '文'].iter().all(|ch| r.contains(*ch))),
             "CJK line rendered: {rows:?}"
@@ -4905,6 +4929,41 @@ mod tests {
                 "rendered row must stay inside terminal width: {row:?}"
             );
         }
+    }
+
+    #[test]
+    fn active_session_view_short_terminal_drops_viewport_before_input_footer() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("provider", "model");
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 4 };
+        state.active_session_view = Some(active_view(4, vec!["must not overlap".to_string()], 0));
+
+        let mut terminal = Terminal::new(TestBackend::new(36, 4)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..36).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..4).map(row).collect();
+
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("attached #4") || r.contains("must not overlap")),
+            "viewport should collapse before overlapping input/footer on a 4-row terminal: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("agent #4")),
+            "input prompt remains visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Ctrl+G")),
+            "footer remains visible: {rows:?}"
+        );
     }
 
     #[test]

@@ -2736,8 +2736,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         },
                                     );
                                     #[cfg(feature = "terminal-tui")]
-                                    let active_view =
-                                        build_active_session_view(seq, view_meta, tail_lines, ring_lines, truncated, 0);
+                                    let active_projection = build_active_session_attach_projection(
+                                        seq, view_meta, tail_lines, ring_lines, truncated,
+                                    );
                                     attached_follow = Some(sid);
                                     attached_follow_seq = Some(seq);
                                     // v1.1b: route plain input to this session as
@@ -2759,11 +2760,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         {
                                             let mut mirror = chat_mirror.lock();
                                             mirror.focus = focus;
-                                            mirror.active_session_view = Some(active_view.clone());
+                                            mirror.active_session_view = Some(active_projection.view.clone());
                                         }
                                         let _ = chat_dispatcher.dispatch_or_log(
                                             crate::chat::action::Action::ActiveSessionViewUpdated {
-                                                view: Some(active_view),
+                                                view: Some(active_projection.view.clone()),
                                             },
                                             "chat.active_session_view_attach",
                                         );
@@ -2771,8 +2772,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             let _ = tx.try_send(());
                                         }
                                     }
+                                    #[cfg(feature = "terminal-tui")]
+                                    emit_chat_output(&active_projection.breadcrumb);
+                                    #[cfg(not(feature = "terminal-tui"))]
                                     emit_chat_output(&format!(
-                                        "Attached session #{seq} (child viewport; input routes as steer). Type /detach or press Esc to stop."
+                                        "Attached session #{seq} (input routes as steer). Type /detach to stop."
                                     ));
                                 }
                                 Err(e) => {
@@ -4536,6 +4540,29 @@ fn apply_optimistic_focus(
 }
 
 #[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveSessionAttachProjection {
+    view: crate::chat::sessions::ActiveSessionView,
+    breadcrumb: String,
+}
+
+#[cfg(feature = "terminal-tui")]
+fn build_active_session_attach_projection(
+    seq: u64,
+    meta: Option<&crate::chat::sessions::model::ManagedSessionView>,
+    tail_lines: Vec<String>,
+    ring_lines: Vec<String>,
+    truncated: bool,
+) -> ActiveSessionAttachProjection {
+    ActiveSessionAttachProjection {
+        view: build_active_session_view(seq, meta, tail_lines, ring_lines, truncated, 0),
+        breadcrumb: format!(
+            "Attached session #{seq} (child viewport; input routes as steer). Type /detach or press Esc to stop."
+        ),
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
 fn build_active_session_view(
     seq: u64,
     meta: Option<&crate::chat::sessions::model::ManagedSessionView>,
@@ -4563,6 +4590,16 @@ fn build_active_session_view(
 }
 
 #[cfg(feature = "terminal-tui")]
+fn active_session_view_from_ring(
+    mut current: crate::chat::sessions::ActiveSessionView,
+    ring: &crate::chat::sessions::SessionRing,
+) -> crate::chat::sessions::ActiveSessionView {
+    current.lines = ring.recent_lines(crate::chat::sessions::event::DEFAULT_RING_CAPACITY);
+    current.truncated = ring.is_truncated();
+    current.clamped_for_height(usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS))
+}
+
+#[cfg(feature = "terminal-tui")]
 fn refresh_attached_session_view_from_ring(
     mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
@@ -4574,9 +4611,7 @@ fn refresh_attached_session_view_from_ring(
     let Some(mut view) = current else {
         return;
     };
-    view.lines = ring.recent_lines(crate::chat::sessions::event::DEFAULT_RING_CAPACITY);
-    view.truncated = ring.is_truncated();
-    view = view.clamped_for_height(usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS));
+    view = active_session_view_from_ring(view, ring);
     mirror.lock().active_session_view = Some(view.clone());
     let _ = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
@@ -6982,6 +7017,86 @@ mod wave8_routing_failure_trace_tests {
         );
         assert_eq!(outcome.final_provider, "test-provider");
         assert_eq!(outcome.final_model, "test-model");
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod p2_iss005_tests {
+    use super::*;
+    use crate::chat::sessions::id::SessionId;
+    use crate::chat::sessions::model::{ManagedKind, ManagedSessionView, ManagedStatus, SessionOrigin};
+
+    fn session_view(seq: u64) -> ManagedSessionView {
+        ManagedSessionView {
+            id: SessionId::from_run_id(&format!("run-{seq}")),
+            seq,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            title: "inspect build output".to_string(),
+            status: ManagedStatus::Running,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn attach_projection_keeps_replay_content_out_of_main_history() {
+        let tail_line = "[assistant] historical answer that must stay in viewport".to_string();
+        let ring_line = "live delta that must stay in viewport".to_string();
+        let meta = session_view(7);
+
+        let projection = build_active_session_attach_projection(
+            7,
+            Some(&meta),
+            vec![tail_line.clone()],
+            vec![ring_line.clone()],
+            true,
+        );
+
+        assert_eq!(projection.view.seq, 7);
+        assert_eq!(projection.view.kind, "agent");
+        assert_eq!(projection.view.title, "inspect build output");
+        assert!(projection.view.lines.contains(&tail_line));
+        assert!(projection.view.lines.contains(&ring_line));
+        assert!(projection.view.truncated);
+
+        assert_eq!(
+            projection.breadcrumb.lines().count(),
+            1,
+            "attach writes exactly one main-history breadcrumb"
+        );
+        assert!(projection.breadcrumb.contains("Attached session #7"));
+        assert!(
+            !projection.breadcrumb.contains("historical answer") && !projection.breadcrumb.contains("live delta"),
+            "main-history breadcrumb must not replay child output: {}",
+            projection.breadcrumb
+        );
+    }
+
+    #[test]
+    fn active_session_live_refresh_preserves_nonzero_scroll_offset() {
+        let mut ring = crate::chat::sessions::SessionRing::with_capacity(16);
+        for i in 0..12 {
+            ring.push(format!("line {i}"));
+        }
+        let current = crate::chat::sessions::ActiveSessionView {
+            seq: 3,
+            kind: "shell".to_string(),
+            title: "watch logs".to_string(),
+            lines: vec!["old line".to_string()],
+            truncated: false,
+            scroll_offset: 2,
+        };
+
+        ring.push("new live line".to_string());
+        let refreshed = active_session_view_from_ring(current, &ring);
+
+        assert_eq!(
+            refreshed.scroll_offset, 2,
+            "reviewing older child output must not be yanked back to follow-tail"
+        );
+        assert!(refreshed.lines.iter().any(|line| line == "new live line"));
     }
 }
 
