@@ -162,6 +162,38 @@ impl SwitcherEntry {
     }
 }
 
+/// Directional child-session navigation used by P3 Left/Right switching.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionDirection {
+    /// Move to the visually previous session in the strip/list order.
+    Previous,
+    /// Move to the visually next session in the strip/list order.
+    Next,
+}
+
+/// Return the adjacent live session seq in the same visual order used by the
+/// sessions strip and Ctrl+G switcher. Terminal entries are skipped so
+/// directional navigation stays on live child surfaces; completed sessions
+/// remain reachable through random access (`Ctrl+G` / `/attach N`).
+#[must_use]
+pub fn adjacent_session_seq(entries: &[SwitcherEntry], current_seq: u64, direction: SessionDirection) -> Option<u64> {
+    let live: Vec<&SwitcherEntry> = entries.iter().filter(|entry| !entry.is_terminal()).collect();
+    if live.len() < 2 {
+        return None;
+    }
+    let current_idx = live.iter().position(|entry| entry.seq == current_seq)?;
+    let target_idx = match direction {
+        SessionDirection::Previous => current_idx
+            .checked_sub(1)
+            .unwrap_or_else(|| live.len().saturating_sub(1)),
+        SessionDirection::Next => {
+            let next = current_idx.saturating_add(1);
+            if next >= live.len() { 0 } else { next }
+        }
+    };
+    live.get(target_idx).map(|entry| entry.seq)
+}
+
 /// The Ctrl+G session switcher overlay state. `None` (in `TuiState`) means the
 /// switcher is closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -379,6 +411,71 @@ mod tests {
         ] {
             assert!(SwitcherEntry::from_view(&view(1, st, "x")).is_terminal());
         }
+    }
+
+    #[test]
+    fn adjacent_session_seq_wraps_in_visual_order() {
+        let entries = switcher_entries(&[
+            view(1, ManagedStatus::Running, "left"),
+            view(2, ManagedStatus::Running, "middle"),
+            view(3, ManagedStatus::Running, "right"),
+        ]);
+
+        assert_eq!(
+            adjacent_session_seq(&entries, 1, SessionDirection::Next),
+            Some(2),
+            "Right moves to the session visually to the right"
+        );
+        assert_eq!(
+            adjacent_session_seq(&entries, 3, SessionDirection::Next),
+            Some(1),
+            "Right wraps at the end"
+        );
+        assert_eq!(
+            adjacent_session_seq(&entries, 1, SessionDirection::Previous),
+            Some(3),
+            "Left wraps to the visual tail"
+        );
+        assert_eq!(
+            adjacent_session_seq(&entries, 3, SessionDirection::Previous),
+            Some(2),
+            "Left moves to the session visually to the left"
+        );
+    }
+
+    #[test]
+    fn adjacent_session_seq_skips_terminal_entries() {
+        let entries = switcher_entries(&[
+            view(1, ManagedStatus::Running, "left"),
+            view(2, ManagedStatus::Completed, "done"),
+            view(3, ManagedStatus::Running, "right"),
+        ]);
+
+        assert_eq!(adjacent_session_seq(&entries, 1, SessionDirection::Next), Some(3));
+        assert_eq!(adjacent_session_seq(&entries, 3, SessionDirection::Previous), Some(1));
+    }
+
+    #[test]
+    fn adjacent_session_seq_none_for_empty_one_or_unknown_current() {
+        assert_eq!(adjacent_session_seq(&[], 1, SessionDirection::Next), None);
+
+        let one = switcher_entries(&[view(1, ManagedStatus::Running, "only")]);
+        assert_eq!(adjacent_session_seq(&one, 1, SessionDirection::Next), None);
+
+        let terminal_plus_one = switcher_entries(&[
+            view(1, ManagedStatus::Completed, "done"),
+            view(2, ManagedStatus::Running, "only-live"),
+        ]);
+        assert_eq!(
+            adjacent_session_seq(&terminal_plus_one, 2, SessionDirection::Previous),
+            None
+        );
+
+        let entries = switcher_entries(&[
+            view(1, ManagedStatus::Running, "left"),
+            view(2, ManagedStatus::Running, "right"),
+        ]);
+        assert_eq!(adjacent_session_seq(&entries, 99, SessionDirection::Next), None);
     }
 
     #[test]

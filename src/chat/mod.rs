@@ -534,6 +534,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::ScrollSessionDown => "ScrollSessionDown",
         tui::KeyDispatch::PageSessionUp => "PageSessionUp",
         tui::KeyDispatch::PageSessionDown => "PageSessionDown",
+        tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -580,7 +581,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::ScrollSessionUp
         | tui::KeyDispatch::ScrollSessionDown
         | tui::KeyDispatch::PageSessionUp
-        | tui::KeyDispatch::PageSessionDown => new_has_quit,
+        | tui::KeyDispatch::PageSessionDown
+        | tui::KeyDispatch::SwitchSession { .. } => new_has_quit,
     };
 
     if is_diff {
@@ -2711,6 +2713,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             match chat_sessions.resolve_run_id(seq).await {
                                 Ok(run_id) => {
                                     let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+                                    let was_following_before_attach = attached_follow.is_some();
                                     let is_terminal = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
                                     let views = chat_sessions.snapshot().await;
                                     let view_meta = views.iter().find(|view| view.seq == seq);
@@ -2773,7 +2776,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         }
                                     }
                                     #[cfg(feature = "terminal-tui")]
-                                    emit_chat_output(&active_projection.breadcrumb);
+                                    if let Some(breadcrumb) = attach_breadcrumb_for_transition(
+                                        was_following_before_attach,
+                                        &active_projection,
+                                    ) {
+                                        emit_chat_output(breadcrumb);
+                                    }
                                     #[cfg(not(feature = "terminal-tui"))]
                                     emit_chat_output(&format!(
                                         "Attached session #{seq} (input routes as steer). Type /detach to stop."
@@ -4505,6 +4513,11 @@ fn send_synthetic_command(
     input_tx.blocking_send(msg).map_err(|_| ())
 }
 
+#[cfg(feature = "terminal-tui")]
+fn attach_command_for_seq(seq: u64) -> String {
+    format!("/attach {seq}")
+}
+
 /// Optimistically apply an input-routing focus change from the synchronous TUI
 /// key thread, keeping the three authorities that decide "where the next
 /// submittable input goes" consistent at the *same instant* the synthetic
@@ -4544,6 +4557,18 @@ fn apply_optimistic_focus(
 struct ActiveSessionAttachProjection {
     view: crate::chat::sessions::ActiveSessionView,
     breadcrumb: String,
+}
+
+#[cfg(feature = "terminal-tui")]
+const fn attach_breadcrumb_for_transition(
+    was_following: bool,
+    projection: &ActiveSessionAttachProjection,
+) -> Option<&str> {
+    if was_following {
+        None
+    } else {
+        Some(projection.breadcrumb.as_str())
+    }
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -5430,7 +5455,26 @@ fn run_tui_unified_loop(
                                 crate::chat::sessions::focus::RoutingIntent::Attach { seq },
                             ),
                         );
-                        if send_synthetic_command(&input_tx, &format!("/attach {seq}")).is_err() {
+                        let command = attach_command_for_seq(seq);
+                        if send_synthetic_command(&input_tx, &command).is_err() {
+                            return Ok(());
+                        }
+                    }
+                    tui::KeyDispatch::SwitchSession { seq } => {
+                        // P3: directional child-session switching reuses the
+                        // exact same attach owner as Ctrl+G Enter. The key
+                        // thread only applies optimistic focus and queues
+                        // `/attach N`; the async main loop remains authoritative.
+                        apply_optimistic_focus(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            crate::chat::sessions::focus::optimistic_focus(
+                                crate::chat::sessions::focus::RoutingIntent::Attach { seq },
+                            ),
+                        );
+                        let command = attach_command_for_seq(seq);
+                        if send_synthetic_command(&input_tx, &command).is_err() {
                             return Ok(());
                         }
                     }
@@ -7097,6 +7141,63 @@ mod p2_iss005_tests {
             "reviewing older child output must not be yanked back to follow-tail"
         );
         assert!(refreshed.lines.iter().any(|line| line == "new live line"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod p3_directional_switch_tests {
+    use super::*;
+    use crate::chat::sessions::id::SessionId;
+    use crate::chat::sessions::model::{ManagedKind, ManagedSessionView, ManagedStatus, SessionOrigin};
+
+    fn session_view(seq: u64) -> ManagedSessionView {
+        ManagedSessionView {
+            id: SessionId::from_run_id(&format!("p3-run-{seq}")),
+            seq,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            title: format!("session {seq}"),
+            status: ManagedStatus::Running,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn directional_switch_focus_and_synthetic_attach_seq_match() {
+        let seq = 42;
+        let focus =
+            crate::chat::sessions::focus::optimistic_focus(crate::chat::sessions::focus::RoutingIntent::Attach { seq });
+
+        assert_eq!(focus, crate::chat::sessions::FocusTarget::Session { seq });
+        assert_eq!(attach_command_for_seq(seq), "/attach 42");
+    }
+
+    #[test]
+    fn session_to_session_switch_suppresses_attach_breadcrumb_spam() {
+        let meta = session_view(1);
+        let projection =
+            build_active_session_attach_projection(1, Some(&meta), vec!["tail".into()], vec!["ring".into()], false);
+
+        assert!(
+            attach_breadcrumb_for_transition(false, &projection).is_some(),
+            "Main->Session entry keeps one breadcrumb"
+        );
+
+        let switches = [
+            build_active_session_attach_projection(2, Some(&session_view(2)), Vec::new(), Vec::new(), false),
+            build_active_session_attach_projection(3, Some(&session_view(3)), Vec::new(), Vec::new(), false),
+            build_active_session_attach_projection(1, Some(&session_view(1)), Vec::new(), Vec::new(), false),
+        ];
+        let emitted = switches
+            .iter()
+            .filter_map(|projection| attach_breadcrumb_for_transition(true, projection))
+            .count();
+        assert_eq!(
+            emitted, 0,
+            "Session->Session directional cycling must not append extra main-history breadcrumbs"
+        );
     }
 }
 

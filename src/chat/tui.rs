@@ -326,6 +326,9 @@ pub enum KeyDispatch {
     PageSessionUp,
     /// P2: page the focused child-session viewport down toward tail.
     PageSessionDown,
+    /// P3: switch to an adjacent live child session through the single `/attach`
+    /// owner path.
+    SwitchSession { seq: u64 },
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -404,6 +407,20 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         let synthetic = KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
         let _ = state.handle_input_key(synthetic);
         return KeyDispatch::Consumed;
+    }
+    if let Some(current_seq) = state.focus.session_seq()
+        && state.input.is_empty()
+        && key.modifiers == KeyModifiers::NONE
+    {
+        let direction = match key.code {
+            KeyCode::Left => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right => Some(crate::chat::sessions::SessionDirection::Next),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            return crate::chat::sessions::focus::adjacent_session_seq(&state.sessions_cache, current_seq, direction)
+                .map_or(KeyDispatch::Consumed, |seq| KeyDispatch::SwitchSession { seq });
+        }
     }
     if state.focus.is_session() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
         match key.code {
@@ -4648,6 +4665,61 @@ mod tests {
             dispatch_global_key(key(KeyCode::PageDown), &mut state),
             KeyDispatch::Consumed,
             "non-empty input keeps edit/history semantics instead of child scroll"
+        );
+    }
+
+    #[test]
+    fn dispatch_directional_session_switching_obeys_focus_input_matrix() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "main+empty must not switch child sessions"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "main+empty must preserve prompt key semantics"
+        );
+
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::SwitchSession { seq: 3 },
+            "session+empty Right switches to the visual neighbor on the right"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::SwitchSession { seq: 1 },
+            "session+empty Left switches to the visual neighbor on the left"
+        );
+
+        dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        dispatch_global_key(key(KeyCode::Char('y')), &mut state);
+        assert_eq!(state.input.cursor, (0, 2));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "session+non-empty Left must move the cursor, not switch sessions"
+        );
+        assert_eq!(state.input.text(), "xy");
+        assert_eq!(state.input.cursor, (0, 1));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "session+non-empty Right must move the cursor, not switch sessions"
+        );
+        assert_eq!(state.input.cursor, (0, 2));
+
+        state.input.clear();
+        dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        assert!(state.switcher.is_some());
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "switcher-open keys must not leak to directional session switching"
         );
     }
 
