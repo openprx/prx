@@ -250,11 +250,24 @@ mod tests {
         let result = resolve_effective_compaction_config(
             &AgentCompactionConfig::default(),
             "anthropic",
-            "claude-sonnet-4-6",
+            "claude-opus-4-8",
             &RouterConfig::default(),
             &[],
         );
         assert_eq!(result.config.max_context_tokens, 1_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+    }
+
+    #[test]
+    fn resolves_current_haiku_builtin_conservatively() {
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "anthropic",
+            "claude-haiku-4-5",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(result.config.max_context_tokens, 200_000);
         assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
     }
 

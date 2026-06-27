@@ -3,6 +3,7 @@ use crate::config::RouterModelConfig;
 const MODERN_LONG_CONTEXT_TOKENS: usize = 1_000_000;
 const ANTHROPIC_HAIKU_CONTEXT_TOKENS: usize = 200_000;
 const GPT_4O_CONTEXT_TOKENS: usize = 128_000;
+const KIMI_K2_5_CONTEXT_TOKENS: usize = 262_144;
 const AGGREGATOR_STANDARD_CONTEXT_TOKENS: usize = 128_000;
 const LEGACY_LOCAL_CONTEXT_TOKENS: usize = 32_000;
 
@@ -29,6 +30,30 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
     vec![
         model(
             "anthropic",
+            "claude-fable-5",
+            10.0,
+            MODERN_LONG_CONTEXT_TOKENS,
+            3_500,
+            &["conversation", "analysis", "long_doc", "code"],
+        ),
+        model(
+            "anthropic",
+            "claude-opus-4-8",
+            5.0,
+            MODERN_LONG_CONTEXT_TOKENS,
+            3_000,
+            &["conversation", "analysis", "long_doc", "code"],
+        ),
+        model(
+            "anthropic",
+            "claude-opus-4-7",
+            5.0,
+            MODERN_LONG_CONTEXT_TOKENS,
+            3_000,
+            &["conversation", "analysis", "long_doc", "code"],
+        ),
+        model(
+            "anthropic",
             "claude-opus-4-6",
             15.0,
             MODERN_LONG_CONTEXT_TOKENS,
@@ -42,6 +67,22 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             MODERN_LONG_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "code", "summary"],
+        ),
+        model(
+            "anthropic",
+            "claude-haiku-4-5-20251001",
+            1.0,
+            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
+            800,
+            &["conversation", "summary", "translation"],
+        ),
+        model(
+            "anthropic",
+            "claude-haiku-4-5",
+            1.0,
+            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
+            800,
+            &["conversation", "summary", "translation"],
         ),
         model(
             "anthropic",
@@ -79,7 +120,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "moonshotai/kimi-k2.5",
             0.6,
-            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
+            KIMI_K2_5_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "long_doc"],
         ),
@@ -210,44 +251,59 @@ mod tests {
         let models = builtin_model_capabilities();
 
         assert_eq!(
-            context_for(&models, "anthropic", "claude-opus-4-6"),
-            MODERN_LONG_CONTEXT_TOKENS
+            context_for(&models, "anthropic", "claude-fable-5"),
+            1_000_000,
+            "Claude Fable 5 is a current 1M model and must not fall back to 128K"
         );
         assert_eq!(
-            context_for(&models, "anthropic", "claude-sonnet-4-6"),
-            MODERN_LONG_CONTEXT_TOKENS
+            context_for(&models, "anthropic", "claude-opus-4-8"),
+            1_000_000,
+            "Claude Opus 4.8 is a current 1M model and must not fall back to 128K"
         );
         assert_eq!(
-            context_for(&models, "openrouter", "google/gemini-3-flash"),
-            MODERN_LONG_CONTEXT_TOKENS
+            context_for(&models, "anthropic", "claude-opus-4-7"),
+            1_000_000,
+            "Claude Opus 4.7 is a current 1M model and must not fall back to 128K"
         );
-        assert_eq!(
-            context_for(&models, "gemini", "gemini-2.5-pro"),
-            MODERN_LONG_CONTEXT_TOKENS
-        );
-        assert_eq!(
-            context_for(&models, "gemini", "gemini-2.0-flash"),
-            MODERN_LONG_CONTEXT_TOKENS
-        );
+        assert_eq!(context_for(&models, "anthropic", "claude-opus-4-6"), 1_000_000);
+        assert_eq!(context_for(&models, "anthropic", "claude-sonnet-4-6"), 1_000_000);
+        assert_eq!(context_for(&models, "openrouter", "google/gemini-3-flash"), 1_000_000);
+        assert_eq!(context_for(&models, "gemini", "gemini-2.5-pro"), 1_000_000);
+        assert_eq!(context_for(&models, "gemini", "gemini-2.0-flash"), 1_000_000);
 
         assert_eq!(
+            context_for(&models, "anthropic", "claude-haiku-4-5"),
+            200_000,
+            "Haiku 4.5 is a known-smaller Claude family and must not inherit 1M"
+        );
+        assert_eq!(
+            context_for(&models, "anthropic", "claude-haiku-4-5-20251001"),
+            200_000,
+            "Haiku 4.5 dated ID is a known-smaller Claude family and must not inherit 1M"
+        );
+        assert_eq!(
             context_for(&models, "anthropic", "claude-haiku-3"),
-            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
+            200_000,
             "Haiku is a known-smaller Claude family and must not inherit 1M"
         );
         assert_eq!(
             context_for(&models, "openai", "gpt-4o"),
-            GPT_4O_CONTEXT_TOKENS,
+            128_000,
             "gpt-4o is a known 128K model and must not inherit 1M"
         );
         assert_eq!(
             context_for(&models, "openai", "gpt-4o-mini"),
-            GPT_4O_CONTEXT_TOKENS,
+            128_000,
             "gpt-4o-mini is a known 128K model and must not inherit 1M"
         );
         assert_eq!(
+            context_for(&models, "openrouter", "moonshotai/kimi-k2.5"),
+            262_144,
+            "Kimi K2.5 must match OpenRouter's published context length"
+        );
+        assert_eq!(
             context_for(&models, "ollama", "*"),
-            LEGACY_LOCAL_CONTEXT_TOKENS,
+            32_000,
             "local legacy fallback must remain conservative"
         );
     }
