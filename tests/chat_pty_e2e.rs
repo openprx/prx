@@ -672,6 +672,9 @@ fn test_chat_plain_mode_no_ansi() {
             && !captured.contains("Ctrl+O transcript")
             && !captured.contains("Ctrl+R reverse-search")
             && !captured.contains("Ctrl+X Ctrl+E edit")
+            && !captured.contains("Shift+Tab mode")
+            && !captured.contains("mode:")
+            && !captured.contains("auth:")
             && !captured.contains("attached #")
             && !captured.contains("transcript "),
         "--plain must not render TUI chrome or child viewport headers; captured:\n{captured}"

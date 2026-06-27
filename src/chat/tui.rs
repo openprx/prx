@@ -30,9 +30,11 @@ use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::agent::loop_::ChatMode;
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
 };
+use crate::security::AutonomyLevel;
 
 /// Live streaming-assistant draft owned by [`TuiState`].
 ///
@@ -70,6 +72,11 @@ pub struct TuiState {
     /// Provider/model displayed in status bar
     pub provider: String,
     pub model: String,
+    /// In-session chat mode displayed in the status bar.
+    pub chat_mode: ChatMode,
+    /// Configured autonomy ceiling displayed in the status bar. This is read-only
+    /// UI metadata; the security gate remains [`crate::security::SecurityPolicy`].
+    pub autonomy_level: AutonomyLevel,
     /// Session title
     pub session_title: String,
     /// Number of conversation turns
@@ -368,6 +375,8 @@ pub enum KeyDispatch {
     ExternalEditorRequested,
     /// P6c1: resolve the foreground tool approval prompt.
     ToolApprovalDecision { tool_id: String, approved: bool },
+    /// P8: cycle the in-session chat mode via Shift+Tab.
+    ModeChanged(ChatMode),
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -597,6 +606,11 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             return KeyDispatch::ExternalEditorRequested;
         }
         return KeyDispatch::Consumed;
+    }
+    if key.code == KeyCode::BackTab && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT) {
+        let mode = cycle_chat_mode(state.chat_mode);
+        state.chat_mode = mode;
+        return KeyDispatch::ModeChanged(mode);
     }
     // v1.1b/P1: Ctrl+G opens the PRX sessions switcher over the cached session
     // list. This intentionally diverges from Claude Code's external-editor
@@ -1490,6 +1504,8 @@ impl TuiState {
         Self {
             provider: provider.to_string(),
             model: model.to_string(),
+            chat_mode: ChatMode::default(),
+            autonomy_level: AutonomyLevel::default(),
             session_title: String::new(),
             turn_count: 0,
             conversation_lines: Vec::new(),
@@ -2086,6 +2102,8 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
 pub trait BottomChromeView {
     fn provider(&self) -> &str;
     fn model(&self) -> &str;
+    fn chat_mode(&self) -> ChatMode;
+    fn autonomy_level(&self) -> AutonomyLevel;
     fn session_title(&self) -> &str;
     fn turn_count(&self) -> usize;
     fn ascii_fallback(&self) -> bool;
@@ -2117,6 +2135,12 @@ impl BottomChromeView for TuiState {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    fn chat_mode(&self) -> ChatMode {
+        self.chat_mode
+    }
+    fn autonomy_level(&self) -> AutonomyLevel {
+        self.autonomy_level
     }
     fn session_title(&self) -> &str {
         &self.session_title
@@ -2168,6 +2192,12 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn model(&self) -> &str {
         &self.model
+    }
+    fn chat_mode(&self) -> ChatMode {
+        self.chat_mode
+    }
+    fn autonomy_level(&self) -> AutonomyLevel {
+        self.autonomy_level
     }
     fn session_title(&self) -> &str {
         &self.session_title
@@ -2898,8 +2928,9 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
 
     let token_estimate = estimate_visible_token_usage(state);
     let budget = render_token_budget(token_estimate, state.context_window_tokens());
+    let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
     let full = format!(
-        " PRX Chat | {}/{} | {} | {} turns | {budget} ",
+        " PRX Chat | {}/{} | {} | {} turns | {permissions} | {budget} ",
         state.provider(),
         state.model(),
         title,
@@ -2909,13 +2940,37 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         return full;
     }
 
-    let compact = format!(" PRX Chat | {}/{} | {budget} ", state.provider(), state.model());
+    let compact = format!(
+        " PRX Chat | {}/{} | {permissions} | {budget} ",
+        state.provider(),
+        state.model()
+    );
     if compact.chars().count() <= usize::from(width) {
         return compact;
     }
 
-    let minimal = format!(" PRX | {budget} ");
+    let minimal = format!(" PRX | {permissions} | {budget} ");
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
+}
+
+fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
+    format!("mode:{} auth:{}", mode.label(), autonomy_label(autonomy))
+}
+
+const fn autonomy_label(level: AutonomyLevel) -> &'static str {
+    match level {
+        AutonomyLevel::ReadOnly => "read_only",
+        AutonomyLevel::Supervised => "supervised",
+        AutonomyLevel::Full => "full",
+    }
+}
+
+const fn cycle_chat_mode(mode: ChatMode) -> ChatMode {
+    match mode {
+        ChatMode::Plan => ChatMode::Edit,
+        ChatMode::Edit => ChatMode::Auto,
+        ChatMode::Auto => ChatMode::Plan,
+    }
 }
 
 fn render_token_budget(used_tokens: usize, window_tokens: Option<usize>) -> String {
@@ -3667,7 +3722,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Ctrl+R reverse-search \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Ctrl+R reverse-search \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Shift+Tab mode \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -5198,6 +5253,79 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_backtab_cycles_chat_mode_and_preserves_input() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("alpha");
+        state.input.cursor = (0, 2);
+        state.chat_mode = ChatMode::Plan;
+
+        let out = dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state);
+
+        assert_eq!(out, KeyDispatch::ModeChanged(ChatMode::Edit));
+        assert_eq!(state.chat_mode, ChatMode::Edit);
+        assert_eq!(state.input.text(), "alpha");
+        assert_eq!(state.input.cursor, (0, 2));
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state),
+            KeyDispatch::ModeChanged(ChatMode::Auto)
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state),
+            KeyDispatch::ModeChanged(ChatMode::Plan)
+        );
+    }
+
+    #[test]
+    fn dispatch_backtab_is_captured_by_modal_layers_before_mode_cycle() {
+        let backtab = key_mod(KeyCode::BackTab, KeyModifiers::SHIFT);
+
+        let mut picker = TuiState::new("p", "m");
+        picker.chat_mode = ChatMode::Plan;
+        picker.input.set_text("draft");
+        picker.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            saved_picker_entry("saved", "saved session", false),
+        ]));
+        assert_eq!(dispatch_global_key(backtab, &mut picker), KeyDispatch::Consumed);
+        assert_eq!(picker.chat_mode, ChatMode::Plan);
+        assert_eq!(picker.input.text(), "draft");
+
+        let mut switcher = TuiState::new("p", "m");
+        switcher.chat_mode = ChatMode::Plan;
+        switcher.sessions_cache = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "model",
+            status: "running",
+            title: "child".to_string(),
+        }];
+        assert!(matches!(
+            dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut switcher),
+            KeyDispatch::SwitcherOpened { .. }
+        ));
+        assert_eq!(dispatch_global_key(backtab, &mut switcher), KeyDispatch::Consumed);
+        assert_eq!(switcher.chat_mode, ChatMode::Plan);
+
+        let mut approval = approval_state();
+        approval.chat_mode = ChatMode::Plan;
+        approval.input.set_text("hold");
+        let cursor = approval.input.cursor;
+        assert_eq!(dispatch_global_key(backtab, &mut approval), KeyDispatch::Consumed);
+        assert_eq!(approval.chat_mode, ChatMode::Plan);
+        assert_eq!(approval.input.text(), "hold");
+        assert_eq!(approval.input.cursor, cursor);
+
+        let mut editor_prefix = TuiState::new("p", "m");
+        editor_prefix.chat_mode = ChatMode::Plan;
+        editor_prefix.input.set_text("edit me");
+        editor_prefix.external_editor_prefix_armed = true;
+        assert_eq!(dispatch_global_key(backtab, &mut editor_prefix), KeyDispatch::Consumed);
+        assert_eq!(editor_prefix.chat_mode, ChatMode::Plan);
+        assert_eq!(editor_prefix.input.text(), "edit me");
+        assert!(!editor_prefix.external_editor_prefix_armed);
+    }
+
+    #[test]
     fn dispatch_tab_toggles_last_reasoning_card_when_more_recent_than_tool() {
         // S1-A: Tab now toggles whichever foldable card sits closest to the
         // end of the conversation. A reasoning card pushed AFTER a tool card
@@ -6720,6 +6848,43 @@ mod tests {
     }
 
     #[test]
+    fn status_bar_renders_chat_mode_and_autonomy_ceiling() {
+        let mut state = TuiState::new("provider", "model");
+        state.chat_mode = ChatMode::Auto;
+        state.autonomy_level = AutonomyLevel::ReadOnly;
+
+        let line = render_status_bar_text(&state, 120);
+
+        assert!(
+            line.contains("mode:auto auth:read_only"),
+            "permission status missing: {line}"
+        );
+        assert!(
+            !line.contains("bypass"),
+            "status copy must not imply permissions are bypassed: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_permission_status_degrades_at_narrow_width() {
+        let mut state = TuiState::new("provider", "model");
+        state.chat_mode = ChatMode::Plan;
+        state.autonomy_level = AutonomyLevel::Full;
+        state.context_window_tokens = Some(1_000_000);
+
+        let line = render_status_bar_text(&state, 32);
+
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) <= 32,
+            "narrow status must fit display width: {line:?}"
+        );
+        assert!(
+            line.contains("mode:"),
+            "minimal status should retain mode before truncation: {line}"
+        );
+    }
+
+    #[test]
     fn status_bar_renders_10m_window_without_raw_integer() {
         let mut state = TuiState::new("provider", "model");
         state.context_window_tokens = Some(10_000_000);
@@ -6961,6 +7126,8 @@ mod tests {
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.context_window_tokens = Some(10_000_000);
+            state.ui.chat_mode = ChatMode::Auto;
+            state.ui.autonomy_level = AutonomyLevel::ReadOnly;
             let active_view = crate::chat::sessions::ActiveSessionView {
                 seq: DIFF_SESSION_SEQ,
                 kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
@@ -6989,6 +7156,8 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
+            tui.chat_mode = ChatMode::Auto;
+            tui.autonomy_level = AutonomyLevel::ReadOnly;
             tui.focus = crate::chat::sessions::FocusTarget::Diff;
             tui.active_session_view = Some(active_view);
             tui.context_window_tokens = Some(10_000_000);
@@ -6996,6 +7165,11 @@ mod tests {
 
             assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
             assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
+            assert_eq!(BottomChromeView::chat_mode(&tui), BottomChromeView::chat_mode(&snap));
+            assert_eq!(
+                BottomChromeView::autonomy_level(&tui),
+                BottomChromeView::autonomy_level(&snap)
+            );
             assert_eq!(
                 BottomChromeView::session_title(&tui),
                 BottomChromeView::session_title(&snap)

@@ -825,6 +825,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::CloseDiffViewer => "CloseDiffViewer",
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
         tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
+        tui::KeyDispatch::ModeChanged(_) => "ModeChanged",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -881,7 +882,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::CloseTranscriptViewer
         | tui::KeyDispatch::CloseDiffViewer
         | tui::KeyDispatch::ExternalEditorRequested
-        | tui::KeyDispatch::ToolApprovalDecision { .. } => new_has_quit,
+        | tui::KeyDispatch::ToolApprovalDecision { .. }
+        | tui::KeyDispatch::ModeChanged(_) => new_has_quit,
     };
 
     if is_diff {
@@ -1670,8 +1672,12 @@ pub async fn run(
     // per-turn `tui_mirror`) collapses all observable mutations into a
     // single state machine so the renderer sees a consistent view.
     #[cfg(feature = "terminal-tui")]
-    let chat_mirror: Arc<parking_lot::Mutex<tui::TuiState>> =
-        Arc::new(parking_lot::Mutex::new(tui::TuiState::new(provider_name, model_name)));
+    let chat_mirror: Arc<parking_lot::Mutex<tui::TuiState>> = {
+        let mut state = tui::TuiState::new(provider_name, model_name);
+        state.chat_mode = chat_session.mode;
+        state.autonomy_level = config.autonomy.level;
+        Arc::new(parking_lot::Mutex::new(state))
+    };
 
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
@@ -1702,6 +1708,11 @@ pub async fn run(
         state::ChatState::new(Arc::from(provider_name), Arc::from(model_name), shutdown.clone());
     if chat_session.turn_count() > 0 {
         let _ = dispatcher_shadow_state.reduce(crate::chat::action::Action::SessionLoaded(chat_session.clone()));
+    }
+    #[cfg(feature = "terminal-tui")]
+    {
+        dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
+        dispatcher_shadow_state.ui.autonomy_level = config.autonomy.level;
     }
 
     // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
@@ -1778,10 +1789,13 @@ pub async fn run(
     // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
     #[cfg(feature = "terminal-tui")]
     let (snapshot_tx_for_dispatcher, snapshot_rx_for_tui) = {
-        let initial = std::sync::Arc::new(crate::chat::state::UiSnapshot::initial(
+        let mut initial = crate::chat::state::UiSnapshot::initial(
             std::sync::Arc::from(provider_name),
             std::sync::Arc::from(model_name),
-        ));
+        );
+        initial.chat_mode = chat_session.mode;
+        initial.autonomy_level = config.autonomy.level;
+        let initial = std::sync::Arc::new(initial);
         let (tx, rx) = tokio::sync::watch::channel(initial);
         tracing::info!(mode = ?top_redux_mode, "snapshot_tx constructed for Pure chat mode");
         (Some(tx), Some(rx))
@@ -2800,6 +2814,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // Pure 跳过 legacy chat_session.set_mode；legacy 模式下 run_tool_call_loop 仍读
                     let _ = chat_dispatcher
                         .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed");
+                    #[cfg(feature = "terminal-tui")]
+                    {
+                        chat_mirror.lock().chat_mode = mode;
+                    }
                     #[cfg(feature = "terminal-tui")]
                     let legacy_session_mode_writes_enabled = false; // S4-B: Pure 单源
                     #[cfg(not(feature = "terminal-tui"))]
@@ -6812,6 +6830,11 @@ fn run_tui_unified_loop(
                         );
                         let _ = redraw_tx.try_send(());
                     }
+                    tui::KeyDispatch::ModeChanged(mode) => {
+                        let _ = chat_dispatcher
+                            .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed_key");
+                        let _ = redraw_tx.try_send(());
+                    }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
                         // synthetic `/detach` so the main loop clears
@@ -7316,6 +7339,8 @@ async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: s
         let mut mirror = ctx.chat_mirror.lock();
         mirror.session_title = ctx.chat_session.title.clone();
         mirror.turn_count = ctx.chat_session.turn_count();
+        mirror.chat_mode = ctx.chat_session.mode;
+        mirror.autonomy_level = ctx.config.autonomy.level;
         mirror.conversation_lines = conversation_lines_for_resumed_session(ctx.chat_session);
         mirror.streaming = None;
         mirror.sessions_status.clear();

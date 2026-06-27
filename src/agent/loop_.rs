@@ -8431,6 +8431,18 @@ mod tests {
         // file_write is registered but plan mode should short-circuit before
         // touching it. We confirm via the DelayTool counter that no execution
         // happened.
+        let mut autonomy = crate::config::AutonomyConfig {
+            level: crate::security::AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        autonomy.sandbox.enabled = Some(false);
+        let policy = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+        assert_eq!(
+            policy.decide("file_write", "user", "terminal", "chat"),
+            crate::security::policy::ToolDecision::Allow,
+            "full autonomy is the ceiling, so the policy itself would allow this write"
+        );
+
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(DelayTool::new(

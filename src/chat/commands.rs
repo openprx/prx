@@ -95,7 +95,7 @@ const HELP_TEXT: &str = "Available commands:
   /export [md|json]  Export conversation
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
-  /auto              Switch to auto mode (no approval prompts)
+  /auto              Switch to auto chat mode (does not override [autonomy])
   /bg <task>         Run a task as an agent child session
   /sessions          List child TUI sessions
   /shell <command>   Run a command as a shell child session

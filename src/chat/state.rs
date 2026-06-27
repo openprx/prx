@@ -48,6 +48,7 @@ use crate::chat::session::{ChatSession, ChatTurn};
 use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
+use crate::security::AutonomyLevel;
 use crate::util::truncate_with_ellipsis;
 
 /// S2-B Step 1: `Action::HistoryCompacted` reducer 对齐 `chat::mod::compact_chat_history`
@@ -247,6 +248,11 @@ pub struct UiState {
     pub input: TuiInput,
     /// 当前对话回合计数（用于状态栏）
     pub turn_count: usize,
+    /// In-session chat mode displayed in the status bar.
+    pub chat_mode: ChatMode,
+    /// Configured autonomy ceiling displayed in the status bar. This is read-only
+    /// UI metadata and does not mutate the security policy.
+    pub autonomy_level: AutonomyLevel,
     /// 是否启用 ASCII 降级（非 UTF-8 终端）
     pub ascii_fallback: bool,
     /// 上次 Ctrl+C 的时间戳（ms），用于双击窗口判断
@@ -303,6 +309,10 @@ pub struct UiSnapshot {
     pub provider: Arc<str>,
     /// 当前 model 名.
     pub model: Arc<str>,
+    /// In-session chat mode displayed in the status bar.
+    pub chat_mode: ChatMode,
+    /// Configured autonomy ceiling displayed in the status bar.
+    pub autonomy_level: AutonomyLevel,
     /// 会话标题（status bar 显示）.
     pub session_title: Arc<str>,
     /// 对话回合计数（status bar 显示）.
@@ -345,6 +355,8 @@ impl UiSnapshot {
             revision: 0,
             provider,
             model,
+            chat_mode: ChatMode::default(),
+            autonomy_level: AutonomyLevel::default(),
             session_title: Arc::from(""),
             turn_count: 0,
             ascii_fallback: false,
@@ -434,6 +446,8 @@ impl ChatState {
                 conversation_generation: 0,
                 input: Self::new_input(),
                 turn_count: 0,
+                chat_mode: ChatMode::default(),
+                autonomy_level: AutonomyLevel::default(),
                 ascii_fallback: false,
                 last_ctrlc_ms: 0,
                 last_submitted: None,
@@ -497,6 +511,8 @@ impl ChatState {
             revision,
             provider: Arc::clone(&self.session.provider),
             model: Arc::clone(&self.session.model),
+            chat_mode: self.ui.chat_mode,
+            autonomy_level: self.ui.autonomy_level,
             session_title: Arc::from(self.session.title.as_str()),
             turn_count: self.ui.turn_count,
             ascii_fallback: self.ui.ascii_fallback,
@@ -563,6 +579,8 @@ impl ChatState {
         u64,
         usize,
         Option<usize>,
+        ChatMode,
+        AutonomyLevel,
         bool,
         crate::chat::sessions::FocusTarget,
     ) {
@@ -574,6 +592,8 @@ impl ChatState {
             draft_ver,
             self.ui.input.lines.len(),
             self.ui.context_window_tokens,
+            self.ui.chat_mode,
+            self.ui.autonomy_level,
             self.ui.pending_tool_approval.is_some(),
             self.ui.focus,
         )
@@ -622,9 +642,8 @@ impl ChatState {
                 vec![]
             }
             Action::ModeChanged(mode) => {
-                // Step 2: ModeChanged reducer 已实现，但主循环尚无 dispatch 来源。
-                // 由 SlashCommand 路径转发，Step 5 接入；当前分支供回归测试用。
                 self.session.mode = mode;
+                self.ui.chat_mode = mode;
                 vec![Effect::RequestRedraw]
             }
             Action::ModelChanged { model } => {
@@ -1603,6 +1622,7 @@ impl ChatState {
         self.session.provider = Arc::from(loaded.provider.as_str());
         self.session.model = Arc::from(loaded.model.as_str());
         self.session.mode = loaded.mode;
+        self.ui.chat_mode = loaded.mode;
         self.session.turns = loaded.turns;
         // v4: restore persisted background-session summaries (display only —
         // the live processes are gone and are never revived). Carrying them in
@@ -2167,8 +2187,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
 
         // 槽命令本身 reducer 是 no-op（实际执行在 mod.rs），不变 UI
         Action::SlashCommandIssued { .. } => false,
-        // 模式切换：仅写 session.mode，UI 不显示模式（status bar 没 mode 字段）
-        Action::ModeChanged(_) => false,
+        // 模式切换：status bar 显示 mode 字段.
+        Action::ModeChanged(_) => true,
         // BUG-07: 模型切换写 session.model，status bar 显示该字段 → dirty.
         Action::ModelChanged { .. } => true,
         // Bug #3: provider 切换写 session.provider（status bar 显示该字段）→ dirty.
@@ -5128,16 +5148,58 @@ mod tests {
             let _ = state.reduce(Action::ModeChanged(ChatMode::Plan));
             legacy.set_mode(ChatMode::Plan);
             assert_eq!(state.session.mode, legacy.mode, "Plan 模式应一致");
+            assert_eq!(state.ui.chat_mode, ChatMode::Plan, "Plan 模式应进入 UI status");
 
             // Auto
             let _ = state.reduce(Action::ModeChanged(ChatMode::Auto));
             legacy.set_mode(ChatMode::Auto);
             assert_eq!(state.session.mode, legacy.mode, "Auto 模式应一致");
+            assert_eq!(state.ui.chat_mode, ChatMode::Auto, "Auto 模式应进入 UI status");
 
             // Edit (default)
             let _ = state.reduce(Action::ModeChanged(ChatMode::Edit));
             legacy.set_mode(ChatMode::Edit);
             assert_eq!(state.session.mode, legacy.mode, "Edit 模式应一致");
+            assert_eq!(state.ui.chat_mode, ChatMode::Edit, "Edit 模式应进入 UI status");
+        }
+
+        #[test]
+        fn p8_mode_changed_does_not_escalate_autonomy_or_policy() {
+            use crate::approval::ApprovalManager;
+            use crate::config::AutonomyConfig;
+            use crate::security::policy::ToolDecision;
+            use crate::security::{AutonomyLevel, SecurityPolicy};
+
+            let mut state = s();
+            let mut autonomy = AutonomyConfig {
+                level: AutonomyLevel::ReadOnly,
+                ..AutonomyConfig::default()
+            };
+            autonomy.sandbox.enabled = Some(false);
+            let autonomy_before = autonomy.clone();
+            let policy_before = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+            let approval_before = ApprovalManager::from_config(&autonomy);
+            state.ui.autonomy_level = autonomy.level;
+
+            for mode in [ChatMode::Plan, ChatMode::Edit, ChatMode::Auto, ChatMode::Plan] {
+                let _ = state.reduce(Action::ModeChanged(mode));
+                assert_eq!(state.ui.autonomy_level, AutonomyLevel::ReadOnly);
+            }
+
+            let policy_after = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
+            let approval_after = ApprovalManager::from_config(&autonomy);
+
+            assert_eq!(autonomy.level, autonomy_before.level);
+            assert_eq!(autonomy.workspace_only, autonomy_before.workspace_only);
+            assert_eq!(autonomy.sandbox.enabled, autonomy_before.sandbox.enabled);
+            assert_eq!(policy_after.autonomy, policy_before.autonomy);
+            assert_eq!(approval_after.autonomy_level(), approval_before.autonomy_level());
+            assert_eq!(state.session.mode, ChatMode::Plan);
+            assert_eq!(
+                policy_after.decide("file_write", "user", "terminal", "chat"),
+                ToolDecision::Deny,
+                "ChatMode::Auto cannot widen read_only autonomy because decide() is ChatMode-free"
+            );
         }
 
         /// BUG-07: `ModelChanged` reducer 更新 `session.model`，使 status bar 立刻
