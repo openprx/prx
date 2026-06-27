@@ -117,6 +117,8 @@ pub struct TuiState {
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
+    /// First half of the `Ctrl+X Ctrl+E` external-editor chord.
+    pub external_editor_prefix_armed: bool,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -191,8 +193,8 @@ pub enum ConversationLine {
     /// Reasoning / thinking-content card from reasoning-capable models
     /// (Anthropic `thinking`, OpenAI `reasoning_content`, Ollama `thinking`).
     ///
-    /// Default folded — only a one-line summary is shown. `Ctrl+R` toggles
-    /// the most recent card to reveal the full text indented under the
+    /// Default folded — only a one-line summary is shown. `Tab` toggles
+    /// the most recent foldable card to reveal the full text indented under the
     /// header. `char_count` is cached so the summary can be rendered without
     /// re-walking `content` on every frame.
     Reasoning {
@@ -202,8 +204,7 @@ pub enum ConversationLine {
         content: String,
         /// Cached `content.chars().count()` for the folded summary line.
         char_count: usize,
-        /// Default `true`. Toggled via
-        /// [`TuiState::toggle_last_reasoning_folded`].
+        /// Default `true`. Toggled through the unified `Tab` fold path.
         folded: bool,
     },
 }
@@ -217,7 +218,7 @@ impl ConversationLine {
     }
 
     /// True if this line is a `Reasoning` variant. Used by [`TuiState`] to
-    /// locate the most recent reasoning card for `Ctrl+R` toggling.
+    /// locate the most recent reasoning card for folding.
     pub const fn is_reasoning(&self) -> bool {
         matches!(self, Self::Reasoning { .. })
     }
@@ -280,8 +281,8 @@ pub enum InputOutcome {
 ///   The folded reasoning summary itself hints `press Tab to
 ///   expand`, so the user never has to learn a separate
 ///   keybinding for thinking blocks.
-/// - `Ctrl+R` — toggles the most recent reasoning card (legacy shortcut,
-///   kept for muscle-memory after the Tab unification).
+/// - `Ctrl+R` — reverse-searches submitted input history.
+/// - `Ctrl+X Ctrl+E` — opens the current draft in an external editor.
 /// - `Ctrl+C` — interrupt the current turn (caller cancels in-flight work)
 /// - `Ctrl+D` — EOF when the input buffer is logically empty
 /// - everything else — forwarded to the input box; submissions surface as
@@ -342,6 +343,8 @@ pub enum KeyDispatch {
     OpenTranscriptViewer,
     /// P6b1: close the read-only transcript child TUI.
     CloseTranscriptViewer,
+    /// P6b2: open the current draft in an external editor.
+    ExternalEditorRequested,
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -498,6 +501,13 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if state.switcher.is_some() {
         return dispatch_switcher_key(key, state);
     }
+    if state.external_editor_prefix_armed {
+        state.external_editor_prefix_armed = false;
+        if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
+            return KeyDispatch::ExternalEditorRequested;
+        }
+        return KeyDispatch::Consumed;
+    }
     // v1.1b/P1: Ctrl+G opens the PRX sessions switcher over the cached session
     // list. This intentionally diverges from Claude Code's external-editor
     // Ctrl+G binding until the P3/P6b parity keybinding pass; keep the footer
@@ -512,6 +522,10 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
         return KeyDispatch::OpenTranscriptViewer;
     }
+    if key.code == KeyCode::Char('x') && key.modifiers == KeyModifiers::CONTROL {
+        state.external_editor_prefix_armed = true;
+        return KeyDispatch::Consumed;
+    }
     // Tab → toggle the most recent foldable card (reasoning OR tool-result,
     // whichever appears later in the conversation). When neither exists Tab
     // is still consumed — per spec it never falls through to the input box.
@@ -519,9 +533,10 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         let _ = state.toggle_last_foldable_card();
         return KeyDispatch::Consumed;
     }
-    // Ctrl+R → toggle most recent reasoning card. Never falls through.
+    // Ctrl+R → reverse-search submitted input history. Never falls through
+    // to child steering, transcript scrolling or the input box.
     if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-        let _ = state.toggle_last_reasoning_folded();
+        let _ = state.input.begin_or_cycle_reverse_search();
         return KeyDispatch::Consumed;
     }
     // Ctrl+C → interrupt active turn. We intentionally do NOT exit on a
@@ -676,6 +691,19 @@ pub struct TuiInput {
     pending_draft: Option<Vec<String>>,
     /// True when text was ignored because the input reached INPUT_MAX_BYTES.
     pub truncated: bool,
+    /// Active reverse history search state (`Ctrl+R`), if any.
+    reverse_search: Option<ReverseSearchState>,
+}
+
+/// Ephemeral reverse-search state for the input history ring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReverseSearchState {
+    /// Draft buffer before the search started; restored on Esc.
+    saved_lines: Vec<String>,
+    /// User-entered incremental search query.
+    pub query: String,
+    /// Currently selected history entry.
+    pub match_pos: Option<usize>,
 }
 
 impl Default for TuiInput {
@@ -694,6 +722,7 @@ impl TuiInput {
             history_pos: None,
             pending_draft: None,
             truncated: false,
+            reverse_search: None,
         }
     }
 
@@ -720,7 +749,7 @@ impl TuiInput {
     }
 
     /// Replace the entire buffer (used by history navigation and paste).
-    fn set_text(&mut self, text: &str) {
+    pub fn set_text(&mut self, text: &str) {
         // Strip a trailing '\n' so single-line history doesn't grow a blank
         // second row when restored.
         let trimmed = text.strip_suffix('\n').unwrap_or(text);
@@ -742,6 +771,7 @@ impl TuiInput {
         self.history_pos = None;
         self.pending_draft = None;
         self.truncated = false;
+        self.reverse_search = None;
     }
 
     /// Insert a single grapheme (`ch`) at the cursor.
@@ -977,6 +1007,150 @@ impl TuiInput {
         self.history.push(text);
     }
 
+    /// True while `Ctrl+R` reverse history search is active.
+    pub const fn is_reverse_search_active(&self) -> bool {
+        self.reverse_search.is_some()
+    }
+
+    /// Human-readable reverse-search status for the input box title.
+    pub fn reverse_search_title(&self) -> Option<String> {
+        let search = self.reverse_search.as_ref()?;
+        let query = truncate_input_title(&search.query, 36);
+        let status = if search.match_pos.is_some() {
+            "match"
+        } else {
+            "no match"
+        };
+        Some(format!(" reverse-search: {query} ({status}) "))
+    }
+
+    /// Start reverse-search, or cycle to the next older match when already active.
+    pub fn begin_or_cycle_reverse_search(&mut self) -> bool {
+        if self.reverse_search.is_none() {
+            self.reverse_search = Some(ReverseSearchState {
+                saved_lines: self.lines.clone(),
+                query: String::new(),
+                match_pos: None,
+            });
+        }
+        self.reverse_search_cycle_older();
+        true
+    }
+
+    fn reverse_search_cycle_older(&mut self) {
+        let Some(search) = self.reverse_search.as_ref() else {
+            return;
+        };
+        let before = search.match_pos.unwrap_or(self.history.len());
+        let query = search.query.clone();
+        let matched = self.find_reverse_history_match(&query, before);
+        if let Some(search) = self.reverse_search.as_mut() {
+            search.match_pos = matched;
+        }
+        self.apply_reverse_search_match();
+    }
+
+    fn reverse_search_query_changed(&mut self) {
+        let Some(search) = self.reverse_search.as_ref() else {
+            return;
+        };
+        let query = search.query.clone();
+        let matched = self.find_reverse_history_match(&query, self.history.len());
+        if let Some(search) = self.reverse_search.as_mut() {
+            search.match_pos = matched;
+        }
+        self.apply_reverse_search_match();
+    }
+
+    fn find_reverse_history_match(&self, query: &str, before: usize) -> Option<usize> {
+        if self.history.is_empty() {
+            return None;
+        }
+        let mut idx = before.min(self.history.len());
+        while idx > 0 {
+            idx -= 1;
+            let Some(entry) = self.history.get(idx) else {
+                continue;
+            };
+            if query.is_empty() || entry.contains(query) {
+                return Some(idx);
+            }
+        }
+        None
+    }
+
+    fn apply_reverse_search_match(&mut self) {
+        let Some(search) = self.reverse_search.as_ref() else {
+            return;
+        };
+        if let Some(pos) = search.match_pos
+            && let Some(entry) = self.history.get(pos)
+        {
+            let entry = entry.clone();
+            self.set_text(&entry);
+        } else {
+            let saved = search.saved_lines.clone();
+            self.lines = if saved.is_empty() { vec![String::new()] } else { saved };
+            let last_line_idx = self.lines.len().saturating_sub(1);
+            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
+            self.cursor = (last_line_idx, last_len);
+            self.truncated = false;
+        }
+    }
+
+    fn cancel_reverse_search(&mut self) {
+        if let Some(search) = self.reverse_search.take() {
+            self.lines = if search.saved_lines.is_empty() {
+                vec![String::new()]
+            } else {
+                search.saved_lines
+            };
+            let last_line_idx = self.lines.len().saturating_sub(1);
+            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
+            self.cursor = (last_line_idx, last_len);
+            self.truncated = false;
+        }
+    }
+
+    fn accept_reverse_search(&mut self) {
+        self.reverse_search = None;
+        self.history_pos = None;
+        self.pending_draft = None;
+    }
+
+    fn handle_reverse_search_key(&mut self, key: KeyEvent) -> InputOutcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('r') if ctrl => {
+                self.reverse_search_cycle_older();
+                InputOutcome::Consumed
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(search) = self.reverse_search.as_mut() {
+                    search.query.push(ch);
+                }
+                self.reverse_search_query_changed();
+                InputOutcome::Consumed
+            }
+            KeyCode::Backspace => {
+                if let Some(search) = self.reverse_search.as_mut() {
+                    search.query.pop();
+                }
+                self.reverse_search_query_changed();
+                InputOutcome::Consumed
+            }
+            KeyCode::Enter => {
+                self.accept_reverse_search();
+                InputOutcome::Consumed
+            }
+            KeyCode::Esc => {
+                self.cancel_reverse_search();
+                InputOutcome::Cancelled
+            }
+            _ => InputOutcome::Consumed,
+        }
+    }
+
     /// Navigate to the previous (older) entry. Saves the in-flight draft on
     /// first call so it can be restored later.
     fn history_prev(&mut self) -> bool {
@@ -1032,6 +1206,10 @@ impl TuiInput {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+        if self.reverse_search.is_some() {
+            return self.handle_reverse_search_key(key);
+        }
 
         match key.code {
             KeyCode::Enter => {
@@ -1153,6 +1331,18 @@ fn clamp_str_to_byte_len(text: &str, max_bytes: usize) -> &str {
     &text[..end]
 }
 
+fn truncate_input_title(input: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in input.chars().enumerate() {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Round `idx` down to the nearest UTF-8 char boundary in `s`. Saturates at 0.
 const fn floor_char_boundary(s: &str, mut idx: usize) -> usize {
     let max = s.len();
@@ -1182,6 +1372,7 @@ impl TuiState {
             sessions_cache: Vec::new(),
             active_session_view: None,
             context_window_tokens: None,
+            external_editor_prefix_armed: false,
         }
     }
 
@@ -1419,8 +1610,8 @@ impl TuiState {
     /// Toggle the folded state of the most recent `Reasoning` line (if any).
     ///
     /// Returns the new `folded` value, or `None` if no `Reasoning` exists.
-    /// This implements the `Ctrl+R` keypath, mirroring the `Tab` key handler
-    /// for tool-result cards. Only the **last** reasoning card is touched;
+    /// This supports legacy action tests and the unified `Tab` key handler.
+    /// Only the **last** reasoning card is touched;
     /// older cards keep their previous state so the user can hop between
     /// turns without losing context.
     pub fn toggle_last_reasoning_folded(&mut self) -> Option<bool> {
@@ -2874,11 +3065,10 @@ fn render_reasoning_card<'a>(
         return;
     }
 
-    // Unicode: remind users of both shortcuts; ASCII: keep it terse.
     let header = if ascii {
         format!("{expanded_icon} Thinking ({tokens} {token_word})")
     } else {
-        format!("{expanded_icon} Thinking ({tokens} {token_word}) - Tab to collapse (Ctrl+R)")
+        format!("{expanded_icon} Thinking ({tokens} {token_word}) - Tab to collapse")
     };
     lines.push(Line::from(Span::styled(header, header_style)));
 
@@ -3121,16 +3311,18 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
         })
         .collect();
 
-    let input_title = if input_ref.truncated {
-        " Input - max 32768 bytes, extra ignored "
-    } else {
-        " Input "
-    };
+    let input_title = input_ref.reverse_search_title().unwrap_or_else(|| {
+        if input_ref.truncated {
+            " Input - max 32768 bytes, extra ignored ".to_string()
+        } else {
+            " Input ".to_string()
+        }
+    });
     let input = Paragraph::new(Text::from(rendered_lines))
         .block(
             Block::default()
                 .borders(Borders::TOP)
-                .title(input_title)
+                .title(input_title.as_str())
                 .border_style(Style::default().fg(Color::DarkGray)),
         )
         .style(Style::default().fg(Color::White));
@@ -3167,10 +3359,10 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
 fn render_footer(frame: &mut Frame, area: Rect) {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
-    // P1: Ctrl+G is intentionally PRX's sessions switcher for now; Claude Code
-    // external-editor parity is deferred to the P3/P6b keybinding pass.
+    // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
+    // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} / commands \u{00B7} ! bash \u{00B7} Tab fold \u{00B7} Esc cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Ctrl+R reverse-search \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -4248,14 +4440,17 @@ mod tests {
             header.contains("tokens"),
             "expanded header carries token count: {header}"
         );
-        // Expanded header shows collapse shortcut with Ctrl+R legacy hint.
         assert!(
             !header.contains("press Tab to expand"),
             "expanded header drops the expand hint: {header}"
         );
         assert!(
-            header.contains("Tab to collapse (Ctrl+R)"),
-            "expanded header shows collapse + Ctrl+R hint: {header}"
+            header.contains("Tab to collapse"),
+            "expanded header shows Tab collapse hint: {header}"
+        );
+        assert!(
+            !header.contains("Ctrl+R"),
+            "expanded header must not advertise Ctrl+R as fold after P6b2: {header}"
         );
         // Each body row begins with "  " indent.
         for (idx, original) in body.lines().enumerate() {
@@ -4728,26 +4923,134 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_ctrl_r_toggles_last_reasoning_card() {
+    fn dispatch_ctrl_r_opens_reverse_search_without_reasoning_toggle() {
         let mut state = TuiState::new("p", "m");
-        // No reasoning card yet — still consumed, no-op.
-        let out = dispatch_global_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut state);
-        assert_eq!(out, KeyDispatch::Consumed);
-        assert!(state.input.is_empty(), "Ctrl+R never falls through to input");
-
-        // Push a reasoning card and verify Ctrl+R flips its folded flag.
+        state.input.history = vec!["alpha".to_string(), "beta".to_string()];
         assert!(state.push_reasoning("step 1\nstep 2"));
         let folded_before = match state.conversation_lines.last() {
             Some(ConversationLine::Reasoning { folded, .. }) => *folded,
             _ => panic!("test: expected Reasoning at end"),
         };
+
         let out = dispatch_global_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut state);
         assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_reverse_search_active(), "Ctrl+R opens reverse-search");
+        assert_eq!(state.input.text(), "beta", "initial Ctrl+R recalls latest history item");
+
         let folded_after = match state.conversation_lines.last() {
             Some(ConversationLine::Reasoning { folded, .. }) => *folded,
             _ => panic!("test: expected Reasoning at end"),
         };
-        assert_ne!(folded_before, folded_after, "Ctrl+R must flip folded state");
+        assert_eq!(folded_before, folded_after, "Ctrl+R must not fold reasoning after P6b2");
+    }
+
+    #[test]
+    fn reverse_search_filters_history_accepts_and_cancels() {
+        let mut input = TuiInput::new();
+        input.history = vec![
+            "alpha one".to_string(),
+            "beta two".to_string(),
+            "alpha three".to_string(),
+        ];
+        input.set_text("draft");
+        assert!(input.begin_or_cycle_reverse_search());
+        assert!(input.is_reverse_search_active());
+        assert_eq!(input.text(), "alpha three");
+
+        assert_eq!(input.handle_key(key(KeyCode::Char('b'))), InputOutcome::Consumed);
+        assert_eq!(input.text(), "beta two", "query filters to matching history entry");
+        assert_eq!(input.handle_key(key(KeyCode::Enter)), InputOutcome::Consumed);
+        assert!(!input.is_reverse_search_active());
+        assert_eq!(input.text(), "beta two", "Enter accepts match without submitting");
+
+        input.set_text("draft");
+        assert!(input.begin_or_cycle_reverse_search());
+        assert_eq!(input.handle_key(key(KeyCode::Char('z'))), InputOutcome::Consumed);
+        assert_eq!(input.text(), "draft", "no-match restores visible draft while searching");
+        assert_eq!(input.handle_key(key(KeyCode::Esc)), InputOutcome::Cancelled);
+        assert_eq!(input.text(), "draft", "Esc cancels and restores saved draft");
+        assert!(!input.is_reverse_search_active());
+    }
+
+    #[test]
+    fn reverse_search_ctrl_r_cycles_older_matches() {
+        let mut input = TuiInput::new();
+        input.history = vec!["alpha first".to_string(), "zzz".to_string(), "alpha second".to_string()];
+        assert!(input.begin_or_cycle_reverse_search());
+        assert_eq!(input.text(), "alpha second");
+        assert_eq!(
+            input.handle_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            InputOutcome::Consumed
+        );
+        assert_eq!(input.text(), "zzz", "empty query cycles older entries");
+        assert_eq!(input.handle_key(key(KeyCode::Char('a'))), InputOutcome::Consumed);
+        assert_eq!(input.text(), "alpha second", "query starts from latest matching entry");
+        assert_eq!(
+            input.handle_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+            InputOutcome::Consumed
+        );
+        assert_eq!(input.text(), "alpha first", "Ctrl+R cycles older query matches");
+    }
+
+    #[test]
+    fn dispatch_ctrl_r_focus_input_matrix_main_session_transcript() {
+        let focuses = [
+            crate::chat::sessions::FocusTarget::Main,
+            crate::chat::sessions::FocusTarget::Session { seq: 7 },
+            crate::chat::sessions::FocusTarget::Transcript,
+        ];
+        for focus in focuses {
+            for seed in ["", "draft"] {
+                let mut state = TuiState::new("p", "m");
+                state.focus = focus;
+                state.input.history = vec!["history item".to_string()];
+                if !seed.is_empty() {
+                    state.input.set_text(seed);
+                }
+                let out = dispatch_global_key(key_mod(KeyCode::Char('r'), KeyModifiers::CONTROL), &mut state);
+                assert_eq!(
+                    out,
+                    KeyDispatch::Consumed,
+                    "Ctrl+R consumed for focus={focus:?} seed={seed:?}"
+                );
+                assert!(
+                    state.input.is_reverse_search_active(),
+                    "reverse-search active for focus={focus:?} seed={seed:?}"
+                );
+                assert_eq!(
+                    state.input.text(),
+                    "history item",
+                    "no steer/scroll leak for focus={focus:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispatch_ctrl_x_ctrl_e_requests_external_editor_without_input_leak() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("draft");
+        let first = dispatch_global_key(key_mod(KeyCode::Char('x'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(first, KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "draft");
+        let second = dispatch_global_key(key_mod(KeyCode::Char('e'), KeyModifiers::CONTROL), &mut state);
+        assert_eq!(second, KeyDispatch::ExternalEditorRequested);
+        assert_eq!(state.input.text(), "draft", "chord must not mutate input itself");
+    }
+
+    #[test]
+    fn dispatch_ctrl_x_non_editor_second_key_does_not_leak() {
+        let mut state = TuiState::new("p", "m");
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('x'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Char('q')), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert!(state.input.is_empty(), "non-E chord tail must not enter input");
+        assert!(!state.external_editor_prefix_armed, "non-E chord tail clears latch");
     }
 
     #[test]

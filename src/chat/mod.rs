@@ -626,6 +626,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
         tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
         tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
+        tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -675,7 +676,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::PageSessionDown
         | tui::KeyDispatch::SwitchSession { .. }
         | tui::KeyDispatch::OpenTranscriptViewer
-        | tui::KeyDispatch::CloseTranscriptViewer => new_has_quit,
+        | tui::KeyDispatch::CloseTranscriptViewer
+        | tui::KeyDispatch::ExternalEditorRequested => new_has_quit,
     };
 
     if is_diff {
@@ -4658,6 +4660,134 @@ fn send_synthetic_command(
 }
 
 #[cfg(feature = "terminal-tui")]
+trait ExternalEditorTerminalMode {
+    fn suspend_for_editor(&self);
+    fn restore_after_editor(&self);
+}
+
+#[cfg(feature = "terminal-tui")]
+struct CrosstermExternalEditorTerminalMode;
+
+#[cfg(feature = "terminal-tui")]
+impl ExternalEditorTerminalMode for CrosstermExternalEditorTerminalMode {
+    fn suspend_for_editor(&self) {
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
+
+    fn restore_after_editor(&self) {
+        let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+struct ExternalEditorTerminalGuard<'a> {
+    terminal: &'a dyn ExternalEditorTerminalMode,
+    active: bool,
+}
+
+#[cfg(feature = "terminal-tui")]
+impl<'a> ExternalEditorTerminalGuard<'a> {
+    fn new(terminal: &'a dyn ExternalEditorTerminalMode) -> Self {
+        terminal.suspend_for_editor();
+        Self { terminal, active: true }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+impl Drop for ExternalEditorTerminalGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.terminal.restore_after_editor();
+            self.active = false;
+        }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExternalEditorResult {
+    Edited(String),
+    Unchanged(String),
+}
+
+#[cfg(feature = "terminal-tui")]
+fn resolve_external_editor() -> Option<String> {
+    std::env::var("VISUAL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| std::env::var("EDITOR").ok().filter(|value| !value.trim().is_empty()))
+}
+
+#[cfg(feature = "terminal-tui")]
+fn run_external_editor_command(editor: &str, path: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+    #[cfg(windows)]
+    {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg(format!("{editor} \"{}\"", path.display()))
+            .status()
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec $PRX_EXTERNAL_EDITOR \"$1\"")
+            .arg("prx-editor")
+            .arg(path)
+            .env("PRX_EXTERNAL_EDITOR", editor)
+            .status()
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn edit_text_with_external_editor(
+    initial: &str,
+    editor: Option<String>,
+    terminal: &dyn ExternalEditorTerminalMode,
+) -> ExternalEditorResult {
+    let Some(editor) = editor else {
+        return ExternalEditorResult::Unchanged("External editor unavailable: set VISUAL or EDITOR.".to_string());
+    };
+    let mut file = match tempfile::NamedTempFile::new() {
+        Ok(file) => file,
+        Err(err) => {
+            return ExternalEditorResult::Unchanged(format!("External editor unavailable: temp file failed ({err})."));
+        }
+    };
+    if let Err(err) = file.write_all(initial.as_bytes()) {
+        return ExternalEditorResult::Unchanged(format!(
+            "External editor unavailable: temp file write failed ({err})."
+        ));
+    }
+    if let Err(err) = file.flush() {
+        return ExternalEditorResult::Unchanged(format!(
+            "External editor unavailable: temp file flush failed ({err})."
+        ));
+    }
+    let path = file.path().to_path_buf();
+    {
+        let _terminal_guard = ExternalEditorTerminalGuard::new(terminal);
+        let status = match run_external_editor_command(&editor, &path) {
+            Ok(status) => status,
+            Err(err) => {
+                return ExternalEditorResult::Unchanged(format!("External editor failed to start: {err}."));
+            }
+        };
+        if !status.success() {
+            return ExternalEditorResult::Unchanged(format!("External editor exited with status {status}."));
+        }
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ExternalEditorResult::Edited(text),
+        Err(err) => ExternalEditorResult::Unchanged(format!("External editor read failed: {err}.")),
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
 fn attach_command_for_seq(seq: u64) -> String {
     format!("/attach {seq}")
 }
@@ -5544,8 +5674,8 @@ fn run_tui_unified_loop(
 
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
                 // C1 fix: any consumed keystroke may have mutated visible
-                // state — typing in the input box, Tab folding a tool card,
-                // Ctrl+R folding a reasoning card, Esc clearing the buffer,
+                // state — typing in the input box, Tab folding a card,
+                // Ctrl+R reverse-searching history, Esc clearing the buffer,
                 // history navigation. Nudge the loop so the change paints
                 // on the next iteration rather than waiting for the next
                 // crossterm event (worst case 50 ms idle poll). cap=1 +
@@ -5700,6 +5830,23 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::CloseTranscriptViewer => {
                         close_transcript_view(&mirror, chat_dispatcher, &redraw_tx);
+                    }
+                    tui::KeyDispatch::ExternalEditorRequested => {
+                        let initial = mirror.lock().input.text();
+                        let terminal_mode = CrosstermExternalEditorTerminalMode;
+                        match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {
+                            ExternalEditorResult::Edited(text) => {
+                                mirror.lock().input.set_text(&text);
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::InputReplaced(text),
+                                    "chat.external_editor_input_replaced",
+                                );
+                                let _ = redraw_tx.try_send(());
+                            }
+                            ExternalEditorResult::Unchanged(reason) => {
+                                surface_session_message(chat_dispatcher, Some(&redraw_tx), &reason);
+                            }
+                        }
                     }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
@@ -7415,6 +7562,80 @@ mod p2_iss005_tests {
             "reviewing older child output must not be yanked back to follow-tail"
         );
         assert!(refreshed.lines.iter().any(|line| line == "new live line"));
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "terminal-tui")]
+mod p6b2_external_editor_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Default)]
+    struct FakeTerminalMode {
+        suspended: Arc<AtomicUsize>,
+        restored: Arc<AtomicUsize>,
+    }
+
+    impl ExternalEditorTerminalMode for FakeTerminalMode {
+        fn suspend_for_editor(&self) {
+            self.suspended.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn restore_after_editor(&self) {
+            self.restored.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn shell_editor_script(body: &str) -> (tempfile::NamedTempFile, String) {
+        let mut script = tempfile::NamedTempFile::new().expect("test: script temp file");
+        script.write_all(body.as_bytes()).expect("test: write editor script");
+        script.flush().expect("test: flush editor script");
+        let command = format!("sh {}", script.path().display());
+        (script, command)
+    }
+
+    #[test]
+    fn external_editor_success_rewrites_draft_and_restores_terminal() {
+        let (_script, editor) = shell_editor_script("printf 'edited draft' > \"$1\"\n");
+        let terminal = FakeTerminalMode::default();
+        let result = edit_text_with_external_editor("old draft", Some(editor), &terminal);
+        assert_eq!(result, ExternalEditorResult::Edited("edited draft".to_string()));
+        assert_eq!(terminal.suspended.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal.restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn external_editor_nonzero_exit_keeps_draft_unchanged_and_restores_terminal() {
+        let (_script, editor) = shell_editor_script("exit 7\n");
+        let terminal = FakeTerminalMode::default();
+        let result = edit_text_with_external_editor("old draft", Some(editor), &terminal);
+        match result {
+            ExternalEditorResult::Unchanged(reason) => {
+                assert!(
+                    reason.contains("exited with status"),
+                    "reason should mention nonzero exit: {reason}"
+                );
+            }
+            other => panic!("expected unchanged result, got {other:?}"),
+        }
+        assert_eq!(terminal.suspended.load(Ordering::SeqCst), 1);
+        assert_eq!(terminal.restored.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn external_editor_missing_env_keeps_draft_unchanged_without_terminal_handoff() {
+        let terminal = FakeTerminalMode::default();
+        let result = edit_text_with_external_editor("old draft", None, &terminal);
+        match result {
+            ExternalEditorResult::Unchanged(reason) => {
+                assert!(reason.contains("VISUAL") && reason.contains("EDITOR"));
+            }
+            other => panic!("expected unchanged result, got {other:?}"),
+        }
+        assert_eq!(terminal.suspended.load(Ordering::SeqCst), 0);
+        assert_eq!(terminal.restored.load(Ordering::SeqCst), 0);
     }
 }
 

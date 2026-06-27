@@ -52,6 +52,8 @@ pub enum Action {
     TerminalResized { w: u16, h: u16 },
     /// dispatcher 解析出的提交（用户按下 Enter）
     InputSubmitted(String),
+    /// Replace the visible draft buffer without submitting it.
+    InputReplaced(String),
     /// Up/Down 历史导航
     HistoryNavigated(HistoryDir),
     /// Esc — 取消当前输入
@@ -208,7 +210,8 @@ pub enum Action {
     // ── UI 折叠/展开 ───────────────────────────────────────────
     /// Tab — 折叠/展开工具卡片
     ToolCardFoldToggled,
-    /// Ctrl+R — 折叠/展开 reasoning 卡片
+    /// Legacy direct action for tests/tools that explicitly fold reasoning.
+    /// `Ctrl+R` no longer maps here; P6b2 reserves it for reverse-search.
     ReasoningFoldToggled,
     /// 请求重绘
     RedrawRequested,
@@ -283,6 +286,7 @@ impl Action {
             Self::PasteReceived(_) => "PasteReceived",
             Self::TerminalResized { .. } => "TerminalResized",
             Self::InputSubmitted(_) => "InputSubmitted",
+            Self::InputReplaced(_) => "InputReplaced",
             Self::HistoryNavigated(_) => "HistoryNavigated",
             Self::InputCancelled => "InputCancelled",
             Self::SlashCommandIssued { .. } => "SlashCommandIssued",

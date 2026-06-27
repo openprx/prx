@@ -3226,6 +3226,7 @@ mod integration_tests {
 
         let actions: Vec<Action> = vec![
             Action::InputSubmitted("x".to_string()),
+            Action::InputReplaced("draft".to_string()),
             Action::HistoryNavigated(HistoryDir::Up),
             Action::HistoryNavigated(HistoryDir::Down),
             Action::InputCancelled,

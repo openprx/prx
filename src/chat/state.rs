@@ -555,6 +555,7 @@ impl ChatState {
                 vec![Effect::RequestRedraw]
             }
             Action::InputSubmitted(text) => self.reduce_input_submitted(text),
+            Action::InputReplaced(text) => self.reduce_input_replaced(&text),
             Action::HistoryNavigated(dir) => self.reduce_history_navigated(dir),
             Action::InputCancelled => self.reduce_input_cancelled(),
 
@@ -686,9 +687,11 @@ impl ChatState {
         if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
             return self.reduce_foldable_card_toggled();
         }
-        // Ctrl+R → 折叠/展开 Reasoning 卡片
+        // Ctrl+R → reverse-search submitted input history. Tab is the sole
+        // fold binding after P6b2.
         if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
-            return self.reduce_reasoning_fold_toggled();
+            let _ = self.ui.input.begin_or_cycle_reverse_search();
+            return vec![Effect::RequestRedraw];
         }
         // Ctrl+L → 清屏（请求重绘即可，host 终端清屏由 effect 执行器决定）
         if key.code == KeyCode::Char('l') && key.modifiers == KeyModifiers::CONTROL {
@@ -769,6 +772,18 @@ impl ChatState {
             },
             Effect::RequestRedraw,
         ]
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
+        self.ui.input.set_text(text);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    fn reduce_input_replaced(&mut self, _text: &str) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
     }
 
     /// 处理 Up/Down 历史导航.
@@ -2004,6 +2019,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::KeyPressed(_)
         | Action::PasteReceived(_)
         | Action::InputSubmitted(_)
+        | Action::InputReplaced(_)
         | Action::HistoryNavigated(_)
         | Action::InputCancelled => true,
 
@@ -2630,6 +2646,45 @@ mod tests {
             assert!(state.ui.input.is_empty());
         }
 
+        #[test]
+        fn ctrl_r_reverse_search_updates_state_and_snapshot_input() {
+            use crate::chat::tui::ConversationLine;
+            let mut state = s();
+            state.ui.input.history = vec!["alpha".to_string(), "beta".to_string()];
+            state.ui.conversation_lines.push(ConversationLine::Reasoning {
+                content: "thinking".to_string(),
+                char_count: 8,
+                folded: true,
+            });
+            let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(has_request_redraw(&effects));
+            assert!(state.ui.input.is_reverse_search_active());
+            assert_eq!(state.ui.input.text(), "beta");
+            match state.ui.conversation_lines.last() {
+                Some(ConversationLine::Reasoning { folded, .. }) => {
+                    assert!(*folded, "Ctrl+R must not fold reasoning after P6b2");
+                }
+                other => panic!("expected Reasoning card, got {other:?}"),
+            }
+            let snap = state.build_ui_snapshot(1);
+            assert!(snap.input.is_reverse_search_active());
+            assert_eq!(snap.input.text(), "beta");
+        }
+
+        #[test]
+        fn input_replaced_updates_snapshot_without_submit() {
+            let mut state = s();
+            let effects = state.reduce(Action::InputReplaced("edited draft".to_string()));
+            assert!(has_request_redraw(&effects));
+            assert_eq!(state.ui.input.text(), "edited draft");
+            assert_eq!(state.ui.turn_count, 0, "external editor replacement must not submit");
+            let snap = state.build_ui_snapshot(2);
+            assert_eq!(snap.input.text(), "edited draft");
+        }
+
         /// 额外：ReasoningFoldToggled 在无 reasoning 卡片时也返回 RequestRedraw
         #[test]
         fn test_reduce_reasoning_fold_toggled_no_panic_when_absent() {
@@ -2726,16 +2781,14 @@ mod tests {
                 "Tab fold toggle must bump conversation_generation to force scrollback re-emit"
             );
 
-            // Ctrl+R (reasoning-specific toggle) must bump again.
+            // Direct legacy fold action still bumps generation, but KeyPressed
+            // Ctrl+R is reverse-search after P6b2 and must not own folding.
             let gen_after_tab = state.ui.conversation_generation;
-            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(
-                KeyCode::Char('r'),
-                KeyModifiers::CONTROL,
-            )));
+            let _ = state.reduce(Action::ReasoningFoldToggled);
             assert_eq!(
                 state.ui.conversation_generation,
                 gen_after_tab + 1,
-                "Ctrl+R fold toggle must also bump conversation_generation"
+                "ReasoningFoldToggled must bump conversation_generation"
             );
         }
 
