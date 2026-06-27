@@ -626,6 +626,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
         tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
         tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
+        tui::KeyDispatch::CloseDiffViewer => "CloseDiffViewer",
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
         tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
     };
@@ -678,6 +679,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitchSession { .. }
         | tui::KeyDispatch::OpenTranscriptViewer
         | tui::KeyDispatch::CloseTranscriptViewer
+        | tui::KeyDispatch::CloseDiffViewer
         | tui::KeyDispatch::ExternalEditorRequested
         | tui::KeyDispatch::ToolApprovalDecision { .. } => new_has_quit,
     };
@@ -2574,6 +2576,27 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             emit_chat_output("Transcript viewer is only available in the terminal TUI.");
                             continue;
                         }
+                        SessionCommand::Diff { cached } => {
+                            attached_follow = None;
+                            attached_follow_seq = None;
+                            let source = collect_workspace_diff(&config.workspace_dir, cached).await;
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                if sessions_redraw_handle.is_some() {
+                                    open_diff_view(
+                                        &chat_mirror,
+                                        &chat_dispatcher,
+                                        sessions_redraw_handle.as_ref(),
+                                        source,
+                                    );
+                                } else {
+                                    emit_chat_output(&source.to_plain_text());
+                                }
+                            }
+                            #[cfg(not(feature = "terminal-tui"))]
+                            emit_chat_output(&source.to_plain_text());
+                            continue;
+                        }
                         SessionCommand::Kill { seq } => {
                             // Unified kill: shells terminate their process group via
                             // the shell registry; agents delegate to the
@@ -2609,6 +2632,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     emit_chat_output(
                                         "Tool approval is a foreground prompt, not a killable child session.",
                                     );
+                                    continue;
+                                }
+                                Ok(crate::chat::sessions::model::ManagedKind::Diff) => {
+                                    emit_chat_output("Diff is a read-only viewer, not a killable child session.");
                                     continue;
                                 }
                                 Err(e) => {
@@ -4958,6 +4985,166 @@ fn scroll_active_session_view(
     let _ = redraw_tx.try_send(());
 }
 
+const DIFF_MAX_BYTES: usize = 256 * 1024;
+const DIFF_MAX_LINES: usize = 2_000;
+const DIFF_ERROR_MAX_BYTES: usize = 4 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffViewSource {
+    title: String,
+    lines: Vec<String>,
+    truncated: bool,
+}
+
+impl DiffViewSource {
+    fn to_plain_text(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+fn diff_command_args(cached: bool) -> Vec<&'static str> {
+    let mut args = vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"];
+    if cached {
+        args.push("--cached");
+    }
+    args
+}
+
+fn truncate_utf8_lossy_bytes(bytes: &[u8], max_bytes: usize) -> String {
+    let capped = if bytes.len() <= max_bytes {
+        bytes
+    } else {
+        let mut end = max_bytes.min(bytes.len());
+        while end > 0
+            && bytes
+                .get(..end)
+                .and_then(|candidate| std::str::from_utf8(candidate).ok())
+                .is_none()
+        {
+            end = end.saturating_sub(1);
+        }
+        bytes.get(..end).map_or(&[] as &[u8], |candidate| candidate)
+    };
+    String::from_utf8_lossy(capped).to_string()
+}
+
+fn bounded_diff_lines(raw: &str, max_bytes: usize, max_lines: usize) -> (Vec<String>, bool) {
+    let mut truncated = raw.len() > max_bytes;
+    let capped = if truncated {
+        let mut end = max_bytes;
+        while end > 0 && !raw.is_char_boundary(end) {
+            end = end.saturating_sub(1);
+        }
+        raw.get(..end).map_or("", |candidate| candidate)
+    } else {
+        raw
+    };
+    let mut lines: Vec<String> = capped.lines().take(max_lines).map(str::to_string).collect();
+    if capped.lines().nth(max_lines).is_some() {
+        truncated = true;
+    }
+    if truncated {
+        lines.push("[output truncated]".to_string());
+    }
+    (lines, truncated)
+}
+
+fn git_diff_error_line(stderr: &[u8], stdout: &[u8]) -> String {
+    let message = if stderr.is_empty() { stdout } else { stderr };
+    let text = truncate_utf8_lossy_bytes(message, DIFF_ERROR_MAX_BYTES);
+    let first = text
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map_or("git diff failed", |line| line);
+    format!("diff unavailable: {first}")
+}
+
+struct BoundedDiffOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+    truncated: bool,
+}
+
+async fn run_git_diff_bounded(workspace_dir: &std::path::Path, cached: bool) -> Result<BoundedDiffOutput, String> {
+    use tokio::io::AsyncReadExt as _;
+
+    let args = diff_command_args(cached);
+    let mut child = tokio::process::Command::new("git")
+        .args(&args)
+        .current_dir(workspace_dir)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("diff unavailable: {err}"))?;
+
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "diff unavailable: failed to capture git stdout".to_string())?
+        .take(u64::try_from(DIFF_MAX_BYTES.saturating_add(1)).map_or(u64::MAX, |value| value));
+    let mut stdout_bytes = Vec::new();
+    stdout
+        .read_to_end(&mut stdout_bytes)
+        .await
+        .map_err(|err| format!("diff unavailable: failed to read git stdout ({err})"))?;
+    let stdout_truncated = stdout_bytes.len() > DIFF_MAX_BYTES;
+    if stdout_truncated {
+        stdout_bytes.truncate(DIFF_MAX_BYTES);
+        let _ = child.start_kill();
+    }
+
+    let mut stderr_bytes = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        let mut stderr = stderr.take(u64::try_from(DIFF_ERROR_MAX_BYTES).map_or(u64::MAX, |value| value));
+        let _ = stderr.read_to_end(&mut stderr_bytes).await;
+    }
+
+    let status = match tokio::time::timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(err)) => return Err(format!("diff unavailable: git wait failed ({err})")),
+        Err(_) => {
+            let _ = child.start_kill();
+            return Err("diff unavailable: git diff timed out".to_string());
+        }
+    };
+
+    Ok(BoundedDiffOutput {
+        success: status.success() || stdout_truncated,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+        truncated: stdout_truncated,
+    })
+}
+
+async fn collect_workspace_diff(workspace_dir: &std::path::Path, cached: bool) -> DiffViewSource {
+    let title = if cached { "staged diff" } else { "workspace diff" }.to_string();
+    match run_git_diff_bounded(workspace_dir, cached).await {
+        Ok(output) if output.success => {
+            let text = truncate_utf8_lossy_bytes(&output.stdout, DIFF_MAX_BYTES);
+            let (mut lines, line_truncated) = bounded_diff_lines(&text, DIFF_MAX_BYTES, DIFF_MAX_LINES);
+            if lines.is_empty() {
+                lines.push("(no workspace diff)".to_string());
+            }
+            DiffViewSource {
+                title,
+                lines,
+                truncated: output.truncated || line_truncated,
+            }
+        }
+        Ok(output) => DiffViewSource {
+            title,
+            lines: vec![git_diff_error_line(&output.stderr, &output.stdout)],
+            truncated: false,
+        },
+        Err(err) => DiffViewSource {
+            title,
+            lines: vec![format!("diff unavailable: {err}")],
+            truncated: false,
+        },
+    }
+}
+
 #[cfg(feature = "terminal-tui")]
 fn open_transcript_view(
     mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
@@ -5018,6 +5205,71 @@ fn close_transcript_view(
     let _ = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
         "chat.transcript_view_close",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
+#[cfg(feature = "terminal-tui")]
+fn open_diff_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    source: DiffViewSource,
+) {
+    let (view, focus) = {
+        let mut guard = mirror.lock();
+        let previous_offset = guard
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::sessions::model::ManagedKind::Diff.as_str())
+            .map_or(0, |view| view.scroll_offset);
+        let view = tui::build_diff_view(&source.title, source.lines, source.truncated, previous_offset);
+        let focus = crate::chat::sessions::FocusTarget::Diff;
+        guard.focus = focus;
+        guard.active_session_view = Some(view.clone());
+        (view, focus)
+    };
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged { focus },
+        "chat.diff_focus_open",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
+        "chat.diff_view_open",
+    );
+    if let Some(tx) = redraw_tx {
+        let _ = tx.try_send(());
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn close_diff_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+) {
+    {
+        let mut guard = mirror.lock();
+        if !matches!(guard.focus, crate::chat::sessions::FocusTarget::Diff)
+            && guard
+                .active_session_view
+                .as_ref()
+                .is_none_or(|view| view.kind != crate::chat::sessions::model::ManagedKind::Diff.as_str())
+        {
+            return;
+        }
+        guard.focus = crate::chat::sessions::FocusTarget::Main;
+        guard.active_session_view = None;
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged {
+            focus: crate::chat::sessions::FocusTarget::Main,
+        },
+        "chat.diff_focus_close",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+        "chat.diff_view_close",
     );
     let _ = redraw_tx.try_send(());
 }
@@ -5849,6 +6101,9 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::CloseTranscriptViewer => {
                         close_transcript_view(&mirror, chat_dispatcher, &redraw_tx);
+                    }
+                    tui::KeyDispatch::CloseDiffViewer => {
+                        close_diff_view(&mirror, chat_dispatcher, &redraw_tx);
                     }
                     tui::KeyDispatch::ExternalEditorRequested => {
                         let initial = mirror.lock().input.text();
@@ -7597,6 +7852,60 @@ mod p2_iss005_tests {
             "reviewing older child output must not be yanked back to follow-tail"
         );
         assert!(refreshed.lines.iter().any(|line| line == "new live line"));
+    }
+}
+
+#[cfg(test)]
+mod p6c2_diff_tests {
+    use super::*;
+
+    #[test]
+    fn diff_command_args_include_no_ext_diff_and_cached_flag() {
+        let workspace = diff_command_args(false);
+        assert_eq!(workspace, vec!["diff", "--no-ext-diff", "--no-color", "--unified=3"]);
+        assert!(
+            workspace.contains(&"--no-ext-diff"),
+            "git diff viewer must disable diff.external"
+        );
+
+        let cached = diff_command_args(true);
+        assert!(cached.contains(&"--no-ext-diff"));
+        assert!(cached.contains(&"--cached"));
+    }
+
+    #[test]
+    fn bounded_diff_lines_caps_bytes_lines_and_marks_truncated() {
+        let raw = (0..12).map(|i| format!("+line {i}")).collect::<Vec<_>>().join("\n");
+        let (lines, truncated) = bounded_diff_lines(&raw, raw.len(), 5);
+        assert!(truncated);
+        assert_eq!(lines.len(), 6, "5 retained lines plus truncation marker");
+        assert_eq!(lines.last().expect("marker"), "[output truncated]");
+
+        let (wide_lines, wide_truncated) = bounded_diff_lines("+你好世界", 5, 20);
+        assert!(wide_truncated);
+        assert!(
+            wide_lines
+                .first()
+                .expect("line")
+                .is_char_boundary(wide_lines.first().expect("line").len()),
+            "byte cap must not split utf-8"
+        );
+    }
+
+    #[test]
+    fn git_diff_error_line_is_single_bounded_line() {
+        let line = git_diff_error_line(b"fatal: not a git repository\nsecond line", b"");
+        assert_eq!(line, "diff unavailable: fatal: not a git repository");
+    }
+
+    #[tokio::test]
+    async fn collect_workspace_diff_git_failure_is_soft() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let source = collect_workspace_diff(temp.path(), false).await;
+        assert_eq!(source.title, "workspace diff");
+        assert_eq!(source.lines.len(), 1);
+        assert!(source.lines[0].starts_with("diff unavailable:"));
+        assert!(!source.truncated);
     }
 }
 

@@ -39,6 +39,9 @@ pub enum FocusTarget {
     /// Foreground tool approval prompt. It is a child TUI surface but never a
     /// steerable managed session.
     Approval,
+    /// Read-only workspace diff viewer. It is a child TUI surface but never a
+    /// steerable managed session.
+    Diff,
 }
 
 impl FocusTarget {
@@ -51,14 +54,17 @@ impl FocusTarget {
     /// Whether any child viewport is currently focused.
     #[must_use]
     pub const fn is_child_view(self) -> bool {
-        matches!(self, Self::Session { .. } | Self::Transcript | Self::Approval)
+        matches!(
+            self,
+            Self::Session { .. } | Self::Transcript | Self::Approval | Self::Diff
+        )
     }
 
     /// The focused session's display sequence `#N`, if any.
     #[must_use]
     pub const fn session_seq(self) -> Option<u64> {
         match self {
-            Self::Main | Self::Transcript | Self::Approval => None,
+            Self::Main | Self::Transcript | Self::Approval | Self::Diff => None,
             Self::Session { seq } => Some(seq),
         }
     }
@@ -310,6 +316,8 @@ pub enum EscAction {
     CloseTranscript,
     /// Input is empty and a foreground tool approval is focused → deny it.
     DenyApproval,
+    /// Input is empty and the read-only diff viewer is focused → close it.
+    CloseDiff,
     /// Input is empty and focus is main → the existing cancel semantics.
     Cancel,
 }
@@ -323,7 +331,8 @@ pub enum EscAction {
 /// 3. Input empty + session focused → detach.
 /// 4. Input empty + transcript focused → close transcript.
 /// 5. Input empty + approval focused → deny the pending tool.
-/// 6. Input empty + main focus → cancel (unchanged legacy behaviour).
+/// 6. Input empty + diff focused → close diff.
+/// 7. Input empty + main focus → cancel (unchanged legacy behaviour).
 #[must_use]
 pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool) -> EscAction {
     if switcher_open {
@@ -336,6 +345,7 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
         FocusTarget::Session { .. } => return EscAction::RequestDetach,
         FocusTarget::Transcript => return EscAction::CloseTranscript,
         FocusTarget::Approval => return EscAction::DenyApproval,
+        FocusTarget::Diff => return EscAction::CloseDiff,
         FocusTarget::Main => {}
     }
     EscAction::Cancel
@@ -421,6 +431,9 @@ mod tests {
         assert!(!FocusTarget::Transcript.is_session());
         assert!(FocusTarget::Transcript.is_child_view());
         assert_eq!(FocusTarget::Transcript.session_seq(), None);
+        assert!(!FocusTarget::Diff.is_session());
+        assert!(FocusTarget::Diff.is_child_view());
+        assert_eq!(FocusTarget::Diff.session_seq(), None);
     }
 
     #[test]
@@ -671,6 +684,7 @@ mod tests {
             resolve_esc(false, FocusTarget::Transcript, false),
             EscAction::ClearInput
         );
+        assert_eq!(resolve_esc(false, FocusTarget::Diff, false), EscAction::ClearInput);
     }
 
     #[test]
@@ -687,6 +701,11 @@ mod tests {
             resolve_esc(true, FocusTarget::Transcript, false),
             EscAction::CloseTranscript
         );
+    }
+
+    #[test]
+    fn resolve_esc_empty_diff_closes_diff() {
+        assert_eq!(resolve_esc(true, FocusTarget::Diff, false), EscAction::CloseDiff);
     }
 
     #[test]

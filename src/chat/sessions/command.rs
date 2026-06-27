@@ -27,6 +27,8 @@ pub enum SessionCommand {
     Detach,
     /// `/transcript` — open the read-only transcript child TUI (P6b1).
     Transcript,
+    /// `/diff` / `/diff --cached` — open a read-only workspace diff child TUI (P6c2).
+    Diff { cached: bool },
     /// `/shell <command>` — background shell session (v2).
     Shell { command: String },
     /// `/logs <seq>` — show a session log (v2).
@@ -73,7 +75,16 @@ pub fn parse_session_command(input: &str) -> Option<SessionCommand> {
         "/sessions" => return Some(SessionCommand::Sessions),
         "/detach" => return Some(SessionCommand::Detach),
         "/transcript" => return Some(SessionCommand::Transcript),
+        "/diff" => return Some(SessionCommand::Diff { cached: false }),
         _ => {}
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/diff") {
+        let rest = rest.strip_prefix(char::is_whitespace)?.trim();
+        if rest == "--cached" {
+            return Some(SessionCommand::Diff { cached: true });
+        }
+        return None;
     }
 
     // `/bg <task>` — everything after the command word is the task.
@@ -190,6 +201,10 @@ pub fn steer_unsupported_message(kind: super::model::ManagedKind, seq: u64) -> O
         ManagedKind::Approval => Some(
             "Steer is not supported for the foreground tool approval prompt. Decide with y, n, or Esc.".to_string(),
         ),
+        ManagedKind::Diff => Some(
+            "Steer is not supported for the read-only diff viewer. Close it with Esc to return to main chat."
+                .to_string(),
+        ),
     }
 }
 
@@ -232,6 +247,20 @@ mod tests {
             parse_session_command("  /transcript  "),
             Some(SessionCommand::Transcript)
         );
+    }
+
+    #[test]
+    fn parses_diff_workspace_and_cached_only() {
+        assert_eq!(
+            parse_session_command("/diff"),
+            Some(SessionCommand::Diff { cached: false })
+        );
+        assert_eq!(
+            parse_session_command("  /diff --cached  "),
+            Some(SessionCommand::Diff { cached: true })
+        );
+        assert_eq!(parse_session_command("/diff src/main.rs"), None);
+        assert_eq!(parse_session_command("/difffoo"), None);
     }
 
     #[test]

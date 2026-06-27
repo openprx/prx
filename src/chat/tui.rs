@@ -28,7 +28,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 use std::collections::HashMap;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
@@ -242,6 +242,8 @@ pub const INPUT_HISTORY_CAPACITY: usize = 200;
 
 /// Synthetic display id for the read-only transcript child TUI.
 pub const TRANSCRIPT_SESSION_SEQ: u64 = 0;
+/// Synthetic display id for the read-only diff child TUI.
+pub const DIFF_SESSION_SEQ: u64 = 0;
 
 /// Bounded transcript viewport size. Conversation history remains authoritative
 /// elsewhere; the child TUI is only a scrollable display snapshot.
@@ -346,6 +348,8 @@ pub enum KeyDispatch {
     OpenTranscriptViewer,
     /// P6b1: close the read-only transcript child TUI.
     CloseTranscriptViewer,
+    /// P6c2: close the read-only diff child TUI.
+    CloseDiffViewer,
     /// P6b2: open the current draft in an external editor.
     ExternalEditorRequested,
     /// P6c1: resolve the foreground tool approval prompt.
@@ -474,6 +478,33 @@ pub fn build_transcript_view(
             "conversation transcript".to_string()
         } else {
             session_title.to_string()
+        },
+        lines,
+        truncated,
+        scroll_offset,
+    }
+    .clamped_for_height(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS))
+}
+
+/// Build the read-only diff child viewport from bounded unified diff lines.
+#[must_use]
+pub fn build_diff_view(
+    title: &str,
+    lines: Vec<String>,
+    truncated: bool,
+    scroll_offset: usize,
+) -> crate::chat::sessions::ActiveSessionView {
+    let mut lines = lines;
+    if lines.is_empty() {
+        lines.push("(no workspace diff)".to_string());
+    }
+    crate::chat::sessions::ActiveSessionView {
+        seq: DIFF_SESSION_SEQ,
+        kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
+        title: if title.trim().is_empty() {
+            "workspace diff".to_string()
+        } else {
+            title.to_string()
         },
         lines,
         truncated,
@@ -634,6 +665,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             EscAction::RequestDetach => return KeyDispatch::RequestDetach,
             EscAction::CloseTranscript => return KeyDispatch::CloseTranscriptViewer,
             EscAction::DenyApproval => return KeyDispatch::Cancelled,
+            EscAction::CloseDiff => return KeyDispatch::CloseDiffViewer,
             EscAction::Cancel => {
                 // Empty buffer + main focus → unchanged legacy cancel semantics.
                 let _ = state.handle_input_key(key);
@@ -643,8 +675,10 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             EscAction::CloseSwitcher => return KeyDispatch::Cancelled,
         }
     }
-    if matches!(state.focus, crate::chat::sessions::FocusTarget::Transcript)
-        && key.code == KeyCode::Enter
+    if matches!(
+        state.focus,
+        crate::chat::sessions::FocusTarget::Transcript | crate::chat::sessions::FocusTarget::Diff
+    ) && key.code == KeyCode::Enter
         && key.modifiers == KeyModifiers::NONE
     {
         return KeyDispatch::Consumed;
@@ -2332,16 +2366,25 @@ fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> Str
     if max == 0 {
         return String::new();
     }
-    if input.chars().count() <= max {
+    if UnicodeWidthStr::width(input) <= max {
         return input.to_string();
     }
     let ellipsis = if ascii { "..." } else { "\u{2026}" };
-    let ellipsis_cols = ellipsis.chars().count();
+    let ellipsis_cols = UnicodeWidthStr::width(ellipsis);
     if max <= ellipsis_cols {
         return ellipsis.chars().take(max).collect();
     }
     let keep = max.saturating_sub(ellipsis_cols);
-    let mut truncated: String = input.chars().take(keep).collect();
+    let mut width = 0usize;
+    let mut truncated = String::new();
+    for ch in input.chars() {
+        let ch_width = UnicodeWidthChar::width(ch).map_or(0, |value| value);
+        if width.saturating_add(ch_width) > keep {
+            break;
+        }
+        width = width.saturating_add(ch_width);
+        truncated.push(ch);
+    }
     truncated.push_str(ellipsis);
     truncated
 }
@@ -2466,6 +2509,8 @@ fn render_active_session_view(
     let marker = if ascii { ">" } else { "\u{25B8}" };
     let prefix = if view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str() {
         format!("{marker} transcript ")
+    } else if view.kind == crate::chat::sessions::model::ManagedKind::Diff.as_str() {
+        format!("{marker} diff ")
     } else {
         format!("{marker} attached #{} {} ", view.seq, view.kind)
     };
@@ -3345,6 +3390,13 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
             let label = format!("approval {arrow} ");
             let width = label.chars().count();
             let span = Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            (span, width)
+        }
+        crate::chat::sessions::FocusTarget::Diff => {
+            let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
+            let label = format!("diff {arrow} ");
+            let width = label.chars().count();
+            let span = Span::styled(label, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
             (span, width)
         }
     }
@@ -5286,6 +5338,23 @@ mod tests {
             "transcript focus is read-only and must not submit/steer"
         );
 
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::ScrollSessionDown,
+            "diff focus must reuse child viewport scrolling"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut state),
+            KeyDispatch::PageSessionUp,
+            "diff focus must support page scrolling"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed,
+            "diff focus is read-only and must not submit/steer"
+        );
+
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
         assert_eq!(
@@ -5307,12 +5376,12 @@ mod tests {
         );
 
         state.input.clear();
-        state.focus = crate::chat::sessions::FocusTarget::Transcript;
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
         dispatch_global_key(key(KeyCode::Char('z')), &mut state);
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
             KeyDispatch::Consumed,
-            "transcript+non-empty input also keeps edit/history semantics"
+            "diff+non-empty input also keeps edit/history semantics"
         );
         assert_eq!(state.input.text(), "z");
     }
@@ -5373,6 +5442,18 @@ mod tests {
             dispatch_global_key(key(KeyCode::Left), &mut state),
             KeyDispatch::Consumed,
             "transcript focus must not switch to real sessions with Left"
+        );
+
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "diff focus must not switch to real sessions with Right"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "diff focus must not switch to real sessions with Left"
         );
 
         dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
@@ -5548,11 +5629,26 @@ mod tests {
             width,
         );
         assert!(
-            line.chars().count() <= width as usize,
-            "CJK strip row must fit char budget {width}, got {} chars: {line}",
-            line.chars().count()
+            UnicodeWidthStr::width(line.as_str()) <= width as usize,
+            "CJK strip row must fit column budget {width}, got {} cols: {line}",
+            UnicodeWidthStr::width(line.as_str())
         );
         assert!(line.contains("#5"), "seq remains visible under CJK truncation: {line}");
+    }
+
+    #[test]
+    fn truncation_is_cjk_column_accurate() {
+        let line = truncate_chars_with_ellipsis("你好世界abc", 5, false);
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) <= 5,
+            "wide chars must fit the column budget, got {:?} width {}",
+            line,
+            UnicodeWidthStr::width(line.as_str())
+        );
+        assert!(
+            line.ends_with('\u{2026}'),
+            "wide truncation should use ellipsis: {line:?}"
+        );
     }
 
     #[test]
@@ -5636,6 +5732,29 @@ mod tests {
             view.lines.first().is_some_and(|line| line.contains("line 25")),
             "oldest lines are trimmed first: {:?}",
             view.lines.first()
+        );
+    }
+
+    #[test]
+    fn diff_view_handles_empty_bounded_and_clamps_scroll() {
+        let empty = build_diff_view("", Vec::new(), false, 0);
+        assert_eq!(empty.seq, DIFF_SESSION_SEQ);
+        assert_eq!(empty.kind, crate::chat::sessions::model::ManagedKind::Diff.as_str());
+        assert_eq!(empty.title, "workspace diff");
+        assert_eq!(empty.lines, vec!["(no workspace diff)".to_string()]);
+
+        let view = build_diff_view(
+            "staged diff",
+            (0..24).map(|i| format!("+新增行{i}")).collect(),
+            true,
+            usize::MAX,
+        );
+        assert_eq!(view.title, "staged diff");
+        assert!(view.truncated);
+        assert_eq!(
+            view.scroll_offset,
+            view.max_scroll_offset(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS)),
+            "oversized diff offset clamps to the oldest retained visible page"
         );
     }
 
@@ -5737,6 +5856,47 @@ mod tests {
     }
 
     #[test]
+    fn diff_view_header_is_not_attached_seq_zero() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("provider", "model");
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
+        state.active_session_view = Some(build_diff_view(
+            "workspace diff",
+            vec![
+                "diff --git a/src/lib.rs b/src/lib.rs".to_string(),
+                "+新增内容".to_string(),
+            ],
+            false,
+            0,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(56, 12)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..56).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..12).map(row).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("diff workspace diff")),
+            "diff header rendered: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|r| r.contains("attached #0")),
+            "diff must not render as fake attached session: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| r.contains('+') && ['新', '增', '内', '容'].iter().all(|ch| r.contains(*ch))),
+            "diff body rendered with CJK content: {rows:?}"
+        );
+    }
+
+    #[test]
     fn active_session_view_short_terminal_drops_viewport_before_input_footer() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -5791,6 +5951,14 @@ mod tests {
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 3 };
         let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
         assert_eq!(out, KeyDispatch::RequestDetach);
+    }
+
+    #[test]
+    fn esc_empty_diff_closes_viewer() {
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::CloseDiffViewer);
     }
 
     #[test]
@@ -6484,13 +6652,17 @@ mod tests {
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.context_window_tokens = Some(10_000_000);
             let active_view = crate::chat::sessions::ActiveSessionView {
-                seq: 7,
-                kind: "agent".to_string(),
-                title: "non-empty parity session".to_string(),
-                lines: vec!["line a".to_string(), "line b".to_string()],
-                truncated: false,
+                seq: DIFF_SESSION_SEQ,
+                kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
+                title: "workspace diff".to_string(),
+                lines: vec![
+                    "diff --git a/src/lib.rs b/src/lib.rs".to_string(),
+                    "+line a".to_string(),
+                ],
+                truncated: true,
                 scroll_offset: 1,
             };
+            state.ui.focus = crate::chat::sessions::FocusTarget::Diff;
             state.ui.active_session_view = Some(active_view.clone());
             let snap = state.build_ui_snapshot(5);
 
@@ -6502,6 +6674,7 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
+            tui.focus = crate::chat::sessions::FocusTarget::Diff;
             tui.active_session_view = Some(active_view);
             tui.context_window_tokens = Some(10_000_000);
 
@@ -6539,6 +6712,7 @@ mod tests {
                 BottomChromeView::active_session_view(&tui),
                 BottomChromeView::active_session_view(&snap)
             );
+            assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
             assert_eq!(
                 BottomChromeView::pending_tool_approval(&tui),
                 BottomChromeView::pending_tool_approval(&snap)

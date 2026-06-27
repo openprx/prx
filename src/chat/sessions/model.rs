@@ -35,6 +35,8 @@ pub enum ManagedKind {
     Transcript,
     /// Foreground tool approval prompt.
     Approval,
+    /// Read-only workspace diff viewer (`/diff`).
+    Diff,
 }
 
 impl ManagedKind {
@@ -47,6 +49,7 @@ impl ManagedKind {
             Self::Pty => "pty",
             Self::Transcript => "transcript",
             Self::Approval => "approval",
+            Self::Diff => "diff",
         }
     }
 }

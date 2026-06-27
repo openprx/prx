@@ -664,6 +664,29 @@ fn test_chat_plain_mode_no_ansi() {
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_diff_no_tui_chrome() {
+    let (mut sg, _guard) = spawn_chat(&["--plain"], &[("PRX_TUI", "1")]);
+    let session = sg.session();
+
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session.send("/diff\r").expect("send /diff");
+    let captured = read_until_with_dsr(session, "diff unavailable:", TURN_TIMEOUT);
+    assert!(
+        !captured.contains("PRX Chat |")
+            && !captured.contains("Ctrl+G sessions")
+            && !captured.contains("diff workspace diff")
+            && !captured.contains("attached #0"),
+        "--plain /diff must emit plain text only, not TUI chrome; captured:\n{captured}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
 /// 6. Chinese (CJK) characters in the mock response must appear contiguously
 /// — no phantom space between each character (regression guard for the
 /// `insert_before` wide-char bug fixed by enabling the `scrolling-regions`
