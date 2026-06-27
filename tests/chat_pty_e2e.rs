@@ -604,7 +604,7 @@ fn test_chat_double_ctrl_c_exit() {
 #[serial(prx_chat_pty)]
 fn test_chat_plain_mode_no_ansi() {
     let sentinel = "[MOCK-PLAIN-C3D4]";
-    let (mut sg, _guard) = spawn_chat(&["--plain"], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let (mut sg, _guard) = spawn_chat(&["--plain"], &[("OPENPRX_MOCK_RESPONSE", sentinel), ("PRX_TUI", "1")]);
     let session = sg.session();
 
     read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
@@ -640,6 +640,10 @@ fn test_chat_plain_mode_no_ansi() {
     assert!(
         matches.is_empty(),
         "SGR colour codes wrap the mock response under --plain: {matches:?}\nresponse line: {line_window:?}"
+    );
+    assert!(
+        !captured.contains("\x1b[?2004h"),
+        "--plain must bypass TerminalGuard/TUI even when PRX_TUI=1; captured bracketed-paste enable in:\n{captured}"
     );
 
     session.send("/exit\r").expect("send /exit");

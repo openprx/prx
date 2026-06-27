@@ -869,6 +869,12 @@ impl Drop for TerminalGuard {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+fn should_enable_terminal_tui(plain_mode: bool, stdin_is_terminal: bool, prx_tui_env: Option<&str>) -> bool {
+    let tui_opt_out = prx_tui_env == Some("0");
+    !plain_mode && !tui_opt_out && stdin_is_terminal
+}
+
 /// Install the chat-specific panic hook.
 ///
 /// The hook restores the terminal (show cursor, leave alternate screen,
@@ -1523,8 +1529,9 @@ pub async fn run(
         // downstream scripts that scrape stdout, or to escape rendering
         // glitches). Non-TTY stdin (pipe / heredoc / scripted) always falls
         // through to the legacy reedline + BufRead path.
-        let tui_opt_out = std::env::var("PRX_TUI").as_deref() == Ok("0");
-        let tui_enabled = !tui_opt_out && std::io::stdin().is_terminal();
+        let prx_tui_env = std::env::var("PRX_TUI").ok();
+        let tui_enabled =
+            should_enable_terminal_tui(plain_mode, std::io::stdin().is_terminal(), prx_tui_env.as_deref());
         if tui_enabled {
             // Order matters: `TerminalGuard::enter()` flips raw mode + alt
             // screen + bracketed paste FIRST, then we wire up the UiActor
@@ -6388,6 +6395,26 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn plain_mode_disables_terminal_tui_even_for_tty() {
+        assert!(
+            !should_enable_terminal_tui(true, true, Some("1")),
+            "--plain must bypass TUI even when PRX_TUI asks for TUI"
+        );
+        assert!(
+            should_enable_terminal_tui(false, true, Some("1")),
+            "TTY + PRX_TUI=1 should enable TUI when not plain"
+        );
+        assert!(
+            !should_enable_terminal_tui(false, true, Some("0")),
+            "PRX_TUI=0 remains an explicit TUI opt-out"
+        );
+        assert!(
+            !should_enable_terminal_tui(false, false, Some("1")),
+            "non-TTY stdin must not enter TUI"
+        );
     }
 
     #[test]
