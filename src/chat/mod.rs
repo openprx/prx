@@ -1615,7 +1615,7 @@ pub async fn run(
     // run_id. The session identity is carried by `chat_session_key`, never by
     // run_id, and turns deliberately set no parent_run_id (that field is reserved
     // for the spawn execution lineage, not for relating turns within a session).
-    let chat_session_key = format!("chat:{}", chat_session.id);
+    let mut chat_session_key = format!("chat:{}", chat_session.id);
     let mut fabric_turn_seq: u64 = 0;
 
     // ── Build banner text ────────────────────────────────────────
@@ -1637,21 +1637,15 @@ pub async fn run(
     );
 
     // ── Conversation history ─────────────────────────────────────
-    let resumed_history = session_turns_to_history(&chat_session);
-    let mut history = if config.skill_rag.enabled {
-        resumed_history
-    } else {
-        let mut h = vec![ChatMessage::system(build_runtime_system_prompt(
-            &config,
-            model_name,
-            &tool_descs,
-            &skills,
-            native_tools,
-            &tools_registry,
-        ))];
-        h.extend(resumed_history);
-        h
-    };
+    let mut history = history_for_session_with_system(
+        &chat_session,
+        &config,
+        model_name,
+        &tool_descs,
+        &skills,
+        native_tools,
+        &tools_registry,
+    );
 
     // ── P3-3: shared TuiState mirror ─────────────────────────────
     //
@@ -2065,6 +2059,8 @@ pub async fn run(
         crate::chat::sessions::id::SessionId,
         crate::chat::sessions::SessionRing,
     > = std::collections::HashMap::new();
+    let mut ignored_session_events: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
+        std::collections::HashSet::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
     // Display sequence `#N` of the currently-followed session, kept in lock-step
     // with `attached_follow`. Used purely to reconstruct the *previous* focus
@@ -2201,6 +2197,9 @@ pub async fn run(
                     continue;
                 };
                 let sid = event.session_id().clone();
+                if ignored_session_events.contains(&sid) {
+                    continue;
+                }
                 let ring = session_rings
                     .entry(sid.clone())
                     .or_insert_with(|| crate::chat::sessions::SessionRing::with_capacity(
@@ -2668,6 +2667,164 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         commands::ChatMode::Auto => "Switched to auto mode (all tools, no approval prompts)",
                     };
                     emit_chat_output(msg);
+                    continue;
+                }
+                commands::CommandResult::ResumeAction(action) => {
+                    match action {
+                        commands::ResumeCommand::List => match saved_chat_sessions(mem.as_ref()).await {
+                            Ok(sessions) => emit_chat_output(&format_saved_chat_sessions(&sessions)),
+                            Err(e) => emit_chat_output(&format!("Failed to list saved chat sessions: {e}")),
+                        },
+                        commands::ResumeCommand::Last | commands::ResumeCommand::Id(_) => {
+                            let target_label = match &action {
+                                commands::ResumeCommand::Last => "last".to_string(),
+                                commands::ResumeCommand::Id(id) => id.clone(),
+                                commands::ResumeCommand::List => String::new(),
+                            };
+
+                            let current_child_summaries = chat_sessions
+                                .snapshot()
+                                .await
+                                .iter()
+                                .map(|view| {
+                                    crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new())
+                                })
+                                .collect::<Vec<_>>();
+                            for summary in &current_child_summaries {
+                                chat_session.record_background_session(summary.clone());
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::BackgroundSessionRecorded {
+                                        summary: summary.clone(),
+                                    },
+                                    "chat.resume_record_child_summary_before_switch",
+                                );
+                            }
+
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SessionSwitched {
+                                    id: target_label.clone(),
+                                },
+                                "chat.resume_session_switched",
+                            );
+
+                            if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+                                emit_chat_output(&format!(
+                                    "Resume aborted: failed to save current session before switching: {e}"
+                                ));
+                                continue;
+                            }
+
+                            let loaded = match &action {
+                                commands::ResumeCommand::Last => match load_latest_session(mem.as_ref()).await {
+                                    Ok(Some(session)) => Some(session),
+                                    Ok(None) => {
+                                        emit_chat_output("No saved chat sessions to resume.");
+                                        None
+                                    }
+                                    Err(e) => {
+                                        emit_chat_output(&format!(
+                                            "Resume aborted: failed to load saved chat session: {e}"
+                                        ));
+                                        None
+                                    }
+                                },
+                                commands::ResumeCommand::Id(id) => match load_session_by_id(mem.as_ref(), id).await {
+                                    Ok(Some(session)) => Some(session),
+                                    Ok(None) => {
+                                        emit_chat_output(&format!("Saved chat session '{id}' not found."));
+                                        None
+                                    }
+                                    Err(e) => {
+                                        emit_chat_output(&format!(
+                                            "Resume aborted: failed to load saved chat session '{id}': {e}"
+                                        ));
+                                        None
+                                    }
+                                },
+                                commands::ResumeCommand::List => None,
+                            };
+                            let Some(mut loaded_session) = loaded else {
+                                continue;
+                            };
+
+                            let (_detached_summaries, ignored_ids) =
+                                chat_sessions.detach_for_chat_session_switch().await;
+                            ignored_session_events.extend(ignored_ids);
+                            session_rings.clear();
+                            reported_sessions.clear();
+                            last_sessions_summary.clear();
+                            last_sessions_entries.clear();
+                            attached_follow = None;
+                            attached_follow_seq = None;
+
+                            bind_session_to_runtime_provider_model(&mut loaded_session, provider_name, model_name);
+                            chat_session = loaded_session;
+                            chat_session_key = format!("chat:{}", chat_session.id);
+                            let resumed_user_turns =
+                                chat_session.turns.iter().filter(|turn| turn.role == "user").count();
+                            fabric_turn_seq = u64::try_from(resumed_user_turns).map_or(u64::MAX, |value| value);
+                            history = history_for_session_with_system(
+                                &chat_session,
+                                &config,
+                                model_name,
+                                &tool_descs,
+                                &skills,
+                                native_tools,
+                                &tools_registry,
+                            );
+
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SessionLoaded(chat_session.clone()),
+                                "chat.resume_session_loaded",
+                            );
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SessionFocusChanged {
+                                    focus: crate::chat::sessions::FocusTarget::Main,
+                                },
+                                "chat.resume_focus_main",
+                            );
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+                                "chat.resume_clear_active_session_view",
+                            );
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SessionsStatusUpdated { summary: String::new() },
+                                "chat.resume_clear_sessions_status",
+                            );
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SessionsEntriesUpdated { entries: Vec::new() },
+                                "chat.resume_clear_sessions_entries",
+                            );
+
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                let mut mirror = chat_mirror.lock();
+                                mirror.session_title = chat_session.title.clone();
+                                mirror.turn_count = chat_session.turn_count();
+                                mirror.conversation_lines = conversation_lines_for_resumed_session(&chat_session);
+                                mirror.streaming = None;
+                                mirror.sessions_status.clear();
+                                mirror.sessions_cache.clear();
+                                mirror.active_session_view = None;
+                                mirror.focus = crate::chat::sessions::FocusTarget::Main;
+                                mirror.switcher = None;
+                            }
+                            if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                let _ = tx.try_send(());
+                            }
+
+                            let title = if chat_session.title.is_empty() {
+                                "(untitled)"
+                            } else {
+                                chat_session.title.as_str()
+                            };
+                            emit_chat_output(&format!(
+                                "Resumed saved chat session {} ({title}, {} turns).",
+                                chat_session.id,
+                                chat_session.turn_count()
+                            ));
+                        }
+                    }
                     continue;
                 }
                 commands::CommandResult::SessionAction(action) => {
@@ -6536,6 +6693,85 @@ fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> 
         .map(|turn| ChatMessage {
             role: turn.role.clone(),
             content: turn.content.clone(),
+        })
+        .collect()
+}
+
+fn history_for_session_with_system(
+    session: &session::ChatSession,
+    config: &Config,
+    model_name: &str,
+    tool_descs: &[(&str, &str)],
+    skills: &[crate::skills::Skill],
+    native_tools: bool,
+    tools_registry: &[Box<dyn Tool>],
+) -> Vec<ChatMessage> {
+    let resumed_history = session_turns_to_history(session);
+    if config.skill_rag.enabled {
+        return resumed_history;
+    }
+    let mut history = vec![ChatMessage::system(build_runtime_system_prompt(
+        config,
+        model_name,
+        tool_descs,
+        skills,
+        native_tools,
+        tools_registry,
+    ))];
+    history.extend(resumed_history);
+    history
+}
+
+fn format_saved_chat_sessions(sessions: &[session::ChatSession]) -> String {
+    if sessions.is_empty() {
+        return "No saved chat sessions.".to_string();
+    }
+
+    let mut out = String::from("Saved chat sessions:\n");
+    for session in sessions {
+        let title = if session.title.is_empty() {
+            "(untitled)"
+        } else {
+            session.title.as_str()
+        };
+        out.push_str(&format!(
+            "  {} | {} | {} turns | {}\n",
+            session.id,
+            title,
+            session.turn_count(),
+            session.updated_at.format("%Y-%m-%d %H:%M")
+        ));
+    }
+    out.push_str("\nResume with: /resume <ID> or /resume last");
+    out
+}
+
+async fn saved_chat_sessions(mem: &dyn Memory) -> Result<Vec<session::ChatSession>> {
+    let entries = mem
+        .list(Some(&MemoryCategory::Conversation), None)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to list saved chat sessions: {e}"))?;
+    let mut sessions = collect_valid_sessions(&entries)?;
+    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    Ok(sessions)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn conversation_lines_for_resumed_session(session: &session::ChatSession) -> Vec<tui::ConversationLine> {
+    session
+        .turns
+        .iter()
+        .filter_map(|turn| match turn.role.as_str() {
+            "user" => Some(tui::ConversationLine::User {
+                content: turn.content.clone(),
+            }),
+            "assistant" => Some(tui::ConversationLine::Assistant {
+                content: turn.content.clone(),
+            }),
+            "system" => Some(tui::ConversationLine::System {
+                content: turn.content.clone(),
+            }),
+            _ => None,
         })
         .collect()
 }

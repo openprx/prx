@@ -300,6 +300,56 @@ impl ChatSessionsHandle {
         views
     }
 
+    /// Detach all live child-session registries before switching the owning
+    /// chat session. Returns display-only persisted summaries plus ids that may
+    /// still emit late events, so the caller can ignore stale event-bridge
+    /// messages from the old chat session.
+    ///
+    /// This never revives or migrates child processes into the new chat session.
+    /// Agent tasks are aborted best-effort; shell/PTY processes are killed
+    /// best-effort and their registries are cleared from the chat projection.
+    pub async fn detach_for_chat_session_switch(
+        &mut self,
+    ) -> (Vec<super::model::PersistedSessionSummary>, Vec<SessionId>) {
+        let views = self.snapshot().await;
+        let summaries = views
+            .iter()
+            .map(|view| super::model::PersistedSessionSummary::from_view(view, String::new()))
+            .collect::<Vec<_>>();
+        let ignored_ids = views.iter().map(|view| view.id.clone()).collect::<Vec<_>>();
+
+        {
+            let mut runs = self.runs.write().await;
+            for run in runs.iter() {
+                if let Some(handle) = run.abort_handle.as_ref() {
+                    handle.abort();
+                }
+            }
+            runs.clear();
+        }
+        let shells = self.shells.lock().clone();
+        for shell in &shells {
+            if !shell.is_terminal() {
+                let _ = shell.kill().await;
+            }
+        }
+        self.shells.lock().clear();
+        #[cfg(feature = "terminal-tui")]
+        {
+            let ptys = self.ptys.lock().clone();
+            for pty in &ptys {
+                if !pty.has_exited() {
+                    let _ = pty.kill().await;
+                }
+            }
+            self.ptys.lock().clear();
+        }
+        self.seq_map.clear();
+        self.next_seq = 1;
+
+        (summaries, ignored_ids)
+    }
+
     /// Poll the registry for sessions that have reached a terminal state and
     /// have not yet been reported, for the v1b summary reflow.
     ///
@@ -628,6 +678,30 @@ mod tests {
         handle.kill_shell(2).await.expect("test: kill shell #2");
         assert!(shell.is_terminal());
         assert!(handle.kill_shell(1).await.is_err(), "agent seq is not a shell");
+    }
+
+    #[tokio::test]
+    async fn detach_for_chat_session_switch_clears_registry_and_returns_ignored_ids() {
+        let runs = Arc::new(RwLock::new(vec![make_run(
+            "old-agent",
+            "agent a",
+            SubAgentStatus::Running,
+        )]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        assert_eq!(handle.snapshot().await.len(), 1);
+
+        let (summaries, ignored_ids) = handle.detach_for_chat_session_switch().await;
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, "old-agent");
+        assert_eq!(summaries[0].status, super::super::model::STATUS_INTERRUPTED);
+        assert_eq!(ignored_ids.len(), 1);
+        assert_eq!(ignored_ids[0].as_str(), "old-agent");
+        assert!(runs.read().await.is_empty(), "agent registry must be cleared");
+        assert!(
+            handle.snapshot().await.is_empty(),
+            "new chat session must start with an empty child-session registry"
+        );
     }
 
     // ── Interactive PTY sessions in the unified list (v3a) ───────────────────

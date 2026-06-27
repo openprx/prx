@@ -78,6 +78,7 @@ pub struct ChatRunner {
     pub temperature: f64,
     pub plain: bool,
     pub session: Option<String>,
+    pub continue_last: bool,
     pub list_sessions: bool,
 }
 
@@ -91,7 +92,7 @@ impl ModeRunner for ChatRunner {
             me.model,
             me.temperature,
             me.plain,
-            me.session,
+            me.session.or_else(|| me.continue_last.then(|| "last".to_string())),
             me.list_sessions,
             shutdown,
         )
@@ -293,6 +294,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             temperature,
             plain,
             session,
+            continue_last,
             list_sessions,
         } => {
             // D5/D9 (A6): drive via ModeRunner with the dispatch root token. chat
@@ -307,6 +309,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 temperature,
                 plain,
                 session,
+                continue_last,
                 list_sessions,
             })
             .run(root_shutdown.clone())
@@ -676,6 +679,7 @@ mod tests {
             temperature: 0.7,
             plain: false,
             session: None,
+            continue_last: false,
             list_sessions: false,
         }));
     }

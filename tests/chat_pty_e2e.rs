@@ -469,6 +469,27 @@ fn run_chat_script_in(guard: &HarnessGuard, extra_args: &[&str], extra_env: &[(&
     String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
+fn list_sessions_in(guard: &HarnessGuard) -> String {
+    let output = build_chat_command_in(guard, &["--list-sessions"], &[])
+        .output()
+        .expect("list sessions");
+    assert!(
+        output.status.success(),
+        "list sessions failed: status={:?}, stdout={}, stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+fn first_saved_session_id(list_output: &str) -> String {
+    list_output
+        .lines()
+        .find_map(|line| line.trim().split_once(" | ").map(|(id, _)| id.to_string()))
+        .expect("saved session id in list output")
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 /// 1. Banner is visible on startup.
@@ -716,6 +737,74 @@ fn test_chat_plain_file_mention_no_tui_chrome() {
 
     session.send("/exit\r").expect("send /exit");
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "ALPHA_REPLY")],
+        "alpha question\n/exit\n",
+    );
+    let alpha_id = first_saved_session_id(&list_sessions_in(&guard));
+
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "BETA_REPLY")],
+        &format!("beta question\n/resume {alpha_id}\n/cost\n/exit\n"),
+    );
+
+    assert!(
+        output.contains("Resumed saved chat session"),
+        "resume confirmation missing; output:\n{output}"
+    );
+    assert!(
+        output.contains("Turns:        2"),
+        "cost after /resume should reflect alpha session's exact two persisted turns; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain /resume must not render TUI chrome; output:\n{output}"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_continue_resumes_last_session_no_tui_chrome() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "CONTINUE_REPLY")],
+        "continue question\n/exit\n",
+    );
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain", "--continue"],
+        &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "CONTINUE_SECOND")],
+        "/cost\n/exit\n",
+    );
+
+    assert!(
+        output.contains("Turns:        2"),
+        "--continue should resume last saved chat session; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain --continue must not render TUI chrome; output:\n{output}"
+    );
 }
 
 /// 6. Chinese (CJK) characters in the mock response must appear contiguously

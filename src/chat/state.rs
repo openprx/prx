@@ -57,6 +57,34 @@ const COMPACT_KEEP_MESSAGES: usize = 8;
 const COMPACT_CONTENT_CHARS: usize = 320;
 const COMPACT_TOTAL_CHARS: usize = 2400;
 
+#[cfg(feature = "terminal-tui")]
+fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
+    turns
+        .iter()
+        .filter_map(|turn| match turn.role.as_str() {
+            "user" => Some(ConversationLine::User {
+                content: turn.content.clone(),
+            }),
+            "assistant" => Some(ConversationLine::Assistant {
+                content: turn.content.clone(),
+            }),
+            "system" => Some(ConversationLine::System {
+                content: turn.content.clone(),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+#[cfg(not(feature = "terminal-tui"))]
+fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
+    turns
+        .iter()
+        .filter(|turn| matches!(turn.role.as_str(), "user" | "assistant" | "system"))
+        .map(|turn| turn.content.clone())
+        .collect()
+}
+
 // ─── Effect ──────────────────────────────────────────────────────────────────
 
 /// Effect = 必须由 async 外壳执行的副作用.
@@ -1583,6 +1611,11 @@ impl ChatState {
                 content: t.content.clone(),
             })
             .collect();
+        self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+        self.ui.active_session_view = None;
+        self.ui.sessions_status.clear();
+        self.ui.sessions_entries.clear();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -3641,6 +3674,11 @@ mod tests {
                 state.session.history.len(),
                 2,
                 "history 应从 turns 重建(user+assistant)"
+            );
+            assert_eq!(
+                state.ui.conversation_lines.len(),
+                2,
+                "UI conversation_lines 应从恢复的 turns 重建"
             );
             assert!(has_request_redraw(&effects), "应含 RequestRedraw");
             assert!(has_log_trace(&effects), "应含 LogTrace");

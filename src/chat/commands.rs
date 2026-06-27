@@ -46,6 +46,17 @@ pub enum CommandResult {
     /// mutable session runtime state (registry handle + provider/model strings),
     /// which the immutable [`CommandContext`] cannot touch.
     SessionAction(super::sessions::SessionCommand),
+    /// /resume — saved chat-session history command. The chat main loop owns
+    /// the mutable session identity, provider history, reducer, and child-session
+    /// registry, so this module only parses the intent.
+    ResumeAction(ResumeCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResumeCommand {
+    List,
+    Last,
+    Id(String),
 }
 
 /// Context passed to command handlers (borrows from the main loop).
@@ -65,6 +76,7 @@ const HELP_TEXT: &str = "Available commands:
   /provider [name [model]]  Show or hot-switch provider
   /tools             List available tools
   /memory <query>    Search memory
+  /resume [last|id]  List or switch saved chat sessions
   /cost              Show token usage estimate
   /compact           Compact conversation context (free up window)
   /export [md|json]  Export conversation
@@ -108,6 +120,17 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         }
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
         "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
+        "/resume" => CommandResult::ResumeAction(ResumeCommand::List),
+        _ if input.starts_with("/resume ") => {
+            let raw = input["/resume ".len()..].trim();
+            if raw.is_empty() {
+                CommandResult::ResumeAction(ResumeCommand::List)
+            } else if raw.eq_ignore_ascii_case("last") {
+                CommandResult::ResumeAction(ResumeCommand::Last)
+            } else {
+                CommandResult::ResumeAction(ResumeCommand::Id(raw.to_string()))
+            }
+        }
         _ if input.starts_with("/model ") => {
             // BUG-07: `/model <name>` is intercepted in the chat run loop (it
             // needs to mutate the live model slot + main-loop state), so this
@@ -276,10 +299,8 @@ mod mode_tests {
     //! these tests exercise the pure mode-classification helpers, plus a
     //! pattern-match shim that mirrors what `dispatch` returns for the three
     //! mode-switching commands.
-    #[cfg(feature = "terminal-tui")]
     use super::CommandContext;
-    use super::{ChatMode, CommandResult};
-    #[cfg(feature = "terminal-tui")]
+    use super::{ChatMode, CommandResult, ResumeCommand};
     use crate::memory::NoneMemory;
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::tools::{Tool, ToolResult};
@@ -743,5 +764,32 @@ mod mode_tests {
             text.contains("Turns:        0"),
             "empty session cost must be 0 turns: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn slash_resume_parses_list_last_and_id() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        let ctx = CommandContext {
+            model_name: "kimi2.6",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        assert!(matches!(
+            super::dispatch("/resume", &ctx).await,
+            CommandResult::ResumeAction(ResumeCommand::List)
+        ));
+        assert!(matches!(
+            super::dispatch("/resume last", &ctx).await,
+            CommandResult::ResumeAction(ResumeCommand::Last)
+        ));
+        assert!(matches!(
+            super::dispatch("/resume abc-123", &ctx).await,
+            CommandResult::ResumeAction(ResumeCommand::Id(id)) if id == "abc-123"
+        ));
     }
 }

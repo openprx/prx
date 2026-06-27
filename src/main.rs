@@ -533,6 +533,7 @@ Examples:
   prx chat -p ollama -m llama3.3        # use local model
   prx chat -p anthropic                 # use Anthropic
   prx chat --plain                      # no ANSI colors
+  prx chat --continue                   # resume last session
   prx chat --session last               # resume last session
   prx chat --session abc123             # resume specific session
   prx chat --list-sessions              # list saved sessions")]
@@ -556,6 +557,10 @@ Examples:
         /// Resume a session by ID, or "last" for the most recent
         #[arg(short, long)]
         session: Option<String>,
+
+        /// Resume the most recent saved session. Explicit --session wins if both are provided.
+        #[arg(long = "continue")]
+        continue_last: bool,
 
         /// List all saved sessions and exit
         #[arg(long)]
@@ -2278,6 +2283,35 @@ mod tests {
                 assert_eq!(api_key.as_deref(), Some("sk-issue946"));
             }
             other => panic!("expected onboard command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_continue_flag_parses_as_resume_last_intent() {
+        let cli = Cli::try_parse_from(["prx", "chat", "--continue"]).expect("chat --continue should parse");
+        match cli.command {
+            Commands::Chat {
+                continue_last, session, ..
+            } => {
+                assert!(continue_last);
+                assert!(session.is_none());
+            }
+            other => panic!("expected chat command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chat_explicit_session_can_coexist_with_continue() {
+        let cli = Cli::try_parse_from(["prx", "chat", "--continue", "--session", "abc"])
+            .expect("explicit --session with --continue should parse");
+        match cli.command {
+            Commands::Chat {
+                continue_last, session, ..
+            } => {
+                assert!(continue_last);
+                assert_eq!(session.as_deref(), Some("abc"));
+            }
+            other => panic!("expected chat command, got {other:?}"),
         }
     }
 
