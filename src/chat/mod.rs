@@ -530,6 +530,10 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
         tui::KeyDispatch::AttachSession { .. } => "AttachSession",
         tui::KeyDispatch::RequestDetach => "RequestDetach",
+        tui::KeyDispatch::ScrollSessionUp => "ScrollSessionUp",
+        tui::KeyDispatch::ScrollSessionDown => "ScrollSessionDown",
+        tui::KeyDispatch::PageSessionUp => "PageSessionUp",
+        tui::KeyDispatch::PageSessionDown => "PageSessionDown",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -572,7 +576,11 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitcherMoved { .. }
         | tui::KeyDispatch::SwitcherClosed
         | tui::KeyDispatch::AttachSession { .. }
-        | tui::KeyDispatch::RequestDetach => new_has_quit,
+        | tui::KeyDispatch::RequestDetach
+        | tui::KeyDispatch::ScrollSessionUp
+        | tui::KeyDispatch::ScrollSessionDown
+        | tui::KeyDispatch::PageSessionUp
+        | tui::KeyDispatch::PageSessionDown => new_has_quit,
     };
 
     if is_diff {
@@ -1771,11 +1779,6 @@ pub async fn run(
     // attach failure the key thread has already pointed the prompt at the new
     // seq, so the main loop restores `Main` (when None) or `Session { seq }`.
     let mut attached_follow_seq: Option<u64> = None;
-    // Sessions for which the live follow has already surfaced an `[output
-    // truncated]` notice, so the marker (P1) is shown at most once per session
-    // while following. Cleared on `/attach` (a fresh follow re-evaluates).
-    let mut attach_truncated_shown: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
-        std::collections::HashSet::new();
     // Guards the event-drain select arm: once the event channel closes (only at
     // shutdown — the sender lives as long as the tool registry) we disable the
     // arm so a closed channel does not busy-spin returning `None`.
@@ -1896,8 +1899,8 @@ pub async fn run(
             }
             maybe_event = session_event_rx.recv(), if session_events_open => {
                 // Drain one background-session event: append it to that session's
-                // ring (single-consumer write, no lock) and, if we are currently
-                // following that session, stream the new line(s) inline.
+                // ring (single-consumer write, no lock) and, if focused, refresh
+                // the child viewport. P2 keeps child output out of main scrollback.
                 let Some(event) = maybe_event else {
                     // Sender side closed (chat shutting down). Disable this arm so
                     // a closed channel does not busy-spin; other arms drive exit.
@@ -1965,35 +1968,15 @@ pub async fn run(
                     }
                     _ => {}
                 }
+                #[cfg(feature = "terminal-tui")]
                 if attached_follow.as_ref() == Some(&sid) {
-                    // Follow mode: surface only the newly-appended lines inline.
-                    let new_lines = ring.drain_new();
-                    // Show `[output truncated]` once per truncation: either riding
-                    // along with new output, or on its own when a `Truncated`
-                    // marker (P1) arrives with no accompanying line.
-                    let show_truncated =
-                        ring.is_truncated() && !attach_truncated_shown.contains(&sid);
-                    if !new_lines.is_empty() || show_truncated {
-                        let mut out = String::new();
-                        for l in &new_lines {
-                            out.push_str(l);
-                            if !l.ends_with('\n') {
-                                out.push('\n');
-                            }
-                        }
-                        if show_truncated {
-                            out.push_str("[output truncated]\n");
-                            attach_truncated_shown.insert(sid.clone());
-                        }
-                        let trimmed = out.trim_end();
-                        if !trimmed.is_empty() {
-                            surface_session_message(
-                                &chat_dispatcher,
-                                sessions_redraw_handle.as_ref(),
-                                trimmed,
-                            );
-                        }
-                    }
+                    refresh_attached_session_view_from_ring(
+                        &chat_mirror,
+                        &chat_dispatcher,
+                        sessions_redraw_handle.as_ref(),
+                        &sid,
+                        ring,
+                    );
                 }
                 continue;
             }
@@ -2661,11 +2644,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Attach { seq } => {
-                            // v1.1a `/attach` is a live read-only follow: it
-                            // streams the session's new incremental output + tool
-                            // calls inline to the existing scrollback. It still
-                            // does NOT route input or take over the screen (input
-                            // routing is v1.1b). Stop following with `/detach`.
+                            // P2 `/attach` focuses the child session viewport.
+                            // Main history receives only a breadcrumb; retained
+                            // and live child output render inside ActiveSessionView.
                             //
                             // v5: PTY sessions are interactive terminal handoffs,
                             // not line-streamed output, so a read-only follow makes
@@ -2712,7 +2693,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
                                     "chat.session_focus_attach_pty_done",
                                 );
-                                chat_mirror.lock().focus = prev_focus;
+                                {
+                                    let mut mirror = chat_mirror.lock();
+                                    mirror.focus = prev_focus;
+                                    mirror.active_session_view = None;
+                                }
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+                                    "chat.active_session_view_attach_pty_done",
+                                );
                                 if let Some(tx) = sessions_redraw_handle.as_ref() {
                                     let _ = tx.try_send(());
                                 }
@@ -2722,59 +2711,33 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             match chat_sessions.resolve_run_id(seq).await {
                                 Ok(run_id) => {
                                     let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
-                                    // P2 fix — dedup attach replay. A terminal
-                                    // session's final answer already lives in the
-                                    // registry history (printed as the tail below)
-                                    // *and* was captured in the live ring via
-                                    // `on_delta`. Printing both duplicates it, so
-                                    // for terminal sessions we print only the
-                                    // history tail and skip ring replay. Running
-                                    // sessions still replay the retained ring +
-                                    // live-follow new lines so incremental output
-                                    // remains visible.
                                     let is_terminal = chat_sessions.is_terminal_for_seq(seq).await.unwrap_or(false);
-                                    // Print the historical tail (registry history)
-                                    // once for context, then start the live follow.
-                                    match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
-                                        Ok(lines) if !lines.is_empty() => {
-                                            let mut out =
-                                                format!("Session #{seq} (last {} lines, read-only):\n", lines.len());
-                                            for l in &lines {
-                                                out.push_str(&format!("  [{}] {}\n", l.role, l.content));
-                                            }
-                                            emit_chat_output(out.trim_end());
+                                    let views = chat_sessions.snapshot().await;
+                                    let view_meta = views.iter().find(|view| view.seq == seq);
+                                    let tail_lines = match chat_sessions.tail(seq, ATTACH_TAIL_LINES).await {
+                                        Ok(lines) => lines
+                                            .into_iter()
+                                            .map(|line| format!("[{}] {}", line.role, line.content))
+                                            .collect::<Vec<_>>(),
+                                        Err(e) => {
+                                            emit_chat_output(&format!("Attach tail failed: {e}"));
+                                            Vec::new()
                                         }
-                                        Ok(_) => {}
-                                        Err(e) => emit_chat_output(&format!("Attach tail failed: {e}")),
-                                    }
-                                    // Fresh follow: re-evaluate the one-shot
-                                    // truncation notice for this session.
-                                    attach_truncated_shown.remove(&sid);
-                                    if let Some(ring) = session_rings.get_mut(&sid) {
-                                        if is_terminal {
-                                            // Skip ring replay (would duplicate the
-                                            // history tail); align the drained
-                                            // cursor to the end so a later re-attach
-                                            // does not replay stale lines either.
-                                            let _ = ring.drain_new();
-                                        } else {
-                                            // Running: replay any retained
-                                            // live-stream lines captured before this
-                                            // attach, then follow new ones.
-                                            ring.rewind();
-                                            let retained = ring.drain_new();
-                                            if !retained.is_empty() {
-                                                let mut out = String::new();
-                                                for l in &retained {
-                                                    out.push_str(l);
-                                                    if !l.ends_with('\n') {
-                                                        out.push('\n');
-                                                    }
-                                                }
-                                                emit_chat_output(out.trim_end());
-                                            }
-                                        }
-                                    }
+                                    };
+                                    let (ring_lines, truncated) = session_rings.get(&sid).map_or_else(
+                                        || (Vec::new(), false),
+                                        |ring| {
+                                            let lines = if is_terminal {
+                                                Vec::new()
+                                            } else {
+                                                ring.recent_lines(crate::chat::sessions::event::DEFAULT_RING_CAPACITY)
+                                            };
+                                            (lines, ring.is_truncated())
+                                        },
+                                    );
+                                    #[cfg(feature = "terminal-tui")]
+                                    let active_view =
+                                        build_active_session_view(seq, view_meta, tail_lines, ring_lines, truncated, 0);
                                     attached_follow = Some(sid);
                                     attached_follow_seq = Some(seq);
                                     // v1.1b: route plain input to this session as
@@ -2793,13 +2756,23 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     );
                                     #[cfg(feature = "terminal-tui")]
                                     {
-                                        chat_mirror.lock().focus = focus;
+                                        {
+                                            let mut mirror = chat_mirror.lock();
+                                            mirror.focus = focus;
+                                            mirror.active_session_view = Some(active_view.clone());
+                                        }
+                                        let _ = chat_dispatcher.dispatch_or_log(
+                                            crate::chat::action::Action::ActiveSessionViewUpdated {
+                                                view: Some(active_view),
+                                            },
+                                            "chat.active_session_view_attach",
+                                        );
                                         if let Some(tx) = sessions_redraw_handle.as_ref() {
                                             let _ = tx.try_send(());
                                         }
                                     }
                                     emit_chat_output(&format!(
-                                        "Following session #{seq} (live, routing input as steer). Type /detach or press Esc to stop."
+                                        "Attached session #{seq} (child viewport; input routes as steer). Type /detach or press Esc to stop."
                                     ));
                                 }
                                 Err(e) => {
@@ -2820,7 +2793,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     );
                                     #[cfg(feature = "terminal-tui")]
                                     {
-                                        chat_mirror.lock().focus = prev_focus;
+                                        {
+                                            let mut mirror = chat_mirror.lock();
+                                            mirror.focus = prev_focus;
+                                            mirror.active_session_view = None;
+                                        }
+                                        let _ = chat_dispatcher.dispatch_or_log(
+                                            crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+                                            "chat.active_session_view_attach_rollback",
+                                        );
                                         if let Some(tx) = sessions_redraw_handle.as_ref() {
                                             let _ = tx.try_send(());
                                         }
@@ -2843,7 +2824,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 );
                                 #[cfg(feature = "terminal-tui")]
                                 {
-                                    chat_mirror.lock().focus = focus;
+                                    {
+                                        let mut mirror = chat_mirror.lock();
+                                        mirror.focus = focus;
+                                        mirror.active_session_view = None;
+                                    }
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+                                        "chat.active_session_view_detach",
+                                    );
                                     if let Some(tx) = sessions_redraw_handle.as_ref() {
                                         let _ = tx.try_send(());
                                     }
@@ -4546,6 +4535,83 @@ fn apply_optimistic_focus(
     let _ = redraw_tx.try_send(());
 }
 
+#[cfg(feature = "terminal-tui")]
+fn build_active_session_view(
+    seq: u64,
+    meta: Option<&crate::chat::sessions::model::ManagedSessionView>,
+    tail_lines: Vec<String>,
+    ring_lines: Vec<String>,
+    truncated: bool,
+    scroll_offset: usize,
+) -> crate::chat::sessions::ActiveSessionView {
+    let (kind, title) = meta.map_or_else(
+        || ("session".to_string(), String::new()),
+        |view| (view.kind.as_str().to_string(), view.title.clone()),
+    );
+    let mut lines = Vec::with_capacity(tail_lines.len().saturating_add(ring_lines.len()));
+    lines.extend(tail_lines);
+    lines.extend(ring_lines);
+    crate::chat::sessions::ActiveSessionView {
+        seq,
+        kind,
+        title,
+        lines,
+        truncated,
+        scroll_offset,
+    }
+    .clamped_for_height(usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS))
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_attached_session_view_from_ring(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    _sid: &crate::chat::sessions::id::SessionId,
+    ring: &crate::chat::sessions::SessionRing,
+) {
+    let current = mirror.lock().active_session_view.clone();
+    let Some(mut view) = current else {
+        return;
+    };
+    view.lines = ring.recent_lines(crate::chat::sessions::event::DEFAULT_RING_CAPACITY);
+    view.truncated = ring.is_truncated();
+    view = view.clamped_for_height(usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS));
+    mirror.lock().active_session_view = Some(view.clone());
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
+        "chat.active_session_view_live",
+    );
+    if let Some(tx) = redraw_tx {
+        let _ = tx.try_send(());
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn scroll_active_session_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+    lines: usize,
+    up: bool,
+) {
+    let Some(current) = mirror.lock().active_session_view.clone() else {
+        return;
+    };
+    let visible_rows = usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS);
+    let view = if up {
+        current.scrolled_up(lines, visible_rows)
+    } else {
+        current.scrolled_down(lines).clamped_for_height(visible_rows)
+    };
+    mirror.lock().active_session_view = Some(view.clone());
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
+        "chat.active_session_view_scroll",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
 /// Handle `/pty <command>` (v3a): spawn an interactive PTY shell and hand the
 /// terminal over to it for the duration of an attach.
 ///
@@ -5352,6 +5418,30 @@ fn run_tui_unified_loop(
                         if send_synthetic_command(&input_tx, "/detach").is_err() {
                             return Ok(());
                         }
+                    }
+                    tui::KeyDispatch::ScrollSessionUp => {
+                        scroll_active_session_view(&mirror, chat_dispatcher, &redraw_tx, 1, true);
+                    }
+                    tui::KeyDispatch::ScrollSessionDown => {
+                        scroll_active_session_view(&mirror, chat_dispatcher, &redraw_tx, 1, false);
+                    }
+                    tui::KeyDispatch::PageSessionUp => {
+                        scroll_active_session_view(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS),
+                            true,
+                        );
+                    }
+                    tui::KeyDispatch::PageSessionDown => {
+                        scroll_active_session_view(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS),
+                            false,
+                        );
                     }
                     tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }

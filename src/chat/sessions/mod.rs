@@ -41,7 +41,7 @@ pub mod shell;
 pub use approval::{PendingApprovals, build_resolver_factory};
 pub use command::{SessionCommand, parse_session_command};
 pub use event::{SessionEvent, SessionEventSink, SessionRing};
-pub use focus::{FocusTarget, SwitcherEntry, SwitcherState};
+pub use focus::{ActiveSessionView, FocusTarget, SwitcherEntry, SwitcherState};
 pub use model::PersistedSessionSummary;
 // `FinishedSession` / `TailLine` are returned by `ChatSessionsHandle` methods
 // and reachable as `runtime::{FinishedSession, TailLine}`; not re-exported at

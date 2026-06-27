@@ -646,8 +646,8 @@ fn test_chat_plain_mode_no_ansi() {
         "--plain must bypass TerminalGuard/TUI even when PRX_TUI=1; captured bracketed-paste enable in:\n{captured}"
     );
     assert!(
-        !captured.contains("PRX Chat |") && !captured.contains("Ctrl+G sessions"),
-        "--plain must not render TUI chrome such as the sessions strip/status/footer; captured:\n{captured}"
+        !captured.contains("PRX Chat |") && !captured.contains("Ctrl+G sessions") && !captured.contains("attached #"),
+        "--plain must not render TUI chrome or child viewport headers; captured:\n{captured}"
     );
 
     session.send("/exit\r").expect("send /exit");

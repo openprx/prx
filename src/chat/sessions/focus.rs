@@ -69,6 +69,56 @@ pub struct SwitcherEntry {
     pub title: String,
 }
 
+/// Pure render snapshot for the focused line-oriented child session viewport
+/// (P2). The chat main loop owns the live [`SessionRing`](super::event::SessionRing);
+/// the TUI receives only this bounded, cloneable view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSessionView {
+    /// Display sequence `#N`.
+    pub seq: u64,
+    /// Stable lowercase kind label (`agent` / `shell`).
+    pub kind: String,
+    /// Dynamic task / command title.
+    pub title: String,
+    /// Retained output lines for the viewport.
+    pub lines: Vec<String>,
+    /// Whether retained output was truncated upstream.
+    pub truncated: bool,
+    /// Lines scrolled up from tail. `0` means pinned to newest output.
+    pub scroll_offset: usize,
+}
+
+impl ActiveSessionView {
+    /// Maximum legal scroll offset for a viewport body of `visible_rows` lines.
+    #[must_use]
+    pub const fn max_scroll_offset(&self, visible_rows: usize) -> usize {
+        self.lines.len().saturating_sub(visible_rows)
+    }
+
+    /// Return a copy with scroll offset clamped for the supplied viewport height.
+    #[must_use]
+    pub fn clamped_for_height(mut self, visible_rows: usize) -> Self {
+        let max = self.max_scroll_offset(visible_rows);
+        self.scroll_offset = self.scroll_offset.min(max);
+        self
+    }
+
+    /// Apply an upward scroll from the tail, saturating at the oldest retained line.
+    #[must_use]
+    pub fn scrolled_up(mut self, lines: usize, visible_rows: usize) -> Self {
+        let max = self.max_scroll_offset(visible_rows);
+        self.scroll_offset = self.scroll_offset.saturating_add(lines).min(max);
+        self
+    }
+
+    /// Apply a downward scroll toward the tail. Offset `0` resumes follow-tail.
+    #[must_use]
+    pub const fn scrolled_down(mut self, lines: usize) -> Self {
+        self.scroll_offset = self.scroll_offset.saturating_sub(lines);
+        self
+    }
+}
+
 impl SwitcherEntry {
     /// Build an entry from a chat-side session view.
     #[must_use]
@@ -329,6 +379,41 @@ mod tests {
         ] {
             assert!(SwitcherEntry::from_view(&view(1, st, "x")).is_terminal());
         }
+    }
+
+    #[test]
+    fn active_session_view_scroll_offset_saturates_and_resumes_follow() {
+        let view = ActiveSessionView {
+            seq: 1,
+            kind: "agent".to_string(),
+            title: "task".to_string(),
+            lines: (0..12).map(|i| format!("line {i}")).collect(),
+            truncated: false,
+            scroll_offset: 0,
+        };
+
+        assert_eq!(view.max_scroll_offset(5), 7);
+        let view = view.scrolled_up(3, 5);
+        assert_eq!(view.scroll_offset, 3);
+        let view = view.scrolled_up(99, 5);
+        assert_eq!(view.scroll_offset, 7, "up scroll clamps at oldest retained line");
+        let view = view.scrolled_down(4);
+        assert_eq!(view.scroll_offset, 3);
+        let view = view.scrolled_down(99);
+        assert_eq!(view.scroll_offset, 0, "down scroll saturates back to follow-tail");
+    }
+
+    #[test]
+    fn active_session_view_clamps_when_visible_rows_exceed_lines() {
+        let view = ActiveSessionView {
+            seq: 2,
+            kind: "shell".to_string(),
+            title: "cmd".to_string(),
+            lines: vec!["only".to_string()],
+            truncated: true,
+            scroll_offset: 99,
+        };
+        assert_eq!(view.clamped_for_height(10).scroll_offset, 0);
     }
 
     /// v5: build a typed view to verify the switcher lists all three kinds and

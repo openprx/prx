@@ -112,6 +112,9 @@ pub struct TuiState {
     /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
     /// run async registry queries) when opening the switcher with Ctrl+G.
     pub sessions_cache: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// P2 active line-session viewport snapshot. `None` when main chat or PTY
+    /// handoff owns the visible surface.
+    pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -315,6 +318,14 @@ pub enum KeyDispatch {
     /// session is focused). The key loop sends a synthetic `/detach` through the
     /// input channel so the async main loop performs the detach.
     RequestDetach,
+    /// P2: scroll the focused child-session viewport one line up from tail.
+    ScrollSessionUp,
+    /// P2: scroll the focused child-session viewport one line down toward tail.
+    ScrollSessionDown,
+    /// P2: page the focused child-session viewport up from tail.
+    PageSessionUp,
+    /// P2: page the focused child-session viewport down toward tail.
+    PageSessionDown,
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -393,6 +404,15 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         let synthetic = KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
         let _ = state.handle_input_key(synthetic);
         return KeyDispatch::Consumed;
+    }
+    if state.focus.is_session() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
+        match key.code {
+            KeyCode::Up => return KeyDispatch::ScrollSessionUp,
+            KeyCode::Down => return KeyDispatch::ScrollSessionDown,
+            KeyCode::PageUp => return KeyDispatch::PageSessionUp,
+            KeyCode::PageDown => return KeyDispatch::PageSessionDown,
+            _ => {}
+        }
     }
     // v1.1b: context-aware Esc. The switcher-open case is already handled above
     // (the early return). Here, with no switcher open, `resolve_esc` decides
@@ -999,6 +1019,7 @@ impl TuiState {
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
             sessions_cache: Vec::new(),
+            active_session_view: None,
         }
     }
 
@@ -1590,6 +1611,8 @@ pub trait BottomChromeView {
     fn sessions_status(&self) -> &str;
     /// Structured child-session entries for the always-visible P1 strip.
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
+    /// Focused line-session viewport (P2), if any.
+    fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
     /// target indicator (`main >` vs `agent #N ▸`).
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
@@ -1627,6 +1650,9 @@ impl BottomChromeView for TuiState {
     }
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         &self.sessions_cache
+    }
+    fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
+        self.active_session_view.as_ref()
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -1667,6 +1693,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         self.sessions_entries.as_slice()
     }
+    fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
+        self.active_session_view.as_ref()
+    }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
     }
@@ -1691,6 +1720,11 @@ pub const BOTTOM_CHROME_MAX_HEIGHT: u16 = 24;
 /// the host terminal's scrollback via `insert_before` on the next loop
 /// iteration.
 pub const STREAMING_VISIBLE_ROWS: u16 = 6;
+
+/// Desired body height for the focused line-session viewport (P2). Header is
+/// additional. The actual render height is capped by the available terminal
+/// area so short terminals degrade without overlapping input/footer.
+pub const ACTIVE_SESSION_VIEW_DESIRED_ROWS: u16 = 10;
 
 /// Compute the inline viewport height needed for the current state.
 ///
@@ -1717,7 +1751,12 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let streaming_rows = if state.streaming().is_some() {
+    let active_view_rows = if state.active_session_view().is_some() {
+        ACTIVE_SESSION_VIEW_DESIRED_ROWS.saturating_add(1)
+    } else {
+        0
+    };
+    let streaming_rows = if state.streaming().is_some() && state.active_session_view().is_none() {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -1725,6 +1764,7 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
     let total: u16 = 1u16 // status row
         .saturating_add(sessions_rows) // child-session status row (v1b)
+        .saturating_add(active_view_rows)
         .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1); // footer row
@@ -1744,7 +1784,8 @@ fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let streaming_rows = if state.streaming().is_some() {
+    let active_view_present = state.active_session_view().is_some();
+    let streaming_rows = if state.streaming().is_some() && !active_view_present {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -1804,36 +1845,52 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
 
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let streaming_rows = if state.streaming().is_some() {
+    let active_view_present = state.active_session_view().is_some();
+    let streaming_rows = if state.streaming().is_some() && !active_view_present {
         STREAMING_VISIBLE_ROWS
     } else {
         0
     };
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
 
+    let fixed_rows = 1u16
+        .saturating_add(sessions_rows)
+        .saturating_add(streaming_rows)
+        .saturating_add(input_height)
+        .saturating_add(1);
+    let active_view_rows = if active_view_present {
+        area.height.saturating_sub(fixed_rows)
+    } else {
+        0
+    };
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),              // Status bar
-            Constraint::Length(sessions_rows),  // Child-session status (0 when none)
-            Constraint::Length(streaming_rows), // Streaming preview (0 when idle)
-            Constraint::Length(input_height),   // Input area (dynamic)
-            Constraint::Length(1),              // Footer
+            Constraint::Length(1),                // Status bar
+            Constraint::Length(sessions_rows),    // Child-session status (0 when none)
+            Constraint::Length(active_view_rows), // Focused child-session viewport (P2)
+            Constraint::Length(streaming_rows),   // Streaming preview (0 when idle)
+            Constraint::Length(input_height),     // Input area (dynamic)
+            Constraint::Length(1),                // Footer
         ])
         .split(area);
 
-    // Layout::split always returns exactly 5 chunks here.
+    // Layout::split always returns exactly 6 chunks here.
     #[allow(clippy::indexing_slicing)]
     {
         render_status_bar(frame, chunks[0], state);
         if sessions_rows > 0 {
             render_sessions_status(frame, chunks[1], state);
         }
-        if streaming_rows > 0 {
-            render_streaming_preview(frame, chunks[2], state);
+        if let Some(view) = state.active_session_view() {
+            render_active_session_view(frame, chunks[2], view, state.ascii_fallback());
         }
-        render_input(frame, chunks[3], state);
-        render_footer(frame, chunks[4]);
+        if streaming_rows > 0 {
+            render_streaming_preview(frame, chunks[3], state);
+        }
+        render_input(frame, chunks[4], state);
+        render_footer(frame, chunks[5]);
     }
 }
 
@@ -1964,6 +2021,51 @@ fn render_sessions_strip_line(
     }
     let body = truncate_chars_with_ellipsis(&body, content_width, ascii);
     format!(" {body}")
+}
+
+fn active_session_visible_lines(view: &crate::chat::sessions::ActiveSessionView, visible_rows: usize) -> Vec<String> {
+    if visible_rows == 0 || view.lines.is_empty() {
+        return Vec::new();
+    }
+    let offset = view.scroll_offset.min(view.lines.len().saturating_sub(visible_rows));
+    let end = view.lines.len().saturating_sub(offset).min(view.lines.len());
+    let start = end.saturating_sub(visible_rows);
+    view.lines
+        .get(start..end)
+        .map(|lines| lines.to_vec())
+        .unwrap_or_default()
+}
+
+fn render_active_session_view(
+    frame: &mut Frame,
+    area: Rect,
+    view: &crate::chat::sessions::ActiveSessionView,
+    ascii: bool,
+) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    let max_width = area.width.saturating_sub(1);
+    let marker = if ascii { ">" } else { "\u{25B8}" };
+    let mut header = format!("{marker} attached #{} {} {}", view.seq, view.kind, view.title);
+    if view.truncated {
+        header.push_str(" [output truncated]");
+    }
+    lines.push(Line::from(Span::styled(
+        truncate_chars_with_ellipsis(&header, max_width, ascii),
+        Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
+    )));
+
+    let body_rows = usize::from(area.height.saturating_sub(1));
+    for line in active_session_visible_lines(view, body_rows) {
+        lines.push(Line::from(Span::styled(
+            truncate_chars_with_ellipsis(&line, max_width, ascii),
+            Style::default().fg(Color::White),
+        )));
+    }
+    let widget = Paragraph::new(Text::from(lines)).style(Style::default().bg(Color::Black));
+    frame.render_widget(widget, area);
 }
 
 /// Render the Ctrl+G session switcher popup (v1.1b) inside the reserved bottom
@@ -4492,6 +4594,44 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_session_scroll_keys_only_when_session_focus_and_empty_input() {
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::ScrollSessionUp
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::ScrollSessionDown
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut state),
+            KeyDispatch::PageSessionUp
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageDown), &mut state),
+            KeyDispatch::PageSessionDown
+        );
+
+        state.focus = crate::chat::sessions::FocusTarget::Main;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut state),
+            KeyDispatch::Consumed,
+            "main focus must not route PgUp into child viewport scrolling"
+        );
+
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
+        dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageDown), &mut state),
+            KeyDispatch::Consumed,
+            "non-empty input keeps edit/history semantics instead of child scroll"
+        );
+    }
+
+    #[test]
     fn dispatch_esc_returns_cancelled() {
         let mut state = TuiState::new("p", "m");
         for ch in "draft".chars() {
@@ -4687,6 +4827,84 @@ mod tests {
             "input prompt kept: {rows:?}"
         );
         assert!(rows.iter().any(|r| r.contains("Ctrl+G")), "footer kept: {rows:?}");
+    }
+
+    fn active_view(seq: u64, lines: Vec<String>, scroll_offset: usize) -> crate::chat::sessions::ActiveSessionView {
+        crate::chat::sessions::ActiveSessionView {
+            seq,
+            kind: "agent".to_string(),
+            title: "监控任务执行状态和输出窗口-with-a-long-title".to_string(),
+            lines,
+            truncated: true,
+            scroll_offset,
+        }
+    }
+
+    #[test]
+    fn active_session_visible_lines_follow_tail_and_scroll_slice() {
+        let view = active_view(4, (0..20).map(|i| format!("line {i}")).collect(), 0);
+        assert_eq!(
+            active_session_visible_lines(&view, 3),
+            vec!["line 17".to_string(), "line 18".to_string(), "line 19".to_string()]
+        );
+
+        let scrolled = active_view(4, (0..20).map(|i| format!("line {i}")).collect(), 2);
+        assert_eq!(
+            active_session_visible_lines(&scrolled, 3),
+            vec!["line 15".to_string(), "line 16".to_string(), "line 17".to_string()]
+        );
+    }
+
+    #[test]
+    fn active_session_view_render_keeps_viewport_input_and_footer_separate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("provider", "model");
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 4 };
+        state.active_session_view = Some(active_view(
+            4,
+            vec![
+                "short".to_string(),
+                "包含中文的输出行".to_string(),
+                "a-very-long-line-that-must-be-truncated-before-it-can-overlap-input".to_string(),
+            ],
+            0,
+        ));
+
+        let mut terminal = Terminal::new(TestBackend::new(42, 12)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..42).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..12).map(row).collect();
+
+        assert!(
+            rows.iter().any(|r| r.contains("attached #4")),
+            "viewport header rendered: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|r| ['包', '含', '中', '文'].iter().all(|ch| r.contains(*ch))),
+            "CJK line rendered: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("agent #4")),
+            "input prompt remains visible: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|r| r.contains("Ctrl+G")),
+            "footer remains visible: {rows:?}"
+        );
+        for row in rows {
+            assert!(
+                row.chars().count() <= 42,
+                "rendered row must stay inside terminal width: {row:?}"
+            );
+        }
     }
 
     #[test]
@@ -5349,6 +5567,15 @@ mod tests {
                 title: "non-empty parity session".to_string(),
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
+            let active_view = crate::chat::sessions::ActiveSessionView {
+                seq: 7,
+                kind: "agent".to_string(),
+                title: "non-empty parity session".to_string(),
+                lines: vec!["line a".to_string(), "line b".to_string()],
+                truncated: false,
+                scroll_offset: 1,
+            };
+            state.ui.active_session_view = Some(active_view.clone());
             let snap = state.build_ui_snapshot(5);
 
             let mut tui = TuiState::new(&state.session.provider, &state.session.model);
@@ -5359,6 +5586,7 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
+            tui.active_session_view = Some(active_view);
 
             assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
             assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
@@ -5390,6 +5618,10 @@ mod tests {
             assert_eq!(tui_entry.origin, snap_entry.origin);
             assert_eq!(tui_entry.status, snap_entry.status);
             assert_eq!(tui_entry.title, snap_entry.title);
+            assert_eq!(
+                BottomChromeView::active_session_view(&tui),
+                BottomChromeView::active_session_view(&snap)
+            );
         }
 
         /// Buffer-level parity: 把同一 view 在小 Buffer 上 render，断言两份 buffer 内容一致.
