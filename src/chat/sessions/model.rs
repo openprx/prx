@@ -33,6 +33,8 @@ pub enum ManagedKind {
     Pty,
     /// Read-only conversation transcript viewer (`Ctrl+O`).
     Transcript,
+    /// Foreground tool approval prompt.
+    Approval,
 }
 
 impl ManagedKind {
@@ -44,6 +46,7 @@ impl ManagedKind {
             Self::Shell => "shell",
             Self::Pty => "pty",
             Self::Transcript => "transcript",
+            Self::Approval => "approval",
         }
     }
 }

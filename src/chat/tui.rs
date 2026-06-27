@@ -115,6 +115,9 @@ pub struct TuiState {
     /// P2 active line-session viewport snapshot. `None` when main chat or PTY
     /// handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// P6c1 foreground tool approval prompt. Display-only; approving/denying is
+    /// returned to the dispatcher as `ToolApprovalReceived`.
+    pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
     /// First half of the `Ctrl+X Ctrl+E` external-editor chord.
@@ -345,6 +348,8 @@ pub enum KeyDispatch {
     CloseTranscriptViewer,
     /// P6b2: open the current draft in an external editor.
     ExternalEditorRequested,
+    /// P6c1: resolve the foreground tool approval prompt.
+    ToolApprovalDecision { tool_id: String, approved: bool },
 }
 
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
@@ -501,6 +506,40 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if state.switcher.is_some() {
         return dispatch_switcher_key(key, state);
     }
+    if let Some(pending) = state.pending_tool_approval.clone()
+        && matches!(state.focus, crate::chat::sessions::FocusTarget::Approval)
+    {
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            state.pending_tool_approval = None;
+            state.focus = crate::chat::sessions::FocusTarget::Main;
+            return KeyDispatch::ToolApprovalDecision {
+                tool_id: pending.tool_id,
+                approved: false,
+            };
+        }
+        if key.modifiers == KeyModifiers::NONE {
+            match key.code {
+                KeyCode::Char('y' | 'Y') => {
+                    state.pending_tool_approval = None;
+                    state.focus = crate::chat::sessions::FocusTarget::Main;
+                    return KeyDispatch::ToolApprovalDecision {
+                        tool_id: pending.tool_id,
+                        approved: true,
+                    };
+                }
+                KeyCode::Char('n' | 'N') | KeyCode::Esc => {
+                    state.pending_tool_approval = None;
+                    state.focus = crate::chat::sessions::FocusTarget::Main;
+                    return KeyDispatch::ToolApprovalDecision {
+                        tool_id: pending.tool_id,
+                        approved: false,
+                    };
+                }
+                _ => return KeyDispatch::Consumed,
+            }
+        }
+        return KeyDispatch::Consumed;
+    }
     if state.external_editor_prefix_armed {
         state.external_editor_prefix_armed = false;
         if key.code == KeyCode::Char('e') && key.modifiers == KeyModifiers::CONTROL {
@@ -594,6 +633,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             }
             EscAction::RequestDetach => return KeyDispatch::RequestDetach,
             EscAction::CloseTranscript => return KeyDispatch::CloseTranscriptViewer,
+            EscAction::DenyApproval => return KeyDispatch::Cancelled,
             EscAction::Cancel => {
                 // Empty buffer + main focus → unchanged legacy cancel semantics.
                 let _ = state.handle_input_key(key);
@@ -1371,6 +1411,7 @@ impl TuiState {
             switcher: None,
             sessions_cache: Vec::new(),
             active_session_view: None,
+            pending_tool_approval: None,
             context_window_tokens: None,
             external_editor_prefix_armed: false,
         }
@@ -1966,6 +2007,8 @@ pub trait BottomChromeView {
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
     /// Focused line-session viewport (P2), if any.
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
+    /// Foreground tool approval prompt (P6c1), if any.
+    fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView>;
     /// Effective context window for UI-only status budget display.
     fn context_window_tokens(&self) -> Option<usize>;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
@@ -2008,6 +2051,9 @@ impl BottomChromeView for TuiState {
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
+    }
+    fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView> {
+        self.pending_tool_approval.as_ref()
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
@@ -2053,6 +2099,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
+    }
+    fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView> {
+        self.pending_tool_approval.as_ref()
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
@@ -2112,12 +2161,13 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let active_view_rows = if state.active_session_view().is_some() {
+    let child_view_rows = if state.pending_tool_approval().is_some() || state.active_session_view().is_some() {
         ACTIVE_SESSION_VIEW_DESIRED_ROWS.saturating_add(1)
     } else {
         0
     };
-    let streaming_rows = if state.streaming().is_some() && state.active_session_view().is_none() {
+    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
+    let streaming_rows = if state.streaming().is_some() && !child_view_present {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -2125,7 +2175,7 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
     let total: u16 = 1u16 // status row
         .saturating_add(sessions_rows) // child-session status row (v1b)
-        .saturating_add(active_view_rows)
+        .saturating_add(child_view_rows)
         .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1); // footer row
@@ -2145,8 +2195,8 @@ fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let active_view_present = state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !active_view_present {
+    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
+    let streaming_rows = if state.streaming().is_some() && !child_view_present {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -2206,8 +2256,8 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
 
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let active_view_present = state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !active_view_present {
+    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
+    let streaming_rows = if state.streaming().is_some() && !child_view_present {
         STREAMING_VISIBLE_ROWS
     } else {
         0
@@ -2219,7 +2269,7 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
         .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1);
-    let active_view_rows = if active_view_present {
+    let child_view_rows = if child_view_present {
         area.height.saturating_sub(fixed_rows)
     } else {
         0
@@ -2228,12 +2278,12 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                // Status bar
-            Constraint::Length(sessions_rows),    // Child-session status (0 when none)
-            Constraint::Length(active_view_rows), // Focused child-session viewport (P2)
-            Constraint::Length(streaming_rows),   // Streaming preview (0 when idle)
-            Constraint::Length(input_height),     // Input area (dynamic)
-            Constraint::Length(1),                // Footer
+            Constraint::Length(1),               // Status bar
+            Constraint::Length(sessions_rows),   // Child-session status (0 when none)
+            Constraint::Length(child_view_rows), // Focused child viewport (P2/P6c1)
+            Constraint::Length(streaming_rows),  // Streaming preview (0 when idle)
+            Constraint::Length(input_height),    // Input area (dynamic)
+            Constraint::Length(1),               // Footer
         ])
         .split(area);
 
@@ -2244,7 +2294,9 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
         if sessions_rows > 0 {
             render_sessions_status(frame, chunks[1], state);
         }
-        if let Some(view) = state.active_session_view() {
+        if let Some(approval) = state.pending_tool_approval() {
+            render_approval(frame, chunks[2], &approval.name, &approval.args, state.ascii_fallback());
+        } else if let Some(view) = state.active_session_view() {
             render_active_session_view(frame, chunks[2], view, state.ascii_fallback());
         }
         if streaming_rows > 0 {
@@ -3288,6 +3340,13 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
             let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
             (span, width)
         }
+        crate::chat::sessions::FocusTarget::Approval => {
+            let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
+            let label = format!("approval {arrow} ");
+            let width = label.chars().count();
+            let span = Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+            (span, width)
+        }
     }
 }
 
@@ -3369,11 +3428,15 @@ fn render_footer(frame: &mut Frame, area: Rect) {
 }
 
 /// Render a tool approval prompt.
-pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &str) {
+pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &str, ascii: bool) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let marker = if ascii { ">" } else { "\u{25B8}" };
     let approval_text = vec![
         Line::from(vec![
             Span::styled(
-                "Tool: ",
+                format!("{marker} Tool: "),
                 Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
             ),
             Span::raw(tool_name),
@@ -3388,8 +3451,8 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
             Span::raw(" approve  "),
             Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw(" deny  "),
-            Span::styled("[a]", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(" always"),
+            Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" deny"),
         ]),
     ];
 
@@ -3398,7 +3461,7 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
         .title(" Tool Approval ")
         .border_style(Style::default().fg(Color::Yellow));
 
-    let paragraph = Paragraph::new(approval_text).block(block);
+    let paragraph = Paragraph::new(approval_text).block(block).wrap(Wrap { trim: false });
     frame.render_widget(paragraph, area);
 }
 
@@ -5053,6 +5116,64 @@ mod tests {
         assert!(!state.external_editor_prefix_armed, "non-E chord tail clears latch");
     }
 
+    fn approval_state() -> TuiState {
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Approval;
+        state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            tool_id: "call-1".to_string(),
+            name: "shell".to_string(),
+            args: r#"{"cmd":"echo hi"}"#.to_string(),
+        });
+        state
+    }
+
+    #[test]
+    fn approval_child_y_sends_tool_approval_received_true() {
+        let mut state = approval_state();
+        let out = dispatch_global_key(key(KeyCode::Char('y')), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: true
+            }
+        );
+        assert!(state.pending_tool_approval.is_none());
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+    }
+
+    #[test]
+    fn approval_child_n_or_esc_sends_tool_approval_received_false() {
+        for key_event in [key(KeyCode::Char('n')), key(KeyCode::Esc)] {
+            let mut state = approval_state();
+            let out = dispatch_global_key(key_event, &mut state);
+            assert_eq!(
+                out,
+                KeyDispatch::ToolApprovalDecision {
+                    tool_id: "call-1".to_string(),
+                    approved: false
+                }
+            );
+            assert!(state.pending_tool_approval.is_none());
+            assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+        }
+    }
+
+    #[test]
+    fn approval_child_text_enter_does_not_submit_or_steer() {
+        for key_event in [key(KeyCode::Char('x')), key(KeyCode::Enter)] {
+            let mut state = approval_state();
+            let out = dispatch_global_key(key_event, &mut state);
+            assert_eq!(out, KeyDispatch::Consumed);
+            assert!(state.input.is_empty(), "approval focus must not edit the main input");
+            assert!(
+                state.pending_tool_approval.is_some(),
+                "text/Enter must not close approval"
+            );
+            assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+        }
+    }
+
     #[test]
     fn dispatch_ctrl_o_opens_transcript_viewer_without_input_leak() {
         let mut state = TuiState::new("p", "m");
@@ -6419,9 +6540,37 @@ mod tests {
                 BottomChromeView::active_session_view(&snap)
             );
             assert_eq!(
+                BottomChromeView::pending_tool_approval(&tui),
+                BottomChromeView::pending_tool_approval(&snap)
+            );
+            assert_eq!(
                 BottomChromeView::context_window_tokens(&tui),
                 BottomChromeView::context_window_tokens(&snap)
             );
+        }
+
+        #[test]
+        fn s4_a_2_pending_tool_approval_parity() {
+            let mut state = make_state_with_lines();
+            let pending = crate::chat::sessions::PendingToolApprovalView {
+                tool_id: "call-approval".to_string(),
+                name: "shell".to_string(),
+                args: r#"{"cmd":"rm -rf /tmp/nope"}"#.to_string(),
+            };
+            state.ui.pending_tool_approval = Some(pending.clone());
+            state.ui.focus = crate::chat::sessions::FocusTarget::Approval;
+            let snap = state.build_ui_snapshot(11);
+
+            let mut tui = TuiState::new(&state.session.provider, &state.session.model);
+            tui.pending_tool_approval = Some(pending);
+            tui.focus = crate::chat::sessions::FocusTarget::Approval;
+
+            assert_eq!(
+                BottomChromeView::pending_tool_approval(&tui),
+                BottomChromeView::pending_tool_approval(&snap)
+            );
+            assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
+            assert_eq!(bottom_chrome_height(&tui), bottom_chrome_height(&snap));
         }
 
         #[test]

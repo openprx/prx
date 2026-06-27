@@ -523,6 +523,10 @@ pub struct EffectDeps {
     /// 渲染重绘 channel（RequestRedraw 唤醒主循环）
     /// 用 mpsc::Sender<()> 而非 broadcast，因为我们只需要"踢一下"主循环
     pub redraw_tx: Option<mpsc::Sender<()>>,
+    /// TUI mirror used only to surface foreground approval prompts on the
+    /// interactive terminal path. The ApprovalRouter remains the execution gate.
+    #[cfg(feature = "terminal-tui")]
+    pub tui_mirror: Option<Arc<ParkingMutex<crate::chat::tui::TuiState>>>,
     /// 关停信号（Effect::Quit 触发）
     pub shutdown: CancellationToken,
     /// Step 5a-4 (Codex P1)：当前 LLM model name，drive_start_turn_stream 用此
@@ -905,6 +909,47 @@ impl EffectExecutor {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
             Effect::RequestApproval { tool_id, name, args } => {
+                let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
+                #[cfg(feature = "terminal-tui")]
+                if interactive_tui {
+                    if let Some(mirror) = deps.tui_mirror.as_ref() {
+                        {
+                            let mut state = mirror.lock();
+                            state.pending_tool_approval =
+                                Some(crate::chat::sessions::PendingToolApprovalView { tool_id, name, args });
+                            state.focus = crate::chat::sessions::FocusTarget::Approval;
+                            state.switcher = None;
+                        }
+                        let tx = {
+                            let slot_guard = self.redraw_slot.lock();
+                            slot_guard.as_ref().or(deps.redraw_tx.as_ref()).cloned()
+                        };
+                        if let Some(tx) = tx {
+                            let _ = tx.try_send(());
+                        }
+                        tracing::info!("RequestApproval effect: foreground approval TUI surfaced");
+                        return;
+                    }
+                    tracing::warn!(
+                        tool_id = %tool_id,
+                        name = %name,
+                        args_len = args.len(),
+                        "RequestApproval effect: TUI active but no approval surface, failing closed"
+                    );
+                    let action_tx = deps.action_tx.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = action_tx
+                            .send(Action::ToolApprovalReceived {
+                                tool_id,
+                                approved: false,
+                            })
+                            .await
+                        {
+                            tracing::debug!(error = %e, "RequestApproval fail-closed: action_tx closed");
+                        }
+                    });
+                    return;
+                }
                 let env_value = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok();
                 let approved = resolve_supervised_approval_override(env_value.as_deref());
                 if env_value.is_none() {
@@ -912,7 +957,7 @@ impl EffectExecutor {
                         tool_id = %tool_id,
                         name = %name,
                         args_len = args.len(),
-                        "supervised approval UI 未接通，默认拒绝。设置 OPENPRX_APPROVAL_OVERRIDE=allow 显式放行"
+                        "RequestApproval effect: non-TUI approval has no override, failing closed"
                     );
                 } else {
                     tracing::info!(
@@ -920,7 +965,7 @@ impl EffectExecutor {
                         name = %name,
                         args_len = args.len(),
                         approved,
-                        "RequestApproval effect (stub): OPENPRX_APPROVAL_OVERRIDE applied"
+                        "RequestApproval effect: non-TUI OPENPRX_APPROVAL_OVERRIDE applied"
                     );
                 }
                 let _ = args;
@@ -3488,6 +3533,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard,
             redraw_tx: Some(redraw_tx),
+            tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
@@ -3878,6 +3924,7 @@ mod real_mode_tests {
                 action_tx,
                 dual_write_guard: RuntimeDualWriteGuard::new(),
                 redraw_tx: Some(redraw_tx),
+                tui_mirror: None,
                 shutdown: shutdown.clone(),
                 model: ModelSlot::from("test-model"),
                 temperature: 0.0,
@@ -3944,6 +3991,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            tui_mirror: None,
             shutdown: shutdown.clone(),
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
@@ -3961,6 +4009,40 @@ mod real_mode_tests {
                 .is_some(),
             "RequestRedraw should ping the redraw channel"
         );
+    }
+
+    #[tokio::test]
+    async fn request_approval_in_tui_opens_surface_without_auto_send() {
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let mirror = Arc::new(ParkingMutex::new(crate::chat::tui::TuiState::new("p", "m")));
+        deps.tui_mirror = Some(Arc::clone(&mirror));
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::RequestApproval {
+                tool_id: "call-tui".to_string(),
+                name: "shell".to_string(),
+                args: r#"{"cmd":"echo secure"}"#.to_string(),
+            })
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), action_rx.recv())
+                .await
+                .is_err(),
+            "TUI RequestApproval must not auto-send ToolApprovalReceived"
+        );
+        let state = mirror.lock();
+        let pending = state
+            .pending_tool_approval
+            .as_ref()
+            .expect("approval surface should be visible");
+        assert_eq!(pending.tool_id, "call-tui");
+        assert_eq!(pending.name, "shell");
+        assert!(pending.args.contains("echo secure"));
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
     }
 
     #[tokio::test]
@@ -4582,6 +4664,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
@@ -4729,6 +4812,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
@@ -4880,6 +4964,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: None, // 模拟构造时 redraw_tx 尚不存在
+            tui_mirror: None,
             shutdown: shutdown.clone(),
             model: ModelSlot::from("test-model"),
             temperature: 0.0,
@@ -7451,12 +7536,17 @@ mod real_mode_tests {
         let mut history = Vec::new();
 
         let router_handle = Arc::clone(&approval_router);
+        let executed_before_approval = Arc::clone(&executed);
         let resolver = tokio::spawn(async move {
             let action = action_rx.recv().await.expect("approval request action");
             match action {
                 Action::ToolApprovalRequested { tool_id, name, .. } => {
                     assert_eq!(tool_id, "call-danger");
                     assert_eq!(name, "danger");
+                    assert!(
+                        !executed_before_approval.load(AtomicOrdering::SeqCst),
+                        "tool must not execute before approval is resolved"
+                    );
                     assert!(router_handle.resolve(&tool_id, true));
                 }
                 other => panic!("expected approval request, got {other:?}"),
@@ -7804,6 +7894,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
             temperature: 0.0,

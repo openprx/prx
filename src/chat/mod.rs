@@ -627,6 +627,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
         tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
+        tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -677,7 +678,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitchSession { .. }
         | tui::KeyDispatch::OpenTranscriptViewer
         | tui::KeyDispatch::CloseTranscriptViewer
-        | tui::KeyDispatch::ExternalEditorRequested => new_has_quit,
+        | tui::KeyDispatch::ExternalEditorRequested
+        | tui::KeyDispatch::ToolApprovalDecision { .. } => new_has_quit,
     };
 
     if is_diff {
@@ -1529,6 +1531,7 @@ pub async fn run(
             action_tx: chat_dispatcher.sender(),
             dual_write_guard: dual_write_guard.clone(),
             redraw_tx: None,
+            tui_mirror: Some(Arc::clone(&chat_mirror)),
             shutdown: shutdown.clone(),
             model: dispatcher::ModelSlot::new(Arc::from(model_name)),
             temperature,
@@ -2600,6 +2603,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
                                 Ok(crate::chat::sessions::model::ManagedKind::Transcript) => {
                                     emit_chat_output("Transcript is a read-only viewer, not a killable child session.");
+                                    continue;
+                                }
+                                Ok(crate::chat::sessions::model::ManagedKind::Approval) => {
+                                    emit_chat_output(
+                                        "Tool approval is a foreground prompt, not a killable child session.",
+                                    );
                                     continue;
                                 }
                                 Err(e) => {
@@ -5655,6 +5664,16 @@ fn run_tui_unified_loop(
                     text.push(ch);
                     drain_plain_character_burst(&mut text, &mut pending_events)?;
                     if text.len() > 1 {
+                        let approval_active = {
+                            let mirror_guard = mirror.lock();
+                            mirror_guard.pending_tool_approval.is_some()
+                                || matches!(mirror_guard.focus, crate::chat::sessions::FocusTarget::Approval)
+                        };
+                        if approval_active {
+                            let _ = redraw_tx.try_send(());
+                            skip_next_draw = true;
+                            continue;
+                        }
                         let _ =
                             chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_key_burst");
                         mirror.lock().input.paste(&text);
@@ -5848,6 +5867,13 @@ fn run_tui_unified_loop(
                             }
                         }
                     }
+                    tui::KeyDispatch::ToolApprovalDecision { tool_id, approved } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::ToolApprovalReceived { tool_id, approved },
+                            "chat.tool_approval_decision",
+                        );
+                        let _ = redraw_tx.try_send(());
+                    }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
                         // synthetic `/detach` so the main loop clears
@@ -5902,6 +5928,15 @@ fn run_tui_unified_loop(
                 // it, IME commit strings are shredded into per-byte
                 // KeyEvents with random modifier bits that
                 // `dispatch_global_key` filters out.
+                let approval_active = {
+                    let mirror_guard = mirror.lock();
+                    mirror_guard.pending_tool_approval.is_some()
+                        || matches!(mirror_guard.focus, crate::chat::sessions::FocusTarget::Approval)
+                };
+                if approval_active {
+                    let _ = redraw_tx.try_send(());
+                    continue;
+                }
                 let _ = chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_paste");
                 mirror.lock().input.paste(&text);
                 // Paste mutates `input.lines` directly so the chrome must

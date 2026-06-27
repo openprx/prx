@@ -36,6 +36,9 @@ pub enum FocusTarget {
     /// Read-only conversation transcript viewer. It reuses the child viewport but
     /// never routes submitted text as a steer to a managed session.
     Transcript,
+    /// Foreground tool approval prompt. It is a child TUI surface but never a
+    /// steerable managed session.
+    Approval,
 }
 
 impl FocusTarget {
@@ -48,17 +51,29 @@ impl FocusTarget {
     /// Whether any child viewport is currently focused.
     #[must_use]
     pub const fn is_child_view(self) -> bool {
-        matches!(self, Self::Session { .. } | Self::Transcript)
+        matches!(self, Self::Session { .. } | Self::Transcript | Self::Approval)
     }
 
     /// The focused session's display sequence `#N`, if any.
     #[must_use]
     pub const fn session_seq(self) -> Option<u64> {
         match self {
-            Self::Main | Self::Transcript => None,
+            Self::Main | Self::Transcript | Self::Approval => None,
             Self::Session { seq } => Some(seq),
         }
     }
+}
+
+/// Display-only foreground tool approval request.
+///
+/// The actual execution gate remains [`crate::chat::dispatcher::ApprovalRouter`].
+/// This view exists only so the TUI can show the pending request and route a
+/// human decision back as `Action::ToolApprovalReceived`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingToolApprovalView {
+    pub tool_id: String,
+    pub name: String,
+    pub args: String,
 }
 
 /// One row in the Ctrl+G session switcher. A plain display snapshot (no async,
@@ -293,6 +308,8 @@ pub enum EscAction {
     RequestDetach,
     /// Input is empty and the read-only transcript viewer is focused → close it.
     CloseTranscript,
+    /// Input is empty and a foreground tool approval is focused → deny it.
+    DenyApproval,
     /// Input is empty and focus is main → the existing cancel semantics.
     Cancel,
 }
@@ -305,7 +322,8 @@ pub enum EscAction {
 /// 2. Input non-empty → clear input (muscle memory preserved).
 /// 3. Input empty + session focused → detach.
 /// 4. Input empty + transcript focused → close transcript.
-/// 5. Input empty + main focus → cancel (unchanged legacy behaviour).
+/// 5. Input empty + approval focused → deny the pending tool.
+/// 6. Input empty + main focus → cancel (unchanged legacy behaviour).
 #[must_use]
 pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool) -> EscAction {
     if switcher_open {
@@ -317,6 +335,7 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     match focus {
         FocusTarget::Session { .. } => return EscAction::RequestDetach,
         FocusTarget::Transcript => return EscAction::CloseTranscript,
+        FocusTarget::Approval => return EscAction::DenyApproval,
         FocusTarget::Main => {}
     }
     EscAction::Cancel

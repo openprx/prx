@@ -187,6 +187,9 @@ pub fn steer_unsupported_message(kind: super::model::ManagedKind, seq: u64) -> O
             "Steer is not supported for the read-only transcript viewer. Close it with Esc to return to main chat."
                 .to_string(),
         ),
+        ManagedKind::Approval => Some(
+            "Steer is not supported for the foreground tool approval prompt. Decide with y, n, or Esc.".to_string(),
+        ),
     }
 }
 

@@ -236,6 +236,9 @@ pub struct UiState {
     /// P2 active line-session viewport snapshot. `None` when the main chat or a
     /// PTY handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// P6c1 foreground tool approval prompt. Display-only; the dispatcher
+    /// ApprovalRouter remains the single execution gate.
+    pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
     /// Effective context window used by status bar budget display. This is a
     /// UI hint denominator only; P5 owns hard tokenizer budgeting.
     pub context_window_tokens: Option<usize>,
@@ -289,6 +292,8 @@ pub struct UiSnapshot {
     pub sessions_entries: Arc<Vec<crate::chat::sessions::SwitcherEntry>>,
     /// P2 active line-session viewport snapshot.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
+    /// P6c1 foreground tool approval prompt.
+    pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
     /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
@@ -317,6 +322,7 @@ impl UiSnapshot {
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
             active_session_view: None,
+            pending_tool_approval: None,
             context_window_tokens: None,
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
@@ -400,6 +406,7 @@ impl ChatState {
                 sessions_status: String::new(),
                 sessions_entries: Vec::new(),
                 active_session_view: None,
+                pending_tool_approval: None,
                 context_window_tokens: None,
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
@@ -465,6 +472,7 @@ impl ChatState {
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
             active_session_view: self.ui.active_session_view.clone(),
+            pending_tool_approval: self.ui.pending_tool_approval.clone(),
             context_window_tokens: self.ui.context_window_tokens,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
@@ -510,7 +518,18 @@ impl ChatState {
     /// 内容字节级变化敏感（如 streaming chunk 累积）— streaming 的内容变化由
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
-    fn snapshot_dirty_fields(&self) -> (usize, u64, bool, u64, usize, Option<usize>) {
+    fn snapshot_dirty_fields(
+        &self,
+    ) -> (
+        usize,
+        u64,
+        bool,
+        u64,
+        usize,
+        Option<usize>,
+        bool,
+        crate::chat::sessions::FocusTarget,
+    ) {
         let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
         (
             self.ui.conversation_lines.len(),
@@ -519,6 +538,8 @@ impl ChatState {
             draft_ver,
             self.ui.input.lines.len(),
             self.ui.context_window_tokens,
+            self.ui.pending_tool_approval.is_some(),
+            self.ui.focus,
         )
     }
 
@@ -680,6 +701,12 @@ impl ChatState {
     fn reduce_key_pressed(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) -> Vec<Effect> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        if self.ui.pending_tool_approval.is_some()
+            || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
+        {
+            return vec![Effect::RequestRedraw];
+        }
+
         // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
         // BUG-01: 旧实现只切 ToolResult，导致 thinking/Reasoning 卡按 Tab 永不展开
         // （折叠提示却写着 "press Tab to expand"）。与 tui::toggle_last_foldable_card
@@ -743,6 +770,11 @@ impl ChatState {
     /// 处理括号粘贴：将文本插入到 input buffer.
     #[cfg(feature = "terminal-tui")]
     fn reduce_paste_received(&mut self, text: &str) -> Vec<Effect> {
+        if self.ui.pending_tool_approval.is_some()
+            || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
+        {
+            return vec![Effect::RequestRedraw];
+        }
         self.ui.input.paste(text);
         vec![Effect::RequestRedraw]
     }
@@ -1376,14 +1408,22 @@ impl ChatState {
         ]
     }
 
-    /// **S3 T3-1**: `Action::ToolApprovalRequested` — 仅产生 `Effect::RequestApproval`.
+    /// **S3 T3-1**: `Action::ToolApprovalRequested` — records the foreground
+    /// approval view and asks the EffectExecutor to surface it.
     ///
     /// driver 在 supervised autonomy 模式下，**先于** ToolStarted 发送该 Action，
     /// 让 reducer 把请求转给 EffectExecutor / UI；driver 自己通过 oneshot rx
     /// 等响应（dispatcher 把 `ToolApprovalReceived` 转写到 driver 的接收 channel）。
-    /// reducer 不维护 pending_approvals — driver 是单一拥有者。
-    fn reduce_tool_approval_requested(&self, tool_id: String, name: String, args: String) -> Vec<Effect> {
-        let _ = &self.ui;
+    /// reducer only owns display state. The driver/router remains the single
+    /// approval owner and execution gate.
+    fn reduce_tool_approval_requested(&mut self, tool_id: String, name: String, args: String) -> Vec<Effect> {
+        self.ui.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            tool_id: tool_id.clone(),
+            name: name.clone(),
+            args: args.clone(),
+        });
+        self.ui.focus = crate::chat::sessions::FocusTarget::Approval;
+        self.ui.switcher = None;
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -1393,14 +1433,28 @@ impl ChatState {
         ]
     }
 
-    /// **S3 T3-1**: `Action::ToolApprovalReceived` — driver 收到 approval 决策后通过
-    /// 反向 mpsc 走 dispatcher 路径转回 driver；reducer 端仅做 trace 记账.
-    fn reduce_tool_approval_received(&self, tool_id: &str, approved: bool) -> Vec<Effect> {
-        let _ = &self.ui;
-        vec![Effect::LogTrace {
-            level: tracing::Level::DEBUG,
-            msg: format!("tool_approval_received tool_id={tool_id} approved={approved}"),
-        }]
+    /// **S3 T3-1**: `Action::ToolApprovalReceived` — clear the display prompt
+    /// after a human/non-TUI decision. The dispatcher resolves the router after
+    /// this reducer step.
+    fn reduce_tool_approval_received(&mut self, tool_id: &str, approved: bool) -> Vec<Effect> {
+        if self
+            .ui
+            .pending_tool_approval
+            .as_ref()
+            .is_some_and(|view| view.tool_id == tool_id)
+        {
+            self.ui.pending_tool_approval = None;
+            if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+                self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+            }
+        }
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: format!("tool_approval_received tool_id={tool_id} approved={approved}"),
+            },
+            Effect::RequestRedraw,
+        ]
     }
 
     /// **S3 T3-1**: `Action::StreamRetryAttempt` — 网络重试尝试，仅 trace + 重绘.
@@ -2048,10 +2102,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolStarted { .. }
         | Action::ToolFinished { .. } => true,
         // 仅 LogTrace，不变 UI
-        Action::ToolProgress { .. }
-        | Action::ToolApprovalRequested { .. }
-        | Action::ToolApprovalReceived { .. }
-        | Action::StreamRetryAttempt { .. } => false,
+        Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } => false,
+        // Foreground approval writes pending view + focus.
+        Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } => true,
 
         // 会话：SessionLoaded 重建 history + 可能要求 UI 重置；SessionSaved/Switched 不影响 UI
         Action::SessionLoaded(_) => true,
@@ -2345,6 +2398,66 @@ mod tests {
         // Closing again is a no-op.
         let effects = state.reduce(Action::SwitcherClosed);
         assert!(effects.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn tool_approval_requested_opens_approval_child_view() {
+        let mut state = make_state();
+        let effects = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-approve".to_string(),
+            name: "shell".to_string(),
+            args: r#"{"cmd":"printf secure"}"#.to_string(),
+        });
+        assert!(state.ui.pending_tool_approval.is_some());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Approval);
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RequestApproval { .. }))
+        );
+
+        let snap = state.build_ui_snapshot(1);
+        let pending = snap
+            .pending_tool_approval
+            .as_ref()
+            .expect("pending approval in snapshot");
+        assert_eq!(pending.tool_id, "call-approve");
+        assert_eq!(pending.name, "shell");
+        assert!(pending.args.contains("printf secure"));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn tool_approval_received_closes_approval_child_view() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-deny".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+        let effects = state.reduce(Action::ToolApprovalReceived {
+            tool_id: "call-deny".to_string(),
+            approved: false,
+        });
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn tool_approval_focus_paste_does_not_edit_input() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-paste".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+        let effects = state.reduce(Action::PasteReceived("must not enter input".to_string()));
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+        assert!(state.ui.input.is_empty());
+        assert!(state.ui.pending_tool_approval.is_some());
     }
 
     /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）
