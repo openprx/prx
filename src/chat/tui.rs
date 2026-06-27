@@ -5341,6 +5341,14 @@ mod tests {
         #[test]
         fn s4_a_2_view_getters_parity() {
             let mut state = make_state_with_lines();
+            let session_entry = crate::chat::sessions::SwitcherEntry {
+                seq: 7,
+                kind: "agent",
+                origin: "model",
+                status: "running",
+                title: "non-empty parity session".to_string(),
+            };
+            state.ui.sessions_entries = vec![session_entry.clone()];
             let snap = state.build_ui_snapshot(5);
 
             let mut tui = TuiState::new(&state.session.provider, &state.session.model);
@@ -5350,6 +5358,7 @@ mod tests {
             tui.conversation_lines = state.ui.conversation_lines.clone();
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
+            tui.sessions_cache = vec![session_entry];
 
             assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
             assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
@@ -5370,6 +5379,17 @@ mod tests {
                 BottomChromeView::sessions_entries(&tui).len(),
                 BottomChromeView::sessions_entries(&snap).len()
             );
+            let [tui_entry] = BottomChromeView::sessions_entries(&tui) else {
+                panic!("TuiState fixture should expose exactly one session entry");
+            };
+            let [snap_entry] = BottomChromeView::sessions_entries(&snap) else {
+                panic!("UiSnapshot fixture should expose exactly one session entry");
+            };
+            assert_eq!(tui_entry.seq, snap_entry.seq);
+            assert_eq!(tui_entry.kind, snap_entry.kind);
+            assert_eq!(tui_entry.origin, snap_entry.origin);
+            assert_eq!(tui_entry.status, snap_entry.status);
+            assert_eq!(tui_entry.title, snap_entry.title);
         }
 
         /// Buffer-level parity: 把同一 view 在小 Buffer 上 render，断言两份 buffer 内容一致.
