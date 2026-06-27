@@ -932,7 +932,7 @@ max_history_messages = 300
 
 [agent.compaction]
 mode = "safeguard"                     # off | safeguard | aggressive
-max_context_tokens = 100000
+# max_context_tokens = 128000          # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
 enabled = true
@@ -962,7 +962,7 @@ max_history_messages = 300
 # Context compaction to manage long conversations.
 [agent.compaction]
 mode = "safeguard"                    # off | safeguard | aggressive
-max_context_tokens = 100000
+# max_context_tokens = 128000         # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
 enabled = true
@@ -1425,6 +1425,36 @@ mod tests {
                     spec.name()
                 )
             });
+        }
+    }
+
+    #[test]
+    fn generated_server_full_templates_do_not_pin_compaction_context() {
+        for spec in [Spec::Server, Spec::Full] {
+            let tmp = tempfile::tempdir().expect("test: create tempdir");
+            let dir = tmp.path();
+            spec.generate(dir, false)
+                .unwrap_or_else(|e| panic!("test: generate {}: {e}", spec.name()));
+
+            let agent = fs::read_to_string(dir.join("config.d/agent.toml")).expect("test: read agent template");
+            assert!(
+                !agent.lines().any(|line| {
+                    let trimmed = line.trim_start();
+                    trimmed.starts_with("max_context_tokens") && !trimmed.starts_with('#')
+                }),
+                "{} template must not explicitly override model-derived context",
+                spec.name()
+            );
+
+            let config_path = dir.join("config.toml");
+            let workspace_dir = dir.join("workspace");
+            let loaded = crate::config::Config::load_from_path(&config_path, workspace_dir)
+                .unwrap_or_else(|e| panic!("test: generated `{}` template must load: {e:#}", spec.name()));
+            assert!(
+                !loaded.agent.compaction.max_context_tokens_explicit,
+                "{} template must leave compaction context model-derived",
+                spec.name()
+            );
         }
     }
 

@@ -1,5 +1,11 @@
 use crate::config::RouterModelConfig;
 
+const MODERN_LONG_CONTEXT_TOKENS: usize = 1_000_000;
+const ANTHROPIC_HAIKU_CONTEXT_TOKENS: usize = 200_000;
+const GPT_4O_CONTEXT_TOKENS: usize = 128_000;
+const AGGREGATOR_STANDARD_CONTEXT_TOKENS: usize = 128_000;
+const LEGACY_LOCAL_CONTEXT_TOKENS: usize = 32_000;
+
 fn model(
     provider: &str,
     model_id: &str,
@@ -25,7 +31,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "anthropic",
             "claude-opus-4-6",
             15.0,
-            200_000,
+            MODERN_LONG_CONTEXT_TOKENS,
             3_000,
             &["conversation", "analysis", "long_doc", "code"],
         ),
@@ -33,7 +39,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "anthropic",
             "claude-sonnet-4-6",
             3.0,
-            200_000,
+            MODERN_LONG_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "code", "summary"],
         ),
@@ -41,7 +47,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "anthropic",
             "claude-haiku-3",
             0.25,
-            200_000,
+            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
             800,
             &["conversation", "summary", "translation"],
         ),
@@ -49,7 +55,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openai-codex",
             "gpt-code5.3",
             2.0,
-            128_000,
+            GPT_4O_CONTEXT_TOKENS,
             1_500,
             &["code", "debug", "refactor", "analysis"],
         ),
@@ -57,7 +63,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openai",
             "gpt-4o",
             5.0,
-            128_000,
+            GPT_4O_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "code"],
         ),
@@ -65,7 +71,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openai",
             "gpt-4o-mini",
             0.15,
-            128_000,
+            GPT_4O_CONTEXT_TOKENS,
             800,
             &["conversation", "summary", "translation"],
         ),
@@ -73,7 +79,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "moonshotai/kimi-k2.5",
             0.6,
-            128_000,
+            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "long_doc"],
         ),
@@ -81,7 +87,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "qwen/qwen3.5-plus",
             0.5,
-            128_000,
+            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
             1_500,
             &["conversation", "code", "summary"],
         ),
@@ -89,7 +95,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "thudm/glm-5",
             0.3,
-            128_000,
+            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
             1_500,
             &["conversation", "summary", "translation"],
         ),
@@ -97,7 +103,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "google/gemini-3-flash",
             0.1,
-            1_000_000,
+            MODERN_LONG_CONTEXT_TOKENS,
             1_000,
             &["conversation", "summary", "long_doc"],
         ),
@@ -105,7 +111,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "openrouter",
             "x-ai/grok-4.1-fast",
             1.0,
-            128_000,
+            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
             1_200,
             &["conversation", "analysis", "code"],
         ),
@@ -113,7 +119,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "xai",
             "grok-3",
             3.0,
-            128_000,
+            AGGREGATOR_STANDARD_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "code"],
         ),
@@ -121,7 +127,7 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "gemini",
             "gemini-2.5-pro",
             1.25,
-            1_000_000,
+            MODERN_LONG_CONTEXT_TOKENS,
             2_000,
             &["conversation", "analysis", "long_doc", "code"],
         ),
@@ -129,11 +135,18 @@ pub fn builtin_model_capabilities() -> Vec<RouterModelConfig> {
             "gemini",
             "gemini-2.0-flash",
             0.1,
-            1_000_000,
+            MODERN_LONG_CONTEXT_TOKENS,
             800,
             &["conversation", "summary", "long_doc"],
         ),
-        model("ollama", "*", 0.0, 32_000, 500, &["conversation", "code"]),
+        model(
+            "ollama",
+            "*",
+            0.0,
+            LEGACY_LOCAL_CONTEXT_TOKENS,
+            500,
+            &["conversation", "code"],
+        ),
     ]
 }
 
@@ -182,5 +195,60 @@ mod tests {
         assert!(providers.contains("openai"));
         assert!(providers.contains("gemini"));
         assert!(providers.contains("ollama"));
+    }
+
+    fn context_for(models: &[RouterModelConfig], provider: &str, model_id: &str) -> usize {
+        models
+            .iter()
+            .find(|model| model.provider == provider && model.model_id == model_id)
+            .unwrap_or_else(|| panic!("missing builtin model {provider}/{model_id}"))
+            .max_context
+    }
+
+    #[test]
+    fn builtin_context_windows_match_p4b_policy() {
+        let models = builtin_model_capabilities();
+
+        assert_eq!(
+            context_for(&models, "anthropic", "claude-opus-4-6"),
+            MODERN_LONG_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            context_for(&models, "anthropic", "claude-sonnet-4-6"),
+            MODERN_LONG_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            context_for(&models, "openrouter", "google/gemini-3-flash"),
+            MODERN_LONG_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            context_for(&models, "gemini", "gemini-2.5-pro"),
+            MODERN_LONG_CONTEXT_TOKENS
+        );
+        assert_eq!(
+            context_for(&models, "gemini", "gemini-2.0-flash"),
+            MODERN_LONG_CONTEXT_TOKENS
+        );
+
+        assert_eq!(
+            context_for(&models, "anthropic", "claude-haiku-3"),
+            ANTHROPIC_HAIKU_CONTEXT_TOKENS,
+            "Haiku is a known-smaller Claude family and must not inherit 1M"
+        );
+        assert_eq!(
+            context_for(&models, "openai", "gpt-4o"),
+            GPT_4O_CONTEXT_TOKENS,
+            "gpt-4o is a known 128K model and must not inherit 1M"
+        );
+        assert_eq!(
+            context_for(&models, "openai", "gpt-4o-mini"),
+            GPT_4O_CONTEXT_TOKENS,
+            "gpt-4o-mini is a known 128K model and must not inherit 1M"
+        );
+        assert_eq!(
+            context_for(&models, "ollama", "*"),
+            LEGACY_LOCAL_CONTEXT_TOKENS,
+            "local legacy fallback must remain conservative"
+        );
     }
 }

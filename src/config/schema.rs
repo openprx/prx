@@ -556,7 +556,7 @@ const fn default_router_knn_k() -> usize {
 }
 
 const fn default_router_max_context() -> usize {
-    128_000
+    1_000_000
 }
 
 const fn default_router_latency() -> u32 {
@@ -6492,6 +6492,16 @@ max_context = 1000000
         let loaded = Config::load_from_path(&config_path, dir.path().join("workspace")).unwrap();
         assert!(loaded.agent.compaction.max_context_tokens_explicit);
         assert_eq!(loaded.agent.compaction.max_context_tokens, 128_000);
+    }
+
+    #[test]
+    async fn router_model_config_omitted_max_context_defaults_to_1m() {
+        let raw = r#"
+model_id = "custom-modern"
+provider = "openrouter"
+"#;
+        let parsed: RouterModelConfig = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.max_context, 1_000_000);
     }
 
     #[test]

@@ -246,6 +246,32 @@ mod tests {
     }
 
     #[test]
+    fn resolves_modern_claude_builtin_to_1m() {
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "anthropic",
+            "claude-sonnet-4-6",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(result.config.max_context_tokens, 1_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+    }
+
+    #[test]
+    fn resolves_local_legacy_builtin_conservatively() {
+        let result = resolve_effective_compaction_config(
+            &AgentCompactionConfig::default(),
+            "ollama",
+            "*",
+            &RouterConfig::default(),
+            &[],
+        );
+        assert_eq!(result.config.max_context_tokens, 32_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterBuiltin);
+    }
+
+    #[test]
     fn falls_back_when_no_model_metadata_matches() {
         let result = resolve_effective_compaction_config(
             &AgentCompactionConfig::default(),
