@@ -2197,7 +2197,7 @@ pub async fn run(
                     continue;
                 };
                 let sid = event.session_id().clone();
-                if ignored_session_events.contains(&sid) {
+                if should_ignore_session_event_after_chat_resume(&ignored_session_events, &event) {
                     continue;
                 }
                 let ring = session_rings
@@ -6756,6 +6756,13 @@ async fn saved_chat_sessions(mem: &dyn Memory) -> Result<Vec<session::ChatSessio
     Ok(sessions)
 }
 
+fn should_ignore_session_event_after_chat_resume(
+    ignored_session_events: &std::collections::HashSet<crate::chat::sessions::id::SessionId>,
+    event: &crate::chat::sessions::SessionEvent,
+) -> bool {
+    ignored_session_events.contains(event.session_id())
+}
+
 #[cfg(feature = "terminal-tui")]
 fn conversation_lines_for_resumed_session(session: &session::ChatSession) -> Vec<tui::ConversationLine> {
     session
@@ -8652,6 +8659,39 @@ mod p3_directional_switch_tests {
         assert_eq!(
             emitted, 0,
             "Session->Session directional cycling must not append extra main-history breadcrumbs"
+        );
+    }
+}
+
+#[cfg(test)]
+mod p7a_resume_tests {
+    use super::*;
+    use crate::chat::sessions::SessionEvent;
+    use crate::chat::sessions::id::SessionId;
+    use std::collections::HashSet;
+
+    #[test]
+    fn resumed_chat_session_ignores_late_events_from_detached_child_sessions() {
+        let old_id = SessionId::from_run_id("old-child");
+        let new_id = SessionId::from_run_id("new-child");
+        let ignored_session_events = HashSet::from([old_id.clone()]);
+
+        let old_event = SessionEvent::Delta {
+            id: old_id,
+            text: "must not enter resumed chat session".to_string(),
+        };
+        let new_event = SessionEvent::Delta {
+            id: new_id,
+            text: "valid new child output".to_string(),
+        };
+
+        assert!(
+            should_ignore_session_event_after_chat_resume(&ignored_session_events, &old_event),
+            "late events from detached child sessions must be dropped before ring/history routing"
+        );
+        assert!(
+            !should_ignore_session_event_after_chat_resume(&ignored_session_events, &new_event),
+            "events from new child sessions must still route normally after resume"
         );
     }
 }
