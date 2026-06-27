@@ -227,6 +227,9 @@ pub struct UiState {
     /// 仅由 chat 主循环经 `Action::SessionsStatusUpdated` 写入；后台 spawn 任务
     /// 绝不触碰（铁律：state 只在主循环写）。
     pub sessions_status: String,
+    /// P1 sessions strip entries. This is the same child TUI registry snapshot
+    /// used by the Ctrl+G switcher, kept structured for rendering.
+    pub sessions_entries: Vec<crate::chat::sessions::SwitcherEntry>,
     /// 当前输入路由目标（v1.1b）。`Main` = 主 chat；`Session{seq}` = 已 attach
     /// 的后台 session（输入作为 steer）。由 chat 主循环经
     /// `Action::SessionFocusChanged` 在 /attach//detach 时写入；驱动提示符的
@@ -273,6 +276,8 @@ pub struct UiSnapshot {
     pub input: TuiInput,
     /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
     pub sessions_status: Arc<str>,
+    /// P1 sessions strip entries, cloned from reducer-owned UI state.
+    pub sessions_entries: Arc<Vec<crate::chat::sessions::SwitcherEntry>>,
     /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
@@ -297,6 +302,7 @@ impl UiSnapshot {
             streaming: None,
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
+            sessions_entries: Arc::new(Vec::new()),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
         }
@@ -377,6 +383,7 @@ impl ChatState {
                 last_ctrlc_ms: 0,
                 last_submitted: None,
                 sessions_status: String::new(),
+                sessions_entries: Vec::new(),
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
             },
@@ -439,6 +446,7 @@ impl ChatState {
             streaming: self.stream.draft.clone(),
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
+            sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
         }
@@ -621,6 +629,7 @@ impl ChatState {
             Action::SystemMessageAdded { text } => self.reduce_system_message_added(text),
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
+            Action::SessionsEntriesUpdated { entries } => self.reduce_sessions_entries_updated(entries),
             Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
@@ -1693,6 +1702,17 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::SessionsEntriesUpdated` — replace the structured child-session
+    /// entries that back the P1 bottom strip. Identical snapshots are no-ops so
+    /// the 1s session poll cannot churn redraws when nothing changed.
+    fn reduce_sessions_entries_updated(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
+        if self.ui.sessions_entries == entries {
+            return Vec::new();
+        }
+        self.ui.sessions_entries = entries;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
     /// summary into `session.background_sessions` and **immediately emit
     /// `Effect::SaveSession`** so the summary is durably persisted to the memory
@@ -1986,10 +2006,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::HistoryCleared
         | Action::HistoryClearedWithNotice { .. }
         | Action::UserMessageEchoed(_) => true,
-        // v1b: writes ui.sessions_status (a snapshot field) → dirty. The main
-        // loop only dispatches this when the summary actually changed, and the
-        // reducer also no-ops identical writes, so this never churns frames.
-        Action::SessionsStatusUpdated { .. } => true,
+        // v1b/P1: writes sessions snapshot fields → dirty. The main loop only
+        // dispatches these when content changes, and reducers also no-op
+        // identical writes, so this never churns frames.
+        Action::SessionsStatusUpdated { .. } | Action::SessionsEntriesUpdated { .. } => true,
         // v1.1b: focus + switcher are snapshot fields driving the prompt
         // indicator and switcher overlay → dirty. Each reducer no-ops identical
         // writes so unchanged state never churns frames.
@@ -2087,6 +2107,37 @@ mod tests {
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.sessions_status.is_empty());
+    }
+
+    /// P1: SessionsEntriesUpdated writes structured strip entries and dedups
+    /// identical snapshots so the 1s poll does not churn redraws.
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_entries_updated_writes_snapshot_and_dedups() {
+        use crate::chat::sessions::SwitcherEntry;
+        let mut state = make_state();
+        assert!(state.ui.sessions_entries.is_empty());
+
+        let entries = vec![SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "user",
+            status: "running",
+            title: "task".into(),
+        }];
+        let expected = entries.clone();
+        let effects = state.reduce(Action::SessionsEntriesUpdated { entries });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.sessions_entries, expected);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.sessions_entries.as_slice(), expected.as_slice());
+
+        let effects = state.reduce(Action::SessionsEntriesUpdated { entries: expected });
+        assert!(effects.is_empty(), "identical entries must not redraw");
+
+        let effects = state.reduce(Action::SessionsEntriesUpdated { entries: Vec::new() });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.sessions_entries.is_empty());
     }
 
     /// v1.1b: SessionFocusChanged writes ui.focus + flows to the snapshot; an

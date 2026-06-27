@@ -645,6 +645,10 @@ fn test_chat_plain_mode_no_ansi() {
         !captured.contains("\x1b[?2004h"),
         "--plain must bypass TerminalGuard/TUI even when PRX_TUI=1; captured bracketed-paste enable in:\n{captured}"
     );
+    assert!(
+        !captured.contains("PRX Chat |") && !captured.contains("Ctrl+G sessions"),
+        "--plain must not render TUI chrome such as the sessions strip/status/footer; captured:\n{captured}"
+    );
 
     session.send("/exit\r").expect("send /exit");
     let _ = wait_for_exit(session, EXIT_TIMEOUT);

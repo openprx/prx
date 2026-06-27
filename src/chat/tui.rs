@@ -353,7 +353,10 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if state.switcher.is_some() {
         return dispatch_switcher_key(key, state);
     }
-    // v1.1b: Ctrl+G opens the session switcher over the cached session list.
+    // v1.1b/P1: Ctrl+G opens the PRX sessions switcher over the cached session
+    // list. This intentionally diverges from Claude Code's external-editor
+    // Ctrl+G binding until the P3/P6b parity keybinding pass; keep the footer
+    // hint discoverable so the temporary divergence is not hidden.
     // Never falls through to the input box. Opening an empty switcher is still
     // valid — it shows the "no child TUI sessions" hint with an Esc to close.
     if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL {
@@ -1585,6 +1588,8 @@ pub trait BottomChromeView {
     fn input(&self) -> &TuiInput;
     /// Persistent child-session status line (v1b). Empty hides the row.
     fn sessions_status(&self) -> &str;
+    /// Structured child-session entries for the always-visible P1 strip.
+    fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
     /// target indicator (`main >` vs `agent #N ▸`).
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
@@ -1619,6 +1624,9 @@ impl BottomChromeView for TuiState {
     }
     fn sessions_status(&self) -> &str {
         &self.sessions_status
+    }
+    fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
+        &self.sessions_cache
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -1655,6 +1663,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn sessions_status(&self) -> &str {
         &self.sessions_status
+    }
+    fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
+        self.sessions_entries.as_slice()
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -1728,7 +1739,7 @@ pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
 /// [`BOTTOM_CHROME_MAX_HEIGHT`], so the input box and footer never lose rows to
 /// the sessions line.
 fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
-    if state.sessions_status().is_empty() {
+    if state.sessions_status().is_empty() && state.sessions_entries().is_empty() {
         return false;
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
@@ -1832,21 +1843,127 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
 /// truncated to the row width so a narrow terminal degrades gracefully rather
 /// than wrapping into the input box.
 fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    let summary = state.sessions_status();
-    if summary.is_empty() {
+    let text = render_sessions_strip_line(
+        state.sessions_entries(),
+        state.sessions_status(),
+        state.focus(),
+        state.ascii_fallback(),
+        area.width,
+    );
+    if text.is_empty() {
         return;
     }
-    let max = usize::from(area.width).saturating_sub(1).max(1);
-    let ellipsis = if state.ascii_fallback() { "..." } else { "\u{2026}" };
-    let text = if summary.chars().count() > max {
-        let keep = max.saturating_sub(ellipsis.chars().count());
-        let truncated: String = summary.chars().take(keep).collect();
-        format!(" {truncated}{ellipsis}")
-    } else {
-        format!(" {summary}")
-    };
     let widget = Paragraph::new(text).style(Style::default().fg(Color::Cyan).bg(Color::Black));
     frame.render_widget(widget, area);
+}
+
+fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> String {
+    let max = usize::from(max_width);
+    if max == 0 {
+        return String::new();
+    }
+    if input.chars().count() <= max {
+        return input.to_string();
+    }
+    let ellipsis = if ascii { "..." } else { "\u{2026}" };
+    let ellipsis_cols = ellipsis.chars().count();
+    if max <= ellipsis_cols {
+        return ellipsis.chars().take(max).collect();
+    }
+    let keep = max.saturating_sub(ellipsis_cols);
+    let mut truncated: String = input.chars().take(keep).collect();
+    truncated.push_str(ellipsis);
+    truncated
+}
+
+const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
+    if active {
+        if ascii { ">" } else { "\u{25B8}" }
+    } else {
+        " "
+    }
+}
+
+fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+    if ascii {
+        match entry.status {
+            "running" => "[~]",
+            "needs-input" => "[?]",
+            "completed" => "[x]",
+            "cancelled" => "[-]",
+            _ => "[!]",
+        }
+    } else {
+        entry.status_glyph()
+    }
+}
+
+fn render_sessions_strip_entry(
+    entry: &crate::chat::sessions::SwitcherEntry,
+    active_seq: Option<u64>,
+    ascii: bool,
+    max_width: u16,
+) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let marker = session_active_marker(active_seq == Some(entry.seq), ascii);
+    let glyph = session_status_glyph(entry, ascii);
+    let prefix = format!("{marker} {glyph} #{} {} ", entry.seq, entry.kind);
+    let prefix_cols = prefix.chars().count();
+    let max = usize::from(max_width);
+    if prefix_cols >= max {
+        return prefix.chars().take(max).collect();
+    }
+    let title_budget = u16::try_from(max.saturating_sub(prefix_cols)).unwrap_or(u16::MAX);
+    let title = truncate_chars_with_ellipsis(&entry.title, title_budget, ascii);
+    format!("{prefix}{title}")
+}
+
+fn render_sessions_strip_line(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    summary: &str,
+    focus: crate::chat::sessions::FocusTarget,
+    ascii: bool,
+    width: u16,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let content_width = width.saturating_sub(1);
+    if content_width == 0 {
+        return String::new();
+    }
+    if entries.is_empty() {
+        if summary.is_empty() {
+            return String::new();
+        }
+        let text = truncate_chars_with_ellipsis(summary, content_width, ascii);
+        return format!(" {text}");
+    }
+
+    let active_seq = focus.session_seq();
+    let sep = if ascii { " | " } else { " \u{00B7} " };
+    let mut body = String::new();
+    for entry in entries {
+        let mut remaining = usize::from(content_width).saturating_sub(body.chars().count());
+        if remaining == 0 {
+            break;
+        }
+        if !body.is_empty() {
+            let sep_cols = sep.chars().count();
+            if remaining <= sep_cols {
+                break;
+            }
+            body.push_str(sep);
+            remaining = remaining.saturating_sub(sep_cols);
+        }
+        let segment =
+            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(remaining).unwrap_or(u16::MAX));
+        body.push_str(&segment);
+    }
+    let body = truncate_chars_with_ellipsis(&body, content_width, ascii);
+    format!(" {body}")
 }
 
 /// Render the Ctrl+G session switcher popup (v1.1b) inside the reserved bottom
@@ -1910,7 +2027,7 @@ fn render_switcher_row(
 }
 
 fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessions::SwitcherState, ascii: bool) {
-    let marker = if ascii { ">" } else { "\u{25B8}" }; // ▸
+    let marker = session_active_marker(true, ascii);
     let block = Block::default()
         .borders(Borders::TOP)
         .title(" Sessions - child TUI registry (Ctrl+G) ")
@@ -1962,17 +2079,7 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
         // (user/model, §17) so the operator can tell at a glance which sessions
         // the model started for itself. On a narrow terminal we drop the origin
         // tag and hard-truncate the title so the row never overflows / wraps.
-        let glyph = if ascii {
-            match entry.status {
-                "running" => "[~]",
-                "needs-input" => "[?]",
-                "completed" => "[x]",
-                "cancelled" => "[-]",
-                _ => "[!]",
-            }
-        } else {
-            entry.status_glyph()
-        };
+        let glyph = session_status_glyph(entry, ascii);
         let narrow = inner.width < 48;
         let body = render_switcher_row(entry, glyph, narrow, inner.width.saturating_sub(2));
         let style = if selected {
@@ -2007,6 +2114,12 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
 }
 
 fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
+    let status_text = render_status_bar_text(state, area.width);
+    let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
+    frame.render_widget(status, area);
+}
+
+fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> String {
     let title_str = state.session_title();
     let title = if title_str.is_empty() {
         "(new session)"
@@ -2015,7 +2128,7 @@ fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect
     };
 
     let token_estimate = estimate_visible_token_usage(state);
-    let status_text = format!(
+    let full = format!(
         " PRX Chat | {}/{} | {} | {} turns | ~{} tok ",
         state.provider(),
         state.model(),
@@ -2023,9 +2136,22 @@ fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect
         state.turn_count(),
         token_estimate
     );
+    if full.chars().count() <= usize::from(width) {
+        return full;
+    }
 
-    let status = Paragraph::new(status_text).style(Style::default().fg(Color::White).bg(Color::DarkGray));
-    frame.render_widget(status, area);
+    let compact = format!(
+        " PRX Chat | {}/{} | ~{} tok ",
+        state.provider(),
+        state.model(),
+        token_estimate
+    );
+    if compact.chars().count() <= usize::from(width) {
+        return compact;
+    }
+
+    let minimal = format!(" PRX | ~{} tok ", token_estimate);
+    truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
 }
 
 /// Rough current-token estimate for the TUI status bar.
@@ -2725,8 +2851,10 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
 fn render_footer(frame: &mut Frame, area: Rect) {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
+    // P1: Ctrl+G is intentionally PRX's sessions switcher for now; Claude Code
+    // external-editor parity is deferred to the P3/P6b keybinding pass.
     let footer = Paragraph::new(
-        " ! for bash \u{00B7} / for commands \u{00B7} Ctrl+G sessions \u{00B7} Tab to fold \u{00B7} Esc to cancel ",
+        " Ctrl+G sessions \u{00B7} / for commands \u{00B7} ! for bash \u{00B7} Tab to fold \u{00B7} Esc to cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -4451,6 +4579,117 @@ mod tests {
     }
 
     #[test]
+    fn sessions_strip_empty_state_is_hidden() {
+        let state = TuiState::new("p", "m");
+        assert!(!sessions_status_visible(&state));
+        assert!(render_sessions_strip_line(&[], "", crate::chat::sessions::FocusTarget::Main, false, 40).is_empty());
+    }
+
+    #[test]
+    fn sessions_strip_one_active_entry_shows_marker_glyph_kind_and_title() {
+        let entries = vec![entry(1)];
+        let line = render_sessions_strip_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 1 },
+            false,
+            80,
+        );
+        assert!(line.contains('\u{25B8}'), "active marker visible: {line}");
+        assert!(line.contains('⏳'), "status glyph visible: {line}");
+        assert!(line.contains("#1"), "seq visible: {line}");
+        assert!(line.contains("agent"), "kind visible: {line}");
+        assert!(line.contains("task 1"), "title visible: {line}");
+        assert!(
+            !line.contains("tok"),
+            "P1 must not fake per-session token usage: {line}"
+        );
+    }
+
+    #[test]
+    fn sessions_strip_multiple_entries_share_one_row() {
+        let entries = vec![entry(1), entry(2)];
+        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
+        assert!(line.contains("#1"), "first session visible: {line}");
+        assert!(line.contains("#2"), "second session visible: {line}");
+        assert!(line.contains('\u{00B7}'), "entries separated in one row: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_narrow_width_truncates() {
+        let entries = vec![pty_entry(
+            7,
+            "a-very-long-interactive-command-that-will-not-fit-in-the-strip",
+        )];
+        let width = 24;
+        let line = render_sessions_strip_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 7 },
+            false,
+            width,
+        );
+        assert!(
+            line.chars().count() <= width as usize,
+            "strip row must fit width {width}, got {} chars: {line}",
+            line.chars().count()
+        );
+        assert!(line.contains('\u{2026}'), "long title should be elided: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_cjk_title_truncates_without_panicking() {
+        let entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 5,
+            kind: "shell",
+            origin: "user",
+            status: "running",
+            title: "监控任务执行状态和输出窗口".to_string(),
+        }];
+        let width = 22;
+        let line = render_sessions_strip_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 5 },
+            false,
+            width,
+        );
+        assert!(
+            line.chars().count() <= width as usize,
+            "CJK strip row must fit char budget {width}, got {} chars: {line}",
+            line.chars().count()
+        );
+        assert!(line.contains("#5"), "seq remains visible under CJK truncation: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_narrow_render_keeps_status_input_and_footer_separate() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut state = TuiState::new("provider", "model");
+        state.sessions_cache = vec![entry(1)];
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+
+        let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..36).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..6).map(row).collect();
+        assert!(rows.iter().any(|r| r.contains("~0 tok")), "status row kept: {rows:?}");
+        assert!(rows.iter().any(|r| r.contains("#1")), "sessions strip kept: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("agent #1")),
+            "input prompt kept: {rows:?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("Ctrl+G")), "footer kept: {rows:?}");
+    }
+
+    #[test]
     fn p0_8_esc_nonempty_clears_input_even_when_attached() {
         // Muscle memory preserved: non-empty input clears first, never detaches.
         let mut state = TuiState::new("p", "m");
@@ -5126,6 +5365,10 @@ mod tests {
             assert_eq!(
                 BottomChromeView::streaming(&tui).is_some(),
                 BottomChromeView::streaming(&snap).is_some()
+            );
+            assert_eq!(
+                BottomChromeView::sessions_entries(&tui).len(),
+                BottomChromeView::sessions_entries(&snap).len()
             );
         }
 

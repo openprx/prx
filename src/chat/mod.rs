@@ -1751,6 +1751,7 @@ pub async fn run(
     // the registry (no event bus until v1.1).
     let mut reported_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_sessions_summary: String = String::new();
+    let mut last_sessions_entries: Vec<crate::chat::sessions::SwitcherEntry> = Vec::new();
     let mut sessions_tick = tokio::time::interval(Duration::from_secs(1));
     sessions_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // ── Event bridge state (v1.1a) ────────────────────────────────
@@ -1867,7 +1868,17 @@ pub async fn run(
                 #[cfg(feature = "terminal-tui")]
                 {
                     let entries = crate::chat::sessions::focus::switcher_entries(&views);
-                    chat_mirror.lock().sessions_cache = entries;
+                    chat_mirror.lock().sessions_cache = entries.clone();
+                    if entries != last_sessions_entries {
+                        last_sessions_entries = entries.clone();
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SessionsEntriesUpdated { entries },
+                            "chat.sessions_entries",
+                        );
+                        if let Some(tx) = sessions_redraw_handle.as_ref() {
+                            let _ = tx.try_send(());
+                        }
+                    }
                 }
                 let new_summary = crate::chat::sessions::status_summary(&views);
                 if new_summary != last_sessions_summary {

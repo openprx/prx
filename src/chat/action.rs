@@ -224,6 +224,11 @@ pub enum Action {
     /// 由 chat 主循环在轮询 registry 后按需 dispatch（仅在内容变化时），reducer
     /// 把它写入 `ui.sessions_status`，经 `build_ui_snapshot` 反映到 renderer。
     SessionsStatusUpdated { summary: String },
+    /// P1 sessions strip entries. This stays separate from the aggregate
+    /// `sessions_status` text so the renderer does not parse display strings.
+    SessionsEntriesUpdated {
+        entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    },
     /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
     /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
     /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
@@ -301,6 +306,7 @@ impl Action {
             Self::SystemMessageAdded { .. } => "SystemMessageAdded",
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
+            Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
             Self::BackgroundSessionRecorded { .. } => "BackgroundSessionRecorded",
             Self::SessionFocusChanged { .. } => "SessionFocusChanged",
             Self::SwitcherOpened { .. } => "SwitcherOpened",
