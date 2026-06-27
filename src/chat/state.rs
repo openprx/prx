@@ -278,6 +278,9 @@ pub struct UiState {
     /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
     /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// P7c saved chat-session history picker. Distinct from the child-TUI
+    /// Ctrl+G switcher.
+    pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -328,6 +331,8 @@ pub struct UiSnapshot {
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// P7c saved chat-session history picker overlay.
+    pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -354,6 +359,7 @@ impl UiSnapshot {
             context_window_tokens: None,
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
+            saved_session_picker: None,
         }
     }
 }
@@ -438,6 +444,7 @@ impl ChatState {
                 context_window_tokens: None,
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
+                saved_session_picker: None,
             },
             stream: StreamState {
                 draft: None,
@@ -504,6 +511,7 @@ impl ChatState {
             context_window_tokens: self.ui.context_window_tokens,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
+            saved_session_picker: self.ui.saved_session_picker.clone(),
         }
     }
 
@@ -710,6 +718,9 @@ impl ChatState {
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
             Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
             Action::SwitcherClosed => self.reduce_switcher_closed(),
+            Action::SavedSessionPickerOpened { entries } => self.reduce_saved_session_picker_opened(entries),
+            Action::SavedSessionPickerMoved { selected } => self.reduce_saved_session_picker_moved(selected),
+            Action::SavedSessionPickerClosed => self.reduce_saved_session_picker_closed(),
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
@@ -1616,6 +1627,8 @@ impl ChatState {
         self.ui.active_session_view = None;
         self.ui.sessions_status.clear();
         self.ui.sessions_entries.clear();
+        self.ui.switcher = None;
+        self.ui.saved_session_picker = None;
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -1920,6 +1933,7 @@ impl ChatState {
     /// `Action::SwitcherOpened` (v1.1b) — open the Ctrl+G switcher overlay over
     /// the supplied session snapshot, highlighting the first row.
     fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
+        self.ui.saved_session_picker = None;
         self.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(entries));
         vec![Effect::RequestRedraw]
     }
@@ -1951,6 +1965,41 @@ impl ChatState {
             return Vec::new();
         }
         self.ui.switcher = None;
+        vec![Effect::RequestRedraw]
+    }
+
+    /// `Action::SavedSessionPickerOpened` (P7c) — open the saved chat-session
+    /// history picker, separate from the child-TUI Ctrl+G switcher.
+    fn reduce_saved_session_picker_opened(
+        &mut self,
+        entries: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    ) -> Vec<Effect> {
+        self.ui.switcher = None;
+        self.ui.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(entries));
+        vec![Effect::RequestRedraw]
+    }
+
+    fn reduce_saved_session_picker_moved(&mut self, selected: usize) -> Vec<Effect> {
+        let Some(picker) = self.ui.saved_session_picker.as_mut() else {
+            return Vec::new();
+        };
+        let clamped = if picker.entries.is_empty() {
+            0
+        } else {
+            selected.min(picker.entries.len().saturating_sub(1))
+        };
+        if picker.selected == clamped {
+            return Vec::new();
+        }
+        picker.selected = clamped;
+        vec![Effect::RequestRedraw]
+    }
+
+    fn reduce_saved_session_picker_closed(&mut self) -> Vec<Effect> {
+        if self.ui.saved_session_picker.is_none() {
+            return Vec::new();
+        }
+        self.ui.saved_session_picker = None;
         vec![Effect::RequestRedraw]
     }
 
@@ -2171,7 +2220,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SessionFocusChanged { .. }
         | Action::SwitcherOpened { .. }
         | Action::SwitcherMoved { .. }
-        | Action::SwitcherClosed => true,
+        | Action::SwitcherClosed
+        | Action::SavedSessionPickerOpened { .. }
+        | Action::SavedSessionPickerMoved { .. }
+        | Action::SavedSessionPickerClosed => true,
         // RedrawRequested 仅产生 RequestRedraw Effect，本身不变 snapshot 字段；
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
@@ -2431,6 +2483,74 @@ mod tests {
         // Closing again is a no-op.
         let effects = state.reduce(Action::SwitcherClosed);
         assert!(effects.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn saved_session_picker_open_move_close_lifecycle() {
+        let mut state = make_state();
+        state.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(vec![
+            crate::chat::sessions::SwitcherEntry {
+                seq: 1,
+                kind: "agent",
+                origin: "model",
+                status: "running",
+                title: "child".to_string(),
+            },
+        ]));
+        let entries = vec![
+            crate::chat::session::SavedSessionPickerEntry {
+                id: "saved-a".to_string(),
+                title: "saved a".to_string(),
+                turn_count: 2,
+                updated_at: chrono::Utc::now(),
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                is_current: true,
+            },
+            crate::chat::session::SavedSessionPickerEntry {
+                id: "saved-b".to_string(),
+                title: "saved b".to_string(),
+                turn_count: 4,
+                updated_at: chrono::Utc::now(),
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                is_current: false,
+            },
+        ];
+
+        let effects = state.reduce(Action::SavedSessionPickerOpened {
+            entries: entries.clone(),
+        });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(
+            state.ui.switcher.is_none(),
+            "saved picker and child switcher are mutually exclusive"
+        );
+        let picker = state.ui.saved_session_picker.as_ref().expect("picker open");
+        assert_eq!(picker.len(), 2);
+        assert_eq!(picker.selected, 0);
+        assert_eq!(
+            state
+                .build_ui_snapshot(1)
+                .saved_session_picker
+                .as_ref()
+                .expect("snapshot picker")
+                .entries
+                .len(),
+            2
+        );
+
+        let effects = state.reduce(Action::SavedSessionPickerMoved { selected: 99 });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.saved_session_picker.as_ref().expect("picker").selected, 1);
+        let effects = state.reduce(Action::SavedSessionPickerMoved { selected: 1 });
+        assert!(effects.is_empty(), "same clamped selection is no-op");
+
+        let effects = state.reduce(Action::SavedSessionPickerClosed);
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert!(state.ui.saved_session_picker.is_none());
+        assert!(state.reduce(Action::SavedSessionPickerClosed).is_empty());
     }
 
     #[cfg(feature = "terminal-tui")]

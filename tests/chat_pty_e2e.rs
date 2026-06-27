@@ -741,6 +741,37 @@ fn test_chat_plain_file_mention_no_tui_chrome() {
 
 #[test]
 #[serial(prx_chat_pty)]
+fn test_chat_plain_resume_list_no_tui_chrome() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "LIST_REPLY")],
+        "list me\n/exit\n",
+    );
+
+    let output = run_chat_script_in(&guard, &["--plain"], &[("PRX_TUI", "1")], "/resume\n/exit\n");
+    assert!(
+        output.contains("Saved chat sessions:"),
+        "plain /resume should emit the text session list; output:\n{output}"
+    );
+    assert!(
+        output.contains("Resume with: /resume <ID> or /resume last"),
+        "plain /resume should include text resume instructions; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Saved chat sessions (/resume)")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain /resume list must not render TUI chrome; output:\n{output}"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
 fn test_chat_plain_resume_command_switches_saved_session_no_tui_chrome() {
     let guard = new_harness_guard().expect("harness guard");
 
@@ -1166,6 +1197,54 @@ fn test_chat_s4_a_0_ratatui_mock_response_via_real_path() {
         .get_process_mut()
         .signal(expectrl::Signal::SIGINT)
         .expect("second SIGINT");
+    let _ = wait_for_exit(session, EXIT_TIMEOUT);
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_ratatui_resume_picker_selects_saved_session() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "ALPHA_REPLY")],
+        "alpha one\nalpha two\n/exit\n",
+    );
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "BETA_REPLY")],
+        "beta one\n/exit\n",
+    );
+
+    let mut sg = spawn_chat_in(&guard, &[], &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "UNUSED")]);
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(300));
+
+    session.send("/resume\r").expect("send /resume");
+    let picker = read_until_with_dsr(session, "Saved chat sessions (/resume)", TURN_TIMEOUT);
+    assert!(
+        picker.contains("Saved chat sessions (/resume)"),
+        "TUI /resume should open saved-session picker overlay; captured:\n{picker}"
+    );
+
+    session.send("\x1b[B\r").expect("select older saved session");
+    let resumed = read_until_with_dsr(session, "Resumed saved chat session", TURN_TIMEOUT);
+    assert!(
+        resumed.contains("Resumed saved chat session"),
+        "picker Enter should resume the selected saved session; captured:\n{resumed}"
+    );
+
+    session.send("/cost\r").expect("send /cost");
+    let cost = read_until_with_dsr(session, "Turns:", TURN_TIMEOUT);
+    assert!(
+        cost.contains("Turns:        4"),
+        "selected alpha session should have four persisted turns; captured:\n{cost}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
     let _ = wait_for_exit(session, EXIT_TIMEOUT);
 }
 

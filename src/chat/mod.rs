@@ -123,6 +123,7 @@ const COMPACT_TOTAL_CHARS: usize = 2400;
 
 /// Capacity for the user-input mpsc channel.
 const INPUT_CHANNEL_CAPACITY: usize = 16;
+const CHAT_CONTROL_CHANNEL_CAPACITY: usize = 8;
 
 /// Capacity for the streaming delta (partial response) mpsc channel.
 const DELTA_CHANNEL_CAPACITY: usize = 64;
@@ -808,6 +809,10 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitcherOpened { .. } => "SwitcherOpened",
         tui::KeyDispatch::SwitcherMoved { .. } => "SwitcherMoved",
         tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
+        tui::KeyDispatch::SavedSessionPickerOpened { .. } => "SavedSessionPickerOpened",
+        tui::KeyDispatch::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
+        tui::KeyDispatch::SavedSessionPickerClosed => "SavedSessionPickerClosed",
+        tui::KeyDispatch::ResumeSavedSession { .. } => "ResumeSavedSession",
         tui::KeyDispatch::AttachSession { .. } => "AttachSession",
         tui::KeyDispatch::RequestDetach => "RequestDetach",
         tui::KeyDispatch::ScrollSessionUp => "ScrollSessionUp",
@@ -861,6 +866,10 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitcherOpened { .. }
         | tui::KeyDispatch::SwitcherMoved { .. }
         | tui::KeyDispatch::SwitcherClosed
+        | tui::KeyDispatch::SavedSessionPickerOpened { .. }
+        | tui::KeyDispatch::SavedSessionPickerMoved { .. }
+        | tui::KeyDispatch::SavedSessionPickerClosed
+        | tui::KeyDispatch::ResumeSavedSession { .. }
         | tui::KeyDispatch::AttachSession { .. }
         | tui::KeyDispatch::RequestDetach
         | tui::KeyDispatch::ScrollSessionUp
@@ -1666,6 +1675,7 @@ pub async fn run(
 
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    let (control_tx, mut control_rx) = mpsc::channel(CHAT_CONTROL_CHANNEL_CAPACITY);
 
     // ── Graceful shutdown signal ─────────────────────────────────
     // Instead of std::process::exit(), all signal handlers use this token to
@@ -1881,6 +1891,7 @@ pub async fn run(
                     // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
                     spawn_tui_unified_loop(
                         input_tx,
+                        control_tx.clone(),
                         Arc::clone(&chat_mirror),
                         redraw_rx,
                         redraw_tx_loop,
@@ -2075,6 +2086,7 @@ pub async fn run(
     // shutdown — the sender lives as long as the tool registry) we disable the
     // arm so a closed channel does not busy-spin returning `None`.
     let mut session_events_open = true;
+    let mut control_events_open = true;
     // Renderer nudge handle, available in both feature configs (the TUI-only
     // `redraw_tx_for_main` is `Some` only on the TUI path; `None` otherwise so
     // the helpers fall back to plain stdout).
@@ -2107,6 +2119,61 @@ pub async fn run(
         tokio::select! {
             msg = input_rx.recv() => break msg,
             _ = shutdown.cancelled() => break None,
+            maybe_control = control_rx.recv(), if control_events_open => {
+                let Some(control) = maybe_control else {
+                    control_events_open = false;
+                    continue;
+                };
+                match control {
+                    ChatControlEvent::ResumeSavedSession { id } => {
+                        let provider_name = current_provider_owned.as_str();
+                        let model_name = current_model_owned.as_str();
+                        match resume_saved_session_by_id(
+                            mem.as_ref(),
+                            &id,
+                            ChatSwitchCtx {
+                                chat_session: &mut chat_session,
+                                chat_session_key: &mut chat_session_key,
+                                fabric_turn_seq: &mut fabric_turn_seq,
+                                history: &mut history,
+                                chat_sessions: &mut chat_sessions,
+                                ignored_session_events: &mut ignored_session_events,
+                                session_rings: &mut session_rings,
+                                reported_sessions: &mut reported_sessions,
+                                last_sessions_summary: &mut last_sessions_summary,
+                                last_sessions_entries: &mut last_sessions_entries,
+                                attached_follow: &mut attached_follow,
+                                attached_follow_seq: &mut attached_follow_seq,
+                                chat_dispatcher: &chat_dispatcher,
+                                redraw_handle: sessions_redraw_handle.as_ref(),
+                                config: &config,
+                                provider_name,
+                                model_name,
+                                tool_descs: &tool_descs,
+                                skills: &skills,
+                                native_tools,
+                                tools_registry: &tools_registry,
+                                #[cfg(feature = "terminal-tui")]
+                                chat_mirror: &chat_mirror,
+                            },
+                        )
+                        .await
+                        {
+                            Ok(message) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &message,
+                            ),
+                            Err(e) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &e.to_string(),
+                            ),
+                        }
+                    }
+                }
+                continue;
+            }
             rewind_approval = async {
                 match pending_chat_rewind.as_mut() {
                     Some(pending) => (&mut pending.approval_rx).await,
@@ -2753,10 +2820,72 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 commands::CommandResult::ResumeAction(action) => {
                     match action {
                         commands::ResumeCommand::List => match saved_chat_sessions(mem.as_ref()).await {
-                            Ok(sessions) => emit_chat_output(&format_saved_chat_sessions(&sessions)),
+                            Ok(sessions) => {
+                                #[cfg(feature = "terminal-tui")]
+                                if sessions_redraw_handle.is_some() {
+                                    let entries = sessions
+                                        .iter()
+                                        .map(|session| {
+                                            crate::chat::session::SavedSessionPickerEntry::from_session(
+                                                session,
+                                                &chat_session.id,
+                                            )
+                                        })
+                                        .collect::<Vec<_>>();
+                                    chat_mirror.lock().saved_session_picker =
+                                        Some(crate::chat::session::SavedSessionPickerState::new(entries.clone()));
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::SavedSessionPickerOpened { entries },
+                                        "chat.saved_session_picker_opened_resume",
+                                    );
+                                    if let Some(tx) = sessions_redraw_handle.as_ref() {
+                                        let _ = tx.try_send(());
+                                    }
+                                } else {
+                                    emit_chat_output(&format_saved_chat_sessions(&sessions));
+                                }
+                                #[cfg(not(feature = "terminal-tui"))]
+                                emit_chat_output(&format_saved_chat_sessions(&sessions));
+                            }
                             Err(e) => emit_chat_output(&format!("Failed to list saved chat sessions: {e}")),
                         },
-                        commands::ResumeCommand::Last | commands::ResumeCommand::Id(_) => {
+                        commands::ResumeCommand::Id(id) => {
+                            match resume_saved_session_by_id(
+                                mem.as_ref(),
+                                &id,
+                                ChatSwitchCtx {
+                                    chat_session: &mut chat_session,
+                                    chat_session_key: &mut chat_session_key,
+                                    fabric_turn_seq: &mut fabric_turn_seq,
+                                    history: &mut history,
+                                    chat_sessions: &mut chat_sessions,
+                                    ignored_session_events: &mut ignored_session_events,
+                                    session_rings: &mut session_rings,
+                                    reported_sessions: &mut reported_sessions,
+                                    last_sessions_summary: &mut last_sessions_summary,
+                                    last_sessions_entries: &mut last_sessions_entries,
+                                    attached_follow: &mut attached_follow,
+                                    attached_follow_seq: &mut attached_follow_seq,
+                                    chat_dispatcher: &chat_dispatcher,
+                                    redraw_handle: sessions_redraw_handle.as_ref(),
+                                    config: &config,
+                                    provider_name,
+                                    model_name,
+                                    tool_descs: &tool_descs,
+                                    skills: &skills,
+                                    native_tools,
+                                    tools_registry: &tools_registry,
+                                    #[cfg(feature = "terminal-tui")]
+                                    chat_mirror: &chat_mirror,
+                                },
+                            )
+                            .await
+                            {
+                                Ok(message) => emit_chat_output(&message),
+                                Err(e) => emit_chat_output(&e.to_string()),
+                            }
+                        }
+                        commands::ResumeCommand::Last => {
                             let current_child_summaries = chat_sessions
                                 .snapshot()
                                 .await
@@ -2785,34 +2914,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 );
                             }
 
-                            let loaded = match &action {
-                                commands::ResumeCommand::Last => match load_latest_session(mem.as_ref()).await {
-                                    Ok(Some(session)) => Some(session),
-                                    Ok(None) => {
-                                        emit_chat_output("No saved chat sessions to resume.");
-                                        None
-                                    }
-                                    Err(e) => {
-                                        emit_chat_output(&format!(
-                                            "Resume aborted: failed to load saved chat session: {e}"
-                                        ));
-                                        None
-                                    }
-                                },
-                                commands::ResumeCommand::Id(id) => match load_session_by_id(mem.as_ref(), id).await {
-                                    Ok(Some(session)) => Some(session),
-                                    Ok(None) => {
-                                        emit_chat_output(&format!("Saved chat session '{id}' not found."));
-                                        None
-                                    }
-                                    Err(e) => {
-                                        emit_chat_output(&format!(
-                                            "Resume aborted: failed to load saved chat session '{id}': {e}"
-                                        ));
-                                        None
-                                    }
-                                },
-                                commands::ResumeCommand::List => None,
+                            let loaded = match load_latest_session(mem.as_ref()).await {
+                                Ok(Some(session)) => Some(session),
+                                Ok(None) => {
+                                    emit_chat_output("No saved chat sessions to resume.");
+                                    None
+                                }
+                                Err(e) => {
+                                    emit_chat_output(&format!(
+                                        "Resume aborted: failed to load saved chat session: {e}"
+                                    ));
+                                    None
+                                }
                             };
                             let Some(loaded_session) = loaded else {
                                 continue;
@@ -5173,6 +5286,7 @@ impl RenderSource {
 #[allow(clippy::too_many_arguments)]
 fn spawn_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     redraw_rx: mpsc::Receiver<()>,
     redraw_tx: mpsc::Sender<()>,
@@ -5185,6 +5299,7 @@ fn spawn_tui_unified_loop(
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
             input_tx,
+            control_tx,
             mirror,
             redraw_rx,
             redraw_tx,
@@ -6230,6 +6345,7 @@ fn pty_stdin_loop(
 #[allow(clippy::too_many_arguments)]
 fn run_tui_unified_loop(
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
+    control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
     mut redraw_rx: mpsc::Receiver<()>,
     redraw_tx: mpsc::Sender<()>,
@@ -6579,6 +6695,36 @@ fn run_tui_unified_loop(
                     tui::KeyDispatch::SwitcherClosed => {
                         let _ = chat_dispatcher
                             .dispatch_or_log(crate::chat::action::Action::SwitcherClosed, "chat.switcher_closed");
+                    }
+                    tui::KeyDispatch::SavedSessionPickerOpened { entries } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SavedSessionPickerOpened { entries },
+                            "chat.saved_session_picker_opened",
+                        );
+                    }
+                    tui::KeyDispatch::SavedSessionPickerMoved { selected } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SavedSessionPickerMoved { selected },
+                            "chat.saved_session_picker_moved",
+                        );
+                    }
+                    tui::KeyDispatch::SavedSessionPickerClosed => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SavedSessionPickerClosed,
+                            "chat.saved_session_picker_closed",
+                        );
+                    }
+                    tui::KeyDispatch::ResumeSavedSession { id } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SavedSessionPickerClosed,
+                            "chat.saved_session_picker_closed_resume",
+                        );
+                        if control_tx
+                            .blocking_send(ChatControlEvent::ResumeSavedSession { id })
+                            .is_err()
+                        {
+                            return Ok(());
+                        }
                     }
                     tui::KeyDispatch::AttachSession { seq } => {
                         // Close the switcher in the snapshot, then route a
@@ -7056,6 +7202,55 @@ struct PendingChatRewind {
     approval_rx: tokio::sync::oneshot::Receiver<bool>,
 }
 
+#[derive(Debug)]
+enum ChatControlEvent {
+    ResumeSavedSession { id: String },
+}
+
+async fn resume_saved_session_by_id(mem: &dyn Memory, target_id: &str, ctx: ChatSwitchCtx<'_>) -> Result<String> {
+    let current_child_summaries = ctx
+        .chat_sessions
+        .snapshot()
+        .await
+        .iter()
+        .map(|view| crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new()))
+        .collect::<Vec<_>>();
+    let mut current_to_save = ctx.chat_session.clone();
+    for summary in &current_child_summaries {
+        current_to_save.record_background_session(summary.clone());
+    }
+
+    if let Err(e) = save_session(mem, &current_to_save).await {
+        anyhow::bail!("Resume aborted: failed to save current session before switching: {e}");
+    }
+    for summary in &current_child_summaries {
+        let _ = ctx.chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::BackgroundSessionRecorded {
+                summary: summary.clone(),
+            },
+            "chat.resume_record_child_summary_before_switch",
+        );
+    }
+
+    let loaded_session = match load_session_by_id(mem, target_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => anyhow::bail!("Saved chat session '{target_id}' not found."),
+        Err(e) => anyhow::bail!("Resume aborted: failed to load saved chat session '{target_id}': {e}"),
+    };
+    let loaded_id = loaded_session.id.clone();
+    let loaded_turns = loaded_session.turn_count();
+    let loaded_title = if loaded_session.title.is_empty() {
+        "(untitled)".to_string()
+    } else {
+        loaded_session.title.clone()
+    };
+
+    apply_chat_session_switch(ctx, loaded_session).await;
+    Ok(format!(
+        "Resumed saved chat session {loaded_id} ({loaded_title}, {loaded_turns} turns)."
+    ))
+}
+
 async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
     let (_detached_summaries, ignored_ids) = ctx.chat_sessions.detach_for_chat_session_switch().await;
     ctx.ignored_session_events.extend(ignored_ids);
@@ -7111,6 +7306,10 @@ async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: s
         crate::chat::action::Action::SwitcherClosed,
         "chat.session_switch_switcher_closed",
     );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SavedSessionPickerClosed,
+        "chat.session_switch_saved_session_picker_closed",
+    );
 
     #[cfg(feature = "terminal-tui")]
     {
@@ -7124,6 +7323,7 @@ async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: s
         mirror.active_session_view = None;
         mirror.focus = crate::chat::sessions::FocusTarget::Main;
         mirror.switcher = None;
+        mirror.saved_session_picker = None;
     }
     if let Some(tx) = ctx.redraw_handle {
         let _ = tx.try_send(());

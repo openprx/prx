@@ -69,6 +69,93 @@ pub struct ChatSession {
     pub mode: ChatMode,
 }
 
+/// Display row for the saved chat-session history picker.
+///
+/// This is deliberately separate from child-TUI `SwitcherEntry`: these entries
+/// represent persisted chat histories, not live child sessions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessionPickerEntry {
+    pub id: String,
+    pub title: String,
+    pub turn_count: usize,
+    pub updated_at: DateTime<Utc>,
+    pub provider: String,
+    pub model: String,
+    pub is_current: bool,
+}
+
+impl SavedSessionPickerEntry {
+    #[must_use]
+    pub fn from_session(session: &ChatSession, current_session_id: &str) -> Self {
+        Self {
+            id: session.id.clone(),
+            title: session.title.clone(),
+            turn_count: session.turn_count(),
+            updated_at: session.updated_at,
+            provider: session.provider.clone(),
+            model: session.model.clone(),
+            is_current: session.id == current_session_id,
+        }
+    }
+}
+
+/// Overlay state for the saved chat-session history picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedSessionPickerState {
+    pub entries: Vec<SavedSessionPickerEntry>,
+    pub selected: usize,
+}
+
+impl SavedSessionPickerState {
+    #[must_use]
+    pub const fn new(entries: Vec<SavedSessionPickerEntry>) -> Self {
+        Self { entries, selected: 0 }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub const fn clamp_selected(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.entries.len().saturating_sub(1);
+        if self.selected > last {
+            self.selected = last;
+        }
+    }
+
+    pub const fn select_prev(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        self.selected = self.selected.saturating_sub(1);
+    }
+
+    pub fn select_next(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let last = self.entries.len().saturating_sub(1);
+        self.selected = self.selected.saturating_add(1).min(last);
+    }
+
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<&SavedSessionPickerEntry> {
+        self.entries.get(self.selected)
+    }
+}
+
 impl ChatSession {
     /// Create a new empty session.
     pub fn new(provider: &str, model: &str) -> Self {

@@ -265,6 +265,15 @@ pub enum Action {
     SwitcherMoved { selected: usize },
     /// 关闭 switcher 弹层（v1.1b）。reducer 写入 `ui.switcher = None`。
     SwitcherClosed,
+    /// P7c: open the saved chat-session history picker. Distinct from the
+    /// child-TUI Ctrl+G switcher.
+    SavedSessionPickerOpened {
+        entries: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    },
+    /// P7c: move the saved chat-session picker highlight.
+    SavedSessionPickerMoved { selected: usize },
+    /// P7c: close the saved chat-session picker.
+    SavedSessionPickerClosed,
 
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
@@ -329,6 +338,9 @@ impl Action {
             Self::SwitcherOpened { .. } => "SwitcherOpened",
             Self::SwitcherMoved { .. } => "SwitcherMoved",
             Self::SwitcherClosed => "SwitcherClosed",
+            Self::SavedSessionPickerOpened { .. } => "SavedSessionPickerOpened",
+            Self::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
+            Self::SavedSessionPickerClosed => "SavedSessionPickerClosed",
             Self::CancelRequested => "CancelRequested",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",

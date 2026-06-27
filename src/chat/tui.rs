@@ -112,6 +112,9 @@ pub struct TuiState {
     /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
     /// run async registry queries) when opening the switcher with Ctrl+G.
     pub sessions_cache: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// P7c saved chat-session history picker. Distinct from the child-TUI
+    /// Ctrl+G switcher.
+    pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
     /// P2 active line-session viewport snapshot. `None` when main chat or PTY
     /// handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
@@ -325,6 +328,17 @@ pub enum KeyDispatch {
     /// v1.1b: the switcher overlay was closed (Esc / Ctrl+G toggle / after
     /// attach). The key loop dispatches `Action::SwitcherClosed`.
     SwitcherClosed,
+    /// P7c: saved chat-session picker opened.
+    SavedSessionPickerOpened {
+        entries: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    },
+    /// P7c: saved chat-session picker moved.
+    SavedSessionPickerMoved { selected: usize },
+    /// P7c: saved chat-session picker closed.
+    SavedSessionPickerClosed,
+    /// P7c: resume the selected saved chat session through the main-loop
+    /// control channel, not by synthetic slash-command text.
+    ResumeSavedSession { id: String },
     /// v1.1b: attach to the given display sequence `#N` (switcher Enter). The
     /// key loop sends a synthetic `/attach <seq>` through the input channel so
     /// the async main loop performs the attach via its existing handler.
@@ -531,6 +545,12 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
         "dispatch_global_key_entry"
     );
+    // P7c: the saved chat-session picker has top overlay priority. It is
+    // distinct from the child-TUI Ctrl+G switcher and captures all keys while
+    // open so navigation cannot leak into input history or child switching.
+    if state.saved_session_picker.is_some() {
+        return dispatch_saved_session_picker_key(key, state);
+    }
     // v1.1b: when the Ctrl+G switcher overlay is open it captures navigation /
     // selection keys before anything else (Tab, input box, etc.). Handled in a
     // dedicated resolver so the open-state key table is self-contained.
@@ -737,6 +757,42 @@ fn dispatch_switcher_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         return KeyDispatch::SwitcherClosed;
     }
     // Any other key is swallowed while the overlay has focus.
+    KeyDispatch::Consumed
+}
+
+/// Resolve a key while the saved chat-session picker overlay is open (P7c).
+fn dispatch_saved_session_picker_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+    let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+    if up || down {
+        let Some(picker) = state.saved_session_picker.as_mut() else {
+            return KeyDispatch::Consumed;
+        };
+        if up {
+            picker.select_prev();
+        } else {
+            picker.select_next();
+        }
+        picker.clamp_selected();
+        return KeyDispatch::SavedSessionPickerMoved {
+            selected: picker.selected,
+        };
+    }
+    if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+        let selected = state.saved_session_picker.as_mut().and_then(|picker| {
+            picker.clamp_selected();
+            picker.selected_entry().cloned()
+        });
+        state.saved_session_picker = None;
+        return selected.map_or(KeyDispatch::SavedSessionPickerClosed, |entry| {
+            KeyDispatch::ResumeSavedSession { id: entry.id }
+        });
+    }
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        state.saved_session_picker = None;
+        return KeyDispatch::SavedSessionPickerClosed;
+    }
     KeyDispatch::Consumed
 }
 
@@ -1444,6 +1500,7 @@ impl TuiState {
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
             sessions_cache: Vec::new(),
+            saved_session_picker: None,
             active_session_view: None,
             pending_tool_approval: None,
             context_window_tokens: None,
@@ -2050,6 +2107,8 @@ pub trait BottomChromeView {
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
     /// Open Ctrl+G session switcher overlay (v1.1b), or `None` when closed.
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState>;
+    /// Open saved chat-session picker overlay (P7c), or `None` when closed.
+    fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState>;
 }
 
 impl BottomChromeView for TuiState {
@@ -2097,6 +2156,9 @@ impl BottomChromeView for TuiState {
     }
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
         self.switcher.as_ref()
+    }
+    fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
+        self.saved_session_picker.as_ref()
     }
 }
 
@@ -2146,6 +2208,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
         self.switcher.as_ref()
     }
+    fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
+        self.saved_session_picker.as_ref()
+    }
 }
 
 /// Minimum height (rows) of the inline viewport. Reserves space for
@@ -2182,6 +2247,11 @@ pub const ACTIVE_SESSION_VIEW_DESIRED_ROWS: u16 = 10;
 ///
 /// S4-A Commit 2: 泛型化让 UiSnapshot 与 TuiState 共用同一份高度计算逻辑。
 pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
+    if let Some(picker) = state.saved_session_picker() {
+        let list_rows = u16::try_from(picker.len().max(1)).unwrap_or(1);
+        let total: u16 = 1u16.saturating_add(1).saturating_add(list_rows).saturating_add(1);
+        return total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT);
+    }
     // v1.1b: when the Ctrl+G switcher is open it replaces the streaming preview
     // + input box with a popup list. The popup wants 1 title row + 1 row per
     // session + 1 footer row, clamped so the whole chrome still fits the budget.
@@ -2266,6 +2336,22 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
         height,
         ..frame_area
     };
+
+    if let Some(picker) = state.saved_session_picker() {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(area.height.saturating_sub(1).max(1)),
+            ])
+            .split(area);
+        #[allow(clippy::indexing_slicing)]
+        {
+            render_status_bar(frame, chunks[0], state);
+            render_saved_session_picker(frame, chunks[1], picker, state.ascii_fallback());
+        }
+        return;
+    }
 
     // v1.1b: the Ctrl+G switcher overlay replaces the streaming/input chrome
     // with a status row + popup list while open. It is rendered inside the same
@@ -2539,6 +2625,114 @@ fn render_active_session_view(
     }
     let widget = Paragraph::new(Text::from(lines)).style(Style::default().bg(Color::Black));
     frame.render_widget(widget, area);
+}
+
+fn render_saved_session_picker_row(
+    entry: &crate::chat::session::SavedSessionPickerEntry,
+    narrow: bool,
+    max_width: u16,
+    ascii: bool,
+) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    let title = if entry.title.trim().is_empty() {
+        "(untitled)".to_string()
+    } else {
+        entry.title.clone()
+    };
+    let title = if entry.is_current {
+        format!("{title} (current)")
+    } else {
+        title
+    };
+    let meta = if narrow {
+        format!("{} turns", entry.turn_count)
+    } else {
+        format!(
+            "{} turns | {}/{} | {}",
+            entry.turn_count,
+            entry.provider,
+            entry.model,
+            entry.updated_at.format("%Y-%m-%d %H:%M")
+        )
+    };
+    truncate_chars_with_ellipsis(&format!("{title} | {meta}"), max_width, ascii)
+}
+
+fn render_saved_session_picker(
+    frame: &mut Frame,
+    area: Rect,
+    picker: &crate::chat::session::SavedSessionPickerState,
+    ascii: bool,
+) {
+    let marker = session_active_marker(true, ascii);
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(" Saved chat sessions (/resume) ")
+        .border_style(Style::default().fg(Color::Green));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let hint_rows: u16 = 1;
+    let list_height = inner.height.saturating_sub(hint_rows) as usize;
+    if picker.is_empty() {
+        let empty =
+            Paragraph::new(" No saved chat sessions. Esc to close. ").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    let total = picker.len();
+    let selected = picker.selected.min(total.saturating_sub(1));
+    let start = if list_height == 0 || total <= list_height {
+        0
+    } else {
+        let half = list_height / 2;
+        selected.saturating_sub(half).min(total.saturating_sub(list_height))
+    };
+    let end = (start + list_height).min(total);
+    let narrow = inner.width < 64;
+    let mut lines: Vec<Line<'_>> = Vec::with_capacity(list_height.saturating_add(1));
+    for (idx, entry) in picker.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
+        let abs = start + idx;
+        let is_selected = abs == selected;
+        let head = if is_selected {
+            format!("{marker} ")
+        } else {
+            "  ".to_string()
+        };
+        let body = render_saved_session_picker_row(entry, narrow, inner.width.saturating_sub(2), ascii);
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Green)
+                .add_modifier(Modifier::BOLD)
+        } else if entry.is_current {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::from(Span::styled(format!("{head}{body}"), style)));
+    }
+
+    let hidden = total.saturating_sub(end).saturating_add(start);
+    let hint = if hidden > 0 {
+        format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter resume \u{00B7} Esc close \u{00B7} {hidden} more ")
+    } else {
+        " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter resume \u{00B7} Esc close ".to_string()
+    };
+    let hint = if ascii {
+        hint.replace('\u{2191}', "Up").replace('\u{2193}', "Down")
+    } else {
+        hint
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Render the Ctrl+G session switcher popup (v1.1b) inside the reserved bottom
@@ -4661,6 +4855,18 @@ mod tests {
         KeyEvent::new(code, m)
     }
 
+    fn saved_picker_entry(id: &str, title: &str, is_current: bool) -> crate::chat::session::SavedSessionPickerEntry {
+        crate::chat::session::SavedSessionPickerEntry {
+            id: id.to_string(),
+            title: title.to_string(),
+            turn_count: 2,
+            updated_at: chrono::Utc::now(),
+            provider: "provider".to_string(),
+            model: "model".to_string(),
+            is_current,
+        }
+    }
+
     /// Convenience: type each char in `s` into `input`.
     fn type_str(input: &mut TuiInput, s: &str) {
         for ch in s.chars() {
@@ -5139,6 +5345,110 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn saved_session_picker_captures_navigation_enter_and_esc() {
+        let mut state = TuiState::new("p", "m");
+        state.input.history = vec!["history item".to_string()];
+        state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            saved_picker_entry("latest", "latest session", true),
+            saved_picker_entry("older", "older session", false),
+        ]));
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::SavedSessionPickerMoved { selected: 1 }
+        );
+        assert!(
+            state.input.is_empty(),
+            "Down must not navigate input history while picker is open"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::SavedSessionPickerMoved { selected: 0 }
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::SavedSessionPickerMoved { selected: 1 }
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::ResumeSavedSession {
+                id: "older".to_string()
+            }
+        );
+        assert!(
+            state.saved_session_picker.is_none(),
+            "Enter closes picker before control event"
+        );
+
+        state.input.set_text("draft");
+        state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            saved_picker_entry("latest", "latest session", true),
+        ]));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Esc), &mut state),
+            KeyDispatch::SavedSessionPickerClosed
+        );
+        assert_eq!(state.input.text(), "draft", "Esc close must preserve draft input");
+    }
+
+    #[test]
+    fn saved_session_picker_priority_blocks_child_switcher_and_stale_index_clamps() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "model",
+            status: "running",
+            title: "child".to_string(),
+        }];
+        state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState {
+            entries: vec![saved_picker_entry("only", "only session", false)],
+            selected: 99,
+        });
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed,
+            "Ctrl+G must not open child switcher while saved-session picker is open"
+        );
+        assert!(state.switcher.is_none());
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::ResumeSavedSession { id: "only".to_string() },
+            "stale picker selection clamps to the last valid row"
+        );
+
+        let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        assert!(matches!(out, KeyDispatch::SwitcherOpened { .. }));
+        assert!(state.switcher.is_some(), "Ctrl+G works again after picker closes");
+    }
+
+    #[test]
+    fn saved_session_picker_row_truncates_to_unicode_width() {
+        let entry = saved_picker_entry("wide", "很长的会话标题 mixed ascii text", true);
+        let row = render_saved_session_picker_row(&entry, false, 18, false);
+        assert!(
+            UnicodeWidthStr::width(row.as_str()) <= 18,
+            "row must fit width, got width={} row={row:?}",
+            UnicodeWidthStr::width(row.as_str())
+        );
+        assert!(row.contains('\u{2026}'), "truncated row should show ellipsis: {row:?}");
+    }
+
+    #[test]
+    fn saved_session_picker_closed_keeps_up_down_input_history_behavior() {
+        let mut state = TuiState::new("p", "m");
+        state.input.history = vec!["alpha".to_string(), "beta".to_string()];
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "beta");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert!(state.input.is_empty());
     }
 
     #[test]
@@ -6664,6 +6974,11 @@ mod tests {
             };
             state.ui.focus = crate::chat::sessions::FocusTarget::Diff;
             state.ui.active_session_view = Some(active_view.clone());
+            let saved_picker = crate::chat::session::SavedSessionPickerState {
+                entries: vec![saved_picker_entry("saved-1", "saved parity session", true)],
+                selected: 0,
+            };
+            state.ui.saved_session_picker = Some(saved_picker.clone());
             let snap = state.build_ui_snapshot(5);
 
             let mut tui = TuiState::new(&state.session.provider, &state.session.model);
@@ -6677,6 +6992,7 @@ mod tests {
             tui.focus = crate::chat::sessions::FocusTarget::Diff;
             tui.active_session_view = Some(active_view);
             tui.context_window_tokens = Some(10_000_000);
+            tui.saved_session_picker = Some(saved_picker);
 
             assert_eq!(BottomChromeView::provider(&tui), BottomChromeView::provider(&snap));
             assert_eq!(BottomChromeView::model(&tui), BottomChromeView::model(&snap));
@@ -6721,6 +7037,21 @@ mod tests {
                 BottomChromeView::context_window_tokens(&tui),
                 BottomChromeView::context_window_tokens(&snap)
             );
+            let tui_picker = BottomChromeView::saved_session_picker(&tui).expect("tui saved picker");
+            let snap_picker = BottomChromeView::saved_session_picker(&snap).expect("snapshot saved picker");
+            assert_eq!(tui_picker.selected, snap_picker.selected);
+            let [tui_saved] = tui_picker.entries.as_slice() else {
+                panic!("TuiState fixture should expose exactly one saved picker entry");
+            };
+            let [snap_saved] = snap_picker.entries.as_slice() else {
+                panic!("UiSnapshot fixture should expose exactly one saved picker entry");
+            };
+            assert_eq!(tui_saved.id, snap_saved.id);
+            assert_eq!(tui_saved.title, snap_saved.title);
+            assert_eq!(tui_saved.turn_count, snap_saved.turn_count);
+            assert_eq!(tui_saved.provider, snap_saved.provider);
+            assert_eq!(tui_saved.model, snap_saved.model);
+            assert_eq!(tui_saved.is_current, snap_saved.is_current);
         }
 
         #[test]
