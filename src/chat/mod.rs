@@ -1751,6 +1751,9 @@ pub async fn run(
     #[cfg(feature = "terminal-tui")]
     let provider_slot = effect_executor.provider_handle();
 
+    #[cfg(feature = "terminal-tui")]
+    let approval_router = effect_executor.approval_router();
+
     // Step 5a-4: TurnCompletionSignal — Redux driver 切闸路径用此 signal 在
     // chat::run 主循环里 await turn 完成。dispatcher task 消费 terminal action
     // (StreamCompleted/Failed/Cancelled) 后 notify_waiters，唤醒等待。
@@ -2079,6 +2082,7 @@ pub async fn run(
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = redraw_tx_for_main.clone();
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
+    let mut pending_chat_rewind: Option<PendingChatRewind> = None;
 
     // ── Reload notice: historical child sessions (v4) ────────
     // If this chat session was resumed and carried persisted background-session
@@ -2103,6 +2107,83 @@ pub async fn run(
         tokio::select! {
             msg = input_rx.recv() => break msg,
             _ = shutdown.cancelled() => break None,
+            rewind_approval = async {
+                match pending_chat_rewind.as_mut() {
+                    Some(pending) => (&mut pending.approval_rx).await,
+                    None => std::future::pending::<std::result::Result<
+                        bool,
+                        tokio::sync::oneshot::error::RecvError,
+                    >>().await,
+                }
+            }, if pending_chat_rewind.is_some() => {
+                let Some(pending) = pending_chat_rewind.take() else {
+                    continue;
+                };
+                match rewind_approval {
+                    Ok(true) => {
+                        let target_id = pending.target_session.id.clone();
+                        let target_turns = pending.target_session.turn_count();
+                        if let Err(e) = save_session(mem.as_ref(), &pending.target_session).await {
+                            surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &format!("Rewind aborted: failed to save trimmed session: {e}"),
+                            );
+                            continue;
+                        }
+                        let provider_name = current_provider_owned.as_str();
+                        let model_name = current_model_owned.as_str();
+                        apply_chat_session_switch(ChatSwitchCtx {
+                            chat_session: &mut chat_session,
+                            chat_session_key: &mut chat_session_key,
+                            fabric_turn_seq: &mut fabric_turn_seq,
+                            history: &mut history,
+                            chat_sessions: &mut chat_sessions,
+                            ignored_session_events: &mut ignored_session_events,
+                            session_rings: &mut session_rings,
+                            reported_sessions: &mut reported_sessions,
+                            last_sessions_summary: &mut last_sessions_summary,
+                            last_sessions_entries: &mut last_sessions_entries,
+                            attached_follow: &mut attached_follow,
+                            attached_follow_seq: &mut attached_follow_seq,
+                            chat_dispatcher: &chat_dispatcher,
+                            redraw_handle: sessions_redraw_handle.as_ref(),
+                            config: &config,
+                            provider_name,
+                            model_name,
+                            tool_descs: &tool_descs,
+                            skills: &skills,
+                            native_tools,
+                            tools_registry: &tools_registry,
+                            #[cfg(feature = "terminal-tui")]
+                            chat_mirror: &chat_mirror,
+                        }, pending.target_session).await;
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            &format!("Rewound chat session {target_id} to {target_turns} turns."),
+                        );
+                    }
+                    Ok(false) => {
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            "Rewind cancelled; current session unchanged.",
+                        );
+                    }
+                    Err(_) => {
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            &format!(
+                                "Rewind cancelled; approval channel closed for {} and current session is unchanged.",
+                                pending.tool_id
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
             _ = sessions_tick.tick() => {
                 // 1) Summary reflow: surface each newly-finished session once,
                 //    carrying its `#N` + status (plan §v1b). No auto-focus.
@@ -2676,12 +2757,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             Err(e) => emit_chat_output(&format!("Failed to list saved chat sessions: {e}")),
                         },
                         commands::ResumeCommand::Last | commands::ResumeCommand::Id(_) => {
-                            let target_label = match &action {
-                                commands::ResumeCommand::Last => "last".to_string(),
-                                commands::ResumeCommand::Id(id) => id.clone(),
-                                commands::ResumeCommand::List => String::new(),
-                            };
-
                             let current_child_summaries = chat_sessions
                                 .snapshot()
                                 .await
@@ -2690,28 +2765,24 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new())
                                 })
                                 .collect::<Vec<_>>();
+                            let mut current_to_save = chat_session.clone();
                             for summary in &current_child_summaries {
-                                chat_session.record_background_session(summary.clone());
+                                current_to_save.record_background_session(summary.clone());
+                            }
+
+                            if let Err(e) = save_session(mem.as_ref(), &current_to_save).await {
+                                emit_chat_output(&format!(
+                                    "Resume aborted: failed to save current session before switching: {e}"
+                                ));
+                                continue;
+                            }
+                            for summary in &current_child_summaries {
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::BackgroundSessionRecorded {
                                         summary: summary.clone(),
                                     },
                                     "chat.resume_record_child_summary_before_switch",
                                 );
-                            }
-
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::SessionSwitched {
-                                    id: target_label.clone(),
-                                },
-                                "chat.resume_session_switched",
-                            );
-
-                            if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
-                                emit_chat_output(&format!(
-                                    "Resume aborted: failed to save current session before switching: {e}"
-                                ));
-                                continue;
                             }
 
                             let loaded = match &action {
@@ -2743,75 +2814,39 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 },
                                 commands::ResumeCommand::List => None,
                             };
-                            let Some(mut loaded_session) = loaded else {
+                            let Some(loaded_session) = loaded else {
                                 continue;
                             };
 
-                            let (_detached_summaries, ignored_ids) =
-                                chat_sessions.detach_for_chat_session_switch().await;
-                            ignored_session_events.extend(ignored_ids);
-                            session_rings.clear();
-                            reported_sessions.clear();
-                            last_sessions_summary.clear();
-                            last_sessions_entries.clear();
-                            attached_follow = None;
-                            attached_follow_seq = None;
-
-                            bind_session_to_runtime_provider_model(&mut loaded_session, provider_name, model_name);
-                            chat_session = loaded_session;
-                            chat_session_key = format!("chat:{}", chat_session.id);
-                            let resumed_user_turns =
-                                chat_session.turns.iter().filter(|turn| turn.role == "user").count();
-                            fabric_turn_seq = u64::try_from(resumed_user_turns).map_or(u64::MAX, |value| value);
-                            history = history_for_session_with_system(
-                                &chat_session,
-                                &config,
-                                model_name,
-                                &tool_descs,
-                                &skills,
-                                native_tools,
-                                &tools_registry,
-                            );
-
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::SessionLoaded(chat_session.clone()),
-                                "chat.resume_session_loaded",
-                            );
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::SessionFocusChanged {
-                                    focus: crate::chat::sessions::FocusTarget::Main,
+                            apply_chat_session_switch(
+                                ChatSwitchCtx {
+                                    chat_session: &mut chat_session,
+                                    chat_session_key: &mut chat_session_key,
+                                    fabric_turn_seq: &mut fabric_turn_seq,
+                                    history: &mut history,
+                                    chat_sessions: &mut chat_sessions,
+                                    ignored_session_events: &mut ignored_session_events,
+                                    session_rings: &mut session_rings,
+                                    reported_sessions: &mut reported_sessions,
+                                    last_sessions_summary: &mut last_sessions_summary,
+                                    last_sessions_entries: &mut last_sessions_entries,
+                                    attached_follow: &mut attached_follow,
+                                    attached_follow_seq: &mut attached_follow_seq,
+                                    chat_dispatcher: &chat_dispatcher,
+                                    redraw_handle: sessions_redraw_handle.as_ref(),
+                                    config: &config,
+                                    provider_name,
+                                    model_name,
+                                    tool_descs: &tool_descs,
+                                    skills: &skills,
+                                    native_tools,
+                                    tools_registry: &tools_registry,
+                                    #[cfg(feature = "terminal-tui")]
+                                    chat_mirror: &chat_mirror,
                                 },
-                                "chat.resume_focus_main",
-                            );
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
-                                "chat.resume_clear_active_session_view",
-                            );
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::SessionsStatusUpdated { summary: String::new() },
-                                "chat.resume_clear_sessions_status",
-                            );
-                            let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::SessionsEntriesUpdated { entries: Vec::new() },
-                                "chat.resume_clear_sessions_entries",
-                            );
-
-                            #[cfg(feature = "terminal-tui")]
-                            {
-                                let mut mirror = chat_mirror.lock();
-                                mirror.session_title = chat_session.title.clone();
-                                mirror.turn_count = chat_session.turn_count();
-                                mirror.conversation_lines = conversation_lines_for_resumed_session(&chat_session);
-                                mirror.streaming = None;
-                                mirror.sessions_status.clear();
-                                mirror.sessions_cache.clear();
-                                mirror.active_session_view = None;
-                                mirror.focus = crate::chat::sessions::FocusTarget::Main;
-                                mirror.switcher = None;
-                            }
-                            if let Some(tx) = sessions_redraw_handle.as_ref() {
-                                let _ = tx.try_send(());
-                            }
+                                loaded_session,
+                            )
+                            .await;
 
                             let title = if chat_session.title.is_empty() {
                                 "(untitled)"
@@ -2823,6 +2858,154 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 chat_session.id,
                                 chat_session.turn_count()
                             ));
+                        }
+                    }
+                    continue;
+                }
+                commands::CommandResult::HistoryAction(action) => {
+                    match action {
+                        commands::HistoryCommand::BranchList => {
+                            emit_chat_output(&format_turn_boundaries(&chat_session));
+                        }
+                        commands::HistoryCommand::Branch(raw) => {
+                            let keep_turns = match parse_turn_boundary(&raw, chat_session.turn_count(), "branch") {
+                                Ok(value) => value,
+                                Err(msg) => {
+                                    emit_chat_output(&msg);
+                                    continue;
+                                }
+                            };
+                            let current_child_summaries = chat_sessions
+                                .snapshot()
+                                .await
+                                .iter()
+                                .map(|view| {
+                                    crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new())
+                                })
+                                .collect::<Vec<_>>();
+                            let mut current_to_save = chat_session.clone();
+                            for summary in current_child_summaries {
+                                current_to_save.record_background_session(summary);
+                            }
+                            if let Err(e) = save_session(mem.as_ref(), &current_to_save).await {
+                                emit_chat_output(&format!(
+                                    "Branch aborted: failed to save current session before forking: {e}"
+                                ));
+                                continue;
+                            }
+                            let branch =
+                                branched_chat_session_from(&current_to_save, keep_turns, provider_name, model_name);
+                            let branch_id = branch.id.clone();
+                            let branch_turns = branch.turn_count();
+                            if let Err(e) = save_session(mem.as_ref(), &branch).await {
+                                emit_chat_output(&format!("Branch aborted: failed to save new branch session: {e}"));
+                                continue;
+                            }
+                            apply_chat_session_switch(
+                                ChatSwitchCtx {
+                                    chat_session: &mut chat_session,
+                                    chat_session_key: &mut chat_session_key,
+                                    fabric_turn_seq: &mut fabric_turn_seq,
+                                    history: &mut history,
+                                    chat_sessions: &mut chat_sessions,
+                                    ignored_session_events: &mut ignored_session_events,
+                                    session_rings: &mut session_rings,
+                                    reported_sessions: &mut reported_sessions,
+                                    last_sessions_summary: &mut last_sessions_summary,
+                                    last_sessions_entries: &mut last_sessions_entries,
+                                    attached_follow: &mut attached_follow,
+                                    attached_follow_seq: &mut attached_follow_seq,
+                                    chat_dispatcher: &chat_dispatcher,
+                                    redraw_handle: sessions_redraw_handle.as_ref(),
+                                    config: &config,
+                                    provider_name,
+                                    model_name,
+                                    tool_descs: &tool_descs,
+                                    skills: &skills,
+                                    native_tools,
+                                    tools_registry: &tools_registry,
+                                    #[cfg(feature = "terminal-tui")]
+                                    chat_mirror: &chat_mirror,
+                                },
+                                branch,
+                            )
+                            .await;
+                            emit_chat_output(&format!(
+                                "Created branch {branch_id} from the first {branch_turns} turns and switched to it."
+                            ));
+                        }
+                        commands::HistoryCommand::Rewind(raw) => {
+                            let keep_turns = match parse_turn_boundary(&raw, chat_session.turn_count(), "rewind") {
+                                Ok(value) => value,
+                                Err(msg) => {
+                                    emit_chat_output(&msg);
+                                    continue;
+                                }
+                            };
+                            if keep_turns == chat_session.turn_count() {
+                                emit_chat_output(&format!(
+                                    "Rewind skipped: session already has exactly {keep_turns} turns."
+                                ));
+                                continue;
+                            }
+                            if pending_chat_rewind.is_some() {
+                                emit_chat_output("Rewind already awaits approval; approve or cancel it first.");
+                                continue;
+                            }
+                            if sessions_redraw_handle.is_none() {
+                                emit_chat_output(
+                                    "Rewind requires interactive confirmation; unavailable in this mode. Current session unchanged.",
+                                );
+                                continue;
+                            }
+                            #[cfg(not(feature = "terminal-tui"))]
+                            {
+                                emit_chat_output(
+                                    "Rewind requires interactive confirmation; unavailable in this mode. Current session unchanged.",
+                                );
+                                continue;
+                            }
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                let Some(router) = approval_router.as_ref() else {
+                                    emit_chat_output(
+                                        "Rewind requires interactive confirmation; approval router unavailable. Current session unchanged.",
+                                    );
+                                    continue;
+                                };
+                                let target_session = rewound_chat_session_from(&chat_session, keep_turns);
+                                let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<bool>();
+                                let tool_id = format!("chat_rewind:{}", uuid::Uuid::new_v4());
+                                router.register(tool_id.clone(), approval_tx);
+                                let args = serde_json::json!({
+                                    "session_id": chat_session.id,
+                                    "from_turns": chat_session.turn_count(),
+                                    "to_turns": keep_turns,
+                                    "drops_child_summaries": keep_turns < chat_session.turn_count(),
+                                })
+                                .to_string();
+                                let dispatch_result = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::ToolApprovalRequested {
+                                        tool_id: tool_id.clone(),
+                                        name: "rewind_chat_session".to_string(),
+                                        args,
+                                    },
+                                    "chat.rewind_approval_requested",
+                                );
+                                if dispatch_result != crate::chat::dispatcher::DispatchResult::Sent {
+                                    let _ = router.resolve(&tool_id, false);
+                                    emit_chat_output("Rewind approval could not be shown; current session unchanged.");
+                                    continue;
+                                }
+                                pending_chat_rewind = Some(PendingChatRewind {
+                                    tool_id,
+                                    target_session,
+                                    approval_rx,
+                                });
+                                emit_chat_output(&format!(
+                                    "Confirm rewind to {keep_turns} turns in the approval prompt."
+                                ));
+                            }
                         }
                     }
                     continue;
@@ -6756,6 +6939,197 @@ async fn saved_chat_sessions(mem: &dyn Memory) -> Result<Vec<session::ChatSessio
     Ok(sessions)
 }
 
+fn parse_turn_boundary(raw: &str, turn_count: usize, command: &str) -> std::result::Result<usize, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!("Usage: /{command} <N> where N is between 0 and {turn_count}."));
+    }
+    if trimmed.split_whitespace().count() != 1 {
+        return Err(format!("Usage: /{command} <N> where N is between 0 and {turn_count}."));
+    }
+    let boundary = trimmed
+        .parse::<usize>()
+        .map_err(|_| format!("Invalid turn boundary '{trimmed}'. Use a number between 0 and {turn_count}."))?;
+    if boundary > turn_count {
+        return Err(format!(
+            "Turn boundary {boundary} is out of range. This session has {turn_count} turns."
+        ));
+    }
+    Ok(boundary)
+}
+
+fn background_summaries_for_turn_boundary(
+    session: &session::ChatSession,
+    keep_turns: usize,
+) -> Vec<crate::chat::sessions::PersistedSessionSummary> {
+    if keep_turns == session.turn_count() {
+        session.background_sessions.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+fn branched_chat_session_from(
+    current: &session::ChatSession,
+    keep_turns: usize,
+    provider_name: &str,
+    model_name: &str,
+) -> session::ChatSession {
+    let mut branch = session::ChatSession::new(provider_name, model_name);
+    branch.id = safe_branch_session_id();
+    branch.title = if current.title.is_empty() {
+        format!("Branch at {keep_turns} turns")
+    } else {
+        format!("{} (branch at {keep_turns})", current.title)
+    };
+    branch.turns = current.turns.iter().take(keep_turns).cloned().collect();
+    branch.background_sessions = background_summaries_for_turn_boundary(current, keep_turns);
+    branch.updated_at = chrono::Utc::now();
+    branch
+}
+
+fn safe_branch_session_id() -> String {
+    let uuid = uuid::Uuid::new_v4();
+    let mut id = String::with_capacity("branch-".len() + 32);
+    id.push_str("branch-");
+    for byte in uuid.as_bytes() {
+        id.push(char::from(b'a' + (byte >> 4)));
+        id.push(char::from(b'a' + (byte & 0x0f)));
+    }
+    id
+}
+
+fn rewound_chat_session_from(current: &session::ChatSession, keep_turns: usize) -> session::ChatSession {
+    let mut rewound = current.clone();
+    rewound.turns.truncate(keep_turns);
+    rewound.background_sessions = background_summaries_for_turn_boundary(current, keep_turns);
+    rewound.updated_at = chrono::Utc::now();
+    rewound
+}
+
+fn format_turn_boundaries(session: &session::ChatSession) -> String {
+    let mut out = format!(
+        "Turn boundaries for session {} ({} turns):\n",
+        session.id,
+        session.turn_count()
+    );
+    out.push_str("  0 | empty branch\n");
+    for (idx, turn) in session.turns.iter().enumerate() {
+        let boundary = idx.saturating_add(1);
+        let preview = truncate_with_ellipsis(&turn.content.replace('\n', " "), 72);
+        out.push_str(&format!("  {boundary} | {} | {}\n", turn.role, preview.trim()));
+    }
+    out.push_str("\nUse /branch <N> to fork, or /rewind <N> to trim this session.");
+    out
+}
+
+struct ChatSwitchCtx<'a> {
+    chat_session: &'a mut session::ChatSession,
+    chat_session_key: &'a mut String,
+    fabric_turn_seq: &'a mut u64,
+    history: &'a mut Vec<ChatMessage>,
+    chat_sessions: &'a mut crate::chat::sessions::ChatSessionsHandle,
+    ignored_session_events: &'a mut std::collections::HashSet<crate::chat::sessions::id::SessionId>,
+    session_rings:
+        &'a mut std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reported_sessions: &'a mut std::collections::HashSet<String>,
+    last_sessions_summary: &'a mut String,
+    last_sessions_entries: &'a mut Vec<crate::chat::sessions::SwitcherEntry>,
+    attached_follow: &'a mut Option<crate::chat::sessions::id::SessionId>,
+    attached_follow_seq: &'a mut Option<u64>,
+    chat_dispatcher: &'a dispatcher::ChatDispatcher,
+    redraw_handle: Option<&'a mpsc::Sender<()>>,
+    config: &'a Config,
+    provider_name: &'a str,
+    model_name: &'a str,
+    tool_descs: &'a [(&'a str, &'a str)],
+    skills: &'a [crate::skills::Skill],
+    native_tools: bool,
+    tools_registry: &'a [Box<dyn Tool>],
+    #[cfg(feature = "terminal-tui")]
+    chat_mirror: &'a Arc<parking_lot::Mutex<tui::TuiState>>,
+}
+
+struct PendingChatRewind {
+    tool_id: String,
+    target_session: session::ChatSession,
+    approval_rx: tokio::sync::oneshot::Receiver<bool>,
+}
+
+async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
+    let (_detached_summaries, ignored_ids) = ctx.chat_sessions.detach_for_chat_session_switch().await;
+    ctx.ignored_session_events.extend(ignored_ids);
+    ctx.session_rings.clear();
+    ctx.reported_sessions.clear();
+    ctx.last_sessions_summary.clear();
+    ctx.last_sessions_entries.clear();
+    *ctx.attached_follow = None;
+    *ctx.attached_follow_seq = None;
+
+    bind_session_to_runtime_provider_model(&mut loaded_session, ctx.provider_name, ctx.model_name);
+    *ctx.chat_session = loaded_session;
+    *ctx.chat_session_key = format!("chat:{}", ctx.chat_session.id);
+    *ctx.fabric_turn_seq = ctx
+        .chat_session
+        .turns
+        .iter()
+        .filter(|turn| turn.role == "user")
+        .fold(0_u64, |acc, _| acc.saturating_add(1));
+    *ctx.history = history_for_session_with_system(
+        ctx.chat_session,
+        ctx.config,
+        ctx.model_name,
+        ctx.tool_descs,
+        ctx.skills,
+        ctx.native_tools,
+        ctx.tools_registry,
+    );
+
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionLoaded(ctx.chat_session.clone()),
+        "chat.session_switch_loaded",
+    );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged {
+            focus: crate::chat::sessions::FocusTarget::Main,
+        },
+        "chat.session_switch_focus_main",
+    );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+        "chat.session_switch_clear_active_session_view",
+    );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionsStatusUpdated { summary: String::new() },
+        "chat.session_switch_clear_sessions_status",
+    );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionsEntriesUpdated { entries: Vec::new() },
+        "chat.session_switch_clear_sessions_entries",
+    );
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SwitcherClosed,
+        "chat.session_switch_switcher_closed",
+    );
+
+    #[cfg(feature = "terminal-tui")]
+    {
+        let mut mirror = ctx.chat_mirror.lock();
+        mirror.session_title = ctx.chat_session.title.clone();
+        mirror.turn_count = ctx.chat_session.turn_count();
+        mirror.conversation_lines = conversation_lines_for_resumed_session(ctx.chat_session);
+        mirror.streaming = None;
+        mirror.sessions_status.clear();
+        mirror.sessions_cache.clear();
+        mirror.active_session_view = None;
+        mirror.focus = crate::chat::sessions::FocusTarget::Main;
+        mirror.switcher = None;
+    }
+    if let Some(tx) = ctx.redraw_handle {
+        let _ = tx.try_send(());
+    }
+}
+
 fn should_ignore_session_event_after_chat_resume(
     ignored_session_events: &std::collections::HashSet<crate::chat::sessions::id::SessionId>,
     event: &crate::chat::sessions::SessionEvent,
@@ -8693,6 +9067,93 @@ mod p7a_resume_tests {
             !should_ignore_session_event_after_chat_resume(&ignored_session_events, &new_event),
             "events from new child sessions must still route normally after resume"
         );
+    }
+}
+
+#[cfg(test)]
+mod p7b_branch_rewind_tests {
+    use super::*;
+
+    fn turn(role: &str, content: &str) -> session::ChatTurn {
+        session::ChatTurn {
+            role: role.to_string(),
+            content: content.to_string(),
+            timestamp: chrono::Utc::now(),
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn child_summary(id: &str) -> crate::chat::sessions::PersistedSessionSummary {
+        crate::chat::sessions::PersistedSessionSummary {
+            id: id.to_string(),
+            seq: 1,
+            kind: "agent".to_string(),
+            origin: "test".to_string(),
+            status: "done".to_string(),
+            title: "child".to_string(),
+            summary: "summary".to_string(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn sample_session() -> session::ChatSession {
+        let mut s = session::ChatSession::new("kimi-code", "kimi2.6");
+        s.title = "source".to_string();
+        s.turns = vec![
+            turn("user", "first"),
+            turn("assistant", "second"),
+            turn("user", "third"),
+        ];
+        s.background_sessions = vec![child_summary("child-1")];
+        s
+    }
+
+    #[test]
+    fn branch_rewind_turn_boundary_parser_rejects_bad_and_out_of_range() {
+        assert_eq!(parse_turn_boundary("0", 3, "branch"), Ok(0));
+        assert_eq!(parse_turn_boundary("3", 3, "rewind"), Ok(3));
+        assert!(parse_turn_boundary("", 3, "rewind").is_err());
+        assert!(parse_turn_boundary("2 extra", 3, "branch").is_err());
+        assert!(parse_turn_boundary("nan", 3, "branch").is_err());
+        assert!(parse_turn_boundary("4", 3, "rewind").is_err());
+    }
+
+    #[test]
+    fn branch_and_rewind_prefixes_are_exact_and_ordered() {
+        let source = sample_session();
+        let branch = branched_chat_session_from(&source, 2, "kimi-code", "kimi2.6");
+        let rewound = rewound_chat_session_from(&source, 2);
+
+        assert_ne!(branch.id, source.id, "branch must fork a new saved session id");
+        assert!(branch.id.starts_with("branch-"));
+        assert!(
+            branch.id.chars().all(|ch| ch == '-' || ch.is_ascii_lowercase()),
+            "branch id must stay memory-safety friendly: {}",
+            branch.id
+        );
+        assert_eq!(branch.turns.len(), 2);
+        assert_eq!(rewound.id, source.id, "rewind trims current session in place");
+        assert_eq!(rewound.turns.len(), 2);
+        for idx in 0..2 {
+            assert_eq!(branch.turns[idx].role, source.turns[idx].role);
+            assert_eq!(branch.turns[idx].content, source.turns[idx].content);
+            assert_eq!(rewound.turns[idx].role, source.turns[idx].role);
+            assert_eq!(rewound.turns[idx].content, source.turns[idx].content);
+        }
+    }
+
+    #[test]
+    fn child_summaries_survive_only_at_full_length_boundary() {
+        let source = sample_session();
+        let full_branch = branched_chat_session_from(&source, source.turn_count(), "kimi-code", "kimi2.6");
+        let short_branch = branched_chat_session_from(&source, 2, "kimi-code", "kimi2.6");
+        let full_rewind = rewound_chat_session_from(&source, source.turn_count());
+        let short_rewind = rewound_chat_session_from(&source, 2);
+
+        assert_eq!(full_branch.background_sessions.len(), 1);
+        assert!(short_branch.background_sessions.is_empty());
+        assert_eq!(full_rewind.background_sessions.len(), 1);
+        assert!(short_rewind.background_sessions.is_empty());
     }
 }
 

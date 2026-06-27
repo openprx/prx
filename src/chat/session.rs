@@ -74,7 +74,7 @@ impl ChatSession {
     pub fn new(provider: &str, model: &str) -> Self {
         let now = Utc::now();
         Self {
-            id: Uuid::new_v4().to_string(),
+            id: new_chat_session_id(),
             schema_version: SCHEMA_VERSION,
             title: String::new(),
             provider: provider.to_string(),
@@ -163,6 +163,17 @@ impl ChatSession {
     }
 }
 
+fn new_chat_session_id() -> String {
+    let uuid = Uuid::new_v4();
+    let mut id = String::with_capacity("chat-".len() + 32);
+    id.push_str("chat-");
+    for byte in uuid.as_bytes() {
+        id.push(char::from(b'a' + (byte >> 4)));
+        id.push(char::from(b'a' + (byte & 0x0f)));
+    }
+    id
+}
+
 /// Truncate content to a title (max 50 chars, break at word boundary).
 pub(crate) fn truncate_title(content: &str) -> String {
     let trimmed = content.trim();
@@ -197,7 +208,8 @@ mod tests {
         assert_eq!(session.model, "anthropic/claude-sonnet-4");
         assert!(session.title.is_empty());
         assert!(session.turns.is_empty());
-        assert!(!session.id.is_empty());
+        assert!(session.id.starts_with("chat-"));
+        assert!(session.id.chars().all(|ch| ch == '-' || ch.is_ascii_lowercase()));
     }
 
     #[test]

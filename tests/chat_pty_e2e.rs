@@ -807,6 +807,84 @@ fn test_chat_plain_continue_resumes_last_session_no_tui_chrome() {
     );
 }
 
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_branch_forks_prefix_no_tui_chrome() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "BRANCH_SOURCE_REPLY")],
+        "branch source\n/exit\n",
+    );
+    let source_id = first_saved_session_id(&list_sessions_in(&guard));
+
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "BRANCH_UNUSED_REPLY")],
+        &format!("/resume {source_id}\n/branch 1\n/cost\n/exit\n"),
+    );
+
+    assert!(
+        output.contains("Created branch"),
+        "branch confirmation missing; output:\n{output}"
+    );
+    assert!(
+        output.contains("Turns:        1"),
+        "cost after /branch 1 should reflect the forked one-turn prefix; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain /branch must not render TUI chrome; output:\n{output}"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_rewind_env_override_cannot_bypass_interactive_confirmation() {
+    let guard = new_harness_guard().expect("harness guard");
+
+    let _ = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("OPENPRX_MOCK_RESPONSE", "REWIND_SOURCE_REPLY")],
+        "rewind source\n/exit\n",
+    );
+    let source_id = first_saved_session_id(&list_sessions_in(&guard));
+
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[
+            ("PRX_TUI", "1"),
+            ("OPENPRX_APPROVAL_OVERRIDE", "allow"),
+            ("OPENPRX_MOCK_RESPONSE", "REWIND_UNUSED_REPLY"),
+        ],
+        &format!("/resume {source_id}\n/rewind 0\n/cost\n/exit\n"),
+    );
+
+    assert!(
+        output.contains("Rewind requires interactive confirmation"),
+        "plain rewind must fail closed before any env override path; output:\n{output}"
+    );
+    assert!(
+        output.contains("Turns:        2"),
+        "plain rewind must leave the resumed two-turn session unchanged; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain /rewind fail-closed path must not render TUI chrome; output:\n{output}"
+    );
+}
+
 /// 6. Chinese (CJK) characters in the mock response must appear contiguously
 /// — no phantom space between each character (regression guard for the
 /// `insert_before` wide-char bug fixed by enabling the `scrolling-regions`
