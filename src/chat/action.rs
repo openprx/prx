@@ -169,6 +169,11 @@ pub enum Action {
     /// 单 mpsc 入口）把决策转给等待中的 driver；driver 端按 `tool_id` 对应到
     /// pending oneshot::Sender<bool> 并 resolve。
     ToolApprovalReceived { tool_id: String, approved: bool },
+    /// Clear any visible approval prompt without approving anything.
+    ///
+    /// Used when a session switch fail-closes outstanding approval routes before
+    /// swapping per-session state.
+    ToolApprovalCleared,
     /// **S3 T3-1**: 网络瞬时故障重试尝试通知（仅作 UI / trace 用，不变状态）.
     ///
     /// `attempt` 从 1 起计数（第 1 次失败 → attempt=1 之后开始 sleep 重试）。
@@ -323,6 +328,7 @@ impl Action {
             Self::ToolProgress { .. } => "ToolProgress",
             Self::ToolApprovalRequested { .. } => "ToolApprovalRequested",
             Self::ToolApprovalReceived { .. } => "ToolApprovalReceived",
+            Self::ToolApprovalCleared => "ToolApprovalCleared",
             Self::StreamRetryAttempt { .. } => "StreamRetryAttempt",
             Self::SessionLoaded(_) => "SessionLoaded",
             Self::SessionSaved { .. } => "SessionSaved",

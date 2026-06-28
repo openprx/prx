@@ -2204,6 +2204,9 @@ pub async fn run(
                                 chat_session_key: &mut chat_session_key,
                                 fabric_turn_seq: &mut fabric_turn_seq,
                                 history: &mut history,
+                                approval_router: approval_router.as_ref(),
+                                pending_chat_rewind: &mut pending_chat_rewind,
+                                pending_diff_apply: &mut pending_diff_apply,
                                 chat_sessions: &mut chat_sessions,
                                 ignored_session_events: &mut ignored_session_events,
                                 session_rings: &mut session_rings,
@@ -2273,6 +2276,9 @@ pub async fn run(
                             chat_session_key: &mut chat_session_key,
                             fabric_turn_seq: &mut fabric_turn_seq,
                             history: &mut history,
+                            approval_router: approval_router.as_ref(),
+                            pending_chat_rewind: &mut pending_chat_rewind,
+                            pending_diff_apply: &mut pending_diff_apply,
                             chat_sessions: &mut chat_sessions,
                             ignored_session_events: &mut ignored_session_events,
                             session_rings: &mut session_rings,
@@ -2964,6 +2970,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
+                                    approval_router: approval_router.as_ref(),
+                                    pending_chat_rewind: &mut pending_chat_rewind,
+                                    pending_diff_apply: &mut pending_diff_apply,
                                     chat_sessions: &mut chat_sessions,
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
@@ -3043,6 +3052,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
+                                    approval_router: approval_router.as_ref(),
+                                    pending_chat_rewind: &mut pending_chat_rewind,
+                                    pending_diff_apply: &mut pending_diff_apply,
                                     chat_sessions: &mut chat_sessions,
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
@@ -3126,6 +3138,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     chat_session_key: &mut chat_session_key,
                                     fabric_turn_seq: &mut fabric_turn_seq,
                                     history: &mut history,
+                                    approval_router: approval_router.as_ref(),
+                                    pending_chat_rewind: &mut pending_chat_rewind,
+                                    pending_diff_apply: &mut pending_diff_apply,
                                     chat_sessions: &mut chat_sessions,
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
@@ -3167,8 +3182,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 ));
                                 continue;
                             }
-                            if pending_chat_rewind.is_some() {
-                                emit_chat_output("Rewind already awaits approval; approve or cancel it first.");
+                            if approval_in_progress(approval_router.as_ref(), &pending_chat_rewind, &pending_diff_apply)
+                            {
+                                emit_chat_output(approval_already_pending_message());
                                 continue;
                             }
                             if sessions_redraw_handle.is_none() {
@@ -3195,7 +3211,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 let target_session = rewound_chat_session_from(&chat_session, keep_turns);
                                 let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<bool>();
                                 let tool_id = format!("chat_rewind:{}", uuid::Uuid::new_v4());
-                                router.register(tool_id.clone(), approval_tx);
+                                if !router.register(tool_id.clone(), approval_tx) {
+                                    emit_chat_output(approval_already_pending_message());
+                                    continue;
+                                }
                                 let args = serde_json::json!({
                                     "session_id": chat_session.id,
                                     "from_turns": chat_session.turn_count(),
@@ -3234,8 +3253,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         commands::ApplyCommand::Latest => 1,
                         commands::ApplyCommand::Index(index) => index,
                     };
-                    if pending_diff_apply.is_some() {
-                        emit_chat_output("Diff apply already awaits approval; approve or cancel it first.");
+                    if approval_in_progress(approval_router.as_ref(), &pending_chat_rewind, &pending_diff_apply) {
+                        emit_chat_output(approval_already_pending_message());
                         continue;
                     }
                     let Some(diff) = diff_apply::latest_fenced_diff(&chat_session.turns, latest_index) else {
@@ -7341,6 +7360,9 @@ struct ChatSwitchCtx<'a> {
     chat_session_key: &'a mut String,
     fabric_turn_seq: &'a mut u64,
     history: &'a mut Vec<ChatMessage>,
+    approval_router: Option<&'a Arc<dispatcher::ApprovalRouter>>,
+    pending_chat_rewind: &'a mut Option<PendingChatRewind>,
+    pending_diff_apply: &'a mut Option<PendingDiffApply>,
     chat_sessions: &'a mut crate::chat::sessions::ChatSessionsHandle,
     ignored_session_events: &'a mut std::collections::HashSet<crate::chat::sessions::id::SessionId>,
     session_rings:
@@ -7393,6 +7415,61 @@ struct PendingDiffApply {
     approval_rx: tokio::sync::oneshot::Receiver<bool>,
 }
 
+fn approval_in_progress(
+    approval_router: Option<&Arc<dispatcher::ApprovalRouter>>,
+    pending_chat_rewind: &Option<PendingChatRewind>,
+    pending_diff_apply: &Option<PendingDiffApply>,
+) -> bool {
+    pending_chat_rewind.is_some()
+        || pending_diff_apply.is_some()
+        || approval_router.is_some_and(|router| router.has_pending())
+}
+
+const fn approval_already_pending_message() -> &'static str {
+    "Another approval is already pending; approve or cancel it first."
+}
+
+fn clear_pending_approvals_for_session_switch(ctx: &mut ChatSwitchCtx<'_>) -> usize {
+    let mut cleared_ids = Vec::new();
+    if let Some(router) = ctx.approval_router {
+        for tool_id in router.resolve_all(false) {
+            cleared_ids.push(tool_id);
+        }
+    }
+    if let Some(pending) = ctx.pending_chat_rewind.take() {
+        if !cleared_ids.iter().any(|existing| existing == &pending.tool_id) {
+            cleared_ids.push(pending.tool_id);
+        }
+    }
+    if let Some(pending) = ctx.pending_diff_apply.take() {
+        if !cleared_ids.iter().any(|existing| existing == &pending.tool_id) {
+            cleared_ids.push(pending.tool_id);
+        }
+    }
+    for tool_id in &cleared_ids {
+        let _ = ctx.chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::ToolApprovalReceived {
+                tool_id: tool_id.clone(),
+                approved: false,
+            },
+            "chat.session_switch_fail_closed_approval",
+        );
+    }
+    let _ = ctx.chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ToolApprovalCleared,
+        "chat.session_switch_clear_approval_view",
+    );
+    #[cfg(feature = "terminal-tui")]
+    {
+        let mut mirror = ctx.chat_mirror.lock();
+        mirror.pending_tool_approval = None;
+        if matches!(mirror.focus, crate::chat::sessions::FocusTarget::Approval) {
+            mirror.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+    }
+    cleared_ids.len()
+}
+
 #[cfg(feature = "terminal-tui")]
 fn request_diff_apply_approval(
     plan: diff_apply::DiffApplyPlan,
@@ -7413,7 +7490,9 @@ fn request_diff_apply_approval(
     };
     let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<bool>();
     let tool_id = format!("diff_apply:{}", uuid::Uuid::new_v4());
-    router.register(tool_id.clone(), approval_tx);
+    if !router.register(tool_id.clone(), approval_tx) {
+        return Err(approval_already_pending_message().to_string());
+    }
     let args = plan.approval_args_json();
     let dispatch_result = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ToolApprovalRequested {
@@ -7483,7 +7562,14 @@ async fn resume_saved_session_by_id(mem: &dyn Memory, target_id: &str, ctx: Chat
     ))
 }
 
-async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
+async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_session: session::ChatSession) {
+    let cleared_approvals = clear_pending_approvals_for_session_switch(&mut ctx);
+    if cleared_approvals > 0 {
+        tracing::warn!(
+            cleared_approvals,
+            "session switch resolved pending approvals fail-closed before swapping state"
+        );
+    }
     let (_detached_summaries, ignored_ids) = ctx.chat_sessions.detach_for_chat_session_switch().await;
     ctx.ignored_session_events.extend(ignored_ids);
     ctx.session_rings.clear();
@@ -7555,6 +7641,10 @@ async fn apply_chat_session_switch(ctx: ChatSwitchCtx<'_>, mut loaded_session: s
         mirror.sessions_status.clear();
         mirror.sessions_cache.clear();
         mirror.active_session_view = None;
+        mirror.pending_tool_approval = None;
+        mirror.context_window_tokens = None;
+        mirror.external_editor_prefix_armed = false;
+        mirror.input.clear_navigation_state();
         mirror.focus = crate::chat::sessions::FocusTarget::Main;
         mirror.switcher = None;
         mirror.saved_session_picker = None;
@@ -9870,6 +9960,167 @@ mod p7b_branch_rewind_tests {
             }
             RewindApprovalOutcome::Apply => panic!("dropped channel must not enter apply arm"),
         }
+    }
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+mod regfix_approval_switch_tests {
+    use super::*;
+    use crate::chat::action::Action;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    #[tokio::test]
+    async fn session_switch_fail_closes_pending_approvals_and_resets_mirror() {
+        let (chat_dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        let approval_router = Arc::new(dispatcher::ApprovalRouter::new());
+        let (router_tx, mut router_rx) = tokio::sync::oneshot::channel::<bool>();
+        assert!(approval_router.register("tool-live".to_string(), router_tx));
+
+        let (_rewind_tx, rewind_rx) = tokio::sync::oneshot::channel::<bool>();
+        let (_apply_tx, apply_rx) = tokio::sync::oneshot::channel::<bool>();
+        let mut pending_chat_rewind = Some(PendingChatRewind {
+            tool_id: "rewind-live".to_string(),
+            target_session: session::ChatSession::new("p", "m"),
+            approval_rx: rewind_rx,
+        });
+        let plan = diff_apply::parse_unified_diff(
+            "diff --git a/foo.txt b/foo.txt\n--- a/foo.txt\n+++ b/foo.txt\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .expect("valid diff fixture");
+        let mut pending_diff_apply = Some(PendingDiffApply {
+            tool_id: "diff-live".to_string(),
+            plan,
+            approval_rx: apply_rx,
+        });
+
+        let mut chat_session = session::ChatSession::new("p", "m");
+        chat_session.id = "current-session".to_string();
+        chat_session.add_user_turn("current");
+        let mut loaded_session = session::ChatSession::new("p", "m");
+        loaded_session.id = "loaded-session".to_string();
+        loaded_session.title = "Loaded".to_string();
+        loaded_session.add_user_turn("hello");
+        loaded_session.add_assistant_turn("hi", vec![]);
+        let mut chat_session_key = "chat:current-session".to_string();
+        let mut fabric_turn_seq = 9;
+        let mut history = vec![ChatMessage::user("old history")];
+        let active_runs = Arc::new(RwLock::new(Vec::<crate::tools::sessions_spawn::SubAgentRun>::new()));
+        let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(active_runs);
+        let mut ignored_session_events = std::collections::HashSet::new();
+        let mut session_rings = std::collections::HashMap::new();
+        let mut reported_sessions = std::collections::HashSet::new();
+        let mut last_sessions_summary = "stale summary".to_string();
+        let mut last_sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "model",
+            status: "running",
+            title: "stale".to_string(),
+        }];
+        let mut attached_follow = None;
+        let mut attached_follow_seq = Some(7);
+        let config = Config::default();
+        let tool_descs: Vec<(&str, &str)> = Vec::new();
+        let skills: Vec<crate::skills::Skill> = Vec::new();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let chat_mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
+        {
+            let mut mirror = chat_mirror.lock();
+            mirror.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+                tool_id: "tool-live".to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+            });
+            mirror.context_window_tokens = Some(10_000_000);
+            mirror.external_editor_prefix_armed = true;
+            mirror.input.set_text("draft");
+            assert!(mirror.input.begin_or_cycle_reverse_search());
+            mirror.focus = crate::chat::sessions::FocusTarget::Approval;
+        }
+
+        apply_chat_session_switch(
+            ChatSwitchCtx {
+                chat_session: &mut chat_session,
+                chat_session_key: &mut chat_session_key,
+                fabric_turn_seq: &mut fabric_turn_seq,
+                history: &mut history,
+                approval_router: Some(&approval_router),
+                pending_chat_rewind: &mut pending_chat_rewind,
+                pending_diff_apply: &mut pending_diff_apply,
+                chat_sessions: &mut chat_sessions,
+                ignored_session_events: &mut ignored_session_events,
+                session_rings: &mut session_rings,
+                reported_sessions: &mut reported_sessions,
+                last_sessions_summary: &mut last_sessions_summary,
+                last_sessions_entries: &mut last_sessions_entries,
+                attached_follow: &mut attached_follow,
+                attached_follow_seq: &mut attached_follow_seq,
+                chat_dispatcher: &chat_dispatcher,
+                redraw_handle: None,
+                config: &config,
+                provider_name: "p",
+                model_name: "m",
+                tool_descs: &tool_descs,
+                skills: &skills,
+                native_tools: false,
+                tools_registry: &tools_registry,
+                chat_mirror: &chat_mirror,
+            },
+            loaded_session,
+        )
+        .await;
+
+        assert_eq!(router_rx.try_recv(), Ok(false), "router approval must be denied");
+        assert!(pending_chat_rewind.is_none());
+        assert!(pending_diff_apply.is_none());
+        assert!(!approval_router.has_pending());
+        assert_eq!(chat_session.id, "loaded-session");
+        assert_eq!(chat_session_key, "chat:loaded-session");
+        assert_eq!(fabric_turn_seq, 1);
+        assert!(last_sessions_summary.is_empty());
+        assert!(last_sessions_entries.is_empty());
+        assert!(attached_follow.is_none());
+        assert!(attached_follow_seq.is_none());
+        {
+            let mirror = chat_mirror.lock();
+            assert!(mirror.pending_tool_approval.is_none());
+            assert_eq!(mirror.context_window_tokens, None);
+            assert!(!mirror.external_editor_prefix_armed);
+            assert!(!mirror.input.is_reverse_search_active());
+            assert_eq!(mirror.focus, crate::chat::sessions::FocusTarget::Main);
+            assert_eq!(mirror.turn_count, 2);
+        }
+
+        let mut received = Vec::new();
+        let mut saw_clear = false;
+        while let Ok(action) = action_rx.try_recv() {
+            match action {
+                Action::ToolApprovalReceived { tool_id, approved } => received.push((tool_id, approved)),
+                Action::ToolApprovalCleared => saw_clear = true,
+                _ => {}
+            }
+        }
+        assert!(received.contains(&("tool-live".to_string(), false)));
+        assert!(received.contains(&("rewind-live".to_string(), false)));
+        assert!(received.contains(&("diff-live".to_string(), false)));
+        assert!(saw_clear, "switch must clear reducer approval display");
+    }
+
+    #[test]
+    fn approval_in_progress_covers_router_rewind_and_diff_apply() {
+        let router = Arc::new(dispatcher::ApprovalRouter::new());
+        let (tx, _rx) = tokio::sync::oneshot::channel::<bool>();
+        assert!(router.register("tool-live".to_string(), tx));
+        assert!(approval_in_progress(Some(&router), &None, &None));
+
+        let (_tx, rewind_rx) = tokio::sync::oneshot::channel::<bool>();
+        let pending_rewind = Some(PendingChatRewind {
+            tool_id: "rewind-live".to_string(),
+            target_session: session::ChatSession::new("p", "m"),
+            approval_rx: rewind_rx,
+        });
+        assert!(approval_in_progress(None, &pending_rewind, &None));
     }
 }
 

@@ -62,8 +62,8 @@ pub const ACTION_CHANNEL_CAPACITY: usize = 2048;
 /// - parking_lot Mutex：register/resolve 都是短同步操作，绝不持锁过 await
 /// - 拒绝 / 超时 / 取消任意路径都由 driver 自身负责清理 pending（drop oneshot tx）
 ///
-/// 不变量：每个 `tool_id` 至多注册一次。重复注册视为 BUG（driver bug），后注册
-/// 会替换前一个 sender — 由 driver 保证不发生（每次发请求前 tool_id 是唯一新值）。
+/// 不变量：最多一个 foreground approval 同时 pending。后续请求会 fail-closed
+/// resolve false，不会覆盖正在显示/等待的人类审批。
 #[derive(Default)]
 pub struct ApprovalRouter {
     pending: ParkingMutex<std::collections::HashMap<String, tokio::sync::oneshot::Sender<bool>>>,
@@ -80,12 +80,43 @@ impl ApprovalRouter {
 
     /// driver 注册一个 pending approval（`tool_id`→`tx`）.
     ///
-    /// 同 `tool_id` 已存在时旧 sender 被替换（仅用作防御性容错，正常路径不会触发）.
-    pub fn register(&self, tool_id: String, tx: tokio::sync::oneshot::Sender<bool>) {
+    /// 已有任何 pending approval 时，新请求立即 fail-closed（给新 tx 发送 false）
+    /// 并返回 false，调用方不得再渲染第二个 approval prompt。
+    pub fn register(&self, tool_id: String, tx: tokio::sync::oneshot::Sender<bool>) -> bool {
         let mut guard = self.pending.lock();
+        if !guard.is_empty() {
+            tracing::warn!(
+                tool_id = %tool_id,
+                pending = guard.len(),
+                "ApprovalRouter::register: rejecting concurrent approval request"
+            );
+            drop(guard);
+            let _ = tx.send(false);
+            return false;
+        }
         if guard.insert(tool_id.clone(), tx).is_some() {
             tracing::warn!(tool_id = %tool_id, "ApprovalRouter::register: replacing existing pending tx");
         }
+        true
+    }
+
+    /// True when any foreground approval is waiting for a decision.
+    #[must_use]
+    pub fn has_pending(&self) -> bool {
+        !self.pending.lock().is_empty()
+    }
+
+    /// Resolve every pending approval with one decision and return their ids.
+    ///
+    /// Used by session-switch cleanup to fail closed before swapping sessions.
+    pub fn resolve_all(&self, approved: bool) -> Vec<String> {
+        let pending = std::mem::take(&mut *self.pending.lock());
+        let mut resolved = Vec::with_capacity(pending.len());
+        for (tool_id, tx) in pending {
+            let _ = tx.send(approved);
+            resolved.push(tool_id);
+        }
+        resolved
     }
 
     /// dispatcher_task 调用：取出 pending sender 并 resolve 决策.
@@ -108,6 +139,27 @@ impl ApprovalRouter {
                 true
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod approval_router_regression_tests {
+    use super::ApprovalRouter;
+
+    #[test]
+    fn approval_router_rejects_concurrent_registration_without_replacing_first() {
+        let router = ApprovalRouter::new();
+        let (first_tx, mut first_rx) = tokio::sync::oneshot::channel::<bool>();
+        let (second_tx, mut second_rx) = tokio::sync::oneshot::channel::<bool>();
+
+        assert!(router.register("first".to_string(), first_tx));
+        assert!(!router.register("second".to_string(), second_tx));
+        assert!(router.has_pending());
+        assert_eq!(second_rx.try_recv(), Ok(false), "second approval must fail closed");
+
+        assert!(router.resolve("first", true));
+        assert_eq!(first_rx.try_recv(), Ok(true), "first pending approval must stay intact");
+        assert!(!router.has_pending());
     }
 }
 
@@ -1890,18 +1942,20 @@ async fn execute_single_tool_call(
     if needs_approval {
         if let Some(router) = approval_router {
             let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-            router.register(call.id.clone(), tx);
+            let registered = router.register(call.id.clone(), tx);
             // 通知 reducer / UI 请求 approval.
-            if let Err(e) = action_tx
-                .send(Action::ToolApprovalRequested {
-                    tool_id: call.id.clone(),
-                    name: call.name.clone(),
-                    args: call.args.clone(),
-                })
-                .await
-            {
-                tracing::debug!(error = %e, "StartTurn: action_tx closed on approval-request");
-                return ToolExecOutcome::SenderClosed;
+            if registered {
+                if let Err(e) = action_tx
+                    .send(Action::ToolApprovalRequested {
+                        tool_id: call.id.clone(),
+                        name: call.name.clone(),
+                        args: call.args.clone(),
+                    })
+                    .await
+                {
+                    tracing::debug!(error = %e, "StartTurn: action_tx closed on approval-request");
+                    return ToolExecOutcome::SenderClosed;
+                }
             }
             // 等响应（与 cancel 竞速；cancel 时清理 pending router）.
             let approved = tokio::select! {

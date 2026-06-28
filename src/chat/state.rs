@@ -714,6 +714,7 @@ impl ChatState {
             Action::ToolApprovalReceived { tool_id, approved } => {
                 self.reduce_tool_approval_received(&tool_id, approved)
             }
+            Action::ToolApprovalCleared => self.reduce_tool_approval_cleared(),
             Action::StreamRetryAttempt { attempt, reason } => self.reduce_stream_retry_attempt(attempt, &reason),
 
             // ── 会话 ──────────────────────────────────────────────
@@ -774,7 +775,7 @@ impl ChatState {
         // BUG-01: 旧实现只切 ToolResult，导致 thinking/Reasoning 卡按 Tab 永不展开
         // （折叠提示却写着 "press Tab to expand"）。与 tui::toggle_last_foldable_card
         // 的统一语义对齐。
-        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+        if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && self.ui.input.is_empty() {
             return self.reduce_foldable_card_toggled();
         }
         // Ctrl+R → reverse-search submitted input history. Tab is the sole
@@ -1521,6 +1522,20 @@ impl ChatState {
         ]
     }
 
+    fn reduce_tool_approval_cleared(&mut self) -> Vec<Effect> {
+        self.ui.pending_tool_approval = None;
+        if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+            self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+        vec![
+            Effect::LogTrace {
+                level: tracing::Level::DEBUG,
+                msg: "tool_approval_cleared".to_string(),
+            },
+            Effect::RequestRedraw,
+        ]
+    }
+
     /// **S3 T3-1**: `Action::StreamRetryAttempt` — 网络重试尝试，仅 trace + 重绘.
     ///
     /// 不 mutate state（driver 自己维护 attempt 计数）；UI 可据此显示 "retrying..." 提示。
@@ -1650,11 +1665,22 @@ impl ChatState {
             .collect();
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+        self.ui.input.clear_navigation_state();
+        self.ui.turn_count = self.session.turns.len();
         self.ui.active_session_view = None;
+        self.ui.pending_tool_approval = None;
+        self.ui.context_window_tokens = None;
+        self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         self.ui.sessions_status.clear();
         self.ui.sessions_entries.clear();
         self.ui.switcher = None;
         self.ui.saved_session_picker = None;
+        self.stream.draft = None;
+        self.stream.pending_tool_cards.clear();
+        self.control.generating = false;
+        self.control.active_cancel = None;
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -2260,7 +2286,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // 仅 LogTrace，不变 UI
         Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } => false,
         // Foreground approval writes pending view + focus.
-        Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } => true,
+        Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {
+            true
+        }
 
         // 会话：SessionLoaded 重建 history + 可能要求 UI 重置；SessionSaved/Switched 不影响 UI
         Action::SessionLoaded(_) => true,
@@ -2684,6 +2712,56 @@ mod tests {
         assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
         assert!(state.ui.input.is_empty());
         assert!(state.ui.pending_tool_approval.is_some());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn session_loaded_resets_transient_holder_set() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-stale".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-stale".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        state.ui.context_window_tokens = Some(10_000_000);
+        state.ui.input.set_text("draft text");
+        assert!(state.ui.input.begin_or_cycle_reverse_search());
+        state.control.generating = true;
+
+        let mut loaded = ChatSession::new("prov-new", "model-new");
+        loaded.id = "sess-new".to_string();
+        loaded.add_user_turn("hello");
+        loaded.add_assistant_turn("hi", vec![]);
+        let effects = state.reduce(Action::SessionLoaded(loaded));
+
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert_eq!(state.ui.context_window_tokens, None);
+        assert!(!state.ui.input.is_reverse_search_active());
+        assert_eq!(state.ui.turn_count, 2);
+        assert!(state.stream.draft.is_none());
+        assert!(!state.control.generating);
+        assert!(state.control.active_cancel.is_none());
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn reducer_tab_mid_edit_inserts_tab_instead_of_folding() {
+        let mut state = make_state();
+        state.ui.input.set_text("alpha");
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Tab,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(state.ui.input.text(), "alpha\t");
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
     }
 
     /// reduce 不 panic（健壮性 baseline，沿用 Step 1 名称便于 grep）

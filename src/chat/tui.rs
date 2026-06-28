@@ -603,7 +603,10 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         }
         return KeyDispatch::Consumed;
     }
-    if key.code == KeyCode::BackTab && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT) {
+    if key.code == KeyCode::BackTab
+        && (key.modifiers == KeyModifiers::NONE || key.modifiers == KeyModifiers::SHIFT)
+        && state.input.is_empty()
+    {
         let mode = cycle_chat_mode(state.chat_mode);
         state.chat_mode = mode;
         return KeyDispatch::ModeChanged(mode);
@@ -629,7 +632,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // Tab → toggle the most recent foldable card (reasoning OR tool-result,
     // whichever appears later in the conversation). When neither exists Tab
     // is still consumed — per spec it never falls through to the input box.
-    if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE {
+    if key.code == KeyCode::Tab && key.modifiers == KeyModifiers::NONE && state.input.is_empty() {
         let _ = state.toggle_last_foldable_card();
         return KeyDispatch::Consumed;
     }
@@ -1395,6 +1398,13 @@ impl TuiInput {
             }
             KeyCode::Char(ch) if !ctrl => {
                 if self.insert_char(ch) {
+                    InputOutcome::Consumed
+                } else {
+                    InputOutcome::Ignored
+                }
+            }
+            KeyCode::Tab => {
+                if self.insert_char('\t') {
                     InputOutcome::Consumed
                 } else {
                     InputOutcome::Ignored
@@ -5260,18 +5270,36 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_backtab_cycles_chat_mode_and_preserves_input() {
+    fn dispatch_tab_mid_edit_inserts_tab_instead_of_folding() {
         let mut state = TuiState::new("p", "m");
         state.input.set_text("alpha");
-        state.input.cursor = (0, 2);
+        state.push_tool_result_started("shell", "{}");
+        let folded_before = match state.conversation_lines.last() {
+            Some(ConversationLine::ToolResult { folded, .. }) => *folded,
+            _ => panic!("test: expected ToolResult at end"),
+        };
+
+        let out = dispatch_global_key(key(KeyCode::Tab), &mut state);
+
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "alpha\t");
+        let folded_after = match state.conversation_lines.last() {
+            Some(ConversationLine::ToolResult { folded, .. }) => *folded,
+            _ => panic!("test: expected ToolResult at end"),
+        };
+        assert_eq!(folded_before, folded_after, "mid-edit Tab must not fold cards");
+    }
+
+    #[test]
+    fn dispatch_backtab_cycles_chat_mode_when_input_empty() {
+        let mut state = TuiState::new("p", "m");
         state.chat_mode = ChatMode::Plan;
 
         let out = dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state);
 
         assert_eq!(out, KeyDispatch::ModeChanged(ChatMode::Edit));
         assert_eq!(state.chat_mode, ChatMode::Edit);
-        assert_eq!(state.input.text(), "alpha");
-        assert_eq!(state.input.cursor, (0, 2));
+        assert!(state.input.is_empty());
 
         assert_eq!(
             dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state),
@@ -5281,6 +5309,21 @@ mod tests {
             dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state),
             KeyDispatch::ModeChanged(ChatMode::Plan)
         );
+    }
+
+    #[test]
+    fn dispatch_backtab_mid_edit_does_not_cycle_mode() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("alpha");
+        state.input.cursor = (0, 2);
+        state.chat_mode = ChatMode::Plan;
+
+        let out = dispatch_global_key(key_mod(KeyCode::BackTab, KeyModifiers::SHIFT), &mut state);
+
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(state.chat_mode, ChatMode::Plan);
+        assert_eq!(state.input.text(), "alpha");
+        assert_eq!(state.input.cursor, (0, 2));
     }
 
     #[test]
