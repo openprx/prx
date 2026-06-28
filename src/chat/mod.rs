@@ -459,19 +459,66 @@ fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<C
     source
 }
 
+fn original_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
+    if history.len() <= 1 {
+        return Vec::new();
+    }
+
+    let has_system = history.first().is_some_and(|msg| msg.role == "system");
+    let start = if has_system { 1 } else { 0 };
+    let non_system_count = history.len().saturating_sub(start);
+    if non_system_count == 0 {
+        return Vec::new();
+    }
+
+    let mut lost_indices = std::collections::BTreeSet::new();
+    let mut retained: Vec<(usize, &ChatMessage)> = history.iter().enumerate().skip(start).collect();
+    if non_system_count > COMPACT_KEEP_MESSAGES {
+        let drop_count = non_system_count.saturating_sub(COMPACT_KEEP_MESSAGES);
+        for (index, _) in retained.iter().take(drop_count) {
+            lost_indices.insert(*index);
+        }
+        retained.drain(0..drop_count);
+    }
+
+    let mut compacted_chars = 0usize;
+    let mut budget_retained = Vec::new();
+    for (index, msg) in retained {
+        if msg.content.chars().count() > COMPACT_CONTENT_CHARS {
+            lost_indices.insert(index);
+        }
+        let compacted_len = msg.content.chars().count().min(COMPACT_CONTENT_CHARS);
+        compacted_chars = compacted_chars.saturating_add(compacted_len);
+        budget_retained.push((index, compacted_len));
+    }
+
+    while compacted_chars > COMPACT_TOTAL_CHARS && budget_retained.len() > 1 {
+        let (index, compacted_len) = budget_retained.remove(0);
+        lost_indices.insert(index);
+        compacted_chars = compacted_chars.saturating_sub(compacted_len);
+    }
+
+    history
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| lost_indices.contains(index))
+        .map(|(_, msg)| msg.clone())
+        .collect()
+}
+
 async fn persist_legacy_chat_compaction_audit(
     mem: &dyn Memory,
     envelope: &RuntimeEnvelope,
     source_history: &[ChatMessage],
+    summary_projection: &[ChatMessage],
     trigger: &str,
 ) {
-    if source_history.len() <= 1 {
+    if source_history.is_empty() {
         return;
     }
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
-    let has_system = source_history.first().is_some_and(|msg| msg.role == "system");
-    let source_message_count = source_history.len().saturating_sub(usize::from(has_system));
+    let source_message_count = source_history.len();
     let source_refs: Vec<serde_json::Value> = source_history
         .iter()
         .enumerate()
@@ -534,7 +581,9 @@ async fn persist_legacy_chat_compaction_audit(
                 serde_json::json!({
                     "compact_keep_messages": COMPACT_KEEP_MESSAGES,
                     "compact_content_chars": COMPACT_CONTENT_CHARS,
-                    "compact_total_chars": COMPACT_TOTAL_CHARS
+                    "compact_total_chars": COMPACT_TOTAL_CHARS,
+                    "summary_projection_message_count": summary_projection.len(),
+                    "summary_projection_token_estimate": estimate_chat_history_tokens(summary_projection)
                 })
                 .to_string(),
             ),
@@ -4637,7 +4686,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
                     // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
                     // 重试会拿同一份未压缩的 history 二次失败。
-                    let source_history = bounded_legacy_chat_compaction_audit_source(&history);
+                    let audit_source_history = original_legacy_chat_compaction_audit_source(&history);
+                    let summary_projection = bounded_legacy_chat_compaction_audit_source(&history);
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::HistoryCompacted {
                             reason: crate::chat::action::CompactReason::ContextOverflow,
@@ -4648,7 +4698,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     persist_legacy_chat_compaction_audit(
                         mem.as_ref(),
                         &runtime_envelope,
-                        &source_history,
+                        &audit_source_history,
+                        &summary_projection,
                         "chat_context_overflow",
                     )
                     .await;
@@ -8034,35 +8085,98 @@ mod legacy_chat_compaction_audit_tests {
         );
     }
 
+    #[test]
+    fn legacy_chat_compaction_original_audit_source_tracks_untruncated_losses() {
+        let mut source_history = vec![ChatMessage::system("system rules")];
+        for idx in 0..12 {
+            source_history.push(ChatMessage::user(format!(
+                "evicted-original-{idx} {}",
+                "payload ".repeat(8)
+            )));
+        }
+
+        let audit_source = original_legacy_chat_compaction_audit_source(&source_history);
+
+        assert_eq!(
+            audit_source.len(),
+            4,
+            "12 non-system messages with keep window 8 must audit the 4 original evicted turns"
+        );
+        assert_eq!(
+            audit_source
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            source_history
+                .iter()
+                .skip(1)
+                .take(4)
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            "audit source must retain the original untruncated evicted turns in order"
+        );
+    }
+
     #[tokio::test]
     async fn legacy_chat_compaction_persists_run_and_summary_memory() {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         let envelope = RuntimeEnvelope::chat("workspace-a", "session-a");
-        let source_history = vec![
-            ChatMessage::system("system rules"),
-            ChatMessage::user("remember /tmp/source-a and owner lineage".repeat(20)),
-            ChatMessage::assistant("acknowledged source hash trace".repeat(20)),
-        ];
+        let mut source_history = vec![ChatMessage::system("system rules")];
+        for idx in 0..12 {
+            source_history.push(ChatMessage::user(format!(
+                "evicted-source-{idx} /tmp/source-a owner lineage {}",
+                "payload ".repeat(8)
+            )));
+        }
+        let audit_source = original_legacy_chat_compaction_audit_source(&source_history);
+        let summary_projection = bounded_legacy_chat_compaction_audit_source(&source_history);
+        let mut hasher = sha2::Sha256::new();
+        let first_audit_source = audit_source.first().expect("fixture must include evicted source");
+        hasher.update(first_audit_source.role.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(first_audit_source.content.as_bytes());
+        let first_original_hash = hex::encode(hasher.finalize());
+        let expected_source_tokens = estimate_chat_history_tokens(&audit_source);
 
-        persist_legacy_chat_compaction_audit(&mem, &envelope, &source_history, "chat_context_overflow").await;
+        persist_legacy_chat_compaction_audit(
+            &mem,
+            &envelope,
+            &audit_source,
+            &summary_projection,
+            "chat_context_overflow",
+        )
+        .await;
 
         let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
-        let (summary_memory_key, mode, fidelity_status, source_refs): (String, String, String, String) = conn
+        let (
+            summary_memory_key,
+            mode,
+            fidelity_status,
+            source_message_count,
+            source_token_estimate,
+            source_refs,
+        ): (String, String, String, i64, i64, String) = conn
             .query_row(
-                "SELECT summary_memory_key, mode, fidelity_status, source_document_refs_json
+                "SELECT summary_memory_key, mode, fidelity_status, source_message_count, source_token_estimate, source_document_refs_json
                  FROM compaction_runs
                  WHERE workspace_id = 'workspace-a'
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
             )
             .unwrap();
         assert!(summary_memory_key.starts_with("compaction_summary_"));
         assert_eq!(mode, "legacy_chat_overflow");
         assert_eq!(fidelity_status, "accepted_legacy_deterministic");
-        assert!(source_refs.contains("content_hash"));
+        assert_eq!(source_message_count, 4);
+        assert_eq!(source_token_estimate, expected_source_tokens as i64);
+        assert!(source_refs.contains(&first_original_hash));
+        assert!(
+            !source_refs.contains("evicted-source-0"),
+            "audit refs must store hashes, not raw evicted content"
+        );
 
         let stored_summary_count: i64 = conn
             .query_row(

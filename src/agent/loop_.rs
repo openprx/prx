@@ -1044,7 +1044,7 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement(
         }
         let remove_index = if history.len() > preserve_until {
             preserve_until
-        } else if history.len() > start.saturating_add(1) {
+        } else if replacement_len == 0 && history.len() > start.saturating_add(1) {
             start
         } else {
             break;
@@ -1451,7 +1451,8 @@ pub(crate) async fn build_configurable_compaction_patch(
         }
         crate::config::AgentCompactionMode::Off => return Ok(None),
     };
-    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, &source_projection);
+    let original_source = history.get(start..compact_end).unwrap_or(&[]);
+    let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
     persist_compaction_audit(
         audit,
         trigger,
@@ -1485,6 +1486,23 @@ pub(crate) async fn build_configurable_compaction_patch(
     }))
 }
 
+async fn apply_configurable_compaction_with_replacement_len(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> Result<Option<usize>> {
+    let Some(patch) = build_configurable_compaction_patch(history, provider, model, config, audit, trigger).await?
+    else {
+        return Ok(None);
+    };
+    let replacement_len = patch.replacement.len();
+    apply_compaction_patch_exact(history, &patch);
+    Ok(Some(replacement_len))
+}
+
 async fn apply_configurable_compaction(
     history: &mut Vec<ChatMessage>,
     provider: &dyn Provider,
@@ -1493,12 +1511,11 @@ async fn apply_configurable_compaction(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<bool> {
-    let Some(patch) = build_configurable_compaction_patch(history, provider, model, config, audit, trigger).await?
-    else {
-        return Ok(false);
-    };
-    apply_compaction_patch_exact(history, &patch);
-    Ok(true)
+    Ok(
+        apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger)
+            .await?
+            .is_some(),
+    )
 }
 
 async fn preflight_context_budget_before_provider_call(
@@ -1524,14 +1541,17 @@ async fn preflight_context_budget_before_provider_call(
         return Ok(budget);
     }
 
+    let mut replacement_len = None;
     if !matches!(config.mode, crate::config::AgentCompactionMode::Off) {
         match tokio::time::timeout(
             std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-            apply_configurable_compaction(history, provider, model, config, audit, trigger),
+            apply_configurable_compaction_with_replacement_len(history, provider, model, config, audit, trigger),
         )
         .await
         {
-            Ok(Ok(_)) => {}
+            Ok(Ok(applied_replacement_len)) => {
+                replacement_len = applied_replacement_len;
+            }
             Ok(Err(error)) => return Err(error),
             Err(_) => {
                 tracing::warn!(
@@ -1544,7 +1564,11 @@ async fn preflight_context_budget_before_provider_call(
 
     budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
-        let trimmed = trim_history_to_context_budget(history, config);
+        let trimmed = if let Some(replacement_len) = replacement_len {
+            trim_history_to_context_budget_preserving_compaction_replacement(history, config, replacement_len)
+        } else {
+            trim_history_to_context_budget(history, config)
+        };
         let after = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
         tracing::warn!(
             before_used_tokens = budget.used_tokens,
@@ -9253,6 +9277,34 @@ ls -la
         );
     }
 
+    #[test]
+    fn compaction_fidelity_status_checks_original_range_not_bounded_projection() {
+        let hidden_identifier = "/tmp/original-only-anchor-iss-032";
+        let messages = vec![ChatMessage::user(format!(
+            "{} {hidden_identifier}",
+            "projection-filler ".repeat(COMPACTION_MAX_SOURCE_CHARS)
+        ))];
+        let projected = bounded_compaction_projection(&messages);
+        assert!(
+            !projected
+                .iter()
+                .any(|message| message.content.contains(hidden_identifier)),
+            "fixture identifier must be truncated out of bounded projection"
+        );
+        let summary = "## Decisions\n- ok\n## Open TODOs\n- ok\n## Critical Context\n- ok";
+
+        assert_eq!(
+            compaction_summary_fidelity_status(summary, crate::config::AgentCompactionMode::Safeguard, &projected),
+            "accepted",
+            "bounded projection would hide the lost identifier"
+        );
+        assert_eq!(
+            compaction_summary_fidelity_status(summary, crate::config::AgentCompactionMode::Safeguard, &messages),
+            "accepted_identifier_loss",
+            "original range must catch identifiers omitted from the summary"
+        );
+    }
+
     #[tokio::test]
     async fn configurable_compaction_safeguard_inserts_summary_marker() {
         let provider = ScriptedProvider::from_text_responses(vec!["- concise summary"]);
@@ -9280,6 +9332,56 @@ ls -la
             history
                 .iter()
                 .any(|msg| { msg.content.contains("[Context compacted at") && msg.content.contains("Summary:") })
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_preserving_trim_keeps_compaction_summary_when_recent_still_over_limit() {
+        let provider = SystemSummaryProvider {
+            response: "## Decisions\n- preserve summary marker\n## Open TODOs\n- trim recent bulk\n## Critical Context\n- SUMMARY_SURVIVES"
+                .to_string(),
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for idx in 0..10 {
+            history.push(ChatMessage::user(format!(
+                "old-or-recent-{idx} {}",
+                "bulk-token ".repeat(80)
+            )));
+        }
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 8,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let budget = preflight_context_budget_before_provider_call(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            None,
+            "test_preflight",
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            history
+                .iter()
+                .any(|msg| msg.content.contains("[Context compacted at") && msg.content.contains("SUMMARY_SURVIVES")),
+            "preserving fallback must keep the just-created compaction summary"
+        );
+        assert!(
+            !history.iter().any(|msg| msg.content.contains("old-or-recent-9")),
+            "recent bulk should be trimmed before deleting the summary"
+        );
+        assert!(
+            !budget.over_hard_limit,
+            "fixture summary is small enough to fit under literal hard limit 110"
         );
     }
 
