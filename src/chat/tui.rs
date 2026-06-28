@@ -6107,7 +6107,10 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let row = |y: u16| -> String { (0..36).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
         let rows: Vec<String> = (0..6).map(row).collect();
-        assert!(rows.iter().any(|r| r.contains("~0 tok")), "status row kept: {rows:?}");
+        assert!(
+            rows.iter().any(|r| r.contains("PRX | mode:edit")),
+            "status row kept: {rows:?}"
+        );
         assert!(rows.iter().any(|r| r.contains("#1")), "sessions strip kept: {rows:?}");
         assert!(
             rows.iter().any(|r| r.contains("agent #1")),
@@ -6408,7 +6411,7 @@ mod tests {
             KeyDispatch::SwitcherOpened { entries } => {
                 assert_eq!(entries.len(), 3);
                 assert!(
-                    entries[0].is_transcript(),
+                    entries.first().is_some_and(|entry| entry.is_transcript()),
                     "transcript row is switcher-only first entry"
                 );
                 assert_eq!(

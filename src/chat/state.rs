@@ -2539,9 +2539,7 @@ mod tests {
             },
         ];
 
-        let effects = state.reduce(Action::SavedSessionPickerOpened {
-            entries: entries.clone(),
-        });
+        let effects = state.reduce(Action::SavedSessionPickerOpened { entries });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(
             state.ui.switcher.is_none(),

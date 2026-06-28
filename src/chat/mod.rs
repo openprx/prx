@@ -9126,7 +9126,12 @@ mod p6c2_diff_tests {
         let source = collect_workspace_diff(temp.path(), false).await;
         assert_eq!(source.title, "workspace diff");
         assert_eq!(source.lines.len(), 1);
-        assert!(source.lines[0].starts_with("diff unavailable:"));
+        assert!(
+            source
+                .lines
+                .first()
+                .is_some_and(|line| line.starts_with("diff unavailable:"))
+        );
         assert!(!source.truncated);
     }
 }
@@ -9359,11 +9364,13 @@ mod p7b_branch_rewind_tests {
         assert_eq!(branch.turns.len(), 2);
         assert_eq!(rewound.id, source.id, "rewind trims current session in place");
         assert_eq!(rewound.turns.len(), 2);
-        for idx in 0..2 {
-            assert_eq!(branch.turns[idx].role, source.turns[idx].role);
-            assert_eq!(branch.turns[idx].content, source.turns[idx].content);
-            assert_eq!(rewound.turns[idx].role, source.turns[idx].role);
-            assert_eq!(rewound.turns[idx].content, source.turns[idx].content);
+        for (idx, source_turn) in source.turns.iter().take(2).enumerate() {
+            let branch_turn = branch.turns.get(idx).expect("branch retains the requested prefix");
+            let rewound_turn = rewound.turns.get(idx).expect("rewind retains the requested prefix");
+            assert_eq!(branch_turn.role, source_turn.role);
+            assert_eq!(branch_turn.content, source_turn.content);
+            assert_eq!(rewound_turn.role, source_turn.role);
+            assert_eq!(rewound_turn.content, source_turn.content);
         }
     }
 

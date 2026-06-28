@@ -1099,21 +1099,16 @@ fn extract_document_ingest_refs(source_messages: &[ChatMessage]) -> Vec<serde_js
     refs
 }
 
-async fn persist_compaction_audit(
-    audit: Option<&DocumentIngestRuntime>,
-    trigger: &str,
-    mode: &crate::config::AgentCompactionMode,
-    source_messages: &[ChatMessage],
-    summary: &str,
-    fidelity_status: &str,
-) {
-    let Some(audit) = audit else {
-        return;
-    };
-    let run_id = Uuid::new_v4().to_string();
-    let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
-    let source_token_estimate = estimate_history_tokens(source_messages);
-    let source_message_refs: Vec<serde_json::Value> = source_messages
+#[derive(Debug, Default)]
+struct CompactionAuditSource {
+    message_count: usize,
+    token_estimate: usize,
+    message_refs: Vec<serde_json::Value>,
+    document_refs: Vec<serde_json::Value>,
+}
+
+fn build_compaction_audit_source(source_messages: &[ChatMessage]) -> CompactionAuditSource {
+    let message_refs = source_messages
         .iter()
         .enumerate()
         .map(|(index, message)| {
@@ -1129,7 +1124,30 @@ async fn persist_compaction_audit(
             })
         })
         .collect();
-    let source_document_refs = extract_document_ingest_refs(source_messages);
+
+    CompactionAuditSource {
+        message_count: source_messages.len(),
+        token_estimate: estimate_history_tokens(source_messages),
+        message_refs,
+        document_refs: extract_document_ingest_refs(source_messages),
+    }
+}
+
+async fn persist_compaction_audit(
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+    mode: &crate::config::AgentCompactionMode,
+    source: Option<&CompactionAuditSource>,
+    summary: &str,
+    fidelity_status: &str,
+) {
+    let Some(audit) = audit else {
+        return;
+    };
+    let empty_source = CompactionAuditSource::default();
+    let source = source.unwrap_or(&empty_source);
+    let run_id = Uuid::new_v4().to_string();
+    let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
     let metadata = MemoryStoreMetadata {
         workspace_id: Some(audit.workspace_id.clone()),
         owner_id: audit.owner_id.clone(),
@@ -1166,15 +1184,15 @@ async fn persist_compaction_audit(
             persona_id: audit.persona_id.clone(),
             trigger: trigger.to_string(),
             mode: format!("{mode:?}"),
-            source_message_count: source_messages.len(),
-            source_token_estimate,
+            source_message_count: source.message_count,
+            source_token_estimate: source.token_estimate,
             summary: summary.to_string(),
             summary_memory_key: Some(summary_memory_key),
             source_event_ids_json: Some(
-                serde_json::to_string(&source_message_refs).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&source.message_refs).unwrap_or_else(|_| "[]".to_string()),
             ),
             source_document_refs_json: Some(
-                serde_json::to_string(&source_document_refs).unwrap_or_else(|_| "[]".to_string()),
+                serde_json::to_string(&source.document_refs).unwrap_or_else(|_| "[]".to_string()),
             ),
             fidelity_status: fidelity_status.to_string(),
             payload_json: Some(
@@ -1232,6 +1250,7 @@ async fn apply_configurable_compaction(
         return Ok(false);
     }
     let compact_end = start + compact_count;
+    let audit_source = audit.and_then(|_| history.get(start..compact_end).map(build_compaction_audit_source));
     let source_projection = history
         .get(start..compact_end)
         .map(bounded_compaction_projection)
@@ -1353,7 +1372,7 @@ async fn apply_configurable_compaction(
         audit,
         trigger,
         &config.mode,
-        &source_projection,
+        audit_source.as_ref(),
         &summary,
         fidelity_status,
     )
