@@ -919,6 +919,47 @@ fn test_chat_plain_rewind_env_override_cannot_bypass_interactive_confirmation() 
     );
 }
 
+#[test]
+#[serial(prx_chat_pty)]
+fn test_chat_plain_apply_env_override_cannot_bypass_interactive_confirmation() {
+    let guard = new_harness_guard().expect("harness guard");
+    let target = guard.workspace_dir.join("apply.txt");
+    std::fs::write(&target, "old\n").expect("seed apply target");
+    let assistant_patch = "```diff\n--- a/apply.txt\n+++ b/apply.txt\n@@ -1 +1 @@\n-old\n+new\n```";
+
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[
+            ("PRX_TUI", "1"),
+            ("OPENPRX_APPROVAL_OVERRIDE", "allow"),
+            ("OPENPRX_MOCK_RESPONSE", assistant_patch),
+        ],
+        "please propose a patch\n/apply\n/exit\n",
+    );
+
+    assert!(
+        output.contains("Diff apply requires interactive TUI approval"),
+        "plain /apply must fail closed through the real sessions_redraw_handle gate; output:\n{output}"
+    );
+    assert!(
+        output.contains("Workspace unchanged"),
+        "plain /apply must visibly report unchanged workspace; output:\n{output}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target).expect("read target"),
+        "old\n",
+        "OPENPRX_APPROVAL_OVERRIDE=allow must not let plain /apply mutate files"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("diff workspace diff"),
+        "--plain /apply fail-closed path must not render TUI chrome; output:\n{output}"
+    );
+}
+
 /// 6. Chinese (CJK) characters in the mock response must appear contiguously
 /// — no phantom space between each character (regression guard for the
 /// `insert_before` wide-char bug fixed by enabling the `scrolling-regions`

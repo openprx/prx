@@ -307,6 +307,11 @@ pub(crate) fn parse_unified_diff(diff: &str) -> Result<DiffApplyPlan, DiffApplyE
                 let Some((kind, text)) = parse_hunk_line(hline) else {
                     return Err(DiffApplyError::Malformed(format!("invalid hunk line at {}", idx + 1)));
                 };
+                if text.starts_with("Subproject commit ") {
+                    return Err(DiffApplyError::Unsupported(
+                        "Subproject commit patches are not supported".to_string(),
+                    ));
+                }
                 match kind {
                     HunkLineKind::Add => additions = additions.saturating_add(1),
                     HunkLineKind::Delete => deletions = deletions.saturating_add(1),
@@ -433,11 +438,11 @@ pub(crate) async fn execute_plan(plan: &DiffApplyPlan, security: &SecurityPolicy
     for item in &prepared {
         authorize_write(&item.target, security)?;
     }
-    for item in prepared {
-        write_target(&item.target, item.content, item.create_new).await?;
-    }
     if !security.record_action() {
         return Err(DiffApplyError::RejectedPath("action budget exhausted".to_string()));
+    }
+    for item in prepared {
+        write_target(&item.target, item.content, item.create_new).await?;
     }
 
     Ok(format!(
@@ -670,6 +675,15 @@ mod tests {
         }
     }
 
+    fn policy_with_action_limit(workspace: &Path, max_actions_per_hour: u32) -> SecurityPolicy {
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: workspace.to_path_buf(),
+            max_actions_per_hour,
+            ..SecurityPolicy::default()
+        }
+    }
+
     fn diff_for(path: &str, old: &str, new: &str) -> String {
         format!("--- a/{path}\n+++ b/{path}\n@@ -1 +1 @@\n-{old}\n+{new}\n")
     }
@@ -703,6 +717,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_rejects_literal_line_cap() {
+        let oversized = format!(
+            "--- a/x\n+++ b/x\n@@ -1 +1,{} @@\n-old\n{}",
+            DIFF_APPLY_MAX_LINES,
+            (0..1_997)
+                .map(|idx| format!("+line {idx}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert_eq!(oversized.lines().count(), 2_001);
+        assert_eq!(parse_unified_diff(&oversized), Err(DiffApplyError::Oversized));
+    }
+
+    #[test]
     fn parse_rejects_unsupported_delete_rename_mode_and_binary() {
         for diff in [
             "--- a/a\n+++ /dev/null\n@@ -1 +0,0 @@\n-old\n",
@@ -715,6 +743,21 @@ mod tests {
                 Err(DiffApplyError::Unsupported(_) | DiffApplyError::Malformed(_))
             ));
         }
+    }
+
+    #[test]
+    fn parse_rejects_submodule_patch() {
+        let diff = "diff --git a/vendor/lib b/vendor/lib\n\
+                    index 1111111..2222222 160000\n\
+                    --- a/vendor/lib\n\
+                    +++ b/vendor/lib\n\
+                    @@ -1 +1 @@\n\
+                    -Subproject commit 1111111111111111111111111111111111111111\n\
+                    +Subproject commit 2222222222222222222222222222222222222222\n";
+        assert!(matches!(
+            parse_unified_diff(diff),
+            Err(DiffApplyError::Unsupported(message)) if message == "Subproject commit patches are not supported"
+        ));
     }
 
     #[tokio::test]
@@ -754,6 +797,33 @@ mod tests {
         .expect("plan");
         let err = execute_plan(&plan, &policy(temp.path())).await.expect_err("stale");
         assert!(matches!(err, DiffApplyError::Stale(_)));
+        assert_eq!(
+            tokio::fs::read_to_string(temp.path().join("a.txt")).await.unwrap(),
+            "old\n"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(temp.path().join("b.txt")).await.unwrap(),
+            "keep\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn budget_exhausted_before_write_leaves_all_targets_unchanged() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        tokio::fs::write(temp.path().join("a.txt"), "old\n")
+            .await
+            .expect("seed a");
+        tokio::fs::write(temp.path().join("b.txt"), "keep\n")
+            .await
+            .expect("seed b");
+        let plan = parse_unified_diff(
+            "--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-keep\n+changed\n",
+        )
+        .expect("plan");
+        let err = execute_plan(&plan, &policy_with_action_limit(temp.path(), 2))
+            .await
+            .expect_err("budget exhausted");
+        assert!(matches!(err, DiffApplyError::RejectedPath(message) if message == "action budget exhausted"));
         assert_eq!(
             tokio::fs::read_to_string(temp.path().join("a.txt")).await.unwrap(),
             "old\n"
