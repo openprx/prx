@@ -53,6 +53,7 @@
 
 pub mod action;
 pub mod commands;
+pub mod diff_apply;
 pub mod dispatcher;
 pub mod error;
 pub mod sanitize;
@@ -2109,6 +2110,7 @@ pub async fn run(
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
+    let mut pending_diff_apply: Option<PendingDiffApply> = None;
 
     // ── Reload notice: historical child sessions (v4) ────────
     // If this chat session was resumed and carried persisted background-session
@@ -2258,6 +2260,54 @@ pub async fn run(
                             sessions_redraw_handle.as_ref(),
                             &format!(
                                 "Rewind cancelled; approval channel closed for {} and current session is unchanged.",
+                                pending.tool_id
+                            ),
+                        );
+                    }
+                }
+                continue;
+            }
+            apply_approval = async {
+                match pending_diff_apply.as_mut() {
+                    Some(pending) => (&mut pending.approval_rx).await,
+                    None => std::future::pending::<std::result::Result<
+                        bool,
+                        tokio::sync::oneshot::error::RecvError,
+                    >>().await,
+                }
+            }, if pending_diff_apply.is_some() => {
+                let Some(pending) = pending_diff_apply.take() else {
+                    continue;
+                };
+                match apply_approval {
+                    Ok(true) => {
+                        let security = crate::runtime::bootstrap::build_security_policy(&config);
+                        match diff_apply::execute_plan(&pending.plan, security.as_ref()).await {
+                            Ok(message) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &message,
+                            ),
+                            Err(error) => surface_session_message(
+                                &chat_dispatcher,
+                                sessions_redraw_handle.as_ref(),
+                                &format!("Diff apply aborted: {error}. Workspace unchanged."),
+                            ),
+                        }
+                    }
+                    Ok(false) => {
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            "Diff apply cancelled; workspace unchanged.",
+                        );
+                    }
+                    Err(_) => {
+                        surface_session_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            &format!(
+                                "Diff apply cancelled; approval channel closed for {} and workspace is unchanged.",
                                 pending.tool_id
                             ),
                         );
@@ -3137,6 +3187,52 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     "Confirm rewind to {keep_turns} turns in the approval prompt."
                                 ));
                             }
+                        }
+                    }
+                    continue;
+                }
+                commands::CommandResult::ApplyAction(action) => {
+                    let latest_index = match action {
+                        commands::ApplyCommand::Latest => 1,
+                        commands::ApplyCommand::Index(index) => index,
+                    };
+                    if pending_diff_apply.is_some() {
+                        emit_chat_output("Diff apply already awaits approval; approve or cancel it first.");
+                        continue;
+                    }
+                    let Some(diff) = diff_apply::latest_fenced_diff(&chat_session.turns, latest_index) else {
+                        emit_chat_output("No applicable fenced diff block found in this conversation.");
+                        continue;
+                    };
+                    let plan = match diff_apply::parse_unified_diff(&diff) {
+                        Ok(plan) => plan,
+                        Err(error) => {
+                            emit_chat_output(&format!("Diff apply rejected: {error}. Workspace unchanged."));
+                            continue;
+                        }
+                    };
+                    if sessions_redraw_handle.is_none() {
+                        emit_chat_output(
+                            "Diff apply requires interactive TUI approval; unavailable in this mode. Workspace unchanged.",
+                        );
+                        continue;
+                    }
+                    #[cfg(not(feature = "terminal-tui"))]
+                    {
+                        emit_chat_output(
+                            "Diff apply requires interactive TUI approval; unavailable in this build. Workspace unchanged.",
+                        );
+                        continue;
+                    }
+                    #[cfg(feature = "terminal-tui")]
+                    {
+                        match request_diff_apply_approval(plan, true, approval_router.as_ref(), &chat_dispatcher) {
+                            Ok(pending) => {
+                                let summary = pending.plan.summary();
+                                pending_diff_apply = Some(pending);
+                                emit_chat_output(&format!("Confirm diff apply in the approval prompt.\n{summary}"));
+                            }
+                            Err(message) => emit_chat_output(&message),
                         }
                     }
                     continue;
@@ -7225,6 +7321,53 @@ struct PendingChatRewind {
     approval_rx: tokio::sync::oneshot::Receiver<bool>,
 }
 
+struct PendingDiffApply {
+    tool_id: String,
+    plan: diff_apply::DiffApplyPlan,
+    approval_rx: tokio::sync::oneshot::Receiver<bool>,
+}
+
+#[cfg(feature = "terminal-tui")]
+fn request_diff_apply_approval(
+    plan: diff_apply::DiffApplyPlan,
+    interactive_tui: bool,
+    approval_router: Option<&Arc<dispatcher::ApprovalRouter>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) -> Result<PendingDiffApply, String> {
+    if !interactive_tui {
+        return Err(
+            "Diff apply requires interactive TUI approval; unavailable in this mode. Workspace unchanged.".to_string(),
+        );
+    }
+    let Some(router) = approval_router else {
+        return Err(
+            "Diff apply requires interactive TUI approval; approval router unavailable. Workspace unchanged."
+                .to_string(),
+        );
+    };
+    let (approval_tx, approval_rx) = tokio::sync::oneshot::channel::<bool>();
+    let tool_id = format!("diff_apply:{}", uuid::Uuid::new_v4());
+    router.register(tool_id.clone(), approval_tx);
+    let args = plan.approval_args_json();
+    let dispatch_result = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ToolApprovalRequested {
+            tool_id: tool_id.clone(),
+            name: "apply_fenced_diff".to_string(),
+            args,
+        },
+        "chat.diff_apply_approval_requested",
+    );
+    if dispatch_result != crate::chat::dispatcher::DispatchResult::Sent {
+        let _ = router.resolve(&tool_id, false);
+        return Err("Diff apply approval could not be shown; workspace unchanged.".to_string());
+    }
+    Ok(PendingDiffApply {
+        tool_id,
+        plan,
+        approval_rx,
+    })
+}
+
 #[derive(Debug)]
 enum ChatControlEvent {
     ResumeSavedSession { id: String },
@@ -9133,6 +9276,117 @@ mod p6c2_diff_tests {
                 .is_some_and(|line| line.starts_with("diff unavailable:"))
         );
         assert!(!source.truncated);
+    }
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+#[allow(clippy::expect_used, clippy::unwrap_used)]
+mod iss_019_diff_apply_tests {
+    use super::*;
+    use crate::security::SecurityPolicy;
+    use crate::security::policy::AutonomyLevel;
+    use std::sync::Arc;
+
+    fn plan() -> diff_apply::DiffApplyPlan {
+        diff_apply::parse_unified_diff("--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+new\n").expect("valid plan")
+    }
+
+    fn policy(workspace: &std::path::Path) -> SecurityPolicy {
+        let autonomy = crate::config::AutonomyConfig {
+            level: AutonomyLevel::Full,
+            ..crate::config::AutonomyConfig::default()
+        };
+        SecurityPolicy::from_config(&autonomy, workspace)
+    }
+
+    #[test]
+    fn plain_apply_ignores_openprx_approval_override_and_leaves_file_unchanged() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let exe = std::env::current_exe().expect("current test exe");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("chat::iss_019_diff_apply_tests::plain_apply_no_bypass_child")
+            .arg("--nocapture")
+            .env("OPENPRX_APPROVAL_OVERRIDE", "allow")
+            .env("ISS019_CHILD_WORKSPACE", temp.path())
+            .status()
+            .expect("run child no-bypass test");
+        assert!(status.success(), "child no-bypass test failed: {status}");
+    }
+
+    #[test]
+    fn plain_apply_no_bypass_child() {
+        let Some(workspace) = std::env::var_os("ISS019_CHILD_WORKSPACE") else {
+            return;
+        };
+        assert_eq!(
+            std::env::var("OPENPRX_APPROVAL_OVERRIDE").as_deref(),
+            Ok("allow"),
+            "child test must exercise the env-override condition"
+        );
+        let workspace = std::path::PathBuf::from(workspace);
+        std::fs::write(workspace.join("a.txt"), "old\n").expect("seed");
+        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        let router = Arc::new(dispatcher::ApprovalRouter::new());
+
+        let result = request_diff_apply_approval(plan(), false, Some(&router), &dispatcher);
+
+        assert!(
+            result.is_err(),
+            "plain mode must fail closed before approval registration"
+        );
+        assert_eq!(std::fs::read_to_string(workspace.join("a.txt")).unwrap(), "old\n");
+    }
+
+    #[test]
+    fn missing_router_fails_closed_before_pending_apply() {
+        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        let result = request_diff_apply_approval(plan(), true, None, &dispatcher);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn channel_drop_resolves_false_and_returns_no_pending_apply() {
+        let (dispatcher, rx) = dispatcher::ChatDispatcher::new();
+        drop(rx);
+        let router = Arc::new(dispatcher::ApprovalRouter::new());
+        let result = request_diff_apply_approval(plan(), true, Some(&router), &dispatcher);
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn tui_approval_true_is_required_before_apply_writes() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("a.txt"), "old\n").expect("seed");
+        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        let router = Arc::new(dispatcher::ApprovalRouter::new());
+
+        let pending =
+            request_diff_apply_approval(plan(), true, Some(&router), &dispatcher).expect("approval requested");
+        assert_eq!(std::fs::read_to_string(temp.path().join("a.txt")).unwrap(), "old\n");
+        assert!(router.resolve(&pending.tool_id, true));
+        assert!(pending.approval_rx.await.expect("approval rx"));
+
+        let message = diff_apply::execute_plan(&pending.plan, &policy(temp.path()))
+            .await
+            .expect("apply");
+        assert_eq!(message, "Applied fenced diff to 1 file.");
+        assert_eq!(std::fs::read_to_string(temp.path().join("a.txt")).unwrap(), "new\n");
+    }
+
+    #[tokio::test]
+    async fn tui_approval_false_leaves_workspace_unchanged() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        std::fs::write(temp.path().join("a.txt"), "old\n").expect("seed");
+        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+        let router = Arc::new(dispatcher::ApprovalRouter::new());
+
+        let pending =
+            request_diff_apply_approval(plan(), true, Some(&router), &dispatcher).expect("approval requested");
+        assert!(router.resolve(&pending.tool_id, false));
+        assert!(!pending.approval_rx.await.expect("approval rx"));
+
+        assert_eq!(std::fs::read_to_string(temp.path().join("a.txt")).unwrap(), "old\n");
     }
 }
 

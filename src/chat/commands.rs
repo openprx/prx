@@ -54,6 +54,9 @@ pub enum CommandResult {
     /// chat main loop owns persistence, approval, and holder realignment, so this
     /// module only parses the intent.
     HistoryAction(HistoryCommand),
+    /// /apply — apply the latest fenced unified diff block from the conversation.
+    /// The chat main loop owns the TUI-only approval gate and workspace writes.
+    ApplyAction(ApplyCommand),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -68,6 +71,12 @@ pub enum HistoryCommand {
     BranchList,
     Branch(String),
     Rewind(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyCommand {
+    Latest,
+    Index(usize),
 }
 
 /// Context passed to command handlers (borrows from the main loop).
@@ -90,6 +99,7 @@ const HELP_TEXT: &str = "Available commands:
   /resume [last|id]  List or switch saved chat sessions
   /branch [N]        List turn boundaries or fork the first N turns
   /rewind <N>        Trim this session to the first N turns (interactive approval)
+  /apply [N]         Apply the latest fenced diff block with interactive approval
   /cost              Show token usage estimate
   /compact           Compact conversation context (free up window)
   /export [md|json]  Export conversation
@@ -157,6 +167,14 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         _ if input.starts_with("/rewind ") => {
             let raw = input["/rewind ".len()..].trim();
             CommandResult::HistoryAction(HistoryCommand::Rewind(raw.to_string()))
+        }
+        "/apply" => CommandResult::ApplyAction(ApplyCommand::Latest),
+        _ if input.starts_with("/apply ") => {
+            let raw = input["/apply ".len()..].trim();
+            match raw.parse::<usize>() {
+                Ok(index) if index > 0 => CommandResult::ApplyAction(ApplyCommand::Index(index)),
+                _ => CommandResult::HandledWithOutput("Usage: /apply [N]".to_string()),
+            }
         }
         _ if input.starts_with("/model ") => {
             // BUG-07: `/model <name>` is intercepted in the chat run loop (it
