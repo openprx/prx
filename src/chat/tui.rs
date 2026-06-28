@@ -698,7 +698,11 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             }
             EscAction::RequestDetach => return KeyDispatch::RequestDetach,
             EscAction::CloseTranscript => return KeyDispatch::CloseTranscriptViewer,
-            EscAction::DenyApproval => return KeyDispatch::Cancelled,
+            EscAction::DenyApproval => {
+                state.pending_tool_approval = None;
+                state.focus = crate::chat::sessions::FocusTarget::Main;
+                return KeyDispatch::Cancelled;
+            }
             EscAction::CloseDiff => return KeyDispatch::CloseDiffViewer,
             EscAction::Cancel => {
                 // Empty buffer + main focus → unchanged legacy cancel semantics.
@@ -3623,28 +3627,28 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
         crate::chat::sessions::FocusTarget::Session { seq } => {
             let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
             let label = format!("agent #{seq} {arrow} ");
-            let width = label.chars().count();
+            let width = UnicodeWidthStr::width(label.as_str());
             let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
             (span, width)
         }
         crate::chat::sessions::FocusTarget::Transcript => {
             let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
             let label = format!("transcript {arrow} ");
-            let width = label.chars().count();
+            let width = UnicodeWidthStr::width(label.as_str());
             let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
             (span, width)
         }
         crate::chat::sessions::FocusTarget::Approval => {
             let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
             let label = format!("approval {arrow} ");
-            let width = label.chars().count();
+            let width = UnicodeWidthStr::width(label.as_str());
             let span = Span::styled(label, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
             (span, width)
         }
         crate::chat::sessions::FocusTarget::Diff => {
             let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
             let label = format!("diff {arrow} ");
-            let width = label.chars().count();
+            let width = UnicodeWidthStr::width(label.as_str());
             let span = Span::styled(label, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
             (span, width)
         }
@@ -5665,6 +5669,19 @@ mod tests {
     }
 
     #[test]
+    fn approval_focus_without_pending_esc_resets_to_main() {
+        let mut state = TuiState::new("p", "m");
+        state.focus = crate::chat::sessions::FocusTarget::Approval;
+        state.pending_tool_approval = None;
+
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+
+        assert_eq!(out, KeyDispatch::Cancelled);
+        assert!(state.pending_tool_approval.is_none());
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+    }
+
+    #[test]
     fn dispatch_ctrl_o_opens_transcript_viewer_without_input_leak() {
         let mut state = TuiState::new("p", "m");
         let out = dispatch_global_key(key_mod(KeyCode::Char('o'), KeyModifiers::CONTROL), &mut state);
@@ -6495,7 +6512,7 @@ mod tests {
         let (sess_span, sess_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, false);
         assert!(sess_span.content.contains("agent #4"), "carries the target as text");
         assert!(sess_span.content.contains('\u{25B8}'), "uses the ▸ glyph");
-        assert_eq!(sess_w, sess_span.content.chars().count());
+        assert_eq!(sess_w, UnicodeWidthStr::width(sess_span.content.as_ref()));
         // ASCII fallback drops the unicode glyph but keeps the text target.
         let (ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, true);
         assert!(ascii_span.content.contains("agent #4"));
@@ -6503,7 +6520,10 @@ mod tests {
         let (transcript_span, transcript_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Transcript, false);
         assert!(transcript_span.content.contains("transcript"));
         assert!(transcript_span.content.contains('\u{25B8}'));
-        assert_eq!(transcript_w, transcript_span.content.chars().count());
+        assert_eq!(transcript_w, UnicodeWidthStr::width(transcript_span.content.as_ref()));
+        let (diff_span, diff_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Diff, false);
+        assert!(diff_span.content.contains("diff"));
+        assert_eq!(diff_w, UnicodeWidthStr::width(diff_span.content.as_ref()));
     }
 
     #[test]

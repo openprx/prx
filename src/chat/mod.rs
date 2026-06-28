@@ -8307,7 +8307,20 @@ mod file_mention_tests {
         let enriched = enrich_file_mentions_for_prompt("read @big.txt", &registry).await;
 
         assert!(enriched.prompt.contains("[content truncated: 64 KiB limit]"));
-        assert!(enriched.prompt.is_char_boundary(enriched.prompt.len()));
+        let attached_content = enriched
+            .prompt
+            .split("Path: big.txt\n\n")
+            .nth(1)
+            .expect("attached content")
+            .split("\n[content truncated: 64 KiB limit]")
+            .next()
+            .expect("truncated content");
+        assert!(
+            attached_content.len() <= FILE_MENTION_MAX_BYTES,
+            "attached content must be byte-capped, got {} bytes",
+            attached_content.len()
+        );
+        assert!(attached_content.is_char_boundary(attached_content.len()));
         assert!(
             enriched
                 .visible_note
@@ -9248,13 +9261,13 @@ mod p6c2_diff_tests {
 
         let (wide_lines, wide_truncated) = bounded_diff_lines("+你好世界", 5, 20);
         assert!(wide_truncated);
+        let first = wide_lines.first().expect("line");
         assert!(
-            wide_lines
-                .first()
-                .expect("line")
-                .is_char_boundary(wide_lines.first().expect("line").len()),
-            "byte cap must not split utf-8"
+            first.len() <= 5,
+            "byte cap must be enforced before line bounding, got {} bytes",
+            first.len()
         );
+        assert!(first.is_char_boundary(first.len()), "byte cap must not split utf-8");
     }
 
     #[test]

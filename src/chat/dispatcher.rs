@@ -909,46 +909,48 @@ impl EffectExecutor {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
             Effect::RequestApproval { tool_id, name, args } => {
-                let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
                 #[cfg(feature = "terminal-tui")]
-                if interactive_tui {
-                    if let Some(mirror) = deps.tui_mirror.as_ref() {
-                        {
-                            let mut state = mirror.lock();
-                            state.pending_tool_approval =
-                                Some(crate::chat::sessions::PendingToolApprovalView { tool_id, name, args });
-                            state.focus = crate::chat::sessions::FocusTarget::Approval;
-                            state.switcher = None;
+                {
+                    let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
+                    if interactive_tui {
+                        if let Some(mirror) = deps.tui_mirror.as_ref() {
+                            {
+                                let mut state = mirror.lock();
+                                state.pending_tool_approval =
+                                    Some(crate::chat::sessions::PendingToolApprovalView { tool_id, name, args });
+                                state.focus = crate::chat::sessions::FocusTarget::Approval;
+                                state.switcher = None;
+                            }
+                            let tx = {
+                                let slot_guard = self.redraw_slot.lock();
+                                slot_guard.as_ref().or(deps.redraw_tx.as_ref()).cloned()
+                            };
+                            if let Some(tx) = tx {
+                                let _ = tx.try_send(());
+                            }
+                            tracing::info!("RequestApproval effect: foreground approval TUI surfaced");
+                            return;
                         }
-                        let tx = {
-                            let slot_guard = self.redraw_slot.lock();
-                            slot_guard.as_ref().or(deps.redraw_tx.as_ref()).cloned()
-                        };
-                        if let Some(tx) = tx {
-                            let _ = tx.try_send(());
-                        }
-                        tracing::info!("RequestApproval effect: foreground approval TUI surfaced");
+                        tracing::warn!(
+                            tool_id = %tool_id,
+                            name = %name,
+                            args_len = args.len(),
+                            "RequestApproval effect: TUI active but no approval surface, failing closed"
+                        );
+                        let action_tx = deps.action_tx.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = action_tx
+                                .send(Action::ToolApprovalReceived {
+                                    tool_id,
+                                    approved: false,
+                                })
+                                .await
+                            {
+                                tracing::debug!(error = %e, "RequestApproval fail-closed: action_tx closed");
+                            }
+                        });
                         return;
                     }
-                    tracing::warn!(
-                        tool_id = %tool_id,
-                        name = %name,
-                        args_len = args.len(),
-                        "RequestApproval effect: TUI active but no approval surface, failing closed"
-                    );
-                    let action_tx = deps.action_tx.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = action_tx
-                            .send(Action::ToolApprovalReceived {
-                                tool_id,
-                                approved: false,
-                            })
-                            .await
-                        {
-                            tracing::debug!(error = %e, "RequestApproval fail-closed: action_tx closed");
-                        }
-                    });
-                    return;
                 }
                 let env_value = std::env::var("OPENPRX_APPROVAL_OVERRIDE").ok();
                 let approved = resolve_supervised_approval_override(env_value.as_deref());
@@ -961,6 +963,7 @@ impl EffectExecutor {
                     );
                 } else {
                     tracing::info!(
+                        security_event = "openprx_approval_override_applied",
                         tool_id = %tool_id,
                         name = %name,
                         args_len = args.len(),
@@ -4043,6 +4046,63 @@ mod real_mode_tests {
         assert_eq!(pending.name, "shell");
         assert!(pending.args.contains("echo secure"));
         assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+    }
+
+    #[test]
+    fn request_approval_in_tui_ignores_openprx_override_parent() {
+        let exe = std::env::current_exe().expect("current test exe");
+        let status = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("chat::dispatcher::tests::request_approval_in_tui_ignores_openprx_override_child")
+            .arg("--nocapture")
+            .env("OPENPRX_APPROVAL_OVERRIDE", "allow")
+            .env("ISS018_OVERRIDE_CHILD", "1")
+            .status()
+            .expect("run child override test");
+        assert!(status.success(), "child override test failed: {status}");
+    }
+
+    #[tokio::test]
+    async fn request_approval_in_tui_ignores_openprx_override_child() {
+        if std::env::var_os("ISS018_OVERRIDE_CHILD").is_none() {
+            return;
+        }
+        assert_eq!(
+            std::env::var("OPENPRX_APPROVAL_OVERRIDE").as_deref(),
+            Ok("allow"),
+            "child test must exercise the env override condition"
+        );
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        let mirror = Arc::new(ParkingMutex::new(crate::chat::tui::TuiState::new("p", "m")));
+        deps.tui_mirror = Some(Arc::clone(&mirror));
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::RequestApproval {
+                tool_id: "call-tui-override".to_string(),
+                name: "shell".to_string(),
+                args: r#"{"cmd":"echo secure"}"#.to_string(),
+            })
+            .await;
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), action_rx.recv())
+                .await
+                .is_err(),
+            "TUI RequestApproval must ignore OPENPRX_APPROVAL_OVERRIDE and wait for human input"
+        );
+        let state = mirror.lock();
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+        assert_eq!(
+            state
+                .pending_tool_approval
+                .as_ref()
+                .map(|pending| pending.tool_id.as_str()),
+            Some("call-tui-override")
+        );
     }
 
     #[tokio::test]
@@ -7308,8 +7368,8 @@ mod real_mode_tests {
         let router_for_resolve = Arc::clone(&deps.approval_router);
         let executor = EffectExecutor::new_with_deps(deps);
 
-        // 拦截 action_rx：截获 ToolApprovalRequested → 直接 resolve(false)，
-        // 让 driver 收到 rejection（绕过 stub auto-approve 的默认行为）。
+        // 拦截 action_rx：截获 ToolApprovalRequested → 通过 TUI `N` 键产生
+        // ToolApprovalDecision(false) → resolve(false)，让 driver 收到 rejection。
         let shutdown_d = CancellationToken::new();
         let (sink_tx, mut sink_rx) = mpsc::channel::<Action>(64);
         let router_handle = Arc::clone(&router_for_resolve);
@@ -7321,9 +7381,42 @@ mod real_mode_tests {
                     maybe = action_rx.recv() => {
                         match maybe {
                             Some(action) => {
-                                // 抢先 reject — 在 stub auto-approve 之前 resolve(false).
-                                if let Action::ToolApprovalRequested { tool_id, .. } = &action {
-                                    router_handle.resolve(tool_id, false);
+                                if let Action::ToolApprovalRequested { tool_id, name, args } = &action {
+                                    #[cfg(feature = "terminal-tui")]
+                                    {
+                                        let mut tui = crate::chat::tui::TuiState::new("p", "m");
+                                        tui.focus = crate::chat::sessions::FocusTarget::Approval;
+                                        tui.pending_tool_approval =
+                                            Some(crate::chat::sessions::PendingToolApprovalView {
+                                                tool_id: tool_id.clone(),
+                                                name: name.clone(),
+                                                args: args.clone(),
+                                            });
+                                        let decision = crate::chat::tui::dispatch_global_key(
+                                            crossterm::event::KeyEvent::new(
+                                                crossterm::event::KeyCode::Char('n'),
+                                                crossterm::event::KeyModifiers::NONE,
+                                            ),
+                                            &mut tui,
+                                        );
+                                        match decision {
+                                            crate::chat::tui::KeyDispatch::ToolApprovalDecision {
+                                                tool_id: decided_tool_id,
+                                                approved,
+                                            } => {
+                                                assert_eq!(decided_tool_id, *tool_id);
+                                                assert!(!approved, "N key must deny approval");
+                                                assert!(tui.pending_tool_approval.is_none());
+                                                assert_eq!(tui.focus, crate::chat::sessions::FocusTarget::Main);
+                                                router_handle.resolve(tool_id, approved);
+                                            }
+                                            other => panic!("expected TUI approval denial, got {other:?}"),
+                                        }
+                                    }
+                                    #[cfg(not(feature = "terminal-tui"))]
+                                    {
+                                        router_handle.resolve(tool_id, false);
+                                    }
                                 }
                                 let _ = sink_tx.send(action).await;
                             }
