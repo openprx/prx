@@ -28,7 +28,7 @@ use self::intent::infer_router_intent;
 use self::knn::KnnStore;
 pub use self::scorer::RouterResult;
 use self::scorer::rank_models;
-pub use context::resolve_effective_compaction_config;
+pub use context::{CompactionResolver, resolve_effective_compaction_config};
 // RouterResult remains the scorer output; RouteDecision is the durable
 // timeline projection used by ingress/provider execution paths.
 

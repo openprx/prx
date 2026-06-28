@@ -680,6 +680,11 @@ pub async fn run_gateway(
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
+        .with_compaction_resolver(crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        ))
         .with_channels(Arc::new(spawn_channels_by_name))
         .with_shared_memory(Arc::clone(&mem))
         .with_event_recording(config.memory.event_recording_config());

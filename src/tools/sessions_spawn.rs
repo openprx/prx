@@ -17,6 +17,7 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::NoopObserver;
 use crate::providers::{self, ChatMessage, Provider};
+use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -335,8 +336,8 @@ pub struct SessionsSpawnTool {
     workspace_dir: PathBuf,
     /// Multimodal config for sub-agent tool call loops.
     multimodal_config: MultimodalConfig,
-    /// Compaction config for sub-agent tool call loops.
-    compaction_config: AgentCompactionConfig,
+    /// Model-aware compaction resolver for sub-agent tool call loops.
+    compaction_resolver: CompactionResolver,
     /// Configured named agents for identity/model/tool scoping in spawn.
     agents: Arc<HashMap<String, DelegateAgentConfig>>,
     /// Global credential fallback from root config.
@@ -428,11 +429,8 @@ impl SessionsSpawnTool {
         spawn_config: SessionsSpawnConfig,
         active_runs: Arc<RwLock<Vec<SubAgentRun>>>,
     ) -> Self {
-        tracing::debug!(
-            max_context_tokens = compaction_config.max_context_tokens,
-            max_context_tokens_explicit = compaction_config.max_context_tokens_explicit,
-            "sessions_spawn using base compaction config; per-session context capability resolution deferred to ISS-008"
-        );
+        let compaction_resolver = CompactionResolver::from_base(compaction_config);
+        tracing::debug!("sessions_spawn initialized child compaction resolver");
         Self {
             channel: Arc::new(RwLock::new(channel)),
             channels: Arc::new(HashMap::new()),
@@ -446,7 +444,7 @@ impl SessionsSpawnTool {
             tools: Arc::new(OnceLock::new()),
             workspace_dir,
             multimodal_config,
-            compaction_config,
+            compaction_resolver,
             agents: Arc::new(agents),
             fallback_api_key,
             provider_runtime_options,
@@ -456,6 +454,19 @@ impl SessionsSpawnTool {
             event_sink: None,
             approval_resolver_factory: None,
         }
+    }
+
+    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
+        self.compaction_resolver = resolver;
+        self
+    }
+
+    fn resolve_child_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::router::context::EffectiveCompactionConfig {
+        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach a [`SpawnEventSink`] so task-mode sub-agents spawned by this tool
@@ -1097,6 +1108,16 @@ impl Tool for SessionsSpawnTool {
                 .filter(|m| !m.is_empty())
                 .unwrap_or_else(|| self.model.clone())
         });
+        let resolved_compaction = self.resolve_child_compaction(&resolved_provider_name, &resolved_model);
+        tracing::debug!(
+            mode = mode.as_str(),
+            provider = resolved_compaction.selected_provider.as_str(),
+            model = resolved_compaction.selected_model.as_str(),
+            max_context_tokens = resolved_compaction.config.max_context_tokens,
+            source = ?resolved_compaction.max_context_source,
+            kernel_capped = resolved_compaction.kernel_capped,
+            "sessions_spawn resolved child compaction window"
+        );
         let resolved_temperature = selected_agent
             .as_ref()
             .and_then(|(_, cfg)| cfg.temperature)
@@ -1221,7 +1242,7 @@ impl Tool for SessionsSpawnTool {
             let process_parent_run_id = parent_run_id.clone();
             let process_session_scope_key = session_scope_key.clone();
             let process_spawn_depth = spawn_depth;
-            let process_compaction_config = self.compaction_config.clone();
+            let process_compaction_config = resolved_compaction.config.clone();
             let process_event_recording = self.event_recording;
             let process_memory_strategy =
                 normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string();
@@ -1420,7 +1441,7 @@ impl Tool for SessionsSpawnTool {
         let security = self.security.clone();
         let task_scope = spawn_scope.clone();
         let task_memory = self.memory.clone();
-        let compaction_config = self.compaction_config.clone();
+        let compaction_config = resolved_compaction.config.clone();
         let task_execution_ctx = SpawnExecutionContext {
             run_id: rid.clone(),
             session_scope_key: session_scope_key.clone(),
@@ -2539,6 +2560,75 @@ fn normalize_process_memory_strategy(strategy: &str) -> anyhow::Result<&'static 
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn build_session_worker_manifest(
+    run_id: &str,
+    task: &str,
+    provider_name: &str,
+    model: &str,
+    api_key: Option<&str>,
+    temperature: f64,
+    worker_workspace: std::path::PathBuf,
+    memory_db_path: std::path::PathBuf,
+    memory_workspace_id: String,
+    normalized_memory_strategy: &str,
+    shared_memory_db_path: std::path::PathBuf,
+    worker_memory_db_path: std::path::PathBuf,
+    agent_id: Option<&str>,
+    event_recording: MemoryEventRecording,
+    allowed_tools: &[String],
+    timeout_secs: u64,
+    max_iterations: usize,
+    identity_dir: Option<String>,
+    scope: Option<&SpawnScope>,
+    lineage: &SpawnLineage,
+    spawn_depth: usize,
+    session_scope_key: &str,
+    parent_run_id: Option<&str>,
+    compaction_config: &AgentCompactionConfig,
+) -> anyhow::Result<(WorkerManifest, String, u64)> {
+    let mut manifest = WorkerManifest {
+        parent_capability: None,
+        run_id: run_id.to_string(),
+        task: task.to_string(),
+        provider_name: provider_name.to_string(),
+        model: model.to_string(),
+        api_key: api_key.map(str::to_string),
+        temperature,
+        workspace_dir: worker_workspace,
+        memory_db_path,
+        memory_workspace_id: Some(memory_workspace_id),
+        memory_strategy: Some(normalized_memory_strategy.to_string()),
+        shared_memory_db_path: Some(shared_memory_db_path),
+        worker_memory_db_path: Some(worker_memory_db_path),
+        agent_id: agent_id.map(str::to_string),
+        persona_id: None,
+        memory_event_recording: event_recording,
+        allowed_tools: allowed_tools.to_vec(),
+        timeout_seconds: timeout_secs,
+        max_iterations,
+        system_prompt: None,
+        identity_dir,
+        scope_sender: scope.map(|ctx| ctx.sender.clone()),
+        scope_channel: scope.map(|ctx| ctx.channel.clone()),
+        scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
+        scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
+        owner_id: lineage.owner_id.clone(),
+        topic_id: lineage.topic_id.clone(),
+        parent_task_id: lineage.parent_task_id.clone(),
+        source_message_event_id: lineage.source_message_event_id.clone(),
+        spawn_depth,
+        session_scope_key: session_scope_key.to_string(),
+        parent_run_id: parent_run_id.map(str::to_string),
+        compaction_config: Some(compaction_config.clone()),
+    };
+
+    let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
+    let sealed_capability = seal_worker_capability(&manifest, capability_expiry)?;
+    manifest.parent_capability = Some(sealed_capability.clone());
+    Ok((manifest, sealed_capability, capability_expiry))
+}
+
 async fn wait_with_parent_timeout(
     child: &mut tokio::process::Child,
     parent_timeout: std::time::Duration,
@@ -2626,45 +2716,32 @@ async fn run_sub_agent_process(
     // it with an HMAC bound to the run id, an absolute expiry, and a digest of
     // the manifest contents. A leaked capability token therefore cannot be
     // replayed for a different run, after expiry, or with a tampered manifest.
-    let mut manifest = WorkerManifest {
-        parent_capability: None,
-        run_id: run_id.to_string(),
-        task: task.to_string(),
-        provider_name: provider_name.to_string(),
-        model: model.to_string(),
-        api_key: api_key.map(str::to_string),
+    let (manifest, sealed_capability, capability_expiry) = build_session_worker_manifest(
+        run_id,
+        task,
+        provider_name,
+        model,
+        api_key,
         temperature,
-        workspace_dir: worker_workspace.clone(),
+        worker_workspace.clone(),
         memory_db_path,
-        memory_workspace_id: Some(memory_workspace_id),
-        memory_strategy: Some(normalized_memory_strategy.to_string()),
-        shared_memory_db_path: Some(shared_memory_db_path),
-        worker_memory_db_path: Some(worker_memory_db_path),
-        agent_id: agent_id.map(str::to_string),
-        persona_id: None,
-        memory_event_recording: event_recording,
-        allowed_tools: allowed_tools.to_vec(),
-        timeout_seconds: timeout_secs,
+        memory_workspace_id,
+        normalized_memory_strategy,
+        shared_memory_db_path,
+        worker_memory_db_path,
+        agent_id,
+        event_recording,
+        allowed_tools,
+        timeout_secs,
         max_iterations,
-        system_prompt: None,
         identity_dir,
-        scope_sender: scope.map(|ctx| ctx.sender.clone()),
-        scope_channel: scope.map(|ctx| ctx.channel.clone()),
-        scope_chat_type: scope.map(|ctx| ctx.chat_type.clone()),
-        scope_chat_id: scope.map(|ctx| ctx.chat_id.clone()),
-        owner_id: lineage.owner_id.clone(),
-        topic_id: lineage.topic_id.clone(),
-        parent_task_id: lineage.parent_task_id.clone(),
-        source_message_event_id: lineage.source_message_event_id.clone(),
+        scope,
+        lineage,
         spawn_depth,
-        session_scope_key: session_scope_key.to_string(),
-        parent_run_id: parent_run_id.map(str::to_string),
-        compaction_config: Some(compaction_config.clone()),
-    };
-
-    let capability_expiry = capability_now_unix().saturating_add(SESSION_WORKER_CAP_TTL_SECS);
-    let sealed_capability = seal_worker_capability(&manifest, capability_expiry)?;
-    manifest.parent_capability = Some(sealed_capability.clone());
+        session_scope_key,
+        parent_run_id,
+        compaction_config,
+    )?;
 
     let executable = std::env::current_exe()?;
     let cli_args = build_session_worker_cli_args(&manifest)?;
@@ -3008,6 +3085,97 @@ mod tests {
             crate::providers::ProviderRuntimeOptions::default(),
             spawn_config,
         )
+    }
+
+    fn router_model(provider: &str, model_id: &str, max_context: usize) -> crate::config::RouterModelConfig {
+        crate::config::RouterModelConfig {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            cost_per_million_tokens: 1.0,
+            max_context,
+            latency_ms: 1_000,
+            categories: vec!["code".to_string()],
+            elo_rating: 1_000.0,
+        }
+    }
+
+    fn compaction_resolver_with_models(
+        models: Vec<crate::config::RouterModelConfig>,
+    ) -> crate::router::CompactionResolver {
+        let mut router = crate::config::RouterConfig::default();
+        router.models = models;
+        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
+    }
+
+    #[test]
+    fn sessions_spawn_child_model_route_200k_beats_1m_parent() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
+            compaction_resolver_with_models(vec![
+                router_model("anthropic", "claude-opus-4-8", 1_000_000),
+                router_model("openrouter", "small-child", 200_000),
+            ]),
+        );
+
+        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+
+        assert_eq!(resolved.config.max_context_tokens, 200_000);
+        assert_eq!(
+            resolved.max_context_source,
+            crate::router::context::ContextWindowSource::RouterModelConfig
+        );
+    }
+
+    #[test]
+    fn sessions_spawn_process_manifest_carries_resolved_child_compaction() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_compaction_resolver(
+            compaction_resolver_with_models(vec![
+                router_model("anthropic", "claude-opus-4-8", 1_000_000),
+                router_model("openrouter", "small-child", 200_000),
+            ]),
+        );
+        let resolved = tool.resolve_child_compaction("openrouter", "small-child");
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let lineage = SpawnLineage {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+        };
+
+        let (manifest, _, _) = build_session_worker_manifest(
+            "run-child",
+            "task",
+            "openrouter",
+            "small-child",
+            None,
+            0.2,
+            temp.path().join("worker"),
+            temp.path().join("brain.db"),
+            temp.path().display().to_string(),
+            PROCESS_MEMORY_STRATEGY_SHARED,
+            temp.path().join("memory").join("brain.db"),
+            temp.path().join("worker").join("brain.db"),
+            None,
+            MemoryEventRecording::default(),
+            &[],
+            30,
+            4,
+            None,
+            None,
+            &lineage,
+            0,
+            "sessions_spawn:test",
+            None,
+            &resolved.config,
+        )
+        .expect("manifest");
+
+        let manifest_config = manifest.compaction_config.expect("manifest compaction config");
+        assert_eq!(manifest_config.max_context_tokens, 200_000);
+        assert_eq!(manifest.model, "small-child");
+        assert_ne!(manifest_config.max_context_tokens, 1_000_000);
     }
 
     /// FIX-P0-37: spawning is now a Medium-risk side effect, which requires an

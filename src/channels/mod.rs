@@ -5053,6 +5053,11 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
             provider_runtime_options.clone(),
             config.sessions_spawn.clone(),
         )
+        .with_compaction_resolver(crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        ))
         .with_channels(spawn_channels_by_name)
         .with_shared_memory(Arc::clone(&mem));
         let spawn_tool = spawn_tool.with_event_recording(config.memory.event_recording_config());

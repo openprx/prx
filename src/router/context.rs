@@ -22,6 +22,31 @@ pub struct EffectiveCompactionConfig {
     pub selected_model: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompactionResolver {
+    base: AgentCompactionConfig,
+    router: RouterConfig,
+    model_routes: Vec<ModelRouteConfig>,
+}
+
+impl CompactionResolver {
+    pub const fn new(base: AgentCompactionConfig, router: RouterConfig, model_routes: Vec<ModelRouteConfig>) -> Self {
+        Self {
+            base,
+            router,
+            model_routes,
+        }
+    }
+
+    pub fn from_base(base: AgentCompactionConfig) -> Self {
+        Self::new(base, RouterConfig::default(), Vec::new())
+    }
+
+    pub fn resolve(&self, provider: &str, model: &str) -> EffectiveCompactionConfig {
+        resolve_effective_compaction_config(&self.base, provider, model, &self.router, &self.model_routes)
+    }
+}
+
 pub fn resolve_effective_compaction_config(
     base: &AgentCompactionConfig,
     provider: &str,
@@ -199,6 +224,18 @@ mod tests {
     use crate::config::{AgentCompactionConfig, AutomixConfig, RouterModelConfig};
 
     fn router_with_model(provider: &str, model_id: &str, max_context: usize) -> RouterConfig {
+        router_with_models(vec![RouterModelConfig {
+            model_id: model_id.to_string(),
+            provider: provider.to_string(),
+            cost_per_million_tokens: 1.0,
+            max_context,
+            latency_ms: 1_000,
+            categories: vec!["code".to_string()],
+            elo_rating: 1_000.0,
+        }])
+    }
+
+    fn router_with_models(models: Vec<RouterModelConfig>) -> RouterConfig {
         RouterConfig {
             enabled: true,
             alpha: 0.0,
@@ -210,15 +247,19 @@ mod tests {
             knn_min_records: 10,
             knn_k: 7,
             automix: AutomixConfig::default(),
-            models: vec![RouterModelConfig {
-                model_id: model_id.to_string(),
-                provider: provider.to_string(),
-                cost_per_million_tokens: 1.0,
-                max_context,
-                latency_ms: 1_000,
-                categories: vec!["code".to_string()],
-                elo_rating: 1_000.0,
-            }],
+            models,
+        }
+    }
+
+    fn model(provider: &str, model_id: &str, max_context: usize) -> RouterModelConfig {
+        RouterModelConfig {
+            model_id: model_id.to_string(),
+            provider: provider.to_string(),
+            cost_per_million_tokens: 1.0,
+            max_context,
+            latency_ms: 1_000,
+            categories: vec!["code".to_string()],
+            elo_rating: 1_000.0,
         }
     }
 
@@ -230,6 +271,21 @@ mod tests {
         assert_eq!(result.config.max_context_tokens, 128_000);
         assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
         assert_eq!(result.model_context_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn compaction_resolver_child_route_200k_beats_parent_1m() {
+        let router = router_with_models(vec![
+            model("anthropic", "claude-opus-4-8", 1_000_000),
+            model("openrouter", "small-child", 200_000),
+        ]);
+        let resolver = CompactionResolver::new(AgentCompactionConfig::default(), router, Vec::new());
+
+        let result = resolver.resolve("openrouter", "small-child");
+
+        assert_eq!(result.config.max_context_tokens, 200_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
+        assert_eq!(result.selected_model, "small-child");
     }
 
     #[test]
@@ -306,6 +362,36 @@ mod tests {
         assert_eq!(result.requested_context_tokens, Some(20_000_000));
         assert_eq!(result.kernel_supported_tokens, 10_000_000);
         assert!(result.kernel_capped);
+    }
+
+    #[test]
+    fn compaction_resolver_explicit_override_wins_and_caps_at_literal_10m() {
+        let router = router_with_model("openrouter", "small-child", 200_000);
+        let mut base = AgentCompactionConfig {
+            max_context_tokens: 20_000_000,
+            ..AgentCompactionConfig::default()
+        };
+        base.max_context_tokens_explicit = true;
+        let resolver = CompactionResolver::new(base, router, Vec::new());
+
+        let result = resolver.resolve("openrouter", "small-child");
+
+        assert_eq!(result.config.max_context_tokens, 10_000_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::AgentCompactionOverride);
+        assert_eq!(result.requested_context_tokens, Some(20_000_000));
+        assert!(result.kernel_capped);
+    }
+
+    #[test]
+    fn compaction_resolver_unknown_child_falls_back_to_literal_128k_not_parent() {
+        let router = router_with_models(vec![model("anthropic", "claude-opus-4-8", 1_000_000)]);
+        let resolver = CompactionResolver::new(AgentCompactionConfig::default(), router, Vec::new());
+
+        let result = resolver.resolve("unknown-provider", "unknown-child");
+
+        assert_eq!(result.config.max_context_tokens, 128_000);
+        assert_eq!(result.max_context_source, ContextWindowSource::FallbackDefault);
+        assert_eq!(result.model_context_tokens, None);
     }
 
     #[test]

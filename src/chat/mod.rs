@@ -1526,6 +1526,11 @@ pub async fn run(
         config.sessions_spawn.clone(),
         Arc::clone(&active_runs),
     )
+    .with_compaction_resolver(crate::router::CompactionResolver::new(
+        config.agent.compaction.clone(),
+        config.router.clone(),
+        config.model_routes.clone(),
+    ))
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())

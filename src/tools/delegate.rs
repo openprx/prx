@@ -5,6 +5,7 @@ use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
+use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::ToolOperation;
@@ -36,8 +37,8 @@ pub struct DelegateTool {
     parent_tools: Arc<Vec<Arc<dyn Tool>>>,
     /// Inherited multimodal handling config for sub-agent loops.
     multimodal_config: crate::config::MultimodalConfig,
-    /// Compaction config inherited from root agent config.
-    compaction_config: crate::config::AgentCompactionConfig,
+    /// Model-aware compaction resolver inherited from root config.
+    compaction_resolver: CompactionResolver,
     /// Shared memory fabric backend for normalized delegation events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -152,7 +153,7 @@ impl DelegateTool {
             depth: 0,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_config: crate::config::AgentCompactionConfig::default(),
+            compaction_resolver: CompactionResolver::from_base(crate::config::AgentCompactionConfig::default()),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -191,7 +192,7 @@ impl DelegateTool {
             depth,
             parent_tools: Arc::new(Vec::new()),
             multimodal_config: crate::config::MultimodalConfig::default(),
-            compaction_config: crate::config::AgentCompactionConfig::default(),
+            compaction_resolver: CompactionResolver::from_base(crate::config::AgentCompactionConfig::default()),
             memory: None,
             event_recording: MemoryEventRecording::default(),
         }
@@ -210,9 +211,23 @@ impl DelegateTool {
     }
 
     /// Attach compaction configuration for agentic sub-agent loops.
-    pub const fn with_compaction_config(mut self, config: crate::config::AgentCompactionConfig) -> Self {
-        self.compaction_config = config;
+    pub fn with_compaction_config(mut self, config: crate::config::AgentCompactionConfig) -> Self {
+        self.compaction_resolver = CompactionResolver::from_base(config);
         self
+    }
+
+    /// Attach model-aware compaction resolution for agentic sub-agent loops.
+    pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
+        self.compaction_resolver = resolver;
+        self
+    }
+
+    fn resolve_child_compaction(
+        &self,
+        provider: &str,
+        model: &str,
+    ) -> crate::router::context::EffectiveCompactionConfig {
+        self.compaction_resolver.resolve(provider, model)
     }
 
     /// Attach shared memory so delegate requests/results join the live fabric.
@@ -801,6 +816,16 @@ impl DelegateTool {
             task_id: scope.task_id.as_deref(),
             source_message_event_id: scope.source_message_event_id.as_deref(),
         });
+        let resolved_compaction = self.resolve_child_compaction(effective_provider, effective_model);
+        tracing::debug!(
+            agent = agent_name,
+            provider = resolved_compaction.selected_provider.as_str(),
+            model = resolved_compaction.selected_model.as_str(),
+            max_context_tokens = resolved_compaction.config.max_context_tokens,
+            source = ?resolved_compaction.max_context_source,
+            kernel_capped = resolved_compaction.kernel_capped,
+            "delegate resolved child compaction window"
+        );
 
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
@@ -827,7 +852,7 @@ impl DelegateTool {
                     rollout_stage: "full".to_string(),
                     ..ToolConcurrencyGovernanceConfig::default()
                 },
-                Some(&self.compaction_config),
+                Some(&resolved_compaction.config),
                 None,
                 None,
                 scope_ctx.as_ref(),
@@ -1123,6 +1148,26 @@ mod tests {
             allowed_tools,
             max_iterations,
         }
+    }
+
+    fn router_model(provider: &str, model_id: &str, max_context: usize) -> crate::config::RouterModelConfig {
+        crate::config::RouterModelConfig {
+            provider: provider.to_string(),
+            model_id: model_id.to_string(),
+            cost_per_million_tokens: 1.0,
+            max_context,
+            latency_ms: 1_000,
+            categories: vec!["code".to_string()],
+            elo_rating: 1_000.0,
+        }
+    }
+
+    fn compaction_resolver_with_models(
+        models: Vec<crate::config::RouterModelConfig>,
+    ) -> crate::router::CompactionResolver {
+        let mut router = crate::config::RouterConfig::default();
+        router.models = models;
+        crate::router::CompactionResolver::new(crate::config::AgentCompactionConfig::default(), router, Vec::new())
     }
 
     #[test]
@@ -1611,6 +1656,25 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("(openrouter/model-test, agentic)"));
         assert!(result.output.contains("done"));
+    }
+
+    #[test]
+    fn delegate_inline_model_override_drives_child_compaction_resolution() {
+        let tool = DelegateTool::new(
+            single_agent("tester", "openrouter", "config-model"),
+            None,
+            test_security(),
+        )
+        .with_compaction_resolver(compaction_resolver_with_models(vec![
+            router_model("openrouter", "config-model", 1_000_000),
+            router_model("openrouter", "inline-small", 200_000),
+        ]));
+
+        let resolved = tool.resolve_child_compaction("openrouter", "inline-small");
+
+        assert_eq!(resolved.config.max_context_tokens, 200_000);
+        assert_eq!(resolved.selected_model, "inline-small");
+        assert_ne!(resolved.config.max_context_tokens, 1_000_000);
     }
 
     #[tokio::test]
