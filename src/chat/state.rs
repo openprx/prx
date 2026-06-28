@@ -667,6 +667,11 @@ impl ChatState {
             Action::HistoryCleared => self.reduce_history_cleared(),
             Action::HistoryClearedWithNotice { notice } => self.reduce_history_cleared_with_notice(notice),
             Action::HistoryCompacted { reason } => self.reduce_history_compacted(reason),
+            Action::HistoryCompactionPatchApplied {
+                reason,
+                patch,
+                compaction_config,
+            } => self.reduce_history_compaction_patch_applied(reason, patch, &compaction_config),
 
             // ── LLM 流式 (Step 3) ─────────────────────────────────
             Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
@@ -2089,6 +2094,54 @@ impl ChatState {
         }]
     }
 
+    fn reduce_history_compaction_patch_applied(
+        &mut self,
+        reason: CompactReason,
+        patch: crate::agent::loop_::CompactionPatch,
+        compaction_config: &crate::config::AgentCompactionConfig,
+    ) -> Vec<Effect> {
+        let history = &mut self.session.history;
+        if crate::agent::loop_::compaction_patch_guard_matches(history, &patch.guard) {
+            crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
+            let budget = crate::agent::loop_::plan_context_budget(
+                history,
+                compaction_config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            let trim_fallback = if budget.over_hard_limit {
+                crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement(
+                    history,
+                    compaction_config,
+                    patch.replacement.len(),
+                )
+            } else {
+                false
+            };
+            return vec![Effect::LogTrace {
+                level: tracing::Level::INFO,
+                msg: format!(
+                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
+                    patch.range_start,
+                    patch.range_end,
+                    patch.replacement.len(),
+                    patch.append_after.len(),
+                    trim_fallback,
+                    history.len()
+                ),
+            }];
+        }
+
+        let before_len = history.len();
+        let trimmed = crate::agent::loop_::trim_history_to_context_budget(history, compaction_config);
+        vec![Effect::LogTrace {
+            level: tracing::Level::WARN,
+            msg: format!(
+                "HistoryCompactionPatch guard mismatch reason={reason:?}; stale patch ignored; trim_fallback={trimmed} before_len={before_len} after_len={}",
+                history.len()
+            ),
+        }]
+    }
+
     /// 辅助：从 StreamState 中取出当前 draft 的 id（不同 feature 下结构不同）.
     #[cfg(feature = "terminal-tui")]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
@@ -2217,7 +2270,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::RecordAssistantTurn(_)
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
-        | Action::HistoryCompacted { .. } => false,
+        | Action::HistoryCompacted { .. }
+        | Action::HistoryCompactionPatchApplied { .. } => false,
         // v4: BackgroundSessionRecorded only upserts session.background_sessions
         // (a persistence field, not a snapshot/UI field) → no UI dirty.
         Action::BackgroundSessionRecorded { .. } => false,
@@ -4298,6 +4352,131 @@ mod tests {
             });
             assert_eq!(state.session.history.len(), 1, "len<=1 时不变");
             assert!(has_log_trace(&effects), "no-op 仍发 LogTrace(DEBUG)");
+        }
+
+        fn messages_as_pairs(messages: &[crate::providers::ChatMessage]) -> Vec<(String, String)> {
+            messages
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect()
+        }
+
+        #[test]
+        fn redux_compaction_patch_applies_exactly_and_matches_driver_history() {
+            use crate::chat::action::CompactReason;
+            let mut state = s();
+            state.session.history = vec![
+                crate::providers::ChatMessage::system("sys"),
+                crate::providers::ChatMessage::user("old user"),
+                crate::providers::ChatMessage::assistant("old assistant"),
+                crate::providers::ChatMessage::user("recent user"),
+            ];
+            let mut driver_history = state.session.history.clone();
+            let guard = crate::agent::loop_::compaction_patch_guard_for(&driver_history, 1, 3).expect("guard");
+            let patch = crate::agent::loop_::CompactionPatch {
+                range_start: 1,
+                range_end: 3,
+                replacement: vec![crate::providers::ChatMessage::assistant(
+                    "[Context compacted at test. Summary: PROVIDER_SUMMARY_MARKER]",
+                )],
+                append_after: vec![crate::providers::ChatMessage::user(
+                    "[Post-compaction context refresh]\nre-read",
+                )],
+                guard,
+            };
+            let config = crate::config::AgentCompactionConfig {
+                max_context_tokens: 10_000,
+                reserve_tokens: 10,
+                max_context_tokens_explicit: true,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+
+            crate::agent::loop_::apply_compaction_patch_exact(&mut driver_history, &patch);
+            let effects = state.reduce(Action::HistoryCompactionPatchApplied {
+                reason: CompactReason::ContextOverflow,
+                patch,
+                compaction_config: config,
+            });
+
+            assert_eq!(
+                messages_as_pairs(&state.session.history),
+                messages_as_pairs(&driver_history),
+                "GP-6: reducer history must exactly match driver history after patch"
+            );
+            assert!(
+                state
+                    .session
+                    .history
+                    .iter()
+                    .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
+                "provider summary marker must be present"
+            );
+            assert!(has_log_trace(&effects));
+        }
+
+        #[test]
+        fn redux_compaction_patch_guard_mismatch_falls_back_without_stale_patch() {
+            use crate::chat::action::CompactReason;
+            let mut state = s();
+            let original = vec![
+                crate::providers::ChatMessage::system("sys"),
+                crate::providers::ChatMessage::user(format!("old user {}", "x ".repeat(180))),
+                crate::providers::ChatMessage::assistant(format!("old assistant {}", "y ".repeat(180))),
+                crate::providers::ChatMessage::user(format!("recent {}", "z ".repeat(180))),
+            ];
+            let guard = crate::agent::loop_::compaction_patch_guard_for(&original, 1, 3).expect("guard");
+            state.session.history = original;
+            state
+                .session
+                .history
+                .push(crate::providers::ChatMessage::user("mutation before reducer"));
+            let patch = crate::agent::loop_::CompactionPatch {
+                range_start: 1,
+                range_end: 3,
+                replacement: vec![crate::providers::ChatMessage::assistant(
+                    "[Context compacted at test. Summary: STALE_PROVIDER_SUMMARY]",
+                )],
+                append_after: vec![crate::providers::ChatMessage::user("stale refresh")],
+                guard,
+            };
+            let config = crate::config::AgentCompactionConfig {
+                max_context_tokens: 90,
+                reserve_tokens: 10,
+                max_context_tokens_explicit: true,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+
+            let effects = state.reduce(Action::HistoryCompactionPatchApplied {
+                reason: CompactReason::ContextOverflow,
+                patch,
+                compaction_config: config.clone(),
+            });
+
+            assert!(
+                state
+                    .session
+                    .history
+                    .iter()
+                    .all(|message| !message.content.contains("STALE_PROVIDER_SUMMARY")),
+                "guard mismatch must not apply stale provider patch"
+            );
+            assert!(
+                crate::agent::loop_::plan_context_budget(
+                    &state.session.history,
+                    &config,
+                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD
+                )
+                .used_tokens
+                    <= 80,
+                "fallback trim must bring history under literal hard limit 80"
+            );
+            assert!(effects.iter().any(|effect| matches!(
+                effect,
+                Effect::LogTrace {
+                    level: tracing::Level::WARN,
+                    msg
+                } if msg.contains("guard mismatch")
+            )));
         }
 
         /// Step4-12: CancelRequested 后再 CancelRequested — 第二次 no-op（generating=false）

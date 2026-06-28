@@ -343,7 +343,7 @@ const MAX_TOOL_RESULT_INLINE_CHARS: usize = 48_000;
 const TOOL_OUTPUT_DOCUMENT_CHUNK_TOKENS: usize = 4_096;
 
 /// Timeout (seconds) for apply_configurable_compaction before falling back to aggressive trim.
-const COMPACTION_TIMEOUT_SECS: u64 = 300;
+pub(crate) const COMPACTION_TIMEOUT_SECS: u64 = 300;
 
 /// Maximum number of times to retry an LLM call after a context overflow error.
 const MAX_OVERFLOW_RETRIES: usize = 3;
@@ -551,7 +551,7 @@ fn trim_history(history: &mut Vec<ChatMessage>, max_history: usize) {
         return;
     }
 
-    let start = if has_system { 1 } else { 0 };
+    let start: usize = if has_system { 1 } else { 0 };
     let to_remove = non_system_count - max_history;
     history.drain(start..start + to_remove);
 }
@@ -879,6 +879,62 @@ fn apply_compaction_summary(history: &mut Vec<ChatMessage>, start: usize, compac
     history.splice(start..compact_end, std::iter::once(summary_msg));
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionPatchGuard {
+    pub history_len: usize,
+    pub range_start: usize,
+    pub range_end: usize,
+    pub replaced_hash: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CompactionPatch {
+    pub range_start: usize,
+    pub range_end: usize,
+    pub replacement: Vec<ChatMessage>,
+    pub append_after: Vec<ChatMessage>,
+    pub guard: CompactionPatchGuard,
+}
+
+fn hash_compaction_messages(messages: &[ChatMessage]) -> String {
+    let mut hasher = sha2::Sha256::new();
+    for message in messages {
+        hasher.update(message.role.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(message.content.as_bytes());
+        hasher.update(b"\0");
+    }
+    hex::encode(hasher.finalize())
+}
+
+#[must_use]
+pub fn compaction_patch_guard_for(
+    history: &[ChatMessage],
+    range_start: usize,
+    range_end: usize,
+) -> Option<CompactionPatchGuard> {
+    let replaced = history.get(range_start..range_end)?;
+    Some(CompactionPatchGuard {
+        history_len: history.len(),
+        range_start,
+        range_end,
+        replaced_hash: hash_compaction_messages(replaced),
+    })
+}
+
+#[must_use]
+pub fn compaction_patch_guard_matches(history: &[ChatMessage], guard: &CompactionPatchGuard) -> bool {
+    let Some(current) = compaction_patch_guard_for(history, guard.range_start, guard.range_end) else {
+        return false;
+    };
+    current == *guard
+}
+
+pub fn apply_compaction_patch_exact(history: &mut Vec<ChatMessage>, patch: &CompactionPatch) {
+    history.splice(patch.range_start..patch.range_end, patch.replacement.clone());
+    history.extend(patch.append_after.clone());
+}
+
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
     estimate_history_tokens_with_source(history).tokens
 }
@@ -968,6 +1024,33 @@ pub(crate) fn trim_history_to_context_budget(
     let before_tokens = measure_history_tokens(history);
     let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
     trim_history_token_aware(history, limit);
+    history.len() != before_len || measure_history_tokens(history) != before_tokens
+}
+
+pub fn trim_history_to_context_budget_preserving_compaction_replacement(
+    history: &mut Vec<ChatMessage>,
+    config: &crate::config::AgentCompactionConfig,
+    replacement_len: usize,
+) -> bool {
+    let before_len = history.len();
+    let before_tokens = measure_history_tokens(history);
+    let limit = config.max_context_tokens.saturating_sub(config.reserve_tokens);
+    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let start: usize = if has_system { 1 } else { 0 };
+    let preserve_until = start.saturating_add(replacement_len).min(history.len());
+    loop {
+        if estimate_history_tokens(history) <= limit {
+            break;
+        }
+        let remove_index = if history.len() > preserve_until {
+            preserve_until
+        } else if history.len() > start.saturating_add(1) {
+            start
+        } else {
+            break;
+        };
+        history.remove(remove_index);
+    }
     history.len() != before_len || measure_history_tokens(history) != before_tokens
 }
 
@@ -1222,32 +1305,32 @@ fn compaction_trigger_limit(config: &crate::config::AgentCompactionConfig) -> Op
     Some(max_tokens - reserve)
 }
 
-async fn apply_configurable_compaction(
-    history: &mut Vec<ChatMessage>,
+pub(crate) async fn build_configurable_compaction_patch(
+    history: &[ChatMessage],
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
-) -> Result<bool> {
+) -> Result<Option<CompactionPatch>> {
     let Some(limit) = compaction_trigger_limit(config) else {
-        return Ok(false);
+        return Ok(None);
     };
     if estimate_history_tokens(history) <= limit {
-        return Ok(false);
+        return Ok(None);
     }
 
     let has_system = history.first().is_some_and(|m| m.role == "system");
     let start = if has_system { 1 } else { 0 };
     let non_system_count = history.len().saturating_sub(start);
     if non_system_count <= 1 {
-        return Ok(false);
+        return Ok(None);
     }
 
     let keep_recent = config.keep_recent_messages.max(1).min(non_system_count);
     let compact_count = non_system_count.saturating_sub(keep_recent);
     if compact_count == 0 {
-        return Ok(false);
+        return Ok(None);
     }
     let compact_end = start + compact_count;
     let audit_source = audit.and_then(|_| history.get(start..compact_end).map(build_compaction_audit_source));
@@ -1256,10 +1339,14 @@ async fn apply_configurable_compaction(
         .map(bounded_compaction_projection)
         .unwrap_or_default();
     if source_projection.is_empty() {
-        return Ok(false);
+        return Ok(None);
     }
+    let Some(guard) = compaction_patch_guard_for(history, start, compact_end) else {
+        return Ok(None);
+    };
     let timestamp = chrono::Utc::now().to_rfc3339();
 
+    let mut replacement = Vec::new();
     if config.memory_flush {
         let flush_prompt = format!(
             "Write a concise memory flush message (max 6 bullets) capturing durable facts, decisions, and unresolved tasks from this history:\n\n{}",
@@ -1274,13 +1361,10 @@ async fn apply_configurable_compaction(
             )
             .await
             .unwrap_or_else(|_| "Memory flush fallback: key context retained.".to_string());
-        history.insert(
-            compact_end,
-            ChatMessage::assistant(format!(
-                "[Memory flush at {timestamp}: {}]",
-                truncate_with_ellipsis(&flush_note, MEMORY_FLUSH_MAX_CHARS)
-            )),
-        );
+        replacement.push(ChatMessage::assistant(format!(
+            "[Memory flush at {timestamp}: {}]",
+            truncate_with_ellipsis(&flush_note, MEMORY_FLUSH_MAX_CHARS)
+        )));
     }
 
     let summary = match config.mode {
@@ -1365,7 +1449,7 @@ async fn apply_configurable_compaction(
             }
             truncate_with_ellipsis(&summary, COMPACTION_MAX_SUMMARY_CHARS)
         }
-        crate::config::AgentCompactionMode::Off => return Ok(false),
+        crate::config::AgentCompactionMode::Off => return Ok(None),
     };
     let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, &source_projection);
     persist_compaction_audit(
@@ -1378,22 +1462,42 @@ async fn apply_configurable_compaction(
     )
     .await;
 
-    history.splice(
-        start..compact_end,
-        std::iter::once(ChatMessage::assistant(format!(
-            "[Context compacted at {timestamp}. Summary: {summary}]"
-        ))),
+    replacement.insert(
+        0,
+        ChatMessage::assistant(format!("[Context compacted at {timestamp}. Summary: {summary}]")),
     );
 
     // P1-1: Inject post-compaction context refresh so the model knows critical
     // rules may have been summarized and should re-read workspace instructions.
-    history.push(ChatMessage::user(
+    let append_after = vec![ChatMessage::user(
         "[Post-compaction context refresh]\n\
          Session was just compacted. Critical rules may have been summarized.\n\
          Re-read workspace instructions if available."
             .to_string(),
-    ));
+    )];
 
+    Ok(Some(CompactionPatch {
+        range_start: start,
+        range_end: compact_end,
+        replacement,
+        append_after,
+        guard,
+    }))
+}
+
+async fn apply_configurable_compaction(
+    history: &mut Vec<ChatMessage>,
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> Result<bool> {
+    let Some(patch) = build_configurable_compaction_patch(history, provider, model, config, audit, trigger).await?
+    else {
+        return Ok(false);
+    };
+    apply_compaction_patch_exact(history, &patch);
     Ok(true)
 }
 

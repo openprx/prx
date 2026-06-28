@@ -1290,6 +1290,72 @@ fn resolve_driver_max_iterations(max_tool_iterations: usize) -> usize {
     }
 }
 
+async fn apply_redux_summary_compaction(
+    provider: &dyn Provider,
+    history: &mut Vec<crate::providers::traits::ChatMessage>,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    action_tx: &mpsc::Sender<Action>,
+    reason: crate::chat::action::CompactReason,
+    trigger: &str,
+) -> Result<bool, ()> {
+    if matches!(config.mode, crate::config::AgentCompactionMode::Off) {
+        return Ok(false);
+    }
+
+    let patch = match tokio::time::timeout(
+        std::time::Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+        crate::agent::loop_::build_configurable_compaction_patch(history, provider, model, config, None, trigger),
+    )
+    .await
+    {
+        Ok(Ok(Some(patch))) => patch,
+        Ok(Ok(None)) => return Ok(false),
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, trigger, "redux driver summary compaction failed; falling back to trim");
+            return Ok(false);
+        }
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = crate::agent::loop_::COMPACTION_TIMEOUT_SECS,
+                trigger,
+                "redux driver summary compaction timed out; falling back to trim"
+            );
+            return Ok(false);
+        }
+    };
+
+    let replacement_len = patch.replacement.len();
+    crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
+    let budget =
+        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_hard_limit {
+        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement(
+            history,
+            config,
+            replacement_len,
+        );
+        tracing::warn!(
+            used_tokens = budget.used_tokens,
+            hard_limit = budget.available_input_tokens,
+            trimmed,
+            "redux driver summary compaction applied preserving trim"
+        );
+    }
+    if let Err(error) = action_tx
+        .send(Action::HistoryCompactionPatchApplied {
+            reason,
+            patch,
+            compaction_config: config.clone(),
+        })
+        .await
+    {
+        tracing::debug!(%error, "StartTurn: action_tx closed on summary-compaction-patch");
+        return Err(());
+    }
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -1351,16 +1417,29 @@ async fn drive_start_turn_stream(
             );
             if budget.over_hard_limit {
                 let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
-                let after_compact = if compaction_off {
-                    budget
+                let summary_applied = if compaction_off {
+                    false
                 } else {
-                    crate::chat::state::compact_history_in_place(&mut history);
-                    crate::agent::loop_::plan_context_budget(
-                        &history,
+                    match apply_redux_summary_compaction(
+                        provider.as_ref(),
+                        &mut history,
+                        &model,
                         config,
-                        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                        &action_tx,
+                        crate::chat::action::CompactReason::ContextOverflow,
+                        "redux_preflight",
                     )
+                    .await
+                    {
+                        Ok(applied) => applied,
+                        Err(()) => return,
+                    }
                 };
+                let after_compact = crate::agent::loop_::plan_context_budget(
+                    &history,
+                    config,
+                    crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+                );
                 if compaction_off || after_compact.over_hard_limit {
                     let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
                     tracing::warn!(
@@ -1368,20 +1447,10 @@ async fn drive_start_turn_stream(
                         after_compact_tokens = after_compact.used_tokens,
                         hard_limit = after_compact.available_input_tokens,
                         compaction_off,
+                        summary_applied,
                         trimmed,
-                        "redux driver context budget preflight remediated with compact-in-place/token-aware trim; summary parity deferred as ISS-011"
+                        "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
-                }
-                if !compaction_off {
-                    if let Err(e) = action_tx
-                        .send(Action::HistoryCompacted {
-                            reason: crate::chat::action::CompactReason::ContextOverflow,
-                        })
-                        .await
-                    {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on budget-preflight-compact");
-                        return;
-                    }
                 }
             } else if budget.over_warning {
                 tracing::info!(
@@ -1426,28 +1495,48 @@ async fn drive_start_turn_stream(
                     return;
                 }
                 overflow_retries = overflow_retries.saturating_add(1);
-                let compaction_off = compaction_config
-                    .as_ref()
-                    .is_some_and(|config| matches!(config.mode, crate::config::AgentCompactionMode::Off));
-                if compaction_off {
-                    if let Some(config) = compaction_config.as_ref() {
+                match compaction_config.as_ref() {
+                    Some(config) if matches!(config.mode, crate::config::AgentCompactionMode::Off) => {
                         let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
                         tracing::warn!(
                             trimmed,
                             "redux driver context-overflow retry used trim-only because compaction mode is Off"
                         );
                     }
-                } else {
-                    // 同步两侧：driver 自己 compact + 通知 reducer compact 自己的 history.
-                    crate::chat::state::compact_history_in_place(&mut history);
-                    if let Err(e) = action_tx
-                        .send(Action::HistoryCompacted {
-                            reason: crate::chat::action::CompactReason::ContextOverflow,
-                        })
+                    Some(config) => {
+                        let summary_applied = match apply_redux_summary_compaction(
+                            provider.as_ref(),
+                            &mut history,
+                            &model,
+                            config,
+                            &action_tx,
+                            crate::chat::action::CompactReason::ContextOverflow,
+                            "redux_overflow_retry",
+                        )
                         .await
-                    {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
-                        return;
+                        {
+                            Ok(applied) => applied,
+                            Err(()) => return,
+                        };
+                        if !summary_applied {
+                            let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
+                            tracing::warn!(
+                                trimmed,
+                                "redux driver context-overflow retry summary unavailable; used token-aware trim"
+                            );
+                        }
+                    }
+                    None => {
+                        crate::chat::state::compact_history_in_place(&mut history);
+                        if let Err(e) = action_tx
+                            .send(Action::HistoryCompacted {
+                                reason: crate::chat::action::CompactReason::ContextOverflow,
+                            })
+                            .await
+                        {
+                            tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
+                            return;
+                        }
                     }
                 }
                 // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
@@ -6751,17 +6840,20 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
-    async fn redux_driver_preflight_trims_before_stream_request_when_over_hard_limit() {
+    async fn redux_driver_preflight_uses_provider_summary_before_first_stream_request() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
             StreamResult,
         };
         use async_trait::async_trait;
         use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex;
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
         struct BudgetCaptureProvider {
             first_tokens: Arc<AtomicUsize>,
+            summary_calls: Arc<AtomicUsize>,
+            first_history: Arc<Mutex<Option<Vec<PMsg>>>>,
         }
         #[async_trait]
         impl Provider for BudgetCaptureProvider {
@@ -6769,7 +6861,11 @@ mod real_mode_tests {
                 ProviderCapabilities::default()
             }
             async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
-                Ok(String::new())
+                self.summary_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(
+                    "PROVIDER_SUMMARY_MARKER\n## Decisions\n- keep decision\n## Open TODOs\n- keep todo\n## Constraints\n- keep rule"
+                        .to_string(),
+                )
             }
             async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
                 Ok(ChatResponse {
@@ -6796,6 +6892,10 @@ mod real_mode_tests {
                         AtomicOrdering::SeqCst,
                     )
                     .ok();
+                let mut guard = self.first_history.lock();
+                if guard.is_none() {
+                    *guard = Some(messages.to_vec());
+                }
                 stream::iter(vec![
                     Ok(StreamChunk::delta("budget-ok")),
                     Ok(StreamChunk::final_chunk()),
@@ -6808,19 +6908,23 @@ mod real_mode_tests {
         }
 
         let first_tokens = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let first_history = Arc::new(Mutex::new(None));
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(BudgetCaptureProvider {
             first_tokens: Arc::clone(&first_tokens),
+            summary_calls: Arc::clone(&summary_calls),
+            first_history: Arc::clone(&first_history),
         });
         let executor = EffectExecutor::new_with_deps(deps);
         let config = crate::config::AgentCompactionConfig {
-            mode: crate::config::AgentCompactionMode::Aggressive,
+            mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 10,
             keep_recent_messages: 2,
             memory_flush: false,
-            max_context_tokens: 120,
+            max_context_tokens: 160,
             max_context_tokens_explicit: true,
             ..crate::config::AgentCompactionConfig::default()
         };
@@ -6840,19 +6944,52 @@ mod real_mode_tests {
             })
             .await;
 
+        let mut saw_summary_patch = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
-            if let Action::StreamCompleted { final_text, .. } = action {
-                assert!(final_text.contains("budget-ok"));
-                break;
+            match action {
+                Action::HistoryCompactionPatchApplied { patch, .. } => {
+                    saw_summary_patch = true;
+                    assert!(
+                        patch
+                            .replacement
+                            .iter()
+                            .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
+                        "summary patch must carry provider summary marker"
+                    );
+                }
+                Action::HistoryCompacted { .. } => {
+                    panic!("preflight summary path must not dispatch lossy HistoryCompacted");
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("budget-ok"));
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
             }
         }
+        assert!(saw_summary_patch, "preflight must dispatch exact summary patch");
+        assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
+        let captured = first_history.lock().clone().expect("first stream history");
         assert!(
-            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
-            "redux first provider call must be below literal hard limit 110 tokens"
+            captured
+                .iter()
+                .any(|message| message.content.contains("PROVIDER_SUMMARY_MARKER")),
+            "first stream request must contain provider summary marker"
+        );
+        assert!(
+            captured
+                .iter()
+                .all(|message| !message.content.contains("compact-in-place")),
+            "first stream request must not contain old lossy compact marker"
+        );
+        assert!(
+            first_tokens.load(AtomicOrdering::SeqCst) <= 150,
+            "redux first provider call must be below literal hard limit 150 tokens"
         );
     }
 
@@ -6868,6 +7005,7 @@ mod real_mode_tests {
 
         struct BudgetCaptureProvider {
             first_tokens: Arc<AtomicUsize>,
+            summary_calls: Arc<AtomicUsize>,
         }
         #[async_trait]
         impl Provider for BudgetCaptureProvider {
@@ -6875,6 +7013,7 @@ mod real_mode_tests {
                 ProviderCapabilities::default()
             }
             async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                self.summary_calls.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(String::new())
             }
             async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
@@ -6914,11 +7053,13 @@ mod real_mode_tests {
         }
 
         let first_tokens = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(BudgetCaptureProvider {
             first_tokens: Arc::clone(&first_tokens),
+            summary_calls: Arc::clone(&summary_calls),
         });
         let executor = EffectExecutor::new_with_deps(deps);
         let config = crate::config::AgentCompactionConfig {
@@ -6947,6 +7088,7 @@ mod real_mode_tests {
             .await;
 
         let mut saw_history_compacted = false;
+        let mut saw_summary_patch = false;
         let mut saw_completion = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
@@ -6956,6 +7098,9 @@ mod real_mode_tests {
             match action {
                 Action::HistoryCompacted { .. } => {
                     saw_history_compacted = true;
+                }
+                Action::HistoryCompactionPatchApplied { .. } => {
+                    saw_summary_patch = true;
                 }
                 Action::StreamCompleted { final_text, .. } => {
                     assert!(final_text.contains("off-budget-ok"));
@@ -6976,9 +7121,300 @@ mod real_mode_tests {
             !saw_history_compacted,
             "Off mode must not dispatch HistoryCompacted because reducer compacts lossy"
         );
+        assert!(!saw_summary_patch, "Off mode must not dispatch summary patch action");
+        assert_eq!(
+            summary_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "Off mode must not call summarizer"
+        );
         assert!(
             first_tokens.load(AtomicOrdering::SeqCst) <= 110,
             "Off-mode first provider call must be below literal hard limit 110 tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_driver_summarizer_failure_uses_local_guard_before_stream() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct FailingSummaryProvider {
+            first_tokens: Arc<AtomicUsize>,
+            summary_calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl Provider for FailingSummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                self.summary_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(anyhow::anyhow!("summary unavailable"))
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                self.first_tokens
+                    .compare_exchange(
+                        0,
+                        crate::agent::loop_::measure_history_tokens(messages),
+                        AtomicOrdering::SeqCst,
+                        AtomicOrdering::SeqCst,
+                    )
+                    .ok();
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("trim-fallback-ok")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let first_tokens = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FailingSummaryProvider {
+            first_tokens: Arc::clone(&first_tokens),
+            summary_calls: Arc::clone(&summary_calls),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..24 {
+            history.push(PMsg::user(format!("turn {i} {}", "long context ".repeat(40))));
+        }
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-summary-failure".into(),
+                history,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_local_guard_patch = false;
+        let mut saw_completion = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::HistoryCompactionPatchApplied { patch, .. } => {
+                    saw_local_guard_patch = patch.replacement.iter().any(|message| {
+                        message
+                            .content
+                            .contains("Summary unavailable; compacted conservatively.")
+                    });
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("trim-fallback-ok"));
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should fail soft to trim: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(saw_completion, "driver must complete after summary failure trim");
+        assert!(
+            saw_local_guard_patch,
+            "summary failure must dispatch the deterministic local guard patch"
+        );
+        assert_eq!(
+            summary_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "Safeguard mode may retry once, but must not issue unbounded summary calls"
+        );
+        assert!(
+            first_tokens.load(AtomicOrdering::SeqCst) <= 110,
+            "summary failure fallback must stream under literal hard limit 110"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_driver_overflow_retry_uses_provider_summary_patch() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamError,
+            StreamOptions, StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct OverflowThenSuccessProvider {
+            stream_calls: Arc<AtomicUsize>,
+            summary_calls: Arc<AtomicUsize>,
+            retry_history: Arc<Mutex<Option<Vec<PMsg>>>>,
+        }
+        #[async_trait]
+        impl Provider for OverflowThenSuccessProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                self.summary_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(
+                    "OVERFLOW_PROVIDER_SUMMARY\n## Decisions\n- recovered\n## Open TODOs\n- retry\n## Constraints\n- no duplicate tools"
+                        .to_string(),
+                )
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let call = self.stream_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                if call == 0 {
+                    stream::iter(vec![Err::<StreamChunk, _>(StreamError::Provider(
+                        "context_length_exceeded".into(),
+                    ))])
+                    .boxed()
+                } else {
+                    let mut guard = self.retry_history.lock();
+                    if guard.is_none() {
+                        *guard = Some(messages.to_vec());
+                    }
+                    stream::iter(vec![
+                        Ok(StreamChunk::delta("summary-retry-ok")),
+                        Ok(StreamChunk::final_chunk()),
+                    ])
+                    .boxed()
+                }
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let stream_calls = Arc::new(AtomicUsize::new(0));
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let retry_history = Arc::new(Mutex::new(None));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(OverflowThenSuccessProvider {
+            stream_calls: Arc::clone(&stream_calls),
+            summary_calls: Arc::clone(&summary_calls),
+            retry_history: Arc::clone(&retry_history),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 2,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..12 {
+            history.push(PMsg::user(format!("turn {i} {}", "overflow context ".repeat(18))));
+        }
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-overflow-summary".into(),
+                history,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_summary_patch = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("must arrive");
+            match action {
+                Action::HistoryCompactionPatchApplied { patch, .. } => {
+                    saw_summary_patch = true;
+                    assert!(
+                        patch
+                            .replacement
+                            .iter()
+                            .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
+                        "overflow retry patch must carry provider summary"
+                    );
+                }
+                Action::HistoryCompacted { .. } => {
+                    panic!("overflow retry with config must not use lossy HistoryCompacted");
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("summary-retry-ok"));
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should recover after summary retry: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(saw_summary_patch, "overflow retry must dispatch exact summary patch");
+        assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(
+            stream_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "overflow retry must perform exactly one retry"
+        );
+        let retry = retry_history.lock().clone().expect("retry history");
+        assert!(
+            retry
+                .iter()
+                .any(|message| message.content.contains("OVERFLOW_PROVIDER_SUMMARY")),
+            "retry provider request must include summary"
         );
     }
 

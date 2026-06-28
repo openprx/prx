@@ -206,6 +206,14 @@ pub enum Action {
     /// reducer 内完成 truncation，无副作用，只产生 LogTrace。`reason` 字段供
     /// 测试断言与 trace 区分 context-overflow vs manual 路径。
     HistoryCompacted { reason: CompactReason },
+    /// Apply an async provider-backed compaction result computed by the Redux
+    /// driver. The reducer remains pure: it only validates the guard token and
+    /// applies the exact patch, or falls back to deterministic trim on mismatch.
+    HistoryCompactionPatchApplied {
+        reason: CompactReason,
+        patch: crate::agent::loop_::CompactionPatch,
+        compaction_config: crate::config::AgentCompactionConfig,
+    },
 
     // ── UI 折叠/展开 ───────────────────────────────────────────
     /// Tab — 折叠/展开工具卡片
@@ -324,6 +332,7 @@ impl Action {
             Self::RecordSystemMessage { .. } => "RecordSystemMessage",
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
             Self::HistoryCompacted { .. } => "HistoryCompacted",
+            Self::HistoryCompactionPatchApplied { .. } => "HistoryCompactionPatchApplied",
             Self::ToolCardFoldToggled => "ToolCardFoldToggled",
             Self::ReasoningFoldToggled => "ReasoningFoldToggled",
             Self::RedrawRequested => "RedrawRequested",
