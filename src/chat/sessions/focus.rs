@@ -514,11 +514,23 @@ mod tests {
         let entries = switcher_entries(&[
             view(1, ManagedStatus::Running, "left"),
             view(2, ManagedStatus::Completed, "done"),
-            view(3, ManagedStatus::Running, "right"),
+            view(3, ManagedStatus::Failed, "failed"),
+            view(4, ManagedStatus::Cancelled, "cancelled"),
+            view(5, ManagedStatus::Running, "right"),
         ]);
 
-        assert_eq!(adjacent_session_seq(&entries, 1, SessionDirection::Next), Some(3));
-        assert_eq!(adjacent_session_seq(&entries, 3, SessionDirection::Previous), Some(1));
+        assert_eq!(adjacent_session_seq(&entries, 1, SessionDirection::Next), Some(5));
+        assert_eq!(adjacent_session_seq(&entries, 5, SessionDirection::Previous), Some(1));
+        assert_eq!(
+            adjacent_session_seq(&entries, 3, SessionDirection::Next),
+            None,
+            "Failed terminal rows are not current switch targets"
+        );
+        assert_eq!(
+            adjacent_session_seq(&entries, 4, SessionDirection::Previous),
+            None,
+            "Cancelled terminal rows are not current switch targets"
+        );
     }
 
     #[test]
@@ -636,6 +648,12 @@ mod tests {
             kinds,
             vec![("agent", "model"), ("shell", "user"), ("pty", "user")],
             "kind + origin labels thread through the switcher"
+        );
+        let seqs: Vec<u64> = entries.iter().map(|entry| entry.seq).collect();
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3],
+            "switcher entries must preserve the visual left-to-right strip order"
         );
     }
 

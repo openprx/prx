@@ -3093,6 +3093,7 @@ mod tests {
             model_id: model_id.to_string(),
             cost_per_million_tokens: 1.0,
             max_context,
+            reserved_output_tokens: None,
             latency_ms: 1_000,
             categories: vec!["code".to_string()],
             elo_rating: 1_000.0,

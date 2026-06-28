@@ -183,6 +183,7 @@ mod tests {
                 provider: provider.to_string(),
                 cost_per_million_tokens: cost,
                 max_context,
+                reserved_output_tokens: None,
                 latency_ms: 2_000,
                 categories: categories.iter().map(|value| (*value).to_string()).collect(),
                 elo_rating: 1_000.0,

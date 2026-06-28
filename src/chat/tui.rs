@@ -335,10 +335,6 @@ pub enum KeyDispatch {
     /// v1.1b: the switcher overlay was closed (Esc / Ctrl+G toggle / after
     /// attach). The key loop dispatches `Action::SwitcherClosed`.
     SwitcherClosed,
-    /// P7c: saved chat-session picker opened.
-    SavedSessionPickerOpened {
-        entries: Vec<crate::chat::session::SavedSessionPickerEntry>,
-    },
     /// P7c: saved chat-session picker moved.
     SavedSessionPickerMoved { selected: usize },
     /// P7c: saved chat-session picker closed.
@@ -910,6 +906,13 @@ impl TuiInput {
         let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
         self.cursor = (last_line_idx, last_len);
         self.truncated = false;
+    }
+
+    /// Clear navigation/search state after an external text replacement.
+    pub fn clear_navigation_state(&mut self) {
+        self.reverse_search = None;
+        self.history_pos = None;
+        self.pending_draft = None;
     }
 
     /// Clear the buffer back to a single empty line.

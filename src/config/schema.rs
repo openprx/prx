@@ -698,6 +698,9 @@ pub struct RouterModelConfig {
     /// Maximum context window in tokens.
     #[serde(default = "default_router_max_context")]
     pub max_context: usize,
+    /// Output tokens reserved for this model when planning input context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reserved_output_tokens: Option<usize>,
     /// Average latency in milliseconds.
     #[serde(default = "default_router_latency")]
     pub latency_ms: u32,

@@ -713,6 +713,30 @@ fn test_chat_plain_diff_no_tui_chrome() {
 
 #[test]
 #[serial(prx_chat_pty)]
+fn test_chat_plain_attach_no_tui_chrome() {
+    let guard = new_harness_guard().expect("harness guard");
+    let output = run_chat_script_in(
+        &guard,
+        &["--plain"],
+        &[("PRX_TUI", "1"), ("OPENPRX_MOCK_RESPONSE", "ATTACH_UNUSED")],
+        "/attach 1\n/exit\n",
+    );
+    assert!(
+        output.contains("Attach failed"),
+        "plain /attach should run the attach handler and fail visibly for a missing child session; output:\n{output}"
+    );
+    assert!(
+        !output.contains("PRX Chat |")
+            && !output.contains("Ctrl+G sessions")
+            && !output.contains("attached #")
+            && !output.contains("child viewport")
+            && !output.contains("diff workspace diff"),
+        "--plain /attach must not render TUI chrome; output:\n{output}"
+    );
+}
+
+#[test]
+#[serial(prx_chat_pty)]
 fn test_chat_plain_file_mention_no_tui_chrome() {
     let sentinel = "[MOCK-FILE-MENTION-OK]";
     let guard = new_harness_guard().expect("harness guard");
@@ -754,7 +778,7 @@ fn test_chat_plain_resume_list_no_tui_chrome() {
         "list me\n/exit\n",
     );
 
-    let output = run_chat_script_in(&guard, &["--plain"], &[("PRX_TUI", "1")], "/resume\n/exit\n");
+    let output = run_chat_script_in(&guard, &["--plain"], &[], "/resume\n/exit\n");
     assert!(
         output.contains("Saved chat sessions:"),
         "plain /resume should emit the text session list; output:\n{output}"

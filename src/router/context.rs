@@ -75,6 +75,7 @@ pub fn resolve_effective_compaction_config(
         return with_model_context(
             base,
             model_config.max_context,
+            model_config.reserved_output_tokens,
             ContextWindowSource::RouterModelConfig,
             selected_provider,
             selected_model,
@@ -86,6 +87,7 @@ pub fn resolve_effective_compaction_config(
         return with_model_context(
             base,
             model_config.max_context,
+            model_config.reserved_output_tokens,
             ContextWindowSource::RouterBuiltin,
             selected_provider,
             selected_model,
@@ -126,6 +128,7 @@ pub fn trace_effective_compaction_resolution(resolution: &EffectiveCompactionCon
 fn with_model_context(
     base: &AgentCompactionConfig,
     max_context_tokens: usize,
+    reserved_output_tokens: Option<usize>,
     source: ContextWindowSource,
     selected_provider: String,
     selected_model: String,
@@ -133,6 +136,9 @@ fn with_model_context(
     let capped = cap_to_kernel(max_context_tokens);
     let mut config = base.clone();
     config.max_context_tokens = capped.effective;
+    if let Some(reserved_output_tokens) = reserved_output_tokens {
+        config.reserve_tokens = reserved_output_tokens;
+    }
     config.max_context_tokens_explicit = false;
     resolved(
         config,
@@ -229,6 +235,7 @@ mod tests {
             provider: provider.to_string(),
             cost_per_million_tokens: 1.0,
             max_context,
+            reserved_output_tokens: None,
             latency_ms: 1_000,
             categories: vec!["code".to_string()],
             elo_rating: 1_000.0,
@@ -257,9 +264,22 @@ mod tests {
             provider: provider.to_string(),
             cost_per_million_tokens: 1.0,
             max_context,
+            reserved_output_tokens: None,
             latency_ms: 1_000,
             categories: vec!["code".to_string()],
             elo_rating: 1_000.0,
+        }
+    }
+
+    fn model_with_reserved_output(
+        provider: &str,
+        model_id: &str,
+        max_context: usize,
+        reserved_output_tokens: usize,
+    ) -> RouterModelConfig {
+        RouterModelConfig {
+            reserved_output_tokens: Some(reserved_output_tokens),
+            ..model(provider, model_id, max_context)
         }
     }
 
@@ -271,6 +291,24 @@ mod tests {
         assert_eq!(result.config.max_context_tokens, 128_000);
         assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
         assert_eq!(result.model_context_tokens, Some(128_000));
+    }
+
+    #[test]
+    fn per_model_reserved_output_tokens_override_global_reserve_literal() {
+        let router = router_with_models(vec![model_with_reserved_output(
+            "openrouter",
+            "output-heavy",
+            200_000,
+            12_345,
+        )]);
+        let base = AgentCompactionConfig {
+            reserve_tokens: 4_096,
+            ..AgentCompactionConfig::default()
+        };
+        let result = resolve_effective_compaction_config(&base, "openrouter", "output-heavy", &router, &[]);
+        assert_eq!(result.config.max_context_tokens, 200_000);
+        assert_eq!(result.config.reserve_tokens, 12_345);
+        assert_eq!(result.max_context_source, ContextWindowSource::RouterModelConfig);
     }
 
     #[test]

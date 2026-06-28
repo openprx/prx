@@ -251,6 +251,7 @@ mod tests {
             latency_ms: latency,
             cost_per_million_tokens: 0.0,
             max_context: 4096,
+            reserved_output_tokens: None,
             categories: vec![],
         }
     }

@@ -810,7 +810,6 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitcherOpened { .. } => "SwitcherOpened",
         tui::KeyDispatch::SwitcherMoved { .. } => "SwitcherMoved",
         tui::KeyDispatch::SwitcherClosed => "SwitcherClosed",
-        tui::KeyDispatch::SavedSessionPickerOpened { .. } => "SavedSessionPickerOpened",
         tui::KeyDispatch::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
         tui::KeyDispatch::SavedSessionPickerClosed => "SavedSessionPickerClosed",
         tui::KeyDispatch::ResumeSavedSession { .. } => "ResumeSavedSession",
@@ -868,7 +867,6 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitcherOpened { .. }
         | tui::KeyDispatch::SwitcherMoved { .. }
         | tui::KeyDispatch::SwitcherClosed
-        | tui::KeyDispatch::SavedSessionPickerOpened { .. }
         | tui::KeyDispatch::SavedSessionPickerMoved { .. }
         | tui::KeyDispatch::SavedSessionPickerClosed
         | tui::KeyDispatch::ResumeSavedSession { .. }
@@ -2207,8 +2205,8 @@ pub async fn run(
                 let Some(pending) = pending_chat_rewind.take() else {
                     continue;
                 };
-                match rewind_approval {
-                    Ok(true) => {
+                match resolve_rewind_approval(&pending.tool_id, rewind_approval) {
+                    RewindApprovalOutcome::Apply => {
                         let target_id = pending.target_session.id.clone();
                         let target_turns = pending.target_session.turn_count();
                         if let Err(e) = save_session(mem.as_ref(), &pending.target_session).await {
@@ -2252,22 +2250,8 @@ pub async fn run(
                             &format!("Rewound chat session {target_id} to {target_turns} turns."),
                         );
                     }
-                    Ok(false) => {
-                        surface_session_message(
-                            &chat_dispatcher,
-                            sessions_redraw_handle.as_ref(),
-                            "Rewind cancelled; current session unchanged.",
-                        );
-                    }
-                    Err(_) => {
-                        surface_session_message(
-                            &chat_dispatcher,
-                            sessions_redraw_handle.as_ref(),
-                            &format!(
-                                "Rewind cancelled; approval channel closed for {} and current session is unchanged.",
-                                pending.tool_id
-                            ),
-                        );
+                    RewindApprovalOutcome::Cancelled(message) => {
+                        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &message);
                     }
                 }
                 continue;
@@ -2885,7 +2869,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             "Switched to plan mode (read-only tools only — write/shell/git_commit will be simulated)"
                         }
                         commands::ChatMode::Edit => "Switched to edit mode (default — write tools enabled)",
-                        commands::ChatMode::Auto => "Switched to auto mode (all tools, no approval prompts)",
+                        commands::ChatMode::Auto => "Switched to auto mode (does not override [autonomy])",
                     };
                     emit_chat_output(msg);
                     continue;
@@ -5556,6 +5540,16 @@ fn edit_text_with_external_editor(
     editor: Option<String>,
     terminal: &dyn ExternalEditorTerminalMode,
 ) -> ExternalEditorResult {
+    edit_text_with_external_editor_with_runner(initial, editor, terminal, run_external_editor_command)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn edit_text_with_external_editor_with_runner(
+    initial: &str,
+    editor: Option<String>,
+    terminal: &dyn ExternalEditorTerminalMode,
+    run_editor: impl FnOnce(&str, &std::path::Path) -> std::io::Result<std::process::ExitStatus>,
+) -> ExternalEditorResult {
     let Some(editor) = editor else {
         return ExternalEditorResult::Unchanged("External editor unavailable: set VISUAL or EDITOR.".to_string());
     };
@@ -5578,7 +5572,7 @@ fn edit_text_with_external_editor(
     let path = file.path().to_path_buf();
     {
         let _terminal_guard = ExternalEditorTerminalGuard::new(terminal);
-        let status = match run_external_editor_command(&editor, &path) {
+        let status = match run_editor(&editor, &path) {
             Ok(status) => status,
             Err(err) => {
                 return ExternalEditorResult::Unchanged(format!("External editor failed to start: {err}."));
@@ -6815,12 +6809,6 @@ fn run_tui_unified_loop(
                         let _ = chat_dispatcher
                             .dispatch_or_log(crate::chat::action::Action::SwitcherClosed, "chat.switcher_closed");
                     }
-                    tui::KeyDispatch::SavedSessionPickerOpened { entries } => {
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::SavedSessionPickerOpened { entries },
-                            "chat.saved_session_picker_opened",
-                        );
-                    }
                     tui::KeyDispatch::SavedSessionPickerMoved { selected } => {
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::SavedSessionPickerMoved { selected },
@@ -6912,7 +6900,11 @@ fn run_tui_unified_loop(
                         let terminal_mode = CrosstermExternalEditorTerminalMode;
                         match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {
                             ExternalEditorResult::Edited(text) => {
-                                mirror.lock().input.set_text(&text);
+                                {
+                                    let mut guard = mirror.lock();
+                                    guard.input.set_text(&text);
+                                    guard.input.clear_navigation_state();
+                                }
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::InputReplaced(text),
                                     "chat.external_editor_input_replaced",
@@ -7324,6 +7316,24 @@ struct PendingChatRewind {
     tool_id: String,
     target_session: session::ChatSession,
     approval_rx: tokio::sync::oneshot::Receiver<bool>,
+}
+
+enum RewindApprovalOutcome {
+    Apply,
+    Cancelled(String),
+}
+
+fn resolve_rewind_approval(
+    tool_id: &str,
+    approval: std::result::Result<bool, tokio::sync::oneshot::error::RecvError>,
+) -> RewindApprovalOutcome {
+    match approval {
+        Ok(true) => RewindApprovalOutcome::Apply,
+        Ok(false) => RewindApprovalOutcome::Cancelled("Rewind cancelled; current session unchanged.".to_string()),
+        Err(_) => RewindApprovalOutcome::Cancelled(format!(
+            "Rewind cancelled; approval channel closed for {tool_id} and current session is unchanged."
+        )),
+    }
 }
 
 struct PendingDiffApply {
@@ -9468,6 +9478,32 @@ mod p6b2_external_editor_tests {
     }
 
     #[test]
+    fn external_editor_spawn_failure_keeps_draft_unchanged_and_restores_terminal() {
+        let terminal = FakeTerminalMode::default();
+        let result = edit_text_with_external_editor_with_runner(
+            "old draft",
+            Some("unused-editor".to_string()),
+            &terminal,
+            |_editor, _path| Err(std::io::Error::new(std::io::ErrorKind::NotFound, "spawn failed")),
+        );
+        match result {
+            ExternalEditorResult::Unchanged(reason) => {
+                assert!(
+                    reason.contains("failed to start"),
+                    "reason should mention spawn failure: {reason}"
+                );
+            }
+            other => panic!("expected unchanged result, got {other:?}"),
+        }
+        assert_eq!(terminal.suspended.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            terminal.restored.load(Ordering::SeqCst),
+            1,
+            "spawn failure must still restore terminal mode"
+        );
+    }
+
+    #[test]
     fn external_editor_missing_env_keeps_draft_unchanged_without_terminal_handoff() {
         let terminal = FakeTerminalMode::default();
         let result = edit_text_with_external_editor("old draft", None, &terminal);
@@ -9659,12 +9695,124 @@ mod p7b_branch_rewind_tests {
         assert_eq!(full_rewind.background_sessions.len(), 1);
         assert!(short_rewind.background_sessions.is_empty());
     }
+
+    fn assert_same_turns(left: &session::ChatSession, right: &session::ChatSession) {
+        assert_eq!(left.turns.len(), right.turns.len());
+        for (left_turn, right_turn) in left.turns.iter().zip(right.turns.iter()) {
+            assert_eq!(left_turn.role, right_turn.role);
+            assert_eq!(left_turn.content, right_turn.content);
+        }
+    }
+
+    #[tokio::test]
+    async fn rewind_denied_approval_does_not_apply_trimmed_session() {
+        let source = sample_session();
+        let target = rewound_chat_session_from(&source, 1);
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tx.send(false).expect("send deny");
+        let outcome = resolve_rewind_approval("chat_rewind:test-deny", rx.await);
+
+        let current = if matches!(outcome, RewindApprovalOutcome::Apply) {
+            target
+        } else {
+            source.clone()
+        };
+
+        assert_eq!(current.turns.len(), 3, "denied rewind must leave session unchanged");
+        assert_same_turns(&current, &source);
+        match outcome {
+            RewindApprovalOutcome::Cancelled(message) => {
+                assert!(
+                    message.contains("unchanged"),
+                    "message should be fail-closed: {message}"
+                );
+            }
+            RewindApprovalOutcome::Apply => panic!("deny must not enter apply arm"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rewind_dropped_approval_channel_does_not_apply_trimmed_session() {
+        let source = sample_session();
+        let target = rewound_chat_session_from(&source, 1);
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(tx);
+        let outcome = resolve_rewind_approval("chat_rewind:test-drop", rx.await);
+
+        let current = if matches!(outcome, RewindApprovalOutcome::Apply) {
+            target
+        } else {
+            source.clone()
+        };
+
+        assert_eq!(current.turns.len(), 3, "dropped approval must leave session unchanged");
+        assert_same_turns(&current, &source);
+        match outcome {
+            RewindApprovalOutcome::Cancelled(message) => {
+                assert!(
+                    message.contains("chat_rewind:test-drop") && message.contains("unchanged"),
+                    "message should include tool id and unchanged state: {message}"
+                );
+            }
+            RewindApprovalOutcome::Apply => panic!("dropped channel must not enter apply arm"),
+        }
+    }
 }
 
 #[cfg(all(test, feature = "terminal-tui"))]
 mod p6b1_transcript_tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn open_transcript_view_sets_read_only_focus_without_session_seq() {
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
+        {
+            let mut guard = mirror.lock();
+            guard.session_title = "main chat".to_string();
+            guard.conversation_lines.push(tui::ConversationLine::User {
+                content: "hello".to_string(),
+            });
+        }
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+        let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
+
+        open_transcript_view(&mirror, &dispatcher, Some(&redraw_tx));
+
+        {
+            let guard = mirror.lock();
+            assert_eq!(guard.focus, crate::chat::sessions::FocusTarget::Transcript);
+            assert_eq!(
+                guard.focus.session_seq(),
+                None,
+                "transcript focus must not become a steerable attached session"
+            );
+            assert!(
+                guard
+                    .active_session_view
+                    .as_ref()
+                    .is_some_and(|view| view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str())
+            );
+        }
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Transcript);
+                assert_eq!(focus.session_seq(), None);
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                let view = view.expect("transcript view");
+                assert_eq!(
+                    view.kind,
+                    crate::chat::sessions::model::ManagedKind::Transcript.as_str()
+                );
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
+        assert!(redraw_rx.try_recv().is_ok(), "open should request redraw");
+    }
 
     #[test]
     fn close_transcript_view_returns_main_focus_and_clears_view() {

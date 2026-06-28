@@ -57,7 +57,7 @@ pub enum SessionCommand {
 fn parse_seq_arg(arg: &str) -> Option<u64> {
     let token = arg.split_whitespace().next()?;
     let digits = token.strip_prefix('#').unwrap_or(token);
-    digits.parse::<u64>().ok()
+    digits.parse::<u64>().ok().filter(|seq| *seq > 0)
 }
 
 /// Parse a chat session command from raw input.
@@ -297,6 +297,16 @@ mod tests {
         assert_eq!(
             parse_session_command("/attach #7"),
             Some(SessionCommand::Attach { seq: 7 })
+        );
+        assert_eq!(
+            parse_session_command("/attach 0"),
+            None,
+            "seq 0 is reserved for synthetic child views and must not route to /attach"
+        );
+        assert_eq!(
+            parse_session_command("/attach #0"),
+            None,
+            "display-form seq 0 is also rejected"
         );
         assert_eq!(parse_session_command("/logs #9"), Some(SessionCommand::Logs { seq: 9 }));
         assert_eq!(

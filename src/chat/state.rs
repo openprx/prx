@@ -872,6 +872,7 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
         self.ui.input.set_text(text);
+        self.ui.input.clear_navigation_state();
         vec![Effect::RequestRedraw]
     }
 
@@ -3015,12 +3016,29 @@ mod tests {
         #[test]
         fn input_replaced_updates_snapshot_without_submit() {
             let mut state = s();
+            state.ui.input.history = vec!["prior draft".to_string()];
+            let _ = state.reduce(Action::KeyPressed(KeyEvent::new(
+                KeyCode::Char('r'),
+                KeyModifiers::CONTROL,
+            )));
+            assert!(
+                state.ui.input.is_reverse_search_active(),
+                "test setup: reverse-search must be active before external editor replacement"
+            );
             let effects = state.reduce(Action::InputReplaced("edited draft".to_string()));
             assert!(has_request_redraw(&effects));
             assert_eq!(state.ui.input.text(), "edited draft");
+            assert!(
+                !state.ui.input.is_reverse_search_active(),
+                "external editor replacement must clear stale reverse-search title"
+            );
             assert_eq!(state.ui.turn_count, 0, "external editor replacement must not submit");
             let snap = state.build_ui_snapshot(2);
             assert_eq!(snap.input.text(), "edited draft");
+            assert!(
+                !snap.input.is_reverse_search_active(),
+                "snapshot must not expose stale reverse-search after replacement"
+            );
         }
 
         /// 额外：ReasoningFoldToggled 在无 reasoning 卡片时也返回 RequestRedraw
