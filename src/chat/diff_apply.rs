@@ -2,13 +2,18 @@ use crate::chat::session::ChatTurn;
 use crate::security::op_id;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 
+// Safety cap for both fenced diff payloads and existing target files read during
+// apply. Larger edits should go through explicit file tools instead of chat
+// diff_apply's in-memory patch path.
 pub(crate) const DIFF_APPLY_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const DIFF_APPLY_MAX_LINES: usize = 2_000;
+const DIFF_APPLY_MAX_TARGET_BYTES: u64 = DIFF_APPLY_MAX_BYTES as u64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DiffApplyPlan {
@@ -175,6 +180,7 @@ pub(crate) fn latest_fenced_diff(turns: &[ChatTurn], latest_index: usize) -> Opt
 pub(crate) fn fenced_diff_blocks(text: &str) -> Vec<String> {
     let mut blocks = Vec::new();
     let mut in_diff = false;
+    let mut discarding_oversized = false;
     let mut current = String::new();
     for line in text.lines() {
         let trimmed = line.trim_start();
@@ -184,21 +190,39 @@ pub(crate) fn fenced_diff_blocks(text: &str) -> Vec<String> {
                 in_diff = matches!(lang.as_str(), "diff" | "patch" | "unified-diff" | "udiff");
                 if in_diff {
                     current.clear();
+                    discarding_oversized = false;
                 }
             }
             continue;
         }
 
         if trimmed.starts_with("```") {
-            blocks.push(current.clone());
+            if !discarding_oversized {
+                blocks.push(current.clone());
+            }
             current.clear();
             in_diff = false;
+            discarding_oversized = false;
+            continue;
+        }
+        if discarding_oversized {
+            continue;
+        }
+        let next_len = current.len().saturating_add(line.len()).saturating_add(1);
+        if next_len > DIFF_APPLY_MAX_BYTES {
+            blocks.push(oversized_diff_marker());
+            current.clear();
+            discarding_oversized = true;
             continue;
         }
         current.push_str(line);
         current.push('\n');
     }
     blocks
+}
+
+fn oversized_diff_marker() -> String {
+    "x".repeat(DIFF_APPLY_MAX_BYTES.saturating_add(1))
 }
 
 pub(crate) fn parse_unified_diff(diff: &str) -> Result<DiffApplyPlan, DiffApplyError> {
@@ -495,6 +519,9 @@ async fn validate_target(file: &FilePatch, security: &SecurityPolicy) -> Result<
                     file.path
                 )));
             }
+            if meta.len() > DIFF_APPLY_MAX_TARGET_BYTES {
+                return Err(DiffApplyError::Oversized);
+            }
             if file.is_add {
                 return Err(DiffApplyError::Stale(format!("{} already exists", file.path)));
             }
@@ -574,8 +601,15 @@ async fn read_current(file: &FilePatch, target: &Path) -> Result<String, DiffApp
         let mut opened = opts
             .open(&target)
             .map_err(|err| DiffApplyError::Io(format!("failed to read {}: {err}", target.display())))?;
-        let mut contents = String::new();
-        std::io::Read::read_to_string(&mut opened, &mut contents)
+        let mut bytes = Vec::new();
+        std::io::Read::by_ref(&mut opened)
+            .take(DIFF_APPLY_MAX_TARGET_BYTES.saturating_add(1))
+            .read_to_end(&mut bytes)
+            .map_err(|err| DiffApplyError::Io(format!("failed to read {}: {err}", target.display())))?;
+        if bytes.len() > DIFF_APPLY_MAX_BYTES {
+            return Err(DiffApplyError::Oversized);
+        }
+        let contents = String::from_utf8(bytes)
             .map_err(|err| DiffApplyError::Unsupported(format!("target is not valid UTF-8 text: {err}")))?;
         Ok(contents)
     })
@@ -717,6 +751,28 @@ mod tests {
     }
 
     #[test]
+    fn fenced_diff_blocks_rejects_oversized_block_before_full_buffering() {
+        let text = format!(
+            "before\n```diff\n{}\n```\nafter",
+            "x".repeat(DIFF_APPLY_MAX_BYTES.saturating_add(512))
+        );
+
+        let blocks = fenced_diff_blocks(&text);
+
+        assert_eq!(blocks.len(), 1);
+        let block_len = blocks.first().map(String::len);
+        assert_eq!(
+            block_len,
+            Some(DIFF_APPLY_MAX_BYTES.saturating_add(1)),
+            "GP-9: oversized fenced block must be capped before full block buffering"
+        );
+        assert_eq!(
+            blocks.first().map(|block| parse_unified_diff(block)),
+            Some(Err(DiffApplyError::Oversized))
+        );
+    }
+
+    #[test]
     fn parse_rejects_literal_line_cap() {
         let oversized = format!(
             "--- a/x\n+++ b/x\n@@ -1 +1,{} @@\n-old\n{}",
@@ -779,6 +835,46 @@ mod tests {
         assert_eq!(
             tokio::fs::read_to_string(temp.path().join("b.txt")).await.unwrap(),
             "added\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_plan_rejects_oversized_existing_target_before_reading() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let target = temp.path().join("big.txt");
+        tokio::fs::write(&target, format!("old\n{}", "x".repeat(DIFF_APPLY_MAX_BYTES)))
+            .await
+            .expect("seed oversized target");
+        let plan = parse_unified_diff(&diff_for("big.txt", "old", "new")).expect("plan");
+
+        let err = execute_plan(&plan, &policy(temp.path()))
+            .await
+            .expect_err("oversized target must be rejected");
+
+        assert_eq!(err, DiffApplyError::Oversized);
+        let metadata = tokio::fs::metadata(&target).await.expect("metadata");
+        assert!(
+            metadata.len() > DIFF_APPLY_MAX_TARGET_BYTES,
+            "fixture must exceed the target read cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_plan_still_applies_normal_size_diff() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        tokio::fs::write(temp.path().join("small.txt"), "old\n")
+            .await
+            .expect("seed");
+        let plan = parse_unified_diff(&diff_for("small.txt", "old", "new")).expect("plan");
+
+        let result = execute_plan(&plan, &policy(temp.path())).await.expect("apply");
+
+        assert!(result.contains("1 file"));
+        assert_eq!(
+            tokio::fs::read_to_string(temp.path().join("small.txt"))
+                .await
+                .expect("read"),
+            "new\n"
         );
     }
 

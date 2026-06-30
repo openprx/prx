@@ -1277,6 +1277,7 @@ impl ChatState {
         if !matches {
             return vec![];
         }
+        let orphan_user_removed = self.rollback_trailing_answerless_user_turn();
         self.stream.draft = None;
         self.stream.pending_tool_cards.clear();
         self.control.active_cancel = None;
@@ -1294,7 +1295,9 @@ impl ChatState {
         vec![
             Effect::LogTrace {
                 level: tracing::Level::WARN,
-                msg: format!("stream_failed draft_id={draft_id} retryable={retryable} err={err}"),
+                msg: format!(
+                    "stream_failed draft_id={draft_id} retryable={retryable} orphan_user_removed={orphan_user_removed} err={err}"
+                ),
             },
             Effect::NotifyHook {
                 event: HookEvent::Error,
@@ -1315,6 +1318,7 @@ impl ChatState {
         if !matches {
             return vec![];
         }
+        self.rollback_trailing_answerless_user_turn();
         self.stream.draft = None;
         self.stream.pending_tool_cards.clear();
         self.control.active_cancel = None;
@@ -1323,6 +1327,30 @@ impl ChatState {
         self.control.current_turn_tool_calls.clear();
         self.control.current_turn_tool_args.clear();
         vec![Effect::RequestRedraw]
+    }
+
+    fn rollback_trailing_answerless_user_turn(&mut self) -> bool {
+        let Some(last_turn) = self.session.turns.last() else {
+            return false;
+        };
+        if last_turn.role != "user" {
+            return false;
+        }
+        let content = last_turn.content.clone();
+        let title_from_user = crate::chat::session::truncate_title(&content);
+        self.session.turns.pop();
+        if self
+            .session
+            .history
+            .last()
+            .is_some_and(|message| message.role == "user" && message.content == content)
+        {
+            self.session.history.pop();
+        }
+        if self.session.turns.is_empty() && self.session.title == title_from_user {
+            self.session.title.clear();
+        }
+        true
     }
 
     /// `Action::ToolStarted` — 追加 Running 状态的 ToolResult 卡片 + 记录索引.
@@ -3631,6 +3659,133 @@ mod tests {
                 state.ui.conversation_lines.len(),
                 lines_before,
                 "cancel 不应 push 任何 conversation line"
+            );
+        }
+
+        #[test]
+        fn stream_failed_removes_trailing_answerless_user_turn() {
+            let mut state = s();
+            let _ = state.reduce(Action::RecordUserTurn("failed question".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-failed".to_string(),
+                cancel: CancellationToken::new(),
+            });
+
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "d-failed".to_string(),
+                err: "provider failed".to_string(),
+                retryable: false,
+            });
+
+            assert!(has_request_redraw(&effects));
+            assert!(
+                state.session.turns.is_empty(),
+                "GP-9: failed turn must not leave an answerless user turn"
+            );
+            assert!(
+                state
+                    .session
+                    .history
+                    .iter()
+                    .all(|message| message.content != "failed question"),
+                "failed turn must also be removed from reducer history"
+            );
+            assert!(
+                state.session.title.is_empty(),
+                "first failed prompt must not become the session title"
+            );
+        }
+
+        #[test]
+        fn stream_cancelled_removes_trailing_answerless_user_turn() {
+            let mut state = s();
+            let _ = state.reduce(Action::RecordUserTurn("cancelled question".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-cancelled".to_string(),
+                cancel: CancellationToken::new(),
+            });
+
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "d-cancelled".to_string(),
+            });
+
+            assert!(has_request_redraw(&effects));
+            assert!(
+                state.session.turns.is_empty(),
+                "GP-9: cancelled turn must not leave an answerless user turn"
+            );
+            assert!(
+                state
+                    .session
+                    .history
+                    .iter()
+                    .all(|message| message.content != "cancelled question"),
+                "cancelled turn must also be removed from reducer history"
+            );
+        }
+
+        #[test]
+        fn failed_turn_orphan_is_absent_from_background_and_later_success_snapshots() {
+            let mut state = s();
+            let _ = state.reduce(Action::RecordUserTurn("orphan candidate".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-failed".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamFailed {
+                draft_id: "d-failed".to_string(),
+                err: "provider failed".to_string(),
+                retryable: false,
+            });
+
+            let background_effects = state.reduce(Action::BackgroundSessionRecorded {
+                summary: bg_summary("run-after-failure", "completed"),
+            });
+            let background_snapshot = background_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::SaveSession(snapshot) => Some(snapshot),
+                    _ => None,
+                })
+                .expect("BackgroundSessionRecorded must emit SaveSession");
+            assert!(
+                background_snapshot
+                    .turns
+                    .iter()
+                    .all(|turn| turn.content != "orphan candidate"),
+                "GP-9: background save snapshot must not persist the failed user turn"
+            );
+
+            let _ = state.reduce(Action::RecordUserTurn("real question".to_string()));
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-ok".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn("real answer".to_string()));
+            let completion_effects = state.reduce(Action::StreamCompleted {
+                draft_id: "d-ok".to_string(),
+                final_text: "real answer".to_string(),
+                reasoning: String::new(),
+            });
+            let completion_snapshot = completion_effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::SaveSession(snapshot) => Some(snapshot),
+                    _ => None,
+                })
+                .expect("StreamCompleted must emit SaveSession");
+            assert_eq!(
+                completion_snapshot.turns.len(),
+                2,
+                "only the successful exchange is persisted"
+            );
+            assert_eq!(
+                completion_snapshot.turns.first().map(|turn| turn.content.as_str()),
+                Some("real question")
+            );
+            assert_eq!(
+                completion_snapshot.turns.get(1).map(|turn| turn.content.as_str()),
+                Some("real answer")
             );
         }
 
