@@ -7065,6 +7065,145 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
+    async fn redux_driver_preflight_provider_history_keeps_real_user_question_last_after_compaction() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex;
+
+        struct CaptureStreamProvider {
+            captured_history: Arc<Mutex<Option<Vec<PMsg>>>>,
+        }
+
+        #[async_trait]
+        impl Provider for CaptureStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("## Decisions\n- preserve Redux compacted context\n## Open TODOs\n- answer the latest user question\n## Critical Context\n- ISS-037 Redux capture test".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let last_user = messages
+                    .iter()
+                    .rfind(|message| message.role == "user")
+                    .map(|message| message.content.clone())
+                    .unwrap_or_default();
+                *self.captured_history.lock() = Some(messages.to_vec());
+                stream::iter(vec![
+                    Ok(StreamChunk::delta(format!("answer bound to: {last_user}"))),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let current_question = "What should ISS-037 answer now?";
+        let captured_history = Arc::new(Mutex::new(None));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(CaptureStreamProvider {
+            captured_history: Arc::clone(&captured_history),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 180,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![PMsg::system("sys")];
+        for i in 0..24 {
+            history.push(PMsg::user(format!("old turn {i} {}", "long context ".repeat(40))));
+        }
+        history.push(PMsg::user(current_question));
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-iss-037-redux".to_string(),
+                history,
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_summary_patch = false;
+        let mut saw_completion = false;
+        for _ in 0..16 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("driver action should arrive");
+            match action {
+                Action::HistoryCompactionPatchApplied { .. } => {
+                    saw_summary_patch = true;
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(
+                        final_text.contains(current_question),
+                        "assistant response must be bound to the real current user question"
+                    );
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(saw_summary_patch, "preflight must apply a summary compaction patch");
+        assert!(saw_completion, "driver must complete");
+        let captured = captured_history
+            .lock()
+            .clone()
+            .expect("provider-bound history should be captured");
+        let last = captured.last().expect("provider-bound history should not be empty");
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, current_question);
+        let refresh_index = captured
+            .iter()
+            .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
+            .expect("refresh marker should be present");
+        assert!(
+            refresh_index + 1 < captured.len(),
+            "refresh marker must not be the trailing provider-bound message"
+        );
+    }
+
+    #[tokio::test]
     async fn redux_driver_second_trim_preserves_summary_and_matches_reducer_history() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,

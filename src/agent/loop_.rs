@@ -932,7 +932,8 @@ pub fn compaction_patch_guard_matches(history: &[ChatMessage], guard: &Compactio
 
 pub fn apply_compaction_patch_exact(history: &mut Vec<ChatMessage>, patch: &CompactionPatch) {
     history.splice(patch.range_start..patch.range_end, patch.replacement.clone());
-    history.extend(patch.append_after.clone());
+    let append_index = patch.range_start + patch.replacement.len();
+    history.splice(append_index..append_index, patch.append_after.clone());
 }
 
 fn estimate_history_tokens(history: &[ChatMessage]) -> usize {
@@ -6825,6 +6826,10 @@ mod tests {
         first_call_tokens: Arc<AtomicUsize>,
     }
 
+    struct CapturingCompactionProvider {
+        captured_history: Arc<Mutex<Option<Vec<ChatMessage>>>>,
+    }
+
     #[async_trait]
     impl Provider for RecordingBudgetProvider {
         async fn chat_with_system(
@@ -6853,6 +6858,42 @@ mod tests {
                 .ok();
             Ok(ChatResponse {
                 text: Some("done".to_string()),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Provider for CapturingCompactionProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok("## Decisions\n- preserve compacted context\n## Open TODOs\n- answer the latest user question\n## Critical Context\n- ISS-037 capture test".to_string())
+        }
+
+        async fn chat(
+            &self,
+            request: ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatResponse> {
+            let last_user = request
+                .messages
+                .iter()
+                .rfind(|message| message.role == "user")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            *self
+                .captured_history
+                .lock()
+                .expect("captured history lock should be valid") = Some(request.messages.to_vec());
+            Ok(ChatResponse {
+                text: Some(format!("answer bound to: {last_user}")),
                 tool_calls: Vec::new(),
                 reasoning_content: None,
             })
@@ -10791,6 +10832,88 @@ Let me check the result."#;
         assert!(
             first_call_tokens.load(Ordering::SeqCst) <= 110,
             "first provider call must be below literal hard limit 110 tokens"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_provider_history_keeps_real_user_question_last_after_compaction() {
+        let current_question = "What should ISS-037 answer now?";
+        let captured_history = Arc::new(Mutex::new(None));
+        let provider = CapturingCompactionProvider {
+            captured_history: Arc::clone(&captured_history),
+        };
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+        let observer = NoopObserver;
+        let hooks = HookManager::new(std::env::temp_dir());
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 180,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..24 {
+            history.push(ChatMessage::user(format!(
+                "old turn {i} {}",
+                "long context ".repeat(40)
+            )));
+        }
+        history.push(ChatMessage::user(current_question));
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            &hooks,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "cli",
+            &crate::config::MultimodalConfig::default(),
+            2,
+            false,
+            2,
+            30,
+            false,
+            Vec::new(),
+            ToolConcurrencyGovernanceConfig::default(),
+            Some(&config),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ChatMode::default(),
+        )
+        .await
+        .expect("legacy provider call should complete");
+
+        let captured = captured_history
+            .lock()
+            .expect("captured history lock should be valid")
+            .clone()
+            .expect("provider-bound history should be captured");
+        let last = captured.last().expect("captured history should not be empty");
+        assert_eq!(last.role, "user");
+        assert_eq!(last.content, current_question);
+        let refresh_index = captured
+            .iter()
+            .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
+            .expect("refresh marker should be present");
+        assert!(
+            refresh_index + 1 < captured.len(),
+            "refresh marker must not be the trailing provider-bound message"
+        );
+        assert!(
+            result.contains(current_question),
+            "assistant response must be bound to the real current user question"
         );
     }
 

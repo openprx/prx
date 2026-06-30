@@ -4511,6 +4511,138 @@ mod tests {
         }
 
         #[test]
+        fn compaction_patch_refresh_position_parity_between_legacy_and_redux() {
+            use crate::chat::action::CompactReason;
+            let current_question = "What should ISS-037 answer now?";
+            let mut state = s();
+            state.session.history = vec![
+                crate::providers::ChatMessage::system("sys"),
+                crate::providers::ChatMessage::user("old user"),
+                crate::providers::ChatMessage::assistant("old assistant"),
+                crate::providers::ChatMessage::user(current_question),
+            ];
+            let mut legacy_history = state.session.history.clone();
+            let guard = crate::agent::loop_::compaction_patch_guard_for(&legacy_history, 1, 3).expect("guard");
+            let patch = crate::agent::loop_::CompactionPatch {
+                range_start: 1,
+                range_end: 3,
+                replacement: vec![crate::providers::ChatMessage::assistant(
+                    "[Context compacted at test. Summary: ISS-037 parity summary]",
+                )],
+                append_after: vec![crate::providers::ChatMessage::user(
+                    "[Post-compaction context refresh]\nre-read",
+                )],
+                guard,
+            };
+            let config = crate::config::AgentCompactionConfig {
+                max_context_tokens: 10_000,
+                reserve_tokens: 10,
+                max_context_tokens_explicit: true,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+
+            crate::agent::loop_::apply_compaction_patch_exact(&mut legacy_history, &patch);
+            let _ = state.reduce(Action::HistoryCompactionPatchApplied {
+                reason: CompactReason::ContextOverflow,
+                patch,
+                compaction_config: config,
+            });
+
+            assert_eq!(
+                messages_as_pairs(&state.session.history),
+                messages_as_pairs(&legacy_history),
+                "GP-6: legacy and Redux histories must match exactly after the shared patch primitive"
+            );
+            let refresh_index = state
+                .session
+                .history
+                .iter()
+                .position(|message| message.content.starts_with("[Post-compaction context refresh]"))
+                .expect("refresh marker should be present");
+            let summary_index = state
+                .session
+                .history
+                .iter()
+                .position(|message| message.content.contains("ISS-037 parity summary"))
+                .expect("summary marker should be present");
+            let question_index = state
+                .session
+                .history
+                .iter()
+                .position(|message| message.content == current_question)
+                .expect("current question should be present");
+            assert!(
+                summary_index < refresh_index && refresh_index < question_index,
+                "refresh marker must sit after the summary and before the real current question"
+            );
+            assert_eq!(
+                state.session.history.last().map(|message| message.content.as_str()),
+                Some(current_question),
+                "real current user question must remain the trailing provider-bound user message"
+            );
+        }
+
+        #[test]
+        fn post_compaction_refresh_not_persisted_as_session_turn() {
+            use crate::chat::action::CompactReason;
+            let current_question = "Persist this as the real user turn";
+            let assistant_reply = "assistant reply bound to the real user turn";
+            let mut state = s();
+            state.session.history = vec![
+                crate::providers::ChatMessage::system("sys"),
+                crate::providers::ChatMessage::user("old user"),
+                crate::providers::ChatMessage::assistant("old assistant"),
+            ];
+            let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
+            let guard = crate::agent::loop_::compaction_patch_guard_for(&state.session.history, 1, 3).expect("guard");
+            let patch = crate::agent::loop_::CompactionPatch {
+                range_start: 1,
+                range_end: 3,
+                replacement: vec![crate::providers::ChatMessage::assistant(
+                    "[Context compacted at test. Summary: persisted-turn summary]",
+                )],
+                append_after: vec![crate::providers::ChatMessage::user(
+                    "[Post-compaction context refresh]\nre-read",
+                )],
+                guard,
+            };
+            let config = crate::config::AgentCompactionConfig {
+                max_context_tokens: 10_000,
+                reserve_tokens: 10,
+                max_context_tokens_explicit: true,
+                ..crate::config::AgentCompactionConfig::default()
+            };
+
+            let _ = state.reduce(Action::HistoryCompactionPatchApplied {
+                reason: CompactReason::ContextOverflow,
+                patch,
+                compaction_config: config,
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn(assistant_reply.to_string()));
+
+            assert_eq!(
+                state.session.turns.len(),
+                2,
+                "only the real user and assistant turns are persisted"
+            );
+            let [user_turn, assistant_turn] = state.session.turns.as_slice() else {
+                panic!("expected exactly the real user turn and assistant turn");
+            };
+            assert_eq!(user_turn.role, "user");
+            assert_eq!(user_turn.content, current_question);
+            assert_eq!(assistant_turn.role, "assistant");
+            assert_eq!(assistant_turn.content, assistant_reply);
+            assert!(
+                state
+                    .session
+                    .turns
+                    .iter()
+                    .all(|turn| !turn.content.starts_with("[Post-compaction context refresh]")),
+                "refresh marker must remain a history context marker, not a persisted user turn"
+            );
+        }
+
+        #[test]
         fn redux_compaction_patch_guard_mismatch_falls_back_without_stale_patch() {
             use crate::chat::action::CompactReason;
             let mut state = s();
