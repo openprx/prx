@@ -52,7 +52,7 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92.0
+                  toolchain: 1.93.0
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run rust quality gate
@@ -78,7 +78,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92.0
+                  toolchain: 1.93.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run tests
               run: cargo test --locked --verbose
@@ -94,7 +94,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.92.0
+                  toolchain: 1.93.0
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
