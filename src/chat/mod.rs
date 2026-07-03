@@ -1230,7 +1230,9 @@ fn enter_terminal_state_with_ops(
     state.raw_mode_active = true;
 
     if mode == ChatTuiMode::Fullscreen {
+        CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
         if let Err(e) = ops.enter_alternate_screen() {
+            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
             let _ = ops.disable_raw_mode();
             return Err(e);
         }
@@ -1240,6 +1242,7 @@ fn enter_terminal_state_with_ops(
     if let Err(e) = ops.enable_bracketed_paste() {
         if state.alternate_screen_active {
             let _ = ops.leave_alternate_screen();
+            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         }
         let _ = ops.disable_raw_mode();
         return Err(e);
@@ -1256,6 +1259,7 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
     }
     if state.alternate_screen_active {
         let _ = ops.leave_alternate_screen();
+        CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
     if state.raw_mode_active {
         let _ = ops.disable_raw_mode();
@@ -1300,9 +1304,6 @@ impl TerminalGuard {
         let mut ops = CrosstermTerminalModeOps;
         let state = enter_terminal_state_with_ops(&mut ops, mode)
             .map_err(|e| anyhow::anyhow!("failed to enter chat TUI terminal mode ({mode:?}): {e}"))?;
-        if state.alternate_screen_active {
-            CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
-        }
         Ok(Self {
             raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
             bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
@@ -2100,6 +2101,7 @@ pub async fn run(
                     // 让其从 watch::Receiver borrow snapshot 替代 chat_mirror.lock()。
                     // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
                     spawn_tui_unified_loop(
+                        tui_selection.mode,
                         input_tx,
                         control_tx.clone(),
                         Arc::clone(&chat_mirror),
@@ -5603,6 +5605,13 @@ fn new_inline_terminal(height: u16) -> Result<InlineTerminal> {
 }
 
 #[cfg(feature = "terminal-tui")]
+fn new_fullscreen_terminal() -> Result<InlineTerminal> {
+    let stdout = std::io::stdout();
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("ratatui Terminal::new failed: {e}"))
+}
+
+#[cfg(feature = "terminal-tui")]
 fn clear_old_inline_chrome_region<B>(terminal: &mut ratatui::Terminal<B>) -> std::result::Result<(), B::Error>
 where
     B: ratatui::backend::Backend,
@@ -5668,6 +5677,7 @@ where
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_tui_unified_loop(
+    mode: ChatTuiMode,
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
@@ -5681,6 +5691,7 @@ fn spawn_tui_unified_loop(
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
+            mode,
             input_tx,
             control_tx,
             mirror,
@@ -6737,6 +6748,7 @@ fn pty_stdin_loop(
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_tui_unified_loop(
+    mode: ChatTuiMode,
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
@@ -6760,22 +6772,32 @@ fn run_tui_unified_loop(
         },
     );
 
-    // Start the inline viewport at the actual bottom-chrome height rather
-    // than reserving the maximum. ratatui stores `Viewport::Inline(height)` in
-    // the terminal, so changing the inline height requires rebuilding the
-    // terminal with a new viewport. We do that only on height deltas below,
-    // then draw immediately so a resize transition never leaves blank chrome.
-    let mut inline_viewport_height = render_source.with_view(desired_inline_viewport_height);
-    let mut terminal = new_inline_terminal(inline_viewport_height)?;
+    // Inline keeps the P3 architecture: a small `Viewport::Inline(height)` plus
+    // host scrollback via `insert_before`. Fullscreen uses a normal ratatui
+    // terminal inside the alternate screen; the full frame is redrawn each time
+    // and no `insert_before` calls are made.
+    let mut inline_viewport_height = if mode == ChatTuiMode::Inline {
+        render_source.with_view(desired_inline_viewport_height)
+    } else {
+        0
+    };
+    let mut terminal = if mode == ChatTuiMode::Inline {
+        new_inline_terminal(inline_viewport_height)?
+    } else {
+        new_fullscreen_terminal()?
+    };
+    let mut fullscreen_scroll = tui::FullscreenTranscriptScroll::default();
 
-    // Materialise the inline viewport immediately so the chrome (status
-    // bar + input box + footer) is visible the moment the session opens,
-    // rather than only after the first event-loop iteration draws.
-    //
-    // S4-A Commit 4: 通过 RenderSource::with_view 拿 &dyn BottomChromeView,
-    // Pure/non-Pure 双路径共用 render_bottom_chrome 泛型.
     terminal
-        .draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view)))
+        .draw(|f| {
+            render_source.with_view(|view| {
+                if mode == ChatTuiMode::Fullscreen {
+                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
+                } else {
+                    tui::render_bottom_chrome(f, view);
+                }
+            });
+        })
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
     // Number of `conversation_lines` already flushed to the host
@@ -6844,8 +6866,9 @@ fn run_tui_unified_loop(
             skip_next_draw = false;
         }
 
-        if let Some(next_height) =
-            render_source.with_view(|view| changed_inline_viewport_height(inline_viewport_height, view))
+        if mode == ChatTuiMode::Inline
+            && let Some(next_height) =
+                render_source.with_view(|view| changed_inline_viewport_height(inline_viewport_height, view))
         {
             if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
                 tracing::warn!(
@@ -6880,31 +6903,33 @@ fn run_tui_unified_loop(
         // S4-A Commit 4: Snapshot 路径 borrow_and_update Arc<UiSnapshot>，
         // Mirror 路径走原有 lock。两种路径都按 `last_pushed_idx` 切片以增量
         // 推送，同语义.
-        let conversation_generation = render_source.conversation_generation();
-        if conversation_generation != last_conversation_generation {
-            last_pushed_idx = 0;
-            last_conversation_generation = conversation_generation;
-        }
-        let visible_len = render_source.conversation_len();
-        if visible_len < last_pushed_idx {
-            last_pushed_idx = 0;
-        }
-        let (pending, ascii_fallback) = render_source.read_pending(last_pushed_idx);
-        let pending_count = pending.len();
-        let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
-        for line in &pending {
-            let height = tui::estimate_message_height(term_width, line, ascii_fallback);
-            // `insert_before` is a no-op for `Viewport::Fullscreen` /
-            // `Fixed` — safe to call with any height; ratatui scrolls
-            // the host terminal up as needed.
-            let render_line = line.clone();
-            if let Err(e) = terminal.insert_before(height, move |buf| {
-                tui::render_message_for_insert(buf, &render_line, ascii_fallback);
-            }) {
-                tracing::warn!(error = %e, "insert_before failed; skipping line");
+        if mode == ChatTuiMode::Inline {
+            let conversation_generation = render_source.conversation_generation();
+            if conversation_generation != last_conversation_generation {
+                last_pushed_idx = 0;
+                last_conversation_generation = conversation_generation;
             }
+            let visible_len = render_source.conversation_len();
+            if visible_len < last_pushed_idx {
+                last_pushed_idx = 0;
+            }
+            let (pending, ascii_fallback) = render_source.read_pending(last_pushed_idx);
+            let pending_count = pending.len();
+            let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
+            for line in &pending {
+                let height = tui::estimate_message_height(term_width, line, ascii_fallback);
+                // `insert_before` is intentionally inline-only. Fullscreen
+                // renders conversation history inside the alternate-screen
+                // frame so resizes are clean by construction.
+                let render_line = line.clone();
+                if let Err(e) = terminal.insert_before(height, move |buf| {
+                    tui::render_message_for_insert(buf, &render_line, ascii_fallback);
+                }) {
+                    tracing::warn!(error = %e, "insert_before failed; skipping line");
+                }
+            }
+            last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
         }
-        last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
 
         // ── 2. Drain coalesced redraw wakeups, then redraw the chrome ─
         // The inline viewport height has already been synchronized above, and
@@ -6918,7 +6943,15 @@ fn run_tui_unified_loop(
         }
         if skip_next_draw && !redraw_requested {
             skip_next_draw = false;
-        } else if let Err(e) = terminal.draw(|f| render_source.with_view(|view| tui::render_bottom_chrome(f, view))) {
+        } else if let Err(e) = terminal.draw(|f| {
+            render_source.with_view(|view| {
+                if mode == ChatTuiMode::Fullscreen {
+                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
+                } else {
+                    tui::render_bottom_chrome(f, view);
+                }
+            });
+        }) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
@@ -6996,6 +7029,28 @@ fn run_tui_unified_loop(
                     if mirror_guard.input.byte_len() >= tui::INPUT_MAX_BYTES {
                         mirror_guard.input.truncated = true;
                         skip_next_draw = true;
+                        continue;
+                    }
+                }
+                if mode == ChatTuiMode::Fullscreen
+                    && key.modifiers == crossterm::event::KeyModifiers::NONE
+                    && matches!(
+                        key.code,
+                        crossterm::event::KeyCode::PageUp | crossterm::event::KeyCode::PageDown
+                    )
+                {
+                    let scroll_available =
+                        render_source.with_view(|view| tui::fullscreen_transcript_scroll_available(view));
+                    if scroll_available {
+                        let total_height = terminal.size().map(|s| s.height).unwrap_or(24);
+                        let page_rows =
+                            render_source.with_view(|view| tui::fullscreen_transcript_page_rows(view, total_height));
+                        match key.code {
+                            crossterm::event::KeyCode::PageUp => fullscreen_scroll.page_up(page_rows),
+                            crossterm::event::KeyCode::PageDown => fullscreen_scroll.page_down(page_rows),
+                            _ => {}
+                        }
+                        let _ = redraw_tx.try_send(());
                         continue;
                     }
                 }
@@ -7291,13 +7346,15 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Resize(w, h) => {
-                if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
-                    tracing::warn!(
-                        error = %e,
-                        w,
-                        h,
-                        "failed to clear old inline chrome before terminal resize redraw"
-                    );
+                if mode == ChatTuiMode::Inline {
+                    if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
+                        tracing::warn!(
+                            error = %e,
+                            w,
+                            h,
+                            "failed to clear old inline chrome before terminal resize redraw"
+                        );
+                    }
                 }
                 let _ = chat_dispatcher.dispatch_or_log(Action::TerminalResized { w, h }, "chat.tui_resize");
                 // crossterm forwards the new size to ratatui automatically on
