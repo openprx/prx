@@ -515,11 +515,32 @@ fn original_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyCompactionTokenMetadata {
+    provider_token_estimate: usize,
+    persisted_token_estimate: usize,
+    enrichment_token_delta: isize,
+}
+
+fn legacy_compaction_token_metadata(
+    provider_history: &[ChatMessage],
+    persisted_history: &[ChatMessage],
+) -> LegacyCompactionTokenMetadata {
+    let provider_token_estimate = estimate_chat_history_tokens(provider_history);
+    let persisted_token_estimate = estimate_chat_history_tokens(persisted_history);
+    LegacyCompactionTokenMetadata {
+        provider_token_estimate,
+        persisted_token_estimate,
+        enrichment_token_delta: provider_token_estimate as isize - persisted_token_estimate as isize,
+    }
+}
+
 async fn persist_legacy_chat_compaction_audit(
     mem: &dyn Memory,
     envelope: &RuntimeEnvelope,
     source_history: &[ChatMessage],
     summary_projection: &[ChatMessage],
+    token_metadata: LegacyCompactionTokenMetadata,
     trigger: &str,
 ) {
     if source_history.is_empty() {
@@ -592,7 +613,10 @@ async fn persist_legacy_chat_compaction_audit(
                     "compact_content_chars": COMPACT_CONTENT_CHARS,
                     "compact_total_chars": COMPACT_TOTAL_CHARS,
                     "summary_projection_message_count": summary_projection.len(),
-                    "summary_projection_token_estimate": estimate_chat_history_tokens(summary_projection)
+                    "summary_projection_token_estimate": estimate_chat_history_tokens(summary_projection),
+                    "provider_token_estimate": token_metadata.provider_token_estimate,
+                    "persisted_token_estimate": token_metadata.persisted_token_estimate,
+                    "enrichment_token_delta": token_metadata.enrichment_token_delta
                 })
                 .to_string(),
             ),
@@ -4119,6 +4143,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             native_tools,
             &tools_registry,
         );
+        let persisted_history_for_turn = persisted_history_for_current_turn(&chat_session, &system_prompt, &user_input);
         if history.is_empty() {
             history.push(ChatMessage::system(system_prompt.clone()));
         } else if let Some(first) = history.first_mut() {
@@ -4128,7 +4153,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // `if empty { push } else { first_mut = ... }` 字节级语义对齐（reducer
         // 内部走同样分支）。每轮 turn 都会跑，append 表达会让 system 堆积。
         let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::SetLeadingSystemPrompt { content: system_prompt },
+            crate::chat::action::Action::SetLeadingSystemPrompt {
+                content: system_prompt.clone(),
+            },
             "chat.system_prompt_per_turn",
         );
         history.push(ChatMessage::user(&enriched));
@@ -4732,8 +4759,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
                     // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
                     // 重试会拿同一份未压缩的 history 二次失败。
-                    let audit_source_history = original_legacy_chat_compaction_audit_source(&history);
-                    let summary_projection = bounded_legacy_chat_compaction_audit_source(&history);
+                    let audit_source_history =
+                        original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+                    let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
+                    let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::HistoryCompacted {
                             reason: crate::chat::action::CompactReason::ContextOverflow,
@@ -4746,6 +4775,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         &runtime_envelope,
                         &audit_source_history,
                         &summary_projection,
+                        token_metadata,
                         "chat_context_overflow",
                     )
                     .await;
@@ -7239,6 +7269,18 @@ fn session_turns_to_history(session: &session::ChatSession) -> Vec<ChatMessage> 
         .collect()
 }
 
+fn persisted_history_for_current_turn(
+    session: &session::ChatSession,
+    system_prompt: &str,
+    user_input: &str,
+) -> Vec<ChatMessage> {
+    let mut history = Vec::with_capacity(session.turns.len().saturating_add(2));
+    history.push(ChatMessage::system(system_prompt.to_string()));
+    history.extend(session_turns_to_history(session));
+    history.push(ChatMessage::user(user_input.to_string()));
+    history
+}
+
 fn history_for_session_with_system(
     session: &session::ChatSession,
     config: &Config,
@@ -8255,12 +8297,22 @@ mod legacy_chat_compaction_audit_tests {
         hasher.update(first_audit_source.content.as_bytes());
         let first_original_hash = hex::encode(hasher.finalize());
         let expected_source_tokens = estimate_chat_history_tokens(&audit_source);
+        let provider_history = {
+            let mut history = source_history.clone();
+            history.push(ChatMessage::user(format!(
+                "visible @file.txt\n\n[Attached file context from @path mentions]\n{}",
+                "hidden enrichment ".repeat(20)
+            )));
+            history
+        };
+        let token_metadata = legacy_compaction_token_metadata(&provider_history, &source_history);
 
         persist_legacy_chat_compaction_audit(
             &mem,
             &envelope,
             &audit_source,
             &summary_projection,
+            token_metadata,
             "chat_context_overflow",
         )
         .await;
@@ -8273,15 +8325,26 @@ mod legacy_chat_compaction_audit_tests {
             source_message_count,
             source_token_estimate,
             source_refs,
-        ): (String, String, String, i64, i64, String) = conn
+            payload_json,
+        ): (String, String, String, i64, i64, String, String) = conn
             .query_row(
-                "SELECT summary_memory_key, mode, fidelity_status, source_message_count, source_token_estimate, source_document_refs_json
+                "SELECT summary_memory_key, mode, fidelity_status, source_message_count, source_token_estimate, source_document_refs_json, payload_json
                  FROM compaction_runs
                  WHERE workspace_id = 'workspace-a'
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .unwrap();
         assert!(summary_memory_key.starts_with("compaction_summary_"));
@@ -8293,6 +8356,26 @@ mod legacy_chat_compaction_audit_tests {
         assert!(
             !source_refs.contains("evicted-source-0"),
             "audit refs must store hashes, not raw evicted content"
+        );
+        let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
+        assert_eq!(
+            payload
+                .get("provider_token_estimate")
+                .and_then(serde_json::Value::as_u64),
+            Some(token_metadata.provider_token_estimate as u64)
+        );
+        assert_eq!(
+            payload
+                .get("persisted_token_estimate")
+                .and_then(serde_json::Value::as_u64),
+            Some(token_metadata.persisted_token_estimate as u64)
+        );
+        assert!(
+            payload
+                .get("enrichment_token_delta")
+                .and_then(serde_json::Value::as_i64)
+                .is_some_and(|delta| delta > 0),
+            "legacy audit metadata must expose non-empty provider enrichment overhead"
         );
 
         let stored_summary_count: i64 = conn

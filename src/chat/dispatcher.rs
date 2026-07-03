@@ -766,6 +766,7 @@ impl EffectExecutor {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_guard_history,
                 compaction_config,
                 cancel,
                 chat_mode,
@@ -818,9 +819,11 @@ impl EffectExecutor {
                         }
                         return;
                     }
+                    let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
                     let driver = drive_start_turn_stream(
                         provider,
                         history,
+                        compaction_guard_history,
                         model,
                         temperature,
                         compaction_config,
@@ -1369,6 +1372,7 @@ fn resolve_driver_max_iterations(max_tool_iterations: usize) -> usize {
 async fn apply_redux_summary_compaction(
     provider: &dyn Provider,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
+    compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
     action_tx: &mpsc::Sender<Action>,
@@ -1381,7 +1385,15 @@ async fn apply_redux_summary_compaction(
 
     let patch = match tokio::time::timeout(
         std::time::Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
-        crate::agent::loop_::build_configurable_compaction_patch(history, provider, model, config, None, trigger),
+        crate::agent::loop_::build_configurable_compaction_patch_with_source_history(
+            history,
+            compaction_guard_history,
+            provider,
+            model,
+            config,
+            None,
+            trigger,
+        ),
     )
     .await
     {
@@ -1403,6 +1415,7 @@ async fn apply_redux_summary_compaction(
 
     let replacement_len = patch.replacement.len();
     crate::agent::loop_::apply_compaction_patch_exact(history, &patch);
+    crate::agent::loop_::apply_compaction_patch_exact(compaction_guard_history, &patch);
     let budget =
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
@@ -1434,10 +1447,16 @@ async fn apply_redux_summary_compaction(
 
 fn trim_redux_driver_context_budget_after_summary(
     history: &mut Vec<crate::providers::traits::ChatMessage>,
+    compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
     config: &crate::config::AgentCompactionConfig,
     replacement_len: Option<usize>,
 ) -> bool {
-    if let Some(replacement_len) = replacement_len {
+    let histories_matched_before_trim = history.len() == compaction_guard_history.len()
+        && history
+            .iter()
+            .zip(compaction_guard_history.iter())
+            .all(|(left, right)| left.role == right.role && left.content == right.content);
+    let trimmed = if let Some(replacement_len) = replacement_len {
         crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
@@ -1445,7 +1464,11 @@ fn trim_redux_driver_context_budget_after_summary(
         )
     } else {
         crate::agent::loop_::trim_history_to_context_budget(history, config)
+    };
+    if histories_matched_before_trim {
+        *compaction_guard_history = history.clone();
     }
+    trimmed
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1459,6 +1482,7 @@ fn trim_redux_driver_context_budget_after_summary(
 async fn drive_start_turn_stream(
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
+    mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
     model: String,
     temperature: f64,
     compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1515,6 +1539,7 @@ async fn drive_start_turn_stream(
                     match apply_redux_summary_compaction(
                         provider.as_ref(),
                         &mut history,
+                        &mut compaction_guard_history,
                         &model,
                         config,
                         &action_tx,
@@ -1533,8 +1558,12 @@ async fn drive_start_turn_stream(
                     crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
                 );
                 if compaction_off || after_compact.over_hard_limit {
-                    let trimmed =
-                        trim_redux_driver_context_budget_after_summary(&mut history, config, summary_replacement_len);
+                    let trimmed = trim_redux_driver_context_budget_after_summary(
+                        &mut history,
+                        &mut compaction_guard_history,
+                        config,
+                        summary_replacement_len,
+                    );
                     tracing::warn!(
                         before_used_tokens = budget.used_tokens,
                         after_compact_tokens = after_compact.used_tokens,
@@ -1600,6 +1629,7 @@ async fn drive_start_turn_stream(
                         let summary_replacement_len = match apply_redux_summary_compaction(
                             provider.as_ref(),
                             &mut history,
+                            &mut compaction_guard_history,
                             &model,
                             config,
                             &action_tx,
@@ -1612,7 +1642,12 @@ async fn drive_start_turn_stream(
                             Err(()) => return,
                         };
                         if summary_replacement_len.is_none() {
-                            let trimmed = trim_redux_driver_context_budget_after_summary(&mut history, config, None);
+                            let trimmed = trim_redux_driver_context_budget_after_summary(
+                                &mut history,
+                                &mut compaction_guard_history,
+                                config,
+                                None,
+                            );
                             tracing::warn!(
                                 trimmed,
                                 "redux driver context-overflow retry summary unavailable; used token-aware trim"
@@ -3544,6 +3579,7 @@ mod integration_tests {
             Effect::StartTurn {
                 draft_id: "shadow-d".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: token.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -3970,6 +4006,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-fixB-B5".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -4318,6 +4355,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-real".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -4382,6 +4420,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-cancelled".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -4470,6 +4509,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-stream".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -4602,6 +4642,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-fail".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -4696,6 +4737,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-mid-cancel".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -5426,6 +5468,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-params".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -5554,6 +5597,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-no-registry".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -5708,6 +5752,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-tool-happy".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -5910,6 +5955,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-ctx-probe".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -6025,6 +6071,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-max-iter".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -6168,6 +6215,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-unrecoverable".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -6278,6 +6326,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-cancel-mid".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -6762,6 +6811,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-t31-streaming".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -6901,6 +6951,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-reasoning-tool-history".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -7018,6 +7069,7 @@ mod real_mode_tests {
                     role: "user".into(),
                     content: "hello".into(),
                 }],
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -7151,6 +7203,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-budget-preflight".into(),
                 history,
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -7366,6 +7419,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-resume-compacted".to_string(),
                 history: resumed.session.history.clone(),
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -7505,6 +7559,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-iss-037-redux".to_string(),
                 history,
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -7552,6 +7607,383 @@ mod real_mode_tests {
         assert!(
             refresh_index + 1 < captured.len(),
             "refresh marker must not be the trailing provider-bound message"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_compaction_guard_uses_persisted_source_when_provider_history_is_enriched() {
+        use crate::chat::state::{ChatState, Effect};
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct SummaryProvider;
+
+        #[async_trait]
+        impl Provider for SummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, prompt: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                assert!(
+                    !prompt.contains("HIDDEN_FILE_SENTINEL"),
+                    "persisted-source compaction must not summarize hidden enrichment"
+                );
+                Ok(
+                    "PERSISTED_SOURCE_SUMMARY\n## Decisions\n- original transcript only\n## Open TODOs\n- continue"
+                        .to_string(),
+                )
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let original_history = vec![
+            PMsg::system("sys"),
+            PMsg::user(format!("old visible user @file.txt {}", "visible ".repeat(60))),
+            PMsg::assistant(format!("old assistant {}", "visible ".repeat(60))),
+            PMsg::user(format!("another old user {}", "visible ".repeat(60))),
+            PMsg::assistant(format!("another old assistant {}", "visible ".repeat(60))),
+            PMsg::user("current visible user"),
+        ];
+        let mut driver_history = original_history.clone();
+        let Some(enriched_old_user) = driver_history.get_mut(1) else {
+            panic!("test fixture must include old user turn");
+        };
+        enriched_old_user.content.push_str(&format!(
+            "\n\n[Attached file context from @path mentions]\nHIDDEN_FILE_SENTINEL {}\n[End attached file context]",
+            "hidden ".repeat(120)
+        ));
+        let enriched_before_compaction = driver_history.clone();
+        let mut compaction_guard_history = original_history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 5,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 220,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
+
+        let replacement_len = apply_redux_summary_compaction(
+            &SummaryProvider,
+            &mut driver_history,
+            &mut compaction_guard_history,
+            "model",
+            &config,
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_persisted_guard_source",
+        )
+        .await
+        .unwrap()
+        .expect("summary patch must apply");
+        assert_eq!(replacement_len, 1);
+
+        let patch = match action_rx.recv().await.expect("patch action") {
+            Action::HistoryCompactionPatchApplied { patch, .. } => patch,
+            other => panic!("expected summary patch action, got {other:?}"),
+        };
+        assert!(
+            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
+            "patch guard must validate against persisted/original history"
+        );
+        assert!(
+            !crate::agent::loop_::compaction_patch_guard_matches(&enriched_before_compaction, &patch.guard),
+            "old enriched guard source would have mismatched the reducer"
+        );
+
+        let mut reducer_state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+        reducer_state.session.history = original_history;
+        let effects = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
+            reason: crate::chat::action::CompactReason::ContextOverflow,
+            patch,
+            compaction_config: config,
+        });
+        assert!(
+            effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+            "matching persisted guard must take the exact patch path, not plain-trim fallback"
+        );
+        assert!(
+            effects.iter().all(|effect| {
+                !matches!(
+                    effect,
+                    Effect::LogTrace {
+                        level: tracing::Level::WARN,
+                        msg
+                    } if msg.contains("guard mismatch")
+                )
+            }),
+            "persisted guard source must not log a guard mismatch"
+        );
+        assert_eq!(
+            driver_history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            reducer_state
+                .session
+                .history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            "GP-6: driver history must match reducer history after persisted-source patch"
+        );
+        assert!(
+            reducer_state
+                .session
+                .history
+                .iter()
+                .all(|message| !message.content.contains("HIDDEN_FILE_SENTINEL")),
+            "hidden enrichment must not be persisted through the compaction summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_compaction_guard_source_is_inert_when_provider_history_is_not_enriched() {
+        use crate::chat::state::{ChatState, Effect};
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct SummaryProvider;
+
+        #[async_trait]
+        impl Provider for SummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("EMPTY_ENRICHMENT_SUMMARY\n## Decisions\n- unchanged".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let original_history = vec![
+            PMsg::system("sys"),
+            PMsg::user(format!("old user {}", "visible ".repeat(60))),
+            PMsg::assistant(format!("old assistant {}", "visible ".repeat(60))),
+            PMsg::user("current user"),
+        ];
+        let mut driver_history = original_history.clone();
+        let mut compaction_guard_history = original_history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 5,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
+
+        let replacement_len = apply_redux_summary_compaction(
+            &SummaryProvider,
+            &mut driver_history,
+            &mut compaction_guard_history,
+            "model",
+            &config,
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_empty_enrichment_guard_source",
+        )
+        .await
+        .unwrap()
+        .expect("summary patch must apply");
+        assert_eq!(replacement_len, 1);
+        let patch = match action_rx.recv().await.expect("patch action") {
+            Action::HistoryCompactionPatchApplied { patch, .. } => patch,
+            other => panic!("expected summary patch action, got {other:?}"),
+        };
+        assert!(
+            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
+            "empty-enrichment path should keep the existing guard behavior"
+        );
+
+        let mut reducer_state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+        reducer_state.session.history = original_history;
+        let effects = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
+            reason: crate::chat::action::CompactReason::ContextOverflow,
+            patch,
+            compaction_config: config,
+        });
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))));
+        assert_eq!(
+            driver_history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            reducer_state
+                .session
+                .history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            "empty-enrichment path should remain byte-for-byte aligned"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_compaction_keeps_enrichment_only_trim_fallback() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct SummaryProvider;
+
+        #[async_trait]
+        impl Provider for SummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("ENRICHMENT_ONLY_SUMMARY\n## Decisions\n- fallback remains".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let original_history = vec![
+            PMsg::system("sys"),
+            PMsg::user("small old user"),
+            PMsg::assistant("small old assistant"),
+            PMsg::user("current @huge.txt"),
+        ];
+        let mut driver_history = original_history.clone();
+        let Some(current_user) = driver_history.get_mut(3) else {
+            panic!("test fixture must include current user turn");
+        };
+        current_user.content.push_str(&format!(
+            "\n\n[Attached file context from @path mentions]\nRECENT_ENRICHMENT_ONLY {}\n[End attached file context]",
+            "hidden ".repeat(1000)
+        ));
+        let mut compaction_guard_history = original_history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 5,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
+
+        let replacement_len = apply_redux_summary_compaction(
+            &SummaryProvider,
+            &mut driver_history,
+            &mut compaction_guard_history,
+            "model",
+            &config,
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_enrichment_only_fallback",
+        )
+        .await
+        .unwrap()
+        .expect("provider-side enrichment pressure should still produce a patch attempt");
+        assert_eq!(replacement_len, 1);
+        let patch = match action_rx.recv().await.expect("patch action") {
+            Action::HistoryCompactionPatchApplied { patch, .. } => patch,
+            other => panic!("expected summary patch action, got {other:?}"),
+        };
+        assert!(
+            crate::agent::loop_::compaction_patch_guard_matches(&original_history, &patch.guard),
+            "fallback-preserving patch must still be guarded by persisted source"
+        );
+        assert!(
+            !driver_history
+                .iter()
+                .any(|message| message.content.contains("RECENT_ENRICHMENT_ONLY")),
+            "existing provider-side trim fallback must still remove enrichment-only overflow"
         );
     }
 
@@ -7617,6 +8049,7 @@ mod real_mode_tests {
             PMsg::user("recent bulk ".repeat(40)),
         ];
         let mut driver_history = original_history.clone();
+        let mut compaction_guard_history = original_history.clone();
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 5,
@@ -7634,6 +8067,7 @@ mod real_mode_tests {
         let replacement_len = apply_redux_summary_compaction(
             &provider,
             &mut driver_history,
+            &mut compaction_guard_history,
             "model",
             &config,
             &action_tx,
@@ -7653,7 +8087,12 @@ mod real_mode_tests {
             !after_compact.over_hard_limit,
             "preserve-trim floor should fully remediate when the protected replacement fits"
         );
-        let _ = trim_redux_driver_context_budget_after_summary(&mut driver_history, &config, Some(replacement_len));
+        let _ = trim_redux_driver_context_budget_after_summary(
+            &mut driver_history,
+            &mut compaction_guard_history,
+            &config,
+            Some(replacement_len),
+        );
 
         let patch = match action_rx.recv().await.expect("patch action") {
             Action::HistoryCompactionPatchApplied { patch, .. } => patch,
@@ -7742,6 +8181,7 @@ mod real_mode_tests {
             )));
         }
         let mut driver_history = original_history.clone();
+        let mut compaction_guard_history = original_history.clone();
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 10,
@@ -7756,6 +8196,7 @@ mod real_mode_tests {
         let replacement_len = apply_redux_summary_compaction(
             &HugeSummaryProvider,
             &mut driver_history,
+            &mut compaction_guard_history,
             "model",
             &config,
             &action_tx,
@@ -7906,6 +8347,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-budget-off-preflight".into(),
                 history,
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -8046,6 +8488,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-summary-failure".into(),
                 history,
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -8192,6 +8635,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-overflow-summary".into(),
                 history,
+                compaction_guard_history: None,
                 compaction_config: Some(config),
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -8302,6 +8746,7 @@ mod real_mode_tests {
                     role: "user".into(),
                     content: "x".repeat(1000),
                 }],
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -8473,6 +8918,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-approval".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -8695,6 +9141,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-reject".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -9056,6 +9503,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-flaky".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
@@ -9152,6 +9600,7 @@ mod real_mode_tests {
             .execute(Effect::StartTurn {
                 draft_id: "draft-net-fail".into(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,

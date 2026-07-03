@@ -128,6 +128,10 @@ pub enum Effect {
     StartTurn {
         draft_id: String,
         history: Vec<ChatMessage>,
+        /// Optional persisted/original-history source used for compaction patch
+        /// guard identity. When absent, the driver uses `history` for both budget
+        /// and guard source, preserving non-chat/test callers.
+        compaction_guard_history: Option<Vec<ChatMessage>>,
         /// P5 proactive budgeting config resolved from the selected model
         /// window. The streaming driver uses it for preflight/mid-turn trims.
         compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1108,6 +1112,7 @@ impl ChatState {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_guard_history: Some(self.session.history.clone()),
                 compaction_config,
                 cancel,
                 chat_mode,
@@ -1144,6 +1149,7 @@ impl ChatState {
             Effect::StartTurn {
                 draft_id,
                 history,
+                compaction_guard_history: Some(self.session.history.clone()),
                 compaction_config,
                 cancel,
                 chat_mode,

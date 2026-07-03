@@ -1337,16 +1337,42 @@ pub(crate) async fn build_configurable_compaction_patch(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<Option<CompactionPatch>> {
+    build_configurable_compaction_patch_with_source_history(history, history, provider, model, config, audit, trigger)
+        .await
+}
+
+pub(crate) async fn build_configurable_compaction_patch_with_source_history(
+    budget_history: &[ChatMessage],
+    source_history: &[ChatMessage],
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+) -> Result<Option<CompactionPatch>> {
+    if budget_history.len() != source_history.len()
+        || budget_history
+            .iter()
+            .zip(source_history.iter())
+            .any(|(budget, source)| budget.role != source.role)
+    {
+        anyhow::bail!(
+            "compaction budget/source histories have different shapes: budget_len={} source_len={}",
+            budget_history.len(),
+            source_history.len()
+        );
+    }
+
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
     };
-    if estimate_history_tokens(history) <= limit {
+    if estimate_history_tokens(budget_history) <= limit {
         return Ok(None);
     }
 
-    let has_system = history.first().is_some_and(|m| m.role == "system");
+    let has_system = source_history.first().is_some_and(|m| m.role == "system");
     let start = if has_system { 1 } else { 0 };
-    let non_system_count = history.len().saturating_sub(start);
+    let non_system_count = source_history.len().saturating_sub(start);
     if non_system_count <= 1 {
         return Ok(None);
     }
@@ -1357,15 +1383,19 @@ pub(crate) async fn build_configurable_compaction_patch(
         return Ok(None);
     }
     let compact_end = start + compact_count;
-    let audit_source = audit.and_then(|_| history.get(start..compact_end).map(build_compaction_audit_source));
-    let source_projection = history
+    let audit_source = audit.and_then(|_| {
+        source_history
+            .get(start..compact_end)
+            .map(build_compaction_audit_source)
+    });
+    let source_projection = source_history
         .get(start..compact_end)
         .map(bounded_compaction_projection)
         .unwrap_or_default();
     if source_projection.is_empty() {
         return Ok(None);
     }
-    let Some(guard) = compaction_patch_guard_for(history, start, compact_end) else {
+    let Some(guard) = compaction_patch_guard_for(source_history, start, compact_end) else {
         return Ok(None);
     };
     let timestamp = chrono::Utc::now().to_rfc3339();
@@ -1475,7 +1505,7 @@ pub(crate) async fn build_configurable_compaction_patch(
         }
         crate::config::AgentCompactionMode::Off => return Ok(None),
     };
-    let original_source = history.get(start..compact_end).unwrap_or(&[]);
+    let original_source = source_history.get(start..compact_end).unwrap_or(&[]);
     let fidelity_status = compaction_summary_fidelity_status(&summary, config.mode, original_source);
     persist_compaction_audit(
         audit,
