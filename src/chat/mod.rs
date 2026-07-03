@@ -5500,6 +5500,28 @@ fn new_inline_terminal(height: u16) -> Result<InlineTerminal> {
     .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))
 }
 
+#[cfg(feature = "terminal-tui")]
+fn clear_old_inline_chrome_region<B>(terminal: &mut ratatui::Terminal<B>) -> std::result::Result<(), B::Error>
+where
+    B: ratatui::backend::Backend,
+{
+    use ratatui::backend::ClearType;
+    use ratatui::layout::Position;
+
+    let area = terminal.get_frame().area();
+    let top = Position { x: area.x, y: area.y };
+    let bottom_anchor = Position {
+        x: area.x,
+        y: area.bottom().saturating_sub(1),
+    };
+    let backend = terminal.backend_mut();
+    backend.set_cursor_position(top)?;
+    backend.clear_region(ClearType::CurrentLine)?;
+    backend.clear_region(ClearType::AfterCursor)?;
+    backend.set_cursor_position(bottom_anchor)?;
+    backend.flush()
+}
+
 /// Runs inside `tokio::task::spawn_blocking` because `terminal.draw()`
 /// performs synchronous I/O and `mpsc::Receiver::blocking_recv()` blocks the
 /// caller. Returning a `JoinHandle` lets the caller observe panics if
@@ -6723,6 +6745,13 @@ fn run_tui_unified_loop(
         if let Some(next_height) =
             render_source.with_view(|view| changed_inline_viewport_height(inline_viewport_height, view))
         {
+            if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
+                tracing::warn!(
+                    error = %e,
+                    height = inline_viewport_height,
+                    "failed to clear old inline chrome before viewport height update"
+                );
+            }
             match new_inline_terminal(next_height) {
                 Ok(next_terminal) => {
                     inline_viewport_height = next_height;
@@ -9362,6 +9391,68 @@ mod s4_a_4 {
         let back_to_idle = super::changed_inline_viewport_height(streaming, &tui)
             .expect("removing streaming preview must shrink the inline viewport");
         assert_eq!(back_to_idle, idle);
+    }
+
+    #[test]
+    fn clear_old_inline_chrome_region_preserves_transcript_above_viewport() {
+        use ratatui::backend::Backend;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::with_lines([
+            "transcript line 1",
+            "transcript line 2",
+            "old chrome header",
+            "old chrome input ",
+            "old chrome footer",
+        ]);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 2, 17, 3)),
+            },
+        )
+        .expect("test terminal");
+
+        super::clear_old_inline_chrome_region(&mut terminal).expect("clear old chrome");
+
+        let rows: Vec<String> = (0..5)
+            .map(|y| {
+                (0..17)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("transcript line 1"),
+            "transcript above viewport must survive"
+        );
+        assert_eq!(
+            rows.get(1).map(String::as_str),
+            Some("transcript line 2"),
+            "transcript above viewport must survive"
+        );
+        assert!(
+            rows.get(2).is_some_and(|row| row.trim().is_empty()),
+            "old chrome header must be cleared: {rows:?}"
+        );
+        assert!(
+            rows.get(3).is_some_and(|row| row.trim().is_empty()),
+            "old chrome input must be cleared: {rows:?}"
+        );
+        assert!(
+            rows.get(4).is_some_and(|row| row.trim().is_empty()),
+            "old chrome footer must be cleared: {rows:?}"
+        );
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().expect("cursor"),
+            ratatui::layout::Position { x: 0, y: 4 },
+            "cursor must be anchored at the old viewport bottom before rebuild"
+        );
     }
 
     /// read_pending：snapshot 路径返回正确切片.
