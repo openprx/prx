@@ -142,7 +142,7 @@ crossterm = { version = "0.28", default-features = false, features = ["events", 
 
 # TUI advanced features (Phase 3) — gated behind terminal-tui feature
 ratatui = { version = "0.30", optional = true, default-features = false, features = ["crossterm", "scrolling-regions"] }
-syntect = { version = "5.2", optional = true, default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "html", "plist-load", "dump-load", "dump-create", "regex-fancy"] }
+syntect = { version = "5.2", optional = true, default-features = false, features = ["parsing", "default-syntaxes", "default-themes", "html", "dump-load", "dump-create", "regex-fancy"] }
 unicode-width = { version = "0.2", optional = true }
 # Interactive PTY shell sessions (v3 of the chat session runtime). Cross-platform
 # pseudo-terminal: openpty on Unix, ConPTY on Windows. Gated behind terminal-tui

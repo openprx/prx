@@ -144,6 +144,12 @@ const EXIT_PERSISTENCE_IDLE_SETTLE_MS: u64 = 50;
 /// Maximum multiplier applied to the base timeout (caps iterations-based scaling).
 const TIMEOUT_MAX_SCALE_FACTOR: u64 = 4;
 
+pub(crate) fn turn_timeout_budget(message_timeout_secs: u64, max_tool_iterations: usize) -> Duration {
+    let base = message_timeout_secs.max(TIMEOUT_MIN_BASE_SECS);
+    let scale = (max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
+    Duration::from_secs(base.saturating_mul(scale))
+}
+
 const FILE_MENTION_MAX_FILES: usize = 5;
 const FILE_MENTION_MAX_BYTES: usize = 64 * 1024;
 
@@ -1798,6 +1804,10 @@ pub async fn run(
             temperature,
             tools_registry: Some(Arc::clone(&tools_registry)),
             max_tool_iterations: config.agent.max_tool_iterations,
+            turn_timeout_budget: Some(turn_timeout_budget(
+                config.channels_config.message_timeout_secs,
+                config.agent.max_tool_iterations,
+            )),
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
             approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
         };
@@ -4309,11 +4319,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         };
 
         // ── Timeout budget ───────────────────────────────────────
-        let timeout_budget = {
-            let base = config.channels_config.message_timeout_secs.max(TIMEOUT_MIN_BASE_SECS);
-            let scale = (config.agent.max_tool_iterations.max(1) as u64).min(TIMEOUT_MAX_SCALE_FACTOR);
-            Duration::from_secs(base.saturating_mul(scale))
-        };
+        let timeout_budget = turn_timeout_budget(
+            config.channels_config.message_timeout_secs,
+            config.agent.max_tool_iterations,
+        );
 
         let effective_compaction = crate::router::resolve_effective_compaction_config(
             &config.agent.compaction,

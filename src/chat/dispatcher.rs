@@ -593,6 +593,9 @@ pub struct EffectDeps {
     pub tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
     /// **5a-6**: max tool iterations — 防 LLM 死循环。0 走默认 (16)，上限受 driver 内部保护。
     pub max_tool_iterations: usize,
+    /// Per-turn Redux driver timeout. Production mirrors the legacy loop budget;
+    /// tests may set `None` to avoid time-coupling unrelated scenarios.
+    pub turn_timeout_budget: Option<std::time::Duration>,
     /// **S3 T3-1**: approval 请求-应答路由器 (driver↔dispatcher 桥接 oneshot).
     ///
     /// driver 在执行需 approval 的 tool 前注册 oneshot tx；dispatcher_task 在
@@ -801,6 +804,7 @@ impl EffectExecutor {
                 // 5a-6: 透传 tool registry + max iterations (None / 0 → driver 退化为纯文本流式).
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let max_tool_iterations = deps.max_tool_iterations;
+                let turn_timeout_budget = deps.turn_timeout_budget;
                 // S3 T3-1: approval 桥接 — router + manager 句柄一起透传给 driver.
                 let approval_router = Some(Arc::clone(&deps.approval_router));
                 let approval_manager = deps.approval_manager.as_ref().map(Arc::clone);
@@ -820,9 +824,9 @@ impl EffectExecutor {
                         model,
                         temperature,
                         compaction_config,
-                        cancel,
-                        draft_id,
-                        action_tx,
+                        cancel.clone(),
+                        draft_id.clone(),
+                        action_tx.clone(),
                         tools_registry,
                         max_tool_iterations,
                         approval_router,
@@ -842,13 +846,33 @@ impl EffectExecutor {
                     // dispatches `StartLLMTurn`), the driver runs unscoped and
                     // spawned sub-agents fall back to user origin — the correct
                     // behavior for those paths.
-                    match turn_spawn_ctx {
-                        Some(ctx) => {
-                            crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
-                                .scope(ctx, driver)
-                                .await;
+                    let scoped_driver = async move {
+                        match turn_spawn_ctx {
+                            Some(ctx) => {
+                                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+                                    .scope(ctx, driver)
+                                    .await;
+                            }
+                            None => driver.await,
                         }
-                        None => driver.await,
+                    };
+                    if let Some(timeout_budget) = turn_timeout_budget {
+                        if tokio::time::timeout(timeout_budget, scoped_driver).await.is_err() {
+                            cancel.cancel();
+                            let err = format!("redux driver: turn timed out after {}s", timeout_budget.as_secs());
+                            if let Err(e) = action_tx
+                                .send(Action::StreamFailed {
+                                    draft_id,
+                                    err,
+                                    retryable: true,
+                                })
+                                .await
+                            {
+                                tracing::debug!(error = %e, "StartTurn: action_tx closed on turn timeout");
+                            }
+                        }
+                    } else {
+                        scoped_driver.await;
                     }
                 });
             }
@@ -1382,7 +1406,7 @@ async fn apply_redux_summary_compaction(
     let budget =
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
-        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement(
+        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
             replacement_len,
@@ -1414,7 +1438,7 @@ fn trim_redux_driver_context_budget_after_summary(
     replacement_len: Option<usize>,
 ) -> bool {
     if let Some(replacement_len) = replacement_len {
-        crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement(
+        crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
             history,
             config,
             replacement_len,
@@ -3702,6 +3726,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };
@@ -4093,6 +4118,7 @@ mod real_mode_tests {
                 temperature: 0.0,
                 tools_registry: None,
                 max_tool_iterations: 0,
+                turn_timeout_budget: None,
                 approval_router: Arc::new(ApprovalRouter::new()),
                 approval_manager: None,
             };
@@ -4160,6 +4186,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };
@@ -4890,6 +4917,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };
@@ -5038,6 +5066,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };
@@ -5190,6 +5219,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };
@@ -6266,6 +6296,106 @@ mod real_mode_tests {
         }
     }
 
+    #[tokio::test]
+    async fn redux_driver_turn_timeout_fails_soft_and_clears_generating() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct NeverStreamProvider;
+        #[async_trait]
+        impl Provider for NeverStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temp: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::pending().boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(NeverStreamProvider);
+        deps.turn_timeout_budget = Some(Duration::from_millis(50));
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        let mut state = crate::chat::state::ChatState::new(
+            Arc::from("test-provider"),
+            Arc::from("test-model"),
+            CancellationToken::new(),
+        );
+        let cancel = CancellationToken::new();
+        let start_effect = state
+            .reduce(Action::StartLLMTurn {
+                draft_id: "draft-timeout".to_string(),
+                history: Vec::new(),
+                compaction_config: None,
+                cancel: cancel.clone(),
+                turn_spawn_ctx: None,
+            })
+            .into_iter()
+            .find(|effect| matches!(effect, Effect::StartTurn { .. }))
+            .expect("StartLLMTurn must emit StartTurn");
+        assert!(state.control.generating);
+        assert!(state.stream.draft.is_some());
+
+        executor.execute(start_effect).await;
+        let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
+            .await
+            .expect("timeout StreamFailed within 2s")
+            .expect("timeout StreamFailed action");
+        match &action {
+            Action::StreamFailed {
+                draft_id,
+                err,
+                retryable,
+            } => {
+                assert_eq!(draft_id, "draft-timeout");
+                assert!(err.contains("redux driver: turn timed out"));
+                assert!(*retryable);
+            }
+            other => panic!("expected StreamFailed timeout, got {other:?}"),
+        }
+        assert!(cancel.is_cancelled(), "timeout must cancel the pending provider stream");
+
+        let _ = state.reduce(action);
+        assert!(!state.control.generating, "StreamFailed must clear generating");
+        assert!(state.control.active_cancel.is_none());
+        assert!(state.stream.draft.is_none());
+    }
+
     /// P0-1 简化版: try_dispatch ChannelClosed 时返回 ChannelClosed
     /// (chat::run driver 分支会据此 abort turn + cleanup + continue).
     #[tokio::test]
@@ -7204,7 +7334,7 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
-    async fn redux_driver_second_trim_preserves_summary_and_matches_reducer_history() {
+    async fn redux_driver_preserve_trim_floor_preserves_fitting_summary_and_matches_reducer_history() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
             StreamResult,
@@ -7224,11 +7354,11 @@ mod real_mode_tests {
             async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
                 let call = self.calls.fetch_add(1, AtomicOrdering::SeqCst);
                 if call == 0 {
-                    Ok(format!("FLUSH_MARKER {}", "flush-context ".repeat(160)))
+                    Ok(format!("FLUSH_MARKER {}", "flush-context ".repeat(12)))
                 } else {
                     Ok(format!(
                         "SUMMARY_MARKER\n## Decisions\n- keep\n## Open TODOs\n- keep\n## Critical Context\n- keep\n{}",
-                        "summary-context ".repeat(160)
+                        "summary-context ".repeat(12)
                     ))
                 }
             }
@@ -7270,7 +7400,7 @@ mod real_mode_tests {
             reserve_tokens: 5,
             keep_recent_messages: 1,
             memory_flush: true,
-            max_context_tokens: 30,
+            max_context_tokens: 300,
             max_context_tokens_explicit: true,
             ..crate::config::AgentCompactionConfig::default()
         };
@@ -7298,8 +7428,8 @@ mod real_mode_tests {
             crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
         );
         assert!(
-            after_compact.over_hard_limit,
-            "fixture must force the post-patch second-trim fallback"
+            !after_compact.over_hard_limit,
+            "preserve-trim floor should fully remediate when the protected replacement fits"
         );
         let _ = trim_redux_driver_context_budget_after_summary(&mut driver_history, &config, Some(replacement_len));
 
@@ -7334,6 +7464,136 @@ mod real_mode_tests {
                 .map(|message| (message.role.clone(), message.content.clone()))
                 .collect::<Vec<_>>(),
             "GP-6: driver fallback history must exactly match reducer history"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_driver_preserve_trim_floor_drops_unfit_summary_and_matches_reducer_history() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct HugeSummaryProvider;
+        #[async_trait]
+        impl Provider for HugeSummaryProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok(format!(
+                    "SUMMARY_TOO_LARGE\n## Decisions\n- {}",
+                    "summary-over-budget ".repeat(800)
+                ))
+            }
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![Ok(StreamChunk::final_chunk())]).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut original_history = vec![PMsg::system("sys")];
+        for idx in 0..8 {
+            original_history.push(PMsg::user(format!(
+                "trim-candidate-{idx} {}",
+                "recent-bulk ".repeat(80)
+            )));
+        }
+        let mut driver_history = original_history.clone();
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 4,
+            memory_flush: false,
+            max_context_tokens: 90,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(4);
+
+        let replacement_len = apply_redux_summary_compaction(
+            &HugeSummaryProvider,
+            &mut driver_history,
+            "model",
+            &config,
+            &action_tx,
+            crate::chat::action::CompactReason::ContextOverflow,
+            "test_floor_drops_unfit_summary",
+        )
+        .await
+        .unwrap()
+        .expect("summary patch must apply");
+        assert_eq!(replacement_len, 1);
+
+        let driver_budget = crate::agent::loop_::plan_context_budget(
+            &driver_history,
+            &config,
+            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        assert!(
+            !driver_budget.over_hard_limit,
+            "driver history must be under hard limit"
+        );
+        assert!(
+            !driver_history
+                .iter()
+                .any(|message| message.content.contains("SUMMARY_TOO_LARGE")),
+            "floor fallback may drop a summary that cannot fit by itself"
+        );
+
+        let patch = match action_rx.recv().await.expect("patch action") {
+            Action::HistoryCompactionPatchApplied { patch, .. } => patch,
+            other => panic!("expected summary patch action, got {other:?}"),
+        };
+        let mut reducer_state =
+            crate::chat::state::ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
+        reducer_state.session.history = original_history;
+        let _ = reducer_state.reduce(Action::HistoryCompactionPatchApplied {
+            reason: crate::chat::action::CompactReason::ContextOverflow,
+            patch,
+            compaction_config: config.clone(),
+        });
+        let reducer_budget = crate::agent::loop_::plan_context_budget(
+            &reducer_state.session.history,
+            &config,
+            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        assert!(
+            !reducer_budget.over_hard_limit,
+            "reducer replay must also enforce the floor"
+        );
+        assert_eq!(
+            driver_history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            reducer_state
+                .session
+                .history
+                .iter()
+                .map(|message| (message.role.clone(), message.content.clone()))
+                .collect::<Vec<_>>(),
+            "driver and reducer floor fallback histories must match"
         );
     }
 
@@ -8773,6 +9033,7 @@ mod real_mode_tests {
             temperature: 0.0,
             tools_registry: None,
             max_tool_iterations: 0,
+            turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
             approval_manager: None,
         };

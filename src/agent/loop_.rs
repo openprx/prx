@@ -1055,6 +1055,29 @@ pub fn trim_history_to_context_budget_preserving_compaction_replacement(
     history.len() != before_len || measure_history_tokens(history) != before_tokens
 }
 
+pub fn trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+    history: &mut Vec<ChatMessage>,
+    config: &crate::config::AgentCompactionConfig,
+    replacement_len: usize,
+) -> bool {
+    let before_len = history.len();
+    let before_tokens = measure_history_tokens(history);
+    trim_history_to_context_budget_preserving_compaction_replacement(history, config, replacement_len);
+    let after_preserve = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
+    if after_preserve.over_hard_limit {
+        trim_history_to_context_budget(history, config);
+        while plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).over_hard_limit {
+            let has_system = history.first().is_some_and(|m| m.role == "system");
+            let start = if has_system { 1 } else { 0 };
+            if history.len() <= start {
+                break;
+            }
+            history.remove(start);
+        }
+    }
+    history.len() != before_len || measure_history_tokens(history) != before_tokens
+}
+
 /// Count the number of tokens in `text`.
 ///
 /// When the `llm-router` feature is enabled this uses the `cl100k_base`
@@ -1566,7 +1589,11 @@ async fn preflight_context_budget_before_provider_call(
     budget = plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
         let trimmed = if let Some(replacement_len) = replacement_len {
-            trim_history_to_context_budget_preserving_compaction_replacement(history, config, replacement_len)
+            trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                history,
+                config,
+                replacement_len,
+            )
         } else {
             trim_history_to_context_budget(history, config)
         };
@@ -9423,6 +9450,54 @@ ls -la
         assert!(
             !budget.over_hard_limit,
             "fixture summary is small enough to fit under literal hard limit 110"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_preflight_preserving_trim_falls_back_when_summary_alone_exceeds_hard_limit() {
+        let provider = SystemSummaryProvider {
+            response: format!(
+                "## Decisions\n- {}\n## Critical Context\n- SUMMARY_TOO_LARGE",
+                "summary-over-budget ".repeat(800)
+            ),
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for idx in 0..8 {
+            history.push(ChatMessage::user(format!(
+                "trim-candidate-{idx} {}",
+                "recent-bulk ".repeat(80)
+            )));
+        }
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 4,
+            memory_flush: false,
+            max_context_tokens: 90,
+            max_context_tokens_explicit: true,
+            os_paging: crate::config::OsPagingConfig::default(),
+        };
+
+        let budget = preflight_context_budget_before_provider_call(
+            &mut history,
+            &provider,
+            "model",
+            &config,
+            None,
+            "test_preflight",
+        )
+        .await
+        .unwrap();
+        let final_budget = plan_context_budget(&history, &config, PRE_TURN_FLUSH_THRESHOLD);
+
+        assert!(!budget.over_hard_limit, "reported budget must be under the hard limit");
+        assert!(
+            !final_budget.over_hard_limit,
+            "history must be under hard limit after preserve-trim floor fallback"
+        );
+        assert!(
+            !history.iter().any(|msg| msg.content.contains("SUMMARY_TOO_LARGE")),
+            "plain trim floor may delete an unfit summary instead of sending an oversized prompt"
         );
     }
 

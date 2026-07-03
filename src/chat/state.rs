@@ -1666,6 +1666,12 @@ impl ChatState {
     /// SessionLoaded 到来时从 turns 重建（Step 5 接线）。
     fn reduce_session_loaded(&mut self, loaded: ChatSession) -> Vec<Effect> {
         let id = loaded.id.clone();
+        if self.control.generating {
+            return vec![Effect::LogTrace {
+                level: tracing::Level::WARN,
+                msg: format!("SessionLoaded rejected while generating: {id}"),
+            }];
+        }
         self.session.id = loaded.id;
         self.session.title = loaded.title;
         self.session.provider = Arc::from(loaded.provider.as_str());
@@ -2164,7 +2170,7 @@ impl ChatState {
                 crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
             );
             let trim_fallback = if budget.over_hard_limit {
-                crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement(
+                crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
                     history,
                     compaction_config,
                     patch.replacement.len(),
@@ -2758,7 +2764,7 @@ mod tests {
         state.ui.context_window_tokens = Some(10_000_000);
         state.ui.input.set_text("draft text");
         assert!(state.ui.input.begin_or_cycle_reverse_search());
-        state.control.generating = true;
+        state.control.generating = false;
 
         let mut loaded = ChatSession::new("prov-new", "model-new");
         loaded.id = "sess-new".to_string();
@@ -2775,6 +2781,42 @@ mod tests {
         assert!(!state.control.generating);
         assert!(state.control.active_cancel.is_none());
         assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn session_loaded_is_rejected_while_generating_without_clearing_active_turn() {
+        let mut state = make_state();
+        state.session.id = "sess-old".to_string();
+        let cancel = CancellationToken::new();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-active".to_string(),
+            cancel: cancel.clone(),
+        });
+        assert!(state.control.generating);
+        assert!(state.stream.draft.is_some());
+        assert!(state.control.active_cancel.is_some());
+
+        let mut loaded = ChatSession::new("prov-new", "model-new");
+        loaded.id = "sess-new".to_string();
+        loaded.add_user_turn("should-not-load");
+        let effects = state.reduce(Action::SessionLoaded(loaded));
+
+        assert_eq!(state.session.id, "sess-old");
+        assert!(state.control.generating);
+        assert!(state.stream.draft.is_some());
+        assert!(state.control.active_cancel.is_some());
+        assert!(!cancel.is_cancelled());
+        assert!(!effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::LogTrace {
+                    level: tracing::Level::WARN,
+                    msg,
+                } if msg.contains("SessionLoaded rejected while generating: sess-new")
+            )
+        }));
     }
 
     #[cfg(feature = "terminal-tui")]
