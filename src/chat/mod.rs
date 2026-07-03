@@ -1113,145 +1113,240 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
     parts.join("\n\n")
 }
 
-// ── P3-2: TerminalGuard RAII + strengthened panic hook ──────────────────────
+// ── P3-2 / alt-screen Phase 0: TerminalGuard RAII + panic restore ────────────
 
-/// Best-effort terminal restoration used by both [`TerminalGuard`] (on Drop /
-/// manual `leave`) and the chat panic hook installed via
-/// [`install_chat_panic_hook`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatTuiMode {
+    Inline,
+    Fullscreen,
+}
+
+impl ChatTuiMode {
+    const fn from_config(mode: crate::config::ChatTuiModeConfig) -> Self {
+        match mode {
+            crate::config::ChatTuiModeConfig::Inline => Self::Inline,
+            crate::config::ChatTuiModeConfig::Fullscreen => Self::Fullscreen,
+        }
+    }
+
+    fn from_env(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "inline" => Some(Self::Inline),
+            "fullscreen" => Some(Self::Fullscreen),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatTuiSelection {
+    enabled: bool,
+    mode: ChatTuiMode,
+}
+
+#[cfg(feature = "terminal-tui")]
+fn select_chat_tui(
+    plain_mode: bool,
+    stdin_is_terminal: bool,
+    prx_tui_env: Option<&str>,
+    prx_tui_mode_env: Option<&str>,
+    config_mode: crate::config::ChatTuiModeConfig,
+) -> ChatTuiSelection {
+    let enabled = should_enable_terminal_tui(plain_mode, stdin_is_terminal, prx_tui_env);
+    let mode = prx_tui_mode_env
+        .and_then(ChatTuiMode::from_env)
+        .unwrap_or_else(|| ChatTuiMode::from_config(config_mode));
+    ChatTuiSelection { enabled, mode }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TerminalGuardState {
+    raw_mode_active: bool,
+    bracketed_paste_active: bool,
+    alternate_screen_active: bool,
+}
+
+impl TerminalGuardState {
+    const fn inactive() -> Self {
+        Self {
+            raw_mode_active: false,
+            bracketed_paste_active: false,
+            alternate_screen_active: false,
+        }
+    }
+}
+
+trait TerminalModeOps {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn disable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn disable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
+    fn show_cursor(&mut self) -> std::io::Result<()>;
+}
+
+struct CrosstermTerminalModeOps;
+
+impl TerminalModeOps for CrosstermTerminalModeOps {
+    fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+        crossterm::terminal::enable_raw_mode()
+    }
+
+    fn disable_raw_mode(&mut self) -> std::io::Result<()> {
+        crossterm::terminal::disable_raw_mode()
+    }
+
+    fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste).map(|_| ())
+    }
+
+    fn disable_bracketed_paste(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste).map(|_| ())
+    }
+
+    fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen).map(|_| ())
+    }
+
+    fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::LeaveAlternateScreen).map(|_| ())
+    }
+
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::cursor::Show).map(|_| ())
+    }
+}
+
+static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn enter_terminal_state_with_ops(
+    ops: &mut impl TerminalModeOps,
+    mode: ChatTuiMode,
+) -> std::io::Result<TerminalGuardState> {
+    let mut state = TerminalGuardState::inactive();
+
+    ops.enable_raw_mode()?;
+    state.raw_mode_active = true;
+
+    if mode == ChatTuiMode::Fullscreen {
+        if let Err(e) = ops.enter_alternate_screen() {
+            let _ = ops.disable_raw_mode();
+            return Err(e);
+        }
+        state.alternate_screen_active = true;
+    }
+
+    if let Err(e) = ops.enable_bracketed_paste() {
+        if state.alternate_screen_active {
+            let _ = ops.leave_alternate_screen();
+        }
+        let _ = ops.disable_raw_mode();
+        return Err(e);
+    }
+    state.bracketed_paste_active = true;
+
+    Ok(state)
+}
+
+fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: TerminalGuardState) {
+    if state.bracketed_paste_active {
+        let _ = ops.disable_bracketed_paste();
+        let _ = ops.show_cursor();
+    }
+    if state.alternate_screen_active {
+        let _ = ops.leave_alternate_screen();
+    }
+    if state.raw_mode_active {
+        let _ = ops.disable_raw_mode();
+    }
+}
+
+fn restore_terminal_state_with_ops(ops: &mut impl TerminalModeOps, leave_alternate_screen: bool) {
+    let state = TerminalGuardState {
+        raw_mode_active: true,
+        bracketed_paste_active: true,
+        alternate_screen_active: leave_alternate_screen,
+    };
+    leave_terminal_state_with_ops(ops, state);
+}
+
+/// Best-effort terminal restoration used by both [`TerminalGuard`] and the chat
+/// panic hook installed via [`install_chat_panic_hook`].
 ///
-/// Sequence (reverse of entry):
-///   1. `DisableBracketedPaste` (paired with `EnableBracketedPaste` in enter)
-///   2. Show cursor (explicit — `Frame::set_cursor_position` may have
-///      left the cursor hidden if a panic happened mid-frame)
-///   3. `disable_raw_mode`
-///
-/// P3-inline note: we no longer toggle the alternate screen, so there is
-/// nothing to `LeaveAlternateScreen` here. Permanent chat output lives in
-/// the host terminal's main scrollback (pushed via
-/// `terminal.insert_before`); leaving raw mode is sufficient to give the
-/// shell a usable cursor back after exit. The previous fullscreen design
-/// wiped the screen on exit — the inline design intentionally preserves
-/// it so users can review the conversation.
-///
-/// Every step swallows its error: by the time this runs we are already on the
-/// cleanup path (Drop or panic unwind) and there is no caller left to surface
-/// the failure to. Errors are silently dropped — logging is intentionally
-/// avoided to keep this callable from a panic hook without re-entering the
-/// tracing machinery.
+/// Inline mode preserves the host scrollback and does not leave alternate
+/// screen. Fullscreen mode records a process-global active flag so panic restore
+/// can emit `LeaveAlternateScreen` before the chained hook prints its backtrace.
 fn restore_terminal_state() {
-    // 1. Disable bracketed paste so the host shell is not left in a
-    //    half-enabled state.
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-    // 2. Show cursor (idempotent — defends against a panic interrupting
-    //    a frame that had hidden the cursor via `set_cursor_position`).
-    let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
-    // 3. Disable raw mode last so any escape sequences emitted above are
-    //    interpreted by the terminal as expected.
-    let _ = crossterm::terminal::disable_raw_mode();
+    let leave_alternate_screen = CHAT_FULLSCREEN_ACTIVE.swap(false, std::sync::atomic::Ordering::AcqRel);
+    let mut ops = CrosstermTerminalModeOps;
+    restore_terminal_state_with_ops(&mut ops, leave_alternate_screen);
 }
 
 /// RAII guard for the chat TUI terminal state.
 ///
-/// Owns the entry side-effects (`enable_raw_mode` + bracketed paste) and
-/// guarantees they are reversed exactly once on Drop — whether by normal
-/// return, `?` early-exit, or panic unwinding. The strengthened panic
-/// hook in [`install_chat_panic_hook`] provides defence-in-depth for
-/// non-unwind aborts and for panics that happen before a guard exists.
-///
-/// **P3-inline change.** This guard no longer enters the alternate
-/// screen. Permanent conversation history is pushed to the host
-/// terminal's main scrollback via `terminal.insert_before` (driven by
-/// the unified TUI loop), and ratatui draws only a fixed-height inline
-/// viewport at the bottom. The benefits are:
-///   * the host terminal's native scroll (mouse wheel, Shift+PgUp,
-///     terminal search / copy / paste) works on chat history;
-///   * exiting prx leaves the conversation in the user's scrollback
-///     instead of wiping the screen.
-///
-/// `enter()` is *transactional*: if bracketed paste fails after raw mode
-/// succeeded, raw mode is rolled back before returning `Err`, so a
-/// failed enter never leaves the terminal in a half-modified state.
-///
-/// The `alt_screen_active` flag is retained for source compatibility
-/// with the existing teardown order (and to keep the unit tests
-/// stable) but now corresponds to "bracketed paste is currently on"
-/// rather than "alt screen is currently on".
+/// Inline mode keeps the existing lifecycle: raw mode + bracketed paste, no
+/// alternate screen. Fullscreen mode additionally enters alternate screen on
+/// setup and leaves it on teardown. `enter()` is transactional: any partial
+/// failure rolls back already-applied terminal state before returning `Err`.
 pub struct TerminalGuard {
-    /// True while raw mode is currently enabled by *this* guard.
     raw_mode_active: std::sync::atomic::AtomicBool,
-    /// True while bracketed paste + cursor-show state is currently owned
-    /// by *this* guard. (Pre-P3-inline this flag also tracked the
-    /// alternate screen; the field name is kept for source compat.)
-    alt_screen_active: std::sync::atomic::AtomicBool,
+    bracketed_paste_active: std::sync::atomic::AtomicBool,
+    alternate_screen_active: std::sync::atomic::AtomicBool,
 }
 
 impl TerminalGuard {
-    /// Enter raw mode + bracketed-paste mode.
-    ///
-    /// Note (P3-inline): we do **not** `EnterAlternateScreen` and we do
-    /// **not** `cursor::Hide`. ratatui's `Frame::set_cursor_position`
-    /// controls cursor visibility per frame; calling `Hide` ahead of
-    /// time leaves `set_cursor_position` with no visible cursor to
-    /// position and breaks the user's ability to see where their input
-    /// is going. Bracketed paste is enabled so CJK IME committed strings
-    /// arrive as a single `Event::Paste(s)` instead of being shredded
-    /// into per-byte `KeyEvent`s with garbage modifier bits.
-    ///
-    /// Transactional: on partial failure (raw mode succeeded but
-    /// bracketed paste failed) the partially-applied state is rolled
-    /// back before returning `Err`, so callers never need to clean up
-    /// after a failed `enter`.
-    pub fn enter() -> Result<Self> {
-        use std::sync::atomic::AtomicBool;
-
-        // Step 1: raw mode.
-        crossterm::terminal::enable_raw_mode()
-            .map_err(|e| anyhow::anyhow!("failed to enable raw mode for chat TUI: {e}"))?;
-
-        // Step 2: bracketed paste. If this fails, roll back step 1
-        // before propagating the error. We intentionally do not enter
-        // the alternate screen — see doc comment.
-        if let Err(e) = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste) {
-            // Best-effort rollback — already on error path, ignore failure.
-            let _ = crossterm::terminal::disable_raw_mode();
-            return Err(anyhow::anyhow!("failed to enable bracketed paste for chat TUI: {e}"));
+    pub(crate) fn enter(mode: ChatTuiMode) -> Result<Self> {
+        let mut ops = CrosstermTerminalModeOps;
+        let state = enter_terminal_state_with_ops(&mut ops, mode)
+            .map_err(|e| anyhow::anyhow!("failed to enter chat TUI terminal mode ({mode:?}): {e}"))?;
+        if state.alternate_screen_active {
+            CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
         }
-
         Ok(Self {
-            raw_mode_active: AtomicBool::new(true),
-            alt_screen_active: AtomicBool::new(true),
+            raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
+            bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
+            alternate_screen_active: std::sync::atomic::AtomicBool::new(state.alternate_screen_active),
         })
     }
 
-    /// Manual early teardown (e.g. before spawning a child process that
-    /// needs a clean terminal). Idempotent — subsequent calls (including the
-    /// Drop hook) are a no-op.
-    ///
-    /// Uses two CAS operations so concurrent `leave()` / `drop()` from
-    /// different threads is safe: only the first caller to flip the flag
-    /// actually issues the crossterm calls.
+    /// Manual early teardown (e.g. before spawning a child process that needs a
+    /// clean terminal). Idempotent across manual calls and Drop.
     pub fn leave(&self) {
-        use std::sync::atomic::Ordering;
-
-        // Order mirrors the reverse of entry: disable bracketed paste +
-        // show cursor first, then raw mode last. Notably we do NOT
-        // clear the screen — the inline design leaves chat history in
-        // the user's main scrollback so they can review it after exit.
-        if self
-            .alt_screen_active
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
-            let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        let mut ops = CrosstermTerminalModeOps;
+        let state = TerminalGuardState {
+            bracketed_paste_active: self
+                .bracketed_paste_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            alternate_screen_active: self
+                .alternate_screen_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            raw_mode_active: self
+                .raw_mode_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+        };
+        if state.alternate_screen_active {
+            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         }
-        if self
-            .raw_mode_active
-            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            let _ = crossterm::terminal::disable_raw_mode();
-        }
+        leave_terminal_state_with_ops(&mut ops, state);
     }
 }
 
@@ -1944,19 +2039,26 @@ pub async fn run(
         // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
         // downstream scripts that scrape stdout, or to escape rendering
         // glitches). Non-TTY stdin (pipe / heredoc / scripted) always falls
-        // through to the legacy reedline + BufRead path.
+        // through to the legacy reedline + BufRead path. PRX_TUI_MODE and
+        // [chat].tui_mode only select inline vs fullscreen after that gate.
         let prx_tui_env = std::env::var("PRX_TUI").ok();
-        let tui_enabled =
-            should_enable_terminal_tui(plain_mode, std::io::stdin().is_terminal(), prx_tui_env.as_deref());
-        if tui_enabled {
-            // Order matters: `TerminalGuard::enter()` flips raw mode + alt
-            // screen + bracketed paste FIRST, then we wire up the UiActor
+        let prx_tui_mode_env = std::env::var("PRX_TUI_MODE").ok();
+        let tui_selection = select_chat_tui(
+            plain_mode,
+            std::io::stdin().is_terminal(),
+            prx_tui_env.as_deref(),
+            prx_tui_mode_env.as_deref(),
+            config.chat.tui_mode,
+        );
+        if tui_selection.enabled {
+            // Order matters: `TerminalGuard::enter()` flips terminal mode
+            // FIRST, then we wire up the UiActor
             // mirror BEFORE spawning the unified TUI loop (so no `UiEvent`
             // can sneak through to the old println!-based renderer in
             // `channels/terminal.rs`). On enter failure we fall back to the
             // legacy reedline path so the user is never left without a
             // prompt.
-            match TerminalGuard::enter() {
+            match TerminalGuard::enter(tui_selection.mode) {
                 Ok(guard) => {
                     // S4-B: 删除 chat_mirror 旁路写，Pure 模式下 reducer 单源接管 banner
                     // S2-C Step 3: 双写到 Redux UI 镜像。Off/Both/Redux 下 chat_mirror
@@ -9002,12 +9104,60 @@ mod terminal_guard_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    #[derive(Default)]
+    struct FakeTerminalModeOps {
+        calls: Vec<&'static str>,
+        fail_enable_bracketed_paste: bool,
+    }
+
+    impl TerminalModeOps for FakeTerminalModeOps {
+        fn enable_raw_mode(&mut self) -> std::io::Result<()> {
+            self.calls.push("enable_raw_mode");
+            Ok(())
+        }
+
+        fn disable_raw_mode(&mut self) -> std::io::Result<()> {
+            self.calls.push("disable_raw_mode");
+            Ok(())
+        }
+
+        fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
+            self.calls.push("enable_bracketed_paste");
+            if self.fail_enable_bracketed_paste {
+                Err(std::io::Error::other("enable bracketed paste failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn disable_bracketed_paste(&mut self) -> std::io::Result<()> {
+            self.calls.push("disable_bracketed_paste");
+            Ok(())
+        }
+
+        fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.calls.push("enter_alternate_screen");
+            Ok(())
+        }
+
+        fn leave_alternate_screen(&mut self) -> std::io::Result<()> {
+            self.calls.push("leave_alternate_screen");
+            Ok(())
+        }
+
+        fn show_cursor(&mut self) -> std::io::Result<()> {
+            self.calls.push("show_cursor");
+            Ok(())
+        }
+    }
+
     /// Build a `TerminalGuard` in the inactive state (no real terminal
     /// mutation), suitable for unit-testing the bookkeeping.
     fn inactive_guard() -> TerminalGuard {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(false),
-            alt_screen_active: AtomicBool::new(false),
+            bracketed_paste_active: AtomicBool::new(false),
+            alternate_screen_active: AtomicBool::new(false),
         }
     }
 
@@ -9019,7 +9169,8 @@ mod terminal_guard_tests {
     fn fake_active_guard() -> TerminalGuard {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(true),
-            alt_screen_active: AtomicBool::new(true),
+            bracketed_paste_active: AtomicBool::new(true),
+            alternate_screen_active: AtomicBool::new(true),
         }
     }
 
@@ -9031,21 +9182,25 @@ mod terminal_guard_tests {
         guard.leave();
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
-        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+        assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
     #[test]
     fn leave_flips_flags_exactly_once() {
         let guard = fake_active_guard();
         assert!(guard.raw_mode_active.load(Ordering::Acquire));
-        assert!(guard.alt_screen_active.load(Ordering::Acquire));
+        assert!(guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(guard.alternate_screen_active.load(Ordering::Acquire));
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
-        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+        assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
         // Second leave is a no-op (CAS fails, no crossterm calls).
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
-        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+        assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -9066,6 +9221,142 @@ mod terminal_guard_tests {
         assert!(
             !should_enable_terminal_tui(false, false, Some("1")),
             "non-TTY stdin must not enter TUI"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn chat_tui_selection_defaults_to_inline() {
+        let selection = select_chat_tui(false, true, None, None, crate::config::ChatTuiModeConfig::Inline);
+
+        assert!(selection.enabled);
+        assert_eq!(selection.mode, ChatTuiMode::Inline);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn prx_tui_mode_fullscreen_selects_fullscreen() {
+        let selection = select_chat_tui(
+            false,
+            true,
+            None,
+            Some("fullscreen"),
+            crate::config::ChatTuiModeConfig::Inline,
+        );
+
+        assert!(selection.enabled);
+        assert_eq!(selection.mode, ChatTuiMode::Fullscreen);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn prx_tui_zero_overrides_prx_tui_mode_fullscreen() {
+        let selection = select_chat_tui(
+            false,
+            true,
+            Some("0"),
+            Some("fullscreen"),
+            crate::config::ChatTuiModeConfig::Inline,
+        );
+
+        assert!(!selection.enabled);
+        assert_eq!(selection.mode, ChatTuiMode::Fullscreen);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn prx_tui_mode_inline_overrides_config_fullscreen() {
+        let selection = select_chat_tui(
+            false,
+            true,
+            None,
+            Some("inline"),
+            crate::config::ChatTuiModeConfig::Fullscreen,
+        );
+
+        assert!(selection.enabled);
+        assert_eq!(selection.mode, ChatTuiMode::Inline);
+    }
+
+    #[test]
+    fn inline_terminal_lifecycle_skips_alternate_screen() {
+        let mut ops = FakeTerminalModeOps::default();
+        let state = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Inline).unwrap();
+        leave_terminal_state_with_ops(&mut ops, state);
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_terminal_lifecycle_enters_and_leaves_alternate_screen_in_order() {
+        let mut ops = FakeTerminalModeOps::default();
+        let state = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Fullscreen).unwrap();
+        leave_terminal_state_with_ops(&mut ops, state);
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_enter_rolls_back_alternate_screen_when_bracketed_paste_fails() {
+        let mut ops = FakeTerminalModeOps {
+            fail_enable_bracketed_paste: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let err = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Fullscreen).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "enable_bracketed_paste",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn panic_restore_leaves_alternate_screen_only_when_fullscreen_active() {
+        let mut inline_ops = FakeTerminalModeOps::default();
+        restore_terminal_state_with_ops(&mut inline_ops, false);
+        assert_eq!(
+            inline_ops.calls,
+            vec!["disable_bracketed_paste", "show_cursor", "disable_raw_mode"]
+        );
+
+        let mut fullscreen_ops = FakeTerminalModeOps::default();
+        restore_terminal_state_with_ops(&mut fullscreen_ops, true);
+        assert_eq!(
+            fullscreen_ops.calls,
+            vec![
+                "disable_bracketed_paste",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
         );
     }
 
@@ -9127,7 +9418,8 @@ mod terminal_guard_tests {
         }
         // After the race both flags must be cleared exactly once.
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
-        assert!(!guard.alt_screen_active.load(Ordering::Acquire));
+        assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
     #[test]

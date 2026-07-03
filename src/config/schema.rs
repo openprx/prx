@@ -249,6 +249,10 @@ pub struct Config {
     #[serde(default)]
     pub sessions_spawn: SessionsSpawnConfig,
 
+    /// Interactive chat UI configuration (`[chat]`).
+    #[serde(default)]
+    pub chat: ChatConfig,
+
     /// Self-system experimental automation controls (`[self_system]`).
     #[serde(default)]
     pub self_system: SelfSystemConfig,
@@ -428,6 +432,7 @@ impl std::fmt::Debug for Config {
             .field("scheduler", &self.scheduler)
             .field("agent", &self.agent)
             .field("sessions_spawn", &self.sessions_spawn)
+            .field("chat", &self.chat)
             .field("self_system", &self.self_system)
             .field("skills", &self.skills)
             .field("skill_rag", &self.skill_rag)
@@ -5111,6 +5116,30 @@ pub struct QQConfig {
     pub mention_only: bool,
 }
 
+/// Interactive chat configuration (`[chat]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct ChatConfig {
+    /// Chat TUI renderer mode. Defaults to `inline` during the Phase 0 rollout.
+    #[serde(default)]
+    pub tui_mode: ChatTuiModeConfig,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            tui_mode: ChatTuiModeConfig::Inline,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatTuiModeConfig {
+    #[default]
+    Inline,
+    Fullscreen,
+}
+
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -5133,6 +5162,7 @@ impl Default for Config {
             scheduler: SchedulerConfig::default(),
             agent: AgentConfig::default(),
             sessions_spawn: SessionsSpawnConfig::default(),
+            chat: ChatConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
@@ -6176,6 +6206,28 @@ min_chars = 12
         assert!(c.discord.is_none());
     }
 
+    #[test]
+    async fn chat_config_defaults_to_inline() {
+        let config = ChatConfig::default();
+
+        assert_eq!(config.tui_mode, ChatTuiModeConfig::Inline);
+    }
+
+    #[test]
+    async fn chat_tui_mode_roundtrips_as_toml_string() {
+        let config = ChatConfig {
+            tui_mode: ChatTuiModeConfig::Fullscreen,
+        };
+
+        let encoded = toml::to_string(&config).unwrap();
+        assert!(encoded.contains("tui_mode = \"fullscreen\""));
+        let decoded: ChatConfig = toml::from_str(&encoded).unwrap();
+        assert_eq!(decoded.tui_mode, ChatTuiModeConfig::Fullscreen);
+
+        let defaulted: ChatConfig = toml::from_str("").unwrap();
+        assert_eq!(defaulted.tui_mode, ChatTuiModeConfig::Inline);
+    }
+
     // ── Serde round-trip ─────────────────────────────────────
 
     #[test]
@@ -6208,6 +6260,7 @@ min_chars = 12
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             sessions_spawn: SessionsSpawnConfig::default(),
+            chat: ChatConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
@@ -6581,6 +6634,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
             sessions_spawn: SessionsSpawnConfig::default(),
+            chat: ChatConfig::default(),
             self_system: SelfSystemConfig::default(),
             skills: SkillsConfig::default(),
             skill_rag: SkillRagConfig::default(),
