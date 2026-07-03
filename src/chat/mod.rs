@@ -7189,13 +7189,21 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Resize(w, h) => {
+                if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
+                    tracing::warn!(
+                        error = %e,
+                        w,
+                        h,
+                        "failed to clear old inline chrome before terminal resize redraw"
+                    );
+                }
                 let _ = chat_dispatcher.dispatch_or_log(Action::TerminalResized { w, h }, "chat.tui_resize");
-                // crossterm forwards the new size to ratatui automatically
-                // on the next `draw()` call; we just nudge the loop so the
-                // redraw happens immediately rather than waiting up to
-                // 50 ms for the next poll. Especially relevant when the
-                // user drags a tmux/screen split and expects the chrome
-                // (status bar, input box) to reflow on the spot.
+                // crossterm forwards the new size to ratatui automatically on
+                // the next `draw()` call. Clear the old inline chrome before
+                // that redraw so status/input text that re-wrapped during a
+                // width transition cannot survive in the scrollback content
+                // area. Then nudge the loop so the redraw happens immediately
+                // rather than waiting up to 50 ms for the next poll.
                 let _ = redraw_tx.try_send(());
             }
             _ => {
@@ -9452,6 +9460,63 @@ mod s4_a_4 {
             terminal.backend_mut().get_cursor_position().expect("cursor"),
             ratatui::layout::Position { x: 0, y: 4 },
             "cursor must be anchored at the old viewport bottom before rebuild"
+        );
+    }
+
+    #[test]
+    fn clear_old_inline_chrome_region_removes_wrapped_resize_residual_below_viewport() {
+        use ratatui::backend::Backend;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::{Terminal, TerminalOptions, Viewport};
+
+        let backend = TestBackend::with_lines([
+            "transcript line 1",
+            "transcript line 2",
+            "PRX Chat old status",
+            "wrapped status tail",
+            "Input: old prompt ",
+            "wrapped input tail ",
+        ]);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 2, 19, 2)),
+            },
+        )
+        .expect("test terminal");
+
+        super::clear_old_inline_chrome_region(&mut terminal).expect("clear old chrome");
+
+        let rows: Vec<String> = (0..6)
+            .map(|y| {
+                (0..19)
+                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
+            .collect();
+
+        assert_eq!(
+            rows.first().map(String::as_str),
+            Some("transcript line 1  "),
+            "transcript above viewport must survive"
+        );
+        assert_eq!(
+            rows.get(1).map(String::as_str),
+            Some("transcript line 2  "),
+            "transcript above viewport must survive"
+        );
+        for row_idx in 2..6 {
+            assert!(
+                rows.get(row_idx).is_some_and(|row| row.trim().is_empty()),
+                "wrapped old chrome row {row_idx} must be cleared: {rows:?}"
+            );
+        }
+        assert_eq!(
+            terminal.backend_mut().get_cursor_position().expect("cursor"),
+            ratatui::layout::Position { x: 0, y: 3 },
+            "cursor must be anchored at the old viewport bottom before resize redraw"
         );
     }
 
