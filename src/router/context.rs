@@ -82,16 +82,19 @@ pub fn resolve_effective_compaction_config(
         );
     }
 
-    let builtin_models = crate::router::models::builtin_model_capabilities();
-    if let Some(model_config) = find_model_config(&builtin_models, &selected_provider, &selected_model) {
-        return with_model_context(
-            base,
-            model_config.max_context,
-            model_config.reserved_output_tokens,
-            ContextWindowSource::RouterBuiltin,
-            selected_provider,
-            selected_model,
-        );
+    #[cfg(feature = "llm-router")]
+    {
+        let builtin_models = crate::router::models::builtin_model_capabilities();
+        if let Some(model_config) = find_model_config(&builtin_models, &selected_provider, &selected_model) {
+            return with_model_context(
+                base,
+                model_config.max_context,
+                model_config.reserved_output_tokens,
+                ContextWindowSource::RouterBuiltin,
+                selected_provider,
+                selected_model,
+            );
+        }
     }
 
     let capped = cap_to_kernel(base.max_context_tokens);

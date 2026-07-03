@@ -1,37 +1,61 @@
+#[cfg(feature = "llm-router")]
 pub mod automix;
+#[cfg(feature = "llm-router")]
 pub mod capability;
 pub mod context;
+#[cfg(feature = "llm-router")]
 pub mod elo;
+#[cfg(feature = "llm-router")]
 pub mod history;
+#[cfg(feature = "llm-router")]
 pub mod intent;
+#[cfg(feature = "llm-router")]
 pub mod knn;
+#[cfg(feature = "llm-router")]
 pub mod models;
+#[cfg(feature = "llm-router")]
 pub mod scorer;
 
+#[cfg(feature = "llm-router")]
 use anyhow::Result;
+#[cfg(feature = "llm-router")]
 use parking_lot::RwLock;
+#[cfg(feature = "llm-router")]
 use std::collections::VecDeque;
+#[cfg(feature = "llm-router")]
 use std::sync::Arc;
 
+#[cfg(feature = "llm-router")]
 use crate::agent::classifier::TaskIntent;
+#[cfg(feature = "llm-router")]
 use crate::config::{ModelRouteConfig, RouterConfig};
+#[cfg(feature = "llm-router")]
 use crate::memory::Memory;
+#[cfg(feature = "llm-router")]
 use crate::memory::embeddings::EmbeddingProvider;
 
+#[cfg(feature = "llm-router")]
 use self::capability::{
     ModelCapabilityEntry, append_success_event, filter_models_by_providers, is_model_reachable, load_recent_successes,
     reachable_provider_names,
 };
+#[cfg(feature = "llm-router")]
 use self::elo::update_elo;
+#[cfg(feature = "llm-router")]
 use self::history::RouterHistory;
+#[cfg(feature = "llm-router")]
 use self::intent::infer_router_intent;
+#[cfg(feature = "llm-router")]
 use self::knn::KnnStore;
+#[cfg(feature = "llm-router")]
 pub use self::scorer::RouterResult;
+#[cfg(feature = "llm-router")]
 use self::scorer::rank_models;
 pub use context::{CompactionResolver, resolve_effective_compaction_config};
 // RouterResult remains the scorer output; RouteDecision is the durable
 // timeline projection used by ingress/provider execution paths.
 
+#[cfg(feature = "llm-router")]
 pub struct RouterEngine {
     config: RouterConfig,
     default_provider: String,
@@ -41,12 +65,14 @@ pub struct RouterEngine {
     history: Option<RouterHistory>,
 }
 
+#[cfg(feature = "llm-router")]
 #[derive(Clone)]
 struct OutcomePersistenceSnapshot {
     model_id: String,
     metrics_entry: ModelCapabilityEntry,
 }
 
+#[cfg(feature = "llm-router")]
 impl RouterEngine {
     pub async fn new(
         mut config: RouterConfig,
@@ -341,12 +367,14 @@ impl RouterEngine {
     }
 }
 
+#[cfg(feature = "llm-router")]
 fn normalize_model_id(model_id: &str) -> String {
     model_id
         .rsplit_once('/')
         .map_or_else(|| model_id.to_string(), |(_, model)| model.to_string())
 }
 
+#[cfg(feature = "llm-router")]
 fn filter_reachable_entries(
     entries: Vec<ModelCapabilityEntry>,
     default_provider: &str,
@@ -368,6 +396,7 @@ fn filter_reachable_entries(
 // SAFETY: chosen_index and other_index are produced by .position()/.enumerate()
 // on the same `models` slice, so they are always valid indices.
 #[allow(clippy::indexing_slicing)]
+#[cfg(feature = "llm-router")]
 fn apply_outcome_update_locked(
     models: &mut [ModelCapabilityEntry],
     model_id: &str,
@@ -422,11 +451,12 @@ fn apply_outcome_update_locked(
     })
 }
 
+#[cfg(feature = "llm-router")]
 fn estimate_tokens(text: &str) -> usize {
     text.chars().count() / 3 + 100
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "llm-router"))]
 mod tests {
     #![allow(
         clippy::indexing_slicing,

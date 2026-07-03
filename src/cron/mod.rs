@@ -10,7 +10,9 @@ mod types;
 
 pub mod scheduler;
 
-pub use schedule::{next_run_for_schedule, normalize_expression, schedule_cron_expression, validate_schedule};
+#[cfg(feature = "wasm-plugins")]
+pub use schedule::normalize_expression;
+pub use schedule::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 #[cfg(test)]
 pub use store::add_job;
 #[allow(unused_imports)]

@@ -285,13 +285,20 @@ impl ApprovalResolver for SuspendingApprovalResolver {
         self.mark_awaiting(&prompt).await;
 
         // 3. Surface a NeedsInput event to the chat main loop (non-intrusive
-        //    banner + status refresh). Sent directly on the sink channel; on a
-        //    full channel we drop the banner (best-effort) but the registry
-        //    status already reflects the suspension.
-        let _ = self.event_tx.try_send(SessionEvent::NeedsInput {
+        //    banner + status refresh). The registry status already reflects
+        //    the suspension; if the bounded UI channel is full, log the missed
+        //    banner instead of discarding it invisibly.
+        if let Err(error) = self.event_tx.try_send(SessionEvent::NeedsInput {
             id: self.session_id.clone(),
             prompt: prompt.clone(),
-        });
+        }) {
+            tracing::warn!(
+                run_id = %self.run_id,
+                session_id = %self.session_id,
+                error = %error,
+                "failed to enqueue NeedsInput banner"
+            );
+        }
 
         tracing::info!(run_id = %self.run_id, tool = %request.tool_name, "background sub-agent suspended awaiting approval");
 

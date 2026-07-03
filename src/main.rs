@@ -241,7 +241,6 @@ mod onboard;
 mod plugins;
 mod providers;
 mod recovery;
-#[cfg(feature = "llm-router")]
 mod router;
 mod runtime;
 // D3 (FIX-P1-21a): the CLI dispatch lives at `src/runtime/mode.rs` but must be a

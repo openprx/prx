@@ -111,7 +111,6 @@ pub mod onboard;
 pub mod plugins;
 pub mod providers;
 pub mod recovery;
-#[cfg(feature = "llm-router")]
 pub mod router;
 pub mod runtime;
 pub mod schema_migration;

@@ -1995,7 +1995,11 @@ async fn execute_single_tool_call(
                 res = rx => res.unwrap_or(false),
             };
             if !approved {
-                let err_msg = "User rejected tool approval".to_string();
+                let err_msg = if registered {
+                    "User rejected tool approval".to_string()
+                } else {
+                    "Another tool approval is already pending; this tool was rejected for safety".to_string()
+                };
                 let tool_payload = serde_json::json!({
                     "tool_call_id": call.id,
                     "content": err_msg,
@@ -3720,6 +3724,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard,
             redraw_tx: Some(redraw_tx),
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
@@ -4112,6 +4117,7 @@ mod real_mode_tests {
                 action_tx,
                 dual_write_guard: RuntimeDualWriteGuard::new(),
                 redraw_tx: Some(redraw_tx),
+                #[cfg(feature = "terminal-tui")]
                 tui_mirror: None,
                 shutdown: shutdown.clone(),
                 model: ModelSlot::from("test-model"),
@@ -4180,6 +4186,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown: shutdown.clone(),
             model: ModelSlot::from("test-model"),
@@ -4201,6 +4208,7 @@ mod real_mode_tests {
         );
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn request_approval_in_tui_opens_surface_without_auto_send() {
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
@@ -4235,6 +4243,7 @@ mod real_mode_tests {
         assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn request_approval_in_tui_ignores_openprx_override_parent() {
         let exe = std::env::current_exe().expect("current test exe");
@@ -4249,6 +4258,7 @@ mod real_mode_tests {
         assert!(status.success(), "child override test failed: {status}");
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn request_approval_in_tui_ignores_openprx_override_child() {
         if std::env::var_os("ISS018_OVERRIDE_CHILD").is_none() {
@@ -4911,6 +4921,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
@@ -5060,6 +5071,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),
@@ -5213,6 +5225,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: None, // 模拟构造时 redraw_tx 尚不存在
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown: shutdown.clone(),
             model: ModelSlot::from("test-model"),
@@ -7195,6 +7208,215 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
+    async fn resumed_compacted_session_does_not_call_summarizer_again() {
+        use crate::chat::state::{ChatState, Effect};
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+        use parking_lot::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        struct ResumeProvider {
+            summary_calls: Arc<AtomicUsize>,
+            streamed_history: Arc<Mutex<Option<Vec<PMsg>>>>,
+        }
+
+        #[async_trait]
+        impl Provider for ResumeProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                self.summary_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok("UNEXPECTED_RESUME_SUMMARY".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                messages: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                *self.streamed_history.lock() = Some(messages.to_vec());
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("resume-ok")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let current_question = "continue from the compacted summary";
+        fn durable_test_turns(messages: &[PMsg]) -> Vec<crate::chat::session::ChatTurn> {
+            let timestamp = chrono::Utc::now();
+            messages
+                .iter()
+                .filter(|message| matches!(message.role.as_str(), "user" | "assistant"))
+                .map(|message| crate::chat::session::ChatTurn {
+                    role: message.role.clone(),
+                    content: message.content.clone(),
+                    timestamp,
+                    tool_calls: Vec::new(),
+                })
+                .collect()
+        }
+
+        let mut state = ChatState::new(
+            Arc::from("test-prov"),
+            Arc::from("test-model"),
+            CancellationToken::new(),
+        );
+        state.session.history = vec![
+            PMsg::system("sys"),
+            PMsg::user(format!("old user {}", "long context ".repeat(80))),
+            PMsg::assistant(format!("old assistant {}", "long context ".repeat(80))),
+        ];
+        state.session.turns = durable_test_turns(&state.session.history);
+        let _ = state.reduce(Action::RecordUserTurn(current_question.to_string()));
+        let guard = crate::agent::loop_::compaction_patch_guard_for(&state.session.history, 1, 3)
+            .expect("test: compaction guard");
+        let patch = crate::agent::loop_::CompactionPatch {
+            range_start: 1,
+            range_end: 3,
+            replacement: vec![PMsg::assistant(
+                "[Context compacted at test. Summary: DURABLE_SUMMARY_MARKER]",
+            )],
+            append_after: vec![PMsg::user("[Post-compaction context refresh]\nre-read")],
+            guard,
+        };
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 170,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+
+        let snapshot = state
+            .reduce(Action::HistoryCompactionPatchApplied {
+                reason: crate::chat::action::CompactReason::ContextOverflow,
+                patch,
+                compaction_config: config.clone(),
+            })
+            .into_iter()
+            .find_map(|effect| match effect {
+                Effect::SaveSession(session) => Some(session),
+                _ => None,
+            })
+            .expect("compaction patch must persist a session snapshot");
+
+        let mut resumed = ChatState::new(
+            Arc::from("test-prov"),
+            Arc::from("test-model"),
+            CancellationToken::new(),
+        );
+        let _ = resumed.reduce(Action::SessionLoaded(snapshot));
+        let resumed_pairs = resumed
+            .session
+            .history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            resumed_pairs,
+            vec![
+                (
+                    "assistant",
+                    "[Context compacted at test. Summary: DURABLE_SUMMARY_MARKER]"
+                ),
+                ("user", current_question),
+            ],
+            "resume must rebuild the already-compacted durable history, not the old source turns"
+        );
+
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let streamed_history = Arc::new(Mutex::new(None));
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ResumeProvider {
+            summary_calls: Arc::clone(&summary_calls),
+            streamed_history: Arc::clone(&streamed_history),
+        });
+        let executor = EffectExecutor::new_with_deps(deps);
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-resume-compacted".to_string(),
+                history: resumed.session.history.clone(),
+                compaction_config: Some(config),
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_completion = false;
+        for _ in 0..8 {
+            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+                .await
+                .expect("driver action within 2s")
+                .expect("driver action should arrive");
+            match action {
+                Action::HistoryCompactionPatchApplied { .. } => {
+                    panic!("resumed compacted history must not dispatch another summary patch");
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    assert!(final_text.contains("resume-ok"));
+                    saw_completion = true;
+                    break;
+                }
+                Action::StreamFailed { err, .. } => panic!("driver should not fail: {err}"),
+                _ => {}
+            }
+        }
+
+        assert!(
+            saw_completion,
+            "driver must stream normally from compacted resume history"
+        );
+        assert_eq!(
+            summary_calls.load(AtomicOrdering::SeqCst),
+            0,
+            "resuming an already-compacted session must not invoke the summarizer again"
+        );
+        let streamed = streamed_history
+            .lock()
+            .clone()
+            .expect("provider-bound history should be captured");
+        assert_eq!(
+            streamed
+                .iter()
+                .map(|message| (message.role.as_str(), message.content.as_str()))
+                .collect::<Vec<_>>(),
+            resumed_pairs,
+            "provider should receive the compacted resume shape"
+        );
+    }
+
+    #[tokio::test]
     async fn redux_driver_preflight_provider_history_keeps_real_user_question_last_after_compaction() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
@@ -8422,6 +8644,8 @@ mod real_mode_tests {
                         match maybe {
                             Some(action) => {
                                 if let Action::ToolApprovalRequested { tool_id, name, args } = &action {
+                                    #[cfg(not(feature = "terminal-tui"))]
+                                    let _ = (name, args);
                                     #[cfg(feature = "terminal-tui")]
                                     {
                                         let mut tui = crate::chat::tui::TuiState::new("p", "m");
@@ -9027,6 +9251,7 @@ mod real_mode_tests {
             action_tx,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
+            #[cfg(feature = "terminal-tui")]
             tui_mirror: None,
             shutdown,
             model: ModelSlot::from("test-model"),

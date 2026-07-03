@@ -242,7 +242,10 @@ async fn enrich_file_mentions_for_prompt(user_input: &str, tools_registry: &[Box
     for mention in mentions.iter().take(FILE_MENTION_MAX_FILES) {
         match file_read {
             Some(tool) => {
-                let args = serde_json::json!({ "path": mention.path });
+                let args = serde_json::json!({
+                    "path": mention.path.as_str(),
+                    "max_bytes": FILE_MENTION_MAX_BYTES,
+                });
                 match tool.execute_named("file_read", args).await {
                     Ok(result) if result.success => {
                         let (content, truncated) = truncate_utf8_to_byte_cap(&result.output, FILE_MENTION_MAX_BYTES);
@@ -1741,6 +1744,8 @@ pub async fn run(
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
     let (control_tx, mut control_rx) = mpsc::channel(CHAT_CONTROL_CHANNEL_CAPACITY);
+    #[cfg(not(feature = "terminal-tui"))]
+    let _ = &control_tx;
 
     // ── Graceful shutdown signal ─────────────────────────────────
     // Instead of std::process::exit(), all signal handlers use this token to
@@ -1837,6 +1842,8 @@ pub async fn run(
 
     #[cfg(feature = "terminal-tui")]
     let approval_router = effect_executor.approval_router();
+    #[cfg(not(feature = "terminal-tui"))]
+    let approval_router: Option<Arc<dispatcher::ApprovalRouter>> = None;
 
     // Step 5a-4: TurnCompletionSignal — Redux driver 切闸路径用此 signal 在
     // chat::run 主循环里 await turn 完成。dispatcher task 消费 terminal action
@@ -3278,6 +3285,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                     };
+                    #[cfg(not(feature = "terminal-tui"))]
+                    let _ = &plan;
                     if sessions_redraw_handle.is_none() {
                         emit_chat_output(
                             "Diff apply requires interactive TUI approval; unavailable in this mode. Workspace unchanged.",
@@ -3302,6 +3311,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             Err(message) => emit_chat_output(&message),
                         }
                     }
+                    #[cfg(feature = "terminal-tui")]
                     continue;
                 }
                 commands::CommandResult::SessionAction(action) => {
@@ -3715,6 +3725,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             };
                                             (lines, ring.is_truncated())
                                         },
+                                    );
+                                    #[cfg(not(feature = "terminal-tui"))]
+                                    let _ = (
+                                        &was_following_before_attach,
+                                        &view_meta,
+                                        &tail_lines,
+                                        &ring_lines,
+                                        truncated,
                                     );
                                     #[cfg(feature = "terminal-tui")]
                                     let active_projection = build_active_session_attach_projection(
@@ -8369,10 +8387,12 @@ mod file_mention_tests {
     use crate::tools::FileReadTool;
     use crate::tools::traits::{ToolCategory, ToolResult, ToolTier};
     use async_trait::async_trait;
+    use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockReadTool {
         calls: Arc<AtomicUsize>,
+        max_bytes_seen: Arc<Mutex<Vec<Option<u64>>>>,
     }
 
     #[async_trait]
@@ -8395,6 +8415,9 @@ mod file_mention_tests {
 
         async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.max_bytes_seen
+                .lock()
+                .push(args.get("max_bytes").and_then(serde_json::Value::as_u64));
             let path = args.get("path").and_then(serde_json::Value::as_str).unwrap_or_default();
             Ok(ToolResult {
                 success: true,
@@ -8508,13 +8531,20 @@ mod file_mention_tests {
     #[tokio::test]
     async fn file_mention_caps_file_count_and_bytes() {
         let calls = Arc::new(AtomicUsize::new(0));
+        let max_bytes_seen = Arc::new(Mutex::new(Vec::new()));
         let registry: Vec<Box<dyn Tool>> = vec![Box::new(MockReadTool {
             calls: Arc::clone(&calls),
+            max_bytes_seen: Arc::clone(&max_bytes_seen),
         })];
 
         let enriched = enrich_file_mentions_for_prompt("x @a @b @c @d @e @f", &registry).await;
 
         assert_eq!(calls.load(Ordering::SeqCst), FILE_MENTION_MAX_FILES);
+        assert_eq!(
+            max_bytes_seen.lock().as_slice(),
+            &[Some(FILE_MENTION_MAX_BYTES as u64); FILE_MENTION_MAX_FILES],
+            "@path expansion must pass a file_read byte cap before prompt enrichment"
+        );
         assert!(enriched.prompt.contains("content for a"));
         assert!(!enriched.prompt.contains("content for f"));
         assert!(enriched.prompt.contains("1 file mention(s) skipped"));
@@ -8864,6 +8894,7 @@ mod terminal_guard_tests {
         assert!(!guard.alt_screen_active.load(Ordering::Acquire));
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn plain_mode_disables_terminal_tui_even_for_tty() {
         assert!(
@@ -8884,6 +8915,7 @@ mod terminal_guard_tests {
         );
     }
 
+    #[cfg(feature = "terminal-tui")]
     #[test]
     fn plain_mode_suppresses_context_budget_warning_chrome() {
         let config = crate::config::AgentCompactionConfig {

@@ -86,6 +86,25 @@ fn conversation_lines_from_turns(turns: &[ChatTurn]) -> Vec<ConversationLine> {
         .collect()
 }
 
+fn is_durable_compaction_history_message(message: &ChatMessage) -> bool {
+    matches!(message.role.as_str(), "user" | "assistant")
+        && !message.content.starts_with("[Post-compaction context refresh]")
+}
+
+fn durable_turns_from_compacted_history(history: &[ChatMessage]) -> Vec<ChatTurn> {
+    let timestamp = chrono::Utc::now();
+    history
+        .iter()
+        .filter(|message| is_durable_compaction_history_message(message))
+        .map(|message| ChatTurn {
+            role: message.role.clone(),
+            content: message.content.clone(),
+            timestamp,
+            tool_calls: Vec::new(),
+        })
+        .collect()
+}
+
 // ─── Effect ──────────────────────────────────────────────────────────────────
 
 /// Effect = 必须由 async 外壳执行的副作用.
@@ -1699,7 +1718,10 @@ impl ChatState {
             .collect();
         self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
         self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+        #[cfg(feature = "terminal-tui")]
         self.ui.input.clear_navigation_state();
+        #[cfg(not(feature = "terminal-tui"))]
+        self.ui.input.clear();
         self.ui.turn_count = self.session.turns.len();
         self.ui.active_session_view = None;
         self.ui.pending_tool_approval = None;
@@ -2178,18 +2200,27 @@ impl ChatState {
             } else {
                 false
             };
-            return vec![Effect::LogTrace {
-                level: tracing::Level::INFO,
-                msg: format!(
-                    "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
-                    patch.range_start,
-                    patch.range_end,
-                    patch.replacement.len(),
-                    patch.append_after.len(),
-                    trim_fallback,
-                    history.len()
-                ),
-            }];
+            self.session.turns = durable_turns_from_compacted_history(history);
+            self.ui.conversation_lines = conversation_lines_from_turns(&self.session.turns);
+            self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
+            self.ui.turn_count = self.session.turns.len();
+
+            return vec![
+                Effect::LogTrace {
+                    level: tracing::Level::INFO,
+                    msg: format!(
+                        "HistoryCompactionPatchApplied reason={reason:?} start={} end={} replacement={} append_after={} trim_fallback={} len={}",
+                        patch.range_start,
+                        patch.range_end,
+                        patch.replacement.len(),
+                        patch.append_after.len(),
+                        trim_fallback,
+                        history.len()
+                    ),
+                },
+                Effect::SaveSession(self.build_session_snapshot()),
+                Effect::RequestRedraw,
+            ];
         }
 
         let before_len = history.len();
@@ -4819,12 +4850,14 @@ mod tests {
 
             assert_eq!(
                 state.session.turns.len(),
-                2,
-                "only the real user and assistant turns are persisted"
+                3,
+                "the compaction summary, real user, and assistant turns are persisted"
             );
-            let [user_turn, assistant_turn] = state.session.turns.as_slice() else {
-                panic!("expected exactly the real user turn and assistant turn");
+            let [summary_turn, user_turn, assistant_turn] = state.session.turns.as_slice() else {
+                panic!("expected summary, real user turn, and assistant turn");
             };
+            assert_eq!(summary_turn.role, "assistant");
+            assert!(summary_turn.content.contains("persisted-turn summary"));
             assert_eq!(user_turn.role, "user");
             assert_eq!(user_turn.content, current_question);
             assert_eq!(assistant_turn.role, "assistant");
@@ -4836,6 +4869,22 @@ mod tests {
                     .iter()
                     .all(|turn| !turn.content.starts_with("[Post-compaction context refresh]")),
                 "refresh marker must remain a history context marker, not a persisted user turn"
+            );
+
+            let snapshot = state.build_session_snapshot();
+            let mut reloaded = s();
+            let _ = reloaded.reduce(Action::SessionLoaded(snapshot));
+            assert_eq!(
+                messages_as_pairs(&reloaded.session.history),
+                vec![
+                    (
+                        "assistant".to_string(),
+                        "[Context compacted at test. Summary: persisted-turn summary]".to_string()
+                    ),
+                    ("user".to_string(), current_question.to_string()),
+                    ("assistant".to_string(), assistant_reply.to_string()),
+                ],
+                "resume must rebuild the compacted durable turn shape"
             );
         }
 

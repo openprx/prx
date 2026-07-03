@@ -156,10 +156,12 @@ mod tests {
     }
 
     #[test]
-    fn test_cost_estimate_default() {
+    fn test_branch_defaults_are_conservative() {
         let cost = CostEstimate::default();
         assert_eq!(cost.estimated_tokens, 0);
         assert_eq!(cost.estimated_cost_micro_usd, 0);
+        assert_eq!(RehearsalLevel::default(), RehearsalLevel::ScoreOnly);
+        assert_eq!(CommitPolicy::default(), CommitPolicy::AutoCommit);
     }
 
     #[test]

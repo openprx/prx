@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt as _;
 
 const MAX_FILE_SIZE_BYTES: u64 = 10 * 1024 * 1024;
 
@@ -61,6 +62,23 @@ impl FileReadTool {
     }
 }
 
+fn optional_max_bytes(args: &serde_json::Value) -> Option<u64> {
+    args.get("max_bytes")
+        .and_then(serde_json::Value::as_u64)
+        .map(|max| max.min(MAX_FILE_SIZE_BYTES))
+}
+
+fn truncate_to_utf8_boundary(mut bytes: Vec<u8>, max_bytes: usize) -> Vec<u8> {
+    if bytes.len() <= max_bytes {
+        return bytes;
+    }
+    bytes.truncate(max_bytes);
+    while std::str::from_utf8(&bytes).is_err() && !bytes.is_empty() {
+        bytes.pop();
+    }
+    bytes
+}
+
 #[async_trait]
 impl Tool for FileReadTool {
     fn name(&self) -> &str {
@@ -78,6 +96,11 @@ impl Tool for FileReadTool {
                 "path": {
                     "type": "string",
                     "description": "Relative path to the file within the workspace"
+                },
+                "max_bytes": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "Optional maximum bytes to return"
                 }
             },
             "required": ["path"]
@@ -171,6 +194,48 @@ impl Tool for FileReadTool {
             }
         }
 
+        if let Some(max_bytes) = optional_max_bytes(&args) {
+            let max_bytes_usize = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+            let read_limit = max_bytes.saturating_add(1);
+            let file = match tokio::fs::File::open(&resolved_path).await {
+                Ok(file) => file,
+                Err(e) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("Failed to read file: {e}")),
+                    });
+                }
+            };
+            let mut bytes = Vec::new();
+            if let Err(e) = file.take(read_limit).read_to_end(&mut bytes).await {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read file: {e}")),
+                });
+            }
+            let truncated = bytes.len() > max_bytes_usize;
+            let bytes = truncate_to_utf8_boundary(bytes, max_bytes_usize);
+            return match String::from_utf8(bytes) {
+                Ok(mut contents) => {
+                    if truncated {
+                        contents.push_str(&format!("\n[content truncated: {max_bytes} byte limit]"));
+                    }
+                    Ok(ToolResult {
+                        success: true,
+                        output: contents,
+                        error: None,
+                    })
+                }
+                Err(e) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read file as UTF-8: {e}")),
+                }),
+            };
+        }
+
         match tokio::fs::read_to_string(&resolved_path).await {
             Ok(contents) => Ok(ToolResult {
                 success: true,
@@ -232,6 +297,7 @@ mod tests {
         let tool = FileReadTool::new(test_security(std::env::temp_dir()), false);
         let schema = tool.parameters_schema();
         assert!(schema["properties"]["path"].is_object());
+        assert!(schema["properties"]["max_bytes"].is_object());
         assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
     }
 
@@ -247,6 +313,23 @@ mod tests {
         assert!(result.success);
         assert_eq!(result.output, "hello world");
         assert!(result.error.is_none());
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_read_respects_optional_max_bytes() {
+        let dir = std::env::temp_dir().join("openprx_test_file_read_max_bytes");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("big.txt"), "abcdef").await.unwrap();
+
+        let tool = FileReadTool::new(test_security(dir.clone()), false);
+        let result = tool.execute(json!({"path": "big.txt", "max_bytes": 3})).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.starts_with("abc"));
+        assert!(!result.output.contains("def"));
+        assert!(result.output.contains("content truncated: 3 byte limit"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
