@@ -24,6 +24,7 @@ ignore = [
     # proc-macro-error2 unmaintained: transitive via matrix-sdk (vodozemac → matrix-pickle-derive)
     # and aquamarine (matrix-sdk-crypto). No maintained alternative; upstream matrix-sdk tracks this.
     { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2: transitive via matrix-sdk/vodozemac, no maintained alternative, upstream matrix-sdk tracks migration" },
+    { id = "RUSTSEC-2026-0189", reason = "rmcp streamable-http SERVER DNS-rebinding — PRX uses rmcp client-only (StreamableHttpClientTransport, src/tools/mcp.rs); no server transport instantiated, unreachable. Follow-up: rmcp>=1.4.0 or drop server feature." },
 ]
 
 # ===== 许可证合规 =====
