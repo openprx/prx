@@ -741,6 +741,7 @@ const fn has_supervised_channels(config: &Config) -> bool {
         linq,
         nextcloud_talk,
         qq,
+        wacli,
         ..
     } = &config.channels_config;
 
@@ -759,6 +760,7 @@ const fn has_supervised_channels(config: &Config) -> bool {
         || linq.is_some()
         || nextcloud_talk.is_some()
         || qq.is_some()
+        || matches!(wacli, Some(w) if w.enabled)
 }
 
 mod systemd_notify {
