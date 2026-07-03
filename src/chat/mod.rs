@@ -1138,6 +1138,14 @@ impl ChatTuiMode {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+const fn pty_handoff_mode_from_chat_tui_mode(mode: ChatTuiMode) -> crate::chat::sessions::pty::PtyHandoffMode {
+    match mode {
+        ChatTuiMode::Inline => crate::chat::sessions::pty::PtyHandoffMode::Inline,
+        ChatTuiMode::Fullscreen => crate::chat::sessions::pty::PtyHandoffMode::Fullscreen,
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatTuiSelection {
     enabled: bool,
@@ -2035,7 +2043,11 @@ pub async fn run(
     // echoing the user's submitted input so the conversation pane reflects
     // it immediately rather than waiting for the next async event).
     #[cfg(feature = "terminal-tui")]
-    let (terminal_guard, redraw_tx_for_main): (Option<TerminalGuard>, Option<mpsc::Sender<()>>) = {
+    let (terminal_guard, redraw_tx_for_main, chat_tui_mode_for_handoff): (
+        Option<TerminalGuard>,
+        Option<mpsc::Sender<()>>,
+        Option<ChatTuiMode>,
+    ) = {
         use std::io::IsTerminal as _;
         // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
         // downstream scripts that scrape stdout, or to escape rendering
@@ -2113,7 +2125,7 @@ pub async fn run(
                         snapshot_rx_for_tui.clone(),
                         Arc::clone(&pty_handoff),
                     );
-                    (Some(guard), Some(redraw_tx_main))
+                    (Some(guard), Some(redraw_tx_main), Some(tui_selection.mode))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
@@ -2127,7 +2139,7 @@ pub async fn run(
                             tracing::error!("Terminal input loop error: {e}");
                         }
                     });
-                    (None, None)
+                    (None, None, None)
                 }
             }
         } else {
@@ -2142,7 +2154,7 @@ pub async fn run(
                     tracing::error!("Terminal input loop error: {e}");
                 }
             });
-            (None, None)
+            (None, None, None)
         }
     };
     #[cfg(not(feature = "terminal-tui"))]
@@ -2304,6 +2316,10 @@ pub async fn run(
     // the helpers fall back to plain stdout).
     #[cfg(feature = "terminal-tui")]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = redraw_tx_for_main.clone();
+    #[cfg(feature = "terminal-tui")]
+    let pty_handoff_mode = chat_tui_mode_for_handoff
+        .map(pty_handoff_mode_from_chat_tui_mode)
+        .unwrap_or(crate::chat::sessions::pty::PtyHandoffMode::Inline);
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
@@ -3790,6 +3806,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             &session,
                                             seq,
                                             &pty_handoff,
+                                            pty_handoff_mode,
                                             sessions_redraw_handle.as_ref(),
                                             &emit_chat_output,
                                         )
@@ -4052,6 +4069,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     &security,
                                     &mut chat_sessions,
                                     &pty_handoff,
+                                    pty_handoff_mode,
                                     sessions_redraw_handle.as_ref(),
                                     &emit_chat_output,
                                 )
@@ -5748,17 +5766,40 @@ trait ExternalEditorTerminalMode {
 }
 
 #[cfg(feature = "terminal-tui")]
-struct CrosstermExternalEditorTerminalMode;
+struct CrosstermExternalEditorTerminalMode {
+    mode: ChatTuiMode,
+}
+
+#[cfg(feature = "terminal-tui")]
+fn write_external_editor_suspend_sequences(out: &mut dyn std::io::Write, mode: ChatTuiMode) {
+    if mode == ChatTuiMode::Fullscreen {
+        crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(out);
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write, mode: ChatTuiMode) {
+    if mode == ChatTuiMode::Fullscreen {
+        crate::chat::sessions::pty::write_handoff_terminal_restore(
+            out,
+            crate::chat::sessions::pty::PtyHandoffMode::Fullscreen,
+        );
+    }
+}
 
 #[cfg(feature = "terminal-tui")]
 impl ExternalEditorTerminalMode for CrosstermExternalEditorTerminalMode {
     fn suspend_for_editor(&self) {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
+        let mut out = std::io::stdout();
+        write_external_editor_suspend_sequences(&mut out, self.mode);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 
     fn restore_after_editor(&self) {
+        let mut out = std::io::stdout();
+        write_external_editor_restore_sequences(&mut out, self.mode);
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
@@ -6351,6 +6392,7 @@ async fn handle_pty_command(
     security: &Arc<crate::security::SecurityPolicy>,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    mode: crate::chat::sessions::pty::PtyHandoffMode,
     redraw_handle: Option<&mpsc::Sender<()>>,
     emit_chat_output: &impl Fn(&str),
 ) {
@@ -6398,7 +6440,7 @@ async fn handle_pty_command(
 
     // First `/pty` goes straight through the unified re-attach entry point, so the
     // spawn path and a later `/attach` share exactly one passthrough code path.
-    reattach_pty(&session, seq, handoff, redraw_handle, emit_chat_output).await;
+    reattach_pty(&session, seq, handoff, mode, redraw_handle, emit_chat_output).await;
 }
 
 /// Re-attach (or first-attach) to a live PTY session: hand the terminal to it,
@@ -6422,6 +6464,7 @@ async fn reattach_pty(
     session: &crate::chat::sessions::pty::PtyShellSession,
     seq: u64,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    mode: crate::chat::sessions::pty::PtyHandoffMode,
     redraw_handle: Option<&mpsc::Sender<()>>,
     emit_chat_output: &impl Fn(&str),
 ) {
@@ -6443,7 +6486,7 @@ async fn reattach_pty(
         // the ack times out we do NOT proceed (running while the render loop might
         // still touch the terminal would corrupt the screen). `acquire` un-pauses
         // the render loop itself on timeout, so we just report the abort.
-        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
+        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge, mode) else {
             return PtyOutcome::AttachAborted;
         };
         PtyOutcome::Exited(run_pty_attach(&session_for_passthrough))
@@ -7249,9 +7292,14 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::ExternalEditorRequested => {
                         let initial = mirror.lock().input.text();
-                        let terminal_mode = CrosstermExternalEditorTerminalMode;
+                        let terminal_mode = CrosstermExternalEditorTerminalMode { mode };
                         match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {
                             ExternalEditorResult::Edited(text) => {
+                                if mode == ChatTuiMode::Fullscreen {
+                                    if let Err(e) = terminal.clear() {
+                                        tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
+                                    }
+                                }
                                 {
                                     let mut guard = mirror.lock();
                                     guard.input.set_text(&text);
@@ -7264,6 +7312,11 @@ fn run_tui_unified_loop(
                                 let _ = redraw_tx.try_send(());
                             }
                             ExternalEditorResult::Unchanged(reason) => {
+                                if mode == ChatTuiMode::Fullscreen {
+                                    if let Err(e) = terminal.clear() {
+                                        tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
+                                    }
+                                }
                                 surface_session_message(chat_dispatcher, Some(&redraw_tx), &reason);
                             }
                         }
@@ -10430,6 +10483,40 @@ mod p6b2_external_editor_tests {
         }
         assert_eq!(terminal.suspended.load(Ordering::SeqCst), 0);
         assert_eq!(terminal.restored.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn external_editor_fullscreen_suspend_leaves_alt_and_restore_reenters() {
+        let mut suspend = Vec::new();
+        write_external_editor_suspend_sequences(&mut suspend, ChatTuiMode::Fullscreen);
+        let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
+        assert!(
+            suspend.contains("\x1b[?1049l") && suspend.contains("\x1b[?47l"),
+            "fullscreen editor suspend must leave chat alt-screen: {suspend:?}"
+        );
+
+        let mut restore = Vec::new();
+        write_external_editor_restore_sequences(&mut restore, ChatTuiMode::Fullscreen);
+        let restore = String::from_utf8(restore).expect("test: restore escape bytes are utf-8");
+        assert!(
+            restore.contains("\x1b[?1049l") && restore.contains("\x1b[?47l"),
+            "fullscreen editor restore must reset any child/editor alt-screen first: {restore:?}"
+        );
+        assert!(
+            restore.ends_with("\x1b[?1049h"),
+            "fullscreen editor restore must re-enter chat alt-screen last: {restore:?}"
+        );
+    }
+
+    #[test]
+    fn external_editor_inline_suspend_restore_do_not_touch_alt_screen() {
+        let mut suspend = Vec::new();
+        write_external_editor_suspend_sequences(&mut suspend, ChatTuiMode::Inline);
+        assert!(suspend.is_empty(), "inline editor suspend keeps legacy no-alt behavior");
+
+        let mut restore = Vec::new();
+        write_external_editor_restore_sequences(&mut restore, ChatTuiMode::Inline);
+        assert!(restore.is_empty(), "inline editor restore keeps legacy no-alt behavior");
     }
 }
 
