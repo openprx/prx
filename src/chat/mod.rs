@@ -7036,7 +7036,10 @@ fn run_tui_unified_loop(
                     && key.modifiers == crossterm::event::KeyModifiers::NONE
                     && matches!(
                         key.code,
-                        crossterm::event::KeyCode::PageUp | crossterm::event::KeyCode::PageDown
+                        crossterm::event::KeyCode::PageUp
+                            | crossterm::event::KeyCode::PageDown
+                            | crossterm::event::KeyCode::Home
+                            | crossterm::event::KeyCode::End
                     )
                 {
                     let scroll_available =
@@ -7048,6 +7051,8 @@ fn run_tui_unified_loop(
                         match key.code {
                             crossterm::event::KeyCode::PageUp => fullscreen_scroll.page_up(page_rows),
                             crossterm::event::KeyCode::PageDown => fullscreen_scroll.page_down(page_rows),
+                            crossterm::event::KeyCode::Home => fullscreen_scroll.jump_top(),
+                            crossterm::event::KeyCode::End => fullscreen_scroll.jump_bottom(),
                             _ => {}
                         }
                         let _ = redraw_tx.try_send(());

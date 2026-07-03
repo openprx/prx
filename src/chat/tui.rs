@@ -2290,6 +2290,8 @@ pub const ACTIVE_SESSION_VIEW_DESIRED_ROWS: u16 = 10;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FullscreenTranscriptScroll {
     pub offset_from_bottom: usize,
+    last_tail_marker: usize,
+    pub new_output_below: bool,
 }
 
 impl FullscreenTranscriptScroll {
@@ -2299,7 +2301,27 @@ impl FullscreenTranscriptScroll {
 
     pub fn page_down(&mut self, rows: usize) {
         self.offset_from_bottom = self.offset_from_bottom.saturating_sub(rows.max(1));
+        if self.offset_from_bottom == 0 {
+            self.new_output_below = false;
+        }
     }
+
+    pub const fn jump_top(&mut self) {
+        self.offset_from_bottom = usize::MAX;
+    }
+
+    pub const fn jump_bottom(&mut self) {
+        self.offset_from_bottom = 0;
+        self.new_output_below = false;
+    }
+}
+
+fn fullscreen_tail_marker<V: BottomChromeView + ?Sized>(state: &V) -> usize {
+    let finalized = state.conversation_lines().len().saturating_mul(1_000_000);
+    let streaming_chars = state
+        .streaming()
+        .map_or(0usize, |streaming| streaming.accumulated.chars().count());
+    finalized.saturating_add(streaming_chars)
 }
 
 /// Compute the inline viewport height needed for the current state.
@@ -2477,7 +2499,7 @@ pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, sta
 /// Unlike [`bottom_chrome_height`], Ctrl+G and saved-session picker do not
 /// replace the chrome here; they render as overlays above the full frame.
 pub fn fullscreen_bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
-    bottom_chrome_base_height(state).clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
+    fullscreen_bottom_chrome_base_height(state).clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
 }
 
 pub fn fullscreen_transcript_page_rows<V: BottomChromeView + ?Sized>(state: &V, total_height: u16) -> usize {
@@ -2489,7 +2511,12 @@ pub fn fullscreen_transcript_page_rows<V: BottomChromeView + ?Sized>(state: &V, 
 }
 
 pub fn fullscreen_transcript_scroll_available<V: BottomChromeView + ?Sized>(state: &V) -> bool {
-    state.switcher().is_none() && state.saved_session_picker().is_none() && !state.focus().is_child_view()
+    state.input().is_empty()
+        && state.switcher().is_none()
+        && state.saved_session_picker().is_none()
+        && state.pending_tool_approval().is_none()
+        && state.active_session_view().is_none()
+        && !state.focus().is_child_view()
 }
 
 fn bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -2514,35 +2541,37 @@ fn bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
         .saturating_add(1)
 }
 
-fn render_bottom_chrome_at<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
+fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !child_view_present {
-        STREAMING_VISIBLE_ROWS
-    } else {
-        0
-    };
+    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
+    1u16.saturating_add(sessions_rows)
+        .saturating_add(input_height)
+        .saturating_add(1)
+}
+
+fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
+    frame: &mut Frame,
+    area: Rect,
+    state: &V,
+    show_new_output_below: bool,
+) {
+    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
 
     let fixed_rows = 1u16
         .saturating_add(sessions_rows)
-        .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1);
-    let child_view_rows = if child_view_present {
-        area.height.saturating_sub(fixed_rows)
-    } else {
-        0
-    };
+    let spacer_rows = area.height.saturating_sub(fixed_rows);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Length(sessions_rows),
-            Constraint::Length(child_view_rows),
-            Constraint::Length(streaming_rows),
+            Constraint::Length(spacer_rows),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
@@ -2554,16 +2583,8 @@ fn render_bottom_chrome_at<V: BottomChromeView + ?Sized>(frame: &mut Frame, area
         if sessions_rows > 0 {
             render_sessions_status(frame, chunks[1], state);
         }
-        if let Some(approval) = state.pending_tool_approval() {
-            render_approval(frame, chunks[2], &approval.name, &approval.args, state.ascii_fallback());
-        } else if let Some(view) = state.active_session_view() {
-            render_active_session_view(frame, chunks[2], view, state.ascii_fallback());
-        }
-        if streaming_rows > 0 {
-            render_streaming_preview(frame, chunks[3], state);
-        }
-        render_input(frame, chunks[4], state);
-        render_footer(frame, chunks[5]);
+        render_input(frame, chunks[3], state);
+        render_fullscreen_footer(frame, chunks[4], state.ascii_fallback(), show_new_output_below);
     }
 }
 
@@ -2576,19 +2597,58 @@ pub fn render_fullscreen_chat<V: BottomChromeView + ?Sized>(
     frame.render_widget(Clear, frame_area);
 
     let chrome_height = fullscreen_bottom_chrome_height(state).min(frame_area.height);
-    let transcript_height = frame_area.height.saturating_sub(chrome_height);
+    let content_height = frame_area.height.saturating_sub(chrome_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(transcript_height), Constraint::Length(chrome_height)])
+        .constraints([Constraint::Length(content_height), Constraint::Length(chrome_height)])
         .split(frame_area);
 
     #[allow(clippy::indexing_slicing)]
     {
-        render_fullscreen_transcript(frame, chunks[0], state, scroll);
-        render_bottom_chrome_at(frame, chunks[1], state);
+        let (transcript_area, panel_area) = fullscreen_content_areas(chunks[0], state);
+        render_fullscreen_transcript(frame, transcript_area, state, scroll);
+        render_fullscreen_panel(frame, panel_area, state);
+        render_fullscreen_bottom_chrome_at(frame, chunks[1], state, scroll.new_output_below);
+        render_fullscreen_overlays(frame, chunks[0], state);
     }
+}
 
-    render_fullscreen_overlays(frame, frame_area, state);
+fn fullscreen_content_areas<V: BottomChromeView + ?Sized>(area: Rect, state: &V) -> (Rect, Option<Rect>) {
+    if area.height == 0 || (state.pending_tool_approval().is_none() && state.active_session_view().is_none()) {
+        return (area, None);
+    }
+    let min_panel = if state.pending_tool_approval().is_some() { 6 } else { 8 };
+    let desired = if state.pending_tool_approval().is_some() {
+        area.height.saturating_mul(35).checked_div(100).unwrap_or(0)
+    } else {
+        area.height.saturating_mul(55).checked_div(100).unwrap_or(0)
+    };
+    let max_panel = area.height.saturating_sub(1);
+    let panel_height = desired.max(min_panel.min(area.height)).min(max_panel);
+    if panel_height == 0 {
+        return (area, None);
+    }
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(area.height.saturating_sub(panel_height)),
+            Constraint::Length(panel_height),
+        ])
+        .split(area);
+    #[allow(clippy::indexing_slicing)]
+    (chunks[0], Some(chunks[1]))
+}
+
+fn render_fullscreen_panel<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Option<Rect>, state: &V) {
+    let Some(area) = area else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    if let Some(approval) = state.pending_tool_approval() {
+        render_approval(frame, area, &approval.name, &approval.args, state.ascii_fallback());
+    } else if let Some(view) = state.active_session_view() {
+        render_active_session_view(frame, area, view, state.ascii_fallback());
+    }
 }
 
 fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
@@ -2622,7 +2682,15 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
     let total_rows = usize::from(measure_wrapped_rows(&lines, area.width.max(1)));
     let visible_rows = usize::from(area.height.max(1));
     let max_scroll = total_rows.saturating_sub(visible_rows);
+    let tail_marker = fullscreen_tail_marker(state);
+    if scroll.offset_from_bottom > 0 && tail_marker > scroll.last_tail_marker && scroll.last_tail_marker > 0 {
+        scroll.new_output_below = true;
+    }
     scroll.offset_from_bottom = scroll.offset_from_bottom.min(max_scroll);
+    if scroll.offset_from_bottom == 0 {
+        scroll.new_output_below = false;
+    }
+    scroll.last_tail_marker = tail_marker;
     let top_scroll = max_scroll.saturating_sub(scroll.offset_from_bottom);
     let top_scroll = u16::try_from(top_scroll).unwrap_or(u16::MAX);
 
@@ -2634,13 +2702,13 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
 
 fn render_fullscreen_overlays<V: BottomChromeView + ?Sized>(frame: &mut Frame, frame_area: Rect, state: &V) {
     if let Some(picker) = state.saved_session_picker() {
-        let area = centered_overlay_rect(frame_area, 90, 70, BOTTOM_CHROME_MIN_HEIGHT);
+        let area = centered_overlay_rect(frame_area, 92, 85, BOTTOM_CHROME_MIN_HEIGHT);
         frame.render_widget(Clear, area);
         render_saved_session_picker(frame, area, picker, state.ascii_fallback());
         return;
     }
     if let Some(switcher) = state.switcher() {
-        let area = centered_overlay_rect(frame_area, 90, 70, BOTTOM_CHROME_MIN_HEIGHT);
+        let area = centered_overlay_rect(frame_area, 92, 85, BOTTOM_CHROME_MIN_HEIGHT);
         frame.render_widget(Clear, area);
         render_switcher(frame, area, switcher, state.ascii_fallback());
     }
@@ -3936,6 +4004,19 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
+}
+
+fn render_fullscreen_footer(frame: &mut Frame, area: Rect, ascii: bool, show_new_output_below: bool) {
+    if show_new_output_below {
+        let sep = if ascii { " | " } else { " \u{00B7} " };
+        let footer = Paragraph::new(format!(
+            " New output below{sep}End jumps to tail{sep}Home top{sep}PageUp/PageDown scroll "
+        ))
+        .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        frame.render_widget(footer, area);
+        return;
+    }
+    render_footer(frame, area);
 }
 
 /// Render a tool approval prompt.
@@ -7141,6 +7222,76 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_home_end_jump_top_and_tail() {
+        let mut state = TuiState::new("provider", "model");
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: (0..80)
+                .map(|idx| format!("jump line {idx:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        scroll.jump_top();
+        let top_rows = fullscreen_rows(&state, 64, 14, &mut scroll);
+        assert!(
+            top_rows.iter().any(|row| row.contains("jump line 000")),
+            "Home jump exposes transcript top: {top_rows:?}"
+        );
+        assert!(
+            !top_rows.iter().any(|row| row.contains("jump line 079")),
+            "Home jump leaves tail below: {top_rows:?}"
+        );
+
+        scroll.jump_bottom();
+        let tail_rows = fullscreen_rows(&state, 64, 14, &mut scroll);
+        assert!(
+            tail_rows.iter().any(|row| row.contains("jump line 079")),
+            "End jump returns to transcript tail: {tail_rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_new_output_below_hint_appears_only_while_scrolled_up() {
+        let mut state = TuiState::new("provider", "model");
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: (0..55)
+                .map(|idx| format!("hint line {idx:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+        scroll.page_up(8);
+        let before_rows = fullscreen_rows(&state, 70, 16, &mut scroll);
+        assert!(
+            !before_rows.iter().any(|row| row.contains("New output below")),
+            "existing scrollback alone should not show new-output hint: {before_rows:?}"
+        );
+
+        state.streaming = Some(StreamingDraft {
+            draft_id: "hint-draft".to_string(),
+            accumulated: "streaming delta below".to_string(),
+            version: 1,
+        });
+        let hinted_rows = fullscreen_rows(&state, 70, 16, &mut scroll);
+        assert!(
+            hinted_rows.iter().any(|row| row.contains("New output below")),
+            "new tail output while scrolled up shows footer hint: {hinted_rows:?}"
+        );
+
+        scroll.jump_bottom();
+        let tail_rows = fullscreen_rows(&state, 70, 16, &mut scroll);
+        assert!(
+            !tail_rows.iter().any(|row| row.contains("New output below")),
+            "jumping to tail clears new-output hint: {tail_rows:?}"
+        );
+        assert!(
+            tail_rows.iter().any(|row| row.contains("streaming delta below")),
+            "tail output visible after jump-bottom: {tail_rows:?}"
+        );
+    }
+
+    #[test]
     fn fullscreen_multiline_input_expands_bottom_chrome_without_gap() {
         let mut state = TuiState::new("provider", "model");
         state.input.set_text("first line\nsecond line\nthird line");
@@ -7192,6 +7343,27 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_streaming_tail_is_not_duplicated_in_bottom_chrome() {
+        let mut state = TuiState::new("provider", "model");
+        state.streaming = Some(StreamingDraft {
+            draft_id: "draft-1".to_string(),
+            accumulated: "phase2 unique streaming tail".to_string(),
+            version: 1,
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 72, 16, &mut scroll);
+        let occurrences = rows
+            .iter()
+            .filter(|row| row.contains("phase2 unique streaming tail"))
+            .count();
+        assert_eq!(
+            occurrences, 1,
+            "fullscreen should render streaming only at transcript tail, not chrome preview: {rows:?}"
+        );
+    }
+
+    #[test]
     fn fullscreen_switcher_overlay_renders_over_large_frame_with_chrome_pinned() {
         let mut state = TuiState::new("provider", "model");
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(vec![entry(1), entry(2)]));
@@ -7210,6 +7382,148 @@ mod tests {
         assert!(
             rows.last().is_some_and(|row| row.contains("Ctrl+G")),
             "bottom chrome footer remains pinned below overlay: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_saved_session_picker_fits_as_overlay_with_chrome_pinned() {
+        let mut state = TuiState::new("provider", "model");
+        state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            saved_picker_entry("saved-1", "saved session one", false),
+            saved_picker_entry("saved-2", "saved session two", true),
+        ]));
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 86, 24, &mut scroll);
+        assert!(
+            rows.iter().any(|row| row.contains("Saved chat sessions")),
+            "saved-session picker title rendered: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("saved session one")),
+            "saved-session picker rows rendered: {rows:?}"
+        );
+        assert!(
+            rows.last().is_some_and(|row| row.contains("Ctrl+G")),
+            "bottom chrome footer remains pinned below saved picker: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_approval_panel_stays_visible_above_input_when_transcript_scrolled() {
+        let mut state = TuiState::new("provider", "model");
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: (0..60)
+                .map(|idx| format!("approval line {idx:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        state.focus = crate::chat::sessions::FocusTarget::Approval;
+        state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            tool_id: "tool-1".to_string(),
+            name: "danger_tool".to_string(),
+            args: "{\"path\":\"/tmp/demo\"}".to_string(),
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+        scroll.jump_top();
+
+        let rows = fullscreen_rows(&state, 80, 24, &mut scroll);
+        assert!(
+            rows.iter().any(|row| row.contains("Tool Approval")),
+            "approval panel visible outside transcript scroll: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("danger_tool")),
+            "approval tool name visible: {rows:?}"
+        );
+        assert!(
+            rows.last().is_some_and(|row| row.contains("Ctrl+G")),
+            "input footer remains pinned below approval panel: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_child_and_diff_views_use_large_panel_above_input() {
+        let mut state = TuiState::new("provider", "model");
+        state.conversation_lines.push(ConversationLine::User {
+            content: "main transcript".to_string(),
+        });
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 7 };
+        state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+            seq: 7,
+            kind: "agent".to_string(),
+            title: "phase2 child".to_string(),
+            lines: (0..40).map(|idx| format!("child-line-{idx:03}")).collect(),
+            truncated: false,
+            scroll_offset: 0,
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+        let child_rows = fullscreen_rows(&state, 84, 26, &mut scroll);
+        assert!(
+            child_rows.iter().any(|row| row.contains("attached #7 agent")),
+            "child view header rendered in fullscreen panel: {child_rows:?}"
+        );
+        assert!(
+            child_rows.iter().any(|row| row.contains("child-line-039")),
+            "child view tail rendered in fullscreen panel: {child_rows:?}"
+        );
+
+        state.focus = crate::chat::sessions::FocusTarget::Diff;
+        state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+            seq: DIFF_SESSION_SEQ,
+            kind: crate::chat::sessions::model::ManagedKind::Diff.as_str().to_string(),
+            title: "workspace diff".to_string(),
+            lines: vec!["diff --git a/src/lib.rs b/src/lib.rs".to_string()],
+            truncated: false,
+            scroll_offset: 0,
+        });
+        let diff_rows = fullscreen_rows(&state, 84, 26, &mut scroll);
+        assert!(
+            diff_rows.iter().any(|row| row.contains("diff workspace diff")),
+            "diff view header rendered in fullscreen panel: {diff_rows:?}"
+        );
+        assert!(
+            diff_rows.iter().any(|row| row.contains("diff --git")),
+            "diff body rendered in fullscreen panel: {diff_rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_scroll_focus_rules_do_not_steal_input_or_child_keys() {
+        let mut input_state = TuiState::new("provider", "model");
+        input_state.input.set_text("draft");
+        assert!(
+            !fullscreen_transcript_scroll_available(&input_state),
+            "draft input keeps Home/End/Page keys for the input box"
+        );
+
+        let mut history_state = TuiState::new("provider", "model");
+        history_state.input.history = vec!["older".to_string(), "newer".to_string()];
+        let out = dispatch_global_key(key(KeyCode::Up), &mut history_state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(
+            history_state.input.text(),
+            "newer",
+            "Up still navigates input history and is not a transcript-scroll key"
+        );
+
+        let mut child_state = TuiState::new("provider", "model");
+        child_state.focus = crate::chat::sessions::FocusTarget::Session { seq: 3 };
+        child_state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+            seq: 3,
+            kind: "agent".to_string(),
+            title: "child".to_string(),
+            lines: vec!["child output".to_string()],
+            truncated: false,
+            scroll_offset: 0,
+        });
+        assert!(
+            !fullscreen_transcript_scroll_available(&child_state),
+            "focused child view owns PageUp/PageDown in fullscreen"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut child_state),
+            KeyDispatch::PageSessionUp
         );
     }
 
