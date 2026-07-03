@@ -2359,7 +2359,7 @@ fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
     without_sessions < BOTTOM_CHROME_MAX_HEIGHT
 }
 
-/// Render the **fixed-height inline viewport** at the bottom of the
+/// Render the bottom inline viewport at the bottom of the
 /// terminal. Permanent conversation lines are NOT drawn here — they are
 /// already in the host terminal's scrollback courtesy of
 /// `terminal.insert_before` (driven by the unified loop in
@@ -2371,11 +2371,9 @@ fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
 ///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
 ///   4. Footer (1 row)
 pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, state: &V) {
-    // The inline viewport reserves `BOTTOM_CHROME_MAX_HEIGHT` rows at the
-    // bottom of the host terminal. The dynamic chrome height is usually
-    // smaller, so align it to the bottom of the reserved frame so the
-    // input box always sits flush with the user's prompt line, with any
-    // unused rows blank above the status bar.
+    // The unified loop keeps the inline viewport at the dynamic chrome
+    // height. Keep bottom alignment as a defensive fallback for unusually
+    // short frames so the input box stays pinned to the prompt line.
     let frame_area = frame.area();
     let height = bottom_chrome_height(state).min(frame_area.height);
     let area = Rect {
@@ -6827,6 +6825,43 @@ mod tests {
         assert!(
             tall <= BOTTOM_CHROME_MAX_HEIGHT,
             "must be clamped to BOTTOM_CHROME_MAX_HEIGHT"
+        );
+    }
+
+    #[test]
+    fn bottom_chrome_actual_height_viewport_has_no_reserved_blank_band() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let state = TuiState::new("provider", "model");
+        let height = bottom_chrome_height(&state);
+        assert!(
+            height < BOTTOM_CHROME_MAX_HEIGHT,
+            "test setup must cover the idle short-chrome case"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(48, height)).expect("test backend");
+        terminal
+            .draw(|frame| {
+                render_bottom_chrome(frame, &state);
+            })
+            .expect("draw bottom chrome");
+
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| -> String { (0..48).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
+        let rows: Vec<String> = (0..height).map(row).collect();
+
+        assert!(
+            rows.first().is_some_and(|r| r.contains("PRX | mode:edit")),
+            "status row must start at the top of the actual-height viewport: {rows:?}"
+        );
+        assert!(
+            rows.iter().all(|r| !r.trim().is_empty()),
+            "actual-height viewport must not retain the old reserved blank band: {rows:?}"
+        );
+        assert!(
+            rows.last().is_some_and(|r| r.contains("Ctrl+G")),
+            "footer remains pinned to the bottom row: {rows:?}"
         );
     }
 

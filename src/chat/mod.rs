@@ -5471,6 +5471,35 @@ impl RenderSource {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+type InlineTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+
+#[cfg(feature = "terminal-tui")]
+fn desired_inline_viewport_height(view: &dyn tui::BottomChromeView) -> u16 {
+    tui::bottom_chrome_height(view).clamp(tui::BOTTOM_CHROME_MIN_HEIGHT, tui::BOTTOM_CHROME_MAX_HEIGHT)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn changed_inline_viewport_height(current: u16, view: &dyn tui::BottomChromeView) -> Option<u16> {
+    let desired = desired_inline_viewport_height(view);
+    (desired != current).then_some(desired)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn new_inline_terminal(height: u16) -> Result<InlineTerminal> {
+    use ratatui::{TerminalOptions, Viewport};
+
+    let stdout = std::io::stdout();
+    let backend = ratatui::backend::CrosstermBackend::new(stdout);
+    ratatui::Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))
+}
+
 /// Runs inside `tokio::task::spawn_blocking` because `terminal.draw()`
 /// performs synchronous I/O and `mpsc::Receiver::blocking_recv()` blocks the
 /// caller. Returning a `JoinHandle` lets the caller observe panics if
@@ -6573,8 +6602,8 @@ fn pty_stdin_loop(
 
 /// Inner body of [`spawn_tui_unified_loop`].
 ///
-/// **P3-inline architecture.** ratatui owns only a fixed-height inline
-/// viewport at the bottom of the terminal — see [`tui::render_bottom_chrome`].
+/// **P3-inline architecture.** ratatui owns only a bottom inline viewport whose
+/// height tracks the live bottom chrome — see [`tui::render_bottom_chrome`].
 /// Permanent conversation history is pushed up into the host terminal's
 /// main scrollback at the top of each loop iteration via
 /// `terminal.insert_before`. Once a [`tui::ConversationLine`] has been
@@ -6598,7 +6627,6 @@ fn run_tui_unified_loop(
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
     use crossterm::event::{Event, KeyEventKind};
-    use ratatui::{TerminalOptions, Viewport};
 
     let render_source = snapshot_rx.map_or_else(
         || RenderSource::Mirror(Arc::clone(&mirror)),
@@ -6608,24 +6636,13 @@ fn run_tui_unified_loop(
         },
     );
 
-    let stdout = std::io::stdout();
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-
-    // Inline viewport height is fixed at creation time — ratatui does not
-    // support dynamically resizing an `Inline` viewport (see ratatui
-    // issue #984; `terminal.resize(Rect)` performs a full clear + viewport
-    // recompute and was the cause of the "blank chrome on entry" bug).
-    // We allocate the maximum possible chrome height up front and let
-    // `render_bottom_chrome` align the actual chrome to the bottom of the
-    // reserved area when the dynamic height is smaller.
-    let initial_height = tui::BOTTOM_CHROME_MAX_HEIGHT;
-    let mut terminal = ratatui::Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(initial_height),
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))?;
+    // Start the inline viewport at the actual bottom-chrome height rather
+    // than reserving the maximum. ratatui stores `Viewport::Inline(height)` in
+    // the terminal, so changing the inline height requires rebuilding the
+    // terminal with a new viewport. We do that only on height deltas below,
+    // then draw immediately so a resize transition never leaves blank chrome.
+    let mut inline_viewport_height = render_source.with_view(desired_inline_viewport_height);
+    let mut terminal = new_inline_terminal(inline_viewport_height)?;
 
     // Materialise the inline viewport immediately so the chrome (status
     // bar + input box + footer) is visible the moment the session opens,
@@ -6703,6 +6720,25 @@ fn run_tui_unified_loop(
             skip_next_draw = false;
         }
 
+        if let Some(next_height) =
+            render_source.with_view(|view| changed_inline_viewport_height(inline_viewport_height, view))
+        {
+            match new_inline_terminal(next_height) {
+                Ok(next_terminal) => {
+                    inline_viewport_height = next_height;
+                    terminal = next_terminal;
+                    skip_next_draw = false;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        height = next_height,
+                        "inline viewport height update failed; keeping previous terminal"
+                    );
+                }
+            }
+        }
+
         // ── 1. Flush newly-finalised conversation lines to scrollback ──
         // We take the mirror lock briefly to snapshot the pending range
         // and the ASCII fallback flag, then release it BEFORE calling
@@ -6740,13 +6776,11 @@ fn run_tui_unified_loop(
         last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
 
         // ── 2. Drain coalesced redraw wakeups, then redraw the chrome ─
-        // Inline-viewport height is fixed at construction time
-        // (`BOTTOM_CHROME_MAX_HEIGHT`); calling `terminal.resize` here
-        // would trigger a full clear every iteration (ratatui issue
-        // #984), which is the bug that this rewrite removes.
-        // `render_bottom_chrome` aligns the actual chrome to the bottom
-        // of the reserved frame area, so unused rows above stay blank
-        // without disturbing scrollback.
+        // The inline viewport height has already been synchronized above, and
+        // that synchronization is gated on actual height deltas. Steady-state
+        // frames never rebuild or resize the terminal, avoiding the ratatui
+        // #984 full-clear path while keeping short transcripts flush with the
+        // bottom chrome.
         let mut redraw_requested = false;
         while redraw_rx.try_recv().is_ok() {
             redraw_requested = true;
@@ -9285,6 +9319,49 @@ mod s4_a_4 {
             assert_eq!(view.provider(), "ps");
             assert_eq!(view.model(), "ms");
         });
+    }
+
+    #[test]
+    fn inline_viewport_height_starts_at_actual_chrome_height() {
+        let tui = TuiState::new("p", "m");
+        let mirror = Arc::new(parking_lot::Mutex::new(tui));
+        let src = RenderSource::Mirror(Arc::clone(&mirror));
+
+        let initial = src.with_view(super::desired_inline_viewport_height);
+        let expected = crate::chat::tui::bottom_chrome_height(&*mirror.lock());
+
+        assert_eq!(initial, expected);
+        assert!(
+            initial < crate::chat::tui::BOTTOM_CHROME_MAX_HEIGHT,
+            "idle inline viewport must not reserve the max-height blank band"
+        );
+    }
+
+    #[test]
+    fn inline_viewport_height_gate_only_changes_on_height_delta() {
+        let mut tui = TuiState::new("p", "m");
+        let idle = super::desired_inline_viewport_height(&tui);
+
+        assert_eq!(
+            super::changed_inline_viewport_height(idle, &tui),
+            None,
+            "steady-state redraws must not rebuild/resize the inline viewport"
+        );
+
+        tui.start_stream("d-live");
+        let streaming = super::changed_inline_viewport_height(idle, &tui)
+            .expect("streaming preview must require a taller inline viewport");
+        assert!(streaming > idle);
+        assert_eq!(
+            super::changed_inline_viewport_height(streaming, &tui),
+            None,
+            "unchanged streaming height must not rebuild/resize repeatedly"
+        );
+
+        tui.cancel_stream("d-live");
+        let back_to_idle = super::changed_inline_viewport_height(streaming, &tui)
+            .expect("removing streaming preview must shrink the inline viewport");
+        assert_eq!(back_to_idle, idle);
     }
 
     /// read_pending：snapshot 路径返回正确切片.
