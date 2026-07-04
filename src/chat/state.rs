@@ -19,7 +19,7 @@
 // Step 5 删旧路径后 chat_mirror 即被 ChatState.ui 取代。
 
 #[cfg(feature = "terminal-tui")]
-pub use crate::chat::tui::{ConversationLine, StreamingDraft, TuiInput};
+pub use crate::chat::tui::{ConversationLine, SlashMenuState, StreamingDraft, TuiInput};
 
 /// 占位：TuiInput（非 terminal-tui feature；保持 reducer 在最小 feature 下也能编译）
 #[cfg(not(feature = "terminal-tui"))]
@@ -28,6 +28,11 @@ pub type TuiInput = Vec<String>;
 /// 占位：ConversationLine（非 terminal-tui feature）
 #[cfg(not(feature = "terminal-tui"))]
 pub type ConversationLine = String;
+
+/// 占位：SlashMenuState（非 terminal-tui feature）
+#[cfg(not(feature = "terminal-tui"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlashMenuState;
 
 /// 占位：StreamingDraft（非 terminal-tui feature）
 #[cfg(not(feature = "terminal-tui"))]
@@ -307,6 +312,8 @@ pub struct UiState {
     /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
     /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// Slash-command menu overlay. Derived from the current input command token.
+    pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
@@ -364,6 +371,8 @@ pub struct UiSnapshot {
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// Slash-command menu overlay.
+    pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker overlay.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
 }
@@ -394,6 +403,7 @@ impl UiSnapshot {
             context_window_tokens: None,
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
+            slash_menu: None,
             saved_session_picker: None,
         }
     }
@@ -481,6 +491,7 @@ impl ChatState {
                 context_window_tokens: None,
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
+                slash_menu: None,
                 saved_session_picker: None,
             },
             stream: StreamState {
@@ -550,6 +561,7 @@ impl ChatState {
             context_window_tokens: self.ui.context_window_tokens,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
+            slash_menu: self.ui.slash_menu.clone(),
             saved_session_picker: self.ui.saved_session_picker.clone(),
         }
     }
@@ -602,6 +614,8 @@ impl ChatState {
         u64,
         usize,
         Option<usize>,
+        bool,
+        Option<usize>,
         ChatMode,
         AutonomyLevel,
         bool,
@@ -615,6 +629,8 @@ impl ChatState {
             draft_ver,
             self.ui.input.lines.len(),
             self.ui.context_window_tokens,
+            self.ui.slash_menu.is_some(),
+            self.ui.slash_menu.as_ref().map(|menu| menu.selected),
             self.ui.chat_mode,
             self.ui.autonomy_level,
             self.ui.pending_tool_approval.is_some(),
@@ -794,6 +810,17 @@ impl ChatState {
             return vec![Effect::RequestRedraw];
         }
 
+        if self.ui.slash_menu.is_some() {
+            let dispatch =
+                crate::chat::tui::dispatch_slash_menu_key_for(&mut self.ui.input, &mut self.ui.slash_menu, key);
+            return match dispatch {
+                crate::chat::tui::KeyDispatch::Submitted(text) => self.reduce_input_submitted(text),
+                crate::chat::tui::KeyDispatch::Cancelled => self.reduce_input_cancelled(),
+                crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
+                _ => vec![Effect::RequestRedraw],
+            };
+        }
+
         // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
         // BUG-01: 旧实现只切 ToolResult，导致 thinking/Reasoning 卡按 Tab 永不展开
         // （折叠提示却写着 "press Tab to expand"）。与 tui::toggle_last_foldable_card
@@ -830,16 +857,22 @@ impl ChatState {
             // 非空 buffer 转发为 Delete
             let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
             let _ = self.ui.input.handle_key(synthetic);
+            crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
             return vec![Effect::RequestRedraw];
         }
         // 其他键 → 转发到 input buffer，根据 InputOutcome 派生后续 Action 自递归
         match self.ui.input.handle_key(key) {
             crate::chat::tui::InputOutcome::Submitted(text) => {
+                self.ui.slash_menu = None;
                 // 用 reduce_with_now 重入以保持单一处理路径
                 self.reduce_input_submitted(text)
             }
-            crate::chat::tui::InputOutcome::Cancelled => self.reduce_input_cancelled(),
+            crate::chat::tui::InputOutcome::Cancelled => {
+                self.ui.slash_menu = None;
+                self.reduce_input_cancelled()
+            }
             crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
+                crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
                 vec![Effect::RequestRedraw]
             }
             crate::chat::tui::InputOutcome::Ignored => Vec::new(),
@@ -863,6 +896,7 @@ impl ChatState {
             return vec![Effect::RequestRedraw];
         }
         self.ui.input.paste(text);
+        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
         vec![Effect::RequestRedraw]
     }
 
@@ -877,6 +911,7 @@ impl ChatState {
     /// Step 2 不触发 LLM（Step 3 才追加 `Effect::StartTurn`）。
     /// `LogTrace` 用于双写期对账。
     fn reduce_input_submitted(&mut self, text: String) -> Vec<Effect> {
+        self.ui.slash_menu = None;
         self.ui.turn_count = self.ui.turn_count.saturating_add(1);
         let log_msg = format!("input_submitted len={}", text.chars().count());
         self.ui.last_submitted = Some(text);
@@ -897,6 +932,7 @@ impl ChatState {
     fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
         self.ui.input.set_text(text);
         self.ui.input.clear_navigation_state();
+        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
         vec![Effect::RequestRedraw]
     }
 
@@ -915,6 +951,7 @@ impl ChatState {
             HistoryDir::Down => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         };
         let _ = self.ui.input.handle_key(key);
+        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
         vec![Effect::RequestRedraw]
     }
 
@@ -927,6 +964,7 @@ impl ChatState {
     /// 处理 Esc — 清空 input buffer.
     #[cfg(feature = "terminal-tui")]
     fn reduce_input_cancelled(&mut self) -> Vec<Effect> {
+        self.ui.slash_menu = None;
         self.ui.input.clear();
         vec![Effect::RequestRedraw]
     }
@@ -1730,6 +1768,7 @@ impl ChatState {
         self.ui.sessions_status.clear();
         self.ui.sessions_entries.clear();
         self.ui.switcher = None;
+        self.ui.slash_menu = None;
         self.ui.saved_session_picker = None;
         self.stream.draft = None;
         self.stream.pending_tool_cards.clear();
@@ -2042,6 +2081,7 @@ impl ChatState {
     /// the supplied session snapshot, highlighting the first row.
     fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
         self.ui.saved_session_picker = None;
+        self.ui.slash_menu = None;
         self.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(entries));
         vec![Effect::RequestRedraw]
     }
@@ -2083,6 +2123,7 @@ impl ChatState {
         entries: Vec<crate::chat::session::SavedSessionPickerEntry>,
     ) -> Vec<Effect> {
         self.ui.switcher = None;
+        self.ui.slash_menu = None;
         self.ui.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(entries));
         vec![Effect::RequestRedraw]
     }

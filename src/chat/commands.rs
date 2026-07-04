@@ -88,35 +88,244 @@ pub struct CommandContext<'a> {
     pub mem: &'a dyn Memory,
 }
 
-/// Help text shared between `/help` output and crate documentation.
-const HELP_TEXT: &str = "Available commands:
-  /help              Show this help message
-  /clear /new        Clear conversation history
-  /model [name]      Show or switch model
-  /provider [name [model]]  Show or hot-switch provider
-  /tools             List available tools
-  /memory <query>    Search memory
-  /resume [last|id]  List or switch saved chat sessions
-  /branch [N]        List turn boundaries or fork the first N turns
-  /rewind <N>        Trim this session to the first N turns (interactive approval)
-  /apply [N]         Apply the latest fenced diff block with interactive approval
-  /cost              Show token usage estimate
-  /compact           Compact conversation context (free up window)
-  /export [md|json]  Export conversation transcript
-  /plan              Switch to plan mode (read-only tools)
-  /edit              Switch to edit mode (default)
-  /auto              Switch to auto chat mode (does not override [autonomy])
-  /bg <task>         Run a task as an agent child session
-  /sessions          List child TUI sessions
-  /shell <command>   Run a command as a shell child session
-  /pty <command>     Open an interactive PTY shell (full terminal handoff)
-  /transcript        Open the read-only transcript child TUI
-  /diff [--cached]   Open the read-only workspace diff child TUI
-  /attach <id>       Show a child session's recent output (read-only)
-  /logs <id>         Dump a child session's buffered output (last 200 lines)
-  /steer <id> <msg>  Send a steering instruction to a child session
-  /kill <id>         Stop a child session
-  /quit /exit        Exit chat";
+/// One authoritative slash-command metadata row used by `/help` and the TUI
+/// slash menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandSpec {
+    /// Canonical command inserted by the slash menu, including the leading `/`.
+    pub name: &'static str,
+    /// Alternate command spellings accepted by the parser.
+    pub aliases: &'static [&'static str],
+    /// Argument hint displayed after the command name.
+    pub args_hint: &'static str,
+    /// Operator-facing description.
+    pub description: &'static str,
+}
+
+impl CommandSpec {
+    #[must_use]
+    pub fn display_name(self) -> String {
+        if self.aliases.is_empty() {
+            self.name.to_string()
+        } else {
+            format!("{} {}", self.name, self.aliases.join(" "))
+        }
+    }
+
+    #[must_use]
+    pub fn usage(self) -> String {
+        if self.args_hint.is_empty() {
+            self.display_name()
+        } else {
+            format!("{} {}", self.display_name(), self.args_hint)
+        }
+    }
+}
+
+/// Single source of truth for user-visible chat slash commands.
+pub const COMMAND_SPECS: &[CommandSpec] = &[
+    CommandSpec {
+        name: "/help",
+        aliases: &[],
+        args_hint: "",
+        description: "Show this help message",
+    },
+    CommandSpec {
+        name: "/clear",
+        aliases: &["/new"],
+        args_hint: "",
+        description: "Clear conversation history",
+    },
+    CommandSpec {
+        name: "/model",
+        aliases: &[],
+        args_hint: "[name]",
+        description: "Show or switch model",
+    },
+    CommandSpec {
+        name: "/provider",
+        aliases: &[],
+        args_hint: "[name [model]]",
+        description: "Show or hot-switch provider",
+    },
+    CommandSpec {
+        name: "/tools",
+        aliases: &[],
+        args_hint: "",
+        description: "List available tools",
+    },
+    CommandSpec {
+        name: "/memory",
+        aliases: &[],
+        args_hint: "<query>",
+        description: "Search memory",
+    },
+    CommandSpec {
+        name: "/resume",
+        aliases: &[],
+        args_hint: "[last|id]",
+        description: "List or switch saved chat sessions",
+    },
+    CommandSpec {
+        name: "/branch",
+        aliases: &[],
+        args_hint: "[N]",
+        description: "List turn boundaries or fork the first N turns",
+    },
+    CommandSpec {
+        name: "/rewind",
+        aliases: &[],
+        args_hint: "<N>",
+        description: "Trim this session to the first N turns with approval",
+    },
+    CommandSpec {
+        name: "/apply",
+        aliases: &[],
+        args_hint: "[N]",
+        description: "Apply a fenced diff block with approval",
+    },
+    CommandSpec {
+        name: "/cost",
+        aliases: &[],
+        args_hint: "",
+        description: "Show token usage estimate",
+    },
+    CommandSpec {
+        name: "/compact",
+        aliases: &[],
+        args_hint: "",
+        description: "Compact conversation context",
+    },
+    CommandSpec {
+        name: "/export",
+        aliases: &[],
+        args_hint: "[md|json]",
+        description: "Export conversation transcript",
+    },
+    CommandSpec {
+        name: "/theme",
+        aliases: &[],
+        args_hint: "",
+        description: "Show available chat themes",
+    },
+    CommandSpec {
+        name: "/plan",
+        aliases: &[],
+        args_hint: "",
+        description: "Switch to plan mode",
+    },
+    CommandSpec {
+        name: "/edit",
+        aliases: &[],
+        args_hint: "",
+        description: "Switch to edit mode",
+    },
+    CommandSpec {
+        name: "/auto",
+        aliases: &[],
+        args_hint: "",
+        description: "Switch to auto chat mode",
+    },
+    CommandSpec {
+        name: "/bg",
+        aliases: &[],
+        args_hint: "<task>",
+        description: "Run a task as an agent child session",
+    },
+    CommandSpec {
+        name: "/sessions",
+        aliases: &[],
+        args_hint: "",
+        description: "List child TUI sessions",
+    },
+    CommandSpec {
+        name: "/shell",
+        aliases: &[],
+        args_hint: "<command>",
+        description: "Run a command as a shell child session",
+    },
+    CommandSpec {
+        name: "/pty",
+        aliases: &[],
+        args_hint: "<command>",
+        description: "Open an interactive PTY shell",
+    },
+    CommandSpec {
+        name: "/transcript",
+        aliases: &[],
+        args_hint: "",
+        description: "Open the read-only transcript child TUI",
+    },
+    CommandSpec {
+        name: "/diff",
+        aliases: &[],
+        args_hint: "[--cached]",
+        description: "Open the read-only workspace diff child TUI",
+    },
+    CommandSpec {
+        name: "/attach",
+        aliases: &[],
+        args_hint: "<id>",
+        description: "Show a child session's recent output",
+    },
+    CommandSpec {
+        name: "/logs",
+        aliases: &[],
+        args_hint: "<id>",
+        description: "Dump a child session's buffered output",
+    },
+    CommandSpec {
+        name: "/steer",
+        aliases: &[],
+        args_hint: "<id> <msg>",
+        description: "Send a steering instruction to a child session",
+    },
+    CommandSpec {
+        name: "/kill",
+        aliases: &[],
+        args_hint: "<id>",
+        description: "Stop a child session",
+    },
+    CommandSpec {
+        name: "/detach",
+        aliases: &[],
+        args_hint: "",
+        description: "Return focus to the main chat",
+    },
+    CommandSpec {
+        name: "/approve",
+        aliases: &[],
+        args_hint: "<id>",
+        description: "Approve a child session approval gate",
+    },
+    CommandSpec {
+        name: "/deny",
+        aliases: &[],
+        args_hint: "<id>",
+        description: "Deny a child session approval gate",
+    },
+    CommandSpec {
+        name: "/quit",
+        aliases: &["/exit"],
+        args_hint: "",
+        description: "Exit chat",
+    },
+];
+
+#[must_use]
+pub const fn command_specs() -> &'static [CommandSpec] {
+    COMMAND_SPECS
+}
+
+#[must_use]
+pub fn help_text() -> String {
+    let mut out = String::from("Available commands:");
+    for spec in command_specs() {
+        out.push('\n');
+        out.push_str(&format!("  {:<24} {}", spec.usage(), spec.description));
+    }
+    out
+}
 
 /// Dispatch a slash command. Returns `CommandResult`.
 ///
@@ -126,7 +335,7 @@ const HELP_TEXT: &str = "Available commands:
 /// write from here would corrupt the visible TUI.
 pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
     match input {
-        "/help" => CommandResult::HandledWithOutput(HELP_TEXT.to_string()),
+        "/help" => CommandResult::HandledWithOutput(help_text()),
         "/quit" | "/exit" => CommandResult::Quit,
         "/plan" => CommandResult::SetMode(ChatMode::Plan),
         "/edit" => CommandResult::SetMode(ChatMode::Edit),
@@ -580,26 +789,70 @@ mod mode_tests {
     }
 
     #[test]
-    fn help_text_lists_session_commands_including_logs() {
-        // v5 regression: `/logs` and `/pty` are implemented and parsed but were
-        // missing from `/help`, leading an operator to believe `/logs` did not
-        // exist. The help surface must advertise the full session command family.
+    fn command_registry_covers_all_known_parser_commands() {
+        let mut commands = BTreeSet::new();
+        for spec in super::command_specs() {
+            assert!(commands.insert(spec.name), "duplicate command spec: {}", spec.name);
+            for alias in spec.aliases {
+                assert!(commands.insert(*alias), "duplicate command alias: {alias}");
+            }
+        }
         for cmd in [
+            "/help",
+            "/quit",
+            "/exit",
+            "/plan",
+            "/edit",
+            "/auto",
+            "/tools",
+            "/cost",
+            "/model",
+            "/provider",
+            "/resume",
+            "/branch",
+            "/rewind",
+            "/apply",
+            "/memory",
+            "/export",
+            "/theme",
+            "/clear",
+            "/new",
+            "/compact",
             "/bg",
             "/sessions",
             "/shell",
             "/pty",
+            "/transcript",
+            "/diff",
             "/attach",
             "/logs",
             "/steer",
             "/kill",
+            "/detach",
+            "/approve",
+            "/deny",
         ] {
-            assert!(
-                super::HELP_TEXT.contains(cmd),
-                "/help must list {cmd}: {}",
-                super::HELP_TEXT
-            );
+            assert!(commands.contains(cmd), "registry must list parser command {cmd}");
         }
+    }
+
+    #[test]
+    fn help_text_is_generated_from_command_registry() {
+        let help = super::help_text();
+        for spec in super::command_specs() {
+            assert!(help.contains(spec.name), "/help must list {}: {help}", spec.name);
+            assert!(
+                help.contains(spec.description),
+                "/help must include description for {}: {help}",
+                spec.name
+            );
+            for alias in spec.aliases {
+                assert!(help.contains(alias), "/help must list alias {alias}: {help}");
+            }
+        }
+        assert!(help.contains("/theme"), "drift regression: /theme must be in help");
+        assert!(help.contains("/approve"), "drift regression: /approve must be in help");
+        assert!(help.contains("/deny"), "drift regression: /deny must be in help");
     }
 
     #[tokio::test]

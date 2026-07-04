@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::loop_::ChatMode;
+use crate::chat::commands::{CommandSpec, command_specs};
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
 };
@@ -104,6 +105,9 @@ pub struct TuiState {
     /// Owned by the synchronous key thread (opened/navigated/closed in
     /// `dispatch_global_key`); rendered as a bottom-chrome popup.
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// Open slash-command menu overlay, or `None` when the cursor is not inside
+    /// a leading command token.
+    pub slash_menu: Option<SlashMenuState>,
     /// Cached background-session snapshot for the switcher, refreshed by the
     /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
     /// run async registry queries) when opening the switcher with Ctrl+G.
@@ -121,6 +125,96 @@ pub struct TuiState {
     pub context_window_tokens: Option<usize>,
     /// First half of the `Ctrl+X Ctrl+E` external-editor chord.
     pub external_editor_prefix_armed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashMenuState {
+    pub filter: String,
+    pub entries: Vec<CommandSpec>,
+    pub selected: usize,
+}
+
+impl SlashMenuState {
+    #[must_use]
+    pub fn new(filter: &str) -> Self {
+        Self {
+            filter: filter.to_string(),
+            entries: filtered_command_specs(filter),
+            selected: 0,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn refresh(&mut self, filter: &str) {
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.entries = filtered_command_specs(filter);
+        self.clamp_selected();
+    }
+
+    pub fn clamp_selected(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+        }
+    }
+
+    pub const fn select_prev(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+        } else if self.selected == 0 {
+            self.selected = self.entries.len().saturating_sub(1);
+        } else {
+            self.selected -= 1;
+        }
+    }
+
+    pub const fn select_next(&mut self) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+        } else {
+            self.selected = (self.selected + 1) % self.entries.len();
+        }
+    }
+
+    #[must_use]
+    pub fn selected_entry(&self) -> Option<CommandSpec> {
+        self.entries.get(self.selected).copied()
+    }
+}
+
+fn filtered_command_specs(filter: &str) -> Vec<CommandSpec> {
+    let needle = filter.trim_start_matches('/').to_ascii_lowercase();
+    command_specs()
+        .iter()
+        .copied()
+        .filter(|spec| {
+            if needle.is_empty() {
+                return true;
+            }
+            command_matches_filter(*spec, &needle)
+        })
+        .collect()
+}
+
+fn command_matches_filter(spec: CommandSpec, needle: &str) -> bool {
+    let name = spec.name.trim_start_matches('/').to_ascii_lowercase();
+    if name.contains(needle) {
+        return true;
+    }
+    spec.aliases
+        .iter()
+        .any(|alias| alias.trim_start_matches('/').to_ascii_lowercase().contains(needle))
 }
 
 /// Maximum width (in chars) for the args preview shown in folded tool cards.
@@ -362,6 +456,81 @@ pub enum KeyDispatch {
     ModeChanged(ChatMode),
 }
 
+pub(crate) fn sync_slash_menu_for_input(input: &TuiInput, slash_menu: &mut Option<SlashMenuState>) {
+    if let Some(filter) = input.slash_command_filter_at_cursor() {
+        if let Some(menu) = slash_menu.as_mut() {
+            menu.refresh(&filter);
+        } else {
+            *slash_menu = Some(SlashMenuState::new(&filter));
+        }
+    } else {
+        *slash_menu = None;
+    }
+}
+
+pub(crate) fn dispatch_slash_menu_key_for(
+    input: &mut TuiInput,
+    slash_menu: &mut Option<SlashMenuState>,
+    key: KeyEvent,
+) -> KeyDispatch {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+    let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+    if up || down {
+        let Some(menu) = slash_menu.as_mut() else {
+            return KeyDispatch::Consumed;
+        };
+        if up {
+            menu.select_prev();
+        } else {
+            menu.select_next();
+        }
+        return KeyDispatch::Consumed;
+    }
+
+    if (key.code == KeyCode::Enter || key.code == KeyCode::Tab) && key.modifiers == KeyModifiers::NONE {
+        if let Some(spec) = slash_menu.as_ref().and_then(SlashMenuState::selected_entry) {
+            input.replace_slash_command_token(spec.name);
+        }
+        *slash_menu = None;
+        return KeyDispatch::Consumed;
+    }
+
+    if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        *slash_menu = None;
+        return KeyDispatch::Consumed;
+    }
+
+    if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return KeyDispatch::Consumed;
+    }
+
+    match key.code {
+        KeyCode::Char(_)
+        | KeyCode::Backspace
+        | KeyCode::Delete
+        | KeyCode::Left
+        | KeyCode::Right
+        | KeyCode::Home
+        | KeyCode::End => match input.handle_key(key) {
+            InputOutcome::Submitted(text) => {
+                *slash_menu = None;
+                KeyDispatch::Submitted(text)
+            }
+            InputOutcome::Cancelled => {
+                *slash_menu = None;
+                KeyDispatch::Cancelled
+            }
+            InputOutcome::Consumed | InputOutcome::Unhandled => {
+                sync_slash_menu_for_input(input, slash_menu);
+                KeyDispatch::Consumed
+            }
+            InputOutcome::Ignored => KeyDispatch::Ignored,
+        },
+        _ => KeyDispatch::Consumed,
+    }
+}
+
 /// Identifies which kind of foldable card was toggled by the unified `Tab`
 /// keybinding. Returned alongside the new folded state from
 /// [`TuiState::toggle_last_foldable_card`] so call-sites (or tests) can
@@ -542,6 +711,9 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // open so navigation cannot leak into input history or child switching.
     if state.saved_session_picker.is_some() {
         return dispatch_saved_session_picker_key(key, state);
+    }
+    if state.slash_menu.is_some() {
+        return dispatch_slash_menu_key_for(&mut state.input, &mut state.slash_menu, key);
     }
     // v1.1b: when the Ctrl+G switcher overlay is open it captures navigation /
     // selection keys before anything else (Tab, input box, etc.). Handled in a
@@ -868,6 +1040,46 @@ impl TuiInput {
     /// True when the buffer is logically empty (single empty line).
     pub fn is_empty(&self) -> bool {
         self.lines.len() == 1 && self.lines.first().is_none_or(String::is_empty)
+    }
+
+    /// Filter text for a leading slash command when the cursor is inside the
+    /// command token. Returns `None` once the cursor moves into arguments.
+    pub fn slash_command_filter_at_cursor(&self) -> Option<String> {
+        let (line_idx, cursor_offset) = self.cursor;
+        let line = self.lines.get(line_idx)?;
+        if !line.starts_with('/') {
+            return None;
+        }
+        let token_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        if cursor_offset > token_end {
+            return None;
+        }
+        let cursor = cursor_offset.min(line.len());
+        line.get(1..cursor).map(str::to_string)
+    }
+
+    /// Replace the current leading slash-command token with `command`, leaving a
+    /// trailing space so the operator can immediately type arguments.
+    fn replace_slash_command_token(&mut self, command: &str) {
+        let (line_idx, _cursor_offset) = self.cursor;
+        let Some(line) = self.lines.get_mut(line_idx) else {
+            return;
+        };
+        if !line.starts_with('/') {
+            return;
+        }
+        let token_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        let suffix = line.get(token_end..).unwrap_or_default().trim_start();
+        let replacement = if suffix.is_empty() {
+            format!("{command} ")
+        } else {
+            format!("{command} {suffix}")
+        };
+        *line = replacement;
+        self.cursor = (line_idx, command.len().saturating_add(1).min(line.len()));
+        self.history_pos = None;
+        self.pending_draft = None;
+        self.reverse_search = None;
     }
 
     /// Current draft size in bytes, counting newline separators between rows.
@@ -1518,6 +1730,7 @@ impl TuiState {
             sessions_status: String::new(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
+            slash_menu: None,
             sessions_cache: Vec::new(),
             saved_session_picker: None,
             active_session_view: None,
@@ -1612,7 +1825,15 @@ impl TuiState {
     /// Returns [`InputOutcome`] so the caller can react to submissions,
     /// cancellations, or scrolling intents.
     pub fn handle_input_key(&mut self, key: KeyEvent) -> InputOutcome {
-        self.input.handle_key(key)
+        let outcome = self.input.handle_key(key);
+        match &outcome {
+            InputOutcome::Submitted(_) | InputOutcome::Cancelled => self.slash_menu = None,
+            InputOutcome::Consumed | InputOutcome::Unhandled => {
+                sync_slash_menu_for_input(&self.input, &mut self.slash_menu);
+            }
+            InputOutcome::Ignored => {}
+        }
+        outcome
     }
 
     /// Toggle ASCII fallback mode for icons (`▸/▾` → `>/v`, `…` → `...`).
@@ -2088,6 +2309,8 @@ pub trait BottomChromeView {
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
     /// Open Ctrl+G session switcher overlay (v1.1b), or `None` when closed.
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState>;
+    /// Open slash-command menu overlay, or `None` when closed.
+    fn slash_menu(&self) -> Option<&SlashMenuState>;
     /// Open saved chat-session picker overlay (P7c), or `None` when closed.
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState>;
 }
@@ -2143,6 +2366,9 @@ impl BottomChromeView for TuiState {
     }
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
         self.switcher.as_ref()
+    }
+    fn slash_menu(&self) -> Option<&SlashMenuState> {
+        self.slash_menu.as_ref()
     }
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
         self.saved_session_picker.as_ref()
@@ -2200,6 +2426,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState> {
         self.switcher.as_ref()
+    }
+    fn slash_menu(&self) -> Option<&SlashMenuState> {
+        self.slash_menu.as_ref()
     }
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
         self.saved_session_picker.as_ref()
@@ -2468,6 +2697,12 @@ fn render_fullscreen_overlays<V: BottomChromeView + ?Sized>(frame: &mut Frame, f
         let area = centered_overlay_rect(frame_area, 92, 85, BOTTOM_CHROME_MIN_HEIGHT);
         frame.render_widget(Clear, area);
         render_saved_session_picker(frame, area, picker, state.ascii_fallback());
+        return;
+    }
+    if let Some(menu) = state.slash_menu() {
+        let area = centered_overlay_rect(frame_area, 92, 85, BOTTOM_CHROME_MIN_HEIGHT);
+        frame.render_widget(Clear, area);
+        render_slash_menu(frame, area, menu, state.ascii_fallback());
         return;
     }
     if let Some(switcher) = state.switcher() {
@@ -2795,6 +3030,160 @@ fn render_saved_session_picker(
         format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter resume \u{00B7} Esc close \u{00B7} {hidden} more ")
     } else {
         " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter resume \u{00B7} Esc close ".to_string()
+    };
+    let hint = if ascii {
+        hint.replace('\u{2191}', "Up").replace('\u{2193}', "Down")
+    } else {
+        hint
+    };
+    lines.push(Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))));
+
+    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn slash_menu_command_spans(spec: CommandSpec, filter: &str, selected: bool) -> Vec<Span<'static>> {
+    let style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    };
+    let highlight = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+    };
+    let filter = filter.trim_start_matches('/').to_ascii_lowercase();
+    let name = spec.name.to_string();
+    if filter.is_empty() {
+        return vec![Span::styled(name, style)];
+    }
+    let name_without_slash = spec.name.trim_start_matches('/');
+    let Some(pos) = name_without_slash.to_ascii_lowercase().find(&filter) else {
+        return vec![Span::styled(name, style)];
+    };
+    let start = pos.saturating_add(1);
+    let end = start.saturating_add(filter.len()).min(spec.name.len());
+    let mut spans = Vec::new();
+    if let Some(prefix) = spec.name.get(..start)
+        && !prefix.is_empty()
+    {
+        spans.push(Span::styled(prefix.to_string(), style));
+    }
+    if let Some(matched) = spec.name.get(start..end)
+        && !matched.is_empty()
+    {
+        spans.push(Span::styled(matched.to_string(), highlight));
+    }
+    if let Some(suffix) = spec.name.get(end..)
+        && !suffix.is_empty()
+    {
+        spans.push(Span::styled(suffix.to_string(), style));
+    }
+    spans
+}
+
+fn render_slash_menu_row(spec: CommandSpec, filter: &str, selected: bool, max_width: u16) -> Line<'static> {
+    let base_style = if selected {
+        Style::default()
+            .fg(Color::White)
+            .bg(Color::Magenta)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    };
+    if max_width == 0 {
+        return Line::default();
+    }
+    let command_width = 18usize.min(usize::from(max_width));
+    let mut spans = slash_menu_command_spans(spec, filter, selected);
+    let usage_tail = if spec.args_hint.is_empty() {
+        String::new()
+    } else {
+        format!(" {}", spec.args_hint)
+    };
+    let usage_cols = spec.name.chars().count().saturating_add(usage_tail.chars().count());
+    if !usage_tail.is_empty() && usage_cols <= command_width {
+        spans.push(Span::styled(usage_tail, base_style));
+    }
+    let used_cols = usage_cols.min(command_width);
+    if used_cols < command_width {
+        spans.push(Span::styled(" ".repeat(command_width - used_cols), base_style));
+    } else {
+        spans.push(Span::styled(" ", base_style));
+    }
+    let description_budget = usize::from(max_width).saturating_sub(command_width.saturating_add(1));
+    if description_budget > 0 {
+        let description = truncate_chars_with_ellipsis(
+            spec.description,
+            u16::try_from(description_budget).unwrap_or(u16::MAX),
+            true,
+        );
+        spans.push(Span::styled(description, base_style));
+    }
+    Line::from(spans)
+}
+
+fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &SlashMenuState, ascii: bool) {
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(" Slash commands ")
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.height == 0 {
+        return;
+    }
+
+    let hint_rows: u16 = 1;
+    let list_height = inner.height.saturating_sub(hint_rows) as usize;
+    if menu.is_empty() {
+        let empty =
+            Paragraph::new(" No matching slash commands. Esc to close. ").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, inner);
+        return;
+    }
+
+    let total = menu.len();
+    let selected = menu.selected.min(total.saturating_sub(1));
+    let start = if list_height == 0 || total <= list_height {
+        0
+    } else {
+        let half = list_height / 2;
+        selected.saturating_sub(half).min(total.saturating_sub(list_height))
+    };
+    let end = (start + list_height).min(total);
+    let marker = session_active_marker(true, ascii);
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(list_height.saturating_add(1));
+    for (idx, spec) in menu.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
+        let abs = start + idx;
+        let selected = abs == selected;
+        let mut row_spans = Vec::new();
+        let head = if selected {
+            format!("{marker} ")
+        } else {
+            "  ".to_string()
+        };
+        let head_style = if selected {
+            Style::default().fg(Color::White).bg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        row_spans.push(Span::styled(head, head_style));
+        row_spans.extend(render_slash_menu_row(*spec, &menu.filter, selected, inner.width.saturating_sub(2)).spans);
+        lines.push(Line::from(row_spans));
+    }
+
+    let hidden = total.saturating_sub(end).saturating_add(start);
+    let hint = if hidden > 0 {
+        format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter/Tab insert \u{00B7} Esc close \u{00B7} {hidden} more ")
+    } else {
+        " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter/Tab insert \u{00B7} Esc close ".to_string()
     };
     let hint = if ascii {
         hint.replace('\u{2191}', "Up").replace('\u{2193}', "Down")
@@ -5212,6 +5601,142 @@ mod tests {
         let out = state.handle_input_key(key(KeyCode::Char('z')));
         assert_eq!(out, InputOutcome::Consumed);
         assert_eq!(state.input.text(), "z");
+    }
+
+    #[test]
+    fn slash_menu_opens_when_input_starts_with_slash() {
+        let mut state = TuiState::new("p", "m");
+
+        let out = dispatch_global_key(key(KeyCode::Char('/')), &mut state);
+
+        assert_eq!(out, KeyDispatch::Consumed);
+        let menu = state.slash_menu.as_ref().expect("slash menu open");
+        assert!(menu.len() >= 30, "registry-backed menu should include all commands");
+        assert!(menu.entries.iter().any(|spec| spec.name == "/help"));
+        assert_eq!(state.input.text(), "/");
+    }
+
+    #[test]
+    fn slash_menu_filters_from_command_token() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/mo".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("slash menu open");
+        assert_eq!(menu.filter, "mo");
+        assert!(menu.entries.iter().any(|spec| spec.name == "/model"));
+        assert!(
+            menu.entries.iter().all(|spec| spec.name != "/provider"),
+            "P0 /mo filter should exclude unrelated commands: {:?}",
+            menu.entries
+        );
+    }
+
+    #[test]
+    fn slash_menu_navigation_and_enter_insert_command_name() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+        let first = state.slash_menu.as_ref().expect("slash menu open").selected;
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        let moved = state.slash_menu.as_ref().expect("slash menu still open").selected;
+        assert_ne!(first, moved, "Down moves slash menu selection");
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(
+            state.slash_menu.as_ref().expect("slash menu still open").selected,
+            first,
+            "Up moves selection back"
+        );
+
+        for ch in "mo".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "/model ");
+        assert_eq!(state.input.cursor, (0, "/model ".len()));
+        assert!(state.slash_menu.is_none(), "selecting closes slash menu");
+    }
+
+    #[test]
+    fn slash_menu_tab_inserts_command_and_esc_dismisses_without_clearing_input() {
+        let mut tab_state = TuiState::new("p", "m");
+        for ch in "/ex".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut tab_state),
+                KeyDispatch::Consumed
+            );
+        }
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Tab), &mut tab_state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(tab_state.input.text(), "/export ");
+        assert!(tab_state.slash_menu.is_none());
+
+        let mut esc_state = TuiState::new("p", "m");
+        for ch in "/mo".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut esc_state),
+                KeyDispatch::Consumed
+            );
+        }
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Esc), &mut esc_state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(esc_state.input.text(), "/mo");
+        assert!(esc_state.slash_menu.is_none(), "Esc closes menu only");
+    }
+
+    #[test]
+    fn input_history_up_down_still_work_when_slash_menu_closed() {
+        let mut state = TuiState::new("p", "m");
+        state.input.history.push("older command".to_string());
+
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "older command");
+        assert!(state.slash_menu.is_none());
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert!(state.input.is_empty());
+    }
+
+    #[test]
+    fn fullscreen_slash_menu_renders_as_overlay_with_filtered_command() {
+        let mut state = TuiState::new("provider", "model");
+        state.slash_menu = Some(SlashMenuState::new("mo"));
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 80, 24, &mut scroll);
+
+        assert!(
+            rows.iter().any(|row| row.contains("Slash commands")),
+            "slash menu title rendered: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("/model")),
+            "filtered command rendered: {rows:?}"
+        );
     }
 
     #[test]
