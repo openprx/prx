@@ -1458,6 +1458,16 @@ impl TuiInput {
             .get(command_end..)
             .and_then(|tail| tail.find(|ch: char| !ch.is_whitespace()))
         else {
+            let insertion = if append_space {
+                format!("{value} ")
+            } else {
+                value.to_string()
+            };
+            line.insert_str(cursor, &insertion);
+            self.cursor = (line_idx, cursor.saturating_add(insertion.len()).min(line.len()));
+            self.history_pos = None;
+            self.pending_draft = None;
+            self.reverse_search = None;
             return;
         };
         let args_start = command_end.saturating_add(args_offset);
@@ -6296,6 +6306,50 @@ mod tests {
             );
         }
 
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "/export json ");
+        assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
+    fn slash_menu_enter_inserts_argument_candidate_at_trailing_space() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/export ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("export arg menu open");
+        assert_eq!(menu.selected_entry().map(|entry| entry.label.as_str()), Some("md"));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "/export md ");
+        assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
+    fn slash_menu_down_enter_inserts_argument_candidate_at_trailing_space() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/export ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        let menu = state.slash_menu.as_ref().expect("export arg menu open");
+        assert_eq!(menu.selected_entry().map(|entry| entry.label.as_str()), Some("json"));
         assert_eq!(
             dispatch_global_key(key(KeyCode::Enter), &mut state),
             KeyDispatch::Consumed
