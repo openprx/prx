@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::loop_::ChatMode;
-use crate::chat::commands::{CommandSpec, command_specs};
+use crate::chat::commands::{CommandArgCandidate, CommandArgSource, CommandSpec, command_specs};
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
 };
@@ -112,6 +112,10 @@ pub struct TuiState {
     /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
     /// run async registry queries) when opening the switcher with Ctrl+G.
     pub sessions_cache: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// Cached saved chat sessions for `/resume` slash-menu argument candidates.
+    pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    /// Enumerable model candidates grouped by provider for slash-menu drill-down.
+    pub provider_model_catalog: Vec<SlashProviderModelCatalog>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
@@ -130,8 +134,49 @@ pub struct TuiState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlashMenuState {
     pub filter: String,
-    pub entries: Vec<CommandSpec>,
+    pub entries: Vec<SlashMenuEntry>,
     pub selected: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashMenuEntry {
+    pub label: String,
+    pub args_hint: String,
+    pub description: String,
+    pub insert_text: String,
+    pub append_space: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashProviderModelCatalog {
+    pub provider: String,
+    pub models: Vec<SlashModelCandidate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlashModelCandidate {
+    pub name: String,
+    pub description: String,
+}
+
+pub(crate) struct SlashMenuSources<'a> {
+    pub live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
+    pub saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
+    pub provider_model_catalog: &'a [SlashProviderModelCatalog],
+    pub current_provider: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SlashCursorContext {
+    Command {
+        filter: String,
+    },
+    Argument {
+        command: String,
+        arg_index: usize,
+        filter: String,
+        previous_args: Vec<String>,
+    },
 }
 
 impl SlashMenuState {
@@ -139,7 +184,16 @@ impl SlashMenuState {
     pub fn new(filter: &str) -> Self {
         Self {
             filter: filter.to_string(),
-            entries: filtered_command_specs(filter),
+            entries: filtered_command_entries(filter),
+            selected: 0,
+        }
+    }
+
+    #[must_use]
+    pub fn new_with_entries(filter: &str, entries: Vec<SlashMenuEntry>) -> Self {
+        Self {
+            filter: filter.to_string(),
+            entries,
             selected: 0,
         }
     }
@@ -157,7 +211,14 @@ impl SlashMenuState {
     pub fn refresh(&mut self, filter: &str) {
         self.filter.clear();
         self.filter.push_str(filter);
-        self.entries = filtered_command_specs(filter);
+        self.entries = filtered_command_entries(filter);
+        self.clamp_selected();
+    }
+
+    pub fn refresh_with_entries(&mut self, filter: &str, entries: Vec<SlashMenuEntry>) {
+        self.filter.clear();
+        self.filter.push_str(filter);
+        self.entries = entries;
         self.clamp_selected();
     }
 
@@ -188,12 +249,88 @@ impl SlashMenuState {
     }
 
     #[must_use]
-    pub fn selected_entry(&self) -> Option<CommandSpec> {
-        self.entries.get(self.selected).copied()
+    pub fn selected_entry(&self) -> Option<&SlashMenuEntry> {
+        self.entries.get(self.selected)
     }
 }
 
-fn filtered_command_specs(filter: &str) -> Vec<CommandSpec> {
+impl SlashMenuEntry {
+    fn from_command(spec: CommandSpec) -> Self {
+        Self {
+            label: spec.name.to_string(),
+            args_hint: spec.args_hint.to_string(),
+            description: spec.description.to_string(),
+            insert_text: spec.name.to_string(),
+            append_space: true,
+        }
+    }
+
+    fn argument(value: impl Into<String>, description: impl Into<String>) -> Self {
+        let value = value.into();
+        Self {
+            label: value.clone(),
+            args_hint: String::new(),
+            description: description.into(),
+            insert_text: value,
+            append_space: true,
+        }
+    }
+}
+
+#[must_use]
+pub fn slash_provider_model_catalog_from_config(config: &crate::config::Config) -> Vec<SlashProviderModelCatalog> {
+    let mut catalog: Vec<SlashProviderModelCatalog> = Vec::new();
+    if let (Some(provider), Some(model)) = (config.default_provider.as_deref(), config.default_model.as_deref()) {
+        push_model_candidate(&mut catalog, provider, model, "Configured default model");
+    }
+    for route in &config.model_routes {
+        push_model_candidate(
+            &mut catalog,
+            &route.provider,
+            &route.model,
+            format!("Model route hint: {}", route.hint),
+        );
+    }
+    for model in &config.router.models {
+        push_model_candidate(&mut catalog, &model.provider, &model.model_id, "Router model candidate");
+    }
+    catalog
+}
+
+fn push_model_candidate(
+    catalog: &mut Vec<SlashProviderModelCatalog>,
+    provider: &str,
+    model: &str,
+    description: impl Into<String>,
+) {
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() {
+        return;
+    }
+    let description = description.into();
+    if let Some(entry) = catalog
+        .iter_mut()
+        .find(|entry| entry.provider.eq_ignore_ascii_case(provider))
+    {
+        if !entry.models.iter().any(|candidate| candidate.name == model) {
+            entry.models.push(SlashModelCandidate {
+                name: model.to_string(),
+                description,
+            });
+        }
+        return;
+    }
+    catalog.push(SlashProviderModelCatalog {
+        provider: provider.to_string(),
+        models: vec![SlashModelCandidate {
+            name: model.to_string(),
+            description,
+        }],
+    });
+}
+
+fn filtered_command_entries(filter: &str) -> Vec<SlashMenuEntry> {
     let needle = filter.trim_start_matches('/').to_ascii_lowercase();
     command_specs()
         .iter()
@@ -204,6 +341,7 @@ fn filtered_command_specs(filter: &str) -> Vec<CommandSpec> {
             }
             command_matches_filter(*spec, &needle)
         })
+        .map(SlashMenuEntry::from_command)
         .collect()
 }
 
@@ -457,21 +595,190 @@ pub enum KeyDispatch {
 }
 
 pub(crate) fn sync_slash_menu_for_input(input: &TuiInput, slash_menu: &mut Option<SlashMenuState>) {
-    if let Some(filter) = input.slash_command_filter_at_cursor() {
-        if let Some(menu) = slash_menu.as_mut() {
-            menu.refresh(&filter);
-        } else {
-            *slash_menu = Some(SlashMenuState::new(&filter));
-        }
-    } else {
+    let sources = SlashMenuSources {
+        live_sessions: &[],
+        saved_sessions: &[],
+        provider_model_catalog: &[],
+        current_provider: "",
+    };
+    sync_slash_menu_for_sources(input, slash_menu, sources);
+}
+
+pub(crate) fn sync_slash_menu_for_sources(
+    input: &TuiInput,
+    slash_menu: &mut Option<SlashMenuState>,
+    sources: SlashMenuSources<'_>,
+) {
+    let Some(context) = input.slash_cursor_context() else {
         *slash_menu = None;
+        return;
+    };
+    match context {
+        SlashCursorContext::Command { filter } => {
+            if let Some(menu) = slash_menu.as_mut() {
+                menu.refresh(&filter);
+            } else {
+                *slash_menu = Some(SlashMenuState::new(&filter));
+            }
+        }
+        SlashCursorContext::Argument {
+            command,
+            arg_index,
+            filter,
+            previous_args,
+        } => {
+            let entries = argument_candidate_entries(&command, arg_index, &filter, &previous_args, sources);
+            if entries.is_empty() {
+                *slash_menu = None;
+            } else if let Some(menu) = slash_menu.as_mut() {
+                menu.refresh_with_entries(&filter, entries);
+            } else {
+                *slash_menu = Some(SlashMenuState::new_with_entries(&filter, entries));
+            }
+        }
     }
+}
+
+fn argument_candidate_entries(
+    command: &str,
+    arg_index: usize,
+    filter: &str,
+    previous_args: &[String],
+    sources: SlashMenuSources<'_>,
+) -> Vec<SlashMenuEntry> {
+    let Some(spec) = command_specs()
+        .iter()
+        .find(|spec| spec.name == command || spec.aliases.iter().any(|alias| *alias == command))
+        .copied()
+    else {
+        return Vec::new();
+    };
+    let source = if spec.name == "/provider" && arg_index == 1 {
+        CommandArgSource::ProviderModels
+    } else if arg_index == 0 {
+        spec.arg.source
+    } else {
+        CommandArgSource::None
+    };
+    let needle = filter.to_ascii_lowercase();
+    let mut entries = match source {
+        CommandArgSource::None | CommandArgSource::FreeText => Vec::new(),
+        CommandArgSource::Static(candidates) => static_candidate_entries(candidates),
+        CommandArgSource::Themes => theme_candidate_entries(),
+        CommandArgSource::LiveSessions => live_session_candidate_entries(sources.live_sessions),
+        CommandArgSource::SavedSessions => saved_session_candidate_entries(sources.saved_sessions),
+        CommandArgSource::Providers => provider_candidate_entries(),
+        CommandArgSource::CurrentProviderModels => {
+            model_candidate_entries(sources.provider_model_catalog, sources.current_provider)
+        }
+        CommandArgSource::ProviderModels => {
+            let provider = previous_args.first().map_or("", String::as_str);
+            model_candidate_entries(sources.provider_model_catalog, provider)
+        }
+    };
+    if needle.is_empty() {
+        return entries;
+    }
+    entries.retain(|entry| {
+        entry.label.to_ascii_lowercase().contains(&needle)
+            || entry.description.to_ascii_lowercase().contains(&needle)
+            || entry.insert_text.to_ascii_lowercase().contains(&needle)
+    });
+    entries
+}
+
+fn static_candidate_entries(candidates: &[CommandArgCandidate]) -> Vec<SlashMenuEntry> {
+    candidates
+        .iter()
+        .map(|candidate| SlashMenuEntry::argument(candidate.value, candidate.description))
+        .collect()
+}
+
+fn theme_candidate_entries() -> Vec<SlashMenuEntry> {
+    ["dark", "light", "monokai"]
+        .into_iter()
+        .map(|name| SlashMenuEntry::argument(name, "Chat color theme"))
+        .collect()
+}
+
+fn live_session_candidate_entries(entries: &[crate::chat::sessions::SwitcherEntry]) -> Vec<SlashMenuEntry> {
+    entries
+        .iter()
+        .filter(|entry| !entry.is_transcript())
+        .map(|entry| {
+            SlashMenuEntry::argument(
+                format!("#{}", entry.seq),
+                format!("{} {} - {}", entry.kind, entry.status, entry.title),
+            )
+        })
+        .collect()
+}
+
+fn saved_session_candidate_entries(entries: &[crate::chat::session::SavedSessionPickerEntry]) -> Vec<SlashMenuEntry> {
+    let mut out = vec![SlashMenuEntry::argument("last", "Most recently saved session")];
+    out.extend(entries.iter().map(|entry| {
+        let title = if entry.title.is_empty() {
+            "(untitled)".to_string()
+        } else {
+            entry.title.clone()
+        };
+        SlashMenuEntry::argument(
+            entry.id.clone(),
+            format!("{} turns - {} / {}", entry.turn_count, title, entry.model),
+        )
+    }));
+    out
+}
+
+fn provider_candidate_entries() -> Vec<SlashMenuEntry> {
+    crate::providers::list_providers()
+        .into_iter()
+        .map(|provider| {
+            let mut description = provider.display_name.to_string();
+            if provider.local {
+                description.push_str(" - local");
+            }
+            SlashMenuEntry::argument(provider.name, description)
+        })
+        .collect()
+}
+
+fn model_candidate_entries(catalog: &[SlashProviderModelCatalog], provider: &str) -> Vec<SlashMenuEntry> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Vec::new();
+    }
+    catalog
+        .iter()
+        .find(|entry| entry.provider.eq_ignore_ascii_case(provider))
+        .map_or_else(Vec::new, |entry| {
+            entry
+                .models
+                .iter()
+                .map(|model| SlashMenuEntry::argument(model.name.clone(), model.description.clone()))
+                .collect()
+        })
 }
 
 pub(crate) fn dispatch_slash_menu_key_for(
     input: &mut TuiInput,
     slash_menu: &mut Option<SlashMenuState>,
     key: KeyEvent,
+) -> KeyDispatch {
+    let sources = SlashMenuSources {
+        live_sessions: &[],
+        saved_sessions: &[],
+        provider_model_catalog: &[],
+        current_provider: "",
+    };
+    dispatch_slash_menu_key_with_sources(input, slash_menu, key, sources)
+}
+
+pub(crate) fn dispatch_slash_menu_key_with_sources(
+    input: &mut TuiInput,
+    slash_menu: &mut Option<SlashMenuState>,
+    key: KeyEvent,
+    sources: SlashMenuSources<'_>,
 ) -> KeyDispatch {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
@@ -489,10 +796,16 @@ pub(crate) fn dispatch_slash_menu_key_for(
     }
 
     if (key.code == KeyCode::Enter || key.code == KeyCode::Tab) && key.modifiers == KeyModifiers::NONE {
-        if let Some(spec) = slash_menu.as_ref().and_then(SlashMenuState::selected_entry) {
-            input.replace_slash_command_token(spec.name);
+        if let Some(entry) = slash_menu.as_ref().and_then(SlashMenuState::selected_entry).cloned() {
+            match input.slash_cursor_context() {
+                Some(SlashCursorContext::Command { .. }) => input.replace_slash_command_token(&entry.insert_text),
+                Some(SlashCursorContext::Argument { .. }) => {
+                    input.replace_slash_argument_token(&entry.insert_text, entry.append_space);
+                }
+                None => {}
+            }
         }
-        *slash_menu = None;
+        sync_slash_menu_for_sources(input, slash_menu, sources);
         return KeyDispatch::Consumed;
     }
 
@@ -522,7 +835,7 @@ pub(crate) fn dispatch_slash_menu_key_for(
                 KeyDispatch::Cancelled
             }
             InputOutcome::Consumed | InputOutcome::Unhandled => {
-                sync_slash_menu_for_input(input, slash_menu);
+                sync_slash_menu_for_sources(input, slash_menu, sources);
                 KeyDispatch::Consumed
             }
             InputOutcome::Ignored => KeyDispatch::Ignored,
@@ -713,7 +1026,13 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         return dispatch_saved_session_picker_key(key, state);
     }
     if state.slash_menu.is_some() {
-        return dispatch_slash_menu_key_for(&mut state.input, &mut state.slash_menu, key);
+        let sources = SlashMenuSources {
+            live_sessions: &state.sessions_cache,
+            saved_sessions: &state.saved_sessions_cache,
+            provider_model_catalog: &state.provider_model_catalog,
+            current_provider: &state.provider,
+        };
+        return dispatch_slash_menu_key_with_sources(&mut state.input, &mut state.slash_menu, key, sources);
     }
     // v1.1b: when the Ctrl+G switcher overlay is open it captures navigation /
     // selection keys before anything else (Tab, input box, etc.). Handled in a
@@ -1045,17 +1364,57 @@ impl TuiInput {
     /// Filter text for a leading slash command when the cursor is inside the
     /// command token. Returns `None` once the cursor moves into arguments.
     pub fn slash_command_filter_at_cursor(&self) -> Option<String> {
+        match self.slash_cursor_context() {
+            Some(SlashCursorContext::Command { filter }) => Some(filter),
+            _ => None,
+        }
+    }
+
+    fn slash_cursor_context(&self) -> Option<SlashCursorContext> {
         let (line_idx, cursor_offset) = self.cursor;
         let line = self.lines.get(line_idx)?;
         if !line.starts_with('/') {
             return None;
         }
-        let token_end = line.find(char::is_whitespace).unwrap_or(line.len());
-        if cursor_offset > token_end {
+        let cursor = cursor_offset.min(line.len());
+        let command_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        if cursor <= command_end {
+            return line.get(1..cursor).map(|filter| SlashCursorContext::Command {
+                filter: filter.to_string(),
+            });
+        }
+        let command = line.get(..command_end)?.to_string();
+        let Some(args_start) = line
+            .get(command_end..)?
+            .find(|ch: char| !ch.is_whitespace())
+            .map(|offset| command_end.saturating_add(offset))
+        else {
+            return Some(SlashCursorContext::Argument {
+                command,
+                arg_index: 0,
+                filter: String::new(),
+                previous_args: Vec::new(),
+            });
+        };
+        if cursor < args_start {
             return None;
         }
-        let cursor = cursor_offset.min(line.len());
-        line.get(1..cursor).map(str::to_string)
+        let before_cursor = line.get(args_start..cursor)?;
+        let mut parts = before_cursor.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+        let cursor_after_whitespace = before_cursor.chars().last().is_some_and(char::is_whitespace);
+        let (arg_index, filter, previous_args) = if cursor_after_whitespace {
+            (parts.len(), String::new(), parts)
+        } else if let Some(filter) = parts.pop() {
+            (parts.len(), filter, parts)
+        } else {
+            (0, String::new(), Vec::new())
+        };
+        Some(SlashCursorContext::Argument {
+            command,
+            arg_index,
+            filter,
+            previous_args,
+        })
     }
 
     /// Replace the current leading slash-command token with `command`, leaving a
@@ -1077,6 +1436,56 @@ impl TuiInput {
         };
         *line = replacement;
         self.cursor = (line_idx, command.len().saturating_add(1).min(line.len()));
+        self.history_pos = None;
+        self.pending_draft = None;
+        self.reverse_search = None;
+    }
+
+    fn replace_slash_argument_token(&mut self, value: &str, append_space: bool) {
+        let (line_idx, cursor_offset) = self.cursor;
+        let Some(line) = self.lines.get_mut(line_idx) else {
+            return;
+        };
+        if !line.starts_with('/') {
+            return;
+        }
+        let cursor = cursor_offset.min(line.len());
+        let command_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        if cursor <= command_end {
+            return;
+        }
+        let Some(args_offset) = line
+            .get(command_end..)
+            .and_then(|tail| tail.find(|ch: char| !ch.is_whitespace()))
+        else {
+            return;
+        };
+        let args_start = command_end.saturating_add(args_offset);
+        if cursor < args_start {
+            return;
+        }
+
+        let mut token_start = args_start;
+        for (offset, ch) in line.get(args_start..cursor).unwrap_or_default().char_indices() {
+            if ch.is_whitespace() {
+                token_start = args_start.saturating_add(offset).saturating_add(ch.len_utf8());
+            }
+        }
+        let token_end = line
+            .get(cursor..)
+            .and_then(|tail| tail.find(char::is_whitespace))
+            .map_or(line.len(), |offset| cursor.saturating_add(offset));
+        let suffix = line.get(token_end..).unwrap_or_default().to_string();
+        let insertion = if append_space {
+            format!("{value} ")
+        } else {
+            value.to_string()
+        };
+        line.replace_range(token_start..token_end, &insertion);
+        self.cursor = (line_idx, token_start.saturating_add(insertion.len()).min(line.len()));
+        if !suffix.is_empty() && !line.ends_with(&suffix) {
+            line.push_str(&suffix);
+        }
         self.history_pos = None;
         self.pending_draft = None;
         self.reverse_search = None;
@@ -1135,6 +1544,8 @@ impl TuiInput {
         }
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
+            self.history_pos = None;
+            self.pending_draft = None;
             // `off` is always at a char boundary because we only ever advance
             // by `ch.len_utf8()` from prior inserts and via `floor_char_boundary`.
             let clamped = off.min(line.len());
@@ -1153,6 +1564,8 @@ impl TuiInput {
         if text.is_empty() {
             return;
         }
+        self.history_pos = None;
+        self.pending_draft = None;
         let remaining = INPUT_MAX_BYTES.saturating_sub(self.byte_len());
         let text = if text.len() > remaining {
             self.truncated = true;
@@ -1199,6 +1612,8 @@ impl TuiInput {
             self.truncated = true;
             return;
         }
+        self.history_pos = None;
+        self.pending_draft = None;
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
             let clamped = off.min(line.len());
@@ -1211,6 +1626,8 @@ impl TuiInput {
     /// Delete the character before the cursor; join with previous line if at
     /// column 0.
     fn backspace(&mut self) {
+        self.history_pos = None;
+        self.pending_draft = None;
         let (li, off) = self.cursor;
         if off > 0 {
             if let Some(line) = self.lines.get_mut(li) {
@@ -1235,6 +1652,8 @@ impl TuiInput {
 
     /// Delete the character at the cursor; join next line if at end of line.
     fn delete_forward(&mut self) {
+        self.history_pos = None;
+        self.pending_draft = None;
         let (li, off) = self.cursor;
         let line_len = self.lines.get(li).map_or(0, String::len);
         if off < line_len {
@@ -1336,6 +1755,8 @@ impl TuiInput {
 
     /// Delete from start of current line up to cursor (`Ctrl+U`).
     fn delete_to_line_start(&mut self) {
+        self.history_pos = None;
+        self.pending_draft = None;
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
             line.replace_range(0..off.min(line.len()), "");
@@ -1732,6 +2153,8 @@ impl TuiState {
             switcher: None,
             slash_menu: None,
             sessions_cache: Vec::new(),
+            saved_sessions_cache: Vec::new(),
+            provider_model_catalog: Vec::new(),
             saved_session_picker: None,
             active_session_view: None,
             pending_tool_approval: None,
@@ -1829,7 +2252,13 @@ impl TuiState {
         match &outcome {
             InputOutcome::Submitted(_) | InputOutcome::Cancelled => self.slash_menu = None,
             InputOutcome::Consumed | InputOutcome::Unhandled => {
-                sync_slash_menu_for_input(&self.input, &mut self.slash_menu);
+                let sources = SlashMenuSources {
+                    live_sessions: &self.sessions_cache,
+                    saved_sessions: &self.saved_sessions_cache,
+                    provider_model_catalog: &self.provider_model_catalog,
+                    current_provider: &self.provider,
+                };
+                sync_slash_menu_for_sources(&self.input, &mut self.slash_menu, sources);
             }
             InputOutcome::Ignored => {}
         }
@@ -3041,7 +3470,7 @@ fn render_saved_session_picker(
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
-fn slash_menu_command_spans(spec: CommandSpec, filter: &str, selected: bool) -> Vec<Span<'static>> {
+fn slash_menu_command_spans(entry: &SlashMenuEntry, filter: &str, selected: bool) -> Vec<Span<'static>> {
     let style = if selected {
         Style::default()
             .fg(Color::White)
@@ -3059,28 +3488,28 @@ fn slash_menu_command_spans(spec: CommandSpec, filter: &str, selected: bool) -> 
         Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
     };
     let filter = filter.trim_start_matches('/').to_ascii_lowercase();
-    let name = spec.name.to_string();
+    let name = entry.label.clone();
     if filter.is_empty() {
         return vec![Span::styled(name, style)];
     }
-    let name_without_slash = spec.name.trim_start_matches('/');
+    let name_without_slash = entry.label.trim_start_matches('/');
     let Some(pos) = name_without_slash.to_ascii_lowercase().find(&filter) else {
         return vec![Span::styled(name, style)];
     };
     let start = pos.saturating_add(1);
-    let end = start.saturating_add(filter.len()).min(spec.name.len());
+    let end = start.saturating_add(filter.len()).min(entry.label.len());
     let mut spans = Vec::new();
-    if let Some(prefix) = spec.name.get(..start)
+    if let Some(prefix) = entry.label.get(..start)
         && !prefix.is_empty()
     {
         spans.push(Span::styled(prefix.to_string(), style));
     }
-    if let Some(matched) = spec.name.get(start..end)
+    if let Some(matched) = entry.label.get(start..end)
         && !matched.is_empty()
     {
         spans.push(Span::styled(matched.to_string(), highlight));
     }
-    if let Some(suffix) = spec.name.get(end..)
+    if let Some(suffix) = entry.label.get(end..)
         && !suffix.is_empty()
     {
         spans.push(Span::styled(suffix.to_string(), style));
@@ -3088,7 +3517,7 @@ fn slash_menu_command_spans(spec: CommandSpec, filter: &str, selected: bool) -> 
     spans
 }
 
-fn render_slash_menu_row(spec: CommandSpec, filter: &str, selected: bool, max_width: u16) -> Line<'static> {
+fn render_slash_menu_row(entry: &SlashMenuEntry, filter: &str, selected: bool, max_width: u16) -> Line<'static> {
     let base_style = if selected {
         Style::default()
             .fg(Color::White)
@@ -3101,13 +3530,13 @@ fn render_slash_menu_row(spec: CommandSpec, filter: &str, selected: bool, max_wi
         return Line::default();
     }
     let command_width = 18usize.min(usize::from(max_width));
-    let mut spans = slash_menu_command_spans(spec, filter, selected);
-    let usage_tail = if spec.args_hint.is_empty() {
+    let mut spans = slash_menu_command_spans(entry, filter, selected);
+    let usage_tail = if entry.args_hint.is_empty() {
         String::new()
     } else {
-        format!(" {}", spec.args_hint)
+        format!(" {}", entry.args_hint)
     };
-    let usage_cols = spec.name.chars().count().saturating_add(usage_tail.chars().count());
+    let usage_cols = entry.label.chars().count().saturating_add(usage_tail.chars().count());
     if !usage_tail.is_empty() && usage_cols <= command_width {
         spans.push(Span::styled(usage_tail, base_style));
     }
@@ -3120,7 +3549,7 @@ fn render_slash_menu_row(spec: CommandSpec, filter: &str, selected: bool, max_wi
     let description_budget = usize::from(max_width).saturating_sub(command_width.saturating_add(1));
     if description_budget > 0 {
         let description = truncate_chars_with_ellipsis(
-            spec.description,
+            &entry.description,
             u16::try_from(description_budget).unwrap_or(u16::MAX),
             true,
         );
@@ -3160,7 +3589,7 @@ fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &SlashMenuState, ascii
     let end = (start + list_height).min(total);
     let marker = session_active_marker(true, ascii);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(list_height.saturating_add(1));
-    for (idx, spec) in menu.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
+    for (idx, entry) in menu.entries.get(start..end).unwrap_or(&[]).iter().enumerate() {
         let abs = start + idx;
         let selected = abs == selected;
         let mut row_spans = Vec::new();
@@ -3175,7 +3604,7 @@ fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &SlashMenuState, ascii
             Style::default().fg(Color::White)
         };
         row_spans.push(Span::styled(head, head_style));
-        row_spans.extend(render_slash_menu_row(*spec, &menu.filter, selected, inner.width.saturating_sub(2)).spans);
+        row_spans.extend(render_slash_menu_row(entry, &menu.filter, selected, inner.width.saturating_sub(2)).spans);
         lines.push(Line::from(row_spans));
     }
 
@@ -5612,7 +6041,7 @@ mod tests {
         assert_eq!(out, KeyDispatch::Consumed);
         let menu = state.slash_menu.as_ref().expect("slash menu open");
         assert!(menu.len() >= 30, "registry-backed menu should include all commands");
-        assert!(menu.entries.iter().any(|spec| spec.name == "/help"));
+        assert!(menu.entries.iter().any(|entry| entry.label == "/help"));
         assert_eq!(state.input.text(), "/");
     }
 
@@ -5628,9 +6057,9 @@ mod tests {
 
         let menu = state.slash_menu.as_ref().expect("slash menu open");
         assert_eq!(menu.filter, "mo");
-        assert!(menu.entries.iter().any(|spec| spec.name == "/model"));
+        assert!(menu.entries.iter().any(|entry| entry.label == "/model"));
         assert!(
-            menu.entries.iter().all(|spec| spec.name != "/provider"),
+            menu.entries.iter().all(|entry| entry.label != "/provider"),
             "P0 /mo filter should exclude unrelated commands: {:?}",
             menu.entries
         );
@@ -5689,7 +6118,13 @@ mod tests {
             KeyDispatch::Consumed
         );
         assert_eq!(tab_state.input.text(), "/export ");
-        assert!(tab_state.slash_menu.is_none());
+        assert!(
+            tab_state
+                .slash_menu
+                .as_ref()
+                .is_some_and(|menu| menu.entries.iter().any(|entry| entry.label == "json")),
+            "selecting /export should drill down to format candidates"
+        );
 
         let mut esc_state = TuiState::new("p", "m");
         for ch in "/mo".chars() {
@@ -5737,6 +6172,165 @@ mod tests {
             rows.iter().any(|row| row.contains("/model")),
             "filtered command rendered: {rows:?}"
         );
+    }
+
+    #[test]
+    fn slash_menu_export_arg_shows_static_candidates() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/export ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("export arg menu open");
+        assert!(menu.entries.iter().any(|entry| entry.label == "md"));
+        assert!(menu.entries.iter().any(|entry| entry.label == "json"));
+    }
+
+    #[test]
+    fn slash_menu_free_text_command_has_no_second_level_menu() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/bg ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert!(state.slash_menu.is_none(), "free-text /bg should not force candidates");
+    }
+
+    #[test]
+    fn slash_menu_kill_arg_uses_live_session_cache() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 7,
+            kind: "agent",
+            origin: "user",
+            status: "running",
+            title: "build release".to_string(),
+        }];
+        for ch in "/kill ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("kill arg menu open");
+        assert!(
+            menu.entries
+                .iter()
+                .any(|entry| entry.label == "#7" && entry.description.contains("build release")),
+            "live session row rendered from cache: {:?}",
+            menu.entries
+        );
+    }
+
+    #[test]
+    fn slash_menu_provider_and_model_candidates_degrade_from_catalog() {
+        let mut state = TuiState::new("openai", "gpt-5.2");
+        state.provider_model_catalog = vec![SlashProviderModelCatalog {
+            provider: "openai".to_string(),
+            models: vec![SlashModelCandidate {
+                name: "gpt-5.2".to_string(),
+                description: "Configured default model".to_string(),
+            }],
+        }];
+        for ch in "/provider ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+        assert!(
+            state
+                .slash_menu
+                .as_ref()
+                .expect("provider menu open")
+                .entries
+                .iter()
+                .any(|entry| entry.label == "openai")
+        );
+
+        for ch in "openai ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+        let menu = state.slash_menu.as_ref().expect("provider model menu open");
+        assert!(menu.entries.iter().any(|entry| entry.label == "gpt-5.2"));
+    }
+
+    #[test]
+    fn slash_menu_model_arg_uses_current_provider_models() {
+        let mut state = TuiState::new("openai", "gpt-5.2");
+        state.provider_model_catalog = vec![SlashProviderModelCatalog {
+            provider: "openai".to_string(),
+            models: vec![SlashModelCandidate {
+                name: "gpt-5-mini".to_string(),
+                description: "Router model candidate".to_string(),
+            }],
+        }];
+        for ch in "/model ".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("model arg menu open");
+        assert!(menu.entries.iter().any(|entry| entry.label == "gpt-5-mini"));
+    }
+
+    #[test]
+    fn slash_menu_enter_inserts_argument_candidate_token() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/export j".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "/export json ");
+        assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
+    fn input_history_edit_then_up_down_steps_clean_entries() {
+        let mut state = TuiState::new("p", "m");
+        state.input.history.push("one".to_string());
+        state.input.history.push("two".to_string());
+
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "two");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Char('!')), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "two!");
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "two", "Up restarts from a clean history entry");
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "one");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "two");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "two!", "Down restores the edited draft");
     }
 
     #[test]

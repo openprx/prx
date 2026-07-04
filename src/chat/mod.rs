@@ -1818,6 +1818,13 @@ pub async fn run(
         let mut state = tui::TuiState::new(provider_name, model_name);
         state.chat_mode = chat_session.mode;
         state.autonomy_level = config.autonomy.level;
+        state.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
+        if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
+            state.saved_sessions_cache = sessions
+                .iter()
+                .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
+                .collect();
+        }
         Arc::new(parking_lot::Mutex::new(state))
     };
 
@@ -2716,6 +2723,10 @@ pub async fn run(
                     if let Some(slot) = model_slot.as_ref() {
                         slot.set(Arc::from(new_model));
                     }
+                    #[cfg(feature = "terminal-tui")]
+                    {
+                        chat_mirror.lock().model = new_model.to_string();
+                    }
                     let _ = chat_dispatcher.dispatch_or_log(
                         crate::chat::action::Action::ModelChanged {
                             model: new_model.to_string(),
@@ -2808,6 +2819,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         }
                     }
                     current_provider_owned = new_provider.clone();
+                    #[cfg(feature = "terminal-tui")]
+                    {
+                        let mut mirror = chat_mirror.lock();
+                        mirror.provider = new_provider.clone();
+                        if model_changed {
+                            mirror.model = candidate_model.clone();
+                        }
+                    }
                     // (d) session 账本：dispatch ProviderChanged，reducer 更新
                     // session.provider（必要时连带 session.model），使 status bar /
                     // UI snapshot 实时反映新 provider。三处（legacy provider 句柄、
@@ -3040,8 +3059,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             )
                                         })
                                         .collect::<Vec<_>>();
-                                    chat_mirror.lock().saved_session_picker =
-                                        Some(crate::chat::session::SavedSessionPickerState::new(entries.clone()));
+                                    {
+                                        let mut mirror = chat_mirror.lock();
+                                        mirror.saved_sessions_cache = entries.clone();
+                                        mirror.saved_session_picker =
+                                            Some(crate::chat::session::SavedSessionPickerState::new(entries.clone()));
+                                    }
                                     let _ = chat_dispatcher.dispatch_or_log(
                                         crate::chat::action::Action::SavedSessionPickerOpened { entries },
                                         "chat.saved_session_picker_opened_resume",

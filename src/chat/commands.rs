@@ -100,6 +100,44 @@ pub struct CommandSpec {
     pub args_hint: &'static str,
     /// Operator-facing description.
     pub description: &'static str,
+    /// Machine-readable first argument metadata for slash-menu drill-down.
+    pub arg: CommandArgSpec,
+}
+
+/// Static argument candidate row used by second-level slash-menu drill-down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandArgCandidate {
+    pub value: &'static str,
+    pub description: &'static str,
+}
+
+/// Candidate source for a slash command's first/next argument.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandArgSource {
+    /// No argument candidates; do not open a second-level menu.
+    None,
+    /// Argument is free text and intentionally has no candidates.
+    FreeText,
+    /// Fixed candidates defined directly in the command registry.
+    Static(&'static [CommandArgCandidate]),
+    /// Theme names accepted by the chat renderer.
+    Themes,
+    /// Current live child sessions from the session switcher cache.
+    LiveSessions,
+    /// Persisted chat sessions plus the static `last` selector.
+    SavedSessions,
+    /// Known provider names from the provider registry.
+    Providers,
+    /// Models for the current provider, if enumerable.
+    CurrentProviderModels,
+    /// Second provider argument: models for the provider typed as arg 1.
+    ProviderModels,
+}
+
+/// Machine-readable first argument metadata for slash-menu drill-down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandArgSpec {
+    pub source: CommandArgSource,
 }
 
 impl CommandSpec {
@@ -122,6 +160,30 @@ impl CommandSpec {
     }
 }
 
+const NO_ARG: CommandArgSpec = CommandArgSpec {
+    source: CommandArgSource::None,
+};
+
+const FREE_TEXT_ARG: CommandArgSpec = CommandArgSpec {
+    source: CommandArgSource::FreeText,
+};
+
+const EXPORT_CANDIDATES: &[CommandArgCandidate] = &[
+    CommandArgCandidate {
+        value: "md",
+        description: "Markdown transcript",
+    },
+    CommandArgCandidate {
+        value: "json",
+        description: "JSON transcript",
+    },
+];
+
+const DIFF_CANDIDATES: &[CommandArgCandidate] = &[CommandArgCandidate {
+    value: "--cached",
+    description: "Show staged changes",
+}];
+
 /// Single source of truth for user-visible chat slash commands.
 pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
@@ -129,186 +191,241 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         aliases: &[],
         args_hint: "",
         description: "Show this help message",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/clear",
         aliases: &["/new"],
         args_hint: "",
         description: "Clear conversation history",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/model",
         aliases: &[],
         args_hint: "[name]",
         description: "Show or switch model",
+        arg: CommandArgSpec {
+            source: CommandArgSource::CurrentProviderModels,
+        },
     },
     CommandSpec {
         name: "/provider",
         aliases: &[],
         args_hint: "[name [model]]",
         description: "Show or hot-switch provider",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Providers,
+        },
     },
     CommandSpec {
         name: "/tools",
         aliases: &[],
         args_hint: "",
         description: "List available tools",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/memory",
         aliases: &[],
         args_hint: "<query>",
         description: "Search memory",
+        arg: FREE_TEXT_ARG,
     },
     CommandSpec {
         name: "/resume",
         aliases: &[],
         args_hint: "[last|id]",
         description: "List or switch saved chat sessions",
+        arg: CommandArgSpec {
+            source: CommandArgSource::SavedSessions,
+        },
     },
     CommandSpec {
         name: "/branch",
         aliases: &[],
         args_hint: "[N]",
         description: "List turn boundaries or fork the first N turns",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/rewind",
         aliases: &[],
         args_hint: "<N>",
         description: "Trim this session to the first N turns with approval",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/apply",
         aliases: &[],
         args_hint: "[N]",
         description: "Apply a fenced diff block with approval",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/cost",
         aliases: &[],
         args_hint: "",
         description: "Show token usage estimate",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/compact",
         aliases: &[],
         args_hint: "",
         description: "Compact conversation context",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/export",
         aliases: &[],
         args_hint: "[md|json]",
         description: "Export conversation transcript",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Static(EXPORT_CANDIDATES),
+        },
     },
     CommandSpec {
         name: "/theme",
         aliases: &[],
         args_hint: "",
         description: "Show available chat themes",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Themes,
+        },
     },
     CommandSpec {
         name: "/plan",
         aliases: &[],
         args_hint: "",
         description: "Switch to plan mode",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/edit",
         aliases: &[],
         args_hint: "",
         description: "Switch to edit mode",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/auto",
         aliases: &[],
         args_hint: "",
         description: "Switch to auto chat mode",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/bg",
         aliases: &[],
         args_hint: "<task>",
         description: "Run a task as an agent child session",
+        arg: FREE_TEXT_ARG,
     },
     CommandSpec {
         name: "/sessions",
         aliases: &[],
         args_hint: "",
         description: "List child TUI sessions",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/shell",
         aliases: &[],
         args_hint: "<command>",
         description: "Run a command as a shell child session",
+        arg: FREE_TEXT_ARG,
     },
     CommandSpec {
         name: "/pty",
         aliases: &[],
         args_hint: "<command>",
         description: "Open an interactive PTY shell",
+        arg: FREE_TEXT_ARG,
     },
     CommandSpec {
         name: "/transcript",
         aliases: &[],
         args_hint: "",
         description: "Open the read-only transcript child TUI",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/diff",
         aliases: &[],
         args_hint: "[--cached]",
         description: "Open the read-only workspace diff child TUI",
+        arg: CommandArgSpec {
+            source: CommandArgSource::Static(DIFF_CANDIDATES),
+        },
     },
     CommandSpec {
         name: "/attach",
         aliases: &[],
         args_hint: "<id>",
         description: "Show a child session's recent output",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/logs",
         aliases: &[],
         args_hint: "<id>",
         description: "Dump a child session's buffered output",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/steer",
         aliases: &[],
         args_hint: "<id> <msg>",
         description: "Send a steering instruction to a child session",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/kill",
         aliases: &[],
         args_hint: "<id>",
         description: "Stop a child session",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/detach",
         aliases: &[],
         args_hint: "",
         description: "Return focus to the main chat",
+        arg: NO_ARG,
     },
     CommandSpec {
         name: "/approve",
         aliases: &[],
         args_hint: "<id>",
         description: "Approve a child session approval gate",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/deny",
         aliases: &[],
         args_hint: "<id>",
         description: "Deny a child session approval gate",
+        arg: CommandArgSpec {
+            source: CommandArgSource::LiveSessions,
+        },
     },
     CommandSpec {
         name: "/quit",
         aliases: &["/exit"],
         args_hint: "",
         description: "Exit chat",
+        arg: NO_ARG,
     },
 ];
 

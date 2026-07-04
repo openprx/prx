@@ -811,8 +811,18 @@ impl ChatState {
         }
 
         if self.ui.slash_menu.is_some() {
-            let dispatch =
-                crate::chat::tui::dispatch_slash_menu_key_for(&mut self.ui.input, &mut self.ui.slash_menu, key);
+            let sources = crate::chat::tui::SlashMenuSources {
+                live_sessions: &self.ui.sessions_entries,
+                saved_sessions: &[],
+                provider_model_catalog: &[],
+                current_provider: self.session.provider.as_ref(),
+            };
+            let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
+                &mut self.ui.input,
+                &mut self.ui.slash_menu,
+                key,
+                sources,
+            );
             return match dispatch {
                 crate::chat::tui::KeyDispatch::Submitted(text) => self.reduce_input_submitted(text),
                 crate::chat::tui::KeyDispatch::Cancelled => self.reduce_input_cancelled(),
@@ -857,7 +867,13 @@ impl ChatState {
             // 非空 buffer 转发为 Delete
             let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
             let _ = self.ui.input.handle_key(synthetic);
-            crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
+            let sources = crate::chat::tui::SlashMenuSources {
+                live_sessions: &self.ui.sessions_entries,
+                saved_sessions: &[],
+                provider_model_catalog: &[],
+                current_provider: self.session.provider.as_ref(),
+            };
+            crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
             return vec![Effect::RequestRedraw];
         }
         // 其他键 → 转发到 input buffer，根据 InputOutcome 派生后续 Action 自递归
@@ -872,7 +888,13 @@ impl ChatState {
                 self.reduce_input_cancelled()
             }
             crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
-                crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
+                let sources = crate::chat::tui::SlashMenuSources {
+                    live_sessions: &self.ui.sessions_entries,
+                    saved_sessions: &[],
+                    provider_model_catalog: &[],
+                    current_provider: self.session.provider.as_ref(),
+                };
+                crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
                 vec![Effect::RequestRedraw]
             }
             crate::chat::tui::InputOutcome::Ignored => Vec::new(),
@@ -896,7 +918,13 @@ impl ChatState {
             return vec![Effect::RequestRedraw];
         }
         self.ui.input.paste(text);
-        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
+        let sources = crate::chat::tui::SlashMenuSources {
+            live_sessions: &self.ui.sessions_entries,
+            saved_sessions: &[],
+            provider_model_catalog: &[],
+            current_provider: self.session.provider.as_ref(),
+        };
+        crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
 
@@ -932,7 +960,13 @@ impl ChatState {
     fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
         self.ui.input.set_text(text);
         self.ui.input.clear_navigation_state();
-        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
+        let sources = crate::chat::tui::SlashMenuSources {
+            live_sessions: &self.ui.sessions_entries,
+            saved_sessions: &[],
+            provider_model_catalog: &[],
+            current_provider: self.session.provider.as_ref(),
+        };
+        crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
 
@@ -951,7 +985,13 @@ impl ChatState {
             HistoryDir::Down => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         };
         let _ = self.ui.input.handle_key(key);
-        crate::chat::tui::sync_slash_menu_for_input(&self.ui.input, &mut self.ui.slash_menu);
+        let sources = crate::chat::tui::SlashMenuSources {
+            live_sessions: &self.ui.sessions_entries,
+            saved_sessions: &[],
+            provider_model_catalog: &[],
+            current_provider: self.session.provider.as_ref(),
+        };
+        crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
 
