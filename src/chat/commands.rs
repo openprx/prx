@@ -102,7 +102,7 @@ const HELP_TEXT: &str = "Available commands:
   /apply [N]         Apply the latest fenced diff block with interactive approval
   /cost              Show token usage estimate
   /compact           Compact conversation context (free up window)
-  /export [md|json]  Export conversation
+  /export [md|json]  Export conversation transcript
   /plan              Switch to plan mode (read-only tools)
   /edit              Switch to edit mode (default)
   /auto              Switch to auto chat mode (does not override [autonomy])

@@ -5119,7 +5119,8 @@ pub struct QQConfig {
 /// Interactive chat configuration (`[chat]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct ChatConfig {
-    /// Chat TUI renderer mode. Defaults to `inline` during the Phase 0 rollout.
+    /// Chat TUI renderer mode. Defaults to fullscreen; use `PRX_TUI=0` or
+    /// `prx chat --plain` for the non-TUI fallback.
     #[serde(default)]
     pub tui_mode: ChatTuiModeConfig,
 }
@@ -5127,7 +5128,7 @@ pub struct ChatConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
-            tui_mode: ChatTuiModeConfig::Inline,
+            tui_mode: ChatTuiModeConfig::Fullscreen,
         }
     }
 }
@@ -5135,8 +5136,8 @@ impl Default for ChatConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatTuiModeConfig {
-    #[default]
     Inline,
+    #[default]
     Fullscreen,
 }
 
@@ -6207,10 +6208,10 @@ min_chars = 12
     }
 
     #[test]
-    async fn chat_config_defaults_to_inline() {
+    async fn chat_config_defaults_to_fullscreen() {
         let config = ChatConfig::default();
 
-        assert_eq!(config.tui_mode, ChatTuiModeConfig::Inline);
+        assert_eq!(config.tui_mode, ChatTuiModeConfig::Fullscreen);
     }
 
     #[test]
@@ -6225,7 +6226,7 @@ min_chars = 12
         assert_eq!(decoded.tui_mode, ChatTuiModeConfig::Fullscreen);
 
         let defaulted: ChatConfig = toml::from_str("").unwrap();
-        assert_eq!(defaulted.tui_mode, ChatTuiModeConfig::Inline);
+        assert_eq!(defaulted.tui_mode, ChatTuiModeConfig::Fullscreen);
     }
 
     // ── Serde round-trip ─────────────────────────────────────

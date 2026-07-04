@@ -63,6 +63,11 @@ active_hours = "08:00-23:00"
 enabled = true
 compact_context = true
 
+[chat]
+# TTY chat sessions default to the fullscreen TUI. Use PRX_TUI=0 or
+# `prx chat --plain` for the non-TUI reedline/plain fallback.
+tui_mode = "fullscreen"
+
 [agent]
 # Master switch for parallel read-only scheduling (default: false).
 parallel_tools = false

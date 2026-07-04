@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `prx chat` now defaults to the fullscreen terminal UI on TTYs. Native terminal
+  scrollback is no longer the chat transcript surface; use in-app scrolling while
+  chatting and `/export [md|json]` to save a transcript. `PRX_TUI=0 prx chat`,
+  `prx chat --plain`, and non-TTY stdin still use the plain reedline fallback.
+
 ### Security
 
 - **BREAKING** — `OPENPRX_APPROVAL_OVERRIDE` env unset 不再静默 auto-approve

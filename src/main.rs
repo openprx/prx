@@ -521,17 +521,23 @@ Examples:
 
     /// Start an interactive chat session with streaming output
     #[command(long_about = "\
-Start an interactive chat session with rich terminal experience.
+Start an interactive chat session with the fullscreen terminal UI.
 
 Features streaming responses, tool execution display, and session history.
 Uses the full Agent pipeline: memory recall, LLM routing, built-in tools,
 and all configured providers.
 
+The fullscreen UI keeps transcript history inside PRX rather than in native
+terminal scrollback. Use in-app scrolling while chatting and `/export [md|json]`
+to save a transcript. Use `--plain` or `PRX_TUI=0` for the non-TUI reedline
+fallback.
+
 Examples:
-  prx chat                              # interactive session
+  prx chat                              # fullscreen interactive session
   prx chat -p ollama -m llama3.3        # use local model
   prx chat -p anthropic                 # use Anthropic
-  prx chat --plain                      # no ANSI colors
+  PRX_TUI=0 prx chat                    # plain reedline fallback
+  prx chat --plain                      # plain text fallback
   prx chat --continue                   # resume last session
   prx chat --session last               # resume last session
   prx chat --session abc123             # resume specific session
