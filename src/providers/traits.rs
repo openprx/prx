@@ -1,4 +1,4 @@
-use crate::llm::route_decision::{ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
+use crate::llm::route_decision::{ProviderAttempt, ProviderExecutionOutcome, RouteDecision, TokenUsage};
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -96,6 +96,8 @@ pub struct ChatTrace {
     pub final_provider: String,
     /// Model that actually produced `response`.
     pub final_model: String,
+    /// Provider-reported or explicitly estimated usage for the successful call.
+    pub tokens_used: TokenUsage,
 }
 
 /// Request payload for provider chat calls.
@@ -255,6 +257,12 @@ pub struct StreamChunk {
     pub is_final: bool,
     /// Approximate token count for this chunk (estimated).
     pub token_count: usize,
+    /// Provider-reported or explicitly estimated usage carried by this chunk.
+    ///
+    /// This is separate from `token_count`: `token_count` is a legacy per-delta
+    /// chars/4 estimate, while `usage` is turn/call-level metering data with a
+    /// source marker.
+    pub usage: Option<TokenUsage>,
     /// **5a-5**: Tool calls surfaced in this chunk. Empty for ordinary text;
     /// non-empty when the provider has parsed a tool_use block from the stream.
     ///
@@ -271,6 +279,7 @@ impl StreamChunk {
             reasoning: None,
             is_final: false,
             token_count: 0,
+            usage: None,
             tool_calls: Vec::new(),
         }
     }
@@ -284,6 +293,7 @@ impl StreamChunk {
             reasoning: Some(text.into()),
             is_final: false,
             token_count: 0,
+            usage: None,
             tool_calls: Vec::new(),
         }
     }
@@ -299,7 +309,20 @@ impl StreamChunk {
             reasoning: None,
             is_final: false,
             token_count: 0,
+            usage: None,
             tool_calls: calls,
+        }
+    }
+
+    /// Create a non-final chunk carrying metered usage only.
+    pub const fn usage(usage: TokenUsage) -> Self {
+        Self {
+            delta: String::new(),
+            reasoning: None,
+            is_final: false,
+            token_count: 0,
+            usage: Some(usage),
+            tool_calls: Vec::new(),
         }
     }
 
@@ -310,6 +333,7 @@ impl StreamChunk {
             reasoning: None,
             is_final: true,
             token_count: 0,
+            usage: None,
             tool_calls: Vec::new(),
         }
     }
@@ -321,6 +345,7 @@ impl StreamChunk {
             reasoning: None,
             is_final: true,
             token_count: 0,
+            usage: None,
             tool_calls: Vec::new(),
         }
     }
@@ -617,6 +642,7 @@ pub trait Provider: Send + Sync {
             }],
             final_provider: "default".to_string(),
             final_model: model.to_string(),
+            tokens_used: TokenUsage::default(),
         })
     }
 

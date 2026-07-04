@@ -132,11 +132,192 @@ pub enum ExecutionStatus {
     AllFailed { last_error_class: String },
 }
 
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TokenUsageSource {
+    Reported,
+    #[default]
+    Estimated,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TokenUsage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    #[serde(default)]
+    pub source: TokenUsageSource,
+}
+
+impl TokenUsage {
+    #[must_use]
+    pub const fn reported(
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            source: TokenUsageSource::Reported,
+        }
+    }
+
+    #[must_use]
+    pub const fn estimated(
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            source: TokenUsageSource::Estimated,
+        }
+    }
+
+    #[must_use]
+    pub const fn has_any_tokens(&self) -> bool {
+        self.prompt_tokens.is_some() || self.completion_tokens.is_some() || self.total_tokens.is_some()
+    }
+
+    #[must_use]
+    pub const fn is_reported(&self) -> bool {
+        matches!(self.source, TokenUsageSource::Reported)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProviderUsageAccumulator {
+    reported: TokenUsageSums,
+    estimated: TokenUsageSums,
+}
+
+impl ProviderUsageAccumulator {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            reported: TokenUsageSums::new(),
+            estimated: TokenUsageSums::new(),
+        }
+    }
+
+    pub fn record(&mut self, usage: TokenUsage) {
+        if !usage.has_any_tokens() {
+            return;
+        }
+        match usage.source {
+            TokenUsageSource::Reported => self.reported.add(&usage),
+            TokenUsageSource::Estimated => self.estimated.add(&usage),
+        }
+    }
+
+    pub fn record_estimated_completion_tokens(&mut self, tokens: u32) {
+        if tokens == 0 {
+            return;
+        }
+        self.record(TokenUsage::estimated(None, Some(tokens), Some(tokens)));
+    }
+
+    pub fn record_estimated_completion_chars(&mut self, chars: usize) {
+        let tokens = chars.div_ceil(4);
+        if let Ok(tokens) = u32::try_from(tokens) {
+            self.record_estimated_completion_tokens(tokens);
+        } else {
+            self.record_estimated_completion_tokens(u32::MAX);
+        }
+    }
+
+    #[must_use]
+    pub fn finish(&self) -> TokenUsage {
+        if self.reported.has_any() {
+            self.reported.to_usage(TokenUsageSource::Reported)
+        } else if self.estimated.has_any() {
+            self.estimated.to_usage(TokenUsageSource::Estimated)
+        } else {
+            TokenUsage::default()
+        }
+    }
+
+    #[must_use]
+    pub fn finish_or_estimate_completion_chars(&self, chars: usize) -> TokenUsage {
+        if self.reported.has_any() || self.estimated.has_any() || chars == 0 {
+            return self.finish();
+        }
+        let mut fallback = Self::new();
+        fallback.record_estimated_completion_chars(chars);
+        fallback.finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TokenUsageSums {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    has_prompt_tokens: bool,
+    has_completion_tokens: bool,
+    has_total_tokens: bool,
+}
+
+impl TokenUsageSums {
+    const fn new() -> Self {
+        Self {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            has_prompt_tokens: false,
+            has_completion_tokens: false,
+            has_total_tokens: false,
+        }
+    }
+
+    const fn has_any(&self) -> bool {
+        self.has_prompt_tokens || self.has_completion_tokens || self.has_total_tokens
+    }
+
+    fn add(&mut self, usage: &TokenUsage) {
+        if let Some(tokens) = usage.prompt_tokens {
+            self.prompt_tokens = self.prompt_tokens.saturating_add(u64::from(tokens));
+            self.has_prompt_tokens = true;
+        }
+        if let Some(tokens) = usage.completion_tokens {
+            self.completion_tokens = self.completion_tokens.saturating_add(u64::from(tokens));
+            self.has_completion_tokens = true;
+        }
+        if let Some(tokens) = usage.total_tokens {
+            self.total_tokens = self.total_tokens.saturating_add(u64::from(tokens));
+            self.has_total_tokens = true;
+        }
+    }
+
+    fn to_usage(self, source: TokenUsageSource) -> TokenUsage {
+        let prompt_tokens = self.has_prompt_tokens.then(|| clamp_u64_to_u32(self.prompt_tokens));
+        let completion_tokens = self
+            .has_completion_tokens
+            .then(|| clamp_u64_to_u32(self.completion_tokens));
+        let total_tokens = if self.has_total_tokens {
+            Some(clamp_u64_to_u32(self.total_tokens))
+        } else if self.has_prompt_tokens || self.has_completion_tokens {
+            Some(clamp_u64_to_u32(
+                self.prompt_tokens.saturating_add(self.completion_tokens),
+            ))
+        } else {
+            None
+        };
+        TokenUsage {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            source,
+        }
+    }
+}
+
+fn clamp_u64_to_u32(value: u64) -> u32 {
+    u32::try_from(value).map_or(u32::MAX, |value| value)
 }
 
 impl Default for FallbackPolicy {
@@ -369,6 +550,15 @@ fn push_unique_candidate(candidates: &mut Vec<RouteCandidate>, candidate: RouteC
 impl ProviderExecutionOutcome {
     #[must_use]
     pub fn success_for_decision(decision: &RouteDecision, started_at: DateTime<Utc>) -> Self {
+        Self::success_for_decision_with_usage(decision, started_at, TokenUsage::default())
+    }
+
+    #[must_use]
+    pub fn success_for_decision_with_usage(
+        decision: &RouteDecision,
+        started_at: DateTime<Utc>,
+        tokens_used: TokenUsage,
+    ) -> Self {
         let finished_at = Utc::now();
         Self {
             decision_id: decision.decision_id.clone(),
@@ -388,7 +578,7 @@ impl ProviderExecutionOutcome {
             final_model: decision.selected.model.clone(),
             status: ExecutionStatus::Success,
             fallback_reason: None,
-            tokens_used: TokenUsage::default(),
+            tokens_used,
         }
     }
 
@@ -425,6 +615,30 @@ impl ProviderExecutionOutcome {
         started_at: DateTime<Utc>,
         finished_at: DateTime<Utc>,
         prior_turns_had_fallback: bool,
+    ) -> Self {
+        Self::from_trace_with_usage(
+            decision,
+            attempts,
+            final_provider,
+            final_model,
+            started_at,
+            finished_at,
+            prior_turns_had_fallback,
+            TokenUsage::default(),
+        )
+    }
+
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_trace_with_usage(
+        decision: &RouteDecision,
+        attempts: Vec<ProviderAttempt>,
+        final_provider: String,
+        final_model: String,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+        prior_turns_had_fallback: bool,
+        tokens_used: TokenUsage,
     ) -> Self {
         // A fallback occurred when more than one attempt was made (a retry or a
         // provider/model switch each add an attempt), when the serving
@@ -466,7 +680,7 @@ impl ProviderExecutionOutcome {
             final_model,
             status,
             fallback_reason,
-            tokens_used: TokenUsage::default(),
+            tokens_used,
         }
     }
 
@@ -856,5 +1070,84 @@ mod tests {
         );
         assert_eq!(outcome.status, ExecutionStatus::FallbackSuccess);
         assert_eq!(outcome.fallback_reason.as_deref(), Some("model_fallback"));
+    }
+
+    #[test]
+    fn usage_accumulator_reported_wins_over_estimate() {
+        let mut accumulator = ProviderUsageAccumulator::new();
+        accumulator.record(TokenUsage::estimated(None, Some(40), Some(40)));
+        accumulator.record(TokenUsage::reported(Some(10), Some(5), Some(15)));
+
+        let usage = accumulator.finish();
+
+        assert_eq!(usage.source, TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(10));
+        assert_eq!(usage.completion_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(15));
+    }
+
+    #[test]
+    fn token_usage_source_marks_reported_and_estimated_values() {
+        let reported = TokenUsage::reported(Some(4), Some(2), Some(6));
+        let estimated = TokenUsage::estimated(None, Some(3), Some(3));
+        let empty = TokenUsage::default();
+
+        assert!(reported.is_reported());
+        assert_eq!(reported.source, TokenUsageSource::Reported);
+        assert!(!estimated.is_reported());
+        assert_eq!(estimated.source, TokenUsageSource::Estimated);
+        assert!(!empty.has_any_tokens());
+        assert_eq!(empty.source, TokenUsageSource::Estimated);
+    }
+
+    #[test]
+    fn token_usage_source_survives_json_round_trip() {
+        let usage = TokenUsage::reported(Some(10), Some(5), Some(15));
+
+        let encoded = serde_json::to_string(&usage).expect("test: serialize token usage");
+        let decoded: TokenUsage = serde_json::from_str(&encoded).expect("test: deserialize token usage");
+
+        assert_eq!(decoded, usage);
+        assert_eq!(decoded.source, TokenUsageSource::Reported);
+    }
+
+    #[test]
+    fn usage_accumulator_missing_usage_falls_back_to_estimate() {
+        let accumulator = ProviderUsageAccumulator::new();
+
+        let usage = accumulator.finish_or_estimate_completion_chars("hello world".chars().count());
+
+        assert_eq!(usage.source, TokenUsageSource::Estimated);
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, Some(3));
+        assert_eq!(usage.total_tokens, Some(3));
+    }
+
+    #[test]
+    fn usage_accumulator_sums_multiple_reported_calls() {
+        let mut accumulator = ProviderUsageAccumulator::new();
+        accumulator.record(TokenUsage::reported(Some(100), Some(20), Some(120)));
+        accumulator.record(TokenUsage::reported(Some(80), Some(30), Some(110)));
+
+        let usage = accumulator.finish();
+
+        assert_eq!(usage.source, TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(180));
+        assert_eq!(usage.completion_tokens, Some(50));
+        assert_eq!(usage.total_tokens, Some(230));
+    }
+
+    #[test]
+    fn usage_accumulator_empty_failed_turn_does_not_fabricate_reported_usage() {
+        let accumulator = ProviderUsageAccumulator::new();
+
+        let usage = accumulator.finish();
+
+        assert_eq!(usage.source, TokenUsageSource::Estimated);
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(usage.total_tokens, None);
+        assert!(!usage.is_reported());
+        assert!(!usage.has_any_tokens());
     }
 }

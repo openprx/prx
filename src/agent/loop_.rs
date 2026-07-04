@@ -3,6 +3,7 @@
 use crate::approval::{ApprovalManager, ApprovalRequest, ApprovalResponse};
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
+use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::{
     self, CompactionRunInput, ConversationTurn, DocumentIngestInput, DocumentSearchResult, Memory, MemoryCategory,
@@ -4554,6 +4555,9 @@ pub(crate) struct ToolLoopTrace {
     /// fallback when its `chat_traced` recorded more than one attempt (each
     /// failed attempt before the terminal success adds an entry).
     pub any_turn_had_fallback: bool,
+    /// Aggregated provider usage across successful provider calls in this user
+    /// turn. Empty/estimated by default until provider capture lands.
+    pub tokens_used: TokenUsage,
 }
 
 /// Terminal outcome of the agent tool-call loop.
@@ -4888,6 +4892,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // overwrites this with that turn's real serving provider/model + attempts;
     // the value at the returning turn is handed back to the caller.
     let mut last_turn_trace = ToolLoopTrace::default();
+    let mut usage_accumulator = ProviderUsageAccumulator::new();
     // FIX #2: sticky cross-turn fallback flag. `last_turn_trace` is overwritten
     // every turn, so a fallback on an intermediate (tool-call) turn would be lost
     // if a later clean turn produced the answer. Accumulate it separately and
@@ -5128,6 +5133,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 if turn_had_fallback {
                     any_turn_had_fallback = true;
                 }
+                usage_accumulator.record(trace.tokens_used.clone());
                 // Record this turn's real attribution. Overwritten each turn;
                 // the value at the returning turn is what the caller receives.
                 last_turn_trace = ToolLoopTrace {
@@ -5136,6 +5142,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                     attempts: trace.attempts,
                     // Folded in just before returning so it reflects all turns.
                     any_turn_had_fallback: false,
+                    tokens_used: TokenUsage::default(),
                 };
                 let resp = trace.response;
                 let duration = llm_started_at.elapsed();
@@ -5327,6 +5334,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
             // FIX #2: fold the cross-turn fallback flag into the returned trace so
             // a fallback on any earlier turn is reflected in the recorded status.
             last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
+            last_turn_trace.tokens_used = usage_accumulator.finish();
             return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
         }
 
@@ -7483,6 +7491,7 @@ mod tests {
                 attempts: turn.attempts,
                 final_provider: turn.final_provider,
                 final_model: model.to_string(),
+                tokens_used: TokenUsage::default(),
             })
         }
     }

@@ -680,6 +680,7 @@ impl Provider for ReliableProvider {
                                 attempts,
                                 final_provider: provider_name.to_string(),
                                 final_model: (*current_model).to_string(),
+                                tokens_used: crate::llm::route_decision::TokenUsage::default(),
                             });
                         }
                         Err(e) => {

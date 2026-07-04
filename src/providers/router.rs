@@ -574,6 +574,7 @@ impl Provider for MockEnvProvider {
                 reasoning: None,
                 is_final: false,
                 token_count: 0,
+                usage: None,
                 tool_calls: Vec::new(),
             }),
             Ok(StreamChunk::final_chunk()),
@@ -998,6 +999,7 @@ mod tests {
                 }],
                 final_provider: self.provider_label.to_string(),
                 final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
     }

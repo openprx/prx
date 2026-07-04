@@ -3116,7 +3116,7 @@ async fn process_channel_message(
 
     type LoopResult = Result<(crate::agent::loop_::ToolLoopOutcome, crate::agent::loop_::ToolLoopTrace), anyhow::Error>;
     enum LlmExecutionResult {
-        Completed(Result<LoopResult, tokio::time::error::Elapsed>),
+        Completed(Box<Result<LoopResult, tokio::time::error::Elapsed>>),
         Cancelled,
     }
 
@@ -3219,79 +3219,81 @@ async fn process_channel_message(
                     smart_group,
                 ),
                 ),
-            ) => LlmExecutionResult::Completed(result),
+            ) => LlmExecutionResult::Completed(Box::new(result)),
         };
 
         match llm_result {
             LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
-            LlmExecutionResult::Completed(Ok(Ok((outcome, _trace)))) => match outcome {
-                crate::agent::loop_::ToolLoopOutcome::Text(response) => {
-                    break LlmFinalOutcome::Success {
-                        response,
-                        history_len_before_tools,
-                    };
-                }
-                crate::agent::loop_::ToolLoopOutcome::Silent { reason } => {
-                    break LlmFinalOutcome::Silent { reason };
-                }
-                // AwaitingApproval is not produced on this (None-resolver) path;
-                // treat it defensively as a no-op silent turn rather than panic.
-                crate::agent::loop_::ToolLoopOutcome::AwaitingApproval(pending) => {
-                    tracing::warn!(
-                        tool = pending.tool_name.as_str(),
-                        "channel loop produced unexpected awaiting-approval outcome (no resolver); treating as silent"
-                    );
-                    break LlmFinalOutcome::Silent {
-                        reason: "unexpected awaiting-approval outcome".to_string(),
-                    };
-                }
-            },
-            LlmExecutionResult::Completed(Ok(Err(e))) => {
-                if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
-                    break LlmFinalOutcome::Cancelled;
-                }
+            LlmExecutionResult::Completed(result) => match *result {
+                Ok(Ok((outcome, _trace))) => match outcome {
+                    crate::agent::loop_::ToolLoopOutcome::Text(response) => {
+                        break LlmFinalOutcome::Success {
+                            response,
+                            history_len_before_tools,
+                        };
+                    }
+                    crate::agent::loop_::ToolLoopOutcome::Silent { reason } => {
+                        break LlmFinalOutcome::Silent { reason };
+                    }
+                    // AwaitingApproval is not produced on this (None-resolver) path;
+                    // treat it defensively as a no-op silent turn rather than panic.
+                    crate::agent::loop_::ToolLoopOutcome::AwaitingApproval(pending) => {
+                        tracing::warn!(
+                            tool = pending.tool_name.as_str(),
+                            "channel loop produced unexpected awaiting-approval outcome (no resolver); treating as silent"
+                        );
+                        break LlmFinalOutcome::Silent {
+                            reason: "unexpected awaiting-approval outcome".to_string(),
+                        };
+                    }
+                },
+                Ok(Err(e)) => {
+                    if crate::agent::loop_::is_tool_loop_cancelled(&e) || cancellation_token.is_cancelled() {
+                        break LlmFinalOutcome::Cancelled;
+                    }
 
-                if is_context_window_overflow_error(&e) {
-                    let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                    // Report the merged-view char count; compaction folds legacy
-                    // into canonical, but reading the union keeps the figure honest
-                    // regardless of which keys remain populated.
-                    let compacted_chars = merged_history(&ctx.conversation_histories.lock(), &history_key)
-                        .iter()
-                        .map(|t| t.content.chars().count())
-                        .sum::<usize>();
-                    eprintln!(
-                        "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
-                        started_at.elapsed().as_millis(),
-                        compacted,
-                        compacted_chars
-                    );
+                    if is_context_window_overflow_error(&e) {
+                        let compacted = compact_sender_history(ctx.as_ref(), &history_key);
+                        // Report the merged-view char count; compaction folds legacy
+                        // into canonical, but reading the union keeps the figure honest
+                        // regardless of which keys remain populated.
+                        let compacted_chars = merged_history(&ctx.conversation_histories.lock(), &history_key)
+                            .iter()
+                            .map(|t| t.content.chars().count())
+                            .sum::<usize>();
+                        eprintln!(
+                            "  ⚠️ Context window exceeded after {}ms; sender history compacted={} (chars={})",
+                            started_at.elapsed().as_millis(),
+                            compacted,
+                            compacted_chars
+                        );
 
-                    if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
-                        context_overflow_retries += 1;
+                        if context_overflow_retries < MAX_CONTEXT_OVERFLOW_RETRIES {
+                            context_overflow_retries += 1;
+                            history = rebuild_history();
+                            continue;
+                        }
+
+                        break LlmFinalOutcome::ContextOverflowExhausted;
+                    }
+
+                    break LlmFinalOutcome::Error(e);
+                }
+                Err(_) => {
+                    if timeout_retries < 1 {
+                        timeout_retries += 1;
+                        tracing::warn!(
+                            "LLM timeout after {}ms, retrying (attempt {}/1)",
+                            started_at.elapsed().as_millis(),
+                            timeout_retries
+                        );
+                        tokio::time::sleep(Duration::from_secs(2)).await;
                         history = rebuild_history();
                         continue;
                     }
-
-                    break LlmFinalOutcome::ContextOverflowExhausted;
+                    break LlmFinalOutcome::Timeout;
                 }
-
-                break LlmFinalOutcome::Error(e);
-            }
-            LlmExecutionResult::Completed(Err(_)) => {
-                if timeout_retries < 1 {
-                    timeout_retries += 1;
-                    tracing::warn!(
-                        "LLM timeout after {}ms, retrying (attempt {}/1)",
-                        started_at.elapsed().as_millis(),
-                        timeout_retries
-                    );
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    history = rebuild_history();
-                    continue;
-                }
-                break LlmFinalOutcome::Timeout;
-            }
+            },
         }
     };
 

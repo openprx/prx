@@ -5149,7 +5149,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 let final_model = turn_trace
                     .final_model
                     .unwrap_or_else(|| route_decision.selected.model.clone());
-                ProviderExecutionOutcome::from_trace(
+                ProviderExecutionOutcome::from_trace_with_usage(
                     &route_decision,
                     turn_trace.attempts,
                     final_provider,
@@ -5159,9 +5159,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // FIX #2: a fallback on any earlier (tool-call) turn must
                     // surface as FallbackSuccess even when the final turn is clean.
                     turn_trace.any_turn_had_fallback,
+                    turn_trace.tokens_used,
                 )
             } else {
-                ProviderExecutionOutcome::success_for_decision(&route_decision, provider_started_at)
+                ProviderExecutionOutcome::success_for_decision_with_usage(
+                    &route_decision,
+                    provider_started_at,
+                    turn_trace.tokens_used,
+                )
             }
         };
         if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
