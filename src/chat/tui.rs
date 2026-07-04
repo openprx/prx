@@ -1,20 +1,15 @@
 //! TUI layout and rendering for `prx chat` using ratatui.
 //!
-//! Architecture (P3-inline): ratatui drives only the **bottom chrome**
-//! (status / streaming buffer / input / footer) inside a
-//! `Viewport::Inline(N)` viewport. Permanent conversation history is pushed
-//! into the host terminal's main scrollback via `terminal.insert_before`,
-//! which lets the terminal's native scroll (mouse wheel, Shift+PgUp,
-//! search, copy/paste) work without any app-level scroll bookkeeping.
+//! Architecture: ratatui owns the full alternate screen. The transcript is
+//! rendered in an in-app scrollable pane and the status/input/footer chrome is
+//! pinned at the bottom. Native terminal scrollback is not used for chat
+//! history; `/export` is the transcript-save path.
 //!
 //! Public surface:
 //! - [`TuiState`] — shared state mirror (input buffer, conversation
 //!   history, in-flight streaming draft).
-//! - [`render_bottom_chrome`] — draws the fixed-height bottom region.
-//! - [`render_message_for_insert`] — renders one [`ConversationLine`]
-//!   into a ratatui `Buffer` for `terminal.insert_before`.
-//! - [`estimate_message_height`] — width-aware row count used to size
-//!   each `insert_before` call.
+//! - [`render_fullscreen_chat`] — draws the transcript pane, overlays, and
+//!   pinned bottom chrome.
 //!
 //! Gated behind the `terminal-tui` feature.
 
@@ -64,10 +59,8 @@ pub struct StreamingDraft {
 
 /// State for the TUI layout.
 ///
-/// Permanent conversation rendering happens above the viewport via
-/// `terminal.insert_before` (see [`render_message_for_insert`]); only the
-/// bottom chrome is repainted every frame. There is no app-level scroll
-/// bookkeeping — the host terminal's scrollback owns history navigation.
+/// Permanent conversation rendering happens inside the fullscreen transcript
+/// pane. Native terminal scrollback is not used for chat history.
 pub struct TuiState {
     /// Provider/model displayed in status bar
     pub provider: String,
@@ -81,9 +74,7 @@ pub struct TuiState {
     pub session_title: String,
     /// Number of conversation turns
     pub turn_count: usize,
-    /// Rendered conversation lines. The unified loop tracks how many of
-    /// these have already been pushed to the main screen via
-    /// `insert_before`; new entries are flushed on the next iteration.
+    /// Rendered conversation lines for the fullscreen transcript pane.
     pub conversation_lines: Vec<ConversationLine>,
     /// Multi-line input buffer + history (P2-10).
     pub input: TuiInput,
@@ -91,16 +82,14 @@ pub struct TuiState {
     pub ascii_fallback: bool,
     /// In-flight streaming-assistant draft (P3-5). `None` between turns.
     ///
-    /// When `Some`, [`render_bottom_chrome`] paints a transient streaming
-    /// block inside the inline viewport. The streaming buffer is
-    /// intentionally kept separate from `conversation_lines` so a stale
-    /// or cancelled delta can never corrupt persisted history. On
-    /// `finalize_stream` the text is lifted into `conversation_lines`
-    /// and the next loop iteration scrolls it permanently into the main
-    /// terminal scrollback.
+    /// When `Some`, [`render_fullscreen_chat`] paints the transient stream at
+    /// the transcript tail. The streaming buffer is intentionally kept separate
+    /// from `conversation_lines` so a stale or cancelled delta can never corrupt
+    /// persisted history. On `finalize_stream` the text is lifted into
+    /// `conversation_lines`.
     pub streaming: Option<StreamingDraft>,
     /// Persistent child-session status line (v1b). Empty when there are
-    /// no child TUI sessions, in which case [`render_bottom_chrome`] omits the
+    /// no child TUI sessions, in which case the bottom chrome omits the
     /// extra row. Written only by the chat main loop (via
     /// `Action::SessionsStatusUpdated`); the background spawn tasks never touch
     /// it.
@@ -264,11 +253,9 @@ pub const TRANSCRIPT_MAX_LINES: usize = 400;
 /// Designed so the surrounding event loop can react with a single match
 /// without inspecting `TuiInput` internals.
 ///
-/// Note (P3-inline): there is no longer an in-app scroll outcome. With the
-/// inline viewport, history scrolling is handled by the host terminal
-/// natively (mouse wheel, Shift+PgUp, terminal search). PageUp / PageDown
-/// fall through as [`InputOutcome::Unhandled`] so the terminal can
-/// interpret them itself.
+/// PageUp / PageDown fall through as [`InputOutcome::Unhandled`] here so the
+/// outer fullscreen event loop can decide whether transcript scrolling or a
+/// focused child view owns them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputOutcome {
     /// Key was consumed; no externally observable change beyond the buffer.
@@ -1461,9 +1448,8 @@ impl TuiInput {
                     InputOutcome::Unhandled
                 }
             }
-            // P3-inline: scrolling history is the host terminal's job
-            // (mouse wheel, Shift+PgUp). We deliberately do NOT consume
-            // PgUp/PgDn so the terminal can interpret them natively.
+            // Fullscreen transcript scrolling is owned by the outer event loop,
+            // not the input widget.
             KeyCode::PageUp | KeyCode::PageDown => InputOutcome::Unhandled,
             KeyCode::Esc => {
                 if !self.is_empty() {
@@ -1986,10 +1972,7 @@ impl crate::channels::terminal::TuiMirrorSink for SnapshotDispatcherSink {
 }
 
 /// Logical row count for a [`ConversationLine`], **before** soft-wrap.
-///
-/// This is the floor used by [`estimate_message_height`]; the real
-/// `insert_before` height is bumped up by hard wrapping at the terminal
-/// width so long User / Assistant / System messages don't get clipped.
+/// Used by tests to compare folded vs expanded card row counts.
 /// Always returns >= 1.
 fn estimate_line_height(line: &ConversationLine) -> u16 {
     let rows = match line {
@@ -2036,32 +2019,6 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
     u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
-/// Width-aware row count used by the unified TUI loop to size each
-/// `terminal.insert_before(height, …)` call.
-///
-/// Builds the same `Line<'_>` vec that [`render_message_for_insert`]
-/// will emit, then counts the rows each `Line` will consume at the
-/// given terminal width using a simple `ceil(display_width / width)`
-/// estimate. This matches the soft-wrap behaviour of
-/// `Paragraph::wrap(Wrap { trim: false })` closely enough for sizing
-/// `insert_before` calls — the goal is to never *clip* a long message,
-/// not to count rows down to the cell. `width` should be the current
-/// terminal column count; zero is treated as 1.
-pub fn estimate_message_height(width: u16, line: &ConversationLine, ascii: bool) -> u16 {
-    let safe_width = width.max(1);
-    let mut sink: Vec<Line<'_>> = Vec::new();
-    render_conversation_line(&mut sink, line, ascii);
-    // `render_message_for_insert` paints this `sink` with ratatui's
-    // word-aware wrapping (`Wrap { trim: false }`). The char-count
-    // `wrapped_rows_for_lines` is only an approximation and can UNDER-count
-    // (a word that does not fit is pushed to the next row), which would make
-    // `insert_before` reserve too few rows and clip the tail of the message
-    // in scrollback (chat-demo defect #1). Measure the exact wrapped height
-    // so finalized messages are never truncated.
-    let wrapped = measure_wrapped_rows(&sink, safe_width);
-    wrapped.max(estimate_line_height(line)).max(1)
-}
-
 /// Count the visible rows a `Vec<Line>` will consume at the given
 /// width, assuming `Paragraph::wrap(Wrap { trim: false })` semantics:
 /// each `Line` takes `ceil(display_width / width)` rows, or `1` if
@@ -2084,17 +2041,6 @@ fn wrapped_rows_for_lines(lines: &[Line<'_>], width: u16) -> u16 {
     u16::try_from(total).unwrap_or(u16::MAX)
 }
 
-/// Render one [`ConversationLine`] directly into a ratatui [`Buffer`] for
-/// `terminal.insert_before`. The buffer's full area is consumed; the
-/// caller is responsible for sizing it via [`estimate_message_height`].
-pub fn render_message_for_insert(buf: &mut Buffer, line: &ConversationLine, ascii: bool) {
-    let mut sink: Vec<Line<'_>> = Vec::new();
-    render_conversation_line(&mut sink, line, ascii);
-    let paragraph = Paragraph::new(Text::from(sink)).wrap(Wrap { trim: false });
-    let area = buf.area;
-    paragraph.render(area, buf);
-}
-
 /// Build a single-line preview of a raw args string, truncated to `max_chars`
 /// characters with the supplied ellipsis. Newlines are collapsed to spaces so
 /// the preview stays on one row.
@@ -2110,8 +2056,8 @@ fn build_args_preview(raw: &str, max_chars: usize, ellipsis: &str) -> String {
     format!("{truncated}{ellipsis}")
 }
 
-/// 渲染源抽象：让 `render_bottom_chrome` / `bottom_chrome_height` 同时支持
-/// `TuiState`（chat_mirror 路径）与 `UiSnapshot`（S4-A Pure 模式 watch 路径）.
+/// 渲染源抽象：让 fullscreen renderer 同时支持 `TuiState`（chat_mirror 路径）
+/// 与 `UiSnapshot`（S4-A Pure 模式 watch 路径）.
 ///
 /// S4-A Commit 2: 把渲染需要的最小字段集抽出来作为 trait，泛型化所有
 /// `&TuiState` 参数为 `&V: BottomChromeView`。本 commit 暂未切换渲染源，
@@ -2260,22 +2206,12 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
 }
 
-/// Minimum height (rows) of the inline viewport. Reserves space for
-/// 1 status line + 1 input row + 1 footer. The unified loop bumps this
-/// up dynamically to accommodate multi-line input and streaming buffers.
+/// Minimum height (rows) of the pinned fullscreen bottom chrome. Reserves space
+/// for status, input, and footer.
 pub const BOTTOM_CHROME_MIN_HEIGHT: u16 = 3;
 
-/// Hard upper bound on the inline viewport height. Streaming + a 12-row
-/// input box + status + footer is the largest reasonable layout; beyond
-/// that the user's main scrollback starts losing valuable rows.
+/// Hard upper bound on the pinned fullscreen bottom chrome height.
 pub const BOTTOM_CHROME_MAX_HEIGHT: u16 = 24;
-
-/// Maximum number of streaming-assistant rows to show inside the inline
-/// viewport while a turn is in flight. Once the stream finalises, the
-/// finalised text is lifted into `conversation_lines` and pushed up to
-/// the host terminal's scrollback via `insert_before` on the next loop
-/// iteration.
-pub const STREAMING_VISIBLE_ROWS: u16 = 6;
 
 /// Desired body height for the focused line-session viewport (P2). Header is
 /// additional. The actual render height is capped by the available terminal
@@ -2324,37 +2260,6 @@ fn fullscreen_tail_marker<V: BottomChromeView + ?Sized>(state: &V) -> usize {
     finalized.saturating_add(streaming_chars)
 }
 
-/// Compute the inline viewport height needed for the current state.
-///
-/// Layout, top to bottom:
-///   1 status row
-/// + optional streaming preview (up to [`STREAMING_VISIBLE_ROWS`])
-/// + 1 input-border row + visible input rows (1..=[`INPUT_MAX_VISIBLE_ROWS`])
-/// + 1 footer row
-///
-/// Clamped to [`BOTTOM_CHROME_MIN_HEIGHT`]..=[`BOTTOM_CHROME_MAX_HEIGHT`].
-///
-/// S4-A Commit 2: 泛型化让 UiSnapshot 与 TuiState 共用同一份高度计算逻辑。
-pub fn bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
-    if let Some(picker) = state.saved_session_picker() {
-        let list_rows = u16::try_from(picker.len().max(1)).unwrap_or(1);
-        let total: u16 = 1u16.saturating_add(1).saturating_add(list_rows).saturating_add(1);
-        return total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT);
-    }
-    // v1.1b: when the Ctrl+G switcher is open it replaces the streaming preview
-    // + input box with a popup list. The popup wants 1 title row + 1 row per
-    // session + 1 footer row, clamped so the whole chrome still fits the budget.
-    if let Some(switcher) = state.switcher() {
-        let list_rows = u16::try_from(switcher.len().max(1)).unwrap_or(1);
-        let total: u16 = 1u16 // status row
-            .saturating_add(1) // switcher title row
-            .saturating_add(list_rows) // one row per session (min 1 for the empty hint)
-            .saturating_add(1); // switcher footer (hint row)
-        return total.clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT);
-    }
-    bottom_chrome_base_height(state).clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
-}
-
 /// Whether the persistent child-session status row should be shown.
 ///
 /// Hidden when empty (no child TUI sessions). As a narrow/short-terminal
@@ -2368,136 +2273,16 @@ fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
     }
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !child_view_present {
-        STREAMING_VISIBLE_ROWS
-    } else {
-        0
-    };
     let without_sessions: u16 = 1u16 // status row
-        .saturating_add(streaming_rows)
         .saturating_add(input_height)
         .saturating_add(1); // footer row
     without_sessions < BOTTOM_CHROME_MAX_HEIGHT
 }
 
-/// Render the bottom inline viewport at the bottom of the
-/// terminal. Permanent conversation lines are NOT drawn here — they are
-/// already in the host terminal's scrollback courtesy of
-/// `terminal.insert_before` (driven by the unified loop in
-/// `chat/mod.rs::run_tui_unified_loop`).
-///
-/// Layout (top to bottom):
-///   1. Status bar (1 row)
-///   2. Streaming preview (optional, up to [`STREAMING_VISIBLE_ROWS`])
-///   3. Input box (dynamic, border + 1..=[`INPUT_MAX_VISIBLE_ROWS`])
-///   4. Footer (1 row)
-pub fn render_bottom_chrome<V: BottomChromeView + ?Sized>(frame: &mut Frame, state: &V) {
-    // The unified loop keeps the inline viewport at the dynamic chrome
-    // height. Keep bottom alignment as a defensive fallback for unusually
-    // short frames so the input box stays pinned to the prompt line.
-    let frame_area = frame.area();
-    let height = bottom_chrome_height(state).min(frame_area.height);
-    let area = Rect {
-        y: frame_area.bottom().saturating_sub(height),
-        height,
-        ..frame_area
-    };
-
-    if let Some(picker) = state.saved_session_picker() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(area.height.saturating_sub(1).max(1)),
-            ])
-            .split(area);
-        #[allow(clippy::indexing_slicing)]
-        {
-            render_status_bar(frame, chunks[0], state);
-            render_saved_session_picker(frame, chunks[1], picker, state.ascii_fallback());
-        }
-        return;
-    }
-
-    // v1.1b: the Ctrl+G switcher overlay replaces the streaming/input chrome
-    // with a status row + popup list while open. It is rendered inside the same
-    // reserved bottom chrome (never an alternate screen), so the user's history
-    // scrollback above is untouched.
-    if let Some(switcher) = state.switcher() {
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),                                    // Status bar
-                Constraint::Length(area.height.saturating_sub(1).max(1)), // Switcher popup
-            ])
-            .split(area);
-        // Layout::split always returns exactly 2 chunks here.
-        #[allow(clippy::indexing_slicing)]
-        {
-            render_status_bar(frame, chunks[0], state);
-            render_switcher(frame, chunks[1], switcher, state.ascii_fallback());
-        }
-        return;
-    }
-
-    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
-    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !child_view_present {
-        STREAMING_VISIBLE_ROWS
-    } else {
-        0
-    };
-    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
-
-    let fixed_rows = 1u16
-        .saturating_add(sessions_rows)
-        .saturating_add(streaming_rows)
-        .saturating_add(input_height)
-        .saturating_add(1);
-    let child_view_rows = if child_view_present {
-        area.height.saturating_sub(fixed_rows)
-    } else {
-        0
-    };
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),               // Status bar
-            Constraint::Length(sessions_rows),   // Child-session status (0 when none)
-            Constraint::Length(child_view_rows), // Focused child viewport (P2/P6c1)
-            Constraint::Length(streaming_rows),  // Streaming preview (0 when idle)
-            Constraint::Length(input_height),    // Input area (dynamic)
-            Constraint::Length(1),               // Footer
-        ])
-        .split(area);
-
-    // Layout::split always returns exactly 6 chunks here.
-    #[allow(clippy::indexing_slicing)]
-    {
-        render_status_bar(frame, chunks[0], state);
-        if sessions_rows > 0 {
-            render_sessions_status(frame, chunks[1], state);
-        }
-        if let Some(approval) = state.pending_tool_approval() {
-            render_approval(frame, chunks[2], &approval.name, &approval.args, state.ascii_fallback());
-        } else if let Some(view) = state.active_session_view() {
-            render_active_session_view(frame, chunks[2], view, state.ascii_fallback());
-        }
-        if streaming_rows > 0 {
-            render_streaming_preview(frame, chunks[3], state);
-        }
-        render_input(frame, chunks[4], state);
-        render_footer(frame, chunks[5]);
-    }
-}
-
 /// Height of the pinned bottom chrome in fullscreen mode.
 ///
-/// Unlike [`bottom_chrome_height`], Ctrl+G and saved-session picker do not
-/// replace the chrome here; they render as overlays above the full frame.
+/// Ctrl+G and saved-session picker do not replace the chrome here; they render
+/// as overlays above the full frame.
 pub fn fullscreen_bottom_chrome_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     fullscreen_bottom_chrome_base_height(state).clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
 }
@@ -2517,28 +2302,6 @@ pub fn fullscreen_transcript_scroll_available<V: BottomChromeView + ?Sized>(stat
         && state.pending_tool_approval().is_none()
         && state.active_session_view().is_none()
         && !state.focus().is_child_view()
-}
-
-fn bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
-    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
-    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let child_view_rows = if state.pending_tool_approval().is_some() || state.active_session_view().is_some() {
-        ACTIVE_SESSION_VIEW_DESIRED_ROWS.saturating_add(1)
-    } else {
-        0
-    };
-    let child_view_present = state.pending_tool_approval().is_some() || state.active_session_view().is_some();
-    let streaming_rows = if state.streaming().is_some() && !child_view_present {
-        STREAMING_VISIBLE_ROWS
-    } else {
-        0
-    };
-    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
-    1u16.saturating_add(sessions_rows)
-        .saturating_add(child_view_rows)
-        .saturating_add(streaming_rows)
-        .saturating_add(input_height)
-        .saturating_add(1)
 }
 
 fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -3311,52 +3074,6 @@ fn estimate_visible_token_usage<V: BottomChromeView + ?Sized>(state: &V) -> usiz
     chars / 4
 }
 
-/// Render the in-flight streaming-assistant draft inside the inline
-/// viewport. Trimmed to the last [`STREAMING_VISIBLE_ROWS`] rows so the
-/// most recently arrived tokens stay visible.
-fn render_streaming_preview<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    let Some(draft) = state.streaming() else {
-        return;
-    };
-    let ascii = state.ascii_fallback();
-
-    // Build the preview body directly (no trailing blank separator): the
-    // separator that `render_conversation_line` appends after a finalised
-    // message would waste one of the few preview rows and, once we scroll
-    // to the bottom, push the newest tokens off-screen.
-    let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
-    let mut body_lines: Vec<&str> = draft.accumulated.lines().collect();
-    if draft.accumulated.is_empty() || draft.accumulated.ends_with('\n') {
-        // `str::lines` drops a trailing empty segment; keep the cursor on a
-        // fresh row when the buffer ends on a newline (or is still empty).
-        body_lines.push("");
-    }
-    let last_idx = body_lines.len().saturating_sub(1);
-    let mut sink: Vec<Line<'_>> = Vec::with_capacity(body_lines.len());
-    for (i, text_line) in body_lines.iter().enumerate() {
-        if i == last_idx {
-            sink.push(Line::from(format!("{text_line}{cursor}")));
-        } else {
-            sink.push(Line::from((*text_line).to_string()));
-        }
-    }
-
-    // The Paragraph below renders with ratatui's word-aware wrapping
-    // (`Wrap { trim: false }`). The char-count `wrapped_rows_for_lines`
-    // estimate over-counts versus that word-wrap, so using it for the
-    // scroll offset over-scrolls and clips the newest tokens. Measure the
-    // real wrapped height via ratatui itself so the scroll keeps the
-    // trailing rows visible.
-    let total_rows: u16 = measure_wrapped_rows(&sink, area.width);
-    let scroll: u16 = total_rows.saturating_sub(area.height);
-
-    let widget = Paragraph::new(Text::from(sink))
-        .block(Block::default().borders(Borders::NONE))
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-    frame.render_widget(widget, area);
-}
-
 /// Count the exact number of rows ratatui's word-wrapping
 /// (`Wrap { trim: false }`) needs to render `lines` at `width`.
 ///
@@ -3413,8 +3130,8 @@ fn measure_wrapped_rows(lines: &[Line<'_>], width: u16) -> u16 {
 /// Render a single conversation line into the ratatui `lines` buffer.
 ///
 /// Pure function (apart from the &mut push target) — kept outside
-/// [`render_message_for_insert`] / [`render_streaming_preview`] so unit
-/// tests can drive it with a `Vec<Line<'_>>` sink.
+/// [`render_fullscreen_transcript`] so unit tests can drive it with a
+/// `Vec<Line<'_>>` sink.
 fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a ConversationLine, ascii: bool) {
     match conv_line {
         ConversationLine::User { content } => {
@@ -4183,10 +3900,8 @@ mod tests {
 
     #[test]
     fn tui_state_turn_count_tracks_user_messages_only() {
-        // P3-inline: app-level scroll has been removed. The TuiState now
-        // just owns the conversation log and turn counter; history scroll
-        // is delegated to the host terminal. This pins the contract that
-        // `turn_count` advances on user submissions only.
+        // TuiState owns the conversation log and turn counter. This pins the
+        // contract that `turn_count` advances on user submissions only.
         let mut state = TuiState::new("test", "model");
         state.push_user_message("hello");
         state.push_assistant_message("world");
@@ -4477,14 +4192,10 @@ mod tests {
     }
 
     #[test]
-    fn streaming_transient_renders_after_history_in_insert_pipeline() {
-        // P3-inline: drive `render_conversation_line` over both the
-        // history and the staged transient line. The history portion is
-        // what `render_message_for_insert` emits per message; the
-        // transient lands in the inline viewport's streaming preview
-        // (see `render_streaming_preview`). Either way the streaming
-        // block must contain the in-flight tokens and end with the
-        // cursor glyph.
+    fn streaming_transient_renders_after_history_in_fullscreen_lines() {
+        // Drive `render_conversation_line` over both finalized history and the
+        // staged transient line. The streaming block must contain the in-flight
+        // tokens and end with the cursor glyph.
         let mut state = TuiState::new("p", "m");
         state.push_assistant_message("first turn done");
         state.start_stream("d-live");
@@ -5471,11 +5182,9 @@ mod tests {
     }
 
     #[test]
-    fn p3_inline_pageup_pagedown_fall_through_to_terminal() {
-        // P3-inline: PgUp/PgDn are intentionally NOT consumed so the host
-        // terminal can scroll the main scrollback natively (alongside
-        // mouse wheel and Shift+PgUp). The input subsystem must report
-        // them as Unhandled.
+    fn input_pageup_pagedown_fall_through_to_outer_loop() {
+        // Fullscreen transcript scroll is handled by the outer TUI loop.
+        // The input subsystem must report these keys as Unhandled.
         let mut input = TuiInput::new();
         assert_eq!(input.handle_key(key(KeyCode::PageUp)), InputOutcome::Unhandled);
         assert_eq!(input.handle_key(key(KeyCode::PageDown)), InputOutcome::Unhandled);
@@ -6052,12 +5761,8 @@ mod tests {
 
     #[test]
     fn dispatch_pageup_pagedown_are_consumed_without_scroll() {
-        // P3-inline: there is no app-level scrolling. PgUp/PgDn are not
-        // routed anywhere by the dispatcher — they surface as Consumed
-        // (the global dispatcher always returns *some* KeyDispatch) and
-        // leave the input buffer untouched. The host terminal handles
-        // history scroll natively, so users still get PgUp/PgDn behavior
-        // via the terminal emulator's own scrollback.
+        // Transcript scroll is owned by the outer fullscreen event loop. The
+        // pure dispatcher consumes the key without mutating input.
         let mut state = TuiState::new("p", "m");
         let out = dispatch_global_key(key(KeyCode::PageUp), &mut state);
         assert_eq!(out, KeyDispatch::Consumed);
@@ -6426,36 +6131,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn sessions_strip_narrow_render_keeps_status_input_and_footer_separate() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = TuiState::new("provider", "model");
-        state.sessions_cache = vec![entry(1)];
-        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
-
-        let mut terminal = Terminal::new(TestBackend::new(36, 6)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..36).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..6).map(row).collect();
-        assert!(
-            rows.iter().any(|r| r.contains("PRX | mode:edit")),
-            "status row kept: {rows:?}"
-        );
-        assert!(rows.iter().any(|r| r.contains("#1")), "sessions strip kept: {rows:?}");
-        assert!(
-            rows.iter().any(|r| r.contains("agent #1")),
-            "input prompt kept: {rows:?}"
-        );
-        assert!(rows.iter().any(|r| r.contains("Ctrl+G")), "footer kept: {rows:?}");
-    }
-
     fn active_view(seq: u64, lines: Vec<String>, scroll_offset: usize) -> crate::chat::sessions::ActiveSessionView {
         crate::chat::sessions::ActiveSessionView {
             seq,
@@ -6533,179 +6208,6 @@ mod tests {
             view.scroll_offset,
             view.max_scroll_offset(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS)),
             "oversized diff offset clamps to the oldest retained visible page"
-        );
-    }
-
-    #[test]
-    fn active_session_view_render_keeps_viewport_input_and_footer_separate() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = TuiState::new("provider", "model");
-        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 4 };
-        state.active_session_view = Some(active_view(
-            4,
-            vec![
-                "short".to_string(),
-                "包含中文的输出行".to_string(),
-                "a-very-long-line-that-must-be-truncated-before-it-can-overlap-input".to_string(),
-            ],
-            0,
-        ));
-
-        let mut terminal = Terminal::new(TestBackend::new(42, 12)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..42).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..12).map(row).collect();
-
-        assert!(
-            rows.iter().any(|r| r.contains("attached #4")),
-            "viewport header rendered: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("[output truncated]")),
-            "truncation marker rendered in viewport header: {rows:?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|r| ['包', '含', '中', '文'].iter().all(|ch| r.contains(*ch))),
-            "CJK line rendered: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("agent #4")),
-            "input prompt remains visible: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("Ctrl+G")),
-            "footer remains visible: {rows:?}"
-        );
-        for row in rows {
-            assert!(
-                row.chars().count() <= 42,
-                "rendered row must stay inside terminal width: {row:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn transcript_view_header_is_not_attached_seq_zero() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = TuiState::new("provider", "model");
-        state.session_title = "demo".to_string();
-        state.focus = crate::chat::sessions::FocusTarget::Transcript;
-        state.conversation_lines.push(ConversationLine::User {
-            content: "hello".to_string(),
-        });
-        state.active_session_view = Some(build_transcript_view(
-            &state.session_title,
-            &state.conversation_lines,
-            0,
-        ));
-
-        let mut terminal = Terminal::new(TestBackend::new(48, 12)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..48).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..12).map(row).collect();
-
-        assert!(
-            rows.iter().any(|r| r.contains("transcript demo")),
-            "transcript header rendered: {rows:?}"
-        );
-        assert!(
-            !rows.iter().any(|r| r.contains("attached #0")),
-            "transcript must not render as fake attached session: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("user: hello")),
-            "transcript body rendered: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn diff_view_header_is_not_attached_seq_zero() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = TuiState::new("provider", "model");
-        state.focus = crate::chat::sessions::FocusTarget::Diff;
-        state.active_session_view = Some(build_diff_view(
-            "workspace diff",
-            vec![
-                "diff --git a/src/lib.rs b/src/lib.rs".to_string(),
-                "+新增内容".to_string(),
-            ],
-            false,
-            0,
-        ));
-
-        let mut terminal = Terminal::new(TestBackend::new(56, 12)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..56).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..12).map(row).collect();
-        assert!(
-            rows.iter().any(|r| r.contains("diff workspace diff")),
-            "diff header rendered: {rows:?}"
-        );
-        assert!(
-            !rows.iter().any(|r| r.contains("attached #0")),
-            "diff must not render as fake attached session: {rows:?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|r| r.contains('+') && ['新', '增', '内', '容'].iter().all(|ch| r.contains(*ch))),
-            "diff body rendered with CJK content: {rows:?}"
-        );
-    }
-
-    #[test]
-    fn active_session_view_short_terminal_drops_viewport_before_input_footer() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let mut state = TuiState::new("provider", "model");
-        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 4 };
-        state.active_session_view = Some(active_view(4, vec!["must not overlap".to_string()], 0));
-
-        let mut terminal = Terminal::new(TestBackend::new(36, 4)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..36).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..4).map(row).collect();
-
-        assert!(
-            !rows
-                .iter()
-                .any(|r| r.contains("attached #4") || r.contains("must not overlap")),
-            "viewport should collapse before overlapping input/footer on a 4-row terminal: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("agent #4")),
-            "input prompt remains visible: {rows:?}"
-        );
-        assert!(
-            rows.iter().any(|r| r.contains("Ctrl+G")),
-            "footer remains visible: {rows:?}"
         );
     }
 
@@ -6935,57 +6437,6 @@ mod tests {
         assert_eq!(state.input.text(), "你好");
     }
 
-    // ── P3-inline: insert_before pipeline tests ──────────────────────────
-
-    #[test]
-    fn render_message_for_insert_paints_user_line_into_buffer() {
-        // The unified TUI loop hands `render_message_for_insert` a Buffer
-        // sized via `estimate_message_height` and expects the message to
-        // be visible in the scrollback after `insert_before` flushes.
-        // Render a short user message into a 4-row × 40-col buffer and
-        // verify the prompt + content land in row 0.
-        let line = ConversationLine::User {
-            content: "hello world".to_string(),
-        };
-        let area = Rect {
-            x: 0,
-            y: 0,
-            width: 40,
-            height: 4,
-        };
-        let mut buf = Buffer::empty(area);
-        render_message_for_insert(&mut buf, &line, false);
-        // Read row 0 cell-by-cell; it should contain "> hello world".
-        let mut row0 = String::new();
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, 0)) {
-                row0.push_str(cell.symbol());
-            }
-        }
-        let trimmed = row0.trim_end();
-        assert!(
-            trimmed.starts_with("> hello world"),
-            "row 0 should contain '> hello world', got {trimmed:?}"
-        );
-    }
-
-    #[test]
-    fn estimate_message_height_grows_with_narrower_terminal() {
-        // A long user message must consume more rows when the terminal
-        // is narrow — the unified loop relies on this to size each
-        // `insert_before` call so wrapped output is never clipped.
-        let long_text = "x".repeat(200);
-        let line = ConversationLine::User { content: long_text };
-        let wide = estimate_message_height(120, &line, false);
-        let narrow = estimate_message_height(40, &line, false);
-        assert!(
-            narrow > wide,
-            "narrow terminal must need more rows: narrow={narrow}, wide={wide}"
-        );
-        // Floor of 2 rows: content row + trailing blank separator.
-        assert!(wide >= 2, "user message always needs at least content + blank");
-    }
-
     #[test]
     fn measure_wrapped_rows_matches_ratatui_wordwrap() {
         // `measure_wrapped_rows` must return the EXACT number of rows
@@ -7059,7 +6510,7 @@ mod tests {
             }
         }
         let width = 80u16;
-        let window = STREAMING_VISIBLE_ROWS;
+        let window = 6;
         let total = measure_wrapped_rows(&sink, width);
         assert!(total > window, "test setup: body must overflow the window");
         let scroll = total.saturating_sub(window);
@@ -7074,70 +6525,29 @@ mod tests {
     }
 
     #[test]
-    fn bottom_chrome_height_expands_with_input_and_streaming() {
+    fn fullscreen_bottom_chrome_height_expands_with_input_not_streaming() {
         // Resting state: status (1) + input border (1) + input row (1) +
-        // footer (1) = 4. Streaming adds the preview block. A long
-        // multi-line input adds more rows up to the visible cap.
+        // footer (1) = 4. Streaming is rendered at the transcript tail, not in
+        // bottom chrome. A long multi-line input adds rows up to the visible cap.
         let mut state = TuiState::new("p", "m");
-        let idle = bottom_chrome_height(&state);
+        let idle = fullscreen_bottom_chrome_height(&state);
         assert!(idle >= BOTTOM_CHROME_MIN_HEIGHT);
         assert!(idle <= BOTTOM_CHROME_MAX_HEIGHT);
 
-        // Streaming should bump the height by `STREAMING_VISIBLE_ROWS`.
         state.start_stream("d-live");
-        let streaming = bottom_chrome_height(&state);
-        assert!(
-            streaming > idle,
-            "streaming preview must add rows: streaming={streaming}, idle={idle}"
-        );
+        let streaming = fullscreen_bottom_chrome_height(&state);
+        assert_eq!(streaming, idle, "streaming must not duplicate into fullscreen chrome");
 
         // Multi-line input drives growth too (until clamped).
         state.cancel_stream("d-live");
         for _ in 0..6 {
             state.input.lines.push(String::new());
         }
-        let tall = bottom_chrome_height(&state);
+        let tall = fullscreen_bottom_chrome_height(&state);
         assert!(tall > idle, "multi-line input must add rows: tall={tall}, idle={idle}");
         assert!(
             tall <= BOTTOM_CHROME_MAX_HEIGHT,
             "must be clamped to BOTTOM_CHROME_MAX_HEIGHT"
-        );
-    }
-
-    #[test]
-    fn bottom_chrome_actual_height_viewport_has_no_reserved_blank_band() {
-        use ratatui::Terminal;
-        use ratatui::backend::TestBackend;
-
-        let state = TuiState::new("provider", "model");
-        let height = bottom_chrome_height(&state);
-        assert!(
-            height < BOTTOM_CHROME_MAX_HEIGHT,
-            "test setup must cover the idle short-chrome case"
-        );
-
-        let mut terminal = Terminal::new(TestBackend::new(48, height)).expect("test backend");
-        terminal
-            .draw(|frame| {
-                render_bottom_chrome(frame, &state);
-            })
-            .expect("draw bottom chrome");
-
-        let buffer = terminal.backend().buffer();
-        let row = |y: u16| -> String { (0..48).map(|x| buffer[(x, y)].symbol()).collect::<Vec<_>>().join("") };
-        let rows: Vec<String> = (0..height).map(row).collect();
-
-        assert!(
-            rows.first().is_some_and(|r| r.contains("PRX | mode:edit")),
-            "status row must start at the top of the actual-height viewport: {rows:?}"
-        );
-        assert!(
-            rows.iter().all(|r| !r.trim().is_empty()),
-            "actual-height viewport must not retain the old reserved blank band: {rows:?}"
-        );
-        assert!(
-            rows.last().is_some_and(|r| r.contains("Ctrl+G")),
-            "footer remains pinned to the bottom row: {rows:?}"
         );
     }
 
@@ -7530,12 +6940,12 @@ mod tests {
     #[test]
     fn sessions_status_row_adds_height_only_when_present() {
         let mut state = TuiState::new("p", "m");
-        let idle = bottom_chrome_height(&state);
+        let idle = fullscreen_bottom_chrome_height(&state);
         assert!(!sessions_status_visible(&state), "empty status row hidden");
 
         state.set_sessions_status("sessions: 1 running");
         assert!(sessions_status_visible(&state), "non-empty status row shown");
-        let with_row = bottom_chrome_height(&state);
+        let with_row = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
             with_row,
             idle.saturating_add(1),
@@ -7545,15 +6955,14 @@ mod tests {
         // Clearing the status hides the row again.
         state.set_sessions_status("");
         assert!(!sessions_status_visible(&state));
-        assert_eq!(bottom_chrome_height(&state), idle);
+        assert_eq!(fullscreen_bottom_chrome_height(&state), idle);
     }
 
     #[test]
     fn sessions_status_row_stays_within_height_budget() {
-        // With current constants the busiest chrome (streaming + max visible
-        // input) is status(1)+streaming(6)+input(1+10)+footer(1)=19, so adding
-        // the 1-row sessions line (=20) still fits under BOTTOM_CHROME_MAX_HEIGHT
-        // (24): the row stays visible and the total never exceeds the cap.
+        // With current constants the busiest fullscreen chrome is
+        // status(1)+input(1+10)+footer(1), so adding the 1-row sessions line
+        // still fits under BOTTOM_CHROME_MAX_HEIGHT (24).
         let mut state = TuiState::new("p", "m");
         state.set_sessions_status("sessions: 9 running");
         state.start_stream("d");
@@ -7564,7 +6973,7 @@ mod tests {
             sessions_status_visible(&state),
             "the sessions row fits within the height budget under real inputs"
         );
-        assert!(bottom_chrome_height(&state) <= BOTTOM_CHROME_MAX_HEIGHT);
+        assert!(fullscreen_bottom_chrome_height(&state) <= BOTTOM_CHROME_MAX_HEIGHT);
     }
 
     #[test]
@@ -7574,7 +6983,6 @@ mod tests {
         // input box and footer never lose rows. We exercise the guard directly
         // via its documented threshold (without depending on specific constants).
         let without_sessions = 1u16 // status
-            + STREAMING_VISIBLE_ROWS
             + u16::try_from(INPUT_MAX_VISIBLE_ROWS + 1).unwrap_or(11)
             + 1; // footer
         assert!(
@@ -7671,32 +7079,26 @@ mod tests {
         assert_eq!(render_token_budget(42, None), "~42 tok");
     }
 
+    fn render_conversation_line_to_buffer(buf: &mut Buffer, line: &ConversationLine, ascii: bool) {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut lines, line, ascii);
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        paragraph.render(buf.area, buf);
+    }
+
     // ── CJK / wide-char rendering regression tests ───────────────────────
     //
-    // These tests guard against the phantom-space bug that appeared in TUI
-    // mode when `insert_before` used the non-scrolling-regions path
-    // (`draw_lines`), which iterated raw Buffer cells without skipping the
-    // "continuation" cell that ratatui places after every wide (CJK) glyph.
-    // Each CJK character occupies 2 columns; ratatui stores the glyph in
-    // cell[x] and resets cell[x+1] to `Cell::EMPTY` (whose `symbol()`
-    // returns `" "`). When `draw_lines` emitted that space verbatim, the
-    // terminal saw `你 好 世 界` instead of `你好世界`.
-    //
-    // The fix: enable the `scrolling-regions` ratatui feature so that
-    // `insert_before` uses `draw_lines_over_cleared`, which goes through
-    // `Buffer::diff()`. `diff()` tracks `to_skip` for wide glyphs and
-    // therefore never emits the continuation cell.
-    //
-    // Here we verify the buffer-level invariants: specifically that the
-    // cells produced by the `scrolling-regions` diff path omit continuation
-    // cells and reconstruct the original CJK text faithfully.
+    // These tests guard the shared conversation-line renderer against phantom
+    // spaces in wide CJK text. Each CJK character occupies 2 columns; ratatui
+    // stores the glyph in cell[x] and resets cell[x+1] to `Cell::EMPTY`
+    // (whose `symbol()` returns `" "`). Buffer diffing must reconstruct the
+    // original text without inter-character spaces.
 
     #[test]
     #[cfg(feature = "terminal-tui")]
     fn cjk_buffer_diff_omits_continuation_cells() {
         // Build a buffer containing a Chinese assistant message, then take
-        // its diff against an empty buffer (same as `draw_lines_over_cleared`
-        // does internally).  The diff updates must not contain any
+        // its diff against an empty buffer. The diff updates must not contain
         // continuation-cell spaces between consecutive CJK characters.
         let line = ConversationLine::Assistant {
             content: "你好世界欢迎使用PRX".to_string(),
@@ -7709,10 +7111,9 @@ mod tests {
         };
         let empty = Buffer::empty(area);
         let mut filled = Buffer::empty(area);
-        render_message_for_insert(&mut filled, &line, false);
+        render_conversation_line_to_buffer(&mut filled, &line, false);
 
-        // Collect symbols from the diff — this is exactly what the
-        // `scrolling-regions` insert_before path emits to the backend.
+        // Collect symbols from the diff.
         let diff = empty.diff(&filled);
         let mut row0_symbols = String::new();
         for (_x, y, cell) in &diff {
@@ -7751,7 +7152,7 @@ mod tests {
         };
         let empty = Buffer::empty(area);
         let mut filled = Buffer::empty(area);
-        render_message_for_insert(&mut filled, &line, false);
+        render_conversation_line_to_buffer(&mut filled, &line, false);
 
         let diff = empty.diff(&filled);
         let mut row0 = String::new();
@@ -7788,7 +7189,7 @@ mod tests {
         };
         let empty = Buffer::empty(area);
         let mut filled = Buffer::empty(area);
-        render_message_for_insert(&mut filled, &line, false);
+        render_conversation_line_to_buffer(&mut filled, &line, false);
 
         let diff = empty.diff(&filled);
         let mut row0 = String::new();
@@ -7831,9 +7232,9 @@ mod tests {
         }
 
         /// Parity 检查：相同 ChatState 同时映射到 TuiState（mirror 兼容字段）+ UiSnapshot 后，
-        /// `bottom_chrome_height` 在两种 view 上返回相同值.
+        /// `fullscreen_bottom_chrome_height` 在两种 view 上返回相同值.
         #[test]
-        fn s4_a_2_bottom_chrome_height_parity_tui_vs_snapshot() {
+        fn s4_a_2_fullscreen_bottom_chrome_height_parity_tui_vs_snapshot() {
             let mut state = make_state_with_lines();
             let snap = state.build_ui_snapshot(1);
 
@@ -7847,15 +7248,15 @@ mod tests {
             tui.input = state.ui.input.clone();
 
             assert_eq!(
-                bottom_chrome_height(&tui),
-                bottom_chrome_height(&snap),
+                fullscreen_bottom_chrome_height(&tui),
+                fullscreen_bottom_chrome_height(&snap),
                 "TuiState vs UiSnapshot 在同 fixture 下高度应一致"
             );
         }
 
         /// Parity 检查：streaming 状态下两种 view 的高度仍一致.
         #[test]
-        fn s4_a_2_bottom_chrome_height_parity_streaming() {
+        fn s4_a_2_fullscreen_bottom_chrome_height_parity_streaming() {
             let mut state = make_state_with_lines();
             state.stream.draft = Some(StreamingDraft {
                 draft_id: "d-1".to_string(),
@@ -7872,11 +7273,14 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
 
-            let h_tui = bottom_chrome_height(&tui);
-            let h_snap = bottom_chrome_height(&snap);
+            let h_tui = fullscreen_bottom_chrome_height(&tui);
+            let h_snap = fullscreen_bottom_chrome_height(&snap);
             assert_eq!(h_tui, h_snap, "streaming 下高度应一致 (tui={h_tui}, snap={h_snap})");
-            // streaming 加 STREAMING_VISIBLE_ROWS — 高于纯文本.
-            assert!(h_tui > BOTTOM_CHROME_MIN_HEIGHT, "streaming 下高度应高于最小值");
+            assert_eq!(
+                h_tui,
+                fullscreen_bottom_chrome_height(&TuiState::new(&state.session.provider, &state.session.model)),
+                "streaming 不应重复占用 fullscreen bottom chrome"
+            );
         }
 
         /// Parity 检查：BottomChromeView 各 getter 在 TuiState 与 UiSnapshot 上返回相同字段.
@@ -8015,7 +7419,10 @@ mod tests {
                 BottomChromeView::pending_tool_approval(&snap)
             );
             assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
-            assert_eq!(bottom_chrome_height(&tui), bottom_chrome_height(&snap));
+            assert_eq!(
+                fullscreen_bottom_chrome_height(&tui),
+                fullscreen_bottom_chrome_height(&snap)
+            );
         }
 
         #[test]
@@ -8062,11 +7469,10 @@ mod tests {
             assert_eq!(tui_entry.title, snap_entry.title);
         }
 
-        /// Buffer-level parity: 把同一 view 在小 Buffer 上 render，断言两份 buffer 内容一致.
-        ///
-        /// 通过 `Buffer::diff` 比较；任何字节级偏差都会被捕获.
+        /// Fullscreen chrome parity: tool cards live in the transcript/panel, so
+        /// bottom chrome height must stay identical for TuiState and UiSnapshot.
         #[test]
-        fn s4_a_2_render_buffer_parity_tool_card() {
+        fn s4_a_2_fullscreen_chrome_parity_tool_card() {
             let mut state = make_state_with_lines();
             state.ui.conversation_lines.push(ConversationLine::ToolResult {
                 tool_name: "memory_recall".to_string(),
@@ -8086,34 +7492,10 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
 
-            // 同时验证 bottom_chrome_height parity（snap & tui 在 tool card 状态下高度一致）.
             assert_eq!(
-                bottom_chrome_height(&tui),
-                bottom_chrome_height(&snap),
+                fullscreen_bottom_chrome_height(&tui),
+                fullscreen_bottom_chrome_height(&snap),
                 "tool card 状态下高度应一致"
-            );
-
-            // 用 render_message_for_insert 验证 tool card 字节级一致.
-            let line = state
-                .ui
-                .conversation_lines
-                .last()
-                .expect("test: just pushed a tool card");
-            let area = Rect {
-                x: 0,
-                y: 0,
-                width: 80,
-                height: 4,
-            };
-            let mut buf_tui = Buffer::empty(area);
-            let mut buf_snap = Buffer::empty(area);
-            render_message_for_insert(&mut buf_tui, line, false);
-            render_message_for_insert(&mut buf_snap, line, false);
-            // Buffer 字节级 diff 应为空（两次渲染同一 line 同 ascii_fallback）.
-            let diff = buf_tui.diff(&buf_snap);
-            assert!(
-                diff.is_empty(),
-                "render_message_for_insert 两次同输入应字节级一致, diff={diff:?}"
             );
         }
     }

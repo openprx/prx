@@ -5118,27 +5118,12 @@ pub struct QQConfig {
 
 /// Interactive chat configuration (`[chat]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ChatConfig {
-    /// Chat TUI renderer mode. Defaults to fullscreen; use `PRX_TUI=0` or
-    /// `prx chat --plain` for the non-TUI fallback.
-    #[serde(default)]
-    pub tui_mode: ChatTuiModeConfig,
-}
+pub struct ChatConfig {}
 
 impl Default for ChatConfig {
     fn default() -> Self {
-        Self {
-            tui_mode: ChatTuiModeConfig::Fullscreen,
-        }
+        Self {}
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum ChatTuiModeConfig {
-    Inline,
-    #[default]
-    Fullscreen,
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -6208,25 +6193,26 @@ min_chars = 12
     }
 
     #[test]
-    async fn chat_config_defaults_to_fullscreen() {
+    async fn chat_config_defaults_to_empty_fullscreen_config() {
         let config = ChatConfig::default();
 
-        assert_eq!(config.tui_mode, ChatTuiModeConfig::Fullscreen);
+        assert_eq!(config, ChatConfig {});
     }
 
     #[test]
-    async fn chat_tui_mode_roundtrips_as_toml_string() {
-        let config = ChatConfig {
-            tui_mode: ChatTuiModeConfig::Fullscreen,
-        };
+    async fn chat_config_roundtrips_without_renderer_mode() {
+        let config = ChatConfig {};
 
         let encoded = toml::to_string(&config).unwrap();
-        assert!(encoded.contains("tui_mode = \"fullscreen\""));
+        assert!(
+            !encoded.contains("tui_mode"),
+            "renderer selection is no longer a persisted config field: {encoded}"
+        );
         let decoded: ChatConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded.tui_mode, ChatTuiModeConfig::Fullscreen);
+        assert_eq!(decoded, ChatConfig {});
 
         let defaulted: ChatConfig = toml::from_str("").unwrap();
-        assert_eq!(defaulted.tui_mode, ChatTuiModeConfig::Fullscreen);
+        assert_eq!(defaulted, ChatConfig {});
     }
 
     // ── Serde round-trip ─────────────────────────────────────

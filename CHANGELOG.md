@@ -13,6 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scrollback is no longer the chat transcript surface; use in-app scrolling while
   chatting and `/export [md|json]` to save a transcript. `PRX_TUI=0 prx chat`,
   `prx chat --plain`, and non-TTY stdin still use the plain reedline fallback.
+  The previous `[chat].tui_mode` / `PRX_TUI_MODE` inline-vs-fullscreen selector
+  is removed because fullscreen is now the only TUI renderer.
 
 ### Security
 

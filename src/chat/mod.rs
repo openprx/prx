@@ -1116,55 +1116,14 @@ fn collect_reasoning_from_history_slice(slice: &[ChatMessage]) -> String {
 // ── P3-2 / alt-screen Phase 0: TerminalGuard RAII + panic restore ────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ChatTuiMode {
-    Inline,
-    Fullscreen,
-}
-
-impl ChatTuiMode {
-    const fn from_config(mode: crate::config::ChatTuiModeConfig) -> Self {
-        match mode {
-            crate::config::ChatTuiModeConfig::Inline => Self::Inline,
-            crate::config::ChatTuiModeConfig::Fullscreen => Self::Fullscreen,
-        }
-    }
-
-    fn from_env(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "inline" => Some(Self::Inline),
-            "fullscreen" => Some(Self::Fullscreen),
-            _ => None,
-        }
-    }
-}
-
-#[cfg(feature = "terminal-tui")]
-const fn pty_handoff_mode_from_chat_tui_mode(mode: ChatTuiMode) -> crate::chat::sessions::pty::PtyHandoffMode {
-    match mode {
-        ChatTuiMode::Inline => crate::chat::sessions::pty::PtyHandoffMode::Inline,
-        ChatTuiMode::Fullscreen => crate::chat::sessions::pty::PtyHandoffMode::Fullscreen,
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatTuiSelection {
     enabled: bool,
-    mode: ChatTuiMode,
 }
 
 #[cfg(feature = "terminal-tui")]
-fn select_chat_tui(
-    plain_mode: bool,
-    stdin_is_terminal: bool,
-    prx_tui_env: Option<&str>,
-    prx_tui_mode_env: Option<&str>,
-    config_mode: crate::config::ChatTuiModeConfig,
-) -> ChatTuiSelection {
+fn select_chat_tui(plain_mode: bool, stdin_is_terminal: bool, prx_tui_env: Option<&str>) -> ChatTuiSelection {
     let enabled = should_enable_terminal_tui(plain_mode, stdin_is_terminal, prx_tui_env);
-    let mode = prx_tui_mode_env
-        .and_then(ChatTuiMode::from_env)
-        .unwrap_or_else(|| ChatTuiMode::from_config(config_mode));
-    ChatTuiSelection { enabled, mode }
+    ChatTuiSelection { enabled }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1228,24 +1187,19 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-fn enter_terminal_state_with_ops(
-    ops: &mut impl TerminalModeOps,
-    mode: ChatTuiMode,
-) -> std::io::Result<TerminalGuardState> {
+fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
     let mut state = TerminalGuardState::inactive();
 
     ops.enable_raw_mode()?;
     state.raw_mode_active = true;
 
-    if mode == ChatTuiMode::Fullscreen {
-        CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
-        if let Err(e) = ops.enter_alternate_screen() {
-            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-            let _ = ops.disable_raw_mode();
-            return Err(e);
-        }
-        state.alternate_screen_active = true;
+    CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    if let Err(e) = ops.enter_alternate_screen() {
+        CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        let _ = ops.disable_raw_mode();
+        return Err(e);
     }
+    state.alternate_screen_active = true;
 
     if let Err(e) = ops.enable_bracketed_paste() {
         if state.alternate_screen_active {
@@ -1286,9 +1240,8 @@ fn restore_terminal_state_with_ops(ops: &mut impl TerminalModeOps, leave_alterna
 /// Best-effort terminal restoration used by both [`TerminalGuard`] and the chat
 /// panic hook installed via [`install_chat_panic_hook`].
 ///
-/// Inline mode preserves the host scrollback and does not leave alternate
-/// screen. Fullscreen mode records a process-global active flag so panic restore
-/// can emit `LeaveAlternateScreen` before the chained hook prints its backtrace.
+/// Fullscreen mode records a process-global active flag so panic restore can
+/// emit `LeaveAlternateScreen` before the chained hook prints its backtrace.
 fn restore_terminal_state() {
     let leave_alternate_screen = CHAT_FULLSCREEN_ACTIVE.swap(false, std::sync::atomic::Ordering::AcqRel);
     let mut ops = CrosstermTerminalModeOps;
@@ -1297,10 +1250,9 @@ fn restore_terminal_state() {
 
 /// RAII guard for the chat TUI terminal state.
 ///
-/// Inline mode keeps the existing lifecycle: raw mode + bracketed paste, no
-/// alternate screen. Fullscreen mode additionally enters alternate screen on
-/// setup and leaves it on teardown. `enter()` is transactional: any partial
-/// failure rolls back already-applied terminal state before returning `Err`.
+/// The fullscreen TUI lifecycle is raw mode + alternate screen + bracketed
+/// paste. `enter()` is transactional: any partial failure rolls back
+/// already-applied terminal state before returning `Err`.
 pub struct TerminalGuard {
     raw_mode_active: std::sync::atomic::AtomicBool,
     bracketed_paste_active: std::sync::atomic::AtomicBool,
@@ -1308,10 +1260,10 @@ pub struct TerminalGuard {
 }
 
 impl TerminalGuard {
-    pub(crate) fn enter(mode: ChatTuiMode) -> Result<Self> {
+    pub(crate) fn enter() -> Result<Self> {
         let mut ops = CrosstermTerminalModeOps;
-        let state = enter_terminal_state_with_ops(&mut ops, mode)
-            .map_err(|e| anyhow::anyhow!("failed to enter chat TUI terminal mode ({mode:?}): {e}"))?;
+        let state = enter_terminal_state_with_ops(&mut ops)
+            .map_err(|e| anyhow::anyhow!("failed to enter chat fullscreen TUI terminal mode: {e}"))?;
         Ok(Self {
             raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
             bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
@@ -2043,26 +1995,14 @@ pub async fn run(
     // echoing the user's submitted input so the conversation pane reflects
     // it immediately rather than waiting for the next async event).
     #[cfg(feature = "terminal-tui")]
-    let (terminal_guard, redraw_tx_for_main, chat_tui_mode_for_handoff): (
-        Option<TerminalGuard>,
-        Option<mpsc::Sender<()>>,
-        Option<ChatTuiMode>,
-    ) = {
+    let (terminal_guard, redraw_tx_for_main): (Option<TerminalGuard>, Option<mpsc::Sender<()>>) = {
         use std::io::IsTerminal as _;
         // TUI is on by default in TTY. Opt out with PRX_TUI=0 (e.g. for
         // downstream scripts that scrape stdout, or to escape rendering
         // glitches). Non-TTY stdin (pipe / heredoc / scripted) always falls
-        // through to the legacy reedline + BufRead path. PRX_TUI_MODE and
-        // [chat].tui_mode only select inline vs fullscreen after that gate.
+        // through to the legacy reedline + BufRead path.
         let prx_tui_env = std::env::var("PRX_TUI").ok();
-        let prx_tui_mode_env = std::env::var("PRX_TUI_MODE").ok();
-        let tui_selection = select_chat_tui(
-            plain_mode,
-            std::io::stdin().is_terminal(),
-            prx_tui_env.as_deref(),
-            prx_tui_mode_env.as_deref(),
-            config.chat.tui_mode,
-        );
+        let tui_selection = select_chat_tui(plain_mode, std::io::stdin().is_terminal(), prx_tui_env.as_deref());
         if tui_selection.enabled {
             // Order matters: `TerminalGuard::enter()` flips terminal mode
             // FIRST, then we wire up the UiActor
@@ -2071,7 +2011,7 @@ pub async fn run(
             // `channels/terminal.rs`). On enter failure we fall back to the
             // legacy reedline path so the user is never left without a
             // prompt.
-            match TerminalGuard::enter(tui_selection.mode) {
+            match TerminalGuard::enter() {
                 Ok(guard) => {
                     // S4-B: 删除 chat_mirror 旁路写，Pure 模式下 reducer 单源接管 banner
                     // S2-C Step 3: 双写到 Redux UI 镜像。Off/Both/Redux 下 chat_mirror
@@ -2113,7 +2053,6 @@ pub async fn run(
                     // 让其从 watch::Receiver borrow snapshot 替代 chat_mirror.lock()。
                     // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
                     spawn_tui_unified_loop(
-                        tui_selection.mode,
                         input_tx,
                         control_tx.clone(),
                         Arc::clone(&chat_mirror),
@@ -2125,7 +2064,7 @@ pub async fn run(
                         snapshot_rx_for_tui.clone(),
                         Arc::clone(&pty_handoff),
                     );
-                    (Some(guard), Some(redraw_tx_main), Some(tui_selection.mode))
+                    (Some(guard), Some(redraw_tx_main))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "TerminalGuard::enter failed; falling back to reedline input");
@@ -2139,7 +2078,7 @@ pub async fn run(
                             tracing::error!("Terminal input loop error: {e}");
                         }
                     });
-                    (None, None, None)
+                    (None, None)
                 }
             }
         } else {
@@ -2154,7 +2093,7 @@ pub async fn run(
                     tracing::error!("Terminal input loop error: {e}");
                 }
             });
-            (None, None, None)
+            (None, None)
         }
     };
     #[cfg(not(feature = "terminal-tui"))]
@@ -2316,10 +2255,6 @@ pub async fn run(
     // the helpers fall back to plain stdout).
     #[cfg(feature = "terminal-tui")]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = redraw_tx_for_main.clone();
-    #[cfg(feature = "terminal-tui")]
-    let pty_handoff_mode = chat_tui_mode_for_handoff
-        .map(pty_handoff_mode_from_chat_tui_mode)
-        .unwrap_or(crate::chat::sessions::pty::PtyHandoffMode::Inline);
     #[cfg(not(feature = "terminal-tui"))]
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
@@ -3806,7 +3741,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                             &session,
                                             seq,
                                             &pty_handoff,
-                                            pty_handoff_mode,
                                             sessions_redraw_handle.as_ref(),
                                             &emit_chat_output,
                                         )
@@ -4069,7 +4003,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     &security,
                                     &mut chat_sessions,
                                     &pty_handoff,
-                                    pty_handoff_mode,
                                     sessions_redraw_handle.as_ref(),
                                     &emit_chat_output,
                                 )
@@ -5480,9 +5413,7 @@ fn render_response(response: &str) -> String {
 /// Off/Both/Redux 模式从 mirror 锁读 TuiState。
 ///
 /// 渲染 hot path 通过 [`Self::with_view`] 闭包统一拿 `&dyn BottomChromeView`，
-/// 避免两条路径重复代码；pending 行 flush 通过 [`Self::read_pending`] 单独拿
-/// `(Vec<ConversationLine>, ascii_fallback)` 元组（mirror 路径用 lock，
-/// snapshot 路径 borrow Arc Vec 内容）.
+/// 避免两条路径重复代码。
 #[cfg(feature = "terminal-tui")]
 pub(crate) enum RenderSource {
     Mirror(Arc<parking_lot::Mutex<tui::TuiState>>),
@@ -5553,102 +5484,16 @@ impl RenderSource {
             }
         }
     }
-
-    /// 返回 (从 `from_idx` 起的 pending 行的 clone, ascii_fallback).
-    pub(crate) fn read_pending(&self, from_idx: usize) -> (Vec<tui::ConversationLine>, bool) {
-        match self {
-            Self::Mirror(arc) => {
-                let guard = arc.lock();
-                let slice: Vec<tui::ConversationLine> = guard
-                    .conversation_lines
-                    .get(from_idx..)
-                    .map(<[tui::ConversationLine]>::to_vec)
-                    .unwrap_or_default();
-                (slice, guard.ascii_fallback)
-            }
-            Self::Snapshot(rx) => {
-                let snap_arc = rx.borrow();
-                let slice: Vec<tui::ConversationLine> = snap_arc
-                    .conversation_lines
-                    .get(from_idx..)
-                    .map(<[tui::ConversationLine]>::to_vec)
-                    .unwrap_or_default();
-                (slice, snap_arc.ascii_fallback)
-            }
-        }
-    }
-
-    pub(crate) fn conversation_len(&self) -> usize {
-        match self {
-            Self::Mirror(arc) => arc.lock().conversation_lines.len(),
-            Self::Snapshot(rx) => rx.borrow().conversation_lines.len(),
-        }
-    }
-
-    pub(crate) fn conversation_generation(&self) -> u64 {
-        match self {
-            Self::Mirror(_) => 0,
-            Self::Snapshot(rx) => rx.borrow().conversation_generation,
-        }
-    }
 }
 
 #[cfg(feature = "terminal-tui")]
-type InlineTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
+type ChatTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 #[cfg(feature = "terminal-tui")]
-fn desired_inline_viewport_height(view: &dyn tui::BottomChromeView) -> u16 {
-    tui::bottom_chrome_height(view).clamp(tui::BOTTOM_CHROME_MIN_HEIGHT, tui::BOTTOM_CHROME_MAX_HEIGHT)
-}
-
-#[cfg(feature = "terminal-tui")]
-fn changed_inline_viewport_height(current: u16, view: &dyn tui::BottomChromeView) -> Option<u16> {
-    let desired = desired_inline_viewport_height(view);
-    (desired != current).then_some(desired)
-}
-
-#[cfg(feature = "terminal-tui")]
-fn new_inline_terminal(height: u16) -> Result<InlineTerminal> {
-    use ratatui::{TerminalOptions, Viewport};
-
-    let stdout = std::io::stdout();
-    let backend = ratatui::backend::CrosstermBackend::new(stdout);
-    ratatui::Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )
-    .map_err(|e| anyhow::anyhow!("ratatui Terminal::with_options failed: {e}"))
-}
-
-#[cfg(feature = "terminal-tui")]
-fn new_fullscreen_terminal() -> Result<InlineTerminal> {
+fn new_fullscreen_terminal() -> Result<ChatTerminal> {
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     ratatui::Terminal::new(backend).map_err(|e| anyhow::anyhow!("ratatui Terminal::new failed: {e}"))
-}
-
-#[cfg(feature = "terminal-tui")]
-fn clear_old_inline_chrome_region<B>(terminal: &mut ratatui::Terminal<B>) -> std::result::Result<(), B::Error>
-where
-    B: ratatui::backend::Backend,
-{
-    use ratatui::backend::ClearType;
-    use ratatui::layout::Position;
-
-    let area = terminal.get_frame().area();
-    let top = Position { x: area.x, y: area.y };
-    let bottom_anchor = Position {
-        x: area.x,
-        y: area.bottom().saturating_sub(1),
-    };
-    let backend = terminal.backend_mut();
-    backend.set_cursor_position(top)?;
-    backend.clear_region(ClearType::CurrentLine)?;
-    backend.clear_region(ClearType::AfterCursor)?;
-    backend.set_cursor_position(bottom_anchor)?;
-    backend.flush()
 }
 
 /// Runs inside `tokio::task::spawn_blocking` because `terminal.draw()`
@@ -5695,7 +5540,6 @@ where
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 fn spawn_tui_unified_loop(
-    mode: ChatTuiMode,
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
@@ -5709,7 +5553,6 @@ fn spawn_tui_unified_loop(
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
-            mode,
             input_tx,
             control_tx,
             mirror,
@@ -5766,25 +5609,16 @@ trait ExternalEditorTerminalMode {
 }
 
 #[cfg(feature = "terminal-tui")]
-struct CrosstermExternalEditorTerminalMode {
-    mode: ChatTuiMode,
+struct CrosstermExternalEditorTerminalMode;
+
+#[cfg(feature = "terminal-tui")]
+fn write_external_editor_suspend_sequences(out: &mut dyn std::io::Write) {
+    crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(out);
 }
 
 #[cfg(feature = "terminal-tui")]
-fn write_external_editor_suspend_sequences(out: &mut dyn std::io::Write, mode: ChatTuiMode) {
-    if mode == ChatTuiMode::Fullscreen {
-        crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(out);
-    }
-}
-
-#[cfg(feature = "terminal-tui")]
-fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write, mode: ChatTuiMode) {
-    if mode == ChatTuiMode::Fullscreen {
-        crate::chat::sessions::pty::write_handoff_terminal_restore(
-            out,
-            crate::chat::sessions::pty::PtyHandoffMode::Fullscreen,
-        );
-    }
+fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write) {
+    crate::chat::sessions::pty::write_handoff_terminal_restore(out);
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -5793,13 +5627,13 @@ impl ExternalEditorTerminalMode for CrosstermExternalEditorTerminalMode {
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
         let mut out = std::io::stdout();
-        write_external_editor_suspend_sequences(&mut out, self.mode);
+        write_external_editor_suspend_sequences(&mut out);
         let _ = crossterm::terminal::disable_raw_mode();
     }
 
     fn restore_after_editor(&self) {
         let mut out = std::io::stdout();
-        write_external_editor_restore_sequences(&mut out, self.mode);
+        write_external_editor_restore_sequences(&mut out);
         let _ = crossterm::terminal::enable_raw_mode();
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::cursor::Show);
@@ -6392,7 +6226,6 @@ async fn handle_pty_command(
     security: &Arc<crate::security::SecurityPolicy>,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
-    mode: crate::chat::sessions::pty::PtyHandoffMode,
     redraw_handle: Option<&mpsc::Sender<()>>,
     emit_chat_output: &impl Fn(&str),
 ) {
@@ -6440,7 +6273,7 @@ async fn handle_pty_command(
 
     // First `/pty` goes straight through the unified re-attach entry point, so the
     // spawn path and a later `/attach` share exactly one passthrough code path.
-    reattach_pty(&session, seq, handoff, mode, redraw_handle, emit_chat_output).await;
+    reattach_pty(&session, seq, handoff, redraw_handle, emit_chat_output).await;
 }
 
 /// Re-attach (or first-attach) to a live PTY session: hand the terminal to it,
@@ -6464,7 +6297,6 @@ async fn reattach_pty(
     session: &crate::chat::sessions::pty::PtyShellSession,
     seq: u64,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
-    mode: crate::chat::sessions::pty::PtyHandoffMode,
     redraw_handle: Option<&mpsc::Sender<()>>,
     emit_chat_output: &impl Fn(&str),
 ) {
@@ -6486,7 +6318,7 @@ async fn reattach_pty(
         // the ack times out we do NOT proceed (running while the render loop might
         // still touch the terminal would corrupt the screen). `acquire` un-pauses
         // the render loop itself on timeout, so we just report the abort.
-        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge, mode) else {
+        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
             return PtyOutcome::AttachAborted;
         };
         PtyOutcome::Exited(run_pty_attach(&session_for_passthrough))
@@ -6780,18 +6612,13 @@ fn pty_stdin_loop(
 
 /// Inner body of [`spawn_tui_unified_loop`].
 ///
-/// **P3-inline architecture.** ratatui owns only a bottom inline viewport whose
-/// height tracks the live bottom chrome — see [`tui::render_bottom_chrome`].
-/// Permanent conversation history is pushed up into the host terminal's
-/// main scrollback at the top of each loop iteration via
-/// `terminal.insert_before`. Once a [`tui::ConversationLine`] has been
-/// pushed it lives in the user's normal terminal scrollback, scrolled by
-/// mouse wheel / Shift+PgUp / terminal search like any other shell
-/// output — there is no app-level scrollbar or scroll state to manage.
+/// **Fullscreen architecture.** ratatui owns the alternate screen and redraws
+/// the transcript pane plus pinned bottom chrome as one full frame. Native
+/// terminal scrollback is intentionally not used; `/export` is the durable
+/// transcript escape hatch.
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 fn run_tui_unified_loop(
-    mode: ChatTuiMode,
     input_tx: mpsc::Sender<crate::channels::traits::ChannelMessage>,
     control_tx: mpsc::Sender<ChatControlEvent>,
     mirror: Arc<parking_lot::Mutex<tui::TuiState>>,
@@ -6815,39 +6642,17 @@ fn run_tui_unified_loop(
         },
     );
 
-    // Inline keeps the P3 architecture: a small `Viewport::Inline(height)` plus
-    // host scrollback via `insert_before`. Fullscreen uses a normal ratatui
-    // terminal inside the alternate screen; the full frame is redrawn each time
-    // and no `insert_before` calls are made.
-    let mut inline_viewport_height = if mode == ChatTuiMode::Inline {
-        render_source.with_view(desired_inline_viewport_height)
-    } else {
-        0
-    };
-    let mut terminal = if mode == ChatTuiMode::Inline {
-        new_inline_terminal(inline_viewport_height)?
-    } else {
-        new_fullscreen_terminal()?
-    };
+    let mut terminal = new_fullscreen_terminal()?;
     let mut fullscreen_scroll = tui::FullscreenTranscriptScroll::default();
 
     terminal
         .draw(|f| {
             render_source.with_view(|view| {
-                if mode == ChatTuiMode::Fullscreen {
-                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
-                } else {
-                    tui::render_bottom_chrome(f, view);
-                }
+                tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
             });
         })
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
-    // Number of `conversation_lines` already flushed to the host
-    // scrollback via `insert_before`. New entries appear at indices
-    // `>= last_pushed_idx` and are pushed on the next loop iteration.
-    let mut last_pushed_idx: usize = 0;
-    let mut last_conversation_generation = render_source.conversation_generation();
     let mut skip_next_draw = false;
     let mut pending_events = VecDeque::new();
 
@@ -6868,7 +6673,7 @@ fn run_tui_unified_loop(
         // While an interactive PTY session is attached, the chat owns NONE
         // of the terminal: the main loop has handed raw stdin/stdout to the
         // PTY passthrough. We must not touch `crossterm` (poll/read) or
-        // `terminal.draw`/`insert_before` here, or we would corrupt the
+        // `terminal.draw` here, or we would corrupt the
         // PTY's full-screen output and steal its keystrokes. We park,
         // acknowledge the park (so the handoff can deterministically know
         // we are out of the way before it takes stdin), and re-check shortly.
@@ -6877,109 +6682,17 @@ fn run_tui_unified_loop(
             std::thread::sleep(Duration::from_millis(10));
             continue;
         }
-        // Just resumed from a handoff: the PTY scribbled over the whole
-        // screen, so force a full clear + repaint to wipe its residue before
-        // resuming normal inline rendering.
-        //
-        // P2-B (render stability across repeated PTY enter/exit): order matters
-        // here. We must (a) clear the screen, (b) re-push the FULL conversation
-        // history via `insert_before` (sections 1), and only THEN (c) draw the
-        // bottom chrome once (section 2) so the status bar + input box land at
-        // the bottom and are not scrolled away by a later `insert_before`. The
-        // previous code drew the chrome *before* re-pushing history, so each
-        // `insert_before` shoved that freshly-drawn chrome up; after a few
-        // enter/exit cycles the title/input bar drifted out of the viewport.
-        //
-        // So here we ONLY clear + reset the push cursor, and we clear
-        // `skip_next_draw` so section 2 is guaranteed to repaint the chrome this
-        // iteration after history has been flushed. No chrome draw happens in
-        // this block.
+        // Just resumed from a handoff: the PTY scribbled over the whole screen,
+        // so force a full clear + repaint to wipe its residue before resuming
+        // fullscreen rendering.
         if handoff.take_force_redraw() {
             if let Err(e) = terminal.clear() {
                 tracing::warn!(error = %e, "post-PTY terminal clear failed");
             }
-            // Everything in scrollback was wiped by the PTY; re-push from the
-            // start so the conversation history is visible again. Section 1
-            // (below) does the actual `insert_before`, then section 2 draws the
-            // chrome at the bottom — this fixed ordering keeps the chrome stable
-            // across repeated enter/exit.
-            last_pushed_idx = 0;
-            // Guarantee the chrome is (re)drawn this iteration even if no redraw
-            // wakeup is pending, so the bottom bar is never left blank.
             skip_next_draw = false;
         }
 
-        if mode == ChatTuiMode::Inline
-            && let Some(next_height) =
-                render_source.with_view(|view| changed_inline_viewport_height(inline_viewport_height, view))
-        {
-            if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
-                tracing::warn!(
-                    error = %e,
-                    height = inline_viewport_height,
-                    "failed to clear old inline chrome before viewport height update"
-                );
-            }
-            match new_inline_terminal(next_height) {
-                Ok(next_terminal) => {
-                    inline_viewport_height = next_height;
-                    terminal = next_terminal;
-                    skip_next_draw = false;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        height = next_height,
-                        "inline viewport height update failed; keeping previous terminal"
-                    );
-                }
-            }
-        }
-
-        // ── 1. Flush newly-finalised conversation lines to scrollback ──
-        // We take the mirror lock briefly to snapshot the pending range
-        // and the ASCII fallback flag, then release it BEFORE calling
-        // `insert_before` (which performs blocking I/O). This avoids
-        // holding the lock across stdout writes — producers can keep
-        // pushing into `conversation_lines` while we drain.
-        //
-        // S4-A Commit 4: Snapshot 路径 borrow_and_update Arc<UiSnapshot>，
-        // Mirror 路径走原有 lock。两种路径都按 `last_pushed_idx` 切片以增量
-        // 推送，同语义.
-        if mode == ChatTuiMode::Inline {
-            let conversation_generation = render_source.conversation_generation();
-            if conversation_generation != last_conversation_generation {
-                last_pushed_idx = 0;
-                last_conversation_generation = conversation_generation;
-            }
-            let visible_len = render_source.conversation_len();
-            if visible_len < last_pushed_idx {
-                last_pushed_idx = 0;
-            }
-            let (pending, ascii_fallback) = render_source.read_pending(last_pushed_idx);
-            let pending_count = pending.len();
-            let term_width = terminal.size().map(|s| s.width).unwrap_or(80).max(1);
-            for line in &pending {
-                let height = tui::estimate_message_height(term_width, line, ascii_fallback);
-                // `insert_before` is intentionally inline-only. Fullscreen
-                // renders conversation history inside the alternate-screen
-                // frame so resizes are clean by construction.
-                let render_line = line.clone();
-                if let Err(e) = terminal.insert_before(height, move |buf| {
-                    tui::render_message_for_insert(buf, &render_line, ascii_fallback);
-                }) {
-                    tracing::warn!(error = %e, "insert_before failed; skipping line");
-                }
-            }
-            last_pushed_idx = last_pushed_idx.saturating_add(pending_count);
-        }
-
-        // ── 2. Drain coalesced redraw wakeups, then redraw the chrome ─
-        // The inline viewport height has already been synchronized above, and
-        // that synchronization is gated on actual height deltas. Steady-state
-        // frames never rebuild or resize the terminal, avoiding the ratatui
-        // #984 full-clear path while keeping short transcripts flush with the
-        // bottom chrome.
+        // ── 1. Drain coalesced redraw wakeups, then redraw fullscreen frame ─
         let mut redraw_requested = false;
         while redraw_rx.try_recv().is_ok() {
             redraw_requested = true;
@@ -6988,17 +6701,13 @@ fn run_tui_unified_loop(
             skip_next_draw = false;
         } else if let Err(e) = terminal.draw(|f| {
             render_source.with_view(|view| {
-                if mode == ChatTuiMode::Fullscreen {
-                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
-                } else {
-                    tui::render_bottom_chrome(f, view);
-                }
+                tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
             });
         }) {
             tracing::warn!(error = %e, "TUI draw failed");
         }
 
-        // ── 3. Wait for the next input event, with a 50 ms floor ──────
+        // ── 2. Wait for the next input event, with a 50 ms floor ──────
         let ev = if let Some(ev) = pending_events.pop_front() {
             ev
         } else {
@@ -7075,8 +6784,7 @@ fn run_tui_unified_loop(
                         continue;
                     }
                 }
-                if mode == ChatTuiMode::Fullscreen
-                    && key.modifiers == crossterm::event::KeyModifiers::NONE
+                if key.modifiers == crossterm::event::KeyModifiers::NONE
                     && matches!(
                         key.code,
                         crossterm::event::KeyCode::PageUp
@@ -7292,13 +7000,11 @@ fn run_tui_unified_loop(
                     }
                     tui::KeyDispatch::ExternalEditorRequested => {
                         let initial = mirror.lock().input.text();
-                        let terminal_mode = CrosstermExternalEditorTerminalMode { mode };
+                        let terminal_mode = CrosstermExternalEditorTerminalMode;
                         match edit_text_with_external_editor(&initial, resolve_external_editor(), &terminal_mode) {
                             ExternalEditorResult::Edited(text) => {
-                                if mode == ChatTuiMode::Fullscreen {
-                                    if let Err(e) = terminal.clear() {
-                                        tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
-                                    }
+                                if let Err(e) = terminal.clear() {
+                                    tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
                                 }
                                 {
                                     let mut guard = mirror.lock();
@@ -7312,10 +7018,8 @@ fn run_tui_unified_loop(
                                 let _ = redraw_tx.try_send(());
                             }
                             ExternalEditorResult::Unchanged(reason) => {
-                                if mode == ChatTuiMode::Fullscreen {
-                                    if let Err(e) = terminal.clear() {
-                                        tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
-                                    }
+                                if let Err(e) = terminal.clear() {
+                                    tracing::warn!(error = %e, "post-editor fullscreen terminal clear failed");
                                 }
                                 surface_session_message(chat_dispatcher, Some(&redraw_tx), &reason);
                             }
@@ -7404,23 +7108,10 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Resize(w, h) => {
-                if mode == ChatTuiMode::Inline {
-                    if let Err(e) = clear_old_inline_chrome_region(&mut terminal) {
-                        tracing::warn!(
-                            error = %e,
-                            w,
-                            h,
-                            "failed to clear old inline chrome before terminal resize redraw"
-                        );
-                    }
-                }
                 let _ = chat_dispatcher.dispatch_or_log(Action::TerminalResized { w, h }, "chat.tui_resize");
                 // crossterm forwards the new size to ratatui automatically on
-                // the next `draw()` call. Clear the old inline chrome before
-                // that redraw so status/input text that re-wrapped during a
-                // width transition cannot survive in the scrollback content
-                // area. Then nudge the loop so the redraw happens immediately
-                // rather than waiting up to 50 ms for the next poll.
+                // the next `draw()` call. Nudge the loop so redraw happens
+                // immediately rather than waiting up to 50 ms for the next poll.
                 let _ = redraw_tx.try_send(());
             }
             _ => {
@@ -9339,82 +9030,10 @@ mod terminal_guard_tests {
         );
     }
 
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn chat_tui_selection_defaults_to_inline() {
-        let selection = select_chat_tui(false, true, None, None, crate::config::ChatTuiModeConfig::Inline);
-
-        assert!(selection.enabled);
-        assert_eq!(selection.mode, ChatTuiMode::Inline);
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn prx_tui_mode_fullscreen_selects_fullscreen() {
-        let selection = select_chat_tui(
-            false,
-            true,
-            None,
-            Some("fullscreen"),
-            crate::config::ChatTuiModeConfig::Inline,
-        );
-
-        assert!(selection.enabled);
-        assert_eq!(selection.mode, ChatTuiMode::Fullscreen);
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn prx_tui_zero_overrides_prx_tui_mode_fullscreen() {
-        let selection = select_chat_tui(
-            false,
-            true,
-            Some("0"),
-            Some("fullscreen"),
-            crate::config::ChatTuiModeConfig::Inline,
-        );
-
-        assert!(!selection.enabled);
-        assert_eq!(selection.mode, ChatTuiMode::Fullscreen);
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn prx_tui_mode_inline_overrides_config_fullscreen() {
-        let selection = select_chat_tui(
-            false,
-            true,
-            None,
-            Some("inline"),
-            crate::config::ChatTuiModeConfig::Fullscreen,
-        );
-
-        assert!(selection.enabled);
-        assert_eq!(selection.mode, ChatTuiMode::Inline);
-    }
-
-    #[test]
-    fn inline_terminal_lifecycle_skips_alternate_screen() {
-        let mut ops = FakeTerminalModeOps::default();
-        let state = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Inline).unwrap();
-        leave_terminal_state_with_ops(&mut ops, state);
-
-        assert_eq!(
-            ops.calls,
-            vec![
-                "enable_raw_mode",
-                "enable_bracketed_paste",
-                "disable_bracketed_paste",
-                "show_cursor",
-                "disable_raw_mode"
-            ]
-        );
-    }
-
     #[test]
     fn fullscreen_terminal_lifecycle_enters_and_leaves_alternate_screen_in_order() {
         let mut ops = FakeTerminalModeOps::default();
-        let state = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Fullscreen).unwrap();
+        let state = enter_terminal_state_with_ops(&mut ops).unwrap();
         leave_terminal_state_with_ops(&mut ops, state);
 
         assert_eq!(
@@ -9438,7 +9057,7 @@ mod terminal_guard_tests {
             ..FakeTerminalModeOps::default()
         };
 
-        let err = enter_terminal_state_with_ops(&mut ops, ChatTuiMode::Fullscreen).unwrap_err();
+        let err = enter_terminal_state_with_ops(&mut ops).unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(
@@ -9766,249 +9385,6 @@ mod s4_a_4 {
     }
 
     #[test]
-    fn inline_viewport_height_starts_at_actual_chrome_height() {
-        let tui = TuiState::new("p", "m");
-        let mirror = Arc::new(parking_lot::Mutex::new(tui));
-        let src = RenderSource::Mirror(Arc::clone(&mirror));
-
-        let initial = src.with_view(super::desired_inline_viewport_height);
-        let expected = crate::chat::tui::bottom_chrome_height(&*mirror.lock());
-
-        assert_eq!(initial, expected);
-        assert!(
-            initial < crate::chat::tui::BOTTOM_CHROME_MAX_HEIGHT,
-            "idle inline viewport must not reserve the max-height blank band"
-        );
-    }
-
-    #[test]
-    fn inline_viewport_height_gate_only_changes_on_height_delta() {
-        let mut tui = TuiState::new("p", "m");
-        let idle = super::desired_inline_viewport_height(&tui);
-
-        assert_eq!(
-            super::changed_inline_viewport_height(idle, &tui),
-            None,
-            "steady-state redraws must not rebuild/resize the inline viewport"
-        );
-
-        tui.start_stream("d-live");
-        let streaming = super::changed_inline_viewport_height(idle, &tui)
-            .expect("streaming preview must require a taller inline viewport");
-        assert!(streaming > idle);
-        assert_eq!(
-            super::changed_inline_viewport_height(streaming, &tui),
-            None,
-            "unchanged streaming height must not rebuild/resize repeatedly"
-        );
-
-        tui.cancel_stream("d-live");
-        let back_to_idle = super::changed_inline_viewport_height(streaming, &tui)
-            .expect("removing streaming preview must shrink the inline viewport");
-        assert_eq!(back_to_idle, idle);
-    }
-
-    #[test]
-    fn clear_old_inline_chrome_region_preserves_transcript_above_viewport() {
-        use ratatui::backend::Backend;
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-        use ratatui::{Terminal, TerminalOptions, Viewport};
-
-        let backend = TestBackend::with_lines([
-            "transcript line 1",
-            "transcript line 2",
-            "old chrome header",
-            "old chrome input ",
-            "old chrome footer",
-        ]);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 2, 17, 3)),
-            },
-        )
-        .expect("test terminal");
-
-        super::clear_old_inline_chrome_region(&mut terminal).expect("clear old chrome");
-
-        let rows: Vec<String> = (0..5)
-            .map(|y| {
-                (0..17)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-
-        assert_eq!(
-            rows.first().map(String::as_str),
-            Some("transcript line 1"),
-            "transcript above viewport must survive"
-        );
-        assert_eq!(
-            rows.get(1).map(String::as_str),
-            Some("transcript line 2"),
-            "transcript above viewport must survive"
-        );
-        assert!(
-            rows.get(2).is_some_and(|row| row.trim().is_empty()),
-            "old chrome header must be cleared: {rows:?}"
-        );
-        assert!(
-            rows.get(3).is_some_and(|row| row.trim().is_empty()),
-            "old chrome input must be cleared: {rows:?}"
-        );
-        assert!(
-            rows.get(4).is_some_and(|row| row.trim().is_empty()),
-            "old chrome footer must be cleared: {rows:?}"
-        );
-        assert_eq!(
-            terminal.backend_mut().get_cursor_position().expect("cursor"),
-            ratatui::layout::Position { x: 0, y: 4 },
-            "cursor must be anchored at the old viewport bottom before rebuild"
-        );
-    }
-
-    #[test]
-    fn clear_old_inline_chrome_region_removes_wrapped_resize_residual_below_viewport() {
-        use ratatui::backend::Backend;
-        use ratatui::backend::TestBackend;
-        use ratatui::layout::Rect;
-        use ratatui::{Terminal, TerminalOptions, Viewport};
-
-        let backend = TestBackend::with_lines([
-            "transcript line 1",
-            "transcript line 2",
-            "PRX Chat old status",
-            "wrapped status tail",
-            "Input: old prompt ",
-            "wrapped input tail ",
-        ]);
-        let mut terminal = Terminal::with_options(
-            backend,
-            TerminalOptions {
-                viewport: Viewport::Fixed(Rect::new(0, 2, 19, 2)),
-            },
-        )
-        .expect("test terminal");
-
-        super::clear_old_inline_chrome_region(&mut terminal).expect("clear old chrome");
-
-        let rows: Vec<String> = (0..6)
-            .map(|y| {
-                (0..19)
-                    .map(|x| terminal.backend().buffer()[(x, y)].symbol())
-                    .collect::<Vec<_>>()
-                    .join("")
-            })
-            .collect();
-
-        assert_eq!(
-            rows.first().map(String::as_str),
-            Some("transcript line 1  "),
-            "transcript above viewport must survive"
-        );
-        assert_eq!(
-            rows.get(1).map(String::as_str),
-            Some("transcript line 2  "),
-            "transcript above viewport must survive"
-        );
-        for row_idx in 2..6 {
-            assert!(
-                rows.get(row_idx).is_some_and(|row| row.trim().is_empty()),
-                "wrapped old chrome row {row_idx} must be cleared: {rows:?}"
-            );
-        }
-        assert_eq!(
-            terminal.backend_mut().get_cursor_position().expect("cursor"),
-            ratatui::layout::Position { x: 0, y: 3 },
-            "cursor must be anchored at the old viewport bottom before resize redraw"
-        );
-    }
-
-    /// read_pending：snapshot 路径返回正确切片.
-    #[test]
-    fn s4_a_4_pending_lines_drain_from_snapshot() {
-        let mut state = build_state_with_lines();
-        let snap = Arc::new(state.build_ui_snapshot(1));
-        let (_tx, rx) = watch::channel(snap);
-        let src = RenderSource::Snapshot(rx);
-        // from_idx=0 → 全部 2 行.
-        let (pending, ascii) = src.read_pending(0);
-        assert_eq!(pending.len(), 2);
-        assert!(!ascii);
-        // from_idx=1 → 1 行.
-        let (pending2, _) = src.read_pending(1);
-        assert_eq!(pending2.len(), 1);
-        // from_idx=10（越界）→ 空.
-        let (pending3, _) = src.read_pending(10);
-        assert!(pending3.is_empty());
-    }
-
-    #[test]
-    fn s4_a_4_pending_index_resets_after_history_clear() {
-        let mut state = build_state_with_lines();
-        let snap0 = Arc::new(state.build_ui_snapshot(1));
-        let (tx, rx) = watch::channel(snap0);
-        let src = RenderSource::Snapshot(rx);
-
-        let mut last_pushed_idx = 2;
-        let _ = state.reduce_tracked(crate::chat::action::Action::HistoryCleared);
-        let _ = state.reduce_tracked(crate::chat::action::Action::SystemMessageAdded {
-            text: "Conversation cleared (kept system prompt).".to_string(),
-        });
-        let snap1 = Arc::new(state.build_ui_snapshot(2));
-        tx.send(snap1).expect("send cleared snap");
-
-        if src.conversation_len() < last_pushed_idx {
-            last_pushed_idx = 0;
-        }
-        let (pending, _) = src.read_pending(last_pushed_idx);
-
-        assert_eq!(pending.len(), 1);
-        assert!(
-            matches!(pending.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
-            "clear feedback must be flushed after conversation_lines shrink"
-        );
-    }
-
-    #[test]
-    fn s4_a_4_pending_index_resets_after_equal_len_history_replacement() {
-        let mut state = crate::chat::state::ChatState::new(
-            Arc::from("ps"),
-            Arc::from("ms"),
-            tokio_util::sync::CancellationToken::new(),
-        );
-        let _ = state.reduce_tracked(crate::chat::action::Action::UserMessageEchoed("/clear".to_string()));
-        let snap0 = Arc::new(state.build_ui_snapshot(1));
-        let (tx, rx) = watch::channel(snap0);
-        let src = RenderSource::Snapshot(rx);
-
-        let mut last_pushed_idx = 1;
-        let mut last_generation = src.conversation_generation();
-        let _ = state.reduce_tracked(crate::chat::action::Action::HistoryClearedWithNotice {
-            notice: "Conversation cleared (kept system prompt).".to_string(),
-        });
-        let snap1 = Arc::new(state.build_ui_snapshot(2));
-        tx.send(snap1).expect("send replaced snap");
-
-        let generation = src.conversation_generation();
-        if generation != last_generation {
-            last_pushed_idx = 0;
-            last_generation = generation;
-        }
-        assert_eq!(last_generation, generation);
-        let (pending, _) = src.read_pending(last_pushed_idx);
-
-        assert_eq!(pending.len(), 1);
-        assert!(
-            matches!(pending.first(), Some(ConversationLine::System { content }) if content.contains("Conversation cleared")),
-            "clear feedback must be flushed even when replacement keeps the same len"
-        );
-    }
-
-    #[test]
     fn plain_character_keys_are_not_logged_as_tui_input_events() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -10091,11 +9467,7 @@ mod s4_a_4 {
         // 新视图应看到 3 行.
         src.with_view(|view| {
             assert_eq!(view.conversation_lines().len(), 3, "watch 推送后应看到新行");
-            // 验证 revision 单调.
-            // (revision 不在 BottomChromeView trait 上, 用 read_pending 间接验证).
         });
-        let (pending, _) = src.read_pending(0);
-        assert_eq!(pending.len(), 3);
     }
 }
 
@@ -10488,7 +9860,7 @@ mod p6b2_external_editor_tests {
     #[test]
     fn external_editor_fullscreen_suspend_leaves_alt_and_restore_reenters() {
         let mut suspend = Vec::new();
-        write_external_editor_suspend_sequences(&mut suspend, ChatTuiMode::Fullscreen);
+        write_external_editor_suspend_sequences(&mut suspend);
         let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
         assert!(
             suspend.contains("\x1b[?1049l") && suspend.contains("\x1b[?47l"),
@@ -10496,7 +9868,7 @@ mod p6b2_external_editor_tests {
         );
 
         let mut restore = Vec::new();
-        write_external_editor_restore_sequences(&mut restore, ChatTuiMode::Fullscreen);
+        write_external_editor_restore_sequences(&mut restore);
         let restore = String::from_utf8(restore).expect("test: restore escape bytes are utf-8");
         assert!(
             restore.contains("\x1b[?1049l") && restore.contains("\x1b[?47l"),
@@ -10506,17 +9878,6 @@ mod p6b2_external_editor_tests {
             restore.ends_with("\x1b[?1049h"),
             "fullscreen editor restore must re-enter chat alt-screen last: {restore:?}"
         );
-    }
-
-    #[test]
-    fn external_editor_inline_suspend_restore_do_not_touch_alt_screen() {
-        let mut suspend = Vec::new();
-        write_external_editor_suspend_sequences(&mut suspend, ChatTuiMode::Inline);
-        assert!(suspend.is_empty(), "inline editor suspend keeps legacy no-alt behavior");
-
-        let mut restore = Vec::new();
-        write_external_editor_restore_sequences(&mut restore, ChatTuiMode::Inline);
-        assert!(restore.is_empty(), "inline editor restore keeps legacy no-alt behavior");
     }
 }
 

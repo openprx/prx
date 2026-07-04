@@ -319,9 +319,9 @@ pub struct UiState {
 /// `Vec<ConversationLine>`；revision 单调递增供 watch::Sender::send_if_modified
 /// 跳过相同帧 + 调试断言。
 ///
-/// 字段对应渲染 chrome 需要的最小集（status bar / streaming preview / input 框
-/// / footer）；BottomChromeView trait（Commit 2 落地）抽象掉 TuiState vs
-/// UiSnapshot 的差异，让 render_bottom_chrome 双源共用。
+/// 字段对应 fullscreen renderer 需要的最小集（status bar / transcript /
+/// input 框 / footer）；BottomChromeView trait（Commit 2 落地）抽象掉
+/// TuiState vs UiSnapshot 的差异。
 #[cfg(feature = "terminal-tui")]
 #[derive(Clone)]
 #[allow(dead_code)]
@@ -342,7 +342,7 @@ pub struct UiSnapshot {
     pub turn_count: usize,
     /// ASCII 降级模式标志.
     pub ascii_fallback: bool,
-    /// 对话行历史（renderer 增量 insert_before 用 len() diff）.
+    /// 对话行历史（fullscreen transcript renderer 使用）.
     pub conversation_lines: Arc<Vec<ConversationLine>>,
     /// Generation marker for wholesale conversation history replacement.
     pub conversation_generation: u64,
@@ -956,15 +956,9 @@ impl ChatState {
                 _ => {}
             }
         }
-        // BUG-01 round-2 fix: conversation history lives in the host terminal's
-        // append-only scrollback (flushed once via `insert_before`); flipping
-        // `folded` on a card that has already scrolled into history does NOT
-        // repaint it, so Tab/Ctrl+R appeared dead (the card stayed "▸" forever).
-        // Bumping `conversation_generation` makes `run_tui_unified_loop` reset
-        // `last_pushed_idx` and re-emit every conversation line with the new fold
-        // state — the same mechanism `/clear` (HistoryCleared) already uses — so
-        // the expanded card actually becomes visible. Only bump when a card was
-        // toggled to avoid spurious full re-emits on no-op key presses.
+        // A fold toggle must still mark the conversation as changed so the
+        // snapshot/repaint path observes the new fold state. Only bump when a
+        // card was toggled to avoid spurious redraw work on no-op key presses.
         if toggled {
             self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         }
@@ -3296,12 +3290,8 @@ mod tests {
             }
         }
 
-        /// BUG-01 round-2: the visible conversation lives in append-only host
-        /// scrollback (flushed once via `insert_before`). Round-1 flipped `folded`
-        /// but never told the unified loop to re-emit, so the already-printed card
-        /// stayed "▸" forever. A fold toggle must therefore bump
-        /// `conversation_generation` — the signal `run_tui_unified_loop` uses to
-        /// reset `last_pushed_idx` and re-emit every line with the new fold state.
+        /// BUG-01 round-2: a fold toggle must bump `conversation_generation` so
+        /// the snapshot/repaint path observes the new fold state.
         #[test]
         fn test_fold_toggle_bumps_conversation_generation() {
             use crate::chat::tui::ConversationLine;

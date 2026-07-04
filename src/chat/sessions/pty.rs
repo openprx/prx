@@ -141,7 +141,7 @@ impl HandoffControl {
     /// parked, so the caller can safely take over `stdin`/`stdout`.
     ///
     /// `timeout` bounds the wait: if the render loop does not acknowledge in
-    /// time (e.g. it is wedged inside a slow `insert_before`, or the TUI was
+    /// time (e.g. it is wedged inside a slow draw, or the TUI was
     /// never started) we proceed anyway after the timeout — handoff is
     /// best-effort, never a deadlock. Returns `true` if the ack was observed,
     /// `false` if we proceeded on timeout.
@@ -208,17 +208,10 @@ impl HandoffControl {
 #[must_use = "dropping the guard is what restores the terminal; bind it for the handoff's lifetime"]
 pub struct PtyHandoffGuard {
     control: Arc<HandoffControl>,
-    mode: PtyHandoffMode,
     /// Best-effort redraw nudge so the render loop repaints immediately on
     /// resume rather than waiting out its idle poll. `None` when the chat has no
     /// TUI render loop (fallback path); restoration still works via the flag.
     redraw_nudge: Option<Box<dyn Fn() + Send>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PtyHandoffMode {
-    Inline,
-    Fullscreen,
 }
 
 impl PtyHandoffGuard {
@@ -235,22 +228,12 @@ impl PtyHandoffGuard {
     ///
     /// `redraw_nudge`, if supplied, is invoked on `Drop` to wake the render loop
     /// immediately (e.g. a `move || { let _ = redraw_tx.try_send(()); }`).
-    pub fn acquire(
-        control: Arc<HandoffControl>,
-        redraw_nudge: Option<Box<dyn Fn() + Send>>,
-        mode: PtyHandoffMode,
-    ) -> Option<Self> {
+    pub fn acquire(control: Arc<HandoffControl>, redraw_nudge: Option<Box<dyn Fn() + Send>>) -> Option<Self> {
         // Block (bounded) until the render loop confirms it has parked.
         if control.pause_and_wait(PAUSE_ACK_TIMEOUT) {
-            if mode == PtyHandoffMode::Fullscreen {
-                let mut out = std::io::stdout();
-                write_chat_alt_screen_leave_for_handoff(&mut out);
-            }
-            return Some(Self {
-                control,
-                mode,
-                redraw_nudge,
-            });
+            let mut out = std::io::stdout();
+            write_chat_alt_screen_leave_for_handoff(&mut out);
+            return Some(Self { control, redraw_nudge });
         }
         // Ack timed out: the render loop never confirmed it parked. Abandon the
         // handoff and undo the pause so the (possibly-slow-but-alive) render loop
@@ -292,7 +275,7 @@ impl Drop for PtyHandoffGuard {
         //     Done while the render loop is still parked so we are the sole writer.
         {
             let mut out = std::io::stdout();
-            write_handoff_terminal_restore(&mut out, self.mode);
+            write_handoff_terminal_restore(&mut out);
         }
 
         // 1b. Defensively re-assert the chat terminal modes the PTY child may
@@ -341,32 +324,15 @@ const HOST_MODE_RESET: &[u8] =
 const CHAT_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 const CHAT_ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l\x1b[?47l";
 
-/// Write the [`HOST_MODE_RESET`] baseline sequences to `out` and flush.
-///
-/// Factored out (taking `&mut dyn Write`) so a unit test can assert the reset is
-/// actually emitted on detach by injecting a capturing sink; production passes the
-/// real `stdout`. Best-effort: write/flush errors are logged, never propagated —
-/// the caller ([`PtyHandoffGuard::drop`]) is an infallible restoration path. The
-/// I/O is a single bounded write of a small constant (terminal-only assumption,
-/// like the rest of this module's stdout writes), so logging the error is the
-/// right boundary rather than a larger async rework.
-fn write_host_mode_reset(out: &mut dyn std::io::Write) {
-    if let Err(e) = out.write_all(HOST_MODE_RESET).and_then(|()| out.flush()) {
-        tracing::warn!(error = %e, "PTY detach: failed to write host terminal mode reset");
-    }
-}
-
 pub(crate) fn write_chat_alt_screen_leave_for_handoff(out: &mut dyn std::io::Write) {
     if let Err(e) = out.write_all(CHAT_ALT_SCREEN_LEAVE).and_then(|()| out.flush()) {
         tracing::warn!(error = %e, "terminal handoff: failed to leave chat alternate screen");
     }
 }
 
-pub(crate) fn write_handoff_terminal_restore(out: &mut dyn std::io::Write, mode: PtyHandoffMode) {
+pub(crate) fn write_handoff_terminal_restore(out: &mut dyn std::io::Write) {
     let result = out.write_all(HOST_MODE_RESET).and_then(|()| {
-        if mode == PtyHandoffMode::Fullscreen {
-            out.write_all(CHAT_ALT_SCREEN_ENTER)?;
-        }
+        out.write_all(CHAT_ALT_SCREEN_ENTER)?;
         out.flush()
     });
     if let Err(e) = result {
@@ -1429,7 +1395,6 @@ mod tests {
             let guard = PtyHandoffGuard::acquire(
                 Arc::clone(&control),
                 Some(Box::new(move || nudged2.store(true, Ordering::Release))),
-                PtyHandoffMode::Inline,
             )
             .expect("test: ack arrives so acquire succeeds");
             // During the handoff the render loop is paused.
@@ -1452,8 +1417,8 @@ mod tests {
         let acker = spawn_acking_render_loop(&control);
         let control2 = Arc::clone(&control);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, PtyHandoffMode::Inline)
-                .expect("test: ack arrives so acquire succeeds");
+            let _guard =
+                PtyHandoffGuard::acquire(Arc::clone(&control2), None).expect("test: ack arrives so acquire succeeds");
             assert!(control2.is_paused());
             panic!("test: simulate a fault during PTY handoff");
         }));
@@ -1468,15 +1433,14 @@ mod tests {
 
     #[test]
     fn fullscreen_guard_restores_even_on_panic_unwind() {
-        // Same RAII contract as the inline path, but in fullscreen mode Drop
-        // also writes the child-mode reset and re-enters chat's alt-screen before
+        // Drop writes the child-mode reset and re-enters chat's alt-screen before
         // unpausing the renderer.
         let control = Arc::new(HandoffControl::new());
         let acker = spawn_acking_render_loop(&control);
         let control2 = Arc::clone(&control);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, PtyHandoffMode::Fullscreen)
-                .expect("test: ack arrives so acquire succeeds");
+            let _guard =
+                PtyHandoffGuard::acquire(Arc::clone(&control2), None).expect("test: ack arrives so acquire succeeds");
             assert!(control2.is_paused());
             panic!("test: simulate a fullscreen PTY handoff fault");
         }));
@@ -1496,7 +1460,7 @@ mod tests {
         // untouched), never proceed with a half-done handoff.
         let control = Arc::new(HandoffControl::new());
         // No acker thread → the ack will time out.
-        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None, PtyHandoffMode::Inline);
+        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None);
         assert!(guard.is_none(), "acquire must refuse when the render loop never parks");
         assert!(
             !control.is_paused(),
@@ -1514,8 +1478,8 @@ mod tests {
         // `!is_paused()` always also sees `force_redraw == true`.
         let control = Arc::new(HandoffControl::new());
         let acker = spawn_acking_render_loop(&control);
-        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None, PtyHandoffMode::Inline)
-            .expect("test: ack arrives so acquire succeeds");
+        let guard =
+            PtyHandoffGuard::acquire(Arc::clone(&control), None).expect("test: ack arrives so acquire succeeds");
         assert!(control.is_paused());
         drop(guard);
         acker.join().expect("test: acker joins");
@@ -1536,7 +1500,7 @@ mod tests {
         // so a regression that drops one (re-introducing the residual-mode bug)
         // fails loudly.
         let mut captured: Vec<u8> = Vec::new();
-        write_host_mode_reset(&mut captured);
+        write_handoff_terminal_restore(&mut captured);
         let s = String::from_utf8(captured).expect("test: reset is valid utf-8");
 
         // Mouse tracking off (X10 / button / any-motion / utf8 / sgr coords).
@@ -1573,16 +1537,19 @@ mod tests {
         // whether a child actually changed them, including the no-TUI path).
         let mut a: Vec<u8> = Vec::new();
         let mut b: Vec<u8> = Vec::new();
-        write_host_mode_reset(&mut a);
-        write_host_mode_reset(&mut b);
+        write_handoff_terminal_restore(&mut a);
+        write_handoff_terminal_restore(&mut b);
         assert_eq!(a, b, "host mode reset must be a deterministic constant");
-        assert_eq!(a, HOST_MODE_RESET, "writer must emit exactly HOST_MODE_RESET");
+        assert!(
+            a.starts_with(HOST_MODE_RESET) && a.ends_with(CHAT_ALT_SCREEN_ENTER),
+            "writer must reset child modes and re-enter chat alt-screen"
+        );
     }
 
     #[test]
     fn fullscreen_handoff_restore_resets_child_then_reenters_chat_alt_screen() {
         let mut captured: Vec<u8> = Vec::new();
-        write_handoff_terminal_restore(&mut captured, PtyHandoffMode::Fullscreen);
+        write_handoff_terminal_restore(&mut captured);
         assert!(
             captured.starts_with(HOST_MODE_RESET),
             "fullscreen restore must first reset child terminal modes: {captured:?}"
@@ -1590,16 +1557,6 @@ mod tests {
         assert!(
             captured.ends_with(CHAT_ALT_SCREEN_ENTER),
             "fullscreen restore must re-enter chat alternate screen after reset: {captured:?}"
-        );
-    }
-
-    #[test]
-    fn inline_handoff_restore_keeps_legacy_host_mode_reset_exact() {
-        let mut captured: Vec<u8> = Vec::new();
-        write_handoff_terminal_restore(&mut captured, PtyHandoffMode::Inline);
-        assert_eq!(
-            captured, HOST_MODE_RESET,
-            "inline PTY handoff must preserve the legacy reset bytes exactly"
         );
     }
 
@@ -1628,7 +1585,7 @@ mod tests {
         }
         let mut sink = FailingSink;
         // Must return normally (no panic) despite the write error.
-        write_host_mode_reset(&mut sink);
+        write_handoff_terminal_restore(&mut sink);
     }
 
     // ── Interruptible reader (P0-A: bounded stop, no EOF dependency) ──────────
