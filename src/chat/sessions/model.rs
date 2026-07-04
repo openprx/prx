@@ -141,6 +141,32 @@ pub struct ManagedSessionView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Format an elapsed duration for compact chat display.
+///
+/// Examples: `3s`, `1m03s`, `1h02m`.
+#[must_use]
+pub fn format_elapsed_compact(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m{:02}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{}h{:02}m", seconds / 3_600, (seconds % 3_600) / 60)
+    }
+}
+
+/// Derive non-negative elapsed seconds from two timestamps.
+#[must_use]
+pub fn elapsed_seconds_between(start: DateTime<Utc>, end: DateTime<Utc>) -> u64 {
+    end.signed_duration_since(start).num_seconds().try_into().unwrap_or(0)
+}
+
+/// Display-ready elapsed string for a session view.
+#[must_use]
+pub fn session_elapsed_label(view: &ManagedSessionView) -> String {
+    format_elapsed_compact(elapsed_seconds_between(view.created_at, view.updated_at))
+}
+
 /// Persisted summary of a child TUI session that ran during a chat session
 /// (v4).
 ///
@@ -258,15 +284,21 @@ pub fn project_run(run: &SubAgentRun, seq: u64) -> ManagedSessionView {
     } else {
         run.task.clone()
     };
+    let status = project_status(&run.status);
+    let updated_at = if matches!(status, ManagedStatus::Running | ManagedStatus::NeedsInput) {
+        Utc::now()
+    } else {
+        run.finished_at.unwrap_or(run.started_at)
+    };
     ManagedSessionView {
         id: SessionId::from_run_id(&run.id),
         seq,
         kind: ManagedKind::Agent,
         origin: SessionOrigin::from_parent_run_id(run.parent_run_id.as_ref()),
         title,
-        status: project_status(&run.status),
+        status,
         created_at: run.started_at,
-        updated_at: run.started_at,
+        updated_at,
     }
 }
 
@@ -295,6 +327,12 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
     } else {
         session.command.clone()
     };
+    let status = project_shell_status(&session.status());
+    let updated_at = if matches!(status, ManagedStatus::Running | ManagedStatus::NeedsInput) {
+        Utc::now()
+    } else {
+        session.finished_at().unwrap_or_else(Utc::now)
+    };
     ManagedSessionView {
         id: session.id.clone(),
         seq,
@@ -303,9 +341,9 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
         // shell-spawn path.
         origin: SessionOrigin::User,
         title,
-        status: project_shell_status(&session.status()),
+        status,
         created_at: session.started_at,
-        updated_at: session.started_at,
+        updated_at,
     }
 }
 
@@ -332,6 +370,7 @@ pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSe
     } else {
         ManagedStatus::Running
     };
+    let updated_at = Utc::now();
     ManagedSessionView {
         id: session.id.clone(),
         seq,
@@ -342,7 +381,7 @@ pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSe
         title,
         status,
         created_at: session.started_at,
-        updated_at: session.started_at,
+        updated_at,
     }
 }
 
@@ -376,6 +415,7 @@ mod tests {
             topic_id: None,
             source_message_event_id: None,
             started_at: Utc::now(),
+            finished_at: None,
             status: SubAgentStatus::Running,
             recipient: None,
             channel_name: None,
@@ -394,6 +434,27 @@ mod tests {
     #[test]
     fn running_maps_to_running() {
         assert_eq!(project_status(&SubAgentStatus::Running), ManagedStatus::Running);
+    }
+
+    #[test]
+    fn elapsed_format_is_compact() {
+        assert_eq!(format_elapsed_compact(3), "3s");
+        assert_eq!(format_elapsed_compact(63), "1m03s");
+        assert_eq!(format_elapsed_compact(3_720), "1h02m");
+    }
+
+    #[test]
+    fn session_elapsed_label_uses_view_timestamps() {
+        let start = DateTime::parse_from_rfc3339("2026-07-04T12:00:00Z")
+            .expect("test timestamp")
+            .with_timezone(&Utc);
+        let end = DateTime::parse_from_rfc3339("2026-07-04T12:01:03Z")
+            .expect("test timestamp")
+            .with_timezone(&Utc);
+        let mut view = view_with_status(ManagedStatus::Completed);
+        view.created_at = start;
+        view.updated_at = end;
+        assert_eq!(session_elapsed_label(&view), "1m03s");
     }
 
     #[test]

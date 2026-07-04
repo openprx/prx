@@ -669,6 +669,42 @@ fn format_reloaded_background_sessions(sessions: &[crate::chat::sessions::Persis
     out
 }
 
+fn format_managed_sessions_list(views: &[crate::chat::sessions::model::ManagedSessionView]) -> String {
+    if views.is_empty() {
+        return "No child TUI sessions.".to_string();
+    }
+    let mut out = String::from("Background sessions:\n");
+    for v in views {
+        out.push_str(&format!(
+            "  #{} {} {} {} {} {}\n",
+            v.seq,
+            v.kind.as_str(),
+            v.origin.as_str(),
+            v.status.as_str(),
+            crate::chat::sessions::model::session_elapsed_label(v),
+            v.title
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+fn format_finished_session_announcement(fin: &crate::chat::sessions::runtime::FinishedSession) -> String {
+    let summary = fin.summary.trim();
+    let kind = fin.kind.as_str();
+    let elapsed = crate::chat::sessions::model::format_elapsed_compact(
+        crate::chat::sessions::model::elapsed_seconds_between(fin.created_at, fin.updated_at),
+    );
+    if summary.is_empty() {
+        format!("[{kind} session #{} {} {elapsed}]", fin.seq, fin.status.as_str())
+    } else {
+        format!(
+            "[{kind} session #{} {} {elapsed}] {summary}",
+            fin.seq,
+            fin.status.as_str()
+        )
+    }
+}
+
 /// Surface a background-session system message into the chat (v1b reflow).
 ///
 /// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
@@ -693,6 +729,36 @@ fn surface_session_message(dispatcher: &dispatcher::ChatDispatcher, redraw_tx: O
     #[cfg(not(feature = "terminal-tui"))]
     {
         print_fallback_chat_output(text);
+    }
+}
+
+#[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
+fn format_turn_elapsed_message(
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let elapsed = crate::chat::sessions::model::format_elapsed_compact(
+        crate::chat::sessions::model::elapsed_seconds_between(started_at, finished_at),
+    );
+    format!("turn {status} {elapsed}")
+}
+
+#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
+fn surface_turn_elapsed_message(
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) {
+    #[cfg(feature = "terminal-tui")]
+    {
+        surface_session_message(
+            dispatcher,
+            redraw_tx,
+            &format_turn_elapsed_message(status, started_at, finished_at),
+        );
     }
 }
 
@@ -729,6 +795,65 @@ mod fallback_chat_output_tests {
     #[test]
     fn fallback_chat_output_uses_crlf_for_terminal_stdout() {
         assert_eq!(format_fallback_chat_output_for("a\nb", true), "a\r\nb\r\n");
+    }
+}
+
+#[cfg(test)]
+mod runtime_display_tests {
+    use super::*;
+    use crate::chat::sessions::id::SessionId;
+    use crate::chat::sessions::model::{ManagedKind, ManagedSessionView, ManagedStatus, SessionOrigin};
+    use crate::chat::sessions::runtime::FinishedSession;
+
+    fn ts(value: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339(value)
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc)
+    }
+
+    #[test]
+    fn sessions_list_rows_include_elapsed() {
+        let view = ManagedSessionView {
+            id: SessionId::from_run_id("run-elapsed"),
+            seq: 9,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::Model,
+            title: "index workspace".to_string(),
+            status: ManagedStatus::Running,
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:03Z"),
+        };
+
+        let out = format_managed_sessions_list(&[view]);
+
+        assert!(out.contains("#9 agent model running 3s index workspace"), "{out}");
+    }
+
+    #[test]
+    fn completion_announcement_includes_final_elapsed() {
+        let fin = FinishedSession {
+            seq: 4,
+            run_id: "run-finished".to_string(),
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Completed,
+            summary: "done".to_string(),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:01:03Z"),
+        };
+
+        assert_eq!(
+            format_finished_session_announcement(&fin),
+            "[agent session #4 completed 1m03s] done"
+        );
+    }
+
+    #[test]
+    fn main_turn_elapsed_message_uses_compact_runtime() {
+        assert_eq!(
+            format_turn_elapsed_message("completed", ts("2026-07-04T12:00:00Z"), ts("2026-07-04T12:00:03Z")),
+            "turn completed 3s"
+        );
     }
 }
 
@@ -2469,13 +2594,7 @@ pub async fn run(
                 // 2) Persistent status line: recompute and dispatch only on change.
                 let views = chat_sessions.snapshot().await;
                 for fin in &finished {
-                    let summary = fin.summary.trim();
-                    let kind = fin.kind.as_str();
-                    let line = if summary.is_empty() {
-                        format!("[{kind} session #{} {}]", fin.seq, fin.status.as_str())
-                    } else {
-                        format!("[{kind} session #{} {}] {summary}", fin.seq, fin.status.as_str())
-                    };
+                    let line = format_finished_session_announcement(fin);
                     surface_session_message(
                         &chat_dispatcher,
                         sessions_redraw_handle.as_ref(),
@@ -2499,7 +2618,7 @@ pub async fn run(
                                 status: fin.status.as_str().to_string(),
                                 title: String::new(),
                                 summary: fin.summary.clone(),
-                                created_at: chrono::Utc::now(),
+                                created_at: fin.created_at,
                             },
                             |view| crate::chat::sessions::PersistedSessionSummary::from_view(view, fin.summary.clone()),
                         );
@@ -3481,25 +3600,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         }
                         SessionCommand::Sessions => {
                             let views = chat_sessions.snapshot().await;
-                            if views.is_empty() {
-                                emit_chat_output("No child TUI sessions.");
-                            } else {
-                                let mut out = String::from("Background sessions:\n");
-                                for v in &views {
-                                    // v5 (§17): tag origin (user `/bg` vs model
-                                    // self-spawn) so both kinds of session are
-                                    // visible in one unified list, distinguishable.
-                                    out.push_str(&format!(
-                                        "  #{} {} {} {} {}\n",
-                                        v.seq,
-                                        v.kind.as_str(),
-                                        v.origin.as_str(),
-                                        v.status.as_str(),
-                                        v.title
-                                    ));
-                                }
-                                emit_chat_output(out.trim_end());
-                            }
+                            emit_chat_output(&format_managed_sessions_list(&views));
                             continue;
                         }
                         SessionCommand::Transcript => {
@@ -4695,6 +4796,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
                     chat_session
                         .add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
+                    surface_turn_elapsed_message(
+                        &chat_dispatcher,
+                        sessions_redraw_handle.as_ref(),
+                        "completed",
+                        provider_started_at,
+                        chrono::Utc::now(),
+                    );
                     let _ = final_text;
                 }
                 Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {
@@ -4713,6 +4821,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     if plain_mode {
                         plain_mode_turn_failed = true;
                     }
+                    surface_turn_elapsed_message(
+                        &chat_dispatcher,
+                        sessions_redraw_handle.as_ref(),
+                        "failed",
+                        provider_started_at,
+                        chrono::Utc::now(),
+                    );
                 }
                 Some(dispatcher::TurnOutcomeKind::Cancelled) | None => {
                     if let Some(ref id) = draft_id {
@@ -4993,6 +5108,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 {
                     tracing::warn!(error = %e, "Failed to append provider.final_outcome message event for failed turn");
                 }
+                surface_turn_elapsed_message(
+                    &chat_dispatcher,
+                    sessions_redraw_handle.as_ref(),
+                    "failed",
+                    failed_outcome.started_at,
+                    failed_outcome.finished_at,
+                );
                 let attempts_count = u8::try_from(failed_outcome.attempts.len()).unwrap_or(u8::MAX);
                 crate::runtime::control_ladder::append_provider_outcome_trace(
                     std::path::Path::new(&config.workspace_dir),
@@ -5045,6 +5167,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
             tracing::warn!(error = %e, "Failed to append provider.final_outcome message event");
         }
+        surface_turn_elapsed_message(
+            &chat_dispatcher,
+            sessions_redraw_handle.as_ref(),
+            "completed",
+            provider_outcome.started_at,
+            provider_outcome.finished_at,
+        );
         // d04 §10 G7: emit a control-ladder trace carrying the structured
         // decision_id / final_provider / final_model / attempts_count so a
         // `decision_id` join links the routing decision to the provider that
@@ -10199,6 +10328,8 @@ mod regfix_approval_switch_tests {
             origin: "model",
             status: "running",
             title: "stale".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         let mut attached_follow = None;
         let mut attached_follow_seq = Some(7);

@@ -210,6 +210,7 @@ mod tests {
             topic_id: None,
             source_message_event_id: None,
             started_at: Utc::now(),
+            finished_at: None,
             status,
             recipient: None,
             channel_name: None,

@@ -859,12 +859,15 @@ pub enum FoldableKind {
 /// Synthetic transcript row shown in the Ctrl+G child TUI switcher.
 #[must_use]
 pub fn transcript_switcher_entry() -> crate::chat::sessions::SwitcherEntry {
+    let now = chrono::Utc::now();
     crate::chat::sessions::SwitcherEntry {
         seq: TRANSCRIPT_SESSION_SEQ,
         kind: crate::chat::sessions::model::ManagedKind::Transcript.as_str(),
         origin: "user",
         status: "ready",
         title: "conversation transcript".to_string(),
+        created_at: now,
+        updated_at: now,
     }
 }
 
@@ -3256,7 +3259,8 @@ fn render_sessions_strip_entry(
     }
     let marker = session_active_marker(active_seq == Some(entry.seq), ascii);
     let glyph = session_status_glyph(entry, ascii);
-    let prefix = format!("{marker} {glyph} #{} {} ", entry.seq, entry.kind);
+    let elapsed = entry.elapsed_label();
+    let prefix = format!("{marker} {glyph} #{} {} {elapsed} ", entry.seq, entry.kind);
     let prefix_cols = prefix.chars().count();
     let max = usize::from(max_width);
     if prefix_cols >= max {
@@ -3666,11 +3670,15 @@ fn render_switcher_row(
     // Fixed prefix (everything but the title), then fit the title into whatever
     // columns remain so the whole row stays within `max_width`.
     let prefix = if narrow {
-        format!("{glyph} #{} {} ", entry.seq, entry.kind)
+        format!("{glyph} #{} {} {} ", entry.seq, entry.kind, entry.elapsed_label())
     } else {
         format!(
-            "{glyph} #{} {} {} {} ",
-            entry.seq, entry.kind, entry.origin, entry.status
+            "{glyph} #{} {} {} {} {} ",
+            entry.seq,
+            entry.kind,
+            entry.origin,
+            entry.status,
+            entry.elapsed_label()
         )
     };
     let prefix_cols = prefix.chars().count();
@@ -6221,6 +6229,8 @@ mod tests {
             origin: "user",
             status: "running",
             title: "build release".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         for ch in "/kill ".chars() {
             assert_eq!(
@@ -6504,6 +6514,8 @@ mod tests {
             origin: "model",
             status: "running",
             title: "child".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         assert!(matches!(
             dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut switcher),
@@ -6737,6 +6749,8 @@ mod tests {
             origin: "model",
             status: "running",
             title: "child".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState {
             entries: vec![saved_picker_entry("only", "only session", false)],
@@ -7132,12 +7146,15 @@ mod tests {
     // ── v1.1b: switcher + Esc-detach + focus indicator ───────────────────────
 
     fn entry(seq: u64) -> crate::chat::sessions::SwitcherEntry {
+        let now = chrono::Utc::now();
         crate::chat::sessions::SwitcherEntry {
             seq,
             kind: "agent",
             origin: "user",
             status: "running",
             title: format!("task {seq}"),
+            created_at: now,
+            updated_at: now,
         }
     }
 
@@ -7153,12 +7170,30 @@ mod tests {
     // ── v5: switcher row layout (origin tag + narrow-terminal degradation) ────
 
     fn pty_entry(seq: u64, title: &str) -> crate::chat::sessions::SwitcherEntry {
+        let now = chrono::Utc::now();
         crate::chat::sessions::SwitcherEntry {
             seq,
             kind: "pty",
             origin: "user",
             status: "running",
             title: title.to_string(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn elapsed_entry(seq: u64, status: &'static str, elapsed_seconds: i64) -> crate::chat::sessions::SwitcherEntry {
+        let created_at = chrono::DateTime::parse_from_rfc3339("2026-07-04T12:00:00Z")
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc);
+        crate::chat::sessions::SwitcherEntry {
+            seq,
+            kind: "agent",
+            origin: "model",
+            status,
+            title: format!("elapsed task {seq}"),
+            created_at,
+            updated_at: created_at + chrono::Duration::seconds(elapsed_seconds),
         }
     }
 
@@ -7171,6 +7206,13 @@ mod tests {
         assert!(row.contains("user"), "row carries the origin: {row}");
         assert!(row.contains("running"), "wide row carries the status text: {row}");
         assert!(row.contains("vim notes.md"), "row carries the title: {row}");
+    }
+
+    #[test]
+    fn switcher_row_includes_elapsed() {
+        let e = elapsed_entry(4, "running", 63);
+        let row = render_switcher_row(&e, "⏳", false, 80);
+        assert!(row.contains("1m03s"), "row carries compact elapsed: {row}");
     }
 
     #[test]
@@ -7234,6 +7276,13 @@ mod tests {
     }
 
     #[test]
+    fn sessions_strip_entry_shows_elapsed() {
+        let entries = vec![elapsed_entry(2, "running", 3)];
+        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
+        assert!(line.contains("3s"), "strip carries compact elapsed: {line}");
+    }
+
+    #[test]
     fn sessions_strip_multiple_entries_share_one_row() {
         let entries = vec![entry(1), entry(2)];
         let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
@@ -7272,6 +7321,8 @@ mod tests {
             origin: "user",
             status: "running",
             title: "监控任务执行状态和输出窗口".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         let width = 22;
         let line = render_sessions_strip_line(
@@ -8466,6 +8517,8 @@ mod tests {
                 origin: "model",
                 status: "running",
                 title: "non-empty parity session".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.context_window_tokens = Some(10_000_000);

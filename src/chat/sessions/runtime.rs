@@ -68,6 +68,10 @@ pub struct FinishedSession {
     /// Result / failure text recorded by the run (the `Completed`/`Failed`
     /// payload), used as the reflow summary body.
     pub summary: String,
+    /// When the child session started.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    /// When the child session reached its terminal state.
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Chat-side handle over the shared agent + shell registries.
@@ -382,6 +386,7 @@ impl ChatSessionsHandle {
                 // defensively, so they carry no completion summary.
                 SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => String::new(),
             };
+            let updated_at = run.finished_at.unwrap_or_else(chrono::Utc::now);
             finished.push(FinishedSession {
                 seq,
                 run_id: run.id.clone(),
@@ -389,6 +394,8 @@ impl ChatSessionsHandle {
                 origin: super::model::SessionOrigin::from_parent_run_id(run.parent_run_id.as_ref()),
                 status,
                 summary,
+                created_at: run.started_at,
+                updated_at,
             });
         }
         // Shells: same once-only terminal reporting, keyed by shell id.
@@ -421,6 +428,8 @@ impl ChatSessionsHandle {
                 origin: super::model::SessionOrigin::User,
                 status,
                 summary,
+                created_at: shell.started_at,
+                updated_at: shell.finished_at().unwrap_or_else(chrono::Utc::now),
             });
         }
         finished
@@ -623,6 +632,7 @@ mod tests {
             topic_id: None,
             source_message_event_id: None,
             started_at: Utc::now(),
+            finished_at: None,
             status,
             recipient: None,
             channel_name: None,

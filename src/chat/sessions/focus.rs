@@ -23,7 +23,8 @@
 //! only detaches when the input is empty *and* a session is focused (plan
 //! §v1.1 P0-8).
 
-use super::model::{ManagedKind, ManagedSessionView, ManagedStatus};
+use super::model::{ManagedKind, ManagedSessionView, ManagedStatus, elapsed_seconds_between, format_elapsed_compact};
+use chrono::{DateTime, Utc};
 
 /// Where plain text + Enter is currently routed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,6 +98,10 @@ pub struct SwitcherEntry {
     pub status: &'static str,
     /// Task / command title (already truncated by the projection).
     pub title: String,
+    /// Session start timestamp used for elapsed display.
+    pub created_at: DateTime<Utc>,
+    /// Live snapshot time for running sessions, final timestamp for terminal sessions.
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Pure render snapshot for the focused line-oriented child session viewport
@@ -159,6 +164,8 @@ impl SwitcherEntry {
             origin: view.origin.as_str(),
             status: view.status.as_str(),
             title: view.title.clone(),
+            created_at: view.created_at,
+            updated_at: view.updated_at,
         }
     }
 
@@ -189,6 +196,12 @@ impl SwitcherEntry {
                 || s == ManagedStatus::Failed.as_str()
                 || s == ManagedStatus::Cancelled.as_str()
         )
+    }
+
+    /// Compact elapsed runtime label derived only from carried timestamps.
+    #[must_use]
+    pub fn elapsed_label(&self) -> String {
+        format_elapsed_compact(elapsed_seconds_between(self.created_at, self.updated_at))
     }
 
     /// Whether this row is the synthetic read-only transcript viewer.
@@ -541,6 +554,8 @@ mod tests {
             origin: "user",
             status: "ready",
             title: "conversation transcript".to_string(),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
         }];
         entries.extend(switcher_entries(&[
             view(1, ManagedStatus::Running, "left"),

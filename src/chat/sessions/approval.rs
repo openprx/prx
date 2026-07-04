@@ -360,6 +360,7 @@ mod tests {
             topic_id: None,
             source_message_event_id: None,
             started_at: chrono::Utc::now(),
+            finished_at: None,
             status: SubAgentStatus::Running,
             recipient: None,
             channel_name: None,

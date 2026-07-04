@@ -98,6 +98,8 @@ pub struct ShellSession {
     pub cwd: PathBuf,
     /// When the session was spawned.
     pub started_at: DateTime<Utc>,
+    /// When the session reached a terminal state, if it has.
+    finished_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     /// Current status, updated by the reaper task when the process exits and by
     /// `kill`. `parking_lot` (synchronous, never held across `.await`).
     status: Arc<Mutex<ShellStatus>>,
@@ -127,6 +129,12 @@ impl ShellSession {
     #[must_use]
     pub fn is_terminal(&self) -> bool {
         !matches!(self.status(), ShellStatus::Running)
+    }
+
+    /// The terminal timestamp recorded by the reaper, if the session has finished.
+    #[must_use]
+    pub fn finished_at(&self) -> Option<DateTime<Utc>> {
+        *self.finished_at.lock()
     }
 
     /// Terminate a still-running session: trip the cancel token (which drives the
@@ -296,6 +304,7 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
     }
 
     let status = Arc::new(Mutex::new(ShellStatus::Running));
+    let finished_at = Arc::new(Mutex::new(None));
     let cancel = CancellationToken::new();
 
     // 3. Stream stdout/stderr line-by-line into the event bridge. The sink's
@@ -319,6 +328,7 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
         child,
         readers,
         status: Arc::clone(&status),
+        finished_at: Arc::clone(&finished_at),
         cancel: cancel.clone(),
         pgid: Arc::clone(&pgid_cell),
         delta_tx,
@@ -329,6 +339,7 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
         command: command.to_string(),
         cwd,
         started_at: Utc::now(),
+        finished_at,
         status,
         cancel,
         pgid: pgid_cell,
@@ -387,6 +398,7 @@ struct ReaperCtx {
     child: tokio::process::Child,
     readers: Vec<JoinHandle<()>>,
     status: Arc<Mutex<ShellStatus>>,
+    finished_at: Arc<Mutex<Option<DateTime<Utc>>>>,
     cancel: CancellationToken,
     pgid: Arc<Mutex<Option<i32>>>,
     delta_tx: tokio::sync::mpsc::Sender<String>,
@@ -415,6 +427,7 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
         mut child,
         readers,
         status,
+        finished_at,
         cancel,
         pgid,
         delta_tx,
@@ -430,13 +443,13 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 let _ = child.wait().await;
                 *pgid.lock() = None;
                 if signalled.is_ok() {
-                    set_if_running(&status, ShellStatus::Cancelled);
+                    set_if_running(&status, &finished_at, ShellStatus::Cancelled);
                     "[shell cancelled]".to_string()
                 } else {
                     // Signal failed for a real reason: leave status as-is and
                     // surface the error in the marker rather than claiming a
                     // clean cancel.
-                    set_if_running(&status, ShellStatus::Failed("kill failed".to_string()));
+                    set_if_running(&status, &finished_at, ShellStatus::Failed("kill failed".to_string()));
                     "[shell kill failed]".to_string()
                 }
             }
@@ -446,16 +459,16 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
                 *pgid.lock() = None;
                 match exited {
                     Ok(es) if es.success() => {
-                        set_if_running(&status, ShellStatus::Completed);
+                        set_if_running(&status, &finished_at, ShellStatus::Completed);
                         "[shell completed]".to_string()
                     }
                     Ok(es) => {
                         let code = es.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
-                        set_if_running(&status, ShellStatus::Failed(format!("exit {code}")));
+                        set_if_running(&status, &finished_at, ShellStatus::Failed(format!("exit {code}")));
                         format!("[shell failed: exit {code}]")
                     }
                     Err(e) => {
-                        set_if_running(&status, ShellStatus::Failed(format!("wait error: {e}")));
+                        set_if_running(&status, &finished_at, ShellStatus::Failed(format!("wait error: {e}")));
                         format!("[shell error: {e}]")
                     }
                 }
@@ -501,9 +514,14 @@ async fn terminate(pgid: &Arc<Mutex<Option<i32>>>, child: &mut tokio::process::C
 
 /// Set the status to `next` only if it is still `Running` (so a `kill`-set
 /// `Cancelled` is never overwritten by a late natural exit).
-fn set_if_running(status: &Arc<Mutex<ShellStatus>>, next: ShellStatus) {
+fn set_if_running(
+    status: &Arc<Mutex<ShellStatus>>,
+    finished_at: &Arc<Mutex<Option<DateTime<Utc>>>>,
+    next: ShellStatus,
+) {
     let mut st = status.lock();
     if matches!(*st, ShellStatus::Running) {
+        *finished_at.lock() = Some(Utc::now());
         *st = next;
     }
 }

@@ -2580,6 +2580,8 @@ mod tests {
             origin: "user",
             status: "running",
             title: "task".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
         }];
         let expected = entries.clone();
         let effects = state.reduce(Action::SessionsEntriesUpdated { entries });
@@ -2700,6 +2702,8 @@ mod tests {
                 origin: "user",
                 status: "running",
                 title: "a".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
             },
             SwitcherEntry {
                 seq: 2,
@@ -2707,6 +2711,8 @@ mod tests {
                 origin: "model",
                 status: "completed",
                 title: "b".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
             },
         ];
         let effects = state.reduce(Action::SwitcherOpened { entries });
@@ -2745,6 +2751,8 @@ mod tests {
                 origin: "model",
                 status: "running",
                 title: "child".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
             },
         ]));
         let entries = vec![

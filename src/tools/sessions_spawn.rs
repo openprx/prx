@@ -78,6 +78,7 @@ pub struct SubAgentRun {
     pub topic_id: Option<String>,
     pub source_message_event_id: Option<String>,
     pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
     pub status: SubAgentStatus,
     pub recipient: Option<String>,
     /// Name of the channel this run must announce/kill-notify back on.
@@ -1179,6 +1180,7 @@ impl Tool for SessionsSpawnTool {
                     topic_id: run_lineage.topic_id.clone(),
                     source_message_event_id: run_lineage.source_message_event_id.clone(),
                     started_at: Utc::now(),
+                    finished_at: None,
                     status: SubAgentStatus::Running,
                     recipient: recipient.clone(),
                     channel_name: run_channel_name.clone(),
@@ -1316,6 +1318,7 @@ impl Tool for SessionsSpawnTool {
                 {
                     let mut runs = active_runs.write().await;
                     if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
+                        run.finished_at = Some(Utc::now());
                         run.status = status;
                         run.steer_tx = None;
                     }
@@ -1364,6 +1367,7 @@ impl Tool for SessionsSpawnTool {
                 topic_id: run_lineage.topic_id.clone(),
                 source_message_event_id: run_lineage.source_message_event_id.clone(),
                 started_at: Utc::now(),
+                finished_at: None,
                 status: SubAgentStatus::Running,
                 recipient: recipient.clone(),
                 channel_name: run_channel_name.clone(),
@@ -1555,6 +1559,7 @@ impl Tool for SessionsSpawnTool {
             {
                 let mut runs = active_runs.write().await;
                 if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
+                    run.finished_at = Some(Utc::now());
                     run.status = status;
                     run.steer_tx = None; // drop sender — no more steering possible
                 }
@@ -1709,6 +1714,7 @@ impl SessionsSpawnTool {
                         // not the shared active channel (avoids cross-channel leak).
                         let channel_name = run.channel_name.clone();
                         let rid = run.id.clone();
+                        run.finished_at = Some(Utc::now());
                         run.status = SubAgentStatus::Failed("killed by user".into());
                         run.steer_tx = None;
                         (recipient, channel_name, rid, run.clone())
@@ -4088,6 +4094,7 @@ mod tests {
                 topic_id: Some("topic-a".to_string()),
                 source_message_event_id: Some("msg-a".to_string()),
                 started_at: Utc::now(),
+                finished_at: None,
                 status: SubAgentStatus::Running,
                 recipient: None,
                 channel_name: None,
@@ -4256,6 +4263,7 @@ mod tests {
                 topic_id: Some("topic-a".to_string()),
                 source_message_event_id: Some("msg-a".to_string()),
                 started_at: Utc::now(),
+                finished_at: None,
                 status: SubAgentStatus::Running,
                 recipient: None,
                 channel_name: None,
@@ -4589,6 +4597,7 @@ mod tests {
             topic_id: None,
             source_message_event_id: None,
             started_at: Utc::now(),
+            finished_at: None,
             status,
             recipient: None,
             channel_name: None,
