@@ -27,6 +27,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::loop_::ChatMode;
 use crate::chat::commands::{CommandArgCandidate, CommandArgSource, CommandSpec, command_specs};
+use crate::chat::session::MainSessionTokenUsageSummary;
 use crate::chat::terminal_proto::{
     DraftVersionTracker, InlineDraftProtocol, LineProtocolError, apply_line_replacement,
 };
@@ -127,6 +128,8 @@ pub struct TuiState {
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
+    /// Main-session cumulative token/cost summary.
+    pub token_usage_summary: MainSessionTokenUsageSummary,
     /// First half of the `Ctrl+X Ctrl+E` external-editor chord.
     pub external_editor_prefix_armed: bool,
 }
@@ -2172,6 +2175,7 @@ impl TuiState {
             active_session_view: None,
             pending_tool_approval: None,
             context_window_tokens: None,
+            token_usage_summary: MainSessionTokenUsageSummary::default(),
             external_editor_prefix_armed: false,
         }
     }
@@ -2746,6 +2750,8 @@ pub trait BottomChromeView {
     fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView>;
     /// Effective context window for UI-only status budget display.
     fn context_window_tokens(&self) -> Option<usize>;
+    /// Main-session cumulative token/cost summary.
+    fn token_usage_summary(&self) -> MainSessionTokenUsageSummary;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
     /// target indicator (`main >` vs `agent #N ▸`).
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
@@ -2802,6 +2808,9 @@ impl BottomChromeView for TuiState {
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
+    }
+    fn token_usage_summary(&self) -> MainSessionTokenUsageSummary {
+        self.token_usage_summary
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -2862,6 +2871,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
+    }
+    fn token_usage_summary(&self) -> MainSessionTokenUsageSummary {
+        self.token_usage_summary
     }
     fn focus(&self) -> crate::chat::sessions::FocusTarget {
         self.focus
@@ -3803,11 +3815,10 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         title_str
     };
 
-    let token_estimate = estimate_visible_token_usage(state);
-    let budget = render_token_budget(token_estimate, state.context_window_tokens());
+    let usage = render_main_token_usage(state.token_usage_summary());
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
     let full = format!(
-        " PRX Chat | {}/{} | {} | {} turns | {permissions} | {budget} ",
+        " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
         state.provider(),
         state.model(),
         title,
@@ -3818,7 +3829,7 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
     }
 
     let compact = format!(
-        " PRX Chat | {}/{} | {permissions} | {budget} ",
+        " PRX Chat | {}/{} | {permissions} | {usage} ",
         state.provider(),
         state.model()
     );
@@ -3826,7 +3837,7 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         return compact;
     }
 
-    let minimal = format!(" PRX | {permissions} | {budget} ");
+    let minimal = format!(" PRX | {permissions} | {usage} ");
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
 }
 
@@ -3850,64 +3861,38 @@ const fn cycle_chat_mode(mode: ChatMode) -> ChatMode {
     }
 }
 
-fn render_token_budget(used_tokens: usize, window_tokens: Option<usize>) -> String {
-    let Some(window) = window_tokens.filter(|tokens| *tokens > 0) else {
-        return format!("~{used_tokens} tok");
+fn render_main_token_usage(summary: MainSessionTokenUsageSummary) -> String {
+    let prefix = if summary.has_estimates() { "~" } else { "" };
+    let cost = if summary.cost_is_unknown() {
+        "cost unknown".to_string()
+    } else {
+        format_cost_usd(summary.known_cost_usd)
     };
-    let clamped_used = used_tokens.min(window);
-    let percent = clamped_used
-        .saturating_mul(100)
-        .saturating_add(window.saturating_sub(1))
-        / window;
-    format!(
-        "~{} / {} tok ({}%)",
-        format_token_count(used_tokens),
-        format_token_count(window),
-        percent.min(100)
-    )
+    format!("{prefix}{} tok | {cost}", format_token_count(summary.total_tokens))
 }
 
-fn format_token_count(tokens: usize) -> String {
-    if tokens >= 1_000_000 && tokens % 1_000_000 == 0 {
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 10_000_000 {
         format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1_000 && tokens % 1_000 == 0 {
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
         format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
     } else {
         tokens.to_string()
     }
 }
 
-/// Rough current-token estimate for the TUI status bar.
-///
-/// This mirrors `/cost`'s cheap chars/4 heuristic and uses only data already
-/// present in the render snapshot. It is an operator hint, not a billing
-/// counter.
-fn estimate_visible_token_usage<V: BottomChromeView + ?Sized>(state: &V) -> usize {
-    let mut chars = 0usize;
-    for line in state.conversation_lines() {
-        chars = chars.saturating_add(match line {
-            ConversationLine::User { content }
-            | ConversationLine::Assistant { content }
-            | ConversationLine::StreamingAssistant { content }
-            | ConversationLine::System { content } => content.chars().count(),
-            ConversationLine::Tool { name, .. } => name.chars().count(),
-            ConversationLine::ToolResult {
-                tool_name,
-                args_full,
-                result,
-                ..
-            } => {
-                tool_name.chars().count()
-                    + args_full.chars().count()
-                    + result.as_deref().map_or(0, |r| r.chars().count())
-            }
-            ConversationLine::Reasoning { char_count, .. } => *char_count,
-        });
+fn format_cost_usd(cost: f64) -> String {
+    if !cost.is_finite() || cost <= 0.0 {
+        "$0.0000".to_string()
+    } else if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else {
+        format!("${cost:.4}")
     }
-    if let Some(streaming) = state.streaming() {
-        chars = chars.saturating_add(streaming.accumulated.chars().count());
-    }
-    chars / 4
 }
 
 /// Count the exact number of rows ratatui's word-wrapping
@@ -7808,7 +7793,7 @@ mod tests {
             "empty transcript message rendered: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("PRX Chat")),
+            rows.iter().any(|row| row.contains("PRX") && row.contains("mode:")),
             "status bar rendered: {rows:?}"
         );
         assert!(
@@ -7818,6 +7803,34 @@ mod tests {
         assert!(
             rows.last().is_some_and(|row| row.contains("Ctrl+G")),
             "footer pinned to bottom row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_status_bar_draws_metered_tokens_and_cost() {
+        let mut state = TuiState::new("provider", "model");
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            reported_tokens: 1_500,
+            request_count: 1,
+            known_cost_usd: 0.0105,
+            ..MainSessionTokenUsageSummary::default()
+        };
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 96, 18, &mut scroll);
+
+        assert!(
+            rows.iter().any(|row| row.contains("1.5k tok | $0.0105")),
+            "status bar should render metered token/cost summary: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|row| row.contains("/ 128k") || row.contains("Total chars")),
+            "status bar must not render the old chars/window gauge: {rows:?}"
         );
     }
 
@@ -8216,32 +8229,28 @@ mod tests {
     }
 
     #[test]
-    fn status_token_estimate_tracks_visible_chat_and_streaming_text() {
-        let mut state = TuiState::new("p", "m");
-        state.push_user_message("12345678");
-        state.push_assistant_message("abcd");
-        assert_eq!(estimate_visible_token_usage(&state), 3);
-
-        state.start_stream("d-live");
-        assert!(state.update_stream("d-live", "wxyz", 1));
-        assert_eq!(
-            estimate_visible_token_usage(&state),
-            4,
-            "streaming text contributes to the status-bar estimate"
-        );
-    }
-
-    #[test]
-    fn status_bar_renders_context_window_percentage() {
+    fn status_bar_renders_reported_tokens_and_cost() {
         let mut state = TuiState::new("provider", "model");
-        state.session_title = "budget".to_string();
-        state.context_window_tokens = Some(1_000_000);
-        state.push_user_message(&"x".repeat(80_000));
+        state.session_title = "tokens".to_string();
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            prompt_tokens: 1_000,
+            completion_tokens: 500,
+            total_tokens: 1_500,
+            reported_tokens: 1_500,
+            estimated_tokens: 0,
+            request_count: 1,
+            known_cost_usd: 0.0105,
+            unknown_cost_requests: 0,
+        };
 
         let line = render_status_bar_text(&state, 120);
         assert!(
-            line.contains("~20k / 1M tok (2%)"),
-            "status should include used/window percentage: {line}"
+            line.contains("1.5k tok | $0.0105"),
+            "status should include cumulative reported tokens and cost: {line}"
+        );
+        assert!(
+            !line.contains("~1.5k"),
+            "reported-only usage must not be marked estimated: {line}"
         );
     }
 
@@ -8268,7 +8277,13 @@ mod tests {
         let mut state = TuiState::new("provider", "model");
         state.chat_mode = ChatMode::Plan;
         state.autonomy_level = AutonomyLevel::Full;
-        state.context_window_tokens = Some(1_000_000);
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            total_tokens: 1_500,
+            estimated_tokens: 1_500,
+            known_cost_usd: 0.0006,
+            request_count: 1,
+            ..MainSessionTokenUsageSummary::default()
+        };
 
         let line = render_status_bar_text(&state, 32);
 
@@ -8283,24 +8298,42 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_renders_10m_window_without_raw_integer() {
+    fn status_bar_marks_estimated_usage_with_tilde() {
         let mut state = TuiState::new("provider", "model");
-        state.context_window_tokens = Some(10_000_000);
-        state.push_user_message(&"x".repeat(40_000));
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            prompt_tokens: 1_000,
+            completion_tokens: 1_000,
+            total_tokens: 2_000,
+            reported_tokens: 0,
+            estimated_tokens: 2_000,
+            request_count: 1,
+            known_cost_usd: 0.002,
+            unknown_cost_requests: 0,
+        };
 
         let line = render_status_bar_text(&state, 120);
-        assert!(line.contains("/ 10M tok"), "10M window should be compact: {line}");
         assert!(
-            !line.contains("10000000"),
-            "10M window must not render as a raw integer: {line}"
+            line.contains("~2.0k tok | $0.0020"),
+            "estimated usage should be marked: {line}"
         );
     }
 
     #[test]
-    fn status_bar_context_window_percentage_is_panic_safe() {
-        assert_eq!(render_token_budget(42, Some(0)), "~42 tok");
-        assert_eq!(render_token_budget(2_000_000, Some(1_000_000)), "~2M / 1M tok (100%)");
-        assert_eq!(render_token_budget(42, None), "~42 tok");
+    fn status_bar_renders_unknown_cost_for_unpriced_usage() {
+        let mut state = TuiState::new("provider", "model");
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            total_tokens: 42,
+            reported_tokens: 42,
+            request_count: 1,
+            unknown_cost_requests: 1,
+            ..MainSessionTokenUsageSummary::default()
+        };
+
+        let line = render_status_bar_text(&state, 120);
+        assert!(
+            line.contains("42 tok | cost unknown"),
+            "unknown cost should be explicit: {line}"
+        );
     }
 
     fn render_conversation_line_to_buffer(buf: &mut Buffer, line: &ConversationLine, ascii: bool) {

@@ -49,7 +49,7 @@ use tokio_util::sync::CancellationToken;
 use crate::agent::loop_::ChatMode;
 use crate::channels::traits::SendMessage;
 use crate::chat::action::{Action, CompactReason, HistoryDir};
-use crate::chat::session::{ChatSession, ChatTurn};
+use crate::chat::session::{ChatSession, ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
 use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
@@ -260,6 +260,8 @@ pub struct SessionState {
     /// `Action::BackgroundSessionRecorded` 写入（去重 by id），随
     /// `build_session_snapshot` 落盘，`reduce_session_loaded` 还原。
     pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
+    /// Main-session token records, success-only. Child-session usage is Phase 4.
+    pub token_usage_records: Vec<MainSessionTokenUsageRecord>,
 }
 
 /// TUI UI 临时状态（退出即弃，不持久化）.
@@ -304,6 +306,8 @@ pub struct UiState {
     /// Effective context window used by status bar budget display. This is a
     /// UI hint denominator only; P5 owns hard tokenizer budgeting.
     pub context_window_tokens: Option<usize>,
+    /// Main-session cumulative token/cost summary for the status bar.
+    pub token_usage_summary: MainSessionTokenUsageSummary,
     /// 当前输入路由目标（v1.1b）。`Main` = 主 chat；`Session{seq}` = 已 attach
     /// 的后台 session（输入作为 steer）。由 chat 主循环经
     /// `Action::SessionFocusChanged` 在 /attach//detach 时写入；驱动提示符的
@@ -367,6 +371,8 @@ pub struct UiSnapshot {
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
+    /// Main-session cumulative token/cost summary for the status bar.
+    pub token_usage_summary: MainSessionTokenUsageSummary,
     /// 当前输入路由目标（v1.1b）。驱动提示符颜色+字形指示。
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
@@ -401,6 +407,7 @@ impl UiSnapshot {
             active_session_view: None,
             pending_tool_approval: None,
             context_window_tokens: None,
+            token_usage_summary: MainSessionTokenUsageSummary::default(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
             slash_menu: None,
@@ -456,6 +463,24 @@ pub struct ChatState {
     cached_lines_arc: Option<Arc<Vec<ConversationLine>>>,
 }
 
+#[cfg(feature = "terminal-tui")]
+#[derive(PartialEq)]
+struct SnapshotDirtyFields {
+    conversation_len: usize,
+    conversation_generation: u64,
+    has_stream_draft: bool,
+    draft_version: u64,
+    input_lines: usize,
+    context_window_tokens: Option<usize>,
+    slash_menu_open: bool,
+    slash_menu_selected: Option<usize>,
+    chat_mode: ChatMode,
+    autonomy_level: AutonomyLevel,
+    approval_visible: bool,
+    focus: crate::chat::sessions::FocusTarget,
+    token_usage_summary: MainSessionTokenUsageSummary,
+}
+
 impl ChatState {
     /// 构造初始状态（合理默认值）.
     ///
@@ -473,6 +498,7 @@ impl ChatState {
                 history: Vec::new(),
                 created_at: None,
                 background_sessions: Vec::new(),
+                token_usage_records: Vec::new(),
             },
             ui: UiState {
                 conversation_lines: Vec::new(),
@@ -489,6 +515,7 @@ impl ChatState {
                 active_session_view: None,
                 pending_tool_approval: None,
                 context_window_tokens: None,
+                token_usage_summary: MainSessionTokenUsageSummary::default(),
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
                 slash_menu: None,
@@ -559,6 +586,7 @@ impl ChatState {
             active_session_view: self.ui.active_session_view.clone(),
             pending_tool_approval: self.ui.pending_tool_approval.clone(),
             context_window_tokens: self.ui.context_window_tokens,
+            token_usage_summary: self.ui.token_usage_summary,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
             slash_menu: self.ui.slash_menu.clone(),
@@ -605,37 +633,23 @@ impl ChatState {
     /// 内容字节级变化敏感（如 streaming chunk 累积）— streaming 的内容变化由
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
-    fn snapshot_dirty_fields(
-        &self,
-    ) -> (
-        usize,
-        u64,
-        bool,
-        u64,
-        usize,
-        Option<usize>,
-        bool,
-        Option<usize>,
-        ChatMode,
-        AutonomyLevel,
-        bool,
-        crate::chat::sessions::FocusTarget,
-    ) {
+    fn snapshot_dirty_fields(&self) -> SnapshotDirtyFields {
         let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
-        (
-            self.ui.conversation_lines.len(),
-            self.ui.conversation_generation,
-            self.stream.draft.is_some(),
-            draft_ver,
-            self.ui.input.lines.len(),
-            self.ui.context_window_tokens,
-            self.ui.slash_menu.is_some(),
-            self.ui.slash_menu.as_ref().map(|menu| menu.selected),
-            self.ui.chat_mode,
-            self.ui.autonomy_level,
-            self.ui.pending_tool_approval.is_some(),
-            self.ui.focus,
-        )
+        SnapshotDirtyFields {
+            conversation_len: self.ui.conversation_lines.len(),
+            conversation_generation: self.ui.conversation_generation,
+            has_stream_draft: self.stream.draft.is_some(),
+            draft_version: draft_ver,
+            input_lines: self.ui.input.lines.len(),
+            context_window_tokens: self.ui.context_window_tokens,
+            slash_menu_open: self.ui.slash_menu.is_some(),
+            slash_menu_selected: self.ui.slash_menu.as_ref().map(|menu| menu.selected),
+            chat_mode: self.ui.chat_mode,
+            autonomy_level: self.ui.autonomy_level,
+            approval_visible: self.ui.pending_tool_approval.is_some(),
+            focus: self.ui.focus,
+            token_usage_summary: self.ui.token_usage_summary,
+        }
     }
 
     /// 非 terminal-tui feature 下 ui_dirty 始终 false（无 UI 渲染源）.
@@ -778,6 +792,7 @@ impl ChatState {
             Action::ContextWindowUpdated { max_context_tokens } => {
                 self.reduce_context_window_updated(max_context_tokens)
             }
+            Action::ProviderUsageRecorded { record } => self.reduce_provider_usage_recorded(record),
             Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
@@ -1777,6 +1792,8 @@ impl ChatState {
         self.session.mode = loaded.mode;
         self.ui.chat_mode = loaded.mode;
         self.session.turns = loaded.turns;
+        self.session.token_usage_records = loaded.token_usage_records;
+        self.ui.token_usage_summary = MainSessionTokenUsageSummary::from_records(&self.session.token_usage_records);
         // v4: restore persisted background-session summaries (display only —
         // the live processes are gone and are never revived). Carrying them in
         // SessionState means the next save_session snapshot re-persists them, so
@@ -1881,6 +1898,7 @@ impl ChatState {
             updated_at: now,
             turns: self.session.turns.clone(),
             background_sessions: self.session.background_sessions.clone(),
+            token_usage_records: self.session.token_usage_records.clone(),
             mode: self.session.mode,
         }
     }
@@ -2064,6 +2082,15 @@ impl ChatState {
         }
         self.ui.context_window_tokens = max_context_tokens;
         vec![Effect::RequestRedraw]
+    }
+
+    fn reduce_provider_usage_recorded(&mut self, record: MainSessionTokenUsageRecord) -> Vec<Effect> {
+        self.session.token_usage_records.push(record);
+        self.ui.token_usage_summary = MainSessionTokenUsageSummary::from_records(&self.session.token_usage_records);
+        vec![
+            Effect::SaveSession(self.build_session_snapshot()),
+            Effect::RequestRedraw,
+        ]
     }
 
     /// `Action::BackgroundSessionRecorded` (v4) — upsert a background-session
@@ -2463,7 +2490,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
         | Action::ActiveSessionViewUpdated { .. }
-        | Action::ContextWindowUpdated { .. } => true,
+        | Action::ContextWindowUpdated { .. }
+        | Action::ProviderUsageRecorded { .. } => true,
         // v1.1b: focus + switcher are snapshot fields driving the prompt
         // indicator and switcher overlay → dirty. Each reducer no-ops identical
         // writes so unchanged state never churns frames.

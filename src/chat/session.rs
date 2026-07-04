@@ -36,6 +36,141 @@ pub struct ToolCallSummary {
     pub success: bool,
 }
 
+/// Per-provider-call token usage recorded for the main chat session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MainSessionTokenUsageRecord {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub source: crate::llm::route_decision::TokenUsageSource,
+    /// Display cost computed from `[cost].prices`. `None` means the model is
+    /// intentionally unknown-priced for this UI pass, not zero cost.
+    pub cost_usd: Option<f64>,
+}
+
+/// Cumulative main-session token/cost summary derived from usage records.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct MainSessionTokenUsageSummary {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub reported_tokens: u64,
+    pub estimated_tokens: u64,
+    pub request_count: u64,
+    pub known_cost_usd: f64,
+    pub unknown_cost_requests: u64,
+}
+
+impl MainSessionTokenUsageSummary {
+    #[must_use]
+    pub const fn has_usage(self) -> bool {
+        self.total_tokens > 0 || self.prompt_tokens > 0 || self.completion_tokens > 0
+    }
+
+    #[must_use]
+    pub const fn has_estimates(self) -> bool {
+        self.estimated_tokens > 0
+    }
+
+    #[must_use]
+    pub const fn cost_is_unknown(self) -> bool {
+        self.unknown_cost_requests > 0
+    }
+
+    #[must_use]
+    pub fn from_records(records: &[MainSessionTokenUsageRecord]) -> Self {
+        let mut summary = Self::default();
+        for record in records {
+            summary.request_count = summary.request_count.saturating_add(1);
+            summary.prompt_tokens = summary.prompt_tokens.saturating_add(record.prompt_tokens);
+            summary.completion_tokens = summary.completion_tokens.saturating_add(record.completion_tokens);
+            summary.total_tokens = summary.total_tokens.saturating_add(record.total_tokens);
+            match record.source {
+                crate::llm::route_decision::TokenUsageSource::Reported => {
+                    summary.reported_tokens = summary.reported_tokens.saturating_add(record.total_tokens);
+                }
+                crate::llm::route_decision::TokenUsageSource::Estimated => {
+                    summary.estimated_tokens = summary.estimated_tokens.saturating_add(record.total_tokens);
+                }
+            }
+            if let Some(cost) = record.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+                summary.known_cost_usd += cost;
+            } else {
+                summary.unknown_cost_requests = summary.unknown_cost_requests.saturating_add(1);
+            }
+        }
+        summary
+    }
+}
+
+impl MainSessionTokenUsageRecord {
+    #[must_use]
+    pub fn from_provider_outcome(
+        outcome: &crate::llm::route_decision::ProviderExecutionOutcome,
+        cost_config: &crate::config::schema::CostConfig,
+    ) -> Option<Self> {
+        let usage = &outcome.tokens_used;
+        if !usage.has_any_tokens() {
+            return None;
+        }
+
+        let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
+        let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
+        let total_tokens = usage
+            .total_tokens
+            .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
+        if total_tokens == 0 && prompt_tokens == 0 && completion_tokens == 0 {
+            return None;
+        }
+
+        let cost_usd = usage_cost_usd(
+            &outcome.final_provider,
+            &outcome.final_model,
+            prompt_tokens,
+            completion_tokens,
+            cost_config,
+        );
+
+        Some(Self {
+            provider: outcome.final_provider.clone(),
+            model: outcome.final_model.clone(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            source: usage.source,
+            cost_usd,
+        })
+    }
+}
+
+fn usage_cost_usd(
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost_config: &crate::config::schema::CostConfig,
+) -> Option<f64> {
+    if provider.eq_ignore_ascii_case("ollama") {
+        return None;
+    }
+    let pricing_key = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    let pricing = cost_config.prices.get(&pricing_key)?;
+    let usage = crate::cost::types::TokenUsage::new(
+        pricing_key,
+        prompt_tokens,
+        completion_tokens,
+        pricing.input,
+        pricing.output,
+    );
+    Some(usage.cost())
+}
+
 /// A complete chat session with versioned schema.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatSession {
@@ -62,6 +197,10 @@ pub struct ChatSession {
     /// older session blobs (written before v4) loadable.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub background_sessions: Vec<crate::chat::sessions::PersistedSessionSummary>,
+    /// Main chat token usage records. These are main-session only; child session
+    /// token propagation is intentionally deferred to token metering Phase 4.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_usage_records: Vec<MainSessionTokenUsageRecord>,
     /// Active interaction mode (plan/edit/auto). Not persisted to JSON so
     /// resumed sessions always start back in the default mode — the user
     /// re-issues `/plan` if they want it.
@@ -170,6 +309,7 @@ impl ChatSession {
             updated_at: now,
             turns: Vec::new(),
             background_sessions: Vec::new(),
+            token_usage_records: Vec::new(),
             mode: ChatMode::default(),
         }
     }
@@ -222,6 +362,21 @@ impl ChatSession {
         } else {
             self.background_sessions.push(summary);
         }
+    }
+
+    pub fn record_provider_usage(
+        &mut self,
+        outcome: &crate::llm::route_decision::ProviderExecutionOutcome,
+        cost_config: &crate::config::schema::CostConfig,
+    ) -> Option<MainSessionTokenUsageRecord> {
+        let record = MainSessionTokenUsageRecord::from_provider_outcome(outcome, cost_config)?;
+        self.token_usage_records.push(record.clone());
+        Some(record)
+    }
+
+    #[must_use]
+    pub fn token_usage_summary(&self) -> MainSessionTokenUsageSummary {
+        MainSessionTokenUsageSummary::from_records(&self.token_usage_records)
     }
 
     /// Memory key for storing this session.
@@ -412,5 +567,50 @@ mod tests {
         assert_eq!(session.background_sessions.len(), 1);
         assert_eq!(session.background_sessions[0].status, "completed");
         assert_eq!(session.background_sessions[0].summary, "finished cleanly");
+    }
+
+    #[test]
+    fn provider_usage_record_computes_cost_when_cost_tracking_disabled() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("openai", "gpt-4o-mini");
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            Utc::now(),
+            crate::llm::route_decision::TokenUsage::reported(Some(1_000), Some(500), Some(1_500)),
+        );
+        let config = crate::config::schema::CostConfig {
+            enabled: false,
+            ..crate::config::schema::CostConfig::default()
+        };
+
+        let record = MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &config)
+            .expect("reported usage should produce a record");
+
+        assert_eq!(record.prompt_tokens, 1_000);
+        assert_eq!(record.completion_tokens, 500);
+        assert_eq!(record.total_tokens, 1_500);
+        assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        let cost = record.cost_usd.expect("default openai price should compute cost");
+        assert!(
+            (cost - 0.000_45).abs() < 0.000_000_1,
+            "cost should be computed independently of cost.enabled: {cost}"
+        );
+    }
+
+    #[test]
+    fn provider_usage_record_marks_ollama_cost_unknown() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("ollama", "llama3");
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            Utc::now(),
+            crate::llm::route_decision::TokenUsage::estimated(None, Some(100), Some(100)),
+        );
+
+        let record =
+            MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &crate::config::schema::CostConfig::default())
+                .expect("estimated usage should produce a record");
+
+        assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Estimated);
+        assert_eq!(record.total_tokens, 100);
+        assert_eq!(record.cost_usd, None);
     }
 }

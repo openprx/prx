@@ -458,15 +458,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/edit" => CommandResult::SetMode(ChatMode::Edit),
         "/auto" => CommandResult::SetMode(ChatMode::Auto),
         "/tools" => CommandResult::HandledWithOutput(format_tools_feedback(ctx.tools_registry)),
-        "/cost" => {
-            let total_chars: usize = ctx.chat_session.turns.iter().map(|t| t.content.chars().count()).sum();
-            let est_tokens = total_chars / 4;
-            let out = format!(
-                "Session cost estimate:\n  Turns:        {}\n  Total chars:  {total_chars}\n  Est. tokens:  ~{est_tokens}",
-                ctx.chat_session.turn_count()
-            );
-            CommandResult::HandledWithOutput(out)
-        }
+        "/cost" => CommandResult::HandledWithOutput(format_cost_feedback(ctx.chat_session)),
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
         "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
         "/resume" => CommandResult::ResumeAction(ResumeCommand::List),
@@ -571,6 +563,55 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
             CommandResult::HandledWithOutput(format!("Unknown command: {input}. Type /help for available commands."))
         }
         _ => CommandResult::NotACommand,
+    }
+}
+
+fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
+    let summary = chat_session.token_usage_summary();
+    let total_prefix = if summary.has_estimates() { "~" } else { "" };
+    let cost = if summary.cost_is_unknown() {
+        if summary.known_cost_usd > 0.0 {
+            format!("cost unknown (known {})", format_cost_usd(summary.known_cost_usd))
+        } else {
+            "cost unknown".to_string()
+        }
+    } else {
+        format_cost_usd(summary.known_cost_usd)
+    };
+
+    format!(
+        "Session cost:\n  Turns:             {}\n  Metered requests:  {}\n  Prompt tokens:     {}\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}",
+        chat_session.turn_count(),
+        summary.request_count,
+        format_token_count(summary.prompt_tokens),
+        format_token_count(summary.completion_tokens),
+        format_token_count(summary.total_tokens),
+        format_token_count(summary.reported_tokens),
+        format_token_count(summary.estimated_tokens),
+    )
+}
+
+fn format_token_count(tokens: u64) -> String {
+    if tokens >= 10_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 10_000 {
+        format!("{}k", tokens / 1_000)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_cost_usd(cost: f64) -> String {
+    if !cost.is_finite() || cost <= 0.0 {
+        "$0.0000".to_string()
+    } else if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else {
+        format!("${cost:.4}")
     }
 }
 
@@ -1124,12 +1165,11 @@ mod mode_tests {
         assert_eq!(parsed.turn_count(), 2);
     }
 
-    /// BUG-06 round-2: `/cost` must read the live in-memory turns. With a
-    /// populated session the estimate reports the real turn count and non-zero
-    /// chars/tokens (the empty-session regression reported Turns:0 forever).
+    /// Phase 3: `/cost` reports metered prompt/completion/total tokens and cost,
+    /// not transcript chars/4.
     #[cfg(feature = "terminal-tui")]
     #[tokio::test]
-    async fn slash_cost_reports_nonzero_for_populated_session() {
+    async fn slash_cost_reports_metered_tokens_and_cost() {
         let memory = NoneMemory::new();
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let mut session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
@@ -1138,6 +1178,17 @@ mod mode_tests {
             "an equally substantial assistant reply with plenty of characters",
             Vec::new(),
         );
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+                total_tokens: 1_500,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+                cost_usd: Some(0.0105),
+            });
         let ctx = CommandContext {
             model_name: "kimi2.6",
             provider_name: "kimi-code",
@@ -1148,17 +1199,110 @@ mod mode_tests {
 
         let text = command_output(super::dispatch("/cost", &ctx).await);
 
-        assert!(text.contains("Turns:        2"), "cost should report 2 turns: {text}");
-        assert!(!text.contains("Total chars:  0"), "cost chars must be non-zero: {text}");
         assert!(
-            !text.contains("Est. tokens:  ~0"),
-            "cost tokens must be non-zero: {text}"
+            text.contains("Turns:             2"),
+            "cost should report 2 turns: {text}"
+        );
+        assert!(
+            text.contains("Prompt tokens:     1.0k"),
+            "prompt tokens missing: {text}"
+        );
+        assert!(
+            text.contains("Completion tokens: 500"),
+            "completion tokens missing: {text}"
+        );
+        assert!(text.contains("Total tokens:      1.5k"), "total tokens missing: {text}");
+        assert!(
+            text.contains("Source split:      real 1.5k, est ~0"),
+            "source split missing: {text}"
+        );
+        assert!(
+            text.contains("Cost:              $0.0105"),
+            "display cost missing: {text}"
+        );
+        assert!(
+            !text.contains("Total chars"),
+            "chars/4 estimate must not be reported: {text}"
         );
     }
 
-    /// BUG-06 round-2: empty session still reports zero (guards against the cost
-    /// estimator reading some unrelated non-empty source — the count must track
-    /// the real conversation).
+    /// Phase 3: estimated records are visibly marked with `~`.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_cost_marks_estimated_usage() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut session = crate::chat::session::ChatSession::new("kimi-code", "kimi2.6");
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "other".to_string(),
+                model: "estimated-model".to_string(),
+                prompt_tokens: 0,
+                completion_tokens: 250,
+                total_tokens: 250,
+                source: crate::llm::route_decision::TokenUsageSource::Estimated,
+                cost_usd: Some(0.0001),
+            });
+        let ctx = CommandContext {
+            model_name: "kimi2.6",
+            provider_name: "kimi-code",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/cost", &ctx).await);
+
+        assert!(
+            text.contains("Total tokens:      ~250"),
+            "estimated total should be marked: {text}"
+        );
+        assert!(
+            text.contains("Source split:      real 0, est ~250"),
+            "estimated split missing: {text}"
+        );
+    }
+
+    /// Phase 3: no-price models surface unknown cost instead of `$0`.
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_cost_reports_unknown_for_unpriced_usage() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut session = crate::chat::session::ChatSession::new("ollama", "llama3");
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+                cost_usd: None,
+            });
+        let ctx = CommandContext {
+            model_name: "llama3",
+            provider_name: "ollama",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/cost", &ctx).await);
+
+        assert!(
+            text.contains("Cost:              cost unknown"),
+            "unknown cost missing: {text}"
+        );
+        assert!(
+            !text.contains("Cost:              $0"),
+            "unknown cost must not be rendered as zero: {text}"
+        );
+    }
+
+    /// BUG-06 round-2: empty session still reports zero.
     #[cfg(feature = "terminal-tui")]
     #[tokio::test]
     async fn slash_cost_reports_zero_for_empty_session() {
@@ -1176,8 +1320,16 @@ mod mode_tests {
         let text = command_output(super::dispatch("/cost", &ctx).await);
 
         assert!(
-            text.contains("Turns:        0"),
+            text.contains("Turns:             0"),
             "empty session cost must be 0 turns: {text}"
+        );
+        assert!(
+            text.contains("Total tokens:      0"),
+            "empty session should report 0 tokens: {text}"
+        );
+        assert!(
+            text.contains("Cost:              $0.0000"),
+            "empty session should report zero known cost: {text}"
         );
     }
 

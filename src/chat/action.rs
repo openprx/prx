@@ -10,7 +10,7 @@ use crossterm::event::KeyEvent;
 use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::ChatMode;
-use crate::chat::session::ChatSession;
+use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord};
 use crate::llm::route_decision::TokenUsage;
 
 /// 历史导航方向。
@@ -259,6 +259,8 @@ pub enum Action {
     /// Effective context window for UI-only status budget display. `None`
     /// preserves the old `~used tok` status fallback.
     ContextWindowUpdated { max_context_tokens: Option<usize> },
+    /// Main-session provider usage has been recorded for a successful turn.
+    ProviderUsageRecorded { record: MainSessionTokenUsageRecord },
     /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
     /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
     /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
@@ -352,6 +354,7 @@ impl Action {
             Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
             Self::ActiveSessionViewUpdated { .. } => "ActiveSessionViewUpdated",
             Self::ContextWindowUpdated { .. } => "ContextWindowUpdated",
+            Self::ProviderUsageRecorded { .. } => "ProviderUsageRecorded",
             Self::BackgroundSessionRecorded { .. } => "BackgroundSessionRecorded",
             Self::SessionFocusChanged { .. } => "SessionFocusChanged",
             Self::SwitcherOpened { .. } => "SwitcherOpened",

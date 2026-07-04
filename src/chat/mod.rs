@@ -1943,6 +1943,7 @@ pub async fn run(
         let mut state = tui::TuiState::new(provider_name, model_name);
         state.chat_mode = chat_session.mode;
         state.autonomy_level = config.autonomy.level;
+        state.token_usage_summary = chat_session.token_usage_summary();
         state.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
         if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
             state.saved_sessions_cache = sessions
@@ -2077,6 +2078,7 @@ pub async fn run(
         );
         initial.chat_mode = chat_session.mode;
         initial.autonomy_level = config.autonomy.level;
+        initial.token_usage_summary = chat_session.token_usage_summary();
         let initial = std::sync::Arc::new(initial);
         let (tx, rx) = tokio::sync::watch::channel(initial);
         tracing::info!(mode = ?top_redux_mode, "snapshot_tx constructed for Pure chat mode");
@@ -4823,6 +4825,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
                     chat_session
                         .add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
+                    if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                        #[cfg(feature = "terminal-tui")]
+                        {
+                            chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+                        }
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::ProviderUsageRecorded { record },
+                            "chat.provider_usage_recorded",
+                        );
+                        #[cfg(feature = "terminal-tui")]
+                        if let Some(tx) = redraw_tx_for_main.as_ref() {
+                            let _ = tx.try_send(());
+                        }
+                    }
                     surface_turn_elapsed_message(
                         &chat_dispatcher,
                         sessions_redraw_handle.as_ref(),
@@ -5380,6 +5396,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // backs the slash commands that read from `chat_session`.
         chat_session.add_user_turn(&sanitized_input);
         chat_session.add_assistant_turn(&sanitized_response, Vec::new());
+        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+            #[cfg(feature = "terminal-tui")]
+            {
+                chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+            }
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::ProviderUsageRecorded { record },
+                "chat.provider_usage_recorded",
+            );
+            #[cfg(feature = "terminal-tui")]
+            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                let _ = tx.try_send(());
+            }
+        }
 
         // P0-1 fix: 旧路径在 Both/Redux 模式下受 dual_write_guard 守卫。
         // Redux reducer 的 SaveSession effect 已在 execute_real 中置位 guard，
@@ -7875,6 +7905,7 @@ async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_sessio
         mirror.active_session_view = None;
         mirror.pending_tool_approval = None;
         mirror.context_window_tokens = None;
+        mirror.token_usage_summary = ctx.chat_session.token_usage_summary();
         mirror.external_editor_prefix_armed = false;
         mirror.input.clear_navigation_state();
         mirror.focus = crate::chat::sessions::FocusTarget::Main;
