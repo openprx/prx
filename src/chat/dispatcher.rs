@@ -38,6 +38,7 @@ use crate::channels::Channel;
 use crate::chat::action::Action;
 use crate::chat::state::{ChatState, Effect};
 use crate::hooks::HookManager;
+use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
 use crate::memory::Memory;
 use crate::observability::Observer;
 use crate::providers::Provider;
@@ -307,6 +308,7 @@ pub enum TurnOutcomeKind {
 pub struct TurnCompletionSignal {
     inner: Arc<tokio::sync::Notify>,
     outcome: Arc<ParkingMutex<Option<TurnOutcomeKind>>>,
+    usage: Arc<ParkingMutex<ProviderUsageAccumulator>>,
 }
 
 impl TurnCompletionSignal {
@@ -316,7 +318,12 @@ impl TurnCompletionSignal {
         Self {
             inner: Arc::new(tokio::sync::Notify::new()),
             outcome: Arc::new(parking_lot::Mutex::new(None)),
+            usage: Arc::new(ParkingMutex::new(ProviderUsageAccumulator::new())),
         }
+    }
+
+    pub fn record_usage(&self, usage: TokenUsage) {
+        self.usage.lock().record(usage);
     }
 
     /// dispatcher task 调用：写入 outcome + 唤醒等待方。
@@ -340,6 +347,13 @@ impl TurnCompletionSignal {
     #[must_use]
     pub fn consume_outcome(&self) -> Option<TurnOutcomeKind> {
         self.outcome.lock().take()
+    }
+
+    pub fn consume_usage(&self) -> TokenUsage {
+        let mut guard = self.usage.lock();
+        let usage = guard.finish();
+        *guard = ProviderUsageAccumulator::new();
+        usage
     }
 }
 
@@ -368,6 +382,14 @@ pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
             retryable: *retryable,
         }),
         Action::StreamCancelled { .. } => Some(TurnOutcomeKind::Cancelled),
+        _ => None,
+    }
+}
+
+#[must_use]
+pub fn extract_stream_usage(action: &Action) -> Option<TokenUsage> {
+    match action {
+        Action::StreamUsageMetered { usage } => Some(usage.clone()),
         _ => None,
     }
 }
@@ -1301,12 +1323,13 @@ const BACKOFF_BASE_MS: u64 = 500;
 /// 单轮 stream 的结果分类（driver loop 用此向上 unwind）.
 enum StreamPassOutcome {
     /// 本轮没有 tool_call，普通文本生成结束。携带最终累计文本。
-    Completed { iter_text: String },
+    Completed { iter_text: String, usage: TokenUsage },
     /// 本轮 LLM 要求工具调用 — 携带聚合好的 tool_calls + 本轮 assistant 文本（提示词）。
     ToolCallRequested {
         calls: Vec<ResolvedToolCall>,
         iter_text: String,
         reasoning_content: String,
+        usage: TokenUsage,
     },
     /// 网络瞬时错误（可走 backoff retry，不消耗 iteration 配额）.
     TransientNetworkError { err: String },
@@ -1500,6 +1523,7 @@ async fn drive_start_turn_stream(
     let mut version: u64 = 0;
     let mut accumulated = String::new();
     let mut reasoning_buf = String::new();
+    let mut usage_accumulator = ProviderUsageAccumulator::new();
     let mut iteration: usize = 0;
     let mut overflow_retries: u8 = 0;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
@@ -1600,7 +1624,8 @@ async fn drive_start_turn_stream(
         .await;
 
         match pass {
-            StreamPassOutcome::Completed { iter_text } => {
+            StreamPassOutcome::Completed { iter_text, usage } => {
+                usage_accumulator.record(usage);
                 accumulated.push_str(&iter_text);
                 break 'outer;
             }
@@ -1699,7 +1724,9 @@ async fn drive_start_turn_stream(
                 calls,
                 iter_text,
                 reasoning_content,
+                usage,
             } => {
+                usage_accumulator.record(usage);
                 // 进入 tool 回合：需要 registry.
                 let registry = match tools_registry.as_ref() {
                     Some(r) => r,
@@ -1825,6 +1852,17 @@ async fn drive_start_turn_stream(
     // T3-3-fixB B5：先 RecordAssistantTurn 再 StreamCompleted，让 reducer
     // reduce_stream_completed emit Effect::SaveSession 时 session.turns 已
     // 含本轮 assistant。与 fixA P0-1 legacy 路径修同款时序契约。
+    let tokens_used = usage_accumulator.finish();
+    if tokens_used.is_reported()
+        && let Err(e) = action_tx
+            .send(Action::StreamUsageMetered {
+                usage: tokens_used.clone(),
+            })
+            .await
+    {
+        tracing::debug!(error = %e, "StartTurn: action_tx closed before StreamUsageMetered");
+        return;
+    }
     let record = Action::RecordAssistantTurn(accumulated.clone());
     if let Err(e) = action_tx.send(record).await {
         tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
@@ -2361,6 +2399,7 @@ async fn run_one_stream_pass(
 
     let mut aggregator = ToolCallAggregator::new();
     let mut completed_calls: Vec<ResolvedToolCall> = Vec::new();
+    let mut usage_accumulator = ProviderUsageAccumulator::new();
     let mut iter_text = String::new();
     let mut iter_reasoning = String::new();
 
@@ -2376,7 +2415,10 @@ async fn run_one_stream_pass(
             }
             next = stream.next() => {
                 match next {
-                    Some(Ok(StreamChunk { delta, reasoning, is_final, tool_calls, .. })) => {
+                    Some(Ok(StreamChunk { delta, reasoning, is_final, usage, tool_calls, .. })) => {
+                        if let Some(usage) = usage {
+                            usage_accumulator.record(usage);
+                        }
                         if !tool_calls.is_empty() {
                             for tc in tool_calls {
                                 if let Some((id, name, args)) = aggregator.ingest(tc) {
@@ -2427,13 +2469,16 @@ async fn run_one_stream_pass(
         }
     }
 
+    let usage = usage_accumulator
+        .finish_or_estimate_completion_chars(iter_text.chars().count().saturating_add(iter_reasoning.chars().count()));
     if completed_calls.is_empty() {
-        StreamPassOutcome::Completed { iter_text }
+        StreamPassOutcome::Completed { iter_text, usage }
     } else {
         StreamPassOutcome::ToolCallRequested {
             calls: completed_calls,
             iter_text,
             reasoning_content: iter_reasoning,
+            usage,
         }
     }
 }
@@ -2563,6 +2608,7 @@ pub fn spawn_dispatcher_task_full(
                     while let Ok(action) = action_rx.try_recv() {
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
+                        let usage = extract_stream_usage(&action);
                         let approval_response = extract_approval_response(&action);
                         let (effects, ui_dirty) = state.reduce_tracked(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2579,8 +2625,13 @@ pub fn spawn_dispatcher_task_full(
                         // 会被 shutdown 抢占前最后一轮 turn 永远卡住（导致 round 2 hang
                         // 回归）。terminal action 携带 outcome — main.rs:888
                         // shutdown_timeout 兜底保证主进程最终退出。
-                        if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
-                            sig.record_and_notify(out);
+                        if let Some(ref sig) = turn_signal {
+                            if let Some(usage) = usage {
+                                sig.record_usage(usage);
+                            }
+                            if let Some(out) = outcome {
+                                sig.record_and_notify(out);
+                            }
                         }
                     }
                     // 兜底：shutdown 期间 chat::run 仍可能在 await turn_signal.notified()，
@@ -2601,6 +2652,7 @@ pub fn spawn_dispatcher_task_full(
                         Some(action) => {
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
+                            let usage = extract_stream_usage(&action);
                             let approval_response = extract_approval_response(&action);
                             let (effects, ui_dirty) = state.reduce_tracked(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2615,8 +2667,13 @@ pub fn spawn_dispatcher_task_full(
                             {
                                 router.resolve(&tool_id, approved);
                             }
-                            if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
-                                sig.record_and_notify(out);
+                            if let Some(ref sig) = turn_signal {
+                                if let Some(usage) = usage {
+                                    sig.record_usage(usage);
+                                }
+                                if let Some(out) = outcome {
+                                    sig.record_and_notify(out);
+                                }
                             }
                         }
                         None => {
@@ -2663,6 +2720,7 @@ pub fn spawn_dispatcher_task_full(
                     while let Ok(action) = action_rx.try_recv() {
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
+                        let usage = extract_stream_usage(&action);
                         let approval_response = extract_approval_response(&action);
                         let effects = state.reduce(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2674,8 +2732,13 @@ pub fn spawn_dispatcher_task_full(
                         {
                             router.resolve(&tool_id, approved);
                         }
-                        if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
-                            sig.record_and_notify(out);
+                        if let Some(ref sig) = turn_signal {
+                            if let Some(usage) = usage {
+                                sig.record_usage(usage);
+                            }
+                            if let Some(out) = outcome {
+                                sig.record_and_notify(out);
+                            }
                         }
                     }
                     if let Some(ref sig) = turn_signal {
@@ -2688,6 +2751,7 @@ pub fn spawn_dispatcher_task_full(
                         Some(action) => {
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
+                            let usage = extract_stream_usage(&action);
                             let approval_response = extract_approval_response(&action);
                             let effects = state.reduce(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2699,8 +2763,13 @@ pub fn spawn_dispatcher_task_full(
                             {
                                 router.resolve(&tool_id, approved);
                             }
-                            if let (Some(out), Some(ref sig)) = (outcome, turn_signal.as_ref()) {
-                                sig.record_and_notify(out);
+                            if let Some(ref sig) = turn_signal {
+                                if let Some(usage) = usage {
+                                    sig.record_usage(usage);
+                                }
+                                if let Some(out) = outcome {
+                                    sig.record_and_notify(out);
+                                }
                             }
                         }
                         None => {

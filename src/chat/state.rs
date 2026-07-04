@@ -726,6 +726,7 @@ impl ChatState {
                 delta,
                 version,
             } => self.reduce_stream_chunk_received(&draft_id, &delta, version),
+            Action::StreamUsageMetered { .. } => vec![],
             Action::StreamCompleted {
                 draft_id,
                 final_text,
@@ -2430,7 +2431,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolStarted { .. }
         | Action::ToolFinished { .. } => true,
         // 仅 LogTrace，不变 UI
-        Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } => false,
+        Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } | Action::StreamUsageMetered { .. } => false,
         // Foreground approval writes pending view + focus.
         Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {
             true

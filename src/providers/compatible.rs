@@ -2,10 +2,12 @@
 //! Most LLM APIs follow the same `/v1/chat/completions` format.
 //! This module provides a single implementation that works for all of them.
 
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk, ToolCallChunkStatus,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
+    StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
+    ToolCallChunkStatus,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -298,6 +300,8 @@ struct ApiChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamUsageOptions>,
 }
 
 #[derive(Debug, Serialize)]
@@ -309,6 +313,8 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     choices: Vec<Choice>,
+    #[serde(default)]
+    usage: Option<OpenAiCompatibleUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -475,6 +481,29 @@ struct NativeChatRequest {
     tools: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamUsageOptions>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct OpenAiCompatibleUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl OpenAiCompatibleUsage {
+    const fn into_reported(self) -> TokenUsage {
+        TokenUsage::reported(self.prompt_tokens, self.completion_tokens, self.total_tokens)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct StreamUsageOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -557,6 +586,8 @@ struct ResponsesContent {
 struct StreamChunkResponse {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiCompatibleUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -628,6 +659,8 @@ struct SseEvent {
     /// `choices[].finish_reason`; `Some("tool_calls")` is the signal to flush
     /// the accumulated tool-call buffer.
     finish_reason: Option<String>,
+    /// Provider-reported usage, usually delivered on a final usage-only chunk.
+    usage: Option<TokenUsage>,
     /// `true` when the chunk was the `[DONE]` sentinel.
     done_sentinel: bool,
 }
@@ -640,6 +673,7 @@ impl SseEvent {
             && self.reasoning.is_none()
             && self.tool_call_deltas.is_empty()
             && self.finish_reason.is_none()
+            && self.usage.is_none()
             && !self.done_sentinel
     }
 }
@@ -698,8 +732,12 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
     // Parse JSON delta
     let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
 
+    let usage = chunk.usage.map(OpenAiCompatibleUsage::into_reported);
     let Some(choice) = chunk.choices.into_iter().next() else {
-        return Ok(None);
+        return Ok(usage.map(|usage| SseEvent {
+            usage: Some(usage),
+            ..SseEvent::default()
+        }));
     };
 
     let content = choice.delta.content.filter(|c| !c.is_empty());
@@ -712,6 +750,7 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
         reasoning,
         tool_call_deltas,
         finish_reason,
+        usage,
         done_sentinel: false,
     };
 
@@ -871,6 +910,8 @@ pub(crate) fn sse_bytes_to_chunks(
         let mut buffer = String::new();
         let mut saw_sse_event = false;
         let mut saw_non_sse_line = false;
+        let mut saw_usage = false;
+        let mut completion_chars: usize = 0;
         // Per-index tool-call accumulator. Carried across all SSE frames so
         // argument fragments split across multiple `data:` lines aggregate
         // correctly before flush.
@@ -922,10 +963,17 @@ pub(crate) fn sse_bytes_to_chunks(
                                 if event.done_sentinel {
                                     continue;
                                 }
+                                if let Some(usage) = event.usage {
+                                    saw_usage = true;
+                                    if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                        return;
+                                    }
+                                }
                                 // Emit a separate StreamChunk for visible content
                                 // and reasoning so consumers can route them
                                 // independently. They are never merged.
                                 if let Some(content) = event.content {
+                                    completion_chars = completion_chars.saturating_add(content.chars().count());
                                     let mut chunk = StreamChunk::delta(content);
                                     if count_tokens {
                                         chunk = chunk.with_token_estimate();
@@ -935,6 +983,7 @@ pub(crate) fn sse_bytes_to_chunks(
                                     }
                                 }
                                 if let Some(reasoning) = event.reasoning {
+                                    completion_chars = completion_chars.saturating_add(reasoning.chars().count());
                                     let mut chunk = StreamChunk::reasoning_delta(reasoning);
                                     if count_tokens {
                                         chunk = chunk.with_token_estimate();
@@ -1006,6 +1055,14 @@ pub(crate) fn sse_bytes_to_chunks(
             let calls = flush_tool_call_buffer(&tool_buf);
             if !calls.is_empty() {
                 let _ = tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await;
+            }
+        }
+
+        if !saw_usage && completion_chars > 0 {
+            let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+            let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+            if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                return;
             }
         }
 
@@ -1397,7 +1454,157 @@ impl OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools,
             tool_choice,
+            stream_options: if options.enabled {
+                Some(StreamUsageOptions { include_usage: true })
+            } else {
+                None
+            },
         }
+    }
+
+    async fn chat_metered(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
+        let credential = self.credential.as_ref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
+                self.name
+            )
+        })?;
+
+        let tools = Self::convert_tool_specs(request.tools);
+        let effective_messages = if self.merge_system_into_user {
+            Self::flatten_system_messages(request.messages)
+        } else {
+            request.messages.to_vec()
+        };
+        let native_messages = Self::convert_messages_for_native(&effective_messages);
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: native_messages,
+            temperature: self.effective_temperature(temperature),
+            stream: Some(false),
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+            stream_options: None,
+        };
+
+        let url = self.chat_completions_url();
+        let response = match self
+            .apply_auth_header(self.http_client().post(&url).json(&native_request), credential)
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(chat_error) => {
+                if self.supports_responses_fallback {
+                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
+                    return self
+                        .chat_via_responses(credential, &effective_messages, model)
+                        .await
+                        .map(|text| {
+                            let mut accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                            accumulator.record_estimated_completion_chars(text.chars().count());
+                            (
+                                ProviderChatResponse {
+                                    text: Some(text),
+                                    tool_calls: vec![],
+                                    reasoning_content: None,
+                                },
+                                accumulator.finish(),
+                            )
+                        })
+                        .map_err(|responses_err| {
+                            anyhow::anyhow!(
+                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
+                                self.name
+                            )
+                        });
+                }
+
+                return Err(chat_error.into());
+            }
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error = response.text().await?;
+            let sanitized = super::sanitize_api_error(&error);
+
+            tracing::warn!(
+                provider = %self.name,
+                http_status = %status,
+                error_preview = %&sanitized[..sanitized.len().min(300)],
+                "OpenAiCompatibleProvider.chat() got non-200 response"
+            );
+
+            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
+                tracing::warn!("is_native_tool_schema_unsupported triggered — falling back to prompt-guided XML tools");
+                let fallback_messages = Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
+                let text = self.chat_with_history(&fallback_messages, model, temperature).await?;
+                let mut accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                accumulator.record_estimated_completion_chars(text.chars().count());
+                return Ok((
+                    ProviderChatResponse {
+                        text: Some(text),
+                        tool_calls: vec![],
+                        reasoning_content: None,
+                    },
+                    accumulator.finish(),
+                ));
+            }
+
+            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
+                return self
+                    .chat_via_responses(credential, &effective_messages, model)
+                    .await
+                    .map(|text| {
+                        let mut accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                        accumulator.record_estimated_completion_chars(text.chars().count());
+                        (
+                            ProviderChatResponse {
+                                text: Some(text),
+                                tool_calls: vec![],
+                                reasoning_content: None,
+                            },
+                            accumulator.finish(),
+                        )
+                    })
+                    .map_err(|responses_err| {
+                        anyhow::anyhow!(
+                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
+                            self.name
+                        )
+                    });
+            }
+
+            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
+        }
+
+        let response_bytes = response.bytes().await?;
+        let response_str = String::from_utf8_lossy(&response_bytes);
+        let native_response: ApiChatResponse = serde_json::from_slice(&response_bytes)
+            .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}\nBody: {response_str}"))?;
+        let usage = native_response.usage.map(OpenAiCompatibleUsage::into_reported);
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|choice| choice.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
+
+        let response = Self::parse_native_response(message);
+        let tokens_used = usage.unwrap_or_else(|| {
+            let chars = response.text.as_deref().unwrap_or("").chars().count()
+                + response.reasoning_content.as_deref().unwrap_or("").chars().count();
+            let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+            accumulator.finish_or_estimate_completion_chars(chars)
+        });
+        Ok((response, tokens_used))
     }
 
     fn is_native_tool_schema_unsupported(status: reqwest::StatusCode, error: &str) -> bool {
@@ -1419,6 +1626,15 @@ impl OpenAiCompatibleProvider {
         ]
         .iter()
         .any(|hint| lower.contains(hint))
+    }
+
+    const fn stream_options_retry_status(status: reqwest::StatusCode) -> bool {
+        matches!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST
+                | reqwest::StatusCode::NOT_FOUND
+                | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        )
     }
 }
 
@@ -1528,6 +1744,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
 
         let url = self.chat_completions_url();
@@ -1642,6 +1859,7 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
 
         let url = self.chat_completions_url();
@@ -1746,6 +1964,7 @@ impl Provider for OpenAiCompatibleProvider {
             } else {
                 Some("auto".to_string())
             },
+            stream_options: None,
         };
 
         let url = self.chat_completions_url();
@@ -1816,115 +2035,36 @@ impl Provider for OpenAiCompatibleProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.credential.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "{} API key not set. Run `prx onboard` or set the appropriate env var.",
-                self.name
-            )
-        })?;
-
-        let tools = Self::convert_tool_specs(request.tools);
-        let effective_messages = if self.merge_system_into_user {
-            Self::flatten_system_messages(request.messages)
-        } else {
-            request.messages.to_vec()
-        };
-        let native_messages = Self::convert_messages_for_native(&effective_messages);
-
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: native_messages,
-            temperature: self.effective_temperature(temperature),
-            stream: Some(false),
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
-        let url = self.chat_completions_url();
-        let response = match self
-            .apply_auth_header(self.http_client().post(&url).json(&native_request), credential)
-            .send()
+        self.chat_metered(request, model, temperature)
             .await
-        {
-            Ok(response) => response,
-            Err(chat_error) => {
-                if self.supports_responses_fallback {
-                    let sanitized = super::sanitize_api_error(&chat_error.to_string());
-                    return self
-                        .chat_via_responses(credential, &effective_messages, model)
-                        .await
-                        .map(|text| ProviderChatResponse {
-                            text: Some(text),
-                            tool_calls: vec![],
-                            reasoning_content: None,
-                        })
-                        .map_err(|responses_err| {
-                            anyhow::anyhow!(
-                                "{} native chat transport error: {sanitized} (responses fallback failed: {responses_err})",
-                                self.name
-                            )
-                        });
-                }
+            .map(|(response, _)| response)
+    }
 
-                return Err(chat_error.into());
-            }
-        };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let error = response.text().await?;
-            let sanitized = super::sanitize_api_error(&error);
-
-            tracing::warn!(
-                provider = %self.name,
-                http_status = %status,
-                error_preview = %&sanitized[..sanitized.len().min(300)],
-                "OpenAiCompatibleProvider.chat() got non-200 response"
-            );
-
-            if Self::is_native_tool_schema_unsupported(status, &sanitized) {
-                tracing::warn!("is_native_tool_schema_unsupported triggered — falling back to prompt-guided XML tools");
-                let fallback_messages = Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
-                let text = self.chat_with_history(&fallback_messages, model, temperature).await?;
-                return Ok(ProviderChatResponse {
-                    text: Some(text),
-                    tool_calls: vec![],
-                    reasoning_content: None,
-                });
-            }
-
-            if status == reqwest::StatusCode::NOT_FOUND && self.supports_responses_fallback {
-                return self
-                    .chat_via_responses(credential, &effective_messages, model)
-                    .await
-                    .map(|text| ProviderChatResponse {
-                        text: Some(text),
-                        tool_calls: vec![],
-                        reasoning_content: None,
-                    })
-                    .map_err(|responses_err| {
-                        anyhow::anyhow!(
-                            "{} API error ({status}): {sanitized} (chat completions unavailable; responses fallback failed: {responses_err})",
-                            self.name
-                        )
-                    });
-            }
-
-            anyhow::bail!("{} API error ({status}): {sanitized}", self.name);
-        }
-
-        let response_bytes = response.bytes().await?;
-        let response_str = String::from_utf8_lossy(&response_bytes);
-        let native_response: ApiChatResponse = serde_json::from_slice(&response_bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}\nBody: {response_str}"))?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|choice| choice.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
-
-        Ok(Self::parse_native_response(message))
+    async fn chat_traced(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (response, tokens_used) = self.chat_metered(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: self.name.clone(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: self.name.clone(),
+            final_model: model.to_string(),
+            tokens_used,
+        })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -1973,6 +2113,11 @@ impl Provider for OpenAiCompatibleProvider {
             stream: Some(options.enabled),
             tools: None,
             tool_choice: None,
+            stream_options: if options.enabled {
+                Some(StreamUsageOptions { include_usage: true })
+            } else {
+                None
+            },
         };
 
         let url = self.chat_completions_url();
@@ -1998,13 +2143,41 @@ impl Provider for OpenAiCompatibleProvider {
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             // Send request
-            let response = match req_builder.send().await {
+            let mut response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Err(StreamError::Http(e))).await;
                     return;
                 }
             };
+
+            if !response.status().is_success()
+                && request.stream_options.is_some()
+                && Self::stream_options_retry_status(response.status())
+            {
+                let status = response.status();
+                tracing::debug!(
+                    provider = %provider_name,
+                    %status,
+                    "stream_options.include_usage rejected; retrying stream without usage request"
+                );
+                let mut fallback_request = request;
+                fallback_request.stream_options = None;
+                let mut fallback_builder = client.post(&url).json(&fallback_request);
+                fallback_builder = match &auth_header {
+                    AuthStyle::Bearer => fallback_builder.header("Authorization", format!("Bearer {}", credential)),
+                    AuthStyle::XApiKey => fallback_builder.header("x-api-key", &credential),
+                    AuthStyle::Custom(header) => fallback_builder.header(header, &credential),
+                };
+                fallback_builder = fallback_builder.header("Accept", "text/event-stream");
+                response = match fallback_builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+            }
 
             // Check status. FIX-P0-33: 429/503 carry a structured Retry-After.
             if !response.status().is_success() {
@@ -2063,13 +2236,41 @@ impl Provider for OpenAiCompatibleProvider {
             };
             req_builder = req_builder.header("Accept", "text/event-stream");
 
-            let response = match req_builder.send().await {
+            let mut response = match req_builder.send().await {
                 Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(Err(StreamError::Http(e))).await;
                     return;
                 }
             };
+
+            if !response.status().is_success()
+                && request.stream_options.is_some()
+                && Self::stream_options_retry_status(response.status())
+            {
+                let status = response.status();
+                tracing::debug!(
+                    provider = %provider_name,
+                    %status,
+                    "stream_options.include_usage rejected; retrying stream without usage request"
+                );
+                let mut fallback_request = request;
+                fallback_request.stream_options = None;
+                let mut fallback_builder = client.post(&url).json(&fallback_request);
+                fallback_builder = match &auth_header {
+                    AuthStyle::Bearer => fallback_builder.header("Authorization", format!("Bearer {}", credential)),
+                    AuthStyle::XApiKey => fallback_builder.header("x-api-key", &credential),
+                    AuthStyle::Custom(header) => fallback_builder.header(header, &credential),
+                };
+                fallback_builder = fallback_builder.header("Accept", "text/event-stream");
+                response = match fallback_builder.send().await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let _ = tx.send(Err(StreamError::Http(e))).await;
+                        return;
+                    }
+                };
+            }
 
             // FIX-P0-33: 429/503 carry a structured Retry-After.
             if !response.status().is_success() {
@@ -2173,6 +2374,7 @@ mod tests {
             stream: Some(false),
             tools: None,
             tool_choice: None,
+            stream_options: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("llama-3.3-70b"));
@@ -2188,6 +2390,21 @@ mod tests {
         let json = r#"{"choices":[{"message":{"content":"Hello from Venice!"}}]}"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.choices[0].message.content, Some("Hello from Venice!".to_string()));
+    }
+
+    #[test]
+    fn compatible_non_streaming_response_usage_maps_reported() {
+        let json = r#"{
+            "choices":[{"message":{"content":"Hello from Venice!"}}],
+            "usage":{"prompt_tokens":44,"completion_tokens":9,"total_tokens":53}
+        }"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage expected").into_reported();
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(44));
+        assert_eq!(usage.completion_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(53));
     }
 
     #[test]
@@ -2826,6 +3043,7 @@ mod tests {
             stream: Some(false),
             tools: Some(tools),
             tool_choice: Some("auto".to_string()),
+            stream_options: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"tools\""));
@@ -3097,6 +3315,41 @@ mod tests {
             .expect("test: should produce delta");
         assert_eq!(result.content.as_deref(), Some("hello"));
         assert_eq!(result.reasoning, None);
+    }
+
+    #[test]
+    fn compatible_sse_line_parses_final_usage_chunk() {
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":21,"completion_tokens":8,"total_tokens":29}}"#;
+        let event = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: usage-only chunk should produce event");
+        let usage = event.usage.expect("usage expected");
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(21));
+        assert_eq!(usage.completion_tokens, Some(8));
+        assert_eq!(usage.total_tokens, Some(29));
+        assert!(event.content.is_none());
+        assert!(event.tool_call_deltas.is_empty());
+    }
+
+    #[test]
+    fn compatible_sse_without_usage_stays_estimated_fallback() {
+        let line = r#"data: {"choices":[{"delta":{"content":"fallback estimate"}}]}"#;
+        let event = parse_sse_line(line)
+            .expect("test: parse should succeed")
+            .expect("test: should produce content event");
+        assert!(
+            event.usage.is_none(),
+            "content chunks must not fabricate reported usage"
+        );
+
+        let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+        let usage =
+            accumulator.finish_or_estimate_completion_chars(event.content.as_deref().unwrap_or("").chars().count());
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Estimated);
+        assert_eq!(usage.prompt_tokens, None);
+        assert!(usage.completion_tokens.unwrap_or_default() > 0);
     }
 
     #[test]

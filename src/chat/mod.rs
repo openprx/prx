@@ -4742,6 +4742,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
 
             let outcome = turn_signal.consume_outcome();
+            let mut redux_tokens_used = turn_signal.consume_usage();
 
             // Finalize streaming（与 legacy 收尾对齐）：drop senders 让后台任务收口.
             //
@@ -4760,6 +4761,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
             match outcome {
                 Some(dispatcher::TurnOutcomeKind::Completed { final_text }) => {
+                    if !redux_tokens_used.has_any_tokens() {
+                        let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                        redux_tokens_used = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
+                    }
                     // 1) 把 driver 流式累计的最终文本写回 LLM history（与 legacy 行尾
                     //    `history.push(ChatMessage::assistant(...))` 对齐）。
                     history.push(ChatMessage::assistant(final_text.clone()));
@@ -4781,6 +4786,28 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     {
                         tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
                     }
+                    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+                        &route_decision,
+                        provider_started_at,
+                        redux_tokens_used.clone(),
+                    );
+                    if let Err(e) =
+                        record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
+                    {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to append provider.final_outcome message event for Redux driver turn"
+                        );
+                    }
+                    let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
+                    crate::runtime::control_ladder::append_provider_outcome_trace(
+                        std::path::Path::new(&config.workspace_dir),
+                        &provider_outcome.decision_id,
+                        &provider_outcome.final_provider,
+                        &provider_outcome.final_model,
+                        attempts_count,
+                        "success",
+                    );
                     // driver 路径 RecordAssistantTurn 已由 dispatcher.rs send（fixB B5）
                     // BUG-06 / BUG-08 round-2 fix: the real TUI drives turns through
                     // this ReduxDriver branch, which `continue`s at the end of the
@@ -4800,8 +4827,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         &chat_dispatcher,
                         sessions_redraw_handle.as_ref(),
                         "completed",
-                        provider_started_at,
-                        chrono::Utc::now(),
+                        provider_outcome.started_at,
+                        provider_outcome.finished_at,
                     );
                     let _ = final_text;
                 }

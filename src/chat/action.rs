@@ -11,6 +11,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::ChatMode;
 use crate::chat::session::ChatSession;
+use crate::llm::route_decision::TokenUsage;
 
 /// 历史导航方向。
 #[allow(dead_code)]
@@ -126,6 +127,8 @@ pub enum Action {
         delta: String,
         version: u64,
     },
+    /// Provider-reported or estimated usage for the active streaming turn.
+    StreamUsageMetered { usage: TokenUsage },
     /// streaming 完成，携带最终文本和 reasoning 摘要
     StreamCompleted {
         draft_id: String,
@@ -320,6 +323,7 @@ impl Action {
             Self::TurnStarted { .. } => "TurnStarted",
             Self::StartLLMTurn { .. } => "StartLLMTurn",
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",
+            Self::StreamUsageMetered { .. } => "StreamUsageMetered",
             Self::StreamCompleted { .. } => "StreamCompleted",
             Self::StreamFailed { .. } => "StreamFailed",
             Self::StreamCancelled { .. } => "StreamCancelled",

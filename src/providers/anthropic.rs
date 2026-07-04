@@ -1,8 +1,10 @@
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::multimodal;
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk, ToolCallChunkStatus,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
+    StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
+    ToolCallChunkStatus,
 };
 use crate::tools::ToolSpec;
 use crate::tools::schema::SchemaCleanr;
@@ -151,6 +153,26 @@ struct SystemBlock {
 struct NativeChatResponse {
     #[serde(default)]
     content: Vec<NativeContentIn>,
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: Option<u32>,
+    #[serde(default)]
+    output_tokens: Option<u32>,
+}
+
+impl AnthropicUsage {
+    const fn into_reported(self) -> TokenUsage {
+        let total = match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            _ => None,
+        };
+        TokenUsage::reported(self.input_tokens, self.output_tokens, total)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -662,6 +684,72 @@ impl AnthropicProvider {
         }
     }
 
+    async fn chat_metered(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
+        let credential = self.ensure_fresh_credential()?;
+
+        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
+
+        if Self::should_cache_conversation(request.messages) {
+            Self::apply_cache_to_last_message(&mut messages);
+        }
+
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            max_tokens: 4096,
+            system: system_prompt,
+            messages,
+            temperature,
+            tools: Self::convert_tools(request.tools),
+        };
+
+        let req = self
+            .http_client()
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&native_request);
+
+        let response = self.apply_auth(req, &credential).send().await?;
+
+        let native_response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Ok(new_credential) = self.try_refresh_after_401() {
+                let retry_req = self
+                    .http_client()
+                    .post(format!("{}/v1/messages", self.base_url))
+                    .header("anthropic-version", "2023-06-01")
+                    .header("content-type", "application/json")
+                    .json(&native_request);
+                let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
+                if !retry_response.status().is_success() {
+                    return Err(super::api_error("Anthropic", retry_response).await);
+                }
+                retry_response.json::<NativeChatResponse>().await?
+            } else {
+                return Err(super::api_error("Anthropic", response).await);
+            }
+        } else {
+            if !response.status().is_success() {
+                return Err(super::api_error("Anthropic", response).await);
+            }
+            response.json::<NativeChatResponse>().await?
+        };
+
+        let usage = native_response.usage.map(AnthropicUsage::into_reported);
+        let response = Self::parse_native_response(native_response);
+        let tokens_used = usage.unwrap_or_else(|| {
+            let chars = response.text.as_deref().unwrap_or("").chars().count()
+                + response.reasoning_content.as_deref().unwrap_or("").chars().count();
+            let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+            accumulator.finish_or_estimate_completion_chars(chars)
+        });
+        Ok((response, tokens_used))
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.anthropic", 120, 10)
             .map_err(|e| {
@@ -949,6 +1037,10 @@ enum DeltaOutcome {
 
 #[derive(Debug, PartialEq, Eq)]
 enum AnthropicEvent {
+    /// `event: message_start` with optional initial usage.
+    MessageStart(AnthropicUsage),
+    /// `event: message_delta` with optional cumulative output usage.
+    MessageDelta(AnthropicUsage),
     /// `event: content_block_start` with parsed payload index + block.
     BlockStart(usize, AnthropicSseContentBlock),
     /// `event: content_block_delta` index + delta.
@@ -957,8 +1049,26 @@ enum AnthropicEvent {
     BlockStop(usize),
     /// `event: message_stop` — terminates the turn.
     MessageStop,
-    /// Any other event (ping/message_start/message_delta) — ignored.
+    /// Any other event (ping, etc.) — ignored.
     Other,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageStartPayload {
+    #[serde(default)]
+    message: MessageStartBody,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageStartBody {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct MessageDeltaPayload {
+    #[serde(default)]
+    usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1005,6 +1115,16 @@ fn parse_anthropic_sse_record(record: &str) -> StreamResult<Option<AnthropicEven
     }
     let event_name = event_name.unwrap_or("");
     match event_name {
+        "message_start" => {
+            let payload: MessageStartPayload = serde_json::from_str(&data_buf).unwrap_or_default();
+            Ok(Some(AnthropicEvent::MessageStart(
+                payload.message.usage.unwrap_or_default(),
+            )))
+        }
+        "message_delta" => {
+            let payload: MessageDeltaPayload = serde_json::from_str(&data_buf).unwrap_or_default();
+            Ok(Some(AnthropicEvent::MessageDelta(payload.usage.unwrap_or_default())))
+        }
         "content_block_start" => {
             let payload: BlockStartPayload = serde_json::from_str(&data_buf).map_err(StreamError::Json)?;
             Ok(Some(AnthropicEvent::BlockStart(payload.index, payload.content_block)))
@@ -1086,58 +1206,36 @@ impl Provider for AnthropicProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self.ensure_fresh_credential()?;
+        self.chat_metered(request, model, temperature)
+            .await
+            .map(|(response, _)| response)
+    }
 
-        let (system_prompt, mut messages) = Self::convert_messages(request.messages);
-
-        // Auto-cache last message if conversation is long
-        if Self::should_cache_conversation(request.messages) {
-            Self::apply_cache_to_last_message(&mut messages);
-        }
-
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            max_tokens: 4096,
-            system: system_prompt,
-            messages,
-            temperature,
-            tools: Self::convert_tools(request.tools),
-        };
-
-        let req = self
-            .http_client()
-            .post(format!("{}/v1/messages", self.base_url))
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&native_request);
-
-        let response = self.apply_auth(req, &credential).send().await?;
-
-        // Handle 401: try one refresh + retry before failing.
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            if let Ok(new_credential) = self.try_refresh_after_401() {
-                let retry_req = self
-                    .http_client()
-                    .post(format!("{}/v1/messages", self.base_url))
-                    .header("anthropic-version", "2023-06-01")
-                    .header("content-type", "application/json")
-                    .json(&native_request);
-                let retry_response = self.apply_auth(retry_req, &new_credential).send().await?;
-                if !retry_response.status().is_success() {
-                    return Err(super::api_error("Anthropic", retry_response).await);
-                }
-                let native_response: NativeChatResponse = retry_response.json().await?;
-                return Ok(Self::parse_native_response(native_response));
-            }
-            return Err(super::api_error("Anthropic", response).await);
-        }
-
-        if !response.status().is_success() {
-            return Err(super::api_error("Anthropic", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        Ok(Self::parse_native_response(native_response))
+    async fn chat_traced(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (response, tokens_used) = self.chat_metered(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "anthropic".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "anthropic".to_string(),
+            final_model: model.to_string(),
+            tokens_used,
+        })
     }
 
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
@@ -1292,8 +1390,11 @@ impl Provider for AnthropicProvider {
             }
 
             let mut state = AnthropicStreamState::default();
+            let mut usage_state = AnthropicUsage::default();
+            let mut usage_seen = false;
             let mut byte_stream = response.bytes_stream();
             let mut buf = String::new();
+            let mut completion_chars: usize = 0;
             let mut sent_final = false;
 
             'outer: while let Some(bytes_res) = byte_stream.next().await {
@@ -1329,6 +1430,28 @@ impl Provider for AnthropicProvider {
                         }
                     };
                     match event {
+                        AnthropicEvent::MessageStart(usage) => {
+                            if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                                usage_seen = true;
+                                if usage.input_tokens.is_some() {
+                                    usage_state.input_tokens = usage.input_tokens;
+                                }
+                                if usage.output_tokens.is_some() {
+                                    usage_state.output_tokens = usage.output_tokens;
+                                }
+                            }
+                        }
+                        AnthropicEvent::MessageDelta(usage) => {
+                            if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                                usage_seen = true;
+                                if usage.input_tokens.is_some() {
+                                    usage_state.input_tokens = usage.input_tokens;
+                                }
+                                if usage.output_tokens.is_some() {
+                                    usage_state.output_tokens = usage.output_tokens;
+                                }
+                            }
+                        }
                         AnthropicEvent::BlockStart(idx, block) => {
                             if let Some(initial) = state.on_content_block_start(idx, block) {
                                 if tx.send(Ok(StreamChunk::tool_call_chunk(vec![initial]))).await.is_err() {
@@ -1340,6 +1463,7 @@ impl Provider for AnthropicProvider {
                             if let Some(outcome) = state.on_content_block_delta(idx, delta) {
                                 let chunk = match outcome {
                                     DeltaOutcome::Text(t) => {
+                                        completion_chars = completion_chars.saturating_add(t.chars().count());
                                         let mut c = StreamChunk::delta(t);
                                         if options.count_tokens {
                                             c = c.with_token_estimate();
@@ -1347,6 +1471,7 @@ impl Provider for AnthropicProvider {
                                         c
                                     }
                                     DeltaOutcome::Reasoning(r) => {
+                                        completion_chars = completion_chars.saturating_add(r.chars().count());
                                         let mut c = StreamChunk::reasoning_delta(r);
                                         if options.count_tokens {
                                             c = c.with_token_estimate();
@@ -1372,6 +1497,21 @@ impl Provider for AnthropicProvider {
                             }
                         }
                         AnthropicEvent::MessageStop => {
+                            if usage_seen {
+                                if tx
+                                    .send(Ok(StreamChunk::usage(usage_state.into_reported())))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            } else if completion_chars > 0 {
+                                let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                                let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+                                if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                                    return;
+                                }
+                            }
                             let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                             sent_final = true;
                             break 'outer;
@@ -1389,6 +1529,21 @@ impl Provider for AnthropicProvider {
                 // turn. Without this, partial tool calls would be lost on EOF.
                 for call in state.drain_pending_tool_calls() {
                     if tx.send(Ok(StreamChunk::tool_call_chunk(vec![call]))).await.is_err() {
+                        return;
+                    }
+                }
+                if usage_seen {
+                    if tx
+                        .send(Ok(StreamChunk::usage(usage_state.into_reported())))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                } else if completion_chars > 0 {
+                    let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                    let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+                    if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
                         return;
                     }
                 }
@@ -2243,6 +2398,57 @@ mod tests {
 
         assert_eq!(parsed.text.as_deref(), Some("Just an answer."));
         assert_eq!(parsed.reasoning_content, None);
+    }
+
+    #[test]
+    fn anthropic_non_streaming_response_usage_maps_reported() {
+        let json = r#"{
+            "content": [{"type": "text", "text": "Just an answer."}],
+            "usage": {"input_tokens": 64, "output_tokens": 11}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage expected").into_reported();
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(64));
+        assert_eq!(usage.completion_tokens, Some(11));
+        assert_eq!(usage.total_tokens, Some(75));
+    }
+
+    #[test]
+    fn anthropic_sse_usage_events_parse_reported_tokens() {
+        let start = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"
+        );
+        let delta = concat!(
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":23}}\n\n"
+        );
+
+        let start_usage = match parse_anthropic_sse_record(start).unwrap().expect("message_start event") {
+            AnthropicEvent::MessageStart(usage) => usage,
+            other => panic!("expected message_start usage, got {other:?}"),
+        };
+        let delta_usage = match parse_anthropic_sse_record(delta).unwrap().expect("message_delta event") {
+            AnthropicEvent::MessageDelta(usage) => usage,
+            other => panic!("expected message_delta usage, got {other:?}"),
+        };
+
+        assert_eq!(start_usage.input_tokens, Some(100));
+        assert_eq!(start_usage.output_tokens, Some(1));
+        assert_eq!(delta_usage.input_tokens, None);
+        assert_eq!(delta_usage.output_tokens, Some(23));
+
+        let reported = AnthropicUsage {
+            input_tokens: start_usage.input_tokens,
+            output_tokens: delta_usage.output_tokens,
+        }
+        .into_reported();
+        assert_eq!(reported.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(reported.prompt_tokens, Some(100));
+        assert_eq!(reported.completion_tokens, Some(23));
+        assert_eq!(reported.total_tokens, Some(123));
     }
 
     // ─── S3 T3-2-A: SSE tool_use incremental streaming ──────────────────────

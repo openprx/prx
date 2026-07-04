@@ -655,8 +655,8 @@ impl Provider for ReliableProvider {
 
                 for attempt in 0..=self.max_retries {
                     let attempt_started_at = chrono::Utc::now();
-                    match provider.chat(request, current_model, temperature).await {
-                        Ok(resp) => {
+                    match provider.chat_traced(request, current_model, temperature).await {
+                        Ok(trace) => {
                             if attempt > 0 || *current_model != model {
                                 tracing::info!(
                                     provider = %provider_name,
@@ -676,11 +676,11 @@ impl Provider for ReliableProvider {
                                 None,
                             ));
                             return Ok(ChatTrace {
-                                response: resp,
+                                response: trace.response,
                                 attempts,
                                 final_provider: provider_name.to_string(),
                                 final_model: (*current_model).to_string(),
-                                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+                                tokens_used: trace.tokens_used,
                             });
                         }
                         Err(e) => {
@@ -771,7 +771,7 @@ impl Provider for ReliableProvider {
             .chat_traced(request, decision.effective_model(), temperature)
             .await?;
         let finished_at = chrono::Utc::now();
-        let outcome = ProviderExecutionOutcome::from_trace(
+        let outcome = ProviderExecutionOutcome::from_trace_with_usage(
             decision,
             trace.attempts,
             trace.final_provider,
@@ -780,6 +780,7 @@ impl Provider for ReliableProvider {
             finished_at,
             // Single chat call: no earlier-turn fallback to fold in.
             false,
+            trace.tokens_used,
         );
         Ok((trace.response, outcome))
     }

@@ -1,6 +1,7 @@
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, TokenUsage};
 use crate::providers::traits::{
-    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, Provider, StreamChunk,
-    StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
+    ChatMessage, ChatRequest as ProviderChatRequest, ChatResponse as ProviderChatResponse, ChatTrace, Provider,
+    StreamChunk, StreamError, StreamOptions, StreamResult, ToolCall as ProviderToolCall, ToolCallChunk,
 };
 use crate::tools::ToolSpec;
 use async_trait::async_trait;
@@ -129,6 +130,38 @@ struct NativeFunctionCall {
 #[derive(Debug, Deserialize)]
 struct NativeChatResponse {
     choices: Vec<NativeChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+struct OpenAiUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+    #[serde(default)]
+    total_tokens: Option<u32>,
+}
+
+impl OpenAiUsage {
+    const fn into_reported(self) -> TokenUsage {
+        TokenUsage::reported(self.prompt_tokens, self.completion_tokens, self.total_tokens)
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct StreamUsageOptions {
+    include_usage: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamingChatRequest {
+    model: String,
+    messages: Vec<NativeMessage>,
+    temperature: f64,
+    stream: bool,
+    stream_options: StreamUsageOptions,
 }
 
 #[derive(Debug, Deserialize)]
@@ -286,6 +319,56 @@ impl OpenAiProvider {
         }
     }
 
+    async fn chat_metered(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(ProviderChatResponse, TokenUsage)> {
+        let credential = self
+            .credential
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
+
+        let tools = Self::convert_tools(request.tools);
+        let native_request = NativeChatRequest {
+            model: model.to_string(),
+            messages: Self::convert_messages(request.messages),
+            temperature,
+            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
+            tools,
+        };
+
+        let response = self
+            .http_client()
+            .post(format!("{}/chat/completions", self.base_url))
+            .header("Authorization", format!("Bearer {credential}"))
+            .json(&native_request)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            return Err(super::api_error("OpenAI", response).await);
+        }
+
+        let native_response: NativeChatResponse = response.json().await?;
+        let usage = native_response.usage.map(OpenAiUsage::into_reported);
+        let message = native_response
+            .choices
+            .into_iter()
+            .next()
+            .map(|c| c.message)
+            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
+        let response = Self::parse_native_response(message);
+        let tokens_used = usage.unwrap_or_else(|| {
+            let chars = response.text.as_deref().unwrap_or("").chars().count()
+                + response.reasoning_content.as_deref().unwrap_or("").chars().count();
+            let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+            accumulator.finish_or_estimate_completion_chars(chars)
+        });
+        Ok((response, tokens_used))
+    }
+
     fn http_client(&self) -> Client {
         crate::config::build_runtime_proxy_client_with_timeouts("provider.openai", 120, 10)
             .map_err(|e| {
@@ -312,6 +395,8 @@ impl OpenAiProvider {
 struct StreamSseResponse {
     #[serde(default)]
     choices: Vec<StreamSseChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -370,6 +455,7 @@ struct OpenAiSseEvent {
     reasoning: Option<String>,
     tool_call_deltas: Vec<StreamSseToolCall>,
     finish_reason: Option<String>,
+    usage: Option<TokenUsage>,
     done_sentinel: bool,
 }
 
@@ -392,12 +478,17 @@ fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
     }
 
     let parsed: StreamSseResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
+    let usage = parsed.usage.map(OpenAiUsage::into_reported);
     let Some(choice) = parsed.choices.into_iter().next() else {
-        return Ok(None);
+        return Ok(usage.map(|usage| OpenAiSseEvent {
+            usage: Some(usage),
+            ..OpenAiSseEvent::default()
+        }));
     };
 
     let mut event = OpenAiSseEvent {
         finish_reason: choice.finish_reason,
+        usage,
         ..OpenAiSseEvent::default()
     };
     event.content = choice.delta.content.filter(|c| !c.is_empty());
@@ -604,40 +695,36 @@ impl Provider for OpenAiProvider {
         model: &str,
         temperature: f64,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let credential = self
-            .credential
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("OpenAI API key not set. Set OPENAI_API_KEY or edit config.toml."))?;
+        self.chat_metered(request, model, temperature)
+            .await
+            .map(|(response, _)| response)
+    }
 
-        let tools = Self::convert_tools(request.tools);
-        let native_request = NativeChatRequest {
-            model: model.to_string(),
-            messages: Self::convert_messages(request.messages),
-            temperature,
-            tool_choice: tools.as_ref().map(|_| "auto".to_string()),
-            tools,
-        };
-
-        let response = self
-            .http_client()
-            .post(format!("{}/chat/completions", self.base_url))
-            .header("Authorization", format!("Bearer {credential}"))
-            .json(&native_request)
-            .send()
-            .await?;
-
-        if !response.status().is_success() {
-            return Err(super::api_error("OpenAI", response).await);
-        }
-
-        let native_response: NativeChatResponse = response.json().await?;
-        let message = native_response
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| anyhow::anyhow!("No response from OpenAI"))?;
-        Ok(Self::parse_native_response(message))
+    async fn chat_traced(
+        &self,
+        request: ProviderChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (response, tokens_used) = self.chat_metered(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "openai".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "openai".to_string(),
+            final_model: model.to_string(),
+            tokens_used,
+        })
     }
 
     fn supports_native_tools(&self) -> bool {
@@ -742,19 +829,12 @@ impl Provider for OpenAiProvider {
         let url = format!("{}/chat/completions", self.base_url);
         let client = self.http_client();
 
-        #[derive(Serialize)]
-        struct StreamingChatRequest {
-            model: String,
-            messages: Vec<NativeMessage>,
-            temperature: f64,
-            stream: bool,
-        }
-
         let request_body = StreamingChatRequest {
             model: model.to_string(),
             messages: native_messages,
             temperature,
             stream: true,
+            stream_options: StreamUsageOptions { include_usage: true },
         };
 
         let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamChunk>>(64);
@@ -781,8 +861,10 @@ impl Provider for OpenAiProvider {
             }
 
             let mut tool_buf: Vec<ToolCallBuffer> = Vec::new();
+            let mut usage_seen = false;
             let mut byte_stream = response.bytes_stream();
             let mut text_buf = String::new();
+            let mut completion_chars: usize = 0;
             let mut sent_final = false;
             let mut saw_sse_event = false;
             let mut saw_non_sse_line = false;
@@ -824,9 +906,21 @@ impl Provider for OpenAiProvider {
                     saw_sse_event = true;
 
                     if event.done_sentinel {
+                        if !usage_seen && completion_chars > 0 {
+                            let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                            let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+                            let _ = tx.send(Ok(StreamChunk::usage(usage))).await;
+                        }
                         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                         sent_final = true;
                         break 'outer;
+                    }
+
+                    if let Some(usage) = event.usage {
+                        usage_seen = true;
+                        if tx.send(Ok(StreamChunk::usage(usage))).await.is_err() {
+                            return;
+                        }
                     }
 
                     if !event.tool_call_deltas.is_empty() {
@@ -838,6 +932,7 @@ impl Provider for OpenAiProvider {
                     }
 
                     if let Some(content) = event.content {
+                        completion_chars = completion_chars.saturating_add(content.chars().count());
                         let mut chunk = StreamChunk::delta(content);
                         if options.count_tokens {
                             chunk = chunk.with_token_estimate();
@@ -847,6 +942,7 @@ impl Provider for OpenAiProvider {
                         }
                     }
                     if let Some(reasoning) = event.reasoning {
+                        completion_chars = completion_chars.saturating_add(reasoning.chars().count());
                         let mut chunk = StreamChunk::reasoning_delta(reasoning);
                         if options.count_tokens {
                             chunk = chunk.with_token_estimate();
@@ -864,12 +960,9 @@ impl Provider for OpenAiProvider {
                                 return;
                             }
                         }
-                        // finish_reason==stop|length|content_filter|tool_calls all
-                        // close the turn. We emit `final_chunk` to be safe even
-                        // when the server forgets `[DONE]`.
-                        let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
-                        sent_final = true;
-                        break 'outer;
+                        // With stream_options.include_usage, OpenAI sends a
+                        // final usage-only chunk after finish_reason and before
+                        // [DONE]. Keep reading so that chunk is not skipped.
                     }
                 }
             }
@@ -905,6 +998,11 @@ impl Provider for OpenAiProvider {
                     if !calls.is_empty() {
                         let _ = tx.send(Ok(StreamChunk::tool_call_chunk(calls))).await;
                     }
+                }
+                if !usage_seen && completion_chars > 0 {
+                    let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                    let usage = accumulator.finish_or_estimate_completion_chars(completion_chars);
+                    let _ = tx.send(Ok(StreamChunk::usage(usage))).await;
                 }
                 let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
             }
@@ -1107,6 +1205,21 @@ mod tests {
         assert_eq!(chat_resp.reasoning_content, None);
     }
 
+    #[test]
+    fn openai_non_streaming_response_usage_maps_reported() {
+        let json = r#"{
+            "choices":[{"message":{"content":"Real answer"}}],
+            "usage":{"prompt_tokens":30,"completion_tokens":7,"total_tokens":37}
+        }"#;
+        let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
+        let usage = resp.usage.expect("usage expected").into_reported();
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(30));
+        assert_eq!(usage.completion_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(37));
+    }
+
     #[tokio::test]
     async fn chat_with_tools_fails_without_key() {
         let p = OpenAiProvider::new(None);
@@ -1200,6 +1313,20 @@ mod tests {
         let line = r#"data: {"choices":[{"delta":{"content":"hello"}}]}"#;
         let ev = parse_openai_sse_line(line).unwrap().expect("event");
         assert_eq!(ev.content.as_deref(), Some("hello"));
+        assert!(ev.tool_call_deltas.is_empty());
+    }
+
+    #[test]
+    fn openai_sse_line_parses_final_usage_chunk() {
+        let line = r#"data: {"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17}}"#;
+        let ev = parse_openai_sse_line(line).unwrap().expect("usage event");
+        let usage = ev.usage.expect("usage must be surfaced");
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(5));
+        assert_eq!(usage.total_tokens, Some(17));
+        assert!(ev.content.is_none());
         assert!(ev.tool_call_deltas.is_empty());
     }
 

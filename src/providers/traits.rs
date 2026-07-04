@@ -653,13 +653,13 @@ pub trait Provider: Send + Sync {
         temperature: f64,
     ) -> anyhow::Result<(ChatResponse, ProviderExecutionOutcome)> {
         let started_at = chrono::Utc::now();
-        match self.chat(request, decision.effective_model(), temperature).await {
-            Ok(response) => Ok((
-                response,
-                ProviderExecutionOutcome::success_for_decision(decision, started_at),
-            )),
-            Err(error) => Err(error),
-        }
+        let trace = self
+            .chat_traced(request, decision.effective_model(), temperature)
+            .await?;
+        Ok((
+            trace.response,
+            ProviderExecutionOutcome::success_for_decision_with_usage(decision, started_at, trace.tokens_used),
+        ))
     }
 
     /// Whether provider supports native tool calls over API.
