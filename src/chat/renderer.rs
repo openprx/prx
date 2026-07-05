@@ -468,7 +468,7 @@ fn render_inline_markdown(line: &str) -> Cow<'_, str> {
         } else if let Some(after) = rest.strip_prefix('*') {
             if let Some(rel_end) = after.find('*') {
                 let body = &after[..rel_end];
-                if !body.is_empty() {
+                if emphasis_body_has_valid_flanks(body) {
                     result.push_str("\x1b[3m");
                     result.push_str(body);
                     result.push_str("\x1b[0m");
@@ -480,7 +480,10 @@ fn render_inline_markdown(line: &str) -> Cow<'_, str> {
             && let Some(rel_end) = after.find('_')
         {
             let body = &after[..rel_end];
-            if !body.is_empty() {
+            let closing_idx = idx.saturating_add(1).saturating_add(rel_end);
+            if emphasis_body_has_valid_flanks(body)
+                && underscore_emphasis_has_word_boundaries(line, idx, closing_idx.saturating_add(1))
+            {
                 result.push_str("\x1b[3m");
                 result.push_str(body);
                 result.push_str("\x1b[0m");
@@ -497,6 +500,21 @@ fn render_inline_markdown(line: &str) -> Cow<'_, str> {
     }
 
     Cow::Owned(result)
+}
+
+fn emphasis_body_has_valid_flanks(body: &str) -> bool {
+    body.chars().next().is_some_and(|ch| !ch.is_whitespace())
+        && body.chars().next_back().is_some_and(|ch| !ch.is_whitespace())
+}
+
+fn is_inline_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn underscore_emphasis_has_word_boundaries(line: &str, opening_idx: usize, after_closing_idx: usize) -> bool {
+    let before = line[..opening_idx].chars().next_back();
+    let after = line[after_closing_idx..].chars().next();
+    !before.is_some_and(is_inline_word_char) && !after.is_some_and(is_inline_word_char)
 }
 
 /// Calculate the display width of a string, accounting for CJK characters.
@@ -600,6 +618,26 @@ mod tests {
             "underscore italic missing: {result:?}"
         );
         assert!(result.contains("\x1b[33mcode\x1b[0m"), "code missing: {result:?}");
+    }
+
+    #[test]
+    fn inline_italic_requires_non_whitespace_flanks() {
+        for line in ["width * height * depth", "* item", "multiply by * factor * here"] {
+            let result = render_inline_markdown(line);
+            assert!(
+                !result.contains("\x1b[3m"),
+                "line must not render accidental italic emphasis: {line:?} -> {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_underscore_italic_requires_word_boundaries() {
+        let result = render_inline_markdown("snake_case_name");
+        assert!(
+            !result.contains("\x1b[3m"),
+            "snake_case_name must not render accidental underscore emphasis: {result:?}"
+        );
     }
 
     #[test]

@@ -2692,8 +2692,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // 会话：SessionLoaded 重建 history + 可能要求 UI 重置；SessionSaved/Switched 不影响 UI
         Action::SessionLoaded(_) => true,
         Action::SessionSaved { .. } | Action::SessionSwitched { .. } => false,
-        // Record* 写 session.turns / history，不直接进 conversation_lines（那是
-        // ToolStarted/StreamCompleted 等单独处理），UI 不变.
+        // Record*/compaction writes session.turns/history only. User-visible
+        // compaction feedback is `SystemMessageAdded`; budget UI refresh is
+        // `ContextWindowUpdated`, so the history patch itself is not snapshot-dirty.
         Action::RecordUserTurn(_)
         | Action::RecordAssistantTurn(_)
         | Action::RecordSystemMessage { .. }
@@ -3154,6 +3155,29 @@ mod tests {
             state.ui.input.text(),
             "draft",
             "matching Alt+Enter must not insert a newline"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn alt_enter_without_strip_selection_falls_through_to_newline_insert() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.input.set_text("a");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.input.text(), "a\nb");
+        assert!(
+            state.ui.conversation_lines.is_empty(),
+            "no strip selection means Alt+Enter falls through to input, not session gone"
         );
     }
 

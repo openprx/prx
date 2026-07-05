@@ -1278,6 +1278,52 @@ mod tests {
     }
 
     #[test]
+    fn token_usage_deserializes_legacy_json_without_cache_fields() {
+        let decoded: TokenUsage = serde_json::from_str(
+            r#"{
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "source": "reported"
+            }"#,
+        )
+        .expect("legacy token usage should deserialize");
+
+        assert_eq!(decoded.prompt_tokens, Some(10));
+        assert_eq!(decoded.completion_tokens, Some(5));
+        assert_eq!(decoded.total_tokens, Some(15));
+        assert_eq!(decoded.cache_creation_input_tokens, None);
+        assert_eq!(decoded.cache_read_input_tokens, None);
+        assert_eq!(decoded.source, TokenUsageSource::Reported);
+    }
+
+    #[test]
+    fn metered_usage_record_deserializes_legacy_json_without_cache_fields() {
+        let decoded: MeteredTokenUsageRecord = serde_json::from_str(
+            r#"{
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "source": "reported",
+                "cost_usd": 0.001
+            }"#,
+        )
+        .expect("legacy metered usage record should deserialize");
+
+        assert_eq!(decoded.provider, "anthropic");
+        assert_eq!(decoded.model, "claude-sonnet");
+        assert_eq!(decoded.prompt_tokens, 100);
+        assert_eq!(decoded.completion_tokens, 20);
+        assert_eq!(decoded.total_tokens, 120);
+        assert_eq!(decoded.cache_creation_input_tokens, 0);
+        assert_eq!(decoded.cache_read_input_tokens, 0);
+        assert_eq!(decoded.source, TokenUsageSource::Reported);
+        assert_eq!(decoded.cost_usd, Some(0.001));
+    }
+
+    #[test]
     fn metered_usage_cost_prices_anthropic_cache_tokens_separately() {
         let usage = TokenUsage::reported_with_cache(Some(1_500), Some(200), Some(1_700), Some(300), Some(700));
         let record = MeteredTokenUsageRecord::from_parts(

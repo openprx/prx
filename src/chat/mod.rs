@@ -424,6 +424,45 @@ fn format_compact_feedback(
     }
 }
 
+fn manual_compact_below_trigger_threshold(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> bool {
+    !crate::agent::loop_::plan_context_budget(
+        history,
+        compaction_config,
+        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+    )
+    .over_hard_limit
+}
+
+fn format_nothing_to_compact_feedback(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> String {
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    let turns = history.len().saturating_sub(system_count);
+    let tokens = estimate_chat_history_tokens(history);
+    let window = format_compact_token_count(compaction_config.max_context_tokens);
+    format!("Nothing to compact: {turns} turns / ~{tokens} tokens / {window} window.")
+}
+
+fn format_compact_feedback_after_history(
+    turns_before: usize,
+    tokens_before: usize,
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> String {
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    format_compact_feedback(
+        turns_before,
+        history.len().saturating_sub(system_count),
+        tokens_before,
+        estimate_chat_history_tokens(history),
+        compaction_config.max_context_tokens,
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct TuiContextBudgetStatus {
     used_context_tokens: usize,
@@ -840,6 +879,21 @@ fn compact_child_completion_summary(text: &str) -> String {
         return String::new();
     };
     clamp_chars(line, CHILD_COMPLETION_SUMMARY_MAX_CHARS)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_sessions_cache_and_clear_stale_strip_selection(
+    mirror: &mut tui::TuiState,
+    entries: Vec<crate::chat::sessions::SwitcherEntry>,
+) -> bool {
+    let stale_strip_selection = mirror
+        .strip_selection
+        .is_some_and(|selected| !entries.iter().any(|entry| entry.seq == selected));
+    mirror.sessions_cache = entries;
+    if stale_strip_selection {
+        mirror.strip_selection = None;
+    }
+    stale_strip_selection
 }
 
 fn is_useful_completion_line(line: &str) -> bool {
@@ -1267,6 +1321,53 @@ mod runtime_display_tests {
         }
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn switcher_entry(seq: u64) -> crate::chat::sessions::SwitcherEntry {
+        crate::chat::sessions::SwitcherEntry {
+            seq,
+            kind: ManagedKind::Agent.as_str(),
+            origin: SessionOrigin::User.as_str(),
+            status: ManagedStatus::Running.as_str(),
+            title: format!("session {seq}"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_tick_helper_clears_reaped_strip_selection() {
+        let mut mirror = tui::TuiState::new("provider", "model");
+        mirror.strip_selection = Some(9);
+
+        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, vec![switcher_entry(1)]);
+
+        assert!(
+            stale,
+            "missing selected seq should request StripSelectionChanged dispatch"
+        );
+        assert_eq!(mirror.strip_selection, None);
+        assert_eq!(mirror.sessions_cache.len(), 1);
+        assert_eq!(mirror.sessions_cache.first().map(|entry| entry.seq), Some(1));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_tick_helper_keeps_live_strip_selection() {
+        let mut mirror = tui::TuiState::new("provider", "model");
+        mirror.strip_selection = Some(2);
+
+        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(
+            &mut mirror,
+            vec![switcher_entry(1), switcher_entry(2)],
+        );
+
+        assert!(!stale);
+        assert_eq!(mirror.strip_selection, Some(2));
+    }
+
     #[test]
     fn sessions_list_rows_include_elapsed() {
         let view = ManagedSessionView {
@@ -1574,6 +1675,55 @@ mod compact_command_tests {
         assert!(
             text.contains("reclaimed ~6000 tokens (60%)"),
             "reclaim delta missing: {text}"
+        );
+    }
+
+    #[test]
+    fn compact_command_below_trigger_threshold_reports_noop() {
+        let config = crate::config::AgentCompactionConfig {
+            reserve_tokens: 10,
+            max_context_tokens: 10_000,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![ChatMessage::system("sys"), ChatMessage::user("short prompt")];
+
+        assert!(
+            manual_compact_below_trigger_threshold(&history, &config),
+            "short history should not fall through to deterministic /compact trimming"
+        );
+        let feedback = format_nothing_to_compact_feedback(&history, &config);
+        assert!(feedback.contains("Nothing to compact"), "{feedback}");
+        assert!(feedback.contains("1 turns"), "{feedback}");
+    }
+
+    #[test]
+    fn legacy_preflight_compaction_feedback_emits_system_message() {
+        let config = crate::config::AgentCompactionConfig {
+            reserve_tokens: 10,
+            max_context_tokens: 10_000,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..(COMPACT_KEEP_MESSAGES + 4) {
+            history.push(long_user(i));
+        }
+        let system_count = usize::from(history.first().is_some_and(|message| message.role == "system"));
+        let turns_before = history.len().saturating_sub(system_count);
+        let tokens_before = estimate_chat_history_tokens(&history);
+        compact_chat_history(&mut history);
+        let text = format_compact_feedback_after_history(turns_before, tokens_before, &history, &config);
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+
+        surface_session_message(&dispatcher, None, &text);
+
+        let action = action_rx
+            .try_recv()
+            .expect("legacy preflight feedback should dispatch a system message");
+        assert!(
+            matches!(action, crate::chat::action::Action::SystemMessageAdded { text: ref actual } if actual == &text),
+            "unexpected feedback action: {action:?}"
         );
     }
 
@@ -3662,16 +3812,9 @@ pub async fn run(
                     }
                     let stale_strip_selection = {
                         let mut mirror = chat_mirror.lock();
-                        mirror.sessions_cache = entries.clone();
-                        let stale = mirror
-                            .strip_selection
-                            .filter(|selected| !entries.iter().any(|entry| entry.seq == *selected));
-                        if stale.is_some() {
-                            mirror.strip_selection = None;
-                        }
-                        stale
+                        refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, entries.clone())
                     };
-                    if stale_strip_selection.is_some() {
+                    if stale_strip_selection {
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::StripSelectionChanged { selected: None },
                             "chat.strip_selection_reaped",
@@ -4129,6 +4272,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &config.router,
                 &config.model_routes,
             );
+            if manual_compact_below_trigger_threshold(&history, &compact_context.config) {
+                emit_chat_output(&format_nothing_to_compact_feedback(&history, &compact_context.config));
+                continue;
+            }
             emit_chat_output("Compacting conversation...");
             let mut compact_source_history = Vec::with_capacity(
                 chat_session
@@ -4172,8 +4319,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     "chat.history_compacted_manual",
                 );
             }
-            let turns_after = history.len().saturating_sub(system_count);
-            let tokens_after = estimate_chat_history_tokens(&history);
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
@@ -4183,13 +4328,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &chat_dispatcher,
             );
 
-            let msg = format_compact_feedback(
-                turns_before,
-                turns_after,
-                tokens_before,
-                tokens_after,
-                compact_context.config.max_context_tokens,
-            );
+            let msg =
+                format_compact_feedback_after_history(turns_before, tokens_before, &history, &compact_context.config);
             emit_chat_output(&msg);
             continue;
         }
@@ -5987,8 +6127,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     "chat.history_compacted_preflight",
                 );
             }
-            let turns_after = history.len().saturating_sub(system_count);
-            let tokens_after = estimate_chat_history_tokens(&history);
             #[cfg(feature = "terminal-tui")]
             refresh_context_budget_for_tui(
                 &history,
@@ -5997,12 +6135,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &chat_mirror,
                 &chat_dispatcher,
             );
-            let compact_msg = format_compact_feedback(
+            let compact_msg = format_compact_feedback_after_history(
                 turns_before,
-                turns_after,
                 tokens_before,
-                tokens_after,
-                effective_compaction.config.max_context_tokens,
+                &history,
+                &effective_compaction.config,
             );
             surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
             tracing::warn!(

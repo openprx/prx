@@ -1484,7 +1484,8 @@ async fn send_redux_compaction_feedback(
     history: &[crate::providers::traits::ChatMessage],
     config: &crate::config::AgentCompactionConfig,
     context: &'static str,
-) -> Result<(), ()> {
+    last_feedback: &mut Option<String>,
+) -> Result<bool, ()> {
     let turns_after = chat_history_turn_count(history);
     let tokens_after = super::estimate_chat_history_tokens(history);
     let text = super::format_compact_feedback(
@@ -1494,8 +1495,33 @@ async fn send_redux_compaction_feedback(
         tokens_after,
         config.max_context_tokens,
     );
-    if let Err(error) = action_tx.send(Action::SystemMessageAdded { text }).await {
+    if last_feedback.as_deref() == Some(text.as_str()) {
+        return Ok(false);
+    }
+    if let Err(error) = action_tx.send(Action::SystemMessageAdded { text: text.clone() }).await {
         tracing::debug!(%error, context, "StartTurn: action_tx closed on compaction feedback");
+        return Err(());
+    }
+    *last_feedback = Some(text);
+    Ok(true)
+}
+
+async fn send_redux_context_window_update(
+    action_tx: &mpsc::Sender<Action>,
+    history: &[crate::providers::traits::ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    context: &'static str,
+) -> Result<(), ()> {
+    let budget =
+        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    if let Err(error) = action_tx
+        .send(Action::ContextWindowUpdated {
+            used_context_tokens: Some(budget.used_tokens),
+            max_context_tokens: Some(budget.max_context_tokens),
+        })
+        .await
+    {
+        tracing::debug!(%error, context, "StartTurn: action_tx closed on context-window update");
         return Err(());
     }
     Ok(())
@@ -1559,6 +1585,7 @@ async fn drive_start_turn_stream(
     let mut usage_accumulator = ProviderUsageAccumulator::new();
     let mut iteration: usize = 0;
     let mut overflow_retries: u8 = 0;
+    let mut last_compaction_feedback: Option<String> = None;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
     let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // BUG-03: count how many times each unrecoverable tool-failure signature has
@@ -1633,6 +1660,17 @@ async fn drive_start_turn_stream(
                         "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
                 }
+                if send_redux_context_window_update(
+                    &action_tx,
+                    &history,
+                    config,
+                    "redux_preflight_context_window_updated",
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
                 if send_redux_compaction_feedback(
                     &action_tx,
                     turns_before,
@@ -1640,6 +1678,7 @@ async fn drive_start_turn_stream(
                     &history,
                     config,
                     "redux_preflight_compaction_feedback",
+                    &mut last_compaction_feedback,
                 )
                 .await
                 .is_err()
@@ -1747,19 +1786,32 @@ async fn drive_start_turn_stream(
                         }
                     }
                 }
-                if let Some((turns_before, tokens_before, config)) = compaction_feedback_before
-                    && send_redux_compaction_feedback(
+                if let Some((turns_before, tokens_before, config)) = compaction_feedback_before {
+                    if send_redux_context_window_update(
+                        &action_tx,
+                        &history,
+                        &config,
+                        "redux_overflow_context_window_updated",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    if send_redux_compaction_feedback(
                         &action_tx,
                         turns_before,
                         tokens_before,
                         &history,
                         &config,
                         "redux_overflow_compaction_feedback",
+                        &mut last_compaction_feedback,
                     )
                     .await
                     .is_err()
-                {
-                    return;
+                    {
+                        return;
+                    }
                 }
                 // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
                 iteration = iteration.saturating_sub(1);
@@ -3308,6 +3360,55 @@ mod tests {
             !e2.iter()
                 .any(|e| matches!(e, crate::chat::state::Effect::RequestRedraw)),
             "version=2 chunk (lower than 5) should be discarded by strict-monotonic reducer"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_compaction_feedback_dedupes_same_state_until_changed() {
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let config = crate::config::AgentCompactionConfig {
+            max_context_tokens: 1_000,
+            reserve_tokens: 10,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![
+            crate::providers::traits::ChatMessage::system("sys"),
+            crate::providers::traits::ChatMessage::user("same state"),
+        ];
+        let changed_history = vec![
+            crate::providers::traits::ChatMessage::system("sys"),
+            crate::providers::traits::ChatMessage::user("changed state"),
+            crate::providers::traits::ChatMessage::assistant("summary"),
+        ];
+        let mut last_feedback = None;
+
+        assert!(
+            send_redux_compaction_feedback(&action_tx, 1, 20, &history, &config, "test", &mut last_feedback)
+                .await
+                .expect("first feedback send"),
+            "first feedback should be emitted"
+        );
+        assert!(
+            !send_redux_compaction_feedback(&action_tx, 1, 20, &history, &config, "test", &mut last_feedback)
+                .await
+                .expect("duplicate feedback send"),
+            "identical feedback should be suppressed"
+        );
+        assert!(
+            send_redux_compaction_feedback(&action_tx, 2, 40, &changed_history, &config, "test", &mut last_feedback,)
+                .await
+                .expect("changed feedback send"),
+            "changed state should emit another feedback"
+        );
+
+        let sent = action_rx.try_recv().expect("first feedback action should be queued");
+        assert!(matches!(sent, Action::SystemMessageAdded { .. }));
+        let sent = action_rx.try_recv().expect("changed feedback action should be queued");
+        assert!(matches!(sent, Action::SystemMessageAdded { .. }));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "duplicate feedback must not queue an action"
         );
     }
 
@@ -7354,6 +7455,8 @@ mod real_mode_tests {
             .await;
 
         let mut saw_summary_patch = false;
+        let mut saw_feedback = false;
+        let mut saw_context_update = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
                 .await
@@ -7373,6 +7476,24 @@ mod real_mode_tests {
                 Action::HistoryCompacted { .. } => {
                     panic!("preflight summary path must not dispatch lossy HistoryCompacted");
                 }
+                Action::ContextWindowUpdated {
+                    used_context_tokens: Some(used),
+                    max_context_tokens: Some(max),
+                } => {
+                    saw_context_update = true;
+                    assert_eq!(max, 160);
+                    assert!(
+                        used <= 150,
+                        "context window update must reflect compacted budget: {used}"
+                    );
+                }
+                Action::SystemMessageAdded { text } => {
+                    saw_feedback = true;
+                    assert!(
+                        text.contains("Compacted context") || text.contains("Context already compact"),
+                        "preflight feedback should describe compaction result: {text}"
+                    );
+                }
                 Action::StreamCompleted { final_text, .. } => {
                     assert!(final_text.contains("budget-ok"));
                     break;
@@ -7382,6 +7503,11 @@ mod real_mode_tests {
             }
         }
         assert!(saw_summary_patch, "preflight must dispatch exact summary patch");
+        assert!(saw_feedback, "preflight must dispatch user-visible compact feedback");
+        assert!(
+            saw_context_update,
+            "preflight must update context-window UI metadata after compaction"
+        );
         assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
         let captured = first_history.lock().clone().expect("first stream history");
         assert!(
@@ -8786,6 +8912,8 @@ mod real_mode_tests {
             .await;
 
         let mut saw_summary_patch = false;
+        let mut saw_feedback = false;
+        let mut saw_context_update = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
                 .await
@@ -8805,6 +8933,24 @@ mod real_mode_tests {
                 Action::HistoryCompacted { .. } => {
                     panic!("overflow retry with config must not use lossy HistoryCompacted");
                 }
+                Action::ContextWindowUpdated {
+                    used_context_tokens: Some(used),
+                    max_context_tokens: Some(max),
+                } => {
+                    saw_context_update = true;
+                    assert_eq!(max, 400);
+                    assert!(
+                        used <= 390,
+                        "overflow context window update should use compacted history: {used}"
+                    );
+                }
+                Action::SystemMessageAdded { text } => {
+                    saw_feedback = true;
+                    assert!(
+                        text.contains("Compacted context") || text.contains("Context already compact"),
+                        "overflow feedback should describe compaction result: {text}"
+                    );
+                }
                 Action::StreamCompleted { final_text, .. } => {
                     assert!(final_text.contains("summary-retry-ok"));
                     break;
@@ -8815,6 +8961,14 @@ mod real_mode_tests {
         }
 
         assert!(saw_summary_patch, "overflow retry must dispatch exact summary patch");
+        assert!(
+            saw_feedback,
+            "overflow retry must dispatch user-visible compact feedback"
+        );
+        assert!(
+            saw_context_update,
+            "overflow retry must update context-window UI metadata after mid-turn compaction"
+        );
         assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             stream_calls.load(AtomicOrdering::SeqCst),
