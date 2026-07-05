@@ -69,9 +69,9 @@ pub mod tui;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
-    apply_compaction_patch_exact, build_configurable_compaction_patch, build_context_with_shared_events_and_scope,
-    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, measure_history_tokens,
-    run_tool_call_loop_traced, select_prompt_skills,
+    apply_compaction_patch_exact, build_configurable_compaction_patch_with_source_history,
+    build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
+    is_tool_loop_cancelled, measure_history_tokens, run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -477,7 +477,8 @@ fn refresh_context_budget_for_tui(
 }
 
 async fn build_chat_compaction_patch_with_timeout(
-    history: &[ChatMessage],
+    budget_history: &[ChatMessage],
+    source_history: &[ChatMessage],
     provider: &dyn Provider,
     model: &str,
     config: &crate::config::AgentCompactionConfig,
@@ -487,7 +488,15 @@ async fn build_chat_compaction_patch_with_timeout(
 ) -> Option<crate::agent::loop_::CompactionPatch> {
     match tokio::time::timeout(
         timeout_duration,
-        build_configurable_compaction_patch(history, provider, model, config, audit, trigger),
+        build_configurable_compaction_patch_with_source_history(
+            budget_history,
+            source_history,
+            provider,
+            model,
+            config,
+            audit,
+            trigger,
+        ),
     )
     .await
     {
@@ -509,13 +518,20 @@ async fn build_chat_compaction_patch_with_timeout(
 
 fn apply_chat_compaction_patch_and_sync(
     history: &mut Vec<ChatMessage>,
+    patch_source_history: Option<&[ChatMessage]>,
     patch: crate::agent::loop_::CompactionPatch,
     config: &crate::config::AgentCompactionConfig,
     reason: crate::chat::action::CompactReason,
     chat_dispatcher: &dispatcher::ChatDispatcher,
 ) {
     let replacement_len = patch.replacement.len();
-    apply_compaction_patch_exact(history, &patch);
+    if let Some(source_history) = patch_source_history {
+        let mut source_history = source_history.to_vec();
+        apply_compaction_patch_exact(&mut source_history, &patch);
+        *history = source_history;
+    } else {
+        apply_compaction_patch_exact(history, &patch);
+    }
     let budget =
         crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
     if budget.over_hard_limit {
@@ -1577,6 +1593,24 @@ mod compact_command_tests {
         }
     }
 
+    struct ImmediateSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ImmediateSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(
+                "## Decisions\n- PERSISTED_GUARD_SUMMARY\n## Open TODOs\n- continue\n## Critical Context\n- persisted source"
+                    .to_string(),
+            )
+        }
+    }
+
     #[tokio::test]
     async fn configurable_summary_compaction_timeout_returns_none_for_fallback() {
         let config = crate::config::AgentCompactionConfig {
@@ -1597,6 +1631,7 @@ mod compact_command_tests {
 
         let patch = build_chat_compaction_patch_with_timeout(
             &history,
+            &history,
             &SlowSummaryProvider,
             "slow-model",
             &config,
@@ -1609,6 +1644,107 @@ mod compact_command_tests {
         assert!(
             patch.is_none(),
             "timeout must let caller fall back to deterministic trim"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 0,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let system_message = ChatMessage::system("sys");
+        let old_user_message = ChatMessage::user(format!("old persisted user {}", "u ".repeat(220)));
+        let old_assistant_message = ChatMessage::assistant(format!("old persisted assistant {}", "a ".repeat(220)));
+        let latest_user_message = ChatMessage::user("latest visible question");
+        let persisted_history = vec![
+            system_message.clone(),
+            old_user_message.clone(),
+            old_assistant_message.clone(),
+            latest_user_message,
+        ];
+        let enriched_history = vec![
+            system_message,
+            old_user_message,
+            old_assistant_message,
+            ChatMessage::assistant(format!("[tool:shell]\n{}", "tool output ".repeat(320))),
+            ChatMessage::user("[Memory context]\nlatest visible question"),
+        ];
+
+        let patch = build_chat_compaction_patch_with_timeout(
+            &enriched_history,
+            &persisted_history,
+            &ImmediateSummaryProvider,
+            "summary-model",
+            &config,
+            None,
+            "test_persisted_guard",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("budget-overflowing enriched history should produce a persisted-source patch");
+
+        assert!(
+            crate::agent::loop_::compaction_patch_guard_matches(&persisted_history, &patch.guard),
+            "patch guard must match the persisted reducer mirror"
+        );
+        assert!(
+            !crate::agent::loop_::compaction_patch_guard_matches(&enriched_history, &patch.guard),
+            "pre-fix enriched guard source would miss once tool/internal messages exist"
+        );
+
+        let mut legacy_history = enriched_history;
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        apply_chat_compaction_patch_and_sync(
+            &mut legacy_history,
+            Some(&persisted_history),
+            patch,
+            &config,
+            crate::chat::action::CompactReason::ContextOverflow,
+            &dispatcher,
+        );
+        let action = action_rx
+            .try_recv()
+            .expect("compaction helper should dispatch reducer patch");
+
+        let mut reducer_state = crate::chat::state::ChatState::new(
+            std::sync::Arc::from("provider"),
+            std::sync::Arc::from("model"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        reducer_state.session.history = persisted_history;
+        let _ = reducer_state.reduce(action);
+
+        let legacy_pairs: Vec<_> = legacy_history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        let reducer_pairs: Vec<_> = reducer_state
+            .session
+            .history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert_eq!(
+            legacy_pairs, reducer_pairs,
+            "legacy driver and reducer mirror must converge on the persisted-source compaction patch"
+        );
+        assert!(
+            legacy_history
+                .iter()
+                .any(|message| message.content.contains("PERSISTED_GUARD_SUMMARY")),
+            "provider summary should survive the reducer guard"
+        );
+        assert!(
+            legacy_history
+                .iter()
+                .all(|message| !message.content.contains("[tool:shell]")),
+            "persisted-source compaction must not keep enriched-only tool/internal messages"
         );
     }
 }
@@ -3993,11 +4129,23 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &config.router,
                 &config.model_routes,
             );
+            emit_chat_output("Compacting conversation...");
+            let mut compact_source_history = Vec::with_capacity(
+                chat_session
+                    .turns
+                    .len()
+                    .saturating_add(usize::from(!history.is_empty())),
+            );
+            if let Some(system) = history.first().filter(|message| message.role == "system") {
+                compact_source_history.push(system.clone());
+            }
+            compact_source_history.extend(session_turns_to_history(&chat_session));
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
             if let Some(patch) = build_chat_compaction_patch_with_timeout(
                 &history,
+                &compact_source_history,
                 provider.as_ref(),
                 model_name,
                 &compact_context.config,
@@ -4009,6 +4157,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             {
                 apply_chat_compaction_patch_and_sync(
                     &mut history,
+                    Some(&compact_source_history),
                     patch,
                     &compact_context.config,
                     crate::chat::action::CompactReason::Manual,
@@ -5811,6 +5960,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             let tokens_before = estimate_chat_history_tokens(&history);
             if let Some(patch) = build_chat_compaction_patch_with_timeout(
                 &history,
+                &persisted_history_for_turn,
                 provider.as_ref(),
                 model_name,
                 &effective_compaction.config,
@@ -5822,6 +5972,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             {
                 apply_chat_compaction_patch_and_sync(
                     &mut history,
+                    Some(&persisted_history_for_turn),
                     patch,
                     &effective_compaction.config,
                     crate::chat::action::CompactReason::ContextOverflow,
@@ -5976,6 +6127,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     let tokens_before = estimate_chat_history_tokens(&history);
                     if let Some(patch) = build_chat_compaction_patch_with_timeout(
                         &history,
+                        &persisted_history_for_turn,
                         provider.as_ref(),
                         model_name,
                         &effective_compaction.config,
@@ -5987,6 +6139,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     {
                         apply_chat_compaction_patch_and_sync(
                             &mut history,
+                            Some(&persisted_history_for_turn),
                             patch,
                             &effective_compaction.config,
                             crate::chat::action::CompactReason::ContextOverflow,
@@ -6000,16 +6153,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             "chat.history_compacted_overflow",
                         );
                         compact_chat_history(&mut history);
-                        persist_legacy_chat_compaction_audit(
-                            mem.as_ref(),
-                            &runtime_envelope,
-                            &audit_source_history,
-                            &summary_projection,
-                            token_metadata,
-                            "chat_context_overflow",
-                        )
-                        .await;
                     }
+                    persist_legacy_chat_compaction_audit(
+                        mem.as_ref(),
+                        &runtime_envelope,
+                        &audit_source_history,
+                        &summary_projection,
+                        token_metadata,
+                        "chat_context_overflow",
+                    )
+                    .await;
                     let turns_after = history
                         .len()
                         .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));

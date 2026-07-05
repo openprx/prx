@@ -1351,19 +1351,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<Option<CompactionPatch>> {
-    if budget_history.len() != source_history.len()
-        || budget_history
-            .iter()
-            .zip(source_history.iter())
-            .any(|(budget, source)| budget.role != source.role)
-    {
-        anyhow::bail!(
-            "compaction budget/source histories have different shapes: budget_len={} source_len={}",
-            budget_history.len(),
-            source_history.len()
-        );
-    }
-
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
     };
