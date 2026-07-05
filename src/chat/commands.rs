@@ -816,6 +816,8 @@ mod mode_tests {
     use async_trait::async_trait;
     use parking_lot::Mutex;
     use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
 
     struct TestTool;
 
@@ -835,6 +837,28 @@ mod mode_tests {
         fn was_forgotten(&self, key: &str) -> bool {
             self.forgotten.lock().contains(key)
         }
+    }
+
+    struct TestCwdGuard {
+        original: PathBuf,
+    }
+
+    impl Drop for TestCwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
+    fn export_session_body_in_unique_tempdir(session: &crate::chat::session::ChatSession, format: &str) -> String {
+        static EXPORT_TEST_CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let _lock = EXPORT_TEST_CWD_LOCK.get_or_init(|| Mutex::new(())).lock();
+        let tempdir = tempfile::tempdir().expect("test: temp export dir should be created");
+        let original = std::env::current_dir().expect("test: current dir should be readable");
+        std::env::set_current_dir(tempdir.path()).expect("test: temp export dir should become cwd");
+        let _cwd_guard = TestCwdGuard { original };
+
+        let path = super::export_session(session, format).expect("test: export should succeed");
+        std::fs::read_to_string(&path).expect("test: exported file should be readable")
     }
 
     fn test_entry(key: &str, category: MemoryCategory) -> MemoryEntry {
@@ -1229,9 +1253,7 @@ mod mode_tests {
         session.add_user_turn("EXPORT_USER_MSG_GAMMA");
         session.add_assistant_turn("EXPORT_ASSISTANT_MSG_DELTA", Vec::new());
 
-        let path = super::export_session(&session, "md").expect("test: export should succeed");
-        let body = std::fs::read_to_string(&path).expect("test: exported file should be readable");
-        let _ = std::fs::remove_file(&path);
+        let body = export_session_body_in_unique_tempdir(&session, "md");
 
         // Every turn body present (not just the Provider/Model/Date header).
         assert!(body.contains("EXPORT_USER_MSG_ALPHA"), "user turn 1 missing: {body}");
@@ -1252,9 +1274,7 @@ mod mode_tests {
         session.add_user_turn("JSON_USER_EPSILON");
         session.add_assistant_turn("JSON_ASSISTANT_ZETA", Vec::new());
 
-        let path = super::export_session(&session, "json").expect("test: json export should succeed");
-        let body = std::fs::read_to_string(&path).expect("test: exported json should be readable");
-        let _ = std::fs::remove_file(&path);
+        let body = export_session_body_in_unique_tempdir(&session, "json");
 
         assert!(body.contains("JSON_USER_EPSILON"));
         assert!(body.contains("JSON_ASSISTANT_ZETA"));
@@ -1279,9 +1299,7 @@ mod mode_tests {
                 cost_usd: Some(0.0105),
             });
 
-        let path = super::export_session(&session, "json").expect("test: json export should succeed");
-        let body = std::fs::read_to_string(&path).expect("test: exported json should be readable");
-        let _ = std::fs::remove_file(&path);
+        let body = export_session_body_in_unique_tempdir(&session, "json");
 
         let parsed = crate::chat::session::ChatSession::from_json(&body).expect("extra usage field must be ignored");
         assert_eq!(parsed.turn_count(), 2);
@@ -1342,9 +1360,7 @@ mod mode_tests {
                 cost_usd: None,
             });
 
-        let path = super::export_session(&session, "md").expect("test: md export should succeed");
-        let body = std::fs::read_to_string(&path).expect("test: exported md should be readable");
-        let _ = std::fs::remove_file(&path);
+        let body = export_session_body_in_unique_tempdir(&session, "md");
 
         assert!(
             body.contains("**Usage**: ~1.5k tok (real 0, est ~1.5k) | **Cost**: cost unknown"),
