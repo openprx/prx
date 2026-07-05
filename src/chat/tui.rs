@@ -371,6 +371,11 @@ pub const ARGS_PREVIEW_ELLIPSIS: &str = "…";
 /// ASCII fallback for the ellipsis when the terminal is in non-UTF-8 mode.
 pub const ARGS_PREVIEW_ELLIPSIS_ASCII: &str = "...";
 
+const TOOL_EXPANDED_OUTPUT_MAX_LINES: usize = 40;
+const TOOL_EXPANDED_OUTPUT_LINE_MAX_CHARS: usize = 240;
+const TOOL_ERROR_REASON_MAX_CHARS: usize = 120;
+const TOOL_ARG_VALUE_MAX_CHARS: usize = 80;
+
 /// Status of a tool call card.
 ///
 /// `Running` means the tool was invoked but no result has been received yet;
@@ -515,9 +520,6 @@ pub enum InputOutcome {
 ///
 /// - `Tab` — toggles the most recent foldable card (reasoning OR
 ///   tool-result, whichever appears later in the conversation).
-///   The folded reasoning summary itself hints `press Tab to
-///   expand`, so the user never has to learn a separate
-///   keybinding for thinking blocks.
 /// - `Ctrl+R` — reverse-searches submitted input history.
 /// - `Ctrl+X Ctrl+E` — opens the current draft in an external editor.
 /// - `Ctrl+C` — interrupt the current turn (caller cancels in-flight work)
@@ -2339,7 +2341,7 @@ impl TuiState {
         } else {
             ARGS_PREVIEW_ELLIPSIS
         };
-        let args_preview = build_args_preview(args_full, ARGS_PREVIEW_MAX_CHARS, preview_ellipsis);
+        let args_preview = build_tool_args_preview(tool_name, args_full, ARGS_PREVIEW_MAX_CHARS, preview_ellipsis);
         self.conversation_lines.push(ConversationLine::ToolResult {
             tool_name: tool_name.to_string(),
             args_preview,
@@ -2667,12 +2669,15 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
             if matches!(status, ToolStatus::Running) {
                 1
             } else if *folded {
-                // header + `⎿ Done (…)` summary row
+                // header + `⎿ ✓ metrics` summary row
                 2
             } else {
-                // header + first body row under hook + continuation rows
+                // header + input row + output/error label + bounded body rows
                 let body = result.as_deref().filter(|s| !s.is_empty()).unwrap_or(args_full);
-                1 + body.lines().count().max(1)
+                let body_line_count = body.lines().count();
+                let body_rows = body_line_count.clamp(1, TOOL_EXPANDED_OUTPUT_MAX_LINES);
+                let trunc_row = usize::from(body_line_count > TOOL_EXPANDED_OUTPUT_MAX_LINES);
+                3 + body_rows + trunc_row
             }
         }
         ConversationLine::Reasoning { folded, content, .. } => {
@@ -4056,15 +4061,11 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
 ///
 /// Folded layout (default):
 /// ```text
-/// ● Bash(ls /tmp)
-///   ⎿ Done (234ms · 12 lines)
+/// ✓ shell(command="ls /tmp")
+///   ⎿ ✓ 234ms · 12 lines · 1.4kB
 /// ```
-/// Expanded layout:
-/// ```text
-/// ● Bash(ls /tmp)
-///   ⎿ <result text, each line indented>
-/// ```
-/// While `Running` no follow-on row is shown — just the header `● Bash(ls /tmp)`.
+/// Expanded layout shows readable input plus bounded output/error rows. While
+/// `Running` no follow-on row is shown — just the header `● shell(...)`.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_result<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -4077,50 +4078,28 @@ fn render_tool_result<'a>(
     folded: bool,
     ascii: bool,
 ) {
-    let (bullet, hook) = tool_card_glyphs(ascii);
-    let bullet_color = tool_bullet_color(status);
-
-    // BUG-11: sub-agent tools get an enriched header that surfaces the child
-    // agent's identity (agent/model) and the delegated task summary, so nested
-    // delegation is visible from the parent TUI even without observer streaming.
-    let subagent_meta = if is_subagent_tool(tool_name) {
-        let meta = extract_subagent_meta(args_full, result);
-        if meta.is_empty() { None } else { Some(meta) }
+    let (_, hook) = tool_card_glyphs(ascii);
+    let (status_glyph, status_color) = tool_status_marker(status, ascii);
+    let preview_ellipsis = if ascii {
+        ARGS_PREVIEW_ELLIPSIS_ASCII
     } else {
-        None
+        ARGS_PREVIEW_ELLIPSIS
     };
-
-    if let Some(meta) = subagent_meta.as_ref() {
-        // Header: `🤖 delegate[agent/model] · <task>` (or ASCII `[bot]`). The
-        // robot glyph + bracketed identity reads as "this card is a sub-agent".
-        let robot = if ascii { "[bot]" } else { "\u{1F916}" }; // 🤖
-        let tag = subagent_identity_tag(meta);
-        let mut header_spans = vec![
-            Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
-            Span::raw(format!("{robot} {tool_name}[")),
-            Span::styled(tag, Style::default().fg(Color::Cyan)),
-            Span::raw("]"),
-        ];
-        if let Some(task) = meta.task.as_deref() {
-            header_spans.push(Span::styled(
-                format!(" \u{00B7} {task}"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.push(Line::from(header_spans));
+    let formatted_preview = build_tool_args_preview(tool_name, args_full, ARGS_PREVIEW_MAX_CHARS, preview_ellipsis);
+    let display_preview = if formatted_preview.is_empty() {
+        args_preview.to_string()
     } else {
-        // Header: `● Tool(args_preview)` — bullet colored by status, name+args in
-        // default foreground.
-        let preview = if args_preview.is_empty() {
-            tool_name.to_string()
-        } else {
-            format!("{tool_name}({args_preview})")
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!("{bullet} "), Style::default().fg(bullet_color)),
-            Span::raw(preview),
-        ]));
-    }
+        formatted_preview
+    };
+    let header = if display_preview.is_empty() {
+        tool_name.to_string()
+    } else {
+        format!("{tool_name}({display_preview})")
+    };
+    lines.push(Line::from(vec![
+        Span::styled(format!("{status_glyph} "), Style::default().fg(status_color)),
+        Span::raw(header),
+    ]));
 
     // No follow-on row while still running — just the header is shown so the
     // user sees an in-flight indicator. (The status bar / footer carry the
@@ -4130,73 +4109,358 @@ fn render_tool_result<'a>(
     }
 
     if folded {
-        // Folded follow-on: `  ⎿ Done (234ms · 12 lines)` summary in dim gray.
-        let result_text = result.unwrap_or("");
-        let line_count = if result_text.is_empty() {
-            0
-        } else {
-            result_text.lines().count()
-        };
-        let status_word = match status {
-            ToolStatus::Running => "Running",
-            ToolStatus::Done => "Done",
-            ToolStatus::Error => "Error",
-        };
-        let mut parts: Vec<String> = vec![status_word.to_string()];
-        if let Some(ms) = elapsed_ms {
-            parts.push(format!("{ms}ms"));
-        }
-        if line_count > 0 {
+        push_folded_tool_summary(lines, hook, status, elapsed_ms, result, ascii);
+        return;
+    }
+
+    push_expanded_tool_io(lines, hook, status, &display_preview, args_full, result, ascii);
+}
+
+fn push_folded_tool_summary<'a>(
+    lines: &mut Vec<Line<'a>>,
+    hook: &str,
+    status: ToolStatus,
+    elapsed_ms: Option<u64>,
+    result: Option<&str>,
+    ascii: bool,
+) {
+    let (status_glyph, status_color) = tool_status_marker(status, ascii);
+    let metrics_style = Style::default().fg(Color::DarkGray);
+    let result_text = result.unwrap_or("");
+    let metrics = match status {
+        ToolStatus::Done => {
+            let line_count = tool_result_line_count(result_text);
+            let byte_count = result_text.len();
+            let mut parts = Vec::new();
+            if let Some(ms) = elapsed_ms {
+                parts.push(format!("{ms}ms"));
+            }
             parts.push(format!(
                 "{line_count} {}",
                 if line_count == 1 { "line" } else { "lines" }
             ));
+            parts.push(format_bytes(byte_count));
+            parts.join(" \u{00B7} ")
         }
-        let summary = format!("  {hook} {}", parts.join(" \u{00B7} ")); // ·
-        lines.push(Line::from(Span::styled(summary, Style::default().fg(Color::DarkGray))));
+        ToolStatus::Error => {
+            let mut parts = Vec::new();
+            if let Some(ms) = elapsed_ms {
+                parts.push(format!("{ms}ms"));
+            }
+            parts.push(tool_error_reason(result_text, ascii));
+            parts.join(" \u{00B7} ")
+        }
+        ToolStatus::Running => String::new(),
+    };
+
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {hook} "), metrics_style),
+        Span::styled(status_glyph, Style::default().fg(status_color)),
+        Span::styled(format!(" {metrics}"), metrics_style),
+    ]));
+}
+
+fn push_expanded_tool_io<'a>(
+    lines: &mut Vec<Line<'a>>,
+    hook: &str,
+    status: ToolStatus,
+    display_preview: &str,
+    args_full: &str,
+    result: Option<&str>,
+    ascii: bool,
+) {
+    let input = if display_preview.is_empty() {
+        build_args_preview(
+            args_full,
+            ARGS_PREVIEW_MAX_CHARS,
+            if ascii {
+                ARGS_PREVIEW_ELLIPSIS_ASCII
+            } else {
+                ARGS_PREVIEW_ELLIPSIS
+            },
+        )
+    } else {
+        display_preview.to_string()
+    };
+    let body_style = Style::default().fg(Color::DarkGray);
+    lines.push(Line::from(Span::styled(format!("  {hook} input: {input}"), body_style)));
+
+    let label = if matches!(status, ToolStatus::Error) {
+        "error"
+    } else {
+        "output"
+    };
+    let label_color = if matches!(status, ToolStatus::Error) {
+        Color::Red
+    } else {
+        Color::DarkGray
+    };
+    lines.push(Line::from(Span::styled(
+        format!("    {label}:"),
+        Style::default().fg(label_color),
+    )));
+
+    let result_text = result.unwrap_or("");
+    if result_text.is_empty() {
+        lines.push(Line::from(Span::styled("    (empty)", body_style)));
         return;
     }
 
-    // Expanded follow-on: result body indented under the hook glyph.
-    if let Some(res) = result {
-        let mut iter = res.lines();
-        if let Some(first) = iter.next() {
-            lines.push(Line::from(Span::styled(
-                format!("  {hook} {first}"),
-                Style::default().fg(Color::DarkGray),
-            )));
-            for body in iter {
-                lines.push(Line::from(Span::styled(
-                    format!("    {body}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
-        }
+    let ellipsis = if ascii {
+        ARGS_PREVIEW_ELLIPSIS_ASCII
     } else {
-        // No result yet (Done with empty result, or Error with no payload).
-        // Fall back to args_full so the expanded view always has something.
-        let mut iter = args_full.lines();
-        if let Some(first) = iter.next() {
-            lines.push(Line::from(Span::styled(
-                format!("  {hook} {first}"),
-                Style::default().fg(Color::DarkGray),
-            )));
-            for body in iter {
-                lines.push(Line::from(Span::styled(
-                    format!("    {body}"),
-                    Style::default().fg(Color::DarkGray),
-                )));
-            }
+        ARGS_PREVIEW_ELLIPSIS
+    };
+    let result_lines = result_text.lines().collect::<Vec<_>>();
+    let total_lines = result_lines.len();
+    let total_bytes = result_text.len();
+    let mut shown_lines = 0usize;
+    let mut shown_bytes = 0usize;
+    let mut truncated = false;
+    for (idx, body) in result_lines.iter().take(TOOL_EXPANDED_OUTPUT_MAX_LINES).enumerate() {
+        let rendered = clamp_one_line(body, TOOL_EXPANDED_OUTPUT_LINE_MAX_CHARS, ellipsis);
+        let line_truncated = rendered.as_str() != *body;
+        truncated |= line_truncated;
+        shown_bytes = shown_bytes.saturating_add(if line_truncated { rendered.len() } else { body.len() });
+        if idx + 1 < total_lines {
+            shown_bytes = shown_bytes.saturating_add(1);
         }
+        shown_lines = shown_lines.saturating_add(1);
+        lines.push(Line::from(Span::styled(format!("    {rendered}"), body_style)));
     }
+    if total_lines > shown_lines || truncated {
+        let hidden_lines = total_lines.saturating_sub(shown_lines);
+        let hidden_bytes = total_bytes.saturating_sub(shown_bytes);
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {ellipsis} truncated: {hidden_lines} {} · {} hidden",
+                if hidden_lines == 1 { "line" } else { "lines" },
+                format_bytes(hidden_bytes)
+            ),
+            body_style,
+        )));
+    }
+}
+
+fn tool_result_line_count(result_text: &str) -> usize {
+    if result_text.is_empty() {
+        0
+    } else {
+        result_text.lines().count()
+    }
+}
+
+fn tool_error_reason(result_text: &str, ascii: bool) -> String {
+    let ellipsis = if ascii {
+        ARGS_PREVIEW_ELLIPSIS_ASCII
+    } else {
+        ARGS_PREVIEW_ELLIPSIS
+    };
+    let reason = result_text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("error");
+    clamp_one_line(reason, TOOL_ERROR_REASON_MAX_CHARS, ellipsis)
+}
+
+fn format_bytes(bytes: usize) -> String {
+    if bytes < 1_000 {
+        return format!("{bytes}B");
+    }
+    if bytes < 1_000_000 {
+        return format!("{:.1}kB", bytes as f64 / 1_000.0);
+    }
+    format!("{:.1}MB", bytes as f64 / 1_000_000.0)
+}
+
+fn build_tool_args_preview(tool_name: &str, raw: &str, max_chars: usize, ellipsis: &str) -> String {
+    let parsed = serde_json::from_str::<serde_json::Value>(raw);
+    let Ok(value) = parsed else {
+        return build_args_preview(raw, max_chars, ellipsis);
+    };
+    let Some(map) = value.as_object() else {
+        return clamp_one_line(&compact_json_value(&value), max_chars, ellipsis);
+    };
+
+    let preview = match tool_name {
+        "file_read" => format_file_read_preview(map),
+        "file_write" => format_file_write_preview(map),
+        "file_edit" => format_file_edit_preview(map),
+        "shell" => format_shell_preview(map),
+        "sessions_spawn" | "delegate" | "subagents" | "session_worker" | "nodes" => {
+            format_session_tool_preview(tool_name, map)
+        }
+        "web_fetch" | "http_request" | "web_search_tool" | "web_search" => format_web_preview(tool_name, map),
+        _ => None,
+    };
+    let preview = preview.unwrap_or_else(|| compact_json_value(&value));
+    clamp_one_line(&preview, max_chars, ellipsis)
+}
+
+fn format_file_read_preview(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let path = json_string_field(map, &["path", "file_path"])?;
+    let mut fields = vec![format!("path={path}")];
+    if let Some(limit) = json_display_field(map, &["max_bytes", "limit", "max_lines"]) {
+        fields.push(format!("limit={limit}"));
+    }
+    Some(fields.join(", "))
+}
+
+fn format_file_write_preview(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let path = json_string_field(map, &["path", "file_path"])?;
+    let bytes = map
+        .get("content")
+        .and_then(serde_json::Value::as_str)
+        .map(str::len)
+        .unwrap_or(0);
+    Some(format!("path={path}, bytes={}", format_bytes(bytes)))
+}
+
+fn format_file_edit_preview(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let path = json_string_field(map, &["path", "file_path"])?;
+    let mut fields = vec![format!("path={path}")];
+    if let Some(replace_all) = map.get("replace_all").and_then(serde_json::Value::as_bool)
+        && replace_all
+    {
+        fields.push("replace_all=true".to_string());
+    }
+    if let Some(old) = map.get("old_string").and_then(serde_json::Value::as_str) {
+        fields.push(format!("old_bytes={}", format_bytes(old.len())));
+    }
+    if let Some(new) = map.get("new_string").and_then(serde_json::Value::as_str) {
+        fields.push(format!("new_bytes={}", format_bytes(new.len())));
+    }
+    Some(fields.join(", "))
+}
+
+fn format_shell_preview(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let command = json_string_field(map, &["command", "cmd"])?;
+    let mut fields = vec![format!(
+        "command={}",
+        quoted_summary(&command, TOOL_ARG_VALUE_MAX_CHARS)
+    )];
+    if let Some(cwd) = json_string_field(map, &["cwd", "workdir"]) {
+        fields.push(format!("cwd={cwd}"));
+    }
+    Some(fields.join(", "))
+}
+
+fn format_session_tool_preview(tool_name: &str, map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let meta = extract_subagent_meta_from_map(map);
+    if meta.is_empty() {
+        if let Some(action) = json_string_field(map, &["action", "operation"]) {
+            return Some(format!("action={action}"));
+        }
+        return None;
+    }
+    let mut fields = Vec::new();
+    if let Some(task) = meta.task.as_deref() {
+        fields.push(format!("task={}", quoted_summary(task, TOOL_ARG_VALUE_MAX_CHARS)));
+    } else if let Some(action) = json_string_field(map, &["action", "operation"]) {
+        fields.push(format!("action={action}"));
+    }
+    if let Some(agent) = meta.agent.as_deref() {
+        fields.push(format!("agent={agent}"));
+    }
+    if let Some(model) = meta.model.as_deref() {
+        fields.push(format!("model={model}"));
+    }
+    if fields.is_empty() {
+        Some(tool_name.to_string())
+    } else {
+        Some(fields.join(", "))
+    }
+}
+
+fn format_web_preview(tool_name: &str, map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    if let Some(url) = json_string_field(map, &["url", "uri", "endpoint"]) {
+        let mut fields = vec![format!("url={url}")];
+        if let Some(max_chars) = json_display_field(map, &["max_chars", "limit"]) {
+            fields.push(format!("limit={max_chars}"));
+        }
+        return Some(fields.join(", "));
+    }
+    if let Some(query) = json_string_field(map, &["query", "q"]) {
+        return Some(format!("query={}", quoted_summary(&query, TOOL_ARG_VALUE_MAX_CHARS)));
+    }
+    if tool_name == "http_request" {
+        return json_string_field(map, &["method"]).map(|method| format!("method={method}"));
+    }
+    None
+}
+
+fn extract_subagent_meta_from_map(map: &serde_json::Map<String, serde_json::Value>) -> SubagentMeta {
+    let str_field = |key: &str| {
+        map.get(key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
+    let mut meta = SubagentMeta {
+        agent: str_field("agent"),
+        model: str_field("model"),
+        task: str_field("prompt").or_else(|| str_field("task")),
+    };
+    if meta.task.is_none() {
+        meta.task = str_field("action").or_else(|| str_field("operation"));
+    }
+    if let Some(task) = meta.task.take() {
+        meta.task = Some(one_line_summary(&task, 60));
+    }
+    meta
+}
+
+fn json_string_field(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        map.get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn json_display_field(map: &serde_json::Map<String, serde_json::Value>, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        let value = map.get(*key)?;
+        if let Some(s) = value.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            return Some(s.to_string());
+        }
+        if value.is_number() || value.is_boolean() {
+            return Some(value.to_string());
+        }
+        None
+    })
+}
+
+fn compact_json_value(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
+}
+
+fn quoted_summary(raw: &str, max_chars: usize) -> String {
+    let summary = one_line_summary(raw, max_chars);
+    format!("\"{}\"", summary.replace('"', "\\\""))
+}
+
+fn clamp_one_line(raw: &str, max_chars: usize, ellipsis: &str) -> String {
+    let collapsed = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let char_count = collapsed.chars().count();
+    if char_count <= max_chars {
+        return collapsed;
+    }
+    let keep = max_chars.saturating_sub(ellipsis.chars().count()).max(1);
+    let mut truncated: String = collapsed.chars().take(keep).collect();
+    truncated.push_str(ellipsis);
+    truncated
 }
 
 /// Render a `Reasoning` card in Claude-Code style.
 ///
-/// Folded → `▸ Thinking (123 tokens) - press Tab to expand`
-///   (or `> Thinking (123 tokens) - press Tab to expand` in ASCII),
-///   dim gray + italic so the line reads as a collapsed annotation rather
-///   than primary content.
+/// Folded → `▸ Thinking (123 tokens)` (or `> Thinking (123 tokens)` in ASCII),
+/// dim gray + italic so the line reads as a collapsed annotation rather than
+/// primary content.
 /// Expanded → header `▾ Thinking (123 tokens)` (or `v Thinking (...)`) on
 ///   row 0, followed by the body — each line indented by two spaces and
 ///   rendered in dim gray italic so the eye flows back to the visible
@@ -4225,8 +4489,8 @@ fn render_reasoning_card<'a>(
     let header_style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
 
     if folded {
-        // Single-line folded summary — token count + key hint, no body.
-        let header = format!("{folded_icon} Thinking ({tokens} {token_word}) - press Tab to expand");
+        // Single-line folded summary — token count only, no noisy key-hint prose.
+        let header = format!("{folded_icon} Thinking ({tokens} {token_word})");
         lines.push(Line::from(Span::styled(header, header_style)));
         return;
     }
@@ -4269,7 +4533,7 @@ const fn reasoning_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     }
 }
 
-/// Pick the bullet (`●` / `*`) and hook glyph (`⎿` / `└`) used by tool cards.
+/// Pick the running bullet (`●` / `*`) and hook glyph (`⎿` / `L`) used by tool cards.
 ///
 /// Claude Code uses a single status-colored bullet for the header and a dim
 /// hook for the follow-on summary / body — far less visually noisy than the
@@ -4278,31 +4542,44 @@ const fn tool_card_glyphs(ascii: bool) -> (&'static str, &'static str) {
     if ascii { ("*", "L") } else { ("\u{25CF}", "\u{23BF}") }
 }
 
-/// Status → bullet color: yellow while running, green on success, red on error.
-const fn tool_bullet_color(status: ToolStatus) -> Color {
+/// Status → header/result marker + marker color.
+const fn tool_status_marker(status: ToolStatus, ascii: bool) -> (&'static str, Color) {
     match status {
-        ToolStatus::Running => Color::Yellow,
-        ToolStatus::Done => Color::Green,
-        ToolStatus::Error => Color::Red,
+        ToolStatus::Running => {
+            if ascii {
+                ("*", Color::White)
+            } else {
+                ("\u{25CF}", Color::White)
+            }
+        }
+        ToolStatus::Done => {
+            if ascii {
+                ("v", Color::Green)
+            } else {
+                ("\u{2713}", Color::Green)
+            }
+        }
+        ToolStatus::Error => {
+            if ascii {
+                ("x", Color::Red)
+            } else {
+                ("\u{2717}", Color::Red)
+            }
+        }
     }
 }
 
-// ── BUG-11: sub-agent visibility ────────────────────────────────────────────
+// ── BUG-11 / UX-E: sub-agent preview visibility ─────────────────────────────
 //
 // The delegate / sessions_spawn / subagents family of tools each spawn a *child*
 // agent that runs its own LLM turns and tool calls. Without observer streaming
 // (NoopObserver lives behind the tools boundary), the TUI only sees the parent
-// tool card spin and then a flat text result. To make the nested activity
-// visible at the chat layer we special-case these cards: we parse the
-// sub-agent's identity (agent name + model) and the delegated task summary out
-// of the tool *args* (always present) and the tool *result* (when finished),
-// then render a distinct `🤖 delegate[agent/model] · <task>` header plus a meta
-// follow-on line. This is the "tool card surfaces sub-agent meta" visibility
-// layer; true real-time nested streaming requires wiring an observer through
-// the tools boundary and is tracked separately.
+// tool card spin and then a flat text result. To keep the card shape consistent
+// with Claude-like tool rendering, we surface the agent/model/task in the normal
+// `tool(preview)` header instead of a separate robot card.
 
 /// Names of the tools that spawn / drive a sub-agent. A card for any of these
-/// gets the enriched sub-agent treatment in [`render_tool_result`].
+/// gets an enriched readable args preview.
 const SUBAGENT_TOOL_NAMES: [&str; 5] = ["delegate", "sessions_spawn", "subagents", "session_worker", "nodes"];
 
 /// True when `tool_name` belongs to the sub-agent tool family.
@@ -4812,10 +5089,9 @@ mod tests {
     }
 
     #[test]
-    fn render_delegate_card_shows_robot_and_identity() {
-        // The rendered sub-agent card must surface the robot glyph, the
-        // agent/model identity tag, and the task summary so nested delegation
-        // is visible from the parent TUI.
+    fn render_delegate_card_shows_readable_identity_preview() {
+        // The rendered sub-agent card must surface agent/model/task in the
+        // same Claude-like `Tool(preview)` header shape as every other tool.
         let mut lines: Vec<Line<'_>> = Vec::new();
         let args = r#"{"agent":"researcher","model":"kimi-2.6","prompt":"investigate the bug"}"#;
         render_tool_result(
@@ -4830,10 +5106,14 @@ mod tests {
             true, // ascii — deterministic, no unicode glyphs
         );
         let header = lines.first().map(line_to_plain).expect("test: header line present");
-        assert!(header.contains("[bot]"), "ascii robot marker present: {header}");
-        assert!(header.contains("delegate["), "tool name + bracket: {header}");
-        assert!(header.contains("researcher/kimi-2.6"), "identity tag: {header}");
-        assert!(header.contains("investigate the bug"), "task summary: {header}");
+        assert!(header.starts_with("v "), "success marker present: {header}");
+        assert!(header.contains("delegate("), "tool name + preview: {header}");
+        assert!(
+            header.contains("task=\"investigate the bug\""),
+            "task summary: {header}"
+        );
+        assert!(header.contains("agent=researcher"), "agent: {header}");
+        assert!(header.contains("model=kimi-2.6"), "model: {header}");
     }
 
     #[test]
@@ -4852,13 +5132,23 @@ mod tests {
             true,
         );
         let header = lines.first().map(line_to_plain).expect("test: header line present");
-        assert!(header.contains("shell(ls /tmp)"), "classic header: {header}");
+        assert!(
+            header.contains("shell(command=\"ls /tmp\")"),
+            "classic readable header: {header}"
+        );
         assert!(!header.contains("[bot]"), "no robot for normal tools: {header}");
     }
 
     /// Flatten a rendered `Line` into plain text for assertions.
     fn line_to_plain(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    fn span_fg(lines: &[Line<'_>], line_idx: usize, span_idx: usize) -> Option<Color> {
+        lines
+            .get(line_idx)
+            .and_then(|line| line.spans.get(span_idx))
+            .and_then(|span| span.style.fg)
     }
 
     // ── P3-5: streaming-draft API tests ────────────────────────────────
@@ -5152,8 +5442,7 @@ mod tests {
                 assert!(result.is_none());
                 assert!(*folded, "default state is folded");
                 assert!(elapsed_ms.is_none());
-                // Short args fit in the preview verbatim (collapsed whitespace).
-                assert_eq!(args_preview, r#"{"command":"ls -la /tmp"}"#);
+                assert_eq!(args_preview, r#"command="ls -la /tmp""#);
             }
             other => panic!("test: expected ToolResult, got {other:?}"),
         }
@@ -5229,8 +5518,8 @@ mod tests {
         let mut lines: Vec<Line<'_>> = Vec::new();
         let card = ConversationLine::ToolResult {
             tool_name: "shell".to_string(),
-            args_preview: "ls".to_string(),
-            args_full: "ls".to_string(),
+            args_preview: r#"command="ls""#.to_string(),
+            args_full: r#"{"command":"ls"}"#.to_string(),
             result: None,
             status: ToolStatus::Running,
             elapsed_ms: None,
@@ -5248,18 +5537,22 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(rendered.contains("\u{25CF}"), "uses ● bullet: {rendered}");
-        assert!(rendered.contains("shell(ls)"), "shows Tool(args) preview: {rendered}");
+        assert!(
+            rendered.contains(r#"shell(command="ls")"#),
+            "shows Tool(args) preview: {rendered}"
+        );
+        assert_eq!(span_fg(&lines, 0, 0), Some(Color::White));
     }
 
     #[test]
     fn render_folded_tool_card_done_shows_hook_summary() {
-        // Claude-Code style follow-on: `  ⎿ Done (234ms · 3 lines)` under the
+        // Claude-Code style follow-on: `  ⎿ ✓ 234ms · 3 lines · 5B` under the
         // bullet header once the tool finishes.
         let mut lines: Vec<Line<'_>> = Vec::new();
         let card = ConversationLine::ToolResult {
             tool_name: "shell".to_string(),
-            args_preview: "ls".to_string(),
-            args_full: "ls".to_string(),
+            args_preview: r#"command="ls""#.to_string(),
+            args_full: r#"{"command":"ls"}"#.to_string(),
             result: Some("a\nb\nc".to_string()),
             status: ToolStatus::Done,
             elapsed_ms: Some(234),
@@ -5275,9 +5568,39 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(summary.contains("\u{23BF}"), "uses ⎿ hook glyph: {summary}");
-        assert!(summary.contains("Done"), "shows status word: {summary}");
+        assert!(summary.contains("\u{2713}"), "shows success check: {summary}");
         assert!(summary.contains("234ms"), "shows elapsed ms: {summary}");
         assert!(summary.contains("3 lines"), "shows result line count: {summary}");
+        assert!(summary.contains("5B"), "shows result byte count: {summary}");
+        assert_eq!(span_fg(&lines, 0, 0), Some(Color::Green));
+        assert_eq!(span_fg(&lines, 1, 1), Some(Color::Green));
+        assert_eq!(span_fg(&lines, 1, 2), Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn render_folded_tool_card_error_shows_reason_and_red_marker() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let card = ConversationLine::ToolResult {
+            tool_name: "file_write".to_string(),
+            args_preview: "path=src/lib.rs, bytes=3B".to_string(),
+            args_full: r#"{"path":"src/lib.rs","content":"abc"}"#.to_string(),
+            result: Some("permission denied\nstack trace".to_string()),
+            status: ToolStatus::Error,
+            elapsed_ms: Some(50),
+            folded: true,
+        };
+        render_conversation_line(&mut lines, &card, false);
+
+        let header = line_to_plain(lines.first().expect("test: header"));
+        let summary = line_to_plain(lines.get(1).expect("test: summary"));
+
+        assert!(header.starts_with("\u{2717} "), "error header marker: {header}");
+        assert!(
+            summary.contains("\u{2717} 50ms \u{00B7} permission denied"),
+            "error summary: {summary}"
+        );
+        assert_eq!(span_fg(&lines, 0, 0), Some(Color::Red));
+        assert_eq!(span_fg(&lines, 1, 1), Some(Color::Red));
     }
 
     #[test]
@@ -5294,10 +5617,11 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, false);
         // Claude-Code style expanded:
-        //   row 0  `● shell(ls)`               — bullet header
-        //   row 1  `  ⎿ total 24`              — first body row under hook
-        //   row 2  `    drwxrwxrwt`            — continuation
-        assert_eq!(lines.len(), 3, "expanded card line count: {}", lines.len());
+        //   row 0  `✓ shell(command="ls -la /tmp")`
+        //   row 1  `  ⎿ input: command="ls -la /tmp"`
+        //   row 2  `    output:`
+        //   row 3+ output body
+        assert_eq!(lines.len(), 5, "expanded card line count: {}", lines.len());
         let join = |i: usize| -> String {
             lines
                 .get(i)
@@ -5307,27 +5631,35 @@ mod tests {
                 .map(|s| s.content.as_ref())
                 .collect()
         };
-        assert!(join(0).contains("\u{25CF}"), "uses ● bullet: {}", join(0));
-        assert!(join(0).contains("shell(ls)"), "shows Tool(args): {}", join(0));
+        assert!(join(0).contains("\u{2713}"), "uses ✓ marker: {}", join(0));
         assert!(
-            join(1).contains("\u{23BF}"),
-            "uses ⎿ hook on first body row: {}",
+            join(0).contains("shell(command=\"ls -la /tmp\")"),
+            "shows readable args: {}",
+            join(0)
+        );
+        assert!(join(1).contains("\u{23BF}"), "uses ⎿ hook on input row: {}", join(1));
+        assert!(
+            join(1).contains("input: command=\"ls -la /tmp\""),
+            "input row: {}",
             join(1)
         );
-        assert!(join(1).contains("total 24"), "first body row: {}", join(1));
-        assert!(join(2).contains("drwxrwxrwt"), "second body row: {}", join(2));
+        assert!(join(2).contains("output:"), "output label: {}", join(2));
+        assert!(join(3).contains("total 24"), "first body row: {}", join(3));
+        assert!(join(4).contains("drwxrwxrwt"), "second body row: {}", join(4));
     }
 
     #[test]
     fn render_tool_card_status_glyphs_and_colors() {
-        // Bullet color tracks status — yellow while running, green on success,
-        // red on error. The bullet glyph itself does not change.
+        // Running keeps the white bullet; terminal states get explicit markers.
         let (bullet, hook) = tool_card_glyphs(false);
         assert_eq!(bullet, "\u{25CF}", "unicode bullet ●");
         assert_eq!(hook, "\u{23BF}", "unicode hook ⎿");
-        assert_eq!(tool_bullet_color(ToolStatus::Running), Color::Yellow);
-        assert_eq!(tool_bullet_color(ToolStatus::Done), Color::Green);
-        assert_eq!(tool_bullet_color(ToolStatus::Error), Color::Red);
+        assert_eq!(
+            tool_status_marker(ToolStatus::Running, false),
+            ("\u{25CF}", Color::White)
+        );
+        assert_eq!(tool_status_marker(ToolStatus::Done, false), ("\u{2713}", Color::Green));
+        assert_eq!(tool_status_marker(ToolStatus::Error, false), ("\u{2717}", Color::Red));
     }
 
     #[test]
@@ -5348,6 +5680,8 @@ mod tests {
         let (bullet, hook) = tool_card_glyphs(true);
         assert_eq!(bullet, "*", "ASCII bullet");
         assert_eq!(hook, "L", "ASCII hook");
+        assert_eq!(tool_status_marker(ToolStatus::Done, true), ("v", Color::Green));
+        assert_eq!(tool_status_marker(ToolStatus::Error, true), ("x", Color::Red));
 
         let card = ConversationLine::ToolResult {
             tool_name: "t".to_string(),
@@ -5368,6 +5702,121 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(rendered.starts_with("* "), "ASCII bullet header: {rendered}");
+
+        let mut done_lines: Vec<Line<'_>> = Vec::new();
+        let done_card = ConversationLine::ToolResult {
+            tool_name: "t".to_string(),
+            args_preview: String::new(),
+            args_full: "{}".to_string(),
+            result: Some("ok".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(1),
+            folded: true,
+        };
+        render_conversation_line(&mut done_lines, &done_card, true);
+        let done_header = done_lines.first().expect("test: done header");
+        assert!(line_to_plain(done_header).starts_with("v "), "ASCII success marker");
+    }
+
+    #[test]
+    fn tool_args_formatter_known_tools_are_readable() {
+        assert_eq!(
+            build_tool_args_preview(
+                "file_read",
+                r#"{"path":"src/chat/tui.rs","max_bytes":200}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "path=src/chat/tui.rs, limit=200"
+        );
+        assert_eq!(
+            build_tool_args_preview(
+                "file_write",
+                r#"{"path":"src/lib.rs","content":"hello"}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "path=src/lib.rs, bytes=5B"
+        );
+        assert_eq!(
+            build_tool_args_preview(
+                "shell",
+                r#"{"command":"cargo test -p openprx","cwd":"/opt/worker/code/prx"}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "command=\"cargo test -p openprx\", cwd=/opt/worker/code/prx"
+        );
+        assert_eq!(
+            build_tool_args_preview(
+                "sessions_spawn",
+                r#"{"task":"Audit session UX","model":"kimi-2.6","agent":"reviewer"}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "task=\"Audit session UX\", agent=reviewer, model=kimi-2.6"
+        );
+        assert_eq!(
+            build_tool_args_preview(
+                "web_fetch",
+                r#"{"url":"https://example.com/docs","max_chars":1200}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "url=https://example.com/docs, limit=1200"
+        );
+    }
+
+    #[test]
+    fn tool_args_formatter_unknown_uses_compact_json_and_clamps() {
+        let preview = build_tool_args_preview(
+            "custom_tool",
+            r#"{"z":2,"nested":{"long":"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"}}"#,
+            40,
+            ARGS_PREVIEW_ELLIPSIS,
+        );
+
+        assert!(preview.starts_with('{'), "compact JSON fallback: {preview}");
+        assert!(preview.ends_with(ARGS_PREVIEW_ELLIPSIS), "clamped fallback: {preview}");
+        assert!(!preview.contains('\n'), "single-line fallback: {preview}");
+    }
+
+    #[test]
+    fn tool_args_formatter_malformed_json_does_not_panic() {
+        let preview = build_tool_args_preview("file_read", "{not valid json", 20, ARGS_PREVIEW_ELLIPSIS_ASCII);
+
+        assert_eq!(preview, "{not valid json");
+    }
+
+    #[test]
+    fn expanded_tool_output_truncates_long_body() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let output = (0..(TOOL_EXPANDED_OUTPUT_MAX_LINES + 3))
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let card = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "command=\"generate\"".to_string(),
+            args_full: r#"{"command":"generate"}"#.to_string(),
+            result: Some(output),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(10),
+            folded: false,
+        };
+
+        render_conversation_line(&mut lines, &card, false);
+        let rendered = lines.iter().map(line_to_plain).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            rendered.contains("truncated:"),
+            "long output has truncation summary: {rendered}"
+        );
+        assert!(
+            lines.len() <= TOOL_EXPANDED_OUTPUT_MAX_LINES + 4,
+            "expanded output is bounded: {}",
+            lines.len()
+        );
     }
 
     #[test]
@@ -5594,13 +6043,13 @@ mod tests {
         render_conversation_line(&mut lines, &card, false);
         assert_eq!(lines.len(), 1, "folded card is exactly one line");
         let rendered = line_text(lines.first().expect("test: first line"));
-        // S1-A folded summary: `▸ Thinking (N tokens) - press Tab to expand`.
+        // Folded summary: `▸ Thinking (N tokens)` without noisy key-hint prose.
         assert!(rendered.starts_with("\u{25B8} "), "uses ▸ folded icon: {rendered}");
         assert!(rendered.contains("Thinking"), "shows Thinking label: {rendered}");
         assert!(rendered.contains("tokens"), "shows token count: {rendered}");
         assert!(
-            rendered.contains("press Tab to expand"),
-            "advertises Tab keybinding: {rendered}"
+            !rendered.contains("press Tab"),
+            "folded header trims noisy Tab prose: {rendered}"
         );
         // Folded summary must NOT leak the body text.
         assert!(!rendered.contains("Step 1"), "body hidden when folded: {rendered}");
@@ -5667,8 +6116,8 @@ mod tests {
             "ASCII keeps Thinking label: {rendered}"
         );
         assert!(
-            rendered.contains("press Tab to expand"),
-            "ASCII keeps Tab hint: {rendered}"
+            !rendered.contains("press Tab"),
+            "ASCII folded header trims noisy Tab prose: {rendered}"
         );
         assert!(!rendered.contains("\u{25B8}"), "no ▸ in ASCII mode: {rendered}");
 
