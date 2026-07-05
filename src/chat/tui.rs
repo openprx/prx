@@ -4881,7 +4881,7 @@ fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &
     let result_lines = result_text.lines().collect::<Vec<_>>();
     let total_lines = result_lines.len();
     for body in result_lines.iter().take(TOOL_FOLDED_RESULT_PREVIEW_LINES) {
-        let rendered = clamp_one_line(body, TOOL_FOLDED_RESULT_PREVIEW_CHARS, ellipsis);
+        let rendered = truncate_chars_with_ellipsis(body, TOOL_FOLDED_RESULT_PREVIEW_CHARS as u16, ascii);
         lines.push(Line::from(Span::styled(format!("    {rendered}"), body_style)));
     }
     let hidden_lines = total_lines.saturating_sub(TOOL_FOLDED_RESULT_PREVIEW_LINES);
@@ -4969,7 +4969,7 @@ fn push_expanded_tool_io<'a>(
         let hidden_bytes = total_bytes.saturating_sub(shown_bytes);
         lines.push(Line::from(Span::styled(
             format!(
-                "    {ellipsis} truncated: {hidden_lines} {} · {} hidden",
+                "    {ellipsis} truncated: {hidden_lines} {} · {} hidden · Ctrl+O for full transcript",
                 if hidden_lines == 1 { "line" } else { "lines" },
                 format_bytes(hidden_bytes)
             ),
@@ -6419,6 +6419,42 @@ mod tests {
     }
 
     #[test]
+    fn folded_tool_card_preview_preserves_indent_and_shows_hidden_line_count() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let result = [
+            "    let value = \"你好你好你好你好你好你好你好你好\";",
+            "        println!(\"still indented\");",
+            "    }",
+            "extra hidden line one",
+            "extra hidden line two",
+        ]
+        .join("\n");
+        let card = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "command=\"cargo test\"".to_string(),
+            args_full: r#"{"command":"cargo test"}"#.to_string(),
+            result: Some(result),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(50),
+            folded: true,
+        };
+
+        render_conversation_line(&mut lines, &card, false);
+
+        let first_preview = line_to_plain(lines.get(2).expect("first preview line"));
+        assert!(
+            first_preview.starts_with("        let value"),
+            "folded preview should preserve original code indentation: {first_preview:?}"
+        );
+        assert!(
+            UnicodeWidthStr::width(first_preview.trim_start()) <= TOOL_FOLDED_RESULT_PREVIEW_CHARS,
+            "folded preview should be width-bounded, not char-count bounded: {first_preview:?}"
+        );
+        let hidden = line_to_plain(lines.get(5).expect("hidden line count"));
+        assert!(hidden.contains("+2 lines"), "hidden line count missing: {hidden:?}");
+    }
+
+    #[test]
     fn render_folded_tool_card_error_shows_reason_and_red_marker() {
         let mut lines: Vec<Line<'_>> = Vec::new();
         let card = ConversationLine::ToolResult {
@@ -6442,6 +6478,16 @@ mod tests {
         );
         assert_eq!(span_fg(&lines, 0, 0), Some(Color::Red));
         assert_eq!(span_fg(&lines, 1, 1), Some(Color::Red));
+        assert_eq!(
+            line_to_plain(lines.get(2).expect("error preview first line")),
+            "    permission denied",
+            "folded error cards should preview the error body"
+        );
+        assert_eq!(
+            line_to_plain(lines.get(3).expect("error preview second line")),
+            "    stack trace",
+            "folded error cards should preview follow-up error lines"
+        );
     }
 
     #[test]
@@ -6652,6 +6698,10 @@ mod tests {
         assert!(
             rendered.contains("truncated:"),
             "long output has truncation summary: {rendered}"
+        );
+        assert!(
+            rendered.contains("Ctrl+O for full transcript"),
+            "expanded truncation hint should point to the verbose transcript: {rendered}"
         );
         assert!(
             lines.len() <= TOOL_EXPANDED_OUTPUT_MAX_LINES + 4,
