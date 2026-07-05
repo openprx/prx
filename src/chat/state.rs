@@ -313,8 +313,10 @@ pub struct UiState {
     /// P6c1 foreground tool approval prompt. Display-only; the dispatcher
     /// ApprovalRouter remains the single execution gate.
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
-    /// Effective context window used by status bar budget display. This is a
-    /// UI hint denominator only; P5 owns hard tokenizer budgeting.
+    /// Current context-budget numerator used by status bar budget display.
+    /// Derived from the planned prompt context, not cumulative session usage.
+    pub context_used_tokens: Option<usize>,
+    /// Effective context window used by status bar budget display.
     pub context_window_tokens: Option<usize>,
     /// Main-session cumulative token/cost summary for the status bar.
     pub token_usage_summary: MainSessionTokenUsageSummary,
@@ -382,6 +384,8 @@ pub struct UiSnapshot {
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
     /// P6c1 foreground tool approval prompt.
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
+    /// Current context-budget numerator for UI-only status budget display.
+    pub context_used_tokens: Option<usize>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
     /// Main-session cumulative token/cost summary for the status bar.
@@ -421,6 +425,7 @@ impl UiSnapshot {
             sessions_entries: Arc::new(Vec::new()),
             active_session_view: None,
             pending_tool_approval: None,
+            context_used_tokens: None,
             context_window_tokens: None,
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             focus: crate::chat::sessions::FocusTarget::Main,
@@ -487,6 +492,7 @@ struct SnapshotDirtyFields {
     has_stream_draft: bool,
     draft_version: u64,
     input_lines: usize,
+    context_used_tokens: Option<usize>,
     context_window_tokens: Option<usize>,
     slash_menu_open: bool,
     slash_menu_selected: Option<usize>,
@@ -532,6 +538,7 @@ impl ChatState {
                 provider_model_catalog: Vec::new(),
                 active_session_view: None,
                 pending_tool_approval: None,
+                context_used_tokens: None,
                 context_window_tokens: None,
                 token_usage_summary: MainSessionTokenUsageSummary::default(),
                 focus: crate::chat::sessions::FocusTarget::Main,
@@ -619,6 +626,7 @@ impl ChatState {
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
             active_session_view: self.ui.active_session_view.clone(),
             pending_tool_approval: self.ui.pending_tool_approval.clone(),
+            context_used_tokens: self.ui.context_used_tokens,
             context_window_tokens: self.ui.context_window_tokens,
             token_usage_summary: self.ui.token_usage_summary,
             focus: self.ui.focus,
@@ -676,6 +684,7 @@ impl ChatState {
             has_stream_draft: self.stream.draft.is_some(),
             draft_version: draft_ver,
             input_lines: self.ui.input.lines.len(),
+            context_used_tokens: self.ui.context_used_tokens,
             context_window_tokens: self.ui.context_window_tokens,
             slash_menu_open: self.ui.slash_menu.is_some(),
             slash_menu_selected: self.ui.slash_menu.as_ref().map(|menu| menu.selected),
@@ -828,9 +837,10 @@ impl ChatState {
                 provider_model_catalog,
             } => self.reduce_slash_menu_sources_updated(saved_sessions, provider_model_catalog),
             Action::ActiveSessionViewUpdated { view } => self.reduce_active_session_view_updated(view),
-            Action::ContextWindowUpdated { max_context_tokens } => {
-                self.reduce_context_window_updated(max_context_tokens)
-            }
+            Action::ContextWindowUpdated {
+                used_context_tokens,
+                max_context_tokens,
+            } => self.reduce_context_window_updated(used_context_tokens, max_context_tokens),
             Action::ProviderUsageRecorded { record } => self.reduce_provider_usage_recorded(record),
             Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
@@ -1922,6 +1932,7 @@ impl ChatState {
         self.ui.turn_count = self.session.turns.len();
         self.ui.active_session_view = None;
         self.ui.pending_tool_approval = None;
+        self.ui.context_used_tokens = None;
         self.ui.context_window_tokens = None;
         self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         self.ui.sessions_status.clear();
@@ -2209,10 +2220,15 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    fn reduce_context_window_updated(&mut self, max_context_tokens: Option<usize>) -> Vec<Effect> {
-        if self.ui.context_window_tokens == max_context_tokens {
+    fn reduce_context_window_updated(
+        &mut self,
+        used_context_tokens: Option<usize>,
+        max_context_tokens: Option<usize>,
+    ) -> Vec<Effect> {
+        if self.ui.context_used_tokens == used_context_tokens && self.ui.context_window_tokens == max_context_tokens {
             return Vec::new();
         }
+        self.ui.context_used_tokens = used_context_tokens;
         self.ui.context_window_tokens = max_context_tokens;
         vec![Effect::RequestRedraw]
     }
@@ -2862,25 +2878,32 @@ mod tests {
     #[test]
     fn context_window_updated_writes_snapshot_and_dedups() {
         let mut state = make_state();
+        assert_eq!(state.ui.context_used_tokens, None);
         assert_eq!(state.ui.context_window_tokens, None);
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: Some(2_500),
             max_context_tokens: Some(10_000_000),
         });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_used_tokens, Some(2_500));
         assert_eq!(state.ui.context_window_tokens, Some(10_000_000));
         let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.context_used_tokens, Some(2_500));
         assert_eq!(snap.context_window_tokens, Some(10_000_000));
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: Some(2_500),
             max_context_tokens: Some(10_000_000),
         });
-        assert!(effects.is_empty(), "identical context window must not redraw");
+        assert!(effects.is_empty(), "identical context budget must not redraw");
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: None,
             max_context_tokens: None,
         });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_used_tokens, None);
         assert_eq!(state.ui.context_window_tokens, None);
     }
 
@@ -3237,6 +3260,7 @@ mod tests {
             cancel: CancellationToken::new(),
         });
         state.ui.context_window_tokens = Some(10_000_000);
+        state.ui.context_used_tokens = Some(2_500);
         state.ui.input.set_text("draft text");
         assert!(state.ui.input.begin_or_cycle_reverse_search());
         state.control.generating = false;
@@ -3250,6 +3274,7 @@ mod tests {
         assert!(state.ui.pending_tool_approval.is_none());
         assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
         assert_eq!(state.ui.context_window_tokens, None);
+        assert_eq!(state.ui.context_used_tokens, None);
         assert!(!state.ui.input.is_reverse_search_active());
         assert_eq!(state.ui.turn_count, 2);
         assert!(state.stream.draft.is_none());

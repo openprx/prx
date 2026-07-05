@@ -262,9 +262,13 @@ pub enum Action {
     ActiveSessionViewUpdated {
         view: Option<crate::chat::sessions::ActiveSessionView>,
     },
-    /// Effective context window for UI-only status budget display. `None`
-    /// preserves the old `~used tok` status fallback.
-    ContextWindowUpdated { max_context_tokens: Option<usize> },
+    /// Current context-budget usage for UI-only status display. `used_context_tokens`
+    /// is the planned prompt context size for this turn, not cumulative session
+    /// token usage.
+    ContextWindowUpdated {
+        used_context_tokens: Option<usize>,
+        max_context_tokens: Option<usize>,
+    },
     /// Main-session provider usage has been recorded for a successful turn.
     ProviderUsageRecorded { record: MainSessionTokenUsageRecord },
     /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环

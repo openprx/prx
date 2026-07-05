@@ -423,12 +423,17 @@ fn format_compact_feedback(
     }
 }
 
-#[cfg(test)]
-fn context_budget_warning_for_tui(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiContextBudgetStatus {
+    used_context_tokens: usize,
+    max_context_tokens: usize,
+}
+
+fn context_budget_status_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
     terminal_tui_enabled: bool,
-) -> Option<String> {
+) -> Option<TuiContextBudgetStatus> {
     if !terminal_tui_enabled {
         return None;
     }
@@ -437,13 +442,10 @@ fn context_budget_warning_for_tui(
         compaction_config,
         crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
     );
-    if !budget.over_warning {
-        return None;
-    }
-    Some(format!(
-        "Context budget warning: ~{} / {} tokens used (window {}, reserve {}).",
-        budget.used_tokens, budget.available_input_tokens, budget.max_context_tokens, budget.reserve_tokens
-    ))
+    Some(TuiContextBudgetStatus {
+        used_context_tokens: budget.used_tokens,
+        max_context_tokens: budget.max_context_tokens,
+    })
 }
 
 fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -5200,11 +5202,19 @@ Retry with a compatible model: /provider {new_provider} <model>"
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
         #[cfg(feature = "terminal-tui")]
-        if redraw_tx_for_main.is_some() {
-            let context_window_tokens = Some(effective_compaction.config.max_context_tokens);
-            chat_mirror.lock().context_window_tokens = context_window_tokens;
+        if let Some(context_budget) =
+            context_budget_status_for_tui(&history, &effective_compaction.config, redraw_tx_for_main.is_some())
+        {
+            let context_used_tokens = Some(context_budget.used_context_tokens);
+            let context_window_tokens = Some(context_budget.max_context_tokens);
+            {
+                let mut mirror = chat_mirror.lock();
+                mirror.context_used_tokens = context_used_tokens;
+                mirror.context_window_tokens = context_window_tokens;
+            }
             let _ = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::ContextWindowUpdated {
+                    used_context_tokens: context_used_tokens,
                     max_context_tokens: context_window_tokens,
                 },
                 "chat.context_window_updated",
@@ -8493,6 +8503,7 @@ async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_sessio
         mirror.sessions_cache.clear();
         mirror.active_session_view = None;
         mirror.pending_tool_approval = None;
+        mirror.context_used_tokens = None;
         mirror.context_window_tokens = None;
         mirror.token_usage_summary = ctx.chat_session.token_usage_summary();
         mirror.external_editor_prefix_armed = false;
@@ -9977,7 +9988,7 @@ mod terminal_guard_tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn plain_mode_suppresses_context_budget_warning_chrome() {
+    fn plain_mode_does_not_emit_context_budget_chrome() {
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Aggressive,
             reserve_tokens: 5,
@@ -9993,18 +10004,15 @@ mod terminal_guard_tests {
         ];
         let budget =
             crate::agent::loop_::plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
-        assert!(budget.over_warning, "fixture must cross the warning threshold");
+        assert!(budget.used_tokens > 0, "fixture must produce context usage");
         let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
         assert!(
-            context_budget_warning_for_tui(&history, &config, terminal_tui_enabled).is_none(),
-            "--plain must not emit context warning chrome"
+            context_budget_status_for_tui(&history, &config, terminal_tui_enabled).is_none(),
+            "--plain must not emit context budget chrome"
         );
-        assert!(
-            context_budget_warning_for_tui(&history, &config, true)
-                .unwrap_or_default()
-                .contains("Context budget warning:"),
-            "non-plain TUI path should still produce the warning"
-        );
+        let status = context_budget_status_for_tui(&history, &config, true).expect("TUI context budget status");
+        assert_eq!(status.used_context_tokens, budget.used_tokens);
+        assert_eq!(status.max_context_tokens, budget.max_context_tokens);
     }
 
     #[test]
@@ -11087,6 +11095,7 @@ mod regfix_approval_switch_tests {
                 name: "shell".to_string(),
                 args: "{}".to_string(),
             });
+            mirror.context_used_tokens = Some(2_500);
             mirror.context_window_tokens = Some(10_000_000);
             mirror.external_editor_prefix_armed = true;
             mirror.input.set_text("draft");
@@ -11140,6 +11149,7 @@ mod regfix_approval_switch_tests {
         {
             let mirror = chat_mirror.lock();
             assert!(mirror.pending_tool_approval.is_none());
+            assert_eq!(mirror.context_used_tokens, None);
             assert_eq!(mirror.context_window_tokens, None);
             assert!(!mirror.external_editor_prefix_armed);
             assert!(!mirror.input.is_reverse_search_active());

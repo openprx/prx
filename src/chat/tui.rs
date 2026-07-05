@@ -132,6 +132,8 @@ pub struct TuiState {
     /// P6c1 foreground tool approval prompt. Display-only; approving/denying is
     /// returned to the dispatcher as `ToolApprovalReceived`.
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
+    /// Current planned context usage for UI-only status budget display.
+    pub context_used_tokens: Option<usize>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
     /// Main-session cumulative token/cost summary.
@@ -2341,6 +2343,7 @@ impl TuiState {
             saved_session_picker: None,
             active_session_view: None,
             pending_tool_approval: None,
+            context_used_tokens: None,
             context_window_tokens: None,
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             external_editor_prefix_armed: false,
@@ -2920,6 +2923,8 @@ pub trait BottomChromeView {
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
     /// Foreground tool approval prompt (P6c1), if any.
     fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView>;
+    /// Current planned context usage for UI-only status budget display.
+    fn context_used_tokens(&self) -> Option<usize>;
     /// Effective context window for UI-only status budget display.
     fn context_window_tokens(&self) -> Option<usize>;
     /// Main-session cumulative token/cost summary.
@@ -2980,6 +2985,9 @@ impl BottomChromeView for TuiState {
     }
     fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView> {
         self.pending_tool_approval.as_ref()
+    }
+    fn context_used_tokens(&self) -> Option<usize> {
+        self.context_used_tokens
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
@@ -3046,6 +3054,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn pending_tool_approval(&self) -> Option<&crate::chat::sessions::PendingToolApprovalView> {
         self.pending_tool_approval.as_ref()
+    }
+    fn context_used_tokens(&self) -> Option<usize> {
+        self.context_used_tokens
     }
     fn context_window_tokens(&self) -> Option<usize> {
         self.context_window_tokens
@@ -4275,7 +4286,11 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         title_str
     };
 
-    let usage = render_main_status_usage(state.token_usage_summary(), state.context_window_tokens());
+    let usage = render_main_status_usage(
+        state.token_usage_summary(),
+        state.context_used_tokens(),
+        state.context_window_tokens(),
+    );
     let activity = render_generation_activity(state);
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
     let full = activity.as_deref().map_or_else(
@@ -4378,9 +4393,13 @@ fn render_main_token_usage(summary: MainSessionTokenUsageSummary) -> String {
     crate::chat::session::format_session_token_usage_inline(summary).unwrap_or_else(|| "0 tok | $0.0000".to_string())
 }
 
-fn render_main_status_usage(summary: MainSessionTokenUsageSummary, context_window_tokens: Option<usize>) -> String {
+fn render_main_status_usage(
+    summary: MainSessionTokenUsageSummary,
+    context_used_tokens: Option<usize>,
+    context_window_tokens: Option<usize>,
+) -> String {
     let mut usage = render_main_token_usage(summary);
-    if let Some(context) = render_context_budget_usage(summary, context_window_tokens) {
+    if let Some(context) = render_context_budget_usage(context_used_tokens, context_window_tokens) {
         usage.push_str(" | ");
         usage.push_str(&context);
     }
@@ -4388,18 +4407,18 @@ fn render_main_status_usage(summary: MainSessionTokenUsageSummary, context_windo
 }
 
 fn render_context_budget_usage(
-    summary: MainSessionTokenUsageSummary,
+    context_used_tokens: Option<usize>,
     context_window_tokens: Option<usize>,
 ) -> Option<String> {
     let window = u64::try_from(context_window_tokens?).ok()?.max(1);
-    let pct = summary
-        .total_tokens
+    let used = u64::try_from(context_used_tokens?).ok()?;
+    let pct = used
         .saturating_mul(100)
         .saturating_add(window.saturating_sub(1))
-        / window;
-    let prefix = if summary.has_estimates() { "~" } else { "" };
+        .saturating_div(window)
+        .min(100);
     let suffix = if pct >= 85 { "!" } else { "" };
-    Some(format!("{prefix}ctx:{pct}%{suffix}"))
+    Some(format!("ctx:{pct}% used{suffix}"))
 }
 
 /// Count the exact number of rows ratatui's word-wrapping
@@ -9987,12 +10006,13 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_renders_context_budget_percent_with_estimate_marker() {
+    fn status_bar_renders_context_budget_percent_from_current_context_source() {
         let mut state = TuiState::new("provider", "model");
+        state.context_used_tokens = Some(8_500);
         state.context_window_tokens = Some(10_000);
         state.token_usage_summary = MainSessionTokenUsageSummary {
-            total_tokens: 8_500,
-            estimated_tokens: 8_500,
+            total_tokens: 50_000,
+            estimated_tokens: 50_000,
             request_count: 1,
             known_cost_usd: 0.002,
             ..MainSessionTokenUsageSummary::default()
@@ -10001,13 +10021,29 @@ mod tests {
         let line = render_status_bar_text(&state, 140);
 
         assert!(
-            line.contains("~8.5k tok"),
+            line.contains("~50.0k tok"),
             "estimated token count remains marked: {line}"
         );
         assert!(
-            line.contains("~ctx:85%!"),
-            "estimated context budget warns near full: {line}"
+            line.contains("ctx:85% used!"),
+            "context budget uses current context numerator, not cumulative tokens: {line}"
         );
+        assert!(
+            !line.contains("~ctx") && !line.contains("ctx:100"),
+            "context budget should not inherit token estimate marker or cumulative total: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_caps_context_budget_percent_at_100() {
+        let mut state = TuiState::new("provider", "model");
+        state.context_used_tokens = Some(15_000);
+        state.context_window_tokens = Some(10_000);
+
+        let line = render_status_bar_text(&state, 140);
+
+        assert!(line.contains("ctx:100% used!"), "context budget caps at 100%: {line}");
+        assert!(!line.contains("ctx:150"), "context budget must not exceed 100%: {line}");
     }
 
     #[test]
@@ -10280,6 +10316,7 @@ mod tests {
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.strip_selection = Some(7);
+            state.ui.context_used_tokens = Some(2_500);
             state.ui.context_window_tokens = Some(10_000_000);
             state.ui.chat_mode = ChatMode::Auto;
             state.ui.autonomy_level = AutonomyLevel::ReadOnly;
@@ -10316,6 +10353,7 @@ mod tests {
             tui.autonomy_level = AutonomyLevel::ReadOnly;
             tui.focus = crate::chat::sessions::FocusTarget::Diff;
             tui.active_session_view = Some(active_view);
+            tui.context_used_tokens = Some(2_500);
             tui.context_window_tokens = Some(10_000_000);
             tui.saved_session_picker = Some(saved_picker);
 
@@ -10366,6 +10404,10 @@ mod tests {
             assert_eq!(
                 BottomChromeView::pending_tool_approval(&tui),
                 BottomChromeView::pending_tool_approval(&snap)
+            );
+            assert_eq!(
+                BottomChromeView::context_used_tokens(&tui),
+                BottomChromeView::context_used_tokens(&snap)
             );
             assert_eq!(
                 BottomChromeView::context_window_tokens(&tui),
