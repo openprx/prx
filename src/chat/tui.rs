@@ -3351,6 +3351,11 @@ fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: boo
     }
 }
 
+const SESSION_STRIP_CHIP_MAX_WIDTH: u16 = 24;
+const SESSION_STRIP_USAGE_CHIP_MAX_WIDTH: u16 = 48;
+const SESSION_STRIP_IDLE_CHIP_MAX_WIDTH: u16 = 30;
+const SESSION_STRIP_TITLE_MAX_WIDTH: u16 = 10;
+
 fn render_sessions_strip_entry(
     entry: &crate::chat::sessions::SwitcherEntry,
     active_seq: Option<u64>,
@@ -3371,23 +3376,36 @@ fn render_sessions_strip_entry(
     let usage = entry
         .token_usage_summary()
         .and_then(crate::chat::session::format_session_token_usage_inline);
+    let chip_cap = if usage.is_some() {
+        SESSION_STRIP_USAGE_CHIP_MAX_WIDTH
+    } else if entry.idle_warning {
+        SESSION_STRIP_IDLE_CHIP_MAX_WIDTH
+    } else {
+        SESSION_STRIP_CHIP_MAX_WIDTH
+    };
+    let chip_width = max_width.min(chip_cap);
     let prefix = usage.map_or_else(
-        || format!("{marker} {glyph} #{} {} {elapsed}{idle} ", entry.seq, entry.kind),
-        |usage| {
-            format!(
-                "{marker} {glyph} #{} {} {elapsed}{idle} {usage} ",
-                entry.seq, entry.kind
-            )
-        },
+        || format!("{marker}{glyph} #{} {} {elapsed}{idle}", entry.seq, entry.kind),
+        |usage| format!("{marker}{glyph} #{} {} {elapsed}{idle} {usage}", entry.seq, entry.kind),
     );
     let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
-    let max = usize::from(max_width);
+    let max = usize::from(chip_width);
     if prefix_cols >= max {
-        return truncate_chars_with_ellipsis(&prefix, max_width, ascii);
+        return truncate_chars_with_ellipsis(&prefix, chip_width, ascii);
     }
-    let title_budget = u16::try_from(max.saturating_sub(prefix_cols)).unwrap_or(u16::MAX);
+    let remaining = max.saturating_sub(prefix_cols);
+    if remaining <= 1 {
+        return prefix;
+    }
+    let title_budget = u16::try_from(remaining.saturating_sub(1))
+        .unwrap_or(u16::MAX)
+        .min(SESSION_STRIP_TITLE_MAX_WIDTH);
     let title = truncate_chars_with_ellipsis(&entry.title, title_budget, ascii);
-    format!("{prefix}{title}")
+    if title.is_empty() {
+        prefix
+    } else {
+        format!("{prefix} {title}")
+    }
 }
 
 fn render_sessions_strip_line(
@@ -3439,29 +3457,144 @@ fn render_sessions_strip_styled_line(
     }
 
     let active_seq = focus.session_seq();
-    let sep = if ascii { " | " } else { " \u{00B7} " };
-    let mut used_cols = 0usize;
+    let target_idx = strip_selection_index(entries, strip_selection, focus);
+    let start = target_idx
+        .map(|target| sessions_strip_window_start(entries, active_seq, ascii, content_width, target))
+        .unwrap_or(0);
     let mut spans = vec![Span::raw(" ")];
-    for entry in entries {
-        let mut remaining = usize::from(content_width).saturating_sub(used_cols);
-        if remaining == 0 {
-            break;
+    spans.extend(render_sessions_strip_window(
+        entries,
+        start,
+        active_seq,
+        strip_selection,
+        ascii,
+        content_width,
+    ));
+    Line::from(spans)
+}
+
+fn sessions_strip_window_start(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    active_seq: Option<u64>,
+    ascii: bool,
+    width: u16,
+    target_idx: usize,
+) -> usize {
+    for start in 0..=target_idx {
+        let visible = sessions_strip_visible_indices(entries, start, active_seq, ascii, width);
+        if visible.contains(&target_idx) {
+            return start;
         }
-        if used_cols > 0 {
-            let sep_cols = UnicodeWidthStr::width(sep);
-            if remaining <= sep_cols {
-                break;
-            }
-            spans.push(Span::raw(sep));
-            remaining = remaining.saturating_sub(sep_cols);
-            used_cols = used_cols.saturating_add(sep_cols);
+    }
+    target_idx.min(entries.len().saturating_sub(1))
+}
+
+fn sessions_strip_visible_indices(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    start: usize,
+    active_seq: Option<u64>,
+    ascii: bool,
+    width: u16,
+) -> Vec<usize> {
+    let mut visible = Vec::new();
+    let mut used_cols = 0usize;
+    let width_cols = usize::from(width);
+    if width_cols == 0 || start >= entries.len() {
+        return visible;
+    }
+    let left = sessions_strip_left_overflow(start, ascii);
+    if !left.is_empty() {
+        let left_cols = UnicodeWidthStr::width(left);
+        if left_cols >= width_cols {
+            return visible;
+        }
+        used_cols = used_cols.saturating_add(left_cols);
+    }
+    for idx in start..entries.len() {
+        let Some(entry) = entries.get(idx) else {
+            break;
+        };
+        let sep_cols = usize::from(idx > start);
+        let hidden_after = entries.len().saturating_sub(idx.saturating_add(1));
+        let right_cols = sessions_strip_right_overflow_width(hidden_after, ascii);
+        let available = width_cols
+            .saturating_sub(used_cols)
+            .saturating_sub(sep_cols)
+            .saturating_sub(right_cols);
+        if available == 0 {
+            break;
         }
         let segment =
-            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(remaining).unwrap_or(u16::MAX));
-        if segment.is_empty() {
+            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(available).unwrap_or(u16::MAX));
+        let segment_cols = UnicodeWidthStr::width(segment.as_str());
+        let seq_marker = format!("#{}", entry.seq);
+        if segment.is_empty()
+            || segment_cols == 0
+            || !segment.contains(seq_marker.as_str())
+            || used_cols
+                .saturating_add(sep_cols)
+                .saturating_add(segment_cols)
+                .saturating_add(right_cols)
+                > width_cols
+        {
             break;
         }
+        visible.push(idx);
+        used_cols = used_cols.saturating_add(sep_cols).saturating_add(segment_cols);
+    }
+    visible
+}
+
+fn render_sessions_strip_window(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    start: usize,
+    active_seq: Option<u64>,
+    strip_selection: Option<u64>,
+    ascii: bool,
+    width: u16,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let width_cols = usize::from(width);
+    if width_cols == 0 || start >= entries.len() {
+        return spans;
+    }
+
+    let mut used_cols = 0usize;
+    let left = sessions_strip_left_overflow(start, ascii);
+    if !left.is_empty() {
+        let left_cols = UnicodeWidthStr::width(left);
+        if left_cols >= width_cols {
+            spans.push(Span::raw(truncate_chars_with_ellipsis(left, width, ascii)));
+            return spans;
+        }
+        spans.push(Span::styled(left.to_string(), Style::default().fg(Color::DarkGray)));
+        used_cols = used_cols.saturating_add(left_cols);
+    }
+
+    let visible = sessions_strip_visible_indices(entries, start, active_seq, ascii, width);
+    for (position, idx) in visible.iter().copied().enumerate() {
+        let Some(entry) = entries.get(idx) else {
+            break;
+        };
+        if position > 0 {
+            spans.push(Span::raw(" "));
+            used_cols = used_cols.saturating_add(1);
+        }
+        let hidden_after = entries.len().saturating_sub(idx.saturating_add(1));
+        let right_cols = sessions_strip_right_overflow_width(hidden_after, ascii);
+        let available = width_cols.saturating_sub(used_cols).saturating_sub(right_cols);
+        if available == 0 {
+            break;
+        }
+        let segment =
+            render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(available).unwrap_or(u16::MAX));
         let segment_cols = UnicodeWidthStr::width(segment.as_str());
+        if segment.is_empty()
+            || segment_cols == 0
+            || used_cols.saturating_add(segment_cols).saturating_add(right_cols) > width_cols
+        {
+            break;
+        }
         let selected = strip_selection == Some(entry.seq);
         if selected {
             spans.push(Span::styled(
@@ -3476,7 +3609,49 @@ fn render_sessions_strip_styled_line(
         }
         used_cols = used_cols.saturating_add(segment_cols);
     }
-    Line::from(spans)
+
+    let rendered_last = visible.last().copied();
+    let hidden_after = rendered_last.map_or_else(
+        || entries.len().saturating_sub(start),
+        |idx| entries.len().saturating_sub(idx.saturating_add(1)),
+    );
+    if hidden_after > 0 {
+        let right = sessions_strip_right_overflow(hidden_after, ascii);
+        let right_cols = UnicodeWidthStr::width(right.as_str());
+        if used_cols.saturating_add(right_cols) <= width_cols {
+            spans.push(Span::styled(right, Style::default().fg(Color::DarkGray)));
+        }
+    }
+
+    spans
+}
+
+const fn sessions_strip_left_overflow(start: usize, ascii: bool) -> &'static str {
+    if start == 0 {
+        ""
+    } else if ascii {
+        "< "
+    } else {
+        "\u{2039} "
+    }
+}
+
+fn sessions_strip_right_overflow(hidden_after: usize, ascii: bool) -> String {
+    if hidden_after == 0 {
+        String::new()
+    } else if ascii {
+        format!(" +{hidden_after}>")
+    } else {
+        format!(" +{hidden_after}\u{203A}")
+    }
+}
+
+fn sessions_strip_right_overflow_width(hidden_after: usize, ascii: bool) -> usize {
+    if hidden_after == 0 {
+        0
+    } else {
+        UnicodeWidthStr::width(sessions_strip_right_overflow(hidden_after, ascii).as_str())
+    }
 }
 
 fn active_session_visible_lines(view: &crate::chat::sessions::ActiveSessionView, visible_rows: usize) -> Vec<String> {
@@ -7974,6 +8149,17 @@ mod tests {
         }
     }
 
+    fn long_strip_entries(count: u64) -> Vec<crate::chat::sessions::SwitcherEntry> {
+        (1..=count)
+            .map(|seq| {
+                let mut entry = elapsed_entry(seq, "completed", i64::try_from(seq).unwrap_or(i64::MAX));
+                entry.title =
+                    format!("List 3 strengths of a terminal chat UI. Return only concise bullets for run {seq}");
+                entry
+            })
+            .collect()
+    }
+
     #[test]
     fn switcher_row_wide_includes_kind_origin_status() {
         let e = pty_entry(3, "vim notes.md");
@@ -8106,7 +8292,118 @@ mod tests {
         let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
         assert!(line.contains("#1"), "first session visible: {line}");
         assert!(line.contains("#2"), "second session visible: {line}");
-        assert!(line.contains('\u{00B7}'), "entries separated in one row: {line}");
+        assert!(line.contains(" #2"), "entries separated in one row: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_long_titles_render_multiple_compact_chips() {
+        let entries = long_strip_entries(6);
+        let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 94);
+
+        assert!(line.contains("#1"), "first compact chip visible: {line}");
+        assert!(line.contains("#2"), "second compact chip visible: {line}");
+        assert!(line.contains("#3"), "third compact chip visible: {line}");
+        assert!(
+            !line.contains("Return only concise bullets"),
+            "strip keeps long descriptions out of compact chips: {line}"
+        );
+        assert!(
+            UnicodeWidthStr::width(line.as_str()) <= 94,
+            "compact strip must fit 94 cols, got {}: {line}",
+            UnicodeWidthStr::width(line.as_str())
+        );
+    }
+
+    #[test]
+    fn sessions_strip_selection_beyond_initial_window_is_visible_and_highlighted() {
+        let entries = long_strip_entries(8);
+        let line = render_sessions_strip_styled_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Main,
+            Some(8),
+            false,
+            58,
+        );
+        let plain = line_to_plain(&line);
+
+        assert!(plain.contains("#8"), "selected seq is windowed into view: {plain}");
+        assert!(
+            plain.contains('\u{2039}'),
+            "leading overflow indicator appears: {plain}"
+        );
+
+        let selected = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("#8"))
+            .expect("test: selected span");
+        assert_eq!(selected.style.bg, Some(Color::Cyan));
+        assert_eq!(selected.style.fg, Some(Color::Black));
+        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn sessions_strip_active_entry_drives_window_when_no_selection() {
+        let entries = long_strip_entries(8);
+        let line = render_sessions_strip_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 7 },
+            false,
+            58,
+        );
+
+        assert!(line.contains("#7"), "active seq is windowed into view: {line}");
+        assert!(line.contains('\u{25B8}'), "active marker remains distinct: {line}");
+        assert!(line.contains('\u{2039}'), "leading overflow indicator appears: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_overflow_indicator_has_ascii_fallback() {
+        let entries = long_strip_entries(8);
+        let line = render_sessions_strip_line_with_selection(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Main,
+            Some(3),
+            true,
+            58,
+        );
+
+        assert!(line.contains("#3"), "selected seq is visible in ASCII mode: {line}");
+        assert!(
+            line.contains('>') && line.contains('+'),
+            "ASCII right overflow/count affordance appears when entries remain hidden: {line}"
+        );
+    }
+
+    #[test]
+    fn sessions_strip_zero_width_and_one_entry_edge_cases_do_not_panic() {
+        let entries = long_strip_entries(1);
+        let empty = render_sessions_strip_line_with_selection(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 1 },
+            Some(1),
+            false,
+            0,
+        );
+        assert!(empty.is_empty());
+
+        let one = render_sessions_strip_line_with_selection(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 1 },
+            Some(1),
+            false,
+            18,
+        );
+        assert!(one.contains("#1"), "single selected chip still renders: {one}");
+        assert!(
+            UnicodeWidthStr::width(one.as_str()) <= 18,
+            "single-chip strip must fit narrow width: {one}"
+        );
     }
 
     #[test]
