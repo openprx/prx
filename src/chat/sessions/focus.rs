@@ -335,6 +335,8 @@ pub enum EscAction {
     CloseSwitcher,
     /// Input buffer is non-empty → clear it (preserves existing muscle memory).
     ClearInput,
+    /// A main turn is generating → interrupt it before local input/focus cleanup.
+    CancelGenerating,
     /// Input is empty and a session is focused → detach back to main.
     RequestDetach,
     /// Input is empty and the read-only transcript viewer is focused → close it.
@@ -352,16 +354,20 @@ pub enum EscAction {
 /// Priority order, deliberately layered so the established "non-empty input
 /// clears" behaviour is never weakened:
 /// 1. Switcher open → close the switcher.
-/// 2. Input non-empty → clear input (muscle memory preserved).
-/// 3. Input empty + session focused → detach.
-/// 4. Input empty + transcript focused → close transcript.
-/// 5. Input empty + approval focused → deny the pending tool.
-/// 6. Input empty + diff focused → close diff.
-/// 7. Input empty + main focus → cancel (unchanged legacy behaviour).
+/// 2. Generating → interrupt the active turn.
+/// 3. Input non-empty → clear input (muscle memory preserved).
+/// 4. Input empty + session focused → detach.
+/// 5. Input empty + transcript focused → close transcript.
+/// 6. Input empty + approval focused → deny the pending tool.
+/// 7. Input empty + diff focused → close diff.
+/// 8. Input empty + main focus → cancel (unchanged legacy behaviour).
 #[must_use]
-pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool) -> EscAction {
+pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool, generating: bool) -> EscAction {
     if switcher_open {
         return EscAction::CloseSwitcher;
+    }
+    if generating {
+        return EscAction::CancelGenerating;
     }
     if !input_empty {
         return EscAction::ClearInput;
@@ -715,31 +721,52 @@ mod tests {
     fn resolve_esc_switcher_open_takes_priority() {
         // Even with non-empty input and session focus, an open switcher closes first.
         assert_eq!(
-            resolve_esc(false, FocusTarget::Session { seq: 1 }, true),
+            resolve_esc(false, FocusTarget::Session { seq: 1 }, true, false),
             EscAction::CloseSwitcher
         );
-        assert_eq!(resolve_esc(true, FocusTarget::Main, true), EscAction::CloseSwitcher);
+        assert_eq!(
+            resolve_esc(true, FocusTarget::Main, true, false),
+            EscAction::CloseSwitcher
+        );
+    }
+
+    #[test]
+    fn resolve_esc_generating_interrupts_before_input_or_focus_cleanup() {
+        assert_eq!(
+            resolve_esc(false, FocusTarget::Session { seq: 1 }, false, true),
+            EscAction::CancelGenerating
+        );
+        assert_eq!(
+            resolve_esc(true, FocusTarget::Diff, false, true),
+            EscAction::CancelGenerating
+        );
     }
 
     #[test]
     fn resolve_esc_nonempty_clears_input() {
         // Muscle memory: non-empty input always clears first (when no switcher).
-        assert_eq!(resolve_esc(false, FocusTarget::Main, false), EscAction::ClearInput);
         assert_eq!(
-            resolve_esc(false, FocusTarget::Session { seq: 2 }, false),
+            resolve_esc(false, FocusTarget::Main, false, false),
             EscAction::ClearInput
         );
         assert_eq!(
-            resolve_esc(false, FocusTarget::Transcript, false),
+            resolve_esc(false, FocusTarget::Session { seq: 2 }, false, false),
             EscAction::ClearInput
         );
-        assert_eq!(resolve_esc(false, FocusTarget::Diff, false), EscAction::ClearInput);
+        assert_eq!(
+            resolve_esc(false, FocusTarget::Transcript, false, false),
+            EscAction::ClearInput
+        );
+        assert_eq!(
+            resolve_esc(false, FocusTarget::Diff, false, false),
+            EscAction::ClearInput
+        );
     }
 
     #[test]
     fn resolve_esc_empty_session_detaches() {
         assert_eq!(
-            resolve_esc(true, FocusTarget::Session { seq: 5 }, false),
+            resolve_esc(true, FocusTarget::Session { seq: 5 }, false, false),
             EscAction::RequestDetach
         );
     }
@@ -747,19 +774,19 @@ mod tests {
     #[test]
     fn resolve_esc_empty_transcript_closes_transcript() {
         assert_eq!(
-            resolve_esc(true, FocusTarget::Transcript, false),
+            resolve_esc(true, FocusTarget::Transcript, false, false),
             EscAction::CloseTranscript
         );
     }
 
     #[test]
     fn resolve_esc_empty_diff_closes_diff() {
-        assert_eq!(resolve_esc(true, FocusTarget::Diff, false), EscAction::CloseDiff);
+        assert_eq!(resolve_esc(true, FocusTarget::Diff, false, false), EscAction::CloseDiff);
     }
 
     #[test]
     fn resolve_esc_empty_main_cancels() {
-        assert_eq!(resolve_esc(true, FocusTarget::Main, false), EscAction::Cancel);
+        assert_eq!(resolve_esc(true, FocusTarget::Main, false, false), EscAction::Cancel);
     }
 
     // ── v1.1b P0: attach/detach input-routing race ──────────────────────────
@@ -794,7 +821,7 @@ mod tests {
         let focus = optimistic_focus(RoutingIntent::Attach { seq: 5 });
         assert_eq!(focus, FocusTarget::Session { seq: 5 });
         // Next submittable input perceives session focus, matching FIFO routing.
-        assert_eq!(resolve_esc(true, focus, false), EscAction::RequestDetach);
+        assert_eq!(resolve_esc(true, focus, false, false), EscAction::RequestDetach);
     }
 
     #[test]
@@ -803,7 +830,7 @@ mod tests {
         // input is perceived (and routed) as a main-chat turn, not a stale steer.
         let focus = optimistic_focus(RoutingIntent::Detach);
         assert_eq!(focus, FocusTarget::Main);
-        assert_eq!(resolve_esc(true, focus, false), EscAction::Cancel);
+        assert_eq!(resolve_esc(true, focus, false, false), EscAction::Cancel);
     }
 
     #[test]

@@ -7882,7 +7882,11 @@ fn run_tui_unified_loop(
                             false,
                         );
                     }
-                    tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
+                    tui::KeyDispatch::Cancelled => {
+                        let _ = chat_dispatcher
+                            .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_tui_esc");
+                    }
+                    tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }
             }
             Event::Paste(text) => {

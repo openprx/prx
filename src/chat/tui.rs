@@ -1100,6 +1100,12 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         input_first_line_chars = state.input.lines.first().map(|s| s.chars().count()).unwrap_or(0),
         "dispatch_global_key_entry"
     );
+    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        return KeyDispatch::InterruptTurn;
+    }
+    if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && state.input.is_empty() {
+        return KeyDispatch::Exit;
+    }
     // P7c: the saved chat-session picker has top overlay priority. It is
     // distinct from the child-TUI Ctrl+G switcher and captures all keys while
     // open so navigation cannot leak into input history or child switching.
@@ -1268,7 +1274,8 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             return KeyDispatch::StripSelectionChanged { selected: None };
         }
         use crate::chat::sessions::focus::{EscAction, resolve_esc};
-        match resolve_esc(state.input.is_empty(), state.focus, false) {
+        match resolve_esc(state.input.is_empty(), state.focus, false, state.streaming.is_some()) {
+            EscAction::CancelGenerating => return KeyDispatch::InterruptTurn,
             EscAction::ClearInput => {
                 // Preserve existing behaviour: clear the buffer, signal cancel.
                 let _ = state.handle_input_key(key);
@@ -4230,29 +4237,63 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
     };
 
     let usage = render_main_token_usage(state.token_usage_summary());
+    let activity = render_generation_activity(state);
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
-    let full = format!(
-        " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
-        state.provider(),
-        state.model(),
-        title,
-        state.turn_count(),
-    );
+    let full = if let Some(activity) = activity.as_deref() {
+        format!(
+            " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} | {activity} ",
+            state.provider(),
+            state.model(),
+            title,
+            state.turn_count(),
+        )
+    } else {
+        format!(
+            " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
+            state.provider(),
+            state.model(),
+            title,
+            state.turn_count(),
+        )
+    };
     if full.chars().count() <= usize::from(width) {
         return full;
     }
 
-    let compact = format!(
-        " PRX Chat | {}/{} | {permissions} | {usage} ",
-        state.provider(),
-        state.model()
-    );
+    let compact = if let Some(activity) = activity.as_deref() {
+        format!(
+            " PRX Chat | {}/{} | {permissions} | {usage} | {activity} ",
+            state.provider(),
+            state.model()
+        )
+    } else {
+        format!(
+            " PRX Chat | {}/{} | {permissions} | {usage} ",
+            state.provider(),
+            state.model()
+        )
+    };
     if compact.chars().count() <= usize::from(width) {
         return compact;
     }
 
-    let minimal = format!(" PRX | {permissions} | {usage} ");
+    let minimal = if let Some(activity) = activity.as_deref() {
+        format!(" PRX | {permissions} | {activity} ")
+    } else {
+        format!(" PRX | {permissions} | {usage} ")
+    };
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
+}
+
+fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option<String> {
+    let streaming = state.streaming()?;
+    let frames = if state.ascii_fallback() {
+        ["-", "\\", "|", "/"]
+    } else {
+        ["⠋", "⠙", "⠹", "⠸"]
+    };
+    let frame = frames[usize::try_from(streaming.version % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0)];
+    Some(format!("{frame} generating 0s (esc to interrupt)"))
 }
 
 fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
@@ -7782,6 +7823,38 @@ mod tests {
     }
 
     #[test]
+    fn overlay_open_ctrl_c_and_empty_ctrl_d_keep_global_semantics() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/mo".chars() {
+            let _ = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+        }
+        assert!(state.slash_menu.is_some());
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::InterruptTurn
+        );
+        state.input.clear();
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Exit
+        );
+    }
+
+    #[test]
+    fn esc_during_generation_interrupts_before_clearing_input() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("draft text");
+        state.start_stream("draft-1");
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Esc), &mut state),
+            KeyDispatch::InterruptTurn
+        );
+        assert_eq!(state.input.text(), "draft text");
+    }
+
+    #[test]
     fn approval_focus_without_pending_esc_resets_to_main() {
         let mut state = TuiState::new("p", "m");
         state.focus = crate::chat::sessions::FocusTarget::Approval;
@@ -9610,6 +9683,23 @@ mod tests {
         assert!(
             line.contains("~2.0k tok | $0.0020"),
             "estimated usage should be marked: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_generation_interrupt_hint() {
+        let mut state = TuiState::new("provider", "model");
+        state.start_stream("draft-1");
+
+        let line = render_status_bar_text(&state, 120);
+
+        assert!(
+            line.contains("generating 0s"),
+            "status shows generation activity: {line}"
+        );
+        assert!(
+            line.contains("(esc to interrupt)"),
+            "status exposes esc interrupt affordance: {line}"
         );
     }
 

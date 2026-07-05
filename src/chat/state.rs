@@ -854,6 +854,21 @@ impl ChatState {
     fn reduce_key_pressed(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) -> Vec<Effect> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            let prev = self.ui.last_ctrlc_ms;
+            self.ui.last_ctrlc_ms = now_ms;
+            if prev != 0 && now_ms.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                return vec![Effect::Quit];
+            }
+            return self.reduce_cancel_requested();
+        }
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
+            return vec![Effect::Quit];
+        }
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
+            return self.reduce_cancel_requested();
+        }
+
         if self.ui.pending_tool_approval.is_some()
             || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
         {
@@ -898,22 +913,8 @@ impl ChatState {
         if key.code == KeyCode::Char('l') && key.modifiers == KeyModifiers::CONTROL {
             return vec![Effect::RequestRedraw];
         }
-        // Ctrl+C → 单击取消 / 双击退出（500ms 窗口）
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            let prev = self.ui.last_ctrlc_ms;
-            self.ui.last_ctrlc_ms = now_ms;
-            if prev != 0 && now_ms.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
-                // 双击 → 优雅退出。Effect::Quit 由外壳触发 shutdown_token.cancel()
-                return vec![Effect::Quit];
-            }
-            // 单击 → 仅记录窗口；实际 cancel 由外壳读取 active_cancel
-            return vec![];
-        }
         // Ctrl+D → 空 buffer 退出 / 非空 forward-delete（委托 handle_key）
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
-            if self.ui.input.is_empty() {
-                return vec![Effect::Quit];
-            }
             // 非空 buffer 转发为 Delete
             let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
             let _ = self.ui.input.handle_key(synthetic);
@@ -1637,8 +1638,8 @@ impl ChatState {
     /// 当前 UI 未单独显示 progress 字段；保留 Action 是为了未来扩展 + 钩子触发.
     /// 不 mutate UI 状态（签名仍接受 `&self` 但 reducer 入口统一传 `&mut`，
     /// 此处用 `&self` 让 clippy::needless-pass-by-ref-mut 静音）.
-    fn reduce_tool_progress(&self, iteration: usize, max: usize) -> Vec<Effect> {
-        let _ = &self.ui; // 强制依赖 self 防止变 const fn
+    fn reduce_tool_progress(&mut self, iteration: usize, max: usize) -> Vec<Effect> {
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -2534,7 +2535,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolStarted { .. }
         | Action::ToolFinished { .. } => true,
         // 仅 LogTrace，不变 UI
-        Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } | Action::StreamUsageMetered { .. } => false,
+        Action::StreamRetryAttempt { .. } | Action::StreamUsageMetered { .. } => false,
+        Action::ToolProgress { .. } => true,
         // Foreground approval writes pending view + focus.
         Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {
             true
@@ -4236,15 +4238,16 @@ mod tests {
             }
         }
 
-        /// Step3-11: ToolProgress 仅返回 RequestRedraw + LogTrace
+        /// Step3-11: ToolProgress returns redraw/log and bumps UI generation.
         #[test]
-        fn test_redux_tool_progress_returns_log_and_redraw() {
+        fn test_redux_tool_progress_returns_log_redraw_and_visible_generation() {
             let mut state = s();
+            let before = state.ui.conversation_generation;
             let effects = state.reduce(Action::ToolProgress { iteration: 3, max: 10 });
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
-            // 不 mutate conversation_lines
             assert!(state.ui.conversation_lines.is_empty());
+            assert_eq!(state.ui.conversation_generation, before + 1);
         }
 
         /// Step3-12: finalize 路径的幂等性 — 即便 StreamCompleted 被错误地重复
@@ -4312,6 +4315,31 @@ mod tests {
                 state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
                 Some("retry".to_string())
             );
+        }
+
+        #[test]
+        fn esc_key_during_generation_cancels_active_turn() {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-esc".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            state.ui.input.set_text("local draft");
+
+            let effects = state.reduce_with_now(
+                Action::KeyPressed(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                1_000,
+            );
+
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::CancelDraft(id) if id == "draft-esc")),
+                "Esc while generating must cancel the active draft: {effects:?}"
+            );
+            assert!(!state.control.generating);
+            assert_eq!(state.ui.input.text(), "local draft");
         }
 
         /// P1-2: Both 模式下连续 10 个正常 Action — 无语义差异（diff_count 基线验证）.
@@ -7178,10 +7206,10 @@ mod tests {
         }
 
         #[test]
-        fn s4_a_1_ui_dirty_false_on_log_trace_only_actions() {
+        fn s4_a_1_tool_progress_dirty_but_retry_trace_only_is_clean() {
             let mut state = make_state();
             let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1, max: 3 });
-            assert!(!d, "ToolProgress 仅 LogTrace, 不应 dirty");
+            assert!(d, "ToolProgress must dirty Pure snapshots so progress is visible");
             let (_e, d2) = state.reduce_tracked(Action::StreamRetryAttempt {
                 attempt: 1,
                 reason: "x".into(),
