@@ -3164,9 +3164,10 @@ pub async fn run(
     // Off / legacy 路径不读 signal，构造成本极低（Arc<Notify>）。
     let turn_signal = dispatcher::TurnCompletionSignal::new();
 
-    // S4-A Commit 3: Pure 模式构造 watch::channel<Arc<UiSnapshot>>，dispatcher
-    // 在 ui_dirty=true 时推送新 snapshot；其他模式（Off/Both/Redux）传 None
-    // 维持 chat_mirror 单源路径。
+    // S4-A Commit 3: 构造 watch::channel<Arc<UiSnapshot>>，dispatcher
+    // 在 ui_dirty=true 时推送新 snapshot；TUI render and child views consume
+    // this reducer-owned snapshot as the primary UI source, with chat_mirror kept
+    // only for synchronous key-thread compatibility and fallback.
     //
     // rx 在 Commit 4 接入 run_tui_unified_loop；本 commit 仅 trace 观察推送频率，
     // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
@@ -3283,9 +3284,9 @@ pub async fn run(
                     // into `chat_mirror`.
                     let redraw_tx_main = redraw_tx.clone();
                     let redraw_tx_loop = redraw_tx.clone();
-                    // S4-A Commit 4: Pure 模式把 snapshot_rx 传给 unified loop，
-                    // 让其从 watch::Receiver borrow snapshot 替代 chat_mirror.lock()。
-                    // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
+                    // S4-A Commit 4: 把 snapshot_rx 传给 unified loop，让其从
+                    // watch::Receiver borrow reducer-owned snapshot 替代
+                    // chat_mirror.lock() on the render path.
                     spawn_tui_unified_loop(
                         input_tx,
                         control_tx.clone(),
@@ -4829,7 +4830,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             attached_follow_seq = None;
                             #[cfg(feature = "terminal-tui")]
                             {
-                                open_transcript_view(&chat_mirror, &chat_dispatcher, sessions_redraw_handle.as_ref());
+                                open_transcript_view(
+                                    &chat_mirror,
+                                    &chat_dispatcher,
+                                    sessions_redraw_handle.as_ref(),
+                                    snapshot_rx_for_tui.as_ref(),
+                                );
                             }
                             #[cfg(not(feature = "terminal-tui"))]
                             emit_chat_output("Transcript viewer is only available in the terminal TUI.");
@@ -7548,7 +7554,19 @@ fn open_transcript_view(
     mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
+    snapshot_rx: Option<&tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) {
+    let snapshot_source = snapshot_rx.and_then(|rx| {
+        let snapshot = rx.borrow();
+        if snapshot.conversation_lines.is_empty() {
+            None
+        } else {
+            Some((
+                snapshot.session_title.to_string(),
+                snapshot.conversation_lines.as_ref().clone(),
+            ))
+        }
+    });
     let (view, focus) = {
         let mut guard = mirror.lock();
         let previous_offset = guard
@@ -7556,7 +7574,11 @@ fn open_transcript_view(
             .as_ref()
             .filter(|view| view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str())
             .map_or(0, |view| view.scroll_offset);
-        let view = tui::build_transcript_view(&guard.session_title, &guard.conversation_lines, previous_offset);
+        let view = if let Some((session_title, conversation_lines)) = snapshot_source {
+            tui::build_transcript_view(&session_title, &conversation_lines, previous_offset)
+        } else {
+            tui::build_transcript_view(&guard.session_title, &guard.conversation_lines, previous_offset)
+        };
         let focus = crate::chat::sessions::FocusTarget::Transcript;
         guard.focus = focus;
         guard.active_session_view = Some(view.clone());
@@ -11996,7 +12018,7 @@ mod p6b1_transcript_tests {
         let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
         let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
 
-        open_transcript_view(&mirror, &dispatcher, Some(&redraw_tx));
+        open_transcript_view(&mirror, &dispatcher, Some(&redraw_tx), None);
 
         {
             let guard = mirror.lock();
@@ -12031,6 +12053,82 @@ mod p6b1_transcript_tests {
             other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
         }
         assert!(redraw_rx.try_recv().is_ok(), "open should request redraw");
+    }
+
+    #[test]
+    fn open_transcript_view_prefers_redux_snapshot_over_empty_mirror() {
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
+        {
+            let guard = mirror.lock();
+            assert!(
+                guard.conversation_lines.is_empty(),
+                "test must model the real Redux-only shape: mirror transcript is empty"
+            );
+        }
+
+        let mut state = crate::chat::state::ChatState::new(
+            Arc::from("p"),
+            Arc::from("m"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.session.title = "redux chat".to_string();
+        state.ui.conversation_lines.push(tui::ConversationLine::User {
+            content: "redux-only user".to_string(),
+        });
+        state.ui.conversation_lines.push(tui::ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "echo ok".to_string(),
+            args_full: "echo ok".to_string(),
+            status: tui::ToolStatus::Done,
+            elapsed_ms: Some(12),
+            result: Some("ok".to_string()),
+            folded: false,
+        });
+        let snapshot = Arc::new(state.build_ui_snapshot(1));
+        let (_snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(snapshot);
+
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+
+        open_transcript_view(&mirror, &dispatcher, None, Some(&snapshot_rx));
+
+        let view = {
+            let guard = mirror.lock();
+            guard.active_session_view.clone().expect("transcript view")
+        };
+        assert_eq!(view.title, "redux chat");
+        assert!(
+            view.lines.iter().any(|line| line.contains("redux-only user")),
+            "transcript must render Redux-only user line: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().any(|line| line.contains("tool shell")),
+            "transcript must render Redux-only tool output line: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().all(|line| !line.contains("(transcript is empty)")),
+            "snapshot-backed transcript must not fall back to empty mirror: {:?}",
+            view.lines
+        );
+
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Transcript);
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                let view = view.expect("transcript view action");
+                assert!(
+                    view.lines.iter().any(|line| line.contains("redux-only user")),
+                    "dispatched view must carry Redux-only transcript: {:?}",
+                    view.lines
+                );
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
     }
 
     #[test]

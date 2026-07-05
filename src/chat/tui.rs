@@ -2914,7 +2914,7 @@ pub trait BottomChromeView {
     /// Main-session cumulative token/cost summary.
     fn token_usage_summary(&self) -> MainSessionTokenUsageSummary;
     /// Current input-routing target (v1.1b). Drives the prompt's colour+glyph
-    /// target indicator (`main >` vs `agent #N ▸`).
+    /// target indicator (`main >` vs `<kind> #N ▸`).
     fn focus(&self) -> crate::chat::sessions::FocusTarget;
     /// Open Ctrl+G session switcher overlay (v1.1b), or `None` when closed.
     fn switcher(&self) -> Option<&crate::chat::sessions::SwitcherState>;
@@ -5430,13 +5430,17 @@ fn subagent_identity_tag(meta: &SubagentMeta) -> String {
 /// The target is dual-encoded with **colour AND text/glyph** so it is never
 /// colour-only (colour-blind / no-color terminals still read the target):
 /// - [`FocusTarget::Main`] → dim cyan `> ` (unchanged from the original prompt).
-/// - [`FocusTarget::Session`] → blue bold `agent #N ▸ ` (or `agent #N > ` under
-///   ASCII fallback). The literal "agent #N" text carries the meaning even with
-///   styling stripped.
+/// - [`FocusTarget::Session`] → blue bold `<kind> #N ▸ ` (or `<kind> #N > `
+///   under ASCII fallback). The literal kind + sequence text carries the meaning
+///   even with styling stripped.
 ///
 /// Returns the [`Span`] plus its column width so the continuation rows and the
 /// terminal cursor can align under the typed text.
-fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (Span<'static>, usize) {
+fn prompt_indicator(
+    focus: crate::chat::sessions::FocusTarget,
+    ascii: bool,
+    session_kind: Option<&str>,
+) -> (Span<'static>, usize) {
     match focus {
         crate::chat::sessions::FocusTarget::Main => {
             // Calmer dim cyan `> ` (matches the long-standing Claude Code prompt).
@@ -5445,7 +5449,11 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
         }
         crate::chat::sessions::FocusTarget::Session { seq } => {
             let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
-            let label = format!("agent #{seq} {arrow} ");
+            let kind = session_kind
+                .map(str::trim)
+                .filter(|kind| !kind.is_empty())
+                .unwrap_or(crate::chat::sessions::model::ManagedKind::Agent.as_str());
+            let label = format!("{kind} #{seq} {arrow} ");
             let width = UnicodeWidthStr::width(label.as_str());
             let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
             (span, width)
@@ -5474,11 +5482,26 @@ fn prompt_indicator(focus: crate::chat::sessions::FocusTarget, ascii: bool) -> (
     }
 }
 
+fn focused_session_kind<V: BottomChromeView + ?Sized>(state: &V, seq: u64) -> Option<&str> {
+    if let Some(view) = state.active_session_view().filter(|view| view.seq == seq) {
+        return Some(view.kind.as_str());
+    }
+    state
+        .sessions_entries()
+        .iter()
+        .find(|entry| entry.seq == seq)
+        .map(|entry| entry.kind)
+}
+
 fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
     // Compose prompt lines: the first row gets the input-target indicator
     // (v1.1b), continuation rows are aligned with blanks of the same width.
     let input_ref = state.input();
-    let (prompt_span, prompt_width) = prompt_indicator(state.focus(), state.ascii_fallback());
+    let session_kind = state
+        .focus()
+        .session_seq()
+        .and_then(|seq| focused_session_kind(state, seq));
+    let (prompt_span, prompt_width) = prompt_indicator(state.focus(), state.ascii_fallback(), session_kind);
     let continuation = " ".repeat(prompt_width);
     let rendered_lines: Vec<Line<'_>> = input_ref
         .lines
@@ -9502,22 +9525,30 @@ mod tests {
 
     #[test]
     fn prompt_indicator_main_vs_session() {
-        let (main_span, main_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Main, false);
+        let (main_span, main_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Main, false, None);
         assert_eq!(main_span.content.as_ref(), "> ");
         assert_eq!(main_w, 2);
-        let (sess_span, sess_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, false);
+        let (sess_span, sess_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, false, None);
         assert!(sess_span.content.contains("agent #4"), "carries the target as text");
         assert!(sess_span.content.contains('\u{25B8}'), "uses the ▸ glyph");
         assert_eq!(sess_w, UnicodeWidthStr::width(sess_span.content.as_ref()));
         // ASCII fallback drops the unicode glyph but keeps the text target.
-        let (ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, true);
+        let (ascii_span, _) = prompt_indicator(crate::chat::sessions::FocusTarget::Session { seq: 4 }, true, None);
         assert!(ascii_span.content.contains("agent #4"));
         assert!(!ascii_span.content.contains('\u{25B8}'), "ascii fallback omits ▸");
-        let (transcript_span, transcript_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Transcript, false);
+        let (shell_span, _) = prompt_indicator(
+            crate::chat::sessions::FocusTarget::Session { seq: 4 },
+            false,
+            Some("shell"),
+        );
+        assert!(shell_span.content.contains("shell #4"));
+        assert!(!shell_span.content.contains("agent #4"));
+        let (transcript_span, transcript_w) =
+            prompt_indicator(crate::chat::sessions::FocusTarget::Transcript, false, None);
         assert!(transcript_span.content.contains("transcript"));
         assert!(transcript_span.content.contains('\u{25B8}'));
         assert_eq!(transcript_w, UnicodeWidthStr::width(transcript_span.content.as_ref()));
-        let (diff_span, diff_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Diff, false);
+        let (diff_span, diff_w) = prompt_indicator(crate::chat::sessions::FocusTarget::Diff, false, None);
         assert!(diff_span.content.contains("diff"));
         assert_eq!(diff_w, UnicodeWidthStr::width(diff_span.content.as_ref()));
     }
@@ -10779,6 +10810,44 @@ mod tests {
                 fullscreen_bottom_chrome_height(&tui),
                 fullscreen_bottom_chrome_height(&snap)
             );
+        }
+
+        #[test]
+        fn s4_a_2_snapshot_prompt_uses_shell_kind_for_attached_session() {
+            let mut state = make_state_with_lines();
+            state.ui.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+            state.ui.sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+                seq: 1,
+                kind: crate::chat::sessions::model::ManagedKind::Shell.as_str(),
+                origin: crate::chat::sessions::model::SessionOrigin::User.as_str(),
+                status: crate::chat::sessions::model::ManagedStatus::Running.as_str(),
+                title: "echo ok".to_string(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
+                idle_warning: false,
+            }];
+            let snap = state.build_ui_snapshot(12);
+
+            let (span, width) = prompt_indicator(
+                snap.focus(),
+                snap.ascii_fallback(),
+                snap.focus()
+                    .session_seq()
+                    .and_then(|seq| focused_session_kind(&snap, seq)),
+            );
+
+            assert!(
+                span.content.contains("shell #1"),
+                "attached shell prompt must identify the ManagedKind: {}",
+                span.content
+            );
+            assert!(
+                !span.content.contains("agent #1"),
+                "shell attach prompt must not fall back to agent: {}",
+                span.content
+            );
+            assert_eq!(width, UnicodeWidthStr::width(span.content.as_ref()));
         }
 
         #[test]
