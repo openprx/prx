@@ -6783,12 +6783,18 @@ struct CrosstermExternalEditorTerminalMode;
 
 #[cfg(feature = "terminal-tui")]
 fn write_external_editor_suspend_sequences(out: &mut dyn std::io::Write) {
-    crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(out);
+    crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(
+        out,
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+    );
 }
 
 #[cfg(feature = "terminal-tui")]
 fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write) {
-    crate::chat::sessions::pty::write_handoff_terminal_restore(out);
+    crate::chat::sessions::pty::write_handoff_terminal_restore(
+        out,
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+    );
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -7488,7 +7494,11 @@ async fn reattach_pty(
         // the ack times out we do NOT proceed (running while the render loop might
         // still touch the terminal would corrupt the screen). `acquire` un-pauses
         // the render loop itself on timeout, so we just report the abort.
-        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
+        let Some(_guard) = PtyHandoffGuard::acquire(
+            handoff,
+            redraw_nudge,
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+        ) else {
             return PtyOutcome::AttachAborted;
         };
         PtyOutcome::Exited(run_pty_attach(&session_for_passthrough))
@@ -10338,6 +10348,37 @@ mod terminal_guard_tests {
     }
 
     #[test]
+    fn fullscreen_enter_rolls_back_when_keyboard_enhancement_push_fails() {
+        let mut ops = FakeTerminalModeOps {
+            keyboard_enhancement_supported: true,
+            fail_push_keyboard_enhancement: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let err = enter_terminal_state_with_ops(&mut ops).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(!CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::Acquire));
+        assert!(
+            !CHAT_FULLSCREEN_ACTIVE.load(Ordering::Acquire),
+            "failed keyboard-enhancement push must roll back fullscreen active flag"
+        );
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "enable_mouse_capture",
+                "supports_keyboard_enhancement",
+                "push_keyboard_enhancement_flags",
+                "disable_mouse_capture",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
     fn fullscreen_terminal_lifecycle_pushes_and_pops_keyboard_enhancement_when_supported() {
         let mut ops = FakeTerminalModeOps {
             keyboard_enhancement_supported: true,
@@ -11184,6 +11225,7 @@ mod p6b2_external_editor_tests {
 
     #[test]
     fn external_editor_fullscreen_suspend_leaves_alt_and_restore_reenters() {
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, Ordering::SeqCst);
         let mut suspend = Vec::new();
         write_external_editor_suspend_sequences(&mut suspend);
         let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
@@ -11209,6 +11251,29 @@ mod p6b2_external_editor_tests {
             alt_enter < mouse_enable,
             "fullscreen editor restore must re-enable chat mouse capture after chat alt-screen: {restore:?}"
         );
+    }
+
+    #[test]
+    fn external_editor_handoff_pops_and_repushes_keyboard_flags_when_active() {
+        let previous = CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.swap(true, Ordering::SeqCst);
+
+        let mut suspend = Vec::new();
+        write_external_editor_suspend_sequences(&mut suspend);
+        let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
+        assert!(
+            suspend.starts_with("\x1b[<1u"),
+            "active keyboard enhancement must be popped before editor handoff: {suspend:?}"
+        );
+
+        let mut restore = Vec::new();
+        write_external_editor_restore_sequences(&mut restore);
+        let restore = String::from_utf8(restore).expect("test: restore escape bytes are utf-8");
+        assert!(
+            restore.ends_with("\x1b[>15u"),
+            "active keyboard enhancement must be re-pushed after editor handoff: {restore:?}"
+        );
+
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(previous, Ordering::SeqCst);
     }
 }
 
