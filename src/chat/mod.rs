@@ -1279,6 +1279,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SavedSessionPickerClosed => "SavedSessionPickerClosed",
         tui::KeyDispatch::ResumeSavedSession { .. } => "ResumeSavedSession",
         tui::KeyDispatch::AttachSession { .. } => "AttachSession",
+        tui::KeyDispatch::StripSelectionChanged { .. } => "StripSelectionChanged",
         tui::KeyDispatch::RequestDetach => "RequestDetach",
         tui::KeyDispatch::ScrollSessionUp => "ScrollSessionUp",
         tui::KeyDispatch::ScrollSessionDown => "ScrollSessionDown",
@@ -1336,6 +1337,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SavedSessionPickerClosed
         | tui::KeyDispatch::ResumeSavedSession { .. }
         | tui::KeyDispatch::AttachSession { .. }
+        | tui::KeyDispatch::StripSelectionChanged { .. }
         | tui::KeyDispatch::RequestDetach
         | tui::KeyDispatch::ScrollSessionUp
         | tui::KeyDispatch::ScrollSessionDown
@@ -7475,6 +7477,12 @@ fn run_tui_unified_loop(
                         if send_synthetic_command(&input_tx, &command).is_err() {
                             return Ok(());
                         }
+                    }
+                    tui::KeyDispatch::StripSelectionChanged { selected } => {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::StripSelectionChanged { selected },
+                            "chat.strip_selection_changed",
+                        );
                     }
                     tui::KeyDispatch::SwitchSession { seq } => {
                         // P3: directional child-session switching reuses the

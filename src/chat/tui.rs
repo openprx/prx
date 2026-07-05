@@ -106,6 +106,11 @@ pub struct TuiState {
     /// Owned by the synchronous key thread (opened/navigated/closed in
     /// `dispatch_global_key`); rendered as a bottom-chrome popup.
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// UI-only bottom-strip selection for direct Alt+arrow navigation. This is
+    /// deliberately separate from [`crate::chat::sessions::FocusTarget`]: it
+    /// highlights a strip entry but never changes input routing until Alt+Enter
+    /// reuses the existing synthetic `/attach N` path.
+    pub strip_selection: Option<u64>,
     /// Open slash-command menu overlay, or `None` when the cursor is not inside
     /// a leading command token.
     pub slash_menu: Option<SlashMenuState>,
@@ -570,6 +575,9 @@ pub enum KeyDispatch {
     /// key loop sends a synthetic `/attach <seq>` through the input channel so
     /// the async main loop performs the attach via its existing handler.
     AttachSession { seq: u64 },
+    /// Phase B: the bottom strip's UI-only selection changed. `None` clears the
+    /// highlight without changing input-routing focus.
+    StripSelectionChanged { selected: Option<u64> },
     /// v1.1b: detach the focused child session (Esc on empty input while a
     /// session is focused). The key loop sends a synthetic `/detach` through the
     /// input channel so the async main loop performs the detach.
@@ -886,6 +894,52 @@ fn switcher_entries_with_transcript(
     out
 }
 
+fn strip_selection_index(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    selected: Option<u64>,
+    focus: crate::chat::sessions::FocusTarget,
+) -> Option<usize> {
+    selected
+        .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
+        .or_else(|| {
+            focus
+                .session_seq()
+                .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
+        })
+}
+
+fn move_strip_selection(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    selected: Option<u64>,
+    focus: crate::chat::sessions::FocusTarget,
+    direction: crate::chat::sessions::SessionDirection,
+) -> Option<u64> {
+    if entries.is_empty() {
+        return None;
+    }
+    let current = strip_selection_index(entries, selected, focus);
+    let target_idx = match (current, direction) {
+        (Some(idx), crate::chat::sessions::SessionDirection::Previous) => {
+            idx.checked_sub(1).unwrap_or_else(|| entries.len().saturating_sub(1))
+        }
+        (Some(idx), crate::chat::sessions::SessionDirection::Next) => {
+            let next = idx.saturating_add(1);
+            if next >= entries.len() { 0 } else { next }
+        }
+        (None, crate::chat::sessions::SessionDirection::Previous) => entries.len().saturating_sub(1),
+        (None, crate::chat::sessions::SessionDirection::Next) => 0,
+    };
+    entries.get(target_idx).map(|entry| entry.seq)
+}
+
+fn selected_strip_entry<'a>(
+    entries: &'a [crate::chat::sessions::SwitcherEntry],
+    selected: Option<u64>,
+) -> Option<&'a crate::chat::sessions::SwitcherEntry> {
+    let seq = selected?;
+    entries.iter().find(|entry| entry.seq == seq)
+}
+
 const fn tool_status_name(status: ToolStatus) -> &'static str {
     match status {
         ToolStatus::Running => "running",
@@ -1109,6 +1163,24 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
         return KeyDispatch::SwitcherOpened { entries };
     }
+    if key.modifiers == KeyModifiers::ALT {
+        let direction = match key.code {
+            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            let selected = move_strip_selection(&state.sessions_cache, state.strip_selection, state.focus, direction);
+            state.strip_selection = selected;
+            return KeyDispatch::StripSelectionChanged { selected };
+        }
+        if key.code == KeyCode::Enter {
+            return selected_strip_entry(&state.sessions_cache, state.strip_selection)
+                .map_or(KeyDispatch::Consumed, |entry| KeyDispatch::AttachSession {
+                    seq: entry.seq,
+                });
+        }
+    }
     if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
         return KeyDispatch::OpenTranscriptViewer;
     }
@@ -1175,6 +1247,9 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // between the established "non-empty clears input" muscle memory and the new
     // "empty + session focused → detach" behaviour, never weakening the former.
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        if state.strip_selection.take().is_some() {
+            return KeyDispatch::StripSelectionChanged { selected: None };
+        }
         use crate::chat::sessions::focus::{EscAction, resolve_esc};
         match resolve_esc(state.input.is_empty(), state.focus, false) {
             EscAction::ClearInput => {
@@ -2170,6 +2245,7 @@ impl TuiState {
             sessions_status: String::new(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
+            strip_selection: None,
             slash_menu: None,
             sessions_cache: Vec::new(),
             saved_sessions_cache: Vec::new(),
@@ -2750,6 +2826,8 @@ pub trait BottomChromeView {
     fn sessions_status(&self) -> &str;
     /// Structured child-session entries for the always-visible P1 strip.
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
+    /// UI-only bottom-strip selection, separate from input-routing focus.
+    fn strip_selection(&self) -> Option<u64>;
     /// Focused line-session viewport (P2), if any.
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
     /// Foreground tool approval prompt (P6c1), if any.
@@ -2805,6 +2883,9 @@ impl BottomChromeView for TuiState {
     }
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         &self.sessions_cache
+    }
+    fn strip_selection(&self) -> Option<u64> {
+        self.strip_selection
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
@@ -2868,6 +2949,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         self.sessions_entries.as_slice()
+    }
+    fn strip_selection(&self) -> Option<u64> {
+        self.strip_selection
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
@@ -3199,17 +3283,18 @@ fn centered_overlay_rect(frame_area: Rect, width_pct: u16, height_pct: u16, min_
 /// truncated to the row width so a narrow terminal degrades gracefully rather
 /// than wrapping into the input box.
 fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    let text = render_sessions_strip_line(
+    let line = render_sessions_strip_styled_line(
         state.sessions_entries(),
         state.sessions_status(),
         state.focus(),
+        state.strip_selection(),
         state.ascii_fallback(),
         area.width,
     );
-    if text.is_empty() {
+    if line.spans.is_empty() {
         return;
     }
-    let widget = Paragraph::new(text).style(Style::default().fg(Color::Cyan).bg(Color::Black));
+    let widget = Paragraph::new(Text::from(line)).style(Style::default().fg(Color::Cyan).bg(Color::Black));
     frame.render_widget(widget, area);
 }
 
@@ -3285,10 +3370,10 @@ fn render_sessions_strip_entry(
         || format!("{marker} {glyph} #{} {} {elapsed} ", entry.seq, entry.kind),
         |usage| format!("{marker} {glyph} #{} {} {elapsed} {usage} ", entry.seq, entry.kind),
     );
-    let prefix_cols = prefix.chars().count();
+    let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
     let max = usize::from(max_width);
     if prefix_cols >= max {
-        return prefix.chars().take(max).collect();
+        return truncate_chars_with_ellipsis(&prefix, max_width, ascii);
     }
     let title_budget = u16::try_from(max.saturating_sub(prefix_cols)).unwrap_or(u16::MAX);
     let title = truncate_chars_with_ellipsis(&entry.title, title_budget, ascii);
@@ -3302,43 +3387,86 @@ fn render_sessions_strip_line(
     ascii: bool,
     width: u16,
 ) -> String {
+    render_sessions_strip_line_with_selection(entries, summary, focus, None, ascii, width)
+}
+
+fn render_sessions_strip_line_with_selection(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    summary: &str,
+    focus: crate::chat::sessions::FocusTarget,
+    strip_selection: Option<u64>,
+    ascii: bool,
+    width: u16,
+) -> String {
+    render_sessions_strip_styled_line(entries, summary, focus, strip_selection, ascii, width)
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn render_sessions_strip_styled_line(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    summary: &str,
+    focus: crate::chat::sessions::FocusTarget,
+    strip_selection: Option<u64>,
+    ascii: bool,
+    width: u16,
+) -> Line<'static> {
     if width == 0 {
-        return String::new();
+        return Line::default();
     }
     let content_width = width.saturating_sub(1);
     if content_width == 0 {
-        return String::new();
+        return Line::default();
     }
     if entries.is_empty() {
         if summary.is_empty() {
-            return String::new();
+            return Line::default();
         }
         let text = truncate_chars_with_ellipsis(summary, content_width, ascii);
-        return format!(" {text}");
+        return Line::from(vec![Span::raw(" "), Span::raw(text)]);
     }
 
     let active_seq = focus.session_seq();
     let sep = if ascii { " | " } else { " \u{00B7} " };
-    let mut body = String::new();
+    let mut used_cols = 0usize;
+    let mut spans = vec![Span::raw(" ")];
     for entry in entries {
-        let mut remaining = usize::from(content_width).saturating_sub(body.chars().count());
+        let mut remaining = usize::from(content_width).saturating_sub(used_cols);
         if remaining == 0 {
             break;
         }
-        if !body.is_empty() {
-            let sep_cols = sep.chars().count();
+        if used_cols > 0 {
+            let sep_cols = UnicodeWidthStr::width(sep);
             if remaining <= sep_cols {
                 break;
             }
-            body.push_str(sep);
+            spans.push(Span::raw(sep));
             remaining = remaining.saturating_sub(sep_cols);
+            used_cols = used_cols.saturating_add(sep_cols);
         }
         let segment =
             render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(remaining).unwrap_or(u16::MAX));
-        body.push_str(&segment);
+        if segment.is_empty() {
+            break;
+        }
+        let segment_cols = UnicodeWidthStr::width(segment.as_str());
+        let selected = strip_selection == Some(entry.seq);
+        if selected {
+            spans.push(Span::styled(
+                segment,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            spans.push(Span::raw(segment));
+        }
+        used_cols = used_cols.saturating_add(segment_cols);
     }
-    let body = truncate_chars_with_ellipsis(&body, content_width, ascii);
-    format!(" {body}")
+    Line::from(spans)
 }
 
 fn active_session_visible_lines(view: &crate::chat::sessions::ActiveSessionView, visible_rows: usize) -> Vec<String> {
@@ -7600,6 +7728,146 @@ mod tests {
         }
     }
 
+    fn kind_entry(seq: u64, kind: &'static str) -> crate::chat::sessions::SwitcherEntry {
+        let mut entry = entry(seq);
+        entry.kind = kind;
+        entry
+    }
+
+    #[test]
+    fn alt_arrows_move_ui_only_strip_selection_without_focus_change() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) }
+        );
+        assert_eq!(state.strip_selection, Some(1));
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(2) }
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Left, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) }
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Up, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(3) }
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Down, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) }
+        );
+        assert_eq!(
+            state.focus,
+            crate::chat::sessions::FocusTarget::Main,
+            "strip selection must not change input-routing focus"
+        );
+    }
+
+    #[test]
+    fn alt_arrows_seed_from_focused_session_when_no_strip_selection_exists() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(3) }
+        );
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Session { seq: 2 });
+    }
+
+    #[test]
+    fn alt_enter_attaches_selected_strip_entry_for_all_session_kinds() {
+        for (seq, kind) in [(1, "agent"), (2, "shell"), (3, "pty")] {
+            let mut state = TuiState::new("p", "m");
+            state.sessions_cache = vec![kind_entry(seq, kind)];
+            state.strip_selection = Some(seq);
+
+            assert_eq!(
+                dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
+                KeyDispatch::AttachSession { seq },
+                "Alt+Enter reuses the single attach dispatch for {kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_clears_strip_selection_before_normal_cancel_or_detach() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        state.strip_selection = Some(1);
+        dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Esc), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: None }
+        );
+        assert_eq!(state.strip_selection, None);
+        assert_eq!(
+            state.input.text(),
+            "x",
+            "Esc clears strip highlight before touching input"
+        );
+    }
+
+    #[test]
+    fn bare_arrows_history_cursor_and_child_scroll_are_not_stolen_by_strip_selection() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2)];
+        state.strip_selection = Some(2);
+        dispatch_global_key(key(KeyCode::Char('a')), &mut state);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Submitted("a".to_string())
+        );
+
+        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(state.input.text(), "a", "bare Up still recalls input history");
+        assert_eq!(state.strip_selection, Some(2));
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "bare Left still edits the input cursor"
+        );
+        assert_eq!(state.input.cursor, (0, 0));
+
+        state.input.clear();
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+        state.active_session_view = Some(crate::chat::sessions::ActiveSessionView {
+            seq: 1,
+            kind: "agent".to_string(),
+            title: "task 1".to_string(),
+            lines: vec!["one".to_string(), "two".to_string(), "three".to_string()],
+            truncated: false,
+            scroll_offset: 0,
+        });
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut state),
+            KeyDispatch::PageSessionUp,
+            "PageUp keeps the focused child scroll binding"
+        );
+    }
+
+    #[test]
+    fn ctrl_g_still_opens_switcher_when_strip_selection_exists() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1), entry(2)];
+        state.strip_selection = Some(2);
+
+        let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+
+        assert!(matches!(out, KeyDispatch::SwitcherOpened { .. }));
+        assert!(state.switcher.is_some(), "Ctrl+G modal remains available");
+        assert_eq!(state.strip_selection, Some(2), "modal does not reuse routing focus");
+    }
+
     fn usage_record(
         source: crate::llm::route_decision::TokenUsageSource,
     ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
@@ -7779,6 +8047,41 @@ mod tests {
         assert!(line.contains("#1"), "first session visible: {line}");
         assert!(line.contains("#2"), "second session visible: {line}");
         assert!(line.contains('\u{00B7}'), "entries separated in one row: {line}");
+    }
+
+    #[test]
+    fn sessions_strip_selected_entry_is_highlighted_separately_from_focus() {
+        let entries = vec![entry(1), entry(2)];
+        let line = render_sessions_strip_styled_line(
+            &entries,
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 1 },
+            Some(2),
+            false,
+            96,
+        );
+        let plain = line_to_plain(&line);
+        assert!(plain.contains("#1"), "focused entry remains visible: {plain}");
+        assert!(plain.contains("#2"), "selected entry remains visible: {plain}");
+
+        let selected = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("#2"))
+            .expect("test: selected span");
+        assert_eq!(selected.style.bg, Some(Color::Cyan));
+        assert_eq!(selected.style.fg, Some(Color::Black));
+        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+
+        let focused = line
+            .spans
+            .iter()
+            .find(|span| span.content.contains("#1"))
+            .expect("test: focused span");
+        assert_eq!(
+            focused.style.bg, None,
+            "input-routing focus uses the active marker, not selected highlight"
+        );
     }
 
     #[test]
@@ -9061,6 +9364,7 @@ mod tests {
                 token_usage_records: Vec::new(),
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
+            state.ui.strip_selection = Some(7);
             state.ui.context_window_tokens = Some(10_000_000);
             state.ui.chat_mode = ChatMode::Auto;
             state.ui.autonomy_level = AutonomyLevel::ReadOnly;
@@ -9092,6 +9396,7 @@ mod tests {
             tui.streaming.clone_from(&state.stream.draft);
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
+            tui.strip_selection = Some(7);
             tui.chat_mode = ChatMode::Auto;
             tui.autonomy_level = AutonomyLevel::ReadOnly;
             tui.focus = crate::chat::sessions::FocusTarget::Diff;
@@ -9139,6 +9444,10 @@ mod tests {
                 BottomChromeView::active_session_view(&snap)
             );
             assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
+            assert_eq!(
+                BottomChromeView::strip_selection(&tui),
+                BottomChromeView::strip_selection(&snap)
+            );
             assert_eq!(
                 BottomChromeView::pending_tool_approval(&tui),
                 BottomChromeView::pending_tool_approval(&snap)

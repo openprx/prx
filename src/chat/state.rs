@@ -316,6 +316,9 @@ pub struct UiState {
     /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
     /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// UI-only bottom-strip selection for direct Alt+arrow navigation. Separate
+    /// from `focus`: this highlights an entry but does not route input there.
+    pub strip_selection: Option<u64>,
     /// Slash-command menu overlay. Derived from the current input command token.
     pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
@@ -377,6 +380,8 @@ pub struct UiSnapshot {
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
+    /// UI-only bottom-strip selection. `None` means no highlighted strip entry.
+    pub strip_selection: Option<u64>,
     /// Slash-command menu overlay.
     pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker overlay.
@@ -410,6 +415,7 @@ impl UiSnapshot {
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
+            strip_selection: None,
             slash_menu: None,
             saved_session_picker: None,
         }
@@ -518,6 +524,7 @@ impl ChatState {
                 token_usage_summary: MainSessionTokenUsageSummary::default(),
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
+                strip_selection: None,
                 slash_menu: None,
                 saved_session_picker: None,
             },
@@ -589,6 +596,7 @@ impl ChatState {
             token_usage_summary: self.ui.token_usage_summary,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
+            strip_selection: self.ui.strip_selection,
             slash_menu: self.ui.slash_menu.clone(),
             saved_session_picker: self.ui.saved_session_picker.clone(),
         }
@@ -798,6 +806,7 @@ impl ChatState {
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
             Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
             Action::SwitcherClosed => self.reduce_switcher_closed(),
+            Action::StripSelectionChanged { selected } => self.reduce_strip_selection_changed(selected),
             Action::SavedSessionPickerOpened { entries } => self.reduce_saved_session_picker_opened(entries),
             Action::SavedSessionPickerMoved { selected } => self.reduce_saved_session_picker_moved(selected),
             Action::SavedSessionPickerClosed => self.reduce_saved_session_picker_closed(),
@@ -2184,6 +2193,16 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::StripSelectionChanged` — update the UI-only bottom-strip
+    /// highlight without changing input-routing focus.
+    fn reduce_strip_selection_changed(&mut self, selected: Option<u64>) -> Vec<Effect> {
+        if self.ui.strip_selection == selected {
+            return Vec::new();
+        }
+        self.ui.strip_selection = selected;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::SavedSessionPickerOpened` (P7c) — open the saved chat-session
     /// history picker, separate from the child-TUI Ctrl+G switcher.
     fn reduce_saved_session_picker_opened(
@@ -2499,6 +2518,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::SwitcherOpened { .. }
         | Action::SwitcherMoved { .. }
         | Action::SwitcherClosed
+        | Action::StripSelectionChanged { .. }
         | Action::SavedSessionPickerOpened { .. }
         | Action::SavedSessionPickerMoved { .. }
         | Action::SavedSessionPickerClosed => true,
@@ -2770,6 +2790,31 @@ mod tests {
         // Closing again is a no-op.
         let effects = state.reduce(Action::SwitcherClosed);
         assert!(effects.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn strip_selection_changed_writes_snapshot_without_focus_change() {
+        let mut state = make_state();
+        state.ui.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+
+        let effects = state.reduce(Action::StripSelectionChanged { selected: Some(2) });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.strip_selection, Some(2));
+        assert_eq!(
+            state.ui.focus,
+            crate::chat::sessions::FocusTarget::Session { seq: 1 },
+            "strip selection is not input routing focus"
+        );
+        assert_eq!(state.build_ui_snapshot(1).strip_selection, Some(2));
+
+        let effects = state.reduce(Action::StripSelectionChanged { selected: Some(2) });
+        assert!(effects.is_empty(), "unchanged strip selection is a reducer no-op");
+
+        let effects = state.reduce(Action::StripSelectionChanged { selected: None });
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.strip_selection, None);
     }
 
     #[cfg(feature = "terminal-tui")]
