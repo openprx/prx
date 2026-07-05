@@ -1064,6 +1064,17 @@ fn format_turn_elapsed_message(
 }
 
 #[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
+fn turn_elapsed_message_for_surface(
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    redraw_tx?;
+    Some(format_turn_elapsed_message(status, started_at, finished_at))
+}
+
+#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
 fn surface_turn_elapsed_message(
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
@@ -1073,11 +1084,10 @@ fn surface_turn_elapsed_message(
 ) {
     #[cfg(feature = "terminal-tui")]
     {
-        surface_session_message(
-            dispatcher,
-            redraw_tx,
-            &format_turn_elapsed_message(status, started_at, finished_at),
-        );
+        let Some(text) = turn_elapsed_message_for_surface(redraw_tx, status, started_at, finished_at) else {
+            return;
+        };
+        surface_session_message(dispatcher, redraw_tx, &text);
     }
 }
 
@@ -1350,6 +1360,20 @@ mod runtime_display_tests {
         assert_eq!(
             format_turn_elapsed_message("completed", ts("2026-07-04T12:00:00Z"), ts("2026-07-04T12:00:03Z")),
             "turn completed 3s"
+        );
+    }
+
+    #[test]
+    fn plain_mode_suppresses_turn_elapsed_chrome() {
+        assert_eq!(
+            turn_elapsed_message_for_surface(
+                None,
+                "completed",
+                ts("2026-07-04T12:00:00Z"),
+                ts("2026-07-04T12:00:03Z")
+            ),
+            None,
+            "plain/fallback path must not surface turn completed chrome"
         );
     }
 }
