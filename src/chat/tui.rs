@@ -1151,6 +1151,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         "dispatch_global_key_entry"
     );
     if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+        state.clear_pending_tool_approval();
         return KeyDispatch::InterruptTurn;
     }
     if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && state.input.is_empty() {
@@ -1265,12 +1266,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if key.code == KeyCode::Char('r') && key.modifiers == KeyModifiers::CONTROL {
         let _ = state.input.begin_or_cycle_reverse_search();
         return KeyDispatch::Consumed;
-    }
-    // Ctrl+C → interrupt active turn. We intentionally do NOT exit on a
-    // single press; the persistent ctrl_c() signal handler in chat/mod.rs
-    // already implements the double-press exit semantics.
-    if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-        return KeyDispatch::InterruptTurn;
     }
     // Ctrl+D → EOF when the input buffer is empty; otherwise treat as a
     // forward-delete (delegated to the input box via Delete equivalence).
@@ -2348,6 +2343,15 @@ impl TuiState {
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             external_editor_prefix_armed: false,
         }
+    }
+
+    pub fn clear_pending_tool_approval(&mut self) -> bool {
+        let had_pending = self.pending_tool_approval.take().is_some();
+        let had_approval_focus = matches!(self.focus, crate::chat::sessions::FocusTarget::Approval);
+        if had_approval_focus {
+            self.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+        had_pending || had_approval_focus
     }
 
     // ── P3-5: streaming-draft API ──────────────────────────────────────────
@@ -8135,10 +8139,33 @@ mod tests {
 
         assert_eq!(out, KeyDispatch::InterruptTurn);
         assert!(
-            state.pending_tool_approval.is_some(),
-            "dispatch only requests interruption; reducer CancelRequested clears approval"
+            state.pending_tool_approval.is_none(),
+            "Ctrl+C must clear mirror approval so later input is not swallowed"
         );
-        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+    }
+
+    #[test]
+    fn approval_child_ctrl_c_allows_next_message_submission() {
+        let mut state = approval_state();
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::InterruptTurn
+        );
+        for ch in "next".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Submitted("next".to_string())
+        );
+        assert!(state.pending_tool_approval.is_none());
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
     }
 
     #[test]

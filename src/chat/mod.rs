@@ -7687,6 +7687,9 @@ fn run_tui_unified_loop(
                         }
                         // Single Ctrl+C is handled by the reducer path
                         // (Action::CancelRequested -> Effect::CancelToken).
+                        if mirror.lock().clear_pending_tool_approval() {
+                            let _ = redraw_tx.try_send(());
+                        }
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::CancelRequested,
                             "chat.cancel_tui_single_ctrlc",
