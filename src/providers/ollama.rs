@@ -1,7 +1,8 @@
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderUsageAccumulator, TokenUsage};
 use crate::multimodal;
 use crate::providers::traits::{
-    ChatMessage, ChatResponse, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions, StreamResult,
-    ToolCall, ToolCallChunk,
+    ChatMessage, ChatResponse, ChatTrace, Provider, ProviderCapabilities, StreamChunk, StreamError, StreamOptions,
+    StreamResult, ToolCall, ToolCallChunk,
 };
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -65,6 +66,10 @@ struct Options {
 #[derive(Debug, Deserialize)]
 struct ApiChatResponse {
     message: ResponseMessage,
+    #[serde(default)]
+    prompt_eval_count: Option<serde_json::Value>,
+    #[serde(default)]
+    eval_count: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -73,6 +78,10 @@ struct StreamChatResponse {
     message: Option<ResponseMessage>,
     #[serde(default)]
     done: bool,
+    #[serde(default)]
+    prompt_eval_count: Option<serde_json::Value>,
+    #[serde(default)]
+    eval_count: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -203,6 +212,127 @@ impl OllamaProvider {
                 })
                 .collect(),
         )
+    }
+
+    fn usage_from_eval_counts(
+        prompt_eval_count: Option<&serde_json::Value>,
+        eval_count: Option<&serde_json::Value>,
+    ) -> Option<TokenUsage> {
+        let prompt = prompt_eval_count
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let completion = eval_count
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok());
+        let (Some(prompt), Some(completion)) = (prompt, completion) else {
+            return None;
+        };
+        Some(TokenUsage::reported(
+            Some(prompt),
+            Some(completion),
+            Some(prompt.saturating_add(completion)),
+        ))
+    }
+
+    fn estimate_completion_usage(response: &ChatResponse) -> TokenUsage {
+        let chars = response.text.as_deref().unwrap_or("").chars().count()
+            + response.reasoning_content.as_deref().unwrap_or("").chars().count();
+        let accumulator = ProviderUsageAccumulator::new();
+        accumulator.finish_or_estimate_completion_chars(chars)
+    }
+
+    fn parse_api_chat_response(&self, response: ApiChatResponse) -> ChatResponse {
+        // Route `thinking` to reasoning_content so it does NOT leak into the
+        // visible text stream. The chat consumer can drop reasoning from the
+        // live UI while history reconstruction still has access to it.
+        let reasoning_content = response.message.thinking.as_ref().and_then(|t| {
+            let trimmed = t.trim();
+            if trimmed.is_empty() { None } else { Some(t.clone()) }
+        });
+
+        // Native tool calls returned by the model.
+        if !response.message.tool_calls.is_empty() {
+            let tool_calls: Vec<ToolCall> = response
+                .message
+                .tool_calls
+                .iter()
+                .map(|tc| {
+                    let (name, args) = self.extract_tool_name_and_args(tc);
+                    ToolCall {
+                        id: tc.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                        name,
+                        arguments: serde_json::to_string(&args).unwrap_or_else(|_| "{}".to_string()),
+                    }
+                })
+                .collect();
+            let text = if response.message.content.is_empty() {
+                None
+            } else {
+                Some(response.message.content)
+            };
+            return ChatResponse {
+                text,
+                tool_calls,
+                reasoning_content,
+            };
+        }
+
+        // Plain text response.
+        let content = response.message.content;
+        if content.is_empty() {
+            if let Some(thinking) = &response.message.thinking {
+                // Empty visible content + thinking-only: the model stopped after
+                // its internal monologue. Log a warning and surface a polite
+                // retry message in the visible text, while preserving the full
+                // thinking content in reasoning_content for history fidelity.
+                tracing::warn!(
+                    "Ollama returned empty content with only thinking: '{}'. Model may have stopped prematurely.",
+                    if thinking.len() > 100 {
+                        &thinking[..100]
+                    } else {
+                        thinking
+                    }
+                );
+                return ChatResponse {
+                    text: Some(
+                        "The model produced only internal reasoning without a final answer. Please try asking again."
+                            .to_string(),
+                    ),
+                    tool_calls: vec![],
+                    reasoning_content,
+                };
+            }
+            tracing::warn!("Ollama returned empty content with no tool calls");
+        }
+        ChatResponse {
+            text: Some(content),
+            tool_calls: vec![],
+            reasoning_content,
+        }
+    }
+
+    async fn chat_metered(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<(ChatResponse, TokenUsage)> {
+        let (normalized_model, should_auth) = self.resolve_request_details(model)?;
+        let api_messages = self.convert_messages(request.messages);
+        let tool_values = Self::convert_stream_tools(request.tools);
+        let response = self
+            .send_request(
+                api_messages,
+                &normalized_model,
+                temperature,
+                should_auth,
+                tool_values.as_deref(),
+            )
+            .await?;
+        let usage = Self::usage_from_eval_counts(response.prompt_eval_count.as_ref(), response.eval_count.as_ref());
+        let response = self.parse_api_chat_response(response);
+        let tokens_used = usage.unwrap_or_else(|| Self::estimate_completion_usage(&response));
+        Ok((response, tokens_used))
     }
 
     fn convert_user_message_content(&self, content: &str) -> (Option<String>, Option<Vec<String>>) {
@@ -700,6 +830,42 @@ impl Provider for OllamaProvider {
         })
     }
 
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        Ok(self.chat_metered(request, model, temperature).await?.0)
+    }
+
+    async fn chat_traced(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (response, tokens_used) = self.chat_metered(request, model, temperature).await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response,
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "ollama".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "ollama".to_string(),
+            final_model: model.to_string(),
+            tokens_used,
+        })
+    }
+
     fn supports_native_tools(&self) -> bool {
         // Ollama's /api/chat supports native function-calling for capable models
         // (qwen2.5, llama3.1, mistral-nemo, etc.). chat_with_tools() sends tool
@@ -827,6 +993,12 @@ impl Provider for OllamaProvider {
                     }
 
                     if parsed.done {
+                        if let Some(usage) =
+                            Self::usage_from_eval_counts(parsed.prompt_eval_count.as_ref(), parsed.eval_count.as_ref())
+                            && tx.send(Ok(StreamChunk::usage(usage))).await.is_err()
+                        {
+                            return;
+                        }
                         let _ = tx.send(Ok(StreamChunk::final_chunk())).await;
                         return;
                     }
@@ -975,6 +1147,45 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    #[test]
+    fn final_eval_counts_map_to_reported_usage() {
+        let response: ApiChatResponse = serde_json::from_str(
+            r#"{
+                "message": {"role": "assistant", "content": "done"},
+                "prompt_eval_count": 31,
+                "eval_count": 9
+            }"#,
+        )
+        .unwrap();
+
+        let usage =
+            OllamaProvider::usage_from_eval_counts(response.prompt_eval_count.as_ref(), response.eval_count.as_ref())
+                .unwrap();
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(31));
+        assert_eq!(usage.completion_tokens, Some(9));
+        assert_eq!(usage.total_tokens, Some(40));
+    }
+
+    #[test]
+    fn malformed_or_partial_eval_counts_do_not_fabricate_reported_usage() {
+        let response: StreamChatResponse = serde_json::from_str(
+            r#"{
+                "done": true,
+                "prompt_eval_count": "bad",
+                "eval_count": 9
+            }"#,
+        )
+        .unwrap();
+
+        assert!(
+            OllamaProvider::usage_from_eval_counts(response.prompt_eval_count.as_ref(), response.eval_count.as_ref())
+                .is_none(),
+            "malformed/partial final stats must fall back to estimate outside the parser"
+        );
     }
 
     #[test]

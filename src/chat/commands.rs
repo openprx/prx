@@ -16,6 +16,7 @@ use super::session;
 use crate::memory::{Memory, MemoryCategory};
 use crate::tools::Tool;
 use anyhow::Result;
+use serde::Serialize;
 
 // Re-export `ChatMode` from the lib crate so the chat slash-command parser
 // and the tool-execution loop share the same type without crossing the
@@ -645,7 +646,7 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
     let filename = format!("prx_chat_{timestamp}.{ext}");
 
     let content = match format {
-        "json" => session.to_json().map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))?,
+        "json" => export_session_json(session)?,
         _ => {
             let mut md = String::new();
             md.push_str(&format!(
@@ -657,11 +658,16 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
                 }
             ));
             md.push_str(&format!(
-                "**Provider**: {} | **Model**: {} | **Date**: {}\n\n---\n\n",
+                "**Provider**: {} | **Model**: {} | **Date**: {}\n\n",
                 session.provider,
                 session.model,
                 session.created_at.format("%Y-%m-%d %H:%M")
             ));
+            if let Some(usage_line) = format_export_usage_line(session) {
+                md.push_str(&usage_line);
+                md.push_str("\n\n");
+            }
+            md.push_str("---\n\n");
             for turn in &session.turns {
                 match turn.role.as_str() {
                     "user" => {
@@ -681,6 +687,118 @@ fn export_session(session: &session::ChatSession, format: &str) -> Result<String
 
     std::fs::write(&filename, &content).map_err(|e| anyhow::anyhow!("write {filename}: {e}"))?;
     Ok(filename)
+}
+
+#[derive(Debug, Serialize)]
+struct ExportUsageMetadata {
+    totals: ExportUsageTotals,
+    turns: Vec<ExportTurnUsage>,
+    records: Vec<session::MainSessionTokenUsageRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportUsageTotals {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    real_tokens: u64,
+    estimated_tokens: u64,
+    request_count: u64,
+    cost_usd: Option<f64>,
+    cost_unknown: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportTurnUsage {
+    request_index: usize,
+    turn_index: Option<usize>,
+    role: &'static str,
+    provider: String,
+    model: String,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+    source: crate::llm::route_decision::TokenUsageSource,
+    cost_usd: Option<f64>,
+}
+
+fn export_usage_metadata(session: &session::ChatSession) -> ExportUsageMetadata {
+    let summary = session.token_usage_summary();
+    let assistant_turns = session
+        .turns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, turn)| (turn.role == "assistant").then_some(index))
+        .collect::<Vec<_>>();
+    let turns = session
+        .token_usage_records
+        .iter()
+        .enumerate()
+        .map(|(request_index, record)| ExportTurnUsage {
+            request_index,
+            turn_index: assistant_turns.get(request_index).copied(),
+            role: "assistant",
+            provider: record.provider.clone(),
+            model: record.model.clone(),
+            prompt_tokens: record.prompt_tokens,
+            completion_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+            source: record.source,
+            cost_usd: record.cost_usd,
+        })
+        .collect();
+
+    ExportUsageMetadata {
+        totals: ExportUsageTotals {
+            prompt_tokens: summary.prompt_tokens,
+            completion_tokens: summary.completion_tokens,
+            total_tokens: summary.total_tokens,
+            real_tokens: summary.reported_tokens,
+            estimated_tokens: summary.estimated_tokens,
+            request_count: summary.request_count,
+            cost_usd: (!summary.cost_is_unknown()).then_some(summary.known_cost_usd),
+            cost_unknown: summary.cost_is_unknown(),
+        },
+        turns,
+        records: session.token_usage_records.clone(),
+    }
+}
+
+fn export_session_json(session: &session::ChatSession) -> Result<String> {
+    let mut value = serde_json::to_value(session).map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))?;
+    let usage =
+        serde_json::to_value(export_usage_metadata(session)).map_err(|e| anyhow::anyhow!("usage serialize: {e}"))?;
+    let Some(object) = value.as_object_mut() else {
+        anyhow::bail!("session JSON root was not an object");
+    };
+    object.insert("usage".to_string(), usage);
+    serde_json::to_string(&value).map_err(|e| anyhow::anyhow!("JSON serialize: {e}"))
+}
+
+fn format_export_usage_line(session: &session::ChatSession) -> Option<String> {
+    let summary = session.token_usage_summary();
+    if !summary.has_usage() {
+        return None;
+    }
+    let prefix = if summary.has_estimates() { "~" } else { "" };
+    let cost = if summary.cost_is_unknown() {
+        if summary.known_cost_usd > 0.0 {
+            format!(
+                "cost unknown (known {})",
+                session::format_cost_usd(summary.known_cost_usd)
+            )
+        } else {
+            "cost unknown".to_string()
+        }
+    } else {
+        session::format_cost_usd(summary.known_cost_usd)
+    };
+    Some(format!(
+        "**Usage**: {prefix}{} tok (real {}, est ~{}) | **Cost**: {cost}",
+        session::format_token_count_compact(summary.total_tokens),
+        session::format_token_count_compact(summary.reported_tokens),
+        session::format_token_count_compact(summary.estimated_tokens),
+    ))
 }
 
 #[cfg(test)]
@@ -1142,6 +1260,96 @@ mod mode_tests {
         assert!(body.contains("JSON_ASSISTANT_ZETA"));
         let parsed = crate::chat::session::ChatSession::from_json(&body).expect("test: json must re-parse");
         assert_eq!(parsed.turn_count(), 2);
+    }
+
+    #[test]
+    fn export_json_includes_usage_metadata_without_breaking_session_import() {
+        let mut session = crate::chat::session::ChatSession::new("openai", "gpt-4o-mini");
+        session.add_user_turn("usage json");
+        session.add_assistant_turn("metered response", Vec::new());
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+                total_tokens: 1_500,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+                cost_usd: Some(0.0105),
+            });
+
+        let path = super::export_session(&session, "json").expect("test: json export should succeed");
+        let body = std::fs::read_to_string(&path).expect("test: exported json should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        let parsed = crate::chat::session::ChatSession::from_json(&body).expect("extra usage field must be ignored");
+        assert_eq!(parsed.turn_count(), 2);
+
+        let value: serde_json::Value = serde_json::from_str(&body).expect("json export should parse");
+        assert_eq!(
+            value
+                .pointer("/usage/totals/total_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_500)
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/totals/real_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(1_500)
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/totals/estimated_tokens")
+                .and_then(serde_json::Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/turns/0/turn_index")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/turns/0/source")
+                .and_then(serde_json::Value::as_str),
+            Some("reported")
+        );
+        assert_eq!(
+            value
+                .pointer("/usage/records/0/provider")
+                .and_then(serde_json::Value::as_str),
+            Some("openai")
+        );
+    }
+
+    #[test]
+    fn export_md_includes_compact_usage_totals_line() {
+        let mut session = crate::chat::session::ChatSession::new("ollama", "llama3");
+        session.add_user_turn("usage md");
+        session.add_assistant_turn("metered response", Vec::new());
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "ollama".to_string(),
+                model: "llama3".to_string(),
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+                total_tokens: 1_500,
+                source: crate::llm::route_decision::TokenUsageSource::Estimated,
+                cost_usd: None,
+            });
+
+        let path = super::export_session(&session, "md").expect("test: md export should succeed");
+        let body = std::fs::read_to_string(&path).expect("test: exported md should be readable");
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            body.contains("**Usage**: ~1.5k tok (real 0, est ~1.5k) | **Cost**: cost unknown"),
+            "usage line missing: {body}"
+        );
     }
 
     /// Phase 3: `/cost` reports metered prompt/completion/total tokens and cost,

@@ -487,18 +487,37 @@ struct NativeChatRequest {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 struct OpenAiCompatibleUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     prompt_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     completion_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     total_tokens: Option<u32>,
 }
 
 impl OpenAiCompatibleUsage {
-    const fn into_reported(self) -> TokenUsage {
-        TokenUsage::reported(self.prompt_tokens, self.completion_tokens, self.total_tokens)
+    fn into_reported(self) -> Option<TokenUsage> {
+        let total = self.total_tokens.or_else(|| {
+            self.prompt_tokens
+                .zip(self.completion_tokens)
+                .map(|(p, c)| p.saturating_add(c))
+        });
+        if total.is_some() || self.prompt_tokens.zip(self.completion_tokens).is_some() {
+            Some(TokenUsage::reported(self.prompt_tokens, self.completion_tokens, total))
+        } else {
+            None
+        }
     }
+}
+
+fn optional_u32_from_any<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok()))
 }
 
 #[derive(Debug, Clone, Copy, Serialize)]
@@ -732,7 +751,7 @@ fn parse_sse_line(line: &str) -> StreamResult<Option<SseEvent>> {
     // Parse JSON delta
     let chunk: StreamChunkResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
 
-    let usage = chunk.usage.map(OpenAiCompatibleUsage::into_reported);
+    let usage = chunk.usage.and_then(OpenAiCompatibleUsage::into_reported);
     let Some(choice) = chunk.choices.into_iter().next() else {
         return Ok(usage.map(|usage| SseEvent {
             usage: Some(usage),
@@ -1589,7 +1608,7 @@ impl OpenAiCompatibleProvider {
         let response_str = String::from_utf8_lossy(&response_bytes);
         let native_response: ApiChatResponse = serde_json::from_slice(&response_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to parse response: {e}\nBody: {response_str}"))?;
-        let usage = native_response.usage.map(OpenAiCompatibleUsage::into_reported);
+        let usage = native_response.usage.and_then(OpenAiCompatibleUsage::into_reported);
         let message = native_response
             .choices
             .into_iter()
@@ -2399,7 +2418,11 @@ mod tests {
             "usage":{"prompt_tokens":44,"completion_tokens":9,"total_tokens":53}
         }"#;
         let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.expect("usage expected").into_reported();
+        let usage = resp
+            .usage
+            .expect("usage expected")
+            .into_reported()
+            .expect("complete usage should report");
 
         assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
         assert_eq!(usage.prompt_tokens, Some(44));
@@ -3331,6 +3354,39 @@ mod tests {
         assert_eq!(usage.total_tokens, Some(29));
         assert!(event.content.is_none());
         assert!(event.tool_call_deltas.is_empty());
+    }
+
+    #[test]
+    fn compatible_malformed_usage_is_ignored_without_breaking_content() {
+        let line = r#"data: {"choices":[{"delta":{"content":"still streams"}}],"usage":{"prompt_tokens":"bad","completion_tokens":8}}"#;
+        let event = parse_sse_line(line)
+            .expect("malformed usage fields should not fail SSE parsing")
+            .expect("content event expected");
+
+        assert_eq!(event.content.as_deref(), Some("still streams"));
+        assert!(
+            event.usage.is_none(),
+            "partial/malformed usage must fall back to estimate outside the parser"
+        );
+    }
+
+    #[test]
+    fn compatible_stream_options_rejection_statuses_retry_without_usage_request() {
+        assert!(OpenAiCompatibleProvider::stream_options_retry_status(
+            reqwest::StatusCode::BAD_REQUEST
+        ));
+        assert!(OpenAiCompatibleProvider::stream_options_retry_status(
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ));
+        assert!(OpenAiCompatibleProvider::stream_options_retry_status(
+            reqwest::StatusCode::NOT_FOUND
+        ));
+        assert!(!OpenAiCompatibleProvider::stream_options_retry_status(
+            reqwest::StatusCode::UNAUTHORIZED
+        ));
+        assert!(!OpenAiCompatibleProvider::stream_options_retry_status(
+            reqwest::StatusCode::TOO_MANY_REQUESTS
+        ));
     }
 
     #[test]

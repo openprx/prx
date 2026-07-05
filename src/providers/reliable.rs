@@ -1348,6 +1348,65 @@ mod tests {
         }
     }
 
+    struct MeteredMockProvider {
+        calls: Arc<AtomicUsize>,
+        fail_until_attempt: usize,
+        response: &'static str,
+        error: &'static str,
+        usage: crate::llm::route_decision::TokenUsage,
+    }
+
+    #[async_trait]
+    impl Provider for MeteredMockProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(self.error);
+            }
+            Ok(self.response.to_string())
+        }
+
+        async fn chat_traced(
+            &self,
+            _request: ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<ChatTrace> {
+            let attempt = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt <= self.fail_until_attempt {
+                anyhow::bail!(self.error);
+            }
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(ChatTrace {
+                response: ChatResponse {
+                    text: Some(self.response.to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![ProviderAttempt {
+                    seq: 1,
+                    provider: "metered-mock".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "metered-mock".to_string(),
+                final_model: model.to_string(),
+                tokens_used: self.usage.clone(),
+            })
+        }
+    }
+
     /// Mock that records which model was used for each call.
     struct ModelAwareMock {
         calls: Arc<AtomicUsize>,
@@ -1541,6 +1600,63 @@ mod tests {
         // final_provider/final_model reflect what actually executed.
         assert_eq!(trace.final_provider, "fallback");
         assert_eq!(trace.final_model, "test");
+    }
+
+    #[tokio::test]
+    async fn chat_traced_counts_only_successful_attempt_usage_after_fallback() {
+        let primary_calls = Arc::new(AtomicUsize::new(0));
+        let fallback_calls = Arc::new(AtomicUsize::new(0));
+
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(MeteredMockProvider {
+                        calls: Arc::clone(&primary_calls),
+                        fail_until_attempt: usize::MAX,
+                        response: "never",
+                        error: "500 primary down",
+                        usage: crate::llm::route_decision::TokenUsage::reported(
+                            Some(10_000),
+                            Some(10_000),
+                            Some(20_000),
+                        ),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(MeteredMockProvider {
+                        calls: Arc::clone(&fallback_calls),
+                        fail_until_attempt: 0,
+                        response: "from fallback",
+                        error: "fallback down",
+                        usage: crate::llm::route_decision::TokenUsage::reported(Some(11), Some(7), Some(18)),
+                    }),
+                ),
+            ],
+            1,
+            1,
+        );
+
+        let messages = vec![ChatMessage::user("hi")];
+        let request = ChatRequest {
+            messages: &messages,
+            tools: None,
+        };
+        let trace = provider.chat_traced(request, "test", 0.0).await.unwrap();
+
+        assert_eq!(primary_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(trace.response.text_or_empty(), "from fallback");
+        assert_eq!(
+            trace.tokens_used.source,
+            crate::llm::route_decision::TokenUsageSource::Reported
+        );
+        assert_eq!(
+            trace.tokens_used.total_tokens,
+            Some(18),
+            "failed primary attempts must not be added to successful fallback usage"
+        );
     }
 
     #[tokio::test]

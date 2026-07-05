@@ -2,8 +2,10 @@
 //! - Direct API key (from config or auth-profiles.json)
 //! - Gemini CLI OAuth tokens (reuse existing ~/.gemini/ authentication)
 
+use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderUsageAccumulator, TokenUsage};
 use crate::providers::traits::{
-    ChatMessage, Provider, StreamChunk, StreamError, StreamOptions, StreamResult, ToolCallChunk, ToolCallChunkStatus,
+    ChatMessage, ChatResponse, ChatTrace, Provider, StreamChunk, StreamError, StreamOptions, StreamResult,
+    ToolCallChunk, ToolCallChunkStatus,
 };
 use async_trait::async_trait;
 use directories::UserDirs;
@@ -104,6 +106,8 @@ struct GenerationConfig {
 struct GenerateContentResponse {
     candidates: Option<Vec<Candidate>>,
     error: Option<ApiError>,
+    #[serde(rename = "usageMetadata", default)]
+    usage_metadata: Option<serde_json::Value>,
     #[serde(default)]
     response: Option<Box<Self>>,
 }
@@ -413,13 +417,37 @@ impl GeminiProvider {
         (system_instruction, contents)
     }
 
-    async fn send_generate_content(
+    fn usage_metadata_to_reported(metadata: Option<&serde_json::Value>) -> Option<TokenUsage> {
+        let metadata = metadata?;
+        let field = |name: &str| -> Option<u32> {
+            metadata
+                .get(name)
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+        };
+        let prompt = field("promptTokenCount");
+        let completion = field("candidatesTokenCount");
+        let total = field("totalTokenCount").or_else(|| prompt.zip(completion).map(|(p, c)| p.saturating_add(c)));
+
+        if total.is_some() || prompt.zip(completion).is_some() {
+            Some(TokenUsage::reported(prompt, completion, total))
+        } else {
+            None
+        }
+    }
+
+    fn estimate_completion_usage(text: &str) -> TokenUsage {
+        let accumulator = ProviderUsageAccumulator::new();
+        accumulator.finish_or_estimate_completion_chars(text.chars().count())
+    }
+
+    async fn send_generate_content_metered(
         &self,
         contents: Vec<Content>,
         system_instruction: Option<Content>,
         model: &str,
         temperature: f64,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(String, TokenUsage)> {
         let auth = self.auth.as_ref().ok_or_else(|| {
             anyhow::anyhow!(
                 "Gemini API key not found. Options:\n\
@@ -462,12 +490,28 @@ impl GeminiProvider {
             anyhow::bail!("Gemini API error: {}", err.message);
         }
 
-        result
+        let usage = Self::usage_metadata_to_reported(result.usage_metadata.as_ref());
+        let text = result
             .candidates
             .and_then(|c| c.into_iter().next())
             .and_then(|c| c.content.parts.into_iter().next())
             .and_then(|p| p.text)
-            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))
+            .ok_or_else(|| anyhow::anyhow!("No response from Gemini"))?;
+        let tokens_used = usage.unwrap_or_else(|| Self::estimate_completion_usage(&text));
+        Ok((text, tokens_used))
+    }
+
+    async fn send_generate_content(
+        &self,
+        contents: Vec<Content>,
+        system_instruction: Option<Content>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<String> {
+        Ok(self
+            .send_generate_content_metered(contents, system_instruction, model, temperature)
+            .await?
+            .0)
     }
 }
 
@@ -541,58 +585,60 @@ fn drain_gemini_chunk(
     if let Some(err) = effective.error {
         return Err(StreamError::Provider(err.message));
     }
-    let Some(candidates) = effective.candidates else {
-        return Ok(Vec::new());
-    };
-
+    let usage = GeminiProvider::usage_metadata_to_reported(effective.usage_metadata.as_ref());
     let mut out: Vec<StreamChunk> = Vec::new();
-    for candidate in candidates {
-        for part in candidate.content.parts {
-            if let Some(text) = part.text {
-                if !text.is_empty() {
-                    let mut sc = StreamChunk::delta(text);
-                    if count_tokens {
-                        sc = sc.with_token_estimate();
+    if let Some(candidates) = effective.candidates {
+        for candidate in candidates {
+            for part in candidate.content.parts {
+                if let Some(text) = part.text {
+                    if !text.is_empty() {
+                        let mut sc = StreamChunk::delta(text);
+                        if count_tokens {
+                            sc = sc.with_token_estimate();
+                        }
+                        out.push(sc);
                     }
-                    out.push(sc);
                 }
-            }
-            if let Some(call) = part.function_call {
-                let name = call.name.unwrap_or_default();
-                if name.is_empty() {
-                    // Defensive: skip malformed function_call entries that
-                    // are missing a name — surfacing them would break the
-                    // driver's tool dispatch which keys on the registered
-                    // tool name.
-                    continue;
+                if let Some(call) = part.function_call {
+                    let name = call.name.unwrap_or_default();
+                    if name.is_empty() {
+                        // Defensive: skip malformed function_call entries that
+                        // are missing a name — surfacing them would break the
+                        // driver's tool dispatch which keys on the registered
+                        // tool name.
+                        continue;
+                    }
+                    // `serde_json::to_string` on a parsed `Value` cannot
+                    // realistically fail (no non-string map keys, no NaN at this
+                    // layer); fall back to `{}` defensively so a malformed
+                    // payload degrades gracefully rather than killing the
+                    // streaming task mid-tool-call.
+                    let args_str = call.args.map_or_else(
+                        || "{}".to_string(),
+                        |v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
+                    );
+                    // Gemini does not provide stable tool-call IDs in its API
+                    // surface (function calls are correlated by name + position).
+                    // Generate a UUID to align with OpenAI / Anthropic semantics
+                    // expected by the driver-side aggregator.
+                    let id = uuid::Uuid::new_v4().to_string();
+                    let index = *tool_call_order;
+                    *tool_call_order = tool_call_order.saturating_add(1);
+                    let tc = ToolCallChunk {
+                        id,
+                        name,
+                        args: args_str,
+                        index,
+                        arguments_delta: None,
+                        status: ToolCallChunkStatus::Completed,
+                    };
+                    out.push(StreamChunk::tool_call_chunk(vec![tc]));
                 }
-                // `serde_json::to_string` on a parsed `Value` cannot
-                // realistically fail (no non-string map keys, no NaN at this
-                // layer); fall back to `{}` defensively so a malformed
-                // payload degrades gracefully rather than killing the
-                // streaming task mid-tool-call.
-                let args_str = call.args.map_or_else(
-                    || "{}".to_string(),
-                    |v| serde_json::to_string(&v).unwrap_or_else(|_| "{}".to_string()),
-                );
-                // Gemini does not provide stable tool-call IDs in its API
-                // surface (function calls are correlated by name + position).
-                // Generate a UUID to align with OpenAI / Anthropic semantics
-                // expected by the driver-side aggregator.
-                let id = uuid::Uuid::new_v4().to_string();
-                let index = *tool_call_order;
-                *tool_call_order = tool_call_order.saturating_add(1);
-                let tc = ToolCallChunk {
-                    id,
-                    name,
-                    args: args_str,
-                    index,
-                    arguments_delta: None,
-                    status: ToolCallChunkStatus::Completed,
-                };
-                out.push(StreamChunk::tool_call_chunk(vec![tc]));
             }
         }
+    }
+    if let Some(usage) = usage {
+        out.push(StreamChunk::usage(usage));
     }
     Ok(out)
 }
@@ -638,6 +684,49 @@ impl Provider for GeminiProvider {
         let (system_instruction, contents) = Self::convert_messages(messages);
         self.send_generate_content(contents, system_instruction, model, temperature)
             .await
+    }
+
+    async fn chat(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatResponse> {
+        Ok(self.chat_traced(request, model, temperature).await?.response)
+    }
+
+    async fn chat_traced(
+        &self,
+        request: crate::providers::traits::ChatRequest<'_>,
+        model: &str,
+        temperature: f64,
+    ) -> anyhow::Result<ChatTrace> {
+        let started_at = chrono::Utc::now();
+        let (system_instruction, contents) = Self::convert_messages(request.messages);
+        let (text, tokens_used) = self
+            .send_generate_content_metered(contents, system_instruction, model, temperature)
+            .await?;
+        let finished_at = chrono::Utc::now();
+        Ok(ChatTrace {
+            response: ChatResponse {
+                text: Some(text),
+                tool_calls: Vec::new(),
+                reasoning_content: None,
+            },
+            attempts: vec![ProviderAttempt {
+                seq: 1,
+                provider: "gemini".to_string(),
+                model: model.to_string(),
+                started_at,
+                finished_at,
+                status: AttemptStatus::Success,
+                error_class: None,
+                error_message: None,
+            }],
+            final_provider: "gemini".to_string(),
+            final_model: model.to_string(),
+            tokens_used,
+        })
     }
 
     async fn warmup(&self) -> anyhow::Result<()> {
@@ -1114,6 +1203,54 @@ mod tests {
             .unwrap()
             .text;
         assert_eq!(text, Some("Hello there!".to_string()));
+    }
+
+    #[test]
+    fn usage_metadata_maps_to_reported_tokens() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello there!"}]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": 12,
+                "candidatesTokenCount": 7,
+                "totalTokenCount": 19
+            }
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let usage = GeminiProvider::usage_metadata_to_reported(response.usage_metadata.as_ref()).unwrap();
+
+        assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        assert_eq!(usage.prompt_tokens, Some(12));
+        assert_eq!(usage.completion_tokens, Some(7));
+        assert_eq!(usage.total_tokens, Some(19));
+    }
+
+    #[test]
+    fn malformed_or_partial_usage_metadata_does_not_fabricate_reported_usage() {
+        let json = r#"{
+            "candidates": [{
+                "content": {
+                    "parts": [{"text": "Hello there!"}]
+                }
+            }],
+            "usageMetadata": {
+                "promptTokenCount": "bad"
+            }
+        }"#;
+
+        let response: GenerateContentResponse = serde_json::from_str(json).unwrap();
+        let mut order = 0;
+        let chunks = drain_gemini_chunk(response, &mut order, true).unwrap();
+
+        assert!(chunks.iter().any(|chunk| chunk.delta == "Hello there!"));
+        assert!(
+            chunks.iter().all(|chunk| chunk.usage.is_none()),
+            "malformed/partial usage must fall back to estimate outside the parser"
+        );
     }
 
     #[test]

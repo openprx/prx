@@ -2353,9 +2353,18 @@ async fn run_sub_agent_task(
 ) -> anyhow::Result<SubAgentTaskResult> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
-        let response = provider
-            .chat_with_system(Some(system_prompt), task, model, temperature)
+        let messages = vec![ChatMessage::system(system_prompt), ChatMessage::user(task)];
+        let trace = provider
+            .chat_traced(
+                crate::providers::traits::ChatRequest {
+                    messages: &messages,
+                    tools: None,
+                },
+                model,
+                temperature,
+            )
             .await?;
+        let response = trace.response.text_or_empty().to_string();
         // No incremental loop output exists on this path (single completion);
         // surface the final response as one delta so an attached follower sees
         // it (best-effort; dropped on a full/closed channel).
@@ -2384,7 +2393,7 @@ async fn run_sub_agent_task(
         };
         return Ok(SubAgentTaskResult {
             output,
-            tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            tokens_used: trace.tokens_used,
         });
     };
 
@@ -3023,6 +3032,94 @@ mod tests {
                 reasoning_content: None,
             })
         }
+
+        async fn chat_traced(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some(self.response.clone()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "echo".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "echo".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            })
+        }
+    }
+
+    struct TraceUsageProvider;
+
+    #[async_trait::async_trait]
+    impl crate::providers::Provider for TraceUsageProvider {
+        async fn chat_with_system(
+            &self,
+            _system: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            anyhow::bail!("task-mode no-tools path must use chat_traced so token usage is preserved")
+        }
+
+        async fn chat(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::ChatResponse> {
+            anyhow::bail!("task-mode no-tools path should use chat_traced directly")
+        }
+
+        async fn chat_traced(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            assert_eq!(model, "metered-model");
+            assert_eq!(request.messages.len(), 2);
+            assert_eq!(request.messages[0].role, "system");
+            assert_eq!(request.messages[1].role, "user");
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some("metered task output".to_string()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "trace".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "trace".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::reported(Some(11), Some(7), Some(18)),
+            })
+        }
     }
 
     /// A provider that always fails.
@@ -3083,6 +3180,37 @@ mod tests {
                 reasoning_content: None,
             })
         }
+
+        async fn chat_traced(
+            &self,
+            _request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            tokio::time::sleep(std::time::Duration::from_millis(self.delay_ms)).await;
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some(self.response.clone()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "sleepy".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "sleepy".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
+            })
+        }
     }
 
     struct EchoSystemProvider;
@@ -3109,6 +3237,42 @@ mod tests {
                 text: Some(String::new()),
                 tool_calls: Vec::new(),
                 reasoning_content: None,
+            })
+        }
+
+        async fn chat_traced(
+            &self,
+            request: crate::providers::ChatRequest<'_>,
+            model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<crate::providers::traits::ChatTrace> {
+            let system = request
+                .messages
+                .iter()
+                .find(|message| message.role == "system")
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            let started_at = chrono::Utc::now();
+            let finished_at = chrono::Utc::now();
+            Ok(crate::providers::traits::ChatTrace {
+                response: crate::providers::ChatResponse {
+                    text: Some(system),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                },
+                attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                    seq: 1,
+                    provider: "echo-system".to_string(),
+                    model: model.to_string(),
+                    started_at,
+                    finished_at,
+                    status: crate::llm::route_decision::AttemptStatus::Success,
+                    error_class: None,
+                    error_message: None,
+                }],
+                final_provider: "echo-system".to_string(),
+                final_model: model.to_string(),
+                tokens_used: crate::llm::route_decision::TokenUsage::default(),
             })
         }
     }
@@ -3315,6 +3479,48 @@ mod tests {
         assert_eq!(wrap_like_task_mode(0).await, Ok("done"));
         // Non-zero generous timeout also completes.
         assert_eq!(wrap_like_task_mode(60).await, Ok("done"));
+    }
+
+    #[tokio::test]
+    async fn task_mode_no_tools_preserves_single_turn_trace_usage() {
+        let (_steer_tx, steer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let history_out = Arc::new(RwLock::new(Vec::new()));
+
+        let result = run_sub_agent_task(
+            "metered task",
+            Arc::new(TraceUsageProvider),
+            "trace",
+            "metered-model",
+            0.0,
+            None,
+            "system prompt",
+            std::path::Path::new("."),
+            test_security(),
+            &MultimodalConfig::default(),
+            &AgentCompactionConfig::default(),
+            1,
+            steer_rx,
+            Arc::clone(&history_out),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(result.output, "metered task output");
+        assert_eq!(
+            result.tokens_used.source,
+            crate::llm::route_decision::TokenUsageSource::Reported
+        );
+        assert_eq!(result.tokens_used.total_tokens, Some(18));
+        let history = history_out.read().await;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1].content, "metered task output");
     }
 
     #[test]

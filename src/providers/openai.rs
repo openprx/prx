@@ -136,18 +136,37 @@ struct NativeChatResponse {
 
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 struct OpenAiUsage {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     prompt_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     completion_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_u32_from_any")]
     total_tokens: Option<u32>,
 }
 
 impl OpenAiUsage {
-    const fn into_reported(self) -> TokenUsage {
-        TokenUsage::reported(self.prompt_tokens, self.completion_tokens, self.total_tokens)
+    fn into_reported(self) -> Option<TokenUsage> {
+        let total = self.total_tokens.or_else(|| {
+            self.prompt_tokens
+                .zip(self.completion_tokens)
+                .map(|(p, c)| p.saturating_add(c))
+        });
+        if total.is_some() || self.prompt_tokens.zip(self.completion_tokens).is_some() {
+            Some(TokenUsage::reported(self.prompt_tokens, self.completion_tokens, total))
+        } else {
+            None
+        }
     }
+}
+
+fn optional_u32_from_any<'de, D>(deserializer: D) -> Result<Option<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok()))
 }
 
 #[derive(Debug, Serialize)]
@@ -352,7 +371,7 @@ impl OpenAiProvider {
         }
 
         let native_response: NativeChatResponse = response.json().await?;
-        let usage = native_response.usage.map(OpenAiUsage::into_reported);
+        let usage = native_response.usage.and_then(OpenAiUsage::into_reported);
         let message = native_response
             .choices
             .into_iter()
@@ -478,7 +497,7 @@ fn parse_openai_sse_line(line: &str) -> StreamResult<Option<OpenAiSseEvent>> {
     }
 
     let parsed: StreamSseResponse = serde_json::from_str(data).map_err(StreamError::Json)?;
-    let usage = parsed.usage.map(OpenAiUsage::into_reported);
+    let usage = parsed.usage.and_then(OpenAiUsage::into_reported);
     let Some(choice) = parsed.choices.into_iter().next() else {
         return Ok(usage.map(|usage| OpenAiSseEvent {
             usage: Some(usage),
@@ -1212,12 +1231,30 @@ mod tests {
             "usage":{"prompt_tokens":30,"completion_tokens":7,"total_tokens":37}
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
-        let usage = resp.usage.expect("usage expected").into_reported();
+        let usage = resp
+            .usage
+            .expect("usage expected")
+            .into_reported()
+            .expect("complete usage should report");
 
         assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
         assert_eq!(usage.prompt_tokens, Some(30));
         assert_eq!(usage.completion_tokens, Some(7));
         assert_eq!(usage.total_tokens, Some(37));
+    }
+
+    #[test]
+    fn openai_malformed_usage_is_ignored_without_breaking_content() {
+        let line = r#"data: {"choices":[{"delta":{"content":"still streams"}}],"usage":{"prompt_tokens":"bad","completion_tokens":4}}"#;
+        let event = parse_openai_sse_line(line)
+            .expect("malformed usage fields should not fail SSE parsing")
+            .expect("content event expected");
+
+        assert_eq!(event.content.as_deref(), Some("still streams"));
+        assert!(
+            event.usage.is_none(),
+            "partial/malformed usage must fall back to estimate outside the parser"
+        );
     }
 
     #[tokio::test]

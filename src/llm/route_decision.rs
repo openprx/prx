@@ -1239,4 +1239,21 @@ mod tests {
         assert!(!usage.is_reported());
         assert!(!usage.has_any_tokens());
     }
+
+    #[test]
+    fn usage_accumulator_cancelled_stream_without_usage_does_not_fabricate_reported_usage() {
+        let mut accumulator = ProviderUsageAccumulator::new();
+        accumulator.record(TokenUsage::default());
+
+        let usage = accumulator.finish();
+
+        assert_eq!(usage.source, TokenUsageSource::Estimated);
+        assert_eq!(usage.prompt_tokens, None);
+        assert_eq!(usage.completion_tokens, None);
+        assert_eq!(usage.total_tokens, None);
+        assert!(
+            !usage.is_reported(),
+            "cancelled streams without a provider usage chunk must not become real usage"
+        );
+    }
 }
