@@ -564,7 +564,7 @@ impl ChatState {
     }
 
     #[cfg(feature = "terminal-tui")]
-    fn slash_menu_sources_from<'a>(
+    const fn slash_menu_sources_from<'a>(
         live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
         saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
         provider_model_catalog: &'a [crate::chat::tui::SlashProviderModelCatalog],

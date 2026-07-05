@@ -9968,7 +9968,7 @@ mod s4_a_3 {
 
     #[tokio::test]
     async fn s4_a_3_dispatcher_skips_unrelated_action() {
-        // ToolProgress 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
+        // StreamRetryAttempt 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
         let state = make_state();
         let initial = Arc::new(UiSnapshot::initial(
             Arc::clone(&state.session.provider),
@@ -9987,12 +9987,17 @@ mod s4_a_3 {
             Some(snap_tx),
         );
 
-        let _ = dispatcher.dispatch(Action::ToolProgress { iteration: 1, max: 3 }).await;
+        let _ = dispatcher
+            .dispatch(Action::StreamRetryAttempt {
+                attempt: 1,
+                reason: "transient".to_string(),
+            })
+            .await;
         // 应在 200ms 内不出现 changed 信号.
         let result = tokio::time::timeout(Duration::from_millis(200), snap_rx.changed()).await;
         assert!(
             result.is_err(),
-            "ToolProgress 不应触发 snapshot 推送 (changed 返回={:?})",
+            "StreamRetryAttempt 不应触发 snapshot 推送 (changed 返回={:?})",
             result.map(|r| r.is_ok())
         );
         assert_eq!(snap_rx.borrow().revision, initial_rev, "revision 应保持不变");

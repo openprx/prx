@@ -70,8 +70,7 @@ pub mod tui;
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
     build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, measure_history_tokens, plan_context_budget, run_tool_call_loop_traced,
-    select_prompt_skills,
+    is_tool_loop_cancelled, measure_history_tokens, run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -424,6 +423,7 @@ fn format_compact_feedback(
     }
 }
 
+#[cfg(test)]
 fn context_budget_warning_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
@@ -432,7 +432,7 @@ fn context_budget_warning_for_tui(
     if !terminal_tui_enabled {
         return None;
     }
-    let budget = plan_context_budget(
+    let budget = crate::agent::loop_::plan_context_budget(
         history,
         compaction_config,
         crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
@@ -5208,14 +5208,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 },
                 "chat.context_window_updated",
             );
-            if let Some(warning) =
-                context_budget_warning_for_tui(&history, &effective_compaction.config, redraw_tx_for_main.is_some())
-            {
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::SystemMessageAdded { text: warning },
-                    "chat.context_budget_warning",
-                );
-            }
         }
 
         let route_decision = RouteDecision::from_model_routes_for_context(
@@ -9998,7 +9990,8 @@ mod terminal_guard_tests {
             ChatMessage::system("sys"),
             ChatMessage::user("context pressure ".repeat(400)),
         ];
-        let budget = plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+        let budget =
+            crate::agent::loop_::plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
         assert!(budget.over_warning, "fixture must cross the warning threshold");
         let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
         assert!(

@@ -3330,8 +3330,7 @@ fn slash_menu_overlay_rect(frame_area: Rect, menu: &SlashMenuState, bottom_chrom
     let width = frame_area
         .width
         .saturating_sub(horizontal_margin.saturating_mul(2))
-        .min(80)
-        .max(1);
+        .clamp(1, 80);
     let visible_items = u16::try_from(menu.len().clamp(1, 10)).unwrap_or(10);
     let height = visible_items
         .saturating_add(2)
@@ -4236,52 +4235,57 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         title_str
     };
 
-    let usage = render_main_token_usage(state.token_usage_summary());
+    let usage = render_main_status_usage(state.token_usage_summary(), state.context_window_tokens());
     let activity = render_generation_activity(state);
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
-    let full = if let Some(activity) = activity.as_deref() {
-        format!(
-            " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} | {activity} ",
-            state.provider(),
-            state.model(),
-            title,
-            state.turn_count(),
-        )
-    } else {
-        format!(
-            " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
-            state.provider(),
-            state.model(),
-            title,
-            state.turn_count(),
-        )
-    };
+    let full = activity.as_deref().map_or_else(
+        || {
+            format!(
+                " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} ",
+                state.provider(),
+                state.model(),
+                title,
+                state.turn_count(),
+            )
+        },
+        |activity| {
+            format!(
+                " PRX Chat | {}/{} | {} | {} turns | {permissions} | {usage} | {activity} ",
+                state.provider(),
+                state.model(),
+                title,
+                state.turn_count(),
+            )
+        },
+    );
     if full.chars().count() <= usize::from(width) {
         return full;
     }
 
-    let compact = if let Some(activity) = activity.as_deref() {
-        format!(
-            " PRX Chat | {}/{} | {permissions} | {usage} | {activity} ",
-            state.provider(),
-            state.model()
-        )
-    } else {
-        format!(
-            " PRX Chat | {}/{} | {permissions} | {usage} ",
-            state.provider(),
-            state.model()
-        )
-    };
+    let compact = activity.as_deref().map_or_else(
+        || {
+            format!(
+                " PRX Chat | {}/{} | {permissions} | {usage} ",
+                state.provider(),
+                state.model()
+            )
+        },
+        |activity| {
+            format!(
+                " PRX Chat | {}/{} | {permissions} | {usage} | {activity} ",
+                state.provider(),
+                state.model()
+            )
+        },
+    );
     if compact.chars().count() <= usize::from(width) {
         return compact;
     }
 
-    let minimal = if let Some(activity) = activity.as_deref() {
-        format!(" PRX | {permissions} | {activity} ")
-    } else {
-        format!(" PRX | {permissions} | {usage} ")
-    };
+    let minimal = activity.as_deref().map_or_else(
+        || format!(" PRX | {permissions} | {usage} "),
+        |activity| format!(" PRX | {permissions} | {activity} "),
+    );
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
 }
 
@@ -4292,7 +4296,8 @@ fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option
     } else {
         ["⠋", "⠙", "⠹", "⠸"]
     };
-    let frame = frames[usize::try_from(streaming.version % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0)];
+    let idx = usize::try_from(streaming.version % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
+    let frame = frames.get(idx).copied().unwrap_or("-");
     Some(format!("{frame} generating 0s (esc to interrupt)"))
 }
 
@@ -4318,6 +4323,30 @@ const fn cycle_chat_mode(mode: ChatMode) -> ChatMode {
 
 fn render_main_token_usage(summary: MainSessionTokenUsageSummary) -> String {
     crate::chat::session::format_session_token_usage_inline(summary).unwrap_or_else(|| "0 tok | $0.0000".to_string())
+}
+
+fn render_main_status_usage(summary: MainSessionTokenUsageSummary, context_window_tokens: Option<usize>) -> String {
+    let mut usage = render_main_token_usage(summary);
+    if let Some(context) = render_context_budget_usage(summary, context_window_tokens) {
+        usage.push_str(" | ");
+        usage.push_str(&context);
+    }
+    usage
+}
+
+fn render_context_budget_usage(
+    summary: MainSessionTokenUsageSummary,
+    context_window_tokens: Option<usize>,
+) -> Option<String> {
+    let window = u64::try_from(context_window_tokens?).ok()?.max(1);
+    let pct = summary
+        .total_tokens
+        .saturating_mul(100)
+        .saturating_add(window.saturating_sub(1))
+        / window;
+    let prefix = if summary.has_estimates() { "~" } else { "" };
+    let suffix = if pct >= 85 { "!" } else { "" };
+    Some(format!("{prefix}ctx:{pct}%{suffix}"))
 }
 
 /// Count the exact number of rows ratatui's word-wrapping
@@ -9683,6 +9712,30 @@ mod tests {
         assert!(
             line.contains("~2.0k tok | $0.0020"),
             "estimated usage should be marked: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_context_budget_percent_with_estimate_marker() {
+        let mut state = TuiState::new("provider", "model");
+        state.context_window_tokens = Some(10_000);
+        state.token_usage_summary = MainSessionTokenUsageSummary {
+            total_tokens: 8_500,
+            estimated_tokens: 8_500,
+            request_count: 1,
+            known_cost_usd: 0.002,
+            ..MainSessionTokenUsageSummary::default()
+        };
+
+        let line = render_status_bar_text(&state, 140);
+
+        assert!(
+            line.contains("~8.5k tok"),
+            "estimated token count remains marked: {line}"
+        );
+        assert!(
+            line.contains("~ctx:85%!"),
+            "estimated context budget warns near full: {line}"
         );
     }
 
