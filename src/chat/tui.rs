@@ -384,6 +384,8 @@ pub const ARGS_PREVIEW_ELLIPSIS_ASCII: &str = "...";
 
 const TOOL_EXPANDED_OUTPUT_MAX_LINES: usize = 40;
 const TOOL_EXPANDED_OUTPUT_LINE_MAX_CHARS: usize = 240;
+const TOOL_FOLDED_RESULT_PREVIEW_LINES: usize = 3;
+const TOOL_FOLDED_RESULT_PREVIEW_CHARS: usize = 180;
 const TOOL_ERROR_REASON_MAX_CHARS: usize = 120;
 const TOOL_ARG_VALUE_MAX_CHARS: usize = 80;
 
@@ -1044,15 +1046,12 @@ fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec
             }
             ConversationLine::ToolResult {
                 tool_name,
-                args_preview,
+                args_full,
                 result,
                 status,
                 ..
             } => {
-                lines.push(format!(
-                    "tool {tool_name} {}: {args_preview}",
-                    tool_status_name(*status)
-                ));
+                lines.push(format!("tool {tool_name} {}: {args_full}", tool_status_name(*status)));
                 if let Some(result) = result {
                     push_transcript_text(&mut lines, "  result", result);
                 }
@@ -1060,21 +1059,14 @@ fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec
             ConversationLine::Reasoning {
                 content,
                 char_count,
-                folded,
+                folded: _,
             } => {
                 lines.push(format!("reasoning: {char_count} chars"));
-                if !*folded {
-                    push_transcript_text(&mut lines, "  thought", content);
-                }
+                push_transcript_text(&mut lines, "  thought", content);
             }
         }
     }
-    let truncated = lines.len() > TRANSCRIPT_MAX_LINES;
-    if truncated {
-        let start = lines.len().saturating_sub(TRANSCRIPT_MAX_LINES);
-        lines = lines.split_off(start);
-    }
-    (lines, truncated)
+    (lines, false)
 }
 
 /// Build the read-only transcript child viewport from current conversation lines.
@@ -1102,7 +1094,6 @@ pub fn build_transcript_view(
         truncated,
         scroll_offset,
     }
-    .clamped_for_height(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS))
 }
 
 /// Build the read-only diff child viewport from bounded unified diff lines.
@@ -1802,6 +1793,20 @@ impl TuiInput {
         }
     }
 
+    fn consume_backslash_line_continuation(&mut self) -> bool {
+        let (li, off) = self.cursor;
+        let Some(line) = self.lines.get_mut(li) else {
+            return false;
+        };
+        if off != line.len() || !line.ends_with('\\') {
+            return false;
+        }
+        line.pop();
+        self.cursor = (li, line.len());
+        self.insert_newline();
+        true
+    }
+
     /// Delete the character before the cursor; join with previous line if at
     /// column 0.
     fn backspace(&mut self) {
@@ -2168,6 +2173,9 @@ impl TuiInput {
             KeyCode::Enter => {
                 if shift || alt {
                     self.insert_newline();
+                    return InputOutcome::Consumed;
+                }
+                if self.consume_backslash_line_continuation() {
                     return InputOutcome::Consumed;
                 }
                 if self.is_empty() {
@@ -4824,6 +4832,35 @@ fn push_folded_tool_summary<'a>(
         Span::styled(status_glyph, Style::default().fg(status_color)),
         Span::styled(format!(" {metrics}"), metrics_style),
     ]));
+    push_folded_tool_result_preview(lines, result_text, ascii);
+}
+
+fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &str, ascii: bool) {
+    if result_text.trim().is_empty() {
+        return;
+    }
+    let ellipsis = if ascii {
+        ARGS_PREVIEW_ELLIPSIS_ASCII
+    } else {
+        ARGS_PREVIEW_ELLIPSIS
+    };
+    let body_style = Style::default().fg(Color::DarkGray);
+    let result_lines = result_text.lines().collect::<Vec<_>>();
+    let total_lines = result_lines.len();
+    for body in result_lines.iter().take(TOOL_FOLDED_RESULT_PREVIEW_LINES) {
+        let rendered = clamp_one_line(body, TOOL_FOLDED_RESULT_PREVIEW_CHARS, ellipsis);
+        lines.push(Line::from(Span::styled(format!("    {rendered}"), body_style)));
+    }
+    let hidden_lines = total_lines.saturating_sub(TOOL_FOLDED_RESULT_PREVIEW_LINES);
+    if hidden_lines > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "    {ellipsis} +{hidden_lines} {}",
+                if hidden_lines == 1 { "line" } else { "lines" }
+            ),
+            body_style,
+        )));
+    }
 }
 
 fn push_expanded_tool_io<'a>(
@@ -5485,7 +5522,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Ctrl+R reverse-search \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Shift+Tab mode \u{00B7} Tab fold \u{00B7} Esc cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Shift+Enter newline \u{00B7} \\+Enter continue \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -6284,7 +6321,7 @@ mod tests {
             folded: true,
         };
         render_conversation_line(&mut lines, &card, false);
-        assert_eq!(lines.len(), 2, "done folded card renders header + summary");
+        assert_eq!(lines.len(), 5, "done folded card renders header + summary + preview");
         let summary: String = lines
             .get(1)
             .expect("test: summary line present")
@@ -6297,6 +6334,9 @@ mod tests {
         assert!(summary.contains("234ms"), "shows elapsed ms: {summary}");
         assert!(summary.contains("3 lines"), "shows result line count: {summary}");
         assert!(summary.contains("5B"), "shows result byte count: {summary}");
+        assert_eq!(line_to_plain(lines.get(2).expect("test: preview line")), "    a");
+        assert_eq!(line_to_plain(lines.get(3).expect("test: preview line")), "    b");
+        assert_eq!(line_to_plain(lines.get(4).expect("test: preview line")), "    c");
         assert_eq!(span_fg(&lines, 0, 0), Some(Color::Green));
         assert_eq!(span_fg(&lines, 1, 1), Some(Color::Green));
         assert_eq!(span_fg(&lines, 1, 2), Some(Color::DarkGray));
@@ -6972,6 +7012,19 @@ mod tests {
         assert_eq!(input.text(), "a\nb");
         assert_eq!(input.lines.len(), 2);
         assert!(!input.is_single_line());
+    }
+
+    #[test]
+    fn p2_10_backslash_enter_continues_without_submitting() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "echo \\");
+        let out = input.handle_key(key(KeyCode::Enter));
+        assert_eq!(out, InputOutcome::Consumed);
+        assert_eq!(input.text(), "echo \n");
+        assert!(input.history.is_empty(), "continuation does not submit");
+        type_str(&mut input, "next");
+        let out = input.handle_key(key(KeyCode::Enter));
+        assert_eq!(out, InputOutcome::Submitted("echo \nnext".to_string()));
     }
 
     #[test]
@@ -9081,7 +9134,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_view_is_bounded_and_handles_empty_history() {
+    fn transcript_view_is_full_and_handles_empty_history() {
         let empty = build_transcript_view("", &[], 0);
         assert_eq!(empty.seq, TRANSCRIPT_SESSION_SEQ);
         assert_eq!(
@@ -9097,17 +9150,53 @@ mod tests {
                 .join("\n"),
         };
         let view = build_transcript_view("demo", &[long], usize::MAX);
-        assert_eq!(view.lines.len(), TRANSCRIPT_MAX_LINES);
-        assert!(view.truncated, "long transcript must report truncation");
+        assert_eq!(view.lines.len(), TRANSCRIPT_MAX_LINES + 25);
+        assert!(!view.truncated, "transcript viewer retains full content");
         assert_eq!(
             view.scroll_offset,
-            view.max_scroll_offset(usize::from(ACTIVE_SESSION_VIEW_DESIRED_ROWS)),
-            "oversized offset clamps to the oldest retained visible page"
+            usize::MAX,
+            "viewer no longer clamps away scroll range"
         );
         assert!(
-            view.lines.first().is_some_and(|line| line.contains("line 25")),
-            "oldest lines are trimmed first: {:?}",
+            view.lines.first().is_some_and(|line| line.contains("line 0")),
+            "oldest lines are retained: {:?}",
             view.lines.first()
+        );
+    }
+
+    #[test]
+    fn transcript_view_expands_folded_tool_and_reasoning_content() {
+        let tool = ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "cmd=short".to_string(),
+            args_full: "{\"cmd\":\"long\"}".to_string(),
+            result: Some("out-1\nout-2".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(1),
+            folded: true,
+        };
+        let reasoning = ConversationLine::Reasoning {
+            content: "hidden thought".to_string(),
+            char_count: 12,
+            folded: true,
+        };
+
+        let view = build_transcript_view("demo", &[tool, reasoning], 0);
+
+        assert!(
+            view.lines.iter().any(|line| line.contains("{\"cmd\":\"long\"}")),
+            "verbose transcript should use full tool args: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().any(|line| line.contains("out-2")),
+            "verbose transcript should include full tool result: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().any(|line| line.contains("hidden thought")),
+            "verbose transcript should include folded reasoning: {:?}",
+            view.lines
         );
     }
 

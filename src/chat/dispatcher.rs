@@ -1471,6 +1471,36 @@ async fn apply_redux_summary_compaction(
     Ok(Some(replacement_len))
 }
 
+fn chat_history_turn_count(history: &[crate::providers::traits::ChatMessage]) -> usize {
+    history
+        .len()
+        .saturating_sub(usize::from(history.first().is_some_and(|msg| msg.role == "system")))
+}
+
+async fn send_redux_compaction_feedback(
+    action_tx: &mpsc::Sender<Action>,
+    turns_before: usize,
+    tokens_before: usize,
+    history: &[crate::providers::traits::ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    context: &'static str,
+) -> Result<(), ()> {
+    let turns_after = chat_history_turn_count(history);
+    let tokens_after = super::estimate_chat_history_tokens(history);
+    let text = super::format_compact_feedback(
+        turns_before,
+        turns_after,
+        tokens_before,
+        tokens_after,
+        config.max_context_tokens,
+    );
+    if let Err(error) = action_tx.send(Action::SystemMessageAdded { text }).await {
+        tracing::debug!(%error, context, "StartTurn: action_tx closed on compaction feedback");
+        return Err(());
+    }
+    Ok(())
+}
+
 fn trim_redux_driver_context_budget_after_summary(
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -1559,6 +1589,8 @@ async fn drive_start_turn_stream(
                 crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
             );
             if budget.over_hard_limit {
+                let turns_before = chat_history_turn_count(&history);
+                let tokens_before = super::estimate_chat_history_tokens(&history);
                 let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
                 let summary_replacement_len = if compaction_off {
                     None
@@ -1600,6 +1632,19 @@ async fn drive_start_turn_stream(
                         trimmed,
                         "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
+                }
+                if send_redux_compaction_feedback(
+                    &action_tx,
+                    turns_before,
+                    tokens_before,
+                    &history,
+                    config,
+                    "redux_preflight_compaction_feedback",
+                )
+                .await
+                .is_err()
+                {
+                    return;
                 }
             } else if budget.over_warning {
                 tracing::info!(
@@ -1645,6 +1690,13 @@ async fn drive_start_turn_stream(
                     return;
                 }
                 overflow_retries = overflow_retries.saturating_add(1);
+                let compaction_feedback_before = compaction_config.as_ref().map(|config| {
+                    (
+                        chat_history_turn_count(&history),
+                        super::estimate_chat_history_tokens(&history),
+                        config.clone(),
+                    )
+                });
                 match compaction_config.as_ref() {
                     Some(config) if matches!(config.mode, crate::config::AgentCompactionMode::Off) => {
                         let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
@@ -1694,6 +1746,20 @@ async fn drive_start_turn_stream(
                             return;
                         }
                     }
+                }
+                if let Some((turns_before, tokens_before, config)) = compaction_feedback_before
+                    && send_redux_compaction_feedback(
+                        &action_tx,
+                        turns_before,
+                        tokens_before,
+                        &history,
+                        &config,
+                        "redux_overflow_compaction_feedback",
+                    )
+                    .await
+                    .is_err()
+                {
+                    return;
                 }
                 // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
                 iteration = iteration.saturating_sub(1);

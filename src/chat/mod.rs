@@ -69,8 +69,9 @@ pub mod tui;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
-    build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, measure_history_tokens, run_tool_call_loop_traced, select_prompt_skills,
+    apply_compaction_patch_exact, build_configurable_compaction_patch, build_context_with_shared_events_and_scope,
+    build_runtime_system_prompt, increment_recalled_useful_counts, is_tool_loop_cancelled, measure_history_tokens,
+    run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -446,6 +447,98 @@ fn context_budget_status_for_tui(
         used_context_tokens: budget.used_tokens,
         max_context_tokens: budget.max_context_tokens,
     })
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_context_budget_for_tui(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+    terminal_tui_enabled: bool,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) {
+    let Some(context_budget) = context_budget_status_for_tui(history, compaction_config, terminal_tui_enabled) else {
+        return;
+    };
+    let context_used_tokens = Some(context_budget.used_context_tokens);
+    let context_window_tokens = Some(context_budget.max_context_tokens);
+    {
+        let mut mirror = chat_mirror.lock();
+        mirror.context_used_tokens = context_used_tokens;
+        mirror.context_window_tokens = context_window_tokens;
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ContextWindowUpdated {
+            used_context_tokens: context_used_tokens,
+            max_context_tokens: context_window_tokens,
+        },
+        "chat.context_window_updated",
+    );
+}
+
+async fn build_chat_compaction_patch_with_timeout(
+    history: &[ChatMessage],
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+    timeout_duration: Duration,
+) -> Option<crate::agent::loop_::CompactionPatch> {
+    match tokio::time::timeout(
+        timeout_duration,
+        build_configurable_compaction_patch(history, provider, model, config, audit, trigger),
+    )
+    .await
+    {
+        Ok(Ok(patch)) => patch,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, trigger, "chat summary compaction failed; falling back to deterministic trim");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?timeout_duration,
+                trigger,
+                "chat summary compaction timed out; falling back to deterministic trim"
+            );
+            None
+        }
+    }
+}
+
+fn apply_chat_compaction_patch_and_sync(
+    history: &mut Vec<ChatMessage>,
+    patch: crate::agent::loop_::CompactionPatch,
+    config: &crate::config::AgentCompactionConfig,
+    reason: crate::chat::action::CompactReason,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) {
+    let replacement_len = patch.replacement.len();
+    apply_compaction_patch_exact(history, &patch);
+    let budget =
+        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_hard_limit {
+        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+            history,
+            config,
+            replacement_len,
+        );
+        tracing::warn!(
+            used_tokens = budget.used_tokens,
+            hard_limit = budget.available_input_tokens,
+            trimmed,
+            "chat summary compaction applied preserving trim"
+        );
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::HistoryCompactionPatchApplied {
+            reason,
+            patch,
+            compaction_config: config.clone(),
+        },
+        "chat.history_compaction_patch_applied",
+    );
 }
 
 fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -1438,6 +1531,57 @@ mod compact_command_tests {
             "reclaim delta missing: {text}"
         );
     }
+
+    struct SlowSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SlowSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok("## Decisions\nslow summary".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn configurable_summary_compaction_timeout_returns_none_for_fallback() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 0,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 16,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older ".repeat(400)),
+            ChatMessage::assistant("middle ".repeat(400)),
+            ChatMessage::user("recent ".repeat(40)),
+        ];
+
+        let patch = build_chat_compaction_patch_with_timeout(
+            &history,
+            &SlowSummaryProvider,
+            "slow-model",
+            &config,
+            None,
+            "test_timeout",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(
+            patch.is_none(),
+            "timeout must let caller fall back to deterministic trim"
+        );
+    }
 }
 
 /// Chat 输入路径的运行模式.
@@ -1781,6 +1925,7 @@ fn select_chat_tui(plain_mode: bool, stdin_is_terminal: bool, prx_tui_env: Optio
 struct TerminalGuardState {
     raw_mode_active: bool,
     bracketed_paste_active: bool,
+    keyboard_enhancement_active: bool,
     mouse_capture_active: bool,
     alternate_screen_active: bool,
 }
@@ -1790,6 +1935,7 @@ impl TerminalGuardState {
         Self {
             raw_mode_active: false,
             bracketed_paste_active: false,
+            keyboard_enhancement_active: false,
             mouse_capture_active: false,
             alternate_screen_active: false,
         }
@@ -1799,6 +1945,9 @@ impl TerminalGuardState {
 trait TerminalModeOps {
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn disable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool>;
+    fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
+    fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn enable_mouse_capture(&mut self) -> std::io::Result<()>;
@@ -1817,6 +1966,22 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 
     fn disable_raw_mode(&mut self) -> std::io::Result<()> {
         crossterm::terminal::disable_raw_mode()
+    }
+
+    fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool> {
+        crossterm::terminal::supports_keyboard_enhancement()
+    }
+
+    fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+        let flags = crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+        crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(flags)).map(|_| ())
+    }
+
+    fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags).map(|_| ())
     }
 
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
@@ -1849,6 +2014,7 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 }
 
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHAT_KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
     let mut state = TerminalGuardState::inactive();
@@ -1874,7 +2040,33 @@ fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Res
     }
     state.mouse_capture_active = true;
 
+    match ops.supports_keyboard_enhancement() {
+        Ok(true) => {
+            if let Err(e) = ops.push_keyboard_enhancement_flags() {
+                if state.mouse_capture_active {
+                    let _ = ops.disable_mouse_capture();
+                }
+                if state.alternate_screen_active {
+                    let _ = ops.leave_alternate_screen();
+                    CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+                }
+                let _ = ops.disable_raw_mode();
+                return Err(e);
+            }
+            state.keyboard_enhancement_active = true;
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "terminal keyboard enhancement probe failed; skipping");
+        }
+    }
+
     if let Err(e) = ops.enable_bracketed_paste() {
+        if state.keyboard_enhancement_active {
+            let _ = ops.pop_keyboard_enhancement_flags();
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
         if state.mouse_capture_active {
             let _ = ops.disable_mouse_capture();
         }
@@ -1895,6 +2087,10 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
         let _ = ops.disable_bracketed_paste();
         let _ = ops.show_cursor();
     }
+    if state.keyboard_enhancement_active {
+        let _ = ops.pop_keyboard_enhancement_flags();
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    }
     if state.mouse_capture_active {
         let _ = ops.disable_mouse_capture();
     }
@@ -1911,6 +2107,7 @@ fn restore_terminal_state_with_ops(ops: &mut impl TerminalModeOps, leave_alterna
     let state = TerminalGuardState {
         raw_mode_active: true,
         bracketed_paste_active: true,
+        keyboard_enhancement_active: CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, std::sync::atomic::Ordering::AcqRel),
         mouse_capture_active: true,
         alternate_screen_active: leave_alternate_screen,
     };
@@ -1936,6 +2133,7 @@ fn restore_terminal_state() {
 pub struct TerminalGuard {
     raw_mode_active: std::sync::atomic::AtomicBool,
     bracketed_paste_active: std::sync::atomic::AtomicBool,
+    keyboard_enhancement_active: std::sync::atomic::AtomicBool,
     mouse_capture_active: std::sync::atomic::AtomicBool,
     alternate_screen_active: std::sync::atomic::AtomicBool,
 }
@@ -1948,6 +2146,7 @@ impl TerminalGuard {
         Ok(Self {
             raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
             bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
+            keyboard_enhancement_active: std::sync::atomic::AtomicBool::new(state.keyboard_enhancement_active),
             mouse_capture_active: std::sync::atomic::AtomicBool::new(state.mouse_capture_active),
             alternate_screen_active: std::sync::atomic::AtomicBool::new(state.alternate_screen_active),
         })
@@ -1969,6 +2168,15 @@ impl TerminalGuard {
                 .is_ok(),
             mouse_capture_active: self
                 .mouse_capture_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            keyboard_enhancement_active: self
+                .keyboard_enhancement_active
                 .compare_exchange(
                     true,
                     false,
@@ -3717,14 +3925,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
-        // Bug #1: `/compact` — manually compact the live LLM context history.
-        //
-        // Intercepted here (like `/clear` / `/model`) because it must mutate the
-        // real `history` Vec that feeds `run_tool_call_loop`; `commands::dispatch`
-        // only carries immutable borrows. Reuses the same `compact_chat_history`
-        // routine the context-overflow safeguard runs automatically, so manual and
-        // automatic compaction stay byte-for-byte identical. Reports the turn /
-        // token delta so the user can see the effect on the context window.
+        // `/compact` mutates the real LLM context history before the next turn.
+        // Prefer the provider-backed summary patch used by the Redux driver; if
+        // the summary call fails or times out, fall back to deterministic trim.
         if matches!(user_input.as_str(), "/compact") {
             let compact_context = crate::router::resolve_effective_compaction_config(
                 &config.agent.compaction,
@@ -3736,16 +3939,42 @@ Retry with a compatible model: /provider {new_provider} <model>"
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
-            compact_chat_history(&mut history);
+            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                &history,
+                provider.as_ref(),
+                model_name,
+                &compact_context.config,
+                None,
+                "chat_manual_compact",
+                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+            )
+            .await
+            {
+                apply_chat_compaction_patch_and_sync(
+                    &mut history,
+                    patch,
+                    &compact_context.config,
+                    crate::chat::action::CompactReason::Manual,
+                    &chat_dispatcher,
+                );
+            } else {
+                compact_chat_history(&mut history);
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::Manual,
+                    },
+                    "chat.history_compacted_manual",
+                );
+            }
             let turns_after = history.len().saturating_sub(system_count);
             let tokens_after = estimate_chat_history_tokens(&history);
-
-            // Keep the Redux UI mirror in sync (manual trigger reason).
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::HistoryCompacted {
-                    reason: crate::chat::action::CompactReason::Manual,
-                },
-                "chat.history_compacted_manual",
+            #[cfg(feature = "terminal-tui")]
+            refresh_context_budget_for_tui(
+                &history,
+                &compact_context.config,
+                redraw_tx_for_main.is_some(),
+                &chat_mirror,
+                &chat_dispatcher,
             );
 
             let msg = format_compact_feedback(
@@ -5202,24 +5431,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
         #[cfg(feature = "terminal-tui")]
-        if let Some(context_budget) =
-            context_budget_status_for_tui(&history, &effective_compaction.config, redraw_tx_for_main.is_some())
-        {
-            let context_used_tokens = Some(context_budget.used_context_tokens);
-            let context_window_tokens = Some(context_budget.max_context_tokens);
-            {
-                let mut mirror = chat_mirror.lock();
-                mirror.context_used_tokens = context_used_tokens;
-                mirror.context_window_tokens = context_window_tokens;
-            }
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::ContextWindowUpdated {
-                    used_context_tokens: context_used_tokens,
-                    max_context_tokens: context_window_tokens,
-                },
-                "chat.context_window_updated",
-            );
-        }
+        refresh_context_budget_for_tui(
+            &history,
+            &effective_compaction.config,
+            redraw_tx_for_main.is_some(),
+            &chat_mirror,
+            &chat_dispatcher,
+        );
 
         let route_decision = RouteDecision::from_model_routes_for_context(
             provider_name,
@@ -5525,6 +5743,67 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
+        let preflight_budget = crate::agent::loop_::plan_context_budget(
+            &history,
+            &effective_compaction.config,
+            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        if preflight_budget.over_hard_limit {
+            let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+            let turns_before = history.len().saturating_sub(system_count);
+            let tokens_before = estimate_chat_history_tokens(&history);
+            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                &history,
+                provider.as_ref(),
+                model_name,
+                &effective_compaction.config,
+                document_ingest.as_ref(),
+                "chat_preflight",
+                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+            )
+            .await
+            {
+                apply_chat_compaction_patch_and_sync(
+                    &mut history,
+                    patch,
+                    &effective_compaction.config,
+                    crate::chat::action::CompactReason::ContextOverflow,
+                    &chat_dispatcher,
+                );
+            } else {
+                compact_chat_history(&mut history);
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                    },
+                    "chat.history_compacted_preflight",
+                );
+            }
+            let turns_after = history.len().saturating_sub(system_count);
+            let tokens_after = estimate_chat_history_tokens(&history);
+            #[cfg(feature = "terminal-tui")]
+            refresh_context_budget_for_tui(
+                &history,
+                &effective_compaction.config,
+                redraw_tx_for_main.is_some(),
+                &chat_mirror,
+                &chat_dispatcher,
+            );
+            let compact_msg = format_compact_feedback(
+                turns_before,
+                turns_after,
+                tokens_before,
+                tokens_after,
+                effective_compaction.config.max_context_tokens,
+            );
+            surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
+            tracing::warn!(
+                before_used_tokens = preflight_budget.used_tokens,
+                hard_limit = preflight_budget.available_input_tokens,
+                "legacy chat context budget preflight compacted before provider call"
+            );
+        }
+
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
         // directly from this chat turn inherits parent_run_id = the per-turn
         // run_id. spawn_depth starts at 0 and is_turn_root keeps the first child's
@@ -5630,34 +5909,70 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 // ── Context window overflow → compact + retry ─────
                 Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
-                    // S2-B Step 4: dispatch `HistoryCompacted` 让 reducer 对
-                    // `state.session.history` 应用同样的 compaction 算法（两侧共享
-                    // COMPACT_KEEP_MESSAGES/COMPACT_CONTENT_CHARS/COMPACT_TOTAL_CHARS
-                    // 三个常量，state.rs 与 mod.rs 同源 → 字节级一致）。
-                    // legacy `compact_chat_history(&mut history)` 仍 unconditional 跑，
-                    // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
-                    // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
-                    // 重试会拿同一份未压缩的 history 二次失败。
                     let audit_source_history =
                         original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
                     let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
                     let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
-                    let _ = chat_dispatcher.dispatch_or_log(
-                        crate::chat::action::Action::HistoryCompacted {
-                            reason: crate::chat::action::CompactReason::ContextOverflow,
-                        },
-                        "chat.history_compacted_overflow",
-                    );
-                    compact_chat_history(&mut history);
-                    persist_legacy_chat_compaction_audit(
-                        mem.as_ref(),
-                        &runtime_envelope,
-                        &audit_source_history,
-                        &summary_projection,
-                        token_metadata,
+                    let turns_before = history
+                        .len()
+                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
+                    let tokens_before = estimate_chat_history_tokens(&history);
+                    if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                        &history,
+                        provider.as_ref(),
+                        model_name,
+                        &effective_compaction.config,
+                        document_ingest.as_ref(),
                         "chat_context_overflow",
+                        Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
                     )
-                    .await;
+                    .await
+                    {
+                        apply_chat_compaction_patch_and_sync(
+                            &mut history,
+                            patch,
+                            &effective_compaction.config,
+                            crate::chat::action::CompactReason::ContextOverflow,
+                            &chat_dispatcher,
+                        );
+                    } else {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::HistoryCompacted {
+                                reason: crate::chat::action::CompactReason::ContextOverflow,
+                            },
+                            "chat.history_compacted_overflow",
+                        );
+                        compact_chat_history(&mut history);
+                        persist_legacy_chat_compaction_audit(
+                            mem.as_ref(),
+                            &runtime_envelope,
+                            &audit_source_history,
+                            &summary_projection,
+                            token_metadata,
+                            "chat_context_overflow",
+                        )
+                        .await;
+                    }
+                    let turns_after = history
+                        .len()
+                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
+                    let tokens_after = estimate_chat_history_tokens(&history);
+                    #[cfg(feature = "terminal-tui")]
+                    refresh_context_budget_for_tui(
+                        &history,
+                        &effective_compaction.config,
+                        redraw_tx_for_main.is_some(),
+                        &chat_mirror,
+                        &chat_dispatcher,
+                    );
+                    let compact_msg = format_compact_feedback(
+                        turns_before,
+                        turns_after,
+                        tokens_before,
+                        tokens_after,
+                        effective_compaction.config.max_context_tokens,
+                    );
+                    surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
                         retries = context_overflow_retries,
@@ -9733,6 +10048,8 @@ mod terminal_guard_tests {
         calls: Vec<&'static str>,
         fail_enable_bracketed_paste: bool,
         fail_enable_mouse_capture: bool,
+        keyboard_enhancement_supported: bool,
+        fail_push_keyboard_enhancement: bool,
     }
 
     impl TerminalModeOps for FakeTerminalModeOps {
@@ -9743,6 +10060,25 @@ mod terminal_guard_tests {
 
         fn disable_raw_mode(&mut self) -> std::io::Result<()> {
             self.calls.push("disable_raw_mode");
+            Ok(())
+        }
+
+        fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool> {
+            self.calls.push("supports_keyboard_enhancement");
+            Ok(self.keyboard_enhancement_supported)
+        }
+
+        fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+            self.calls.push("push_keyboard_enhancement_flags");
+            if self.fail_push_keyboard_enhancement {
+                Err(std::io::Error::other("push keyboard enhancement failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+            self.calls.push("pop_keyboard_enhancement_flags");
             Ok(())
         }
 
@@ -9796,6 +10132,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(false),
             bracketed_paste_active: AtomicBool::new(false),
+            keyboard_enhancement_active: AtomicBool::new(false),
             mouse_capture_active: AtomicBool::new(false),
             alternate_screen_active: AtomicBool::new(false),
         }
@@ -9810,6 +10147,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(true),
             bracketed_paste_active: AtomicBool::new(true),
+            keyboard_enhancement_active: AtomicBool::new(true),
             mouse_capture_active: AtomicBool::new(true),
             alternate_screen_active: AtomicBool::new(true),
         }
@@ -9824,6 +10162,7 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
@@ -9838,11 +10177,13 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
         // Second leave is a no-op (CAS fails, no crossterm calls).
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
@@ -9881,6 +10222,7 @@ mod terminal_guard_tests {
                 "enable_raw_mode",
                 "enter_alternate_screen",
                 "enable_mouse_capture",
+                "supports_keyboard_enhancement",
                 "enable_bracketed_paste",
                 "disable_bracketed_paste",
                 "show_cursor",
@@ -9929,7 +10271,38 @@ mod terminal_guard_tests {
                 "enable_raw_mode",
                 "enter_alternate_screen",
                 "enable_mouse_capture",
+                "supports_keyboard_enhancement",
                 "enable_bracketed_paste",
+                "disable_mouse_capture",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_terminal_lifecycle_pushes_and_pops_keyboard_enhancement_when_supported() {
+        let mut ops = FakeTerminalModeOps {
+            keyboard_enhancement_supported: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let state = enter_terminal_state_with_ops(&mut ops).unwrap();
+        assert!(state.keyboard_enhancement_active);
+        leave_terminal_state_with_ops(&mut ops, state);
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "enable_mouse_capture",
+                "supports_keyboard_enhancement",
+                "push_keyboard_enhancement_flags",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "pop_keyboard_enhancement_flags",
                 "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
