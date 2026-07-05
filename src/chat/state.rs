@@ -2632,6 +2632,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         let expected = entries.clone();
         let effects = state.reduce(Action::SessionsEntriesUpdated { entries });
@@ -2755,6 +2756,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 token_usage_records: Vec::new(),
+                idle_warning: false,
             },
             SwitcherEntry {
                 seq: 2,
@@ -2765,6 +2767,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 token_usage_records: Vec::new(),
+                idle_warning: false,
             },
         ];
         let effects = state.reduce(Action::SwitcherOpened { entries });
@@ -2831,6 +2834,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 token_usage_records: Vec::new(),
+                idle_warning: false,
             },
         ]));
         let entries = vec![

@@ -19,7 +19,9 @@ use super::model::{
 use super::shell::ShellSession;
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use anyhow::{Result, anyhow};
+use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -75,6 +77,77 @@ pub struct FinishedSession {
     pub token_usage_records: Vec<crate::chat::session::SessionTokenUsageRecord>,
 }
 
+/// Retention and archive limits for chat-side session cleanup.
+#[derive(Debug, Clone)]
+pub struct ReapPolicy {
+    /// How long terminal sessions remain in the live strip after finishing.
+    pub terminal_ttl: Duration,
+    /// Always keep at least this many newest terminal sessions visible.
+    pub keep_last_terminal: usize,
+    /// Keep full archived logs for this many newest reaped sessions.
+    pub archive_keep_last: usize,
+    /// Keep full archived logs for this long after reaping.
+    pub archive_ttl: Duration,
+    /// Maximum log lines stored for one archived session.
+    pub archive_max_lines: usize,
+    /// Maximum UTF-8 bytes stored for one archived session log.
+    pub archive_max_bytes: usize,
+    /// Warn about detached shell/PTY entries after this much idle time.
+    pub idle_warn_after: Duration,
+}
+
+impl Default for ReapPolicy {
+    fn default() -> Self {
+        Self {
+            terminal_ttl: Duration::minutes(10),
+            keep_last_terminal: 5,
+            archive_keep_last: 5,
+            archive_ttl: Duration::minutes(10),
+            archive_max_lines: 200,
+            archive_max_bytes: 64 * 1024,
+            idle_warn_after: Duration::minutes(10),
+        }
+    }
+}
+
+/// Compact metadata for a session removed from the live registries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReapedSession {
+    pub id: SessionId,
+    pub seq: u64,
+    pub kind: ManagedKind,
+    pub summary: super::model::PersistedSessionSummary,
+    pub terminal_at: DateTime<Utc>,
+    pub reaped_at: DateTime<Utc>,
+}
+
+/// Result of one cleanup pass.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ReapOutcome {
+    pub reaped: Vec<ReapedSession>,
+}
+
+/// Result of shutting down every child owned by the chat session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ShutdownReport {
+    pub summaries: Vec<super::model::PersistedSessionSummary>,
+    pub ignored_ids: Vec<SessionId>,
+    pub aborted_agents: usize,
+    pub killed_shells: usize,
+    #[cfg(feature = "terminal-tui")]
+    pub killed_ptys: usize,
+}
+
+#[derive(Debug, Clone)]
+struct ReapCandidate {
+    id: SessionId,
+    seq: u64,
+    kind: ManagedKind,
+    view: ManagedSessionView,
+    summary_text: String,
+    terminal_at: DateTime<Utc>,
+}
+
 /// Chat-side handle over the shared agent + shell registries.
 ///
 /// Unifies two single-source registries into **one display seq space** so
@@ -101,6 +174,13 @@ pub struct ChatSessionsHandle {
     seq_map: Vec<(u64, SessionId)>,
     /// Next sequence number to hand out.
     next_seq: u64,
+    /// First time this handle observed a PTY as exited. PTY sessions do not
+    /// carry `finished_at`, so cleanup ages them from this observation point.
+    pty_terminal_seen_at: HashMap<SessionId, DateTime<Utc>>,
+    /// Compact metadata for sessions reaped from live registries. This lets
+    /// `/logs #N` distinguish "was reaped" from "never existed" after the full
+    /// bounded archive ages out.
+    reaped_sessions: Vec<ReapedSession>,
 }
 
 impl ChatSessionsHandle {
@@ -115,6 +195,8 @@ impl ChatSessionsHandle {
             ptys: Arc::new(Mutex::new(Vec::new())),
             seq_map: Vec::new(),
             next_seq: 1,
+            pty_terminal_seen_at: HashMap::new(),
+            reaped_sessions: Vec::new(),
         }
     }
 
@@ -268,6 +350,173 @@ impl ChatSessionsHandle {
         runs
     }
 
+    /// Compact metadata for a previously reaped session, by display sequence.
+    #[must_use]
+    pub fn reaped_session(&self, seq: u64) -> Option<&ReapedSession> {
+        self.reaped_sessions.iter().rev().find(|session| session.seq == seq)
+    }
+
+    /// Reap terminal sessions that are older than the retention window, while
+    /// always keeping the newest terminal sessions visible.
+    pub async fn reap(&mut self, policy: &ReapPolicy, now: DateTime<Utc>) -> ReapOutcome {
+        let runs = self.refresh_seqs().await;
+        let mut candidates = Vec::new();
+
+        for run in &runs {
+            let status = project_status(&run.status);
+            if !matches!(
+                status,
+                ManagedStatus::Completed | ManagedStatus::Failed | ManagedStatus::Cancelled
+            ) {
+                continue;
+            }
+            let seq = self.seq_for(&SessionId::from_run_id(&run.id));
+            let view = project_run(run, seq);
+            let summary_text = match &run.status {
+                SubAgentStatus::Completed(text) | SubAgentStatus::Failed(text) => compact_reaped_summary(text),
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => String::new(),
+            };
+            candidates.push(ReapCandidate {
+                id: SessionId::from_run_id(&run.id),
+                seq,
+                kind: ManagedKind::Agent,
+                view,
+                summary_text,
+                terminal_at: run.finished_at.unwrap_or(run.started_at),
+            });
+        }
+
+        let shells = self.shells.lock().clone();
+        for shell in &shells {
+            let status = project_shell_status(&shell.status());
+            if !matches!(
+                status,
+                ManagedStatus::Completed | ManagedStatus::Failed | ManagedStatus::Cancelled
+            ) {
+                continue;
+            }
+            let seq = self.seq_for(&shell.id);
+            let view = project_shell(shell, seq);
+            let summary_text = match shell.status() {
+                super::shell::ShellStatus::Failed(reason) => compact_reaped_summary(&reason),
+                super::shell::ShellStatus::Running
+                | super::shell::ShellStatus::Completed
+                | super::shell::ShellStatus::Cancelled => String::new(),
+            };
+            candidates.push(ReapCandidate {
+                id: shell.id.clone(),
+                seq,
+                kind: ManagedKind::Shell,
+                view,
+                summary_text,
+                terminal_at: shell.finished_at().unwrap_or(now),
+            });
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        {
+            let ptys = self.ptys.lock().clone();
+            for pty in &ptys {
+                if !pty.has_exited() {
+                    self.pty_terminal_seen_at.remove(&pty.id);
+                    continue;
+                }
+                let terminal_at = *self.pty_terminal_seen_at.entry(pty.id.clone()).or_insert(now);
+                let seq = self.seq_for(&pty.id);
+                candidates.push(ReapCandidate {
+                    id: pty.id.clone(),
+                    seq,
+                    kind: ManagedKind::Pty,
+                    view: super::model::project_pty(pty, seq),
+                    summary_text: String::new(),
+                    terminal_at,
+                });
+            }
+        }
+
+        candidates.sort_by(|a, b| b.terminal_at.cmp(&a.terminal_at).then_with(|| b.seq.cmp(&a.seq)));
+        let keep_ids = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, candidate)| {
+                let within_ttl = now.signed_duration_since(candidate.terminal_at) <= policy.terminal_ttl;
+                (idx < policy.keep_last_terminal || within_ttl).then(|| candidate.id.clone())
+            })
+            .collect::<HashSet<_>>();
+
+        let reaped = candidates
+            .into_iter()
+            .filter(|candidate| !keep_ids.contains(&candidate.id))
+            .map(|candidate| ReapedSession {
+                id: candidate.id,
+                seq: candidate.seq,
+                kind: candidate.kind,
+                summary: super::model::PersistedSessionSummary::from_view(&candidate.view, candidate.summary_text),
+                terminal_at: candidate.terminal_at,
+                reaped_at: now,
+            })
+            .collect::<Vec<_>>();
+
+        if reaped.is_empty() {
+            return ReapOutcome { reaped };
+        }
+
+        let reap_ids = reaped.iter().map(|session| session.id.clone()).collect::<HashSet<_>>();
+        {
+            let mut runs = self.runs.write().await;
+            runs.retain(|run| !reap_ids.contains(&SessionId::from_run_id(&run.id)));
+        }
+        self.shells.lock().retain(|shell| !reap_ids.contains(&shell.id));
+        #[cfg(feature = "terminal-tui")]
+        {
+            let removed_ptys = self
+                .ptys
+                .lock()
+                .iter()
+                .filter(|pty| reap_ids.contains(&pty.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            for pty in &removed_ptys {
+                pty.reap_reader();
+                self.pty_terminal_seen_at.remove(&pty.id);
+            }
+            self.ptys.lock().retain(|pty| !reap_ids.contains(&pty.id));
+        }
+        self.seq_map.retain(|(_, id)| !reap_ids.contains(id));
+        self.reaped_sessions.extend(reaped.clone());
+
+        ReapOutcome { reaped }
+    }
+
+    /// Display sequences for detached shell/PTY sessions that should carry an
+    /// idle warning in the strip. This is warning-only: it never kills sessions.
+    pub async fn idle_warning_seqs(&mut self, policy: &ReapPolicy, now: DateTime<Utc>) -> HashSet<u64> {
+        let _ = self.refresh_seqs().await;
+        let mut warned = HashSet::new();
+        let shells = self.shells.lock().clone();
+        for shell in &shells {
+            if shell.is_terminal() {
+                continue;
+            }
+            if now.signed_duration_since(shell.started_at) >= policy.idle_warn_after {
+                warned.insert(self.seq_for(&shell.id));
+            }
+        }
+        #[cfg(feature = "terminal-tui")]
+        {
+            let ptys = self.ptys.lock().clone();
+            for pty in &ptys {
+                if pty.has_exited() {
+                    continue;
+                }
+                if now.signed_duration_since(pty.started_at) >= policy.idle_warn_after {
+                    warned.insert(self.seq_for(&pty.id));
+                }
+            }
+        }
+        warned
+    }
+
     /// Find a shell session by its display seq `#N`, cloning the (cheap) handle
     /// out of the registry. Returns `None` if the seq does not map to a shell.
     fn shell_for_seq(&self, seq: u64) -> Option<ShellSession> {
@@ -316,43 +565,67 @@ impl ChatSessionsHandle {
     pub async fn detach_for_chat_session_switch(
         &mut self,
     ) -> (Vec<super::model::PersistedSessionSummary>, Vec<SessionId>) {
+        let report = self.shutdown_all("chat-session-switch").await;
+        (report.summaries, report.ignored_ids)
+    }
+
+    /// Terminate every live child and clear all live registries.
+    pub async fn shutdown_all(&mut self, reason: &str) -> ShutdownReport {
         let views = self.snapshot().await;
         let summaries = views
             .iter()
             .map(|view| super::model::PersistedSessionSummary::from_view(view, String::new()))
             .collect::<Vec<_>>();
         let ignored_ids = views.iter().map(|view| view.id.clone()).collect::<Vec<_>>();
-
+        let mut aborted_agents = 0usize;
         {
             let mut runs = self.runs.write().await;
             for run in runs.iter() {
                 if let Some(handle) = run.abort_handle.as_ref() {
                     handle.abort();
+                    aborted_agents = aborted_agents.saturating_add(1);
                 }
             }
             runs.clear();
         }
         let shells = self.shells.lock().clone();
+        let mut killed_shells = 0usize;
         for shell in &shells {
             if !shell.is_terminal() {
-                let _ = shell.kill().await;
+                match shell.kill().await {
+                    Ok(()) => killed_shells = killed_shells.saturating_add(1),
+                    Err(e) => tracing::warn!(error = %e, reason, "failed to terminate shell during chat shutdown"),
+                }
             }
         }
         self.shells.lock().clear();
+        #[cfg(feature = "terminal-tui")]
+        let mut killed_ptys = 0usize;
         #[cfg(feature = "terminal-tui")]
         {
             let ptys = self.ptys.lock().clone();
             for pty in &ptys {
                 if !pty.has_exited() {
-                    let _ = pty.kill().await;
+                    match pty.kill().await {
+                        Ok(()) => killed_ptys = killed_ptys.saturating_add(1),
+                        Err(e) => tracing::warn!(error = %e, reason, "failed to terminate PTY during chat shutdown"),
+                    }
                 }
             }
             self.ptys.lock().clear();
         }
         self.seq_map.clear();
         self.next_seq = 1;
+        self.pty_terminal_seen_at.clear();
 
-        (summaries, ignored_ids)
+        ShutdownReport {
+            summaries,
+            ignored_ids,
+            aborted_agents,
+            killed_shells,
+            #[cfg(feature = "terminal-tui")]
+            killed_ptys,
+        }
     }
 
     /// Poll the registry for sessions that have reached a terminal state and
@@ -577,6 +850,27 @@ impl ChatSessionsHandle {
     }
 }
 
+const REAP_SUMMARY_MAX_CHARS: usize = 120;
+
+fn compact_reaped_summary(text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return String::new();
+    };
+    let mut chars = line.chars();
+    let mut out = String::new();
+    for _ in 0..REAP_SUMMARY_MAX_CHARS {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() && !out.is_empty() {
+        out.pop();
+        out.push('…');
+    }
+    out
+}
+
 /// Build the persistent status-line summary from a session snapshot.
 ///
 /// Returns an empty string when there are no sessions (the chat status row is
@@ -649,6 +943,17 @@ mod tests {
         }
     }
 
+    fn finished_run(id: &str, finished_at: chrono::DateTime<Utc>) -> SubAgentRun {
+        let mut run = make_run(
+            id,
+            &format!("task {id}"),
+            SubAgentStatus::Completed(format!("done {id}")),
+        );
+        run.started_at = finished_at - chrono::Duration::minutes(1);
+        run.finished_at = Some(finished_at);
+        run
+    }
+
     fn usage_record(
         source: crate::llm::route_decision::TokenUsageSource,
     ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
@@ -671,6 +976,127 @@ mod tests {
             workspace_dir: std::env::temp_dir(),
             ..crate::security::SecurityPolicy::default()
         })
+    }
+
+    #[tokio::test]
+    async fn reap_keeps_ten_minute_window_and_last_five_terminal_sessions() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
+            .expect("test timestamp")
+            .with_timezone(&Utc);
+        let mut runs = Vec::new();
+        runs.push(finished_run("recent", now - chrono::Duration::minutes(9)));
+        for idx in 1..=6 {
+            runs.push(finished_run(
+                &format!("old-{idx}"),
+                now - chrono::Duration::minutes(30) + chrono::Duration::seconds(idx),
+            ));
+        }
+        let runs = Arc::new(RwLock::new(runs));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let _ = handle.snapshot().await;
+
+        let outcome = handle.reap(&ReapPolicy::default(), now).await;
+
+        assert_eq!(
+            outcome.reaped.len(),
+            2,
+            "entries outside both the TTL window and last-5 terminal set are reaped"
+        );
+        let reaped_ids = outcome
+            .reaped
+            .iter()
+            .map(|session| session.summary.id.as_str())
+            .collect::<Vec<_>>();
+        assert!(reaped_ids.contains(&"old-1"));
+        assert!(reaped_ids.contains(&"old-2"));
+        assert!(
+            handle.reaped_session(outcome.reaped[0].seq).is_some(),
+            "compact reaped metadata is retained for /logs fallback"
+        );
+        let remaining = runs.read().await.iter().map(|run| run.id.clone()).collect::<Vec<_>>();
+        assert!(
+            remaining.contains(&"recent".to_string()),
+            "10-minute window keeps recent terminal runs"
+        );
+        assert_eq!(
+            remaining.len(),
+            5,
+            "recent plus the four newest old terminal runs remain visible"
+        );
+        assert!(!remaining.contains(&"old-1".to_string()));
+        assert!(!remaining.contains(&"old-2".to_string()));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_aborts_agent_and_kills_shell() {
+        let task = tokio::spawn(async {
+            std::future::pending::<()>().await;
+        });
+        let abort_handle = task.abort_handle();
+        let mut run = make_run("live-agent", "agent", SubAgentStatus::Running);
+        run.abort_handle = Some(abort_handle);
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        handle.add_shell(shell.clone());
+
+        let report = handle.shutdown_all("test-shutdown").await;
+
+        assert_eq!(report.aborted_agents, 1);
+        assert_eq!(report.killed_shells, 1);
+        assert!(task.is_finished(), "agent task was aborted");
+        assert!(runs.read().await.is_empty(), "agent registry cleared");
+        assert!(handle.shell_registry().lock().is_empty(), "shell registry cleared");
+        assert!(shell.is_terminal(), "shell process group was killed");
+    }
+
+    #[tokio::test]
+    async fn idle_warning_marks_shell_without_killing_it() {
+        let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
+        let mut handle = ChatSessionsHandle::new(runs);
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let seq = handle.add_shell(shell.clone());
+
+        let warnings = handle
+            .idle_warning_seqs(&ReapPolicy::default(), shell.started_at + chrono::Duration::minutes(11))
+            .await;
+
+        assert!(warnings.contains(&seq), "long-running detached shell is warning-marked");
+        assert!(
+            !shell.is_terminal(),
+            "idle warning must not auto-kill during active chat"
+        );
+        shell.kill().await.expect("test: cleanup shell");
+    }
+
+    #[cfg(all(unix, feature = "terminal-tui"))]
+    #[tokio::test]
+    async fn shutdown_all_kills_pty_fixture() {
+        use super::super::pty::PtyShellSession;
+        use portable_pty::PtySize;
+
+        let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
+        let mut handle = ChatSessionsHandle::new(runs);
+        let sec = permissive_security();
+        let pty = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
+        handle.add_pty(pty.clone());
+
+        let report = handle.shutdown_all("test-pty-shutdown").await;
+
+        assert_eq!(report.killed_ptys, 1);
+        assert!(handle.pty_registry().lock().is_empty(), "PTY registry cleared");
+        for _ in 0..50 {
+            if pty.has_exited() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(pty.has_exited(), "PTY child terminated during shutdown_all");
     }
 
     #[tokio::test]

@@ -103,6 +103,10 @@ pub struct SwitcherEntry {
     /// Live snapshot time for running sessions, final timestamp for terminal sessions.
     pub updated_at: DateTime<Utc>,
     pub token_usage_records: Vec<crate::chat::session::SessionTokenUsageRecord>,
+    /// Display-only stale interactive warning. This never changes routing or
+    /// lifecycle; it only marks detached shell/PTY entries that have been idle
+    /// past the cleanup policy's warning threshold.
+    pub idle_warning: bool,
 }
 
 /// Pure render snapshot for the focused line-oriented child session viewport
@@ -168,6 +172,7 @@ impl SwitcherEntry {
             created_at: view.created_at,
             updated_at: view.updated_at,
             token_usage_records: view.token_usage_records.clone(),
+            idle_warning: false,
         }
     }
 
@@ -565,6 +570,7 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         entries.extend(switcher_entries(&[
             view(1, ManagedStatus::Running, "left"),

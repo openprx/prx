@@ -764,6 +764,245 @@ fn format_session_logs(seq: u64, lines: &[String], truncated: bool) -> String {
     out.trim_end().to_string()
 }
 
+#[derive(Debug, Clone)]
+struct ArchivedReapedSessionLog {
+    seq: u64,
+    reaped_at: chrono::DateTime<chrono::Utc>,
+    summary: crate::chat::sessions::PersistedSessionSummary,
+    lines: Option<Vec<String>>,
+    truncated: bool,
+}
+
+#[derive(Debug, Default)]
+struct ReapedSessionLogArchive {
+    entries: Vec<ArchivedReapedSessionLog>,
+}
+
+impl ReapedSessionLogArchive {
+    fn archive_reaped(
+        &mut self,
+        reaped: &[crate::chat::sessions::runtime::ReapedSession],
+        session_rings: &mut std::collections::HashMap<
+            crate::chat::sessions::id::SessionId,
+            crate::chat::sessions::SessionRing,
+        >,
+        policy: &crate::chat::sessions::runtime::ReapPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        for session in reaped {
+            let (lines, truncated) = session_rings.remove(&session.id).map_or_else(
+                || (Vec::new(), false),
+                |ring| {
+                    (
+                        cap_archived_log_lines(
+                            ring.recent_lines(policy.archive_max_lines),
+                            policy.archive_max_lines,
+                            policy.archive_max_bytes,
+                        ),
+                        ring.is_truncated(),
+                    )
+                },
+            );
+            self.entries.push(ArchivedReapedSessionLog {
+                seq: session.seq,
+                reaped_at: session.reaped_at,
+                summary: session.summary.clone(),
+                lines: Some(lines),
+                truncated,
+            });
+        }
+        self.prune(policy, now);
+    }
+
+    fn prune(&mut self, policy: &crate::chat::sessions::runtime::ReapPolicy, now: chrono::DateTime<chrono::Utc>) {
+        self.entries
+            .sort_by(|a, b| b.reaped_at.cmp(&a.reaped_at).then_with(|| b.seq.cmp(&a.seq)));
+        for (idx, entry) in self.entries.iter_mut().enumerate() {
+            let within_ttl = now.signed_duration_since(entry.reaped_at) <= policy.archive_ttl;
+            if idx >= policy.archive_keep_last && !within_ttl {
+                entry.lines = None;
+            }
+        }
+    }
+
+    fn logs_message(
+        &mut self,
+        seq: u64,
+        policy: &crate::chat::sessions::runtime::ReapPolicy,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Option<String> {
+        self.prune(policy, now);
+        let entry = self.entries.iter().rev().find(|entry| entry.seq == seq)?;
+        match entry.lines.as_ref() {
+            Some(lines) if !lines.is_empty() => Some(format_session_logs(seq, lines, entry.truncated)),
+            Some(_) => Some(format_reaped_session_notice(seq, Some(&entry.summary))),
+            None => Some(format_reaped_session_notice(seq, Some(&entry.summary))),
+        }
+    }
+}
+
+fn cap_archived_log_lines(mut lines: Vec<String>, max_lines: usize, max_bytes: usize) -> Vec<String> {
+    if lines.len() > max_lines {
+        let drop = lines.len().saturating_sub(max_lines);
+        lines.drain(0..drop);
+    }
+    let mut total = lines.iter().map(|line| line.len()).sum::<usize>();
+    while total > max_bytes && !lines.is_empty() {
+        let first = lines.remove(0);
+        total = total.saturating_sub(first.len());
+    }
+    lines
+}
+
+fn format_reaped_session_notice(seq: u64, summary: Option<&crate::chat::sessions::PersistedSessionSummary>) -> String {
+    let mut msg = format!("Session #{seq} was reaped from live sessions; use the persisted summary.");
+    if let Some(summary) = summary {
+        let body = summary.summary.trim();
+        if !body.is_empty() {
+            msg.push_str(&format!(" Summary: {body}"));
+        }
+    }
+    msg
+}
+
+fn is_chat_quit_command(input: &str) -> bool {
+    matches!(input, "/quit" | "/exit")
+}
+
+async fn shutdown_child_sessions_for_exit(
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    chat_session: &mut session::ChatSession,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) -> crate::chat::sessions::runtime::ShutdownReport {
+    let report = chat_sessions.shutdown_all("chat-exit").await;
+    for persisted in report
+        .summaries
+        .iter()
+        .filter(|summary| summary.status == crate::chat::sessions::model::STATUS_INTERRUPTED)
+        .cloned()
+    {
+        chat_session.record_background_session(persisted.clone());
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
+            "chat.bg_session_recorded_exit",
+        );
+    }
+    report
+}
+
+#[cfg(test)]
+mod session_cleanup_tests {
+    use super::*;
+    use crate::chat::sessions::id::SessionId;
+    use crate::chat::sessions::model::ManagedKind;
+    use crate::chat::sessions::runtime::{ReapPolicy, ReapedSession};
+
+    fn reaped(seq: u64, id: &SessionId, now: chrono::DateTime<chrono::Utc>) -> ReapedSession {
+        ReapedSession {
+            id: id.clone(),
+            seq,
+            kind: ManagedKind::Agent,
+            summary: crate::chat::sessions::PersistedSessionSummary {
+                id: id.as_str().to_string(),
+                seq,
+                kind: "agent".to_string(),
+                origin: "user".to_string(),
+                status: "completed".to_string(),
+                title: "archived task".to_string(),
+                summary: "persisted compact summary".to_string(),
+                token_usage_records: Vec::new(),
+                created_at: now - chrono::Duration::minutes(20),
+            },
+            terminal_at: now - chrono::Duration::minutes(20),
+            reaped_at: now,
+        }
+    }
+
+    #[test]
+    fn logs_archive_returns_full_in_window_then_reaped_notice() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-05T12:00:00Z")
+            .expect("test timestamp")
+            .with_timezone(&chrono::Utc);
+        let id = SessionId::from_run_id("archived-run");
+        let mut ring = crate::chat::sessions::SessionRing::with_capacity(10);
+        ring.push("full retained output".to_string());
+        let mut rings = std::collections::HashMap::from([(id.clone(), ring)]);
+        let mut policy = ReapPolicy::default();
+        policy.archive_keep_last = 0;
+        let mut archive = ReapedSessionLogArchive::default();
+
+        archive.archive_reaped(&[reaped(7, &id, now)], &mut rings, &policy, now);
+
+        let live_window = archive
+            .logs_message(7, &policy, now + chrono::Duration::minutes(5))
+            .expect("archive hit in window");
+        assert!(live_window.contains("Session #7 logs"));
+        assert!(live_window.contains("full retained output"));
+
+        let expired = archive
+            .logs_message(7, &policy, now + chrono::Duration::minutes(11))
+            .expect("compact reaped notice after archive expiry");
+        assert!(expired.contains("was reaped"));
+        assert!(expired.contains("persisted summary"));
+        assert!(expired.contains("persisted compact summary"));
+        assert!(
+            !expired.contains("full retained output"),
+            "expired archive should not dump old full logs"
+        );
+    }
+
+    #[test]
+    fn quit_and_exit_are_shutdown_commands() {
+        assert!(is_chat_quit_command("/quit"));
+        assert!(is_chat_quit_command("/exit"));
+        assert!(!is_chat_quit_command("/quit now"));
+        assert!(!is_chat_quit_command(" /quit"));
+    }
+
+    #[tokio::test]
+    async fn exit_shutdown_helper_calls_shutdown_all_and_records_interrupted_summary() {
+        let run = crate::tools::sessions_spawn::SubAgentRun {
+            id: "quit-live-agent".to_string(),
+            task: "still running".to_string(),
+            owner_id: None,
+            topic_id: None,
+            source_message_event_id: None,
+            started_at: chrono::Utc::now(),
+            finished_at: None,
+            status: crate::tools::sessions_spawn::SubAgentStatus::Running,
+            recipient: None,
+            channel_name: None,
+            abort_handle: None,
+            history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
+            steer_tx: None,
+            parent_run_id: None,
+            session_scope_key: String::new(),
+            spawn_depth: 0,
+            token_usage_records: Vec::new(),
+        };
+        let runs = std::sync::Arc::new(tokio::sync::RwLock::new(vec![run]));
+        let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::clone(&runs));
+        let mut chat_session = session::ChatSession::new("provider", "model");
+        let (dispatcher, _rx) = dispatcher::ChatDispatcher::new();
+
+        let report = shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &dispatcher).await;
+
+        assert_eq!(report.summaries.len(), 1);
+        assert!(
+            runs.read().await.is_empty(),
+            "/quit exit helper must clear live agent registry"
+        );
+        assert_eq!(chat_session.background_sessions.len(), 1);
+        assert_eq!(
+            chat_session
+                .background_sessions
+                .first()
+                .map(|summary| summary.status.as_str()),
+            Some(crate::chat::sessions::model::STATUS_INTERRUPTED)
+        );
+    }
+}
+
 #[cfg(feature = "terminal-tui")]
 const MOUSE_WHEEL_TRANSCRIPT_ROWS: usize = 3;
 
@@ -2671,6 +2910,8 @@ pub async fn run(
         crate::chat::sessions::id::SessionId,
         crate::chat::sessions::SessionRing,
     > = std::collections::HashMap::new();
+    let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+    let mut reaped_log_archive = ReapedSessionLogArchive::default();
     let mut ignored_session_events: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
         std::collections::HashSet::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
@@ -2942,12 +3183,64 @@ pub async fn run(
                         "chat.bg_session_recorded",
                     );
                 }
+                let now = chrono::Utc::now();
+                let reaped = chat_sessions.reap(&reap_policy, now).await;
+                if !reaped.reaped.is_empty() {
+                    let reaped_ids = reaped
+                        .reaped
+                        .iter()
+                        .map(|session| session.id.clone())
+                        .collect::<std::collections::HashSet<_>>();
+                    for session in &reaped.reaped {
+                        if chat_session
+                            .background_sessions
+                            .iter()
+                            .any(|summary| summary.id == session.summary.id)
+                        {
+                            continue;
+                        }
+                        chat_session.record_background_session(session.summary.clone());
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::BackgroundSessionRecorded {
+                                summary: session.summary.clone(),
+                            },
+                            "chat.bg_session_recorded_reap",
+                        );
+                    }
+                    reaped_log_archive.archive_reaped(&reaped.reaped, &mut session_rings, &reap_policy, now);
+                    if attached_follow.as_ref().is_some_and(|id| reaped_ids.contains(id)) {
+                        attached_follow = None;
+                        attached_follow_seq = None;
+                        let focus = crate::chat::sessions::FocusTarget::Main;
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::SessionFocusChanged { focus },
+                            "chat.session_focus_reaped",
+                        );
+                        #[cfg(feature = "terminal-tui")]
+                        {
+                            {
+                                let mut mirror = chat_mirror.lock();
+                                mirror.focus = focus;
+                                mirror.active_session_view = None;
+                            }
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+                                "chat.active_session_view_reaped",
+                            );
+                        }
+                    }
+                }
+                let views = chat_sessions.snapshot().await;
                 // v1.1b: refresh the switcher cache the key thread reads on Ctrl+G
                 // (it cannot run async registry queries itself). Display staleness
                 // is harmless: switcher Enter re-resolves the seq via /attach.
                 #[cfg(feature = "terminal-tui")]
                 {
-                    let entries = crate::chat::sessions::focus::switcher_entries(&views);
+                    let idle_warnings = chat_sessions.idle_warning_seqs(&reap_policy, chrono::Utc::now()).await;
+                    let mut entries = crate::chat::sessions::focus::switcher_entries(&views);
+                    for entry in &mut entries {
+                        entry.idle_warning = idle_warnings.contains(&entry.seq);
+                    }
                     chat_mirror.lock().sessions_cache = entries.clone();
                     if entries != last_sessions_entries {
                         last_sessions_entries = entries.clone();
@@ -3103,7 +3396,7 @@ pub async fn run(
         }
 
         // Handle /quit and /exit immediately
-        if matches!(user_input.as_str(), "/quit" | "/exit") {
+        if is_chat_quit_command(user_input.as_str()) {
             break;
         }
 
@@ -4409,7 +4702,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         }
                                     }
                                 }
-                                Err(e) => emit_chat_output(&format!("Logs failed: {e}")),
+                                Err(e) => {
+                                    let now = chrono::Utc::now();
+                                    if let Some(message) = reaped_log_archive.logs_message(seq, &reap_policy, now) {
+                                        emit_chat_output(&message);
+                                    } else if let Some(reaped) = chat_sessions.reaped_session(seq) {
+                                        emit_chat_output(&format_reaped_session_notice(seq, Some(&reaped.summary)));
+                                    } else {
+                                        emit_chat_output(&format!("Logs failed: {e}"));
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -5743,73 +6045,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
     }
 
-    // ── Persist background-session summaries on exit (v4) ─────────
-    // Snapshot every child session (agent / shell / pty) still tracked at
-    // exit and record a summary so a future reload of this chat session can show
-    // what its background tasks were. `from_view` maps any session still in a
-    // live state (Running / NeedsInput) to the terminal `interrupted` sentinel:
-    // its process is about to be killed below and can never be revived — reload
-    // must present it as a non-revivable terminal state, never as "running".
-    // Sessions that already finished during the loop were recorded in the poll
-    // path; recording again here is an idempotent upsert (dedup by id).
-    {
-        use crate::chat::sessions::model::ManagedStatus;
-        let exit_views = chat_sessions.snapshot().await;
-        for view in &exit_views {
-            // Only record sessions still live at exit: terminal sessions already
-            // recorded their (richer) summary text during the poll loop, and
-            // re-recording with an empty summary here would clobber it. A live
-            // session has no captured summary anyway — `from_view` maps it to the
-            // `interrupted` terminal sentinel, the load-bearing fact for reload.
-            if !matches!(view.status, ManagedStatus::Running | ManagedStatus::NeedsInput) {
-                continue;
-            }
-            let persisted = crate::chat::sessions::PersistedSessionSummary::from_view(view, String::new());
-            chat_session.record_background_session(persisted.clone());
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::BackgroundSessionRecorded { summary: persisted },
-                "chat.bg_session_recorded_exit",
-            );
-        }
-    }
-
-    // ── Background shell cleanup (v2) ─────────────────────────────
-    // On chat exit, terminate every **still-running** background shell's whole
-    // process group so no child (e.g. a `sleep` forked by `sh -c`) is left
-    // orphaned. We skip already-terminal shells (v2 review fix 1④): their pgid
-    // may have been recycled by the OS, so signalling them could mis-kill an
-    // unrelated process group. `kill()` is async (graceful SIGTERM → SIGKILL) and
-    // idempotent.
-    {
-        let shells = chat_sessions.shell_registry();
-        let to_kill: Vec<_> = shells.lock().clone();
-        for shell in &to_kill {
-            if shell.is_terminal() {
-                continue;
-            }
-            if let Err(e) = shell.kill().await {
-                tracing::warn!(error = %e, "Failed to terminate background shell process group on exit");
-            }
-        }
-    }
-
-    // ── Interactive PTY cleanup (v3a) ─────────────────────────────
-    // Same rationale as the background shell cleanup: terminate every PTY
-    // session's process group on chat exit so no interactive shell (or anything
-    // it backgrounded) is left orphaned. Skip already-exited sessions.
-    #[cfg(feature = "terminal-tui")]
-    {
-        let ptys = chat_sessions.pty_registry();
-        let to_kill: Vec<_> = ptys.lock().clone();
-        for pty in &to_kill {
-            if pty.has_exited() {
-                continue;
-            }
-            if let Err(e) = pty.kill().await {
-                tracing::warn!(error = %e, "Failed to terminate PTY process group on exit");
-            }
-        }
-    }
+    // ── Child-session shutdown on exit (Phase C) ─────────────────
+    // Snapshot every child session still tracked at exit, persist summaries for
+    // live sessions as interrupted, then terminate and clear every child
+    // registry through the single session owner. This covers running agents,
+    // NeedsInput agents, background shells, and interactive PTYs uniformly.
+    let _shutdown_report =
+        shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &chat_dispatcher).await;
+    session_rings.clear();
 
     // Give the reducer-owned turn persistence path a bounded chance to finish
     // before shutdown cancellation drains the dispatcher. This closes the
@@ -10791,6 +11034,7 @@ mod regfix_approval_switch_tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         let mut attached_follow = None;
         let mut attached_follow_seq = Some(7);

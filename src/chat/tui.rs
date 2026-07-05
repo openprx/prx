@@ -882,6 +882,7 @@ pub fn transcript_switcher_entry() -> crate::chat::sessions::SwitcherEntry {
         created_at: now,
         updated_at: now,
         token_usage_records: Vec::new(),
+        idle_warning: false,
     }
 }
 
@@ -3362,12 +3363,22 @@ fn render_sessions_strip_entry(
     let marker = session_active_marker(active_seq == Some(entry.seq), ascii);
     let glyph = session_status_glyph(entry, ascii);
     let elapsed = entry.elapsed_label();
+    let idle = if entry.idle_warning {
+        if ascii { " [idle]" } else { " ⚠ idle" }
+    } else {
+        ""
+    };
     let usage = entry
         .token_usage_summary()
         .and_then(crate::chat::session::format_session_token_usage_inline);
     let prefix = usage.map_or_else(
-        || format!("{marker} {glyph} #{} {} {elapsed} ", entry.seq, entry.kind),
-        |usage| format!("{marker} {glyph} #{} {} {elapsed} {usage} ", entry.seq, entry.kind),
+        || format!("{marker} {glyph} #{} {} {elapsed}{idle} ", entry.seq, entry.kind),
+        |usage| {
+            format!(
+                "{marker} {glyph} #{} {} {elapsed}{idle} {usage} ",
+                entry.seq, entry.kind
+            )
+        },
     );
     let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
     let max = usize::from(max_width);
@@ -6809,6 +6820,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         for ch in "/kill ".chars() {
             assert_eq!(
@@ -7095,6 +7107,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         assert!(matches!(
             dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut switcher),
@@ -7331,6 +7344,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState {
             entries: vec![saved_picker_entry("only", "only session", false)],
@@ -7736,6 +7750,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }
     }
 
@@ -7938,6 +7953,7 @@ mod tests {
             created_at: now,
             updated_at: now,
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }
     }
 
@@ -7954,6 +7970,7 @@ mod tests {
             created_at,
             updated_at: created_at + chrono::Duration::seconds(elapsed_seconds),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }
     }
 
@@ -8075,6 +8092,15 @@ mod tests {
     }
 
     #[test]
+    fn sessions_strip_entry_shows_idle_warning() {
+        let mut entry = elapsed_entry(2, "running", 601);
+        entry.kind = "shell";
+        entry.idle_warning = true;
+        let line = render_sessions_strip_line(&[entry], "", crate::chat::sessions::FocusTarget::Main, false, 80);
+        assert!(line.contains("⚠ idle"), "strip carries idle warning: {line}");
+    }
+
+    #[test]
     fn sessions_strip_multiple_entries_share_one_row() {
         let entries = vec![entry(1), entry(2)];
         let line = render_sessions_strip_line(&entries, "", crate::chat::sessions::FocusTarget::Main, false, 80);
@@ -8151,6 +8177,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             token_usage_records: Vec::new(),
+            idle_warning: false,
         }];
         let width = 22;
         let line = render_sessions_strip_line(
@@ -9396,6 +9423,7 @@ mod tests {
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
                 token_usage_records: Vec::new(),
+                idle_warning: false,
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.strip_selection = Some(7);
