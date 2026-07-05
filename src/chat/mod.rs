@@ -1473,6 +1473,33 @@ mod runtime_display_tests {
             "plain/fallback path must not surface turn completed chrome"
         );
     }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn surface_turn_elapsed_message_dispatches_system_message_and_redraw() {
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
+
+        surface_turn_elapsed_message(
+            &dispatcher,
+            Some(&redraw_tx),
+            "completed",
+            ts("2026-07-04T12:00:00Z"),
+            ts("2026-07-04T12:00:03Z"),
+        );
+
+        assert!(redraw_rx.try_recv().is_ok(), "surface path should request redraw");
+        let action = action_rx
+            .try_recv()
+            .expect("surface path should dispatch system message");
+        assert!(
+            matches!(
+                action,
+                crate::chat::action::Action::SystemMessageAdded { ref text } if text == "turn completed 3s"
+            ),
+            "unexpected action: {action:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2716,18 +2743,25 @@ pub async fn run(
     // per-turn `tui_mirror`) collapses all observable mutations into a
     // single state machine so the renderer sees a consistent view.
     #[cfg(feature = "terminal-tui")]
+    let initial_saved_session_entries = match saved_chat_sessions(mem.as_ref()).await {
+        Ok(sessions) => sessions
+            .iter()
+            .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load saved chat sessions for TUI slash-menu cache");
+            Vec::new()
+        }
+    };
+
+    #[cfg(feature = "terminal-tui")]
     let chat_mirror: Arc<parking_lot::Mutex<tui::TuiState>> = {
         let mut state = tui::TuiState::new(provider_name, model_name);
         state.chat_mode = chat_session.mode;
         state.autonomy_level = config.autonomy.level;
         state.token_usage_summary = chat_session.token_usage_summary();
         state.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
-        if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
-            state.saved_sessions_cache = sessions
-                .iter()
-                .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
-                .collect();
-        }
+        state.saved_sessions_cache = initial_saved_session_entries.clone();
         Arc::new(parking_lot::Mutex::new(state))
     };
 
@@ -2768,12 +2802,7 @@ pub async fn run(
         dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
         dispatcher_shadow_state.ui.autonomy_level = config.autonomy.level;
         dispatcher_shadow_state.ui.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
-        if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
-            dispatcher_shadow_state.ui.saved_sessions_cache = sessions
-                .iter()
-                .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
-                .collect();
-        }
+        dispatcher_shadow_state.ui.saved_sessions_cache = initial_saved_session_entries.clone();
     }
 
     // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
@@ -3044,6 +3073,10 @@ pub async fn run(
         let cancel_ref = Arc::clone(&active_cancel);
         let shutdown_signal = shutdown.clone();
         let dispatcher_for_signal = chat_dispatcher.clone();
+        #[cfg(feature = "terminal-tui")]
+        let mirror_for_signal = Arc::clone(&chat_mirror);
+        #[cfg(feature = "terminal-tui")]
+        let redraw_for_signal = redraw_tx_for_main.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -3072,6 +3105,12 @@ pub async fn run(
 
                 // Single Ctrl+C → cancel active generation if any
                 // Step 5b shadow: 同步投递 CancelRequested 给 reducer 观察。
+                #[cfg(feature = "terminal-tui")]
+                if mirror_for_signal.lock().clear_pending_tool_approval()
+                    && let Some(tx) = redraw_for_signal.as_ref()
+                {
+                    let _ = tx.try_send(());
+                }
                 let _ = dispatcher_for_signal
                     .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_single_ctrlc");
                 #[cfg(not(feature = "terminal-tui"))]

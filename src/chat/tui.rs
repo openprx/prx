@@ -500,7 +500,8 @@ pub const DIFF_SESSION_SEQ: u64 = 0;
 /// Bounded transcript viewport size. Conversation history remains authoritative
 /// elsewhere; the child TUI is only a scrollable display snapshot.
 pub const TRANSCRIPT_MAX_LINES: usize = 400;
-const ASSISTANT_MARKDOWN_CACHE_CAPACITY: usize = 128;
+const ASSISTANT_MARKDOWN_CACHE_CAPACITY: usize = 512;
+const STREAMING_MARKDOWN_HIGHLIGHT_MAX_BYTES: usize = 32 * 1024;
 
 static ASSISTANT_MARKDOWN_CACHE: LazyLock<Mutex<AssistantMarkdownCache>> =
     LazyLock::new(|| Mutex::new(AssistantMarkdownCache::new(ASSISTANT_MARKDOWN_CACHE_CAPACITY)));
@@ -662,16 +663,6 @@ pub enum KeyDispatch {
     ModeChanged(ChatMode),
 }
 
-pub(crate) fn sync_slash_menu_for_input(input: &TuiInput, slash_menu: &mut Option<SlashMenuState>) {
-    let sources = SlashMenuSources {
-        live_sessions: &[],
-        saved_sessions: &[],
-        provider_model_catalog: &[],
-        current_provider: "",
-    };
-    sync_slash_menu_for_sources(input, slash_menu, sources);
-}
-
 pub(crate) fn sync_slash_menu_for_sources(
     input: &TuiInput,
     slash_menu: &mut Option<SlashMenuState>,
@@ -829,20 +820,6 @@ fn model_candidate_entries(catalog: &[SlashProviderModelCatalog], provider: &str
                 .map(|model| SlashMenuEntry::argument(model.name.clone(), model.description.clone()))
                 .collect()
         })
-}
-
-pub(crate) fn dispatch_slash_menu_key_for(
-    input: &mut TuiInput,
-    slash_menu: &mut Option<SlashMenuState>,
-    key: KeyEvent,
-) -> KeyDispatch {
-    let sources = SlashMenuSources {
-        live_sessions: &[],
-        saved_sessions: &[],
-        provider_model_catalog: &[],
-        current_provider: "",
-    };
-    dispatch_slash_menu_key_with_sources(input, slash_menu, key, sources)
 }
 
 pub(crate) fn dispatch_slash_menu_key_with_sources(
@@ -4083,9 +4060,6 @@ fn render_slash_menu(frame: &mut Frame, area: Rect, menu: &SlashMenuState, ascii
     let hint_rows: u16 = 1;
     let list_height = inner.height.saturating_sub(hint_rows) as usize;
     if menu.is_empty() {
-        let empty =
-            Paragraph::new(" No matching slash commands. Esc to close. ").style(Style::default().fg(Color::DarkGray));
-        frame.render_widget(empty, inner);
         return;
     }
 
@@ -4404,7 +4378,11 @@ fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option
     } else {
         ["⠋", "⠙", "⠹", "⠸"]
     };
-    let tick = streaming.map_or(0, |draft| draft.version);
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis() / 50).unwrap_or(u64::MAX)
+        });
     let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
     let frame = frames.get(idx).copied().unwrap_or("-");
     Some(format!("{frame} generating (esc to interrupt)"))
@@ -4606,8 +4584,15 @@ fn cached_finalized_assistant_markdown_lines(content: &str) -> Arc<Vec<Line<'sta
 }
 
 fn render_streaming_assistant_markdown_lines(content: &str, ascii: bool) -> Vec<Line<'static>> {
-    let mut lines = render_assistant_markdown_lines(content);
     let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
+    let mut lines = if content.len() > STREAMING_MARKDOWN_HIGHLIGHT_MAX_BYTES {
+        content
+            .split('\n')
+            .map(|line| Line::from(line.to_string()))
+            .collect::<Vec<_>>()
+    } else {
+        render_assistant_markdown_lines(content)
+    };
     if let Some(last) = lines.last_mut() {
         last.spans.push(Span::raw(cursor.to_string()));
     } else {
@@ -4630,11 +4615,13 @@ fn ansi_sgr_to_lines(input: &str) -> Vec<Line<'static>> {
 
     while idx < input.len() {
         if input[idx..].starts_with("\x1b[")
-            && let Some(end_rel) = input[idx + 2..].find('m')
+            && let Some((end_rel, final_byte)) = find_csi_final(&input[idx + 2..])
         {
             flush_ansi_segment(&mut spans, &mut segment, style);
-            let codes = &input[idx + 2..idx + 2 + end_rel];
-            style = apply_sgr_codes(style, codes);
+            if final_byte == b'm' {
+                let codes = &input[idx + 2..idx + 2 + end_rel];
+                style = apply_sgr_codes(style, codes);
+            }
             idx += 2 + end_rel + 1;
             continue;
         }
@@ -4658,6 +4645,10 @@ fn ansi_sgr_to_lines(input: &str) -> Vec<Line<'static>> {
         lines.push(Line::from(spans));
     }
     lines
+}
+
+fn find_csi_final(input: &str) -> Option<(usize, u8)> {
+    input.bytes().enumerate().find(|(_, byte)| (0x40..=0x7e).contains(byte))
 }
 
 fn flush_ansi_segment(spans: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
@@ -4699,22 +4690,35 @@ fn apply_sgr_codes(mut style: Style, codes: &str) -> Style {
             100..=107 => {
                 style = style.bg(ansi_basic_color(code - 70, true));
             }
-            38 | 48 => {
-                if let (Some(2), Some(r), Some(g), Some(b)) = (
-                    values.get(idx + 1).copied(),
-                    values.get(idx + 2).copied(),
-                    values.get(idx + 3).copied(),
-                    values.get(idx + 4).copied(),
-                ) {
-                    let color = Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
-                    if code == 38 {
-                        style = style.fg(color);
-                    } else {
-                        style = style.bg(color);
+            38 | 48 => match values.get(idx + 1).copied() {
+                Some(2) => {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        values.get(idx + 2).copied(),
+                        values.get(idx + 3).copied(),
+                        values.get(idx + 4).copied(),
+                    ) {
+                        let color = Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+                        if code == 38 {
+                            style = style.fg(color);
+                        } else {
+                            style = style.bg(color);
+                        }
+                        idx += 4;
                     }
-                    idx += 4;
                 }
-            }
+                Some(5) => {
+                    if let Some(indexed) = values.get(idx + 2).copied() {
+                        let color = Color::Indexed(indexed.min(255) as u8);
+                        if code == 38 {
+                            style = style.fg(color);
+                        } else {
+                            style = style.bg(color);
+                        }
+                        idx += 2;
+                    }
+                }
+                _ => {}
+            },
             _ => {}
         }
         idx += 1;
@@ -5732,6 +5736,8 @@ impl InlineDraftProtocol for DraftLineBuffer {
 mod tests {
     use super::*;
 
+    static MARKDOWN_CACHE_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
     #[test]
     fn tui_state_turn_count_tracks_user_messages_only() {
         // TuiState owns the conversation log and turn counter. This pins the
@@ -5893,6 +5899,7 @@ mod tests {
 
     #[test]
     fn finalized_assistant_markdown_renders_inline_code_and_fenced_blocks() {
+        let _guard = MARKDOWN_CACHE_TEST_LOCK.lock();
         ASSISTANT_MARKDOWN_CACHE.lock().clear();
         let line = ConversationLine::Assistant {
             content: "Use `cargo build`\n```rust\nfn main() {}\n```".to_string(),
@@ -5932,7 +5939,47 @@ mod tests {
     }
 
     #[test]
+    fn large_streaming_markdown_uses_plain_threshold_path_with_cursor() {
+        let content = format!(
+            "```rust\n{}\n```",
+            "fn demo() {}\n".repeat((STREAMING_MARKDOWN_HIGHLIGHT_MAX_BYTES / 12).saturating_add(1))
+        );
+
+        let lines = render_streaming_assistant_markdown_lines(&content, false);
+        let rendered = lines.iter().map(line_to_plain).collect::<Vec<_>>().join("\n");
+
+        assert!(
+            rendered.contains("```rust"),
+            "large streaming markdown should stay plain"
+        );
+        assert!(rendered.ends_with('\u{258C}'), "cursor remains at large streaming tail");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .all(|span| span.style == Style::default()),
+            "large streaming threshold path should avoid expensive highlighted spans"
+        );
+    }
+
+    #[test]
+    fn ansi_bridge_supports_indexed_color_and_skips_non_sgr_csi() {
+        let lines = ansi_sgr_to_lines("plain\x1b[2K \x1b[38;5;196mred\x1b[0m done");
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            line_to_plain(lines.first().expect("one ANSI bridge line")),
+            "plain red done"
+        );
+        assert_eq!(
+            span_fg_for_content(&lines, "red"),
+            Some(Color::Indexed(196)),
+            "38;5 indexed colour should bridge into ratatui style"
+        );
+    }
+
+    #[test]
     fn finalized_assistant_markdown_uses_render_cache() {
+        let _guard = MARKDOWN_CACHE_TEST_LOCK.lock();
         ASSISTANT_MARKDOWN_CACHE.lock().clear();
         let first = cached_finalized_assistant_markdown_lines("Use `cargo build`");
         let second = cached_finalized_assistant_markdown_lines("Use `cargo build`");
@@ -7377,15 +7424,37 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.input.lines = vec!["open".to_string(), String::new()];
         state.input.cursor = (1, 0);
-        for ch in "/usr/bin".chars() {
+        for ch in "/he".chars() {
             let _ = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
         }
 
-        assert_eq!(state.input.text(), "open\n/usr/bin");
+        assert_eq!(state.input.text(), "open\n/he");
         assert!(
             state.slash_menu.is_none(),
-            "second-line absolute path must not open slash menu"
+            "second-line slash command prefix with matches must not open slash menu"
         );
+    }
+
+    #[test]
+    fn slash_menu_overlay_rect_stays_above_bottom_chrome() {
+        let frame = Rect {
+            x: 0,
+            y: 0,
+            width: 120,
+            height: 30,
+        };
+        let bottom_chrome_height = 5;
+        let menu = SlashMenuState::new("");
+
+        let rect = slash_menu_overlay_rect(frame, &menu, bottom_chrome_height);
+
+        assert!(rect.width <= 80, "slash menu width should be capped: {rect:?}");
+        assert_eq!(rect.x, 2, "slash menu should keep a horizontal margin");
+        assert!(
+            rect.y.saturating_add(rect.height) <= frame.height.saturating_sub(bottom_chrome_height),
+            "slash menu should sit above bottom chrome: {rect:?}"
+        );
+        assert!(rect.height >= 1, "slash menu should remain visible: {rect:?}");
     }
 
     #[test]
