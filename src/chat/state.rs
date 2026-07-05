@@ -2611,6 +2611,7 @@ mod tests {
             title: "task".into(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         let expected = entries.clone();
         let effects = state.reduce(Action::SessionsEntriesUpdated { entries });
@@ -2733,6 +2734,7 @@ mod tests {
                 title: "a".into(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
             },
             SwitcherEntry {
                 seq: 2,
@@ -2742,6 +2744,7 @@ mod tests {
                 title: "b".into(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
             },
         ];
         let effects = state.reduce(Action::SwitcherOpened { entries });
@@ -2782,6 +2785,7 @@ mod tests {
                 title: "child".to_string(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
             },
         ]));
         let entries = vec![
@@ -4323,6 +4327,7 @@ mod tests {
                 status: status.to_string(),
                 title: "task".to_string(),
                 summary: String::new(),
+                token_usage_records: Vec::new(),
                 created_at: chrono::Utc::now(),
             }
         }

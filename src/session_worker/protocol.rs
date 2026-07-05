@@ -61,6 +61,8 @@ pub struct WorkerResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<crate::llm::route_decision::TokenUsage>,
 }
 
 #[cfg(test)]
@@ -146,6 +148,7 @@ mod tests {
             success: false,
             output: String::new(),
             error: Some("timeout".into()),
+            tokens_used: None,
         };
 
         let json = serde_json::to_string(&result).expect("serialize result");

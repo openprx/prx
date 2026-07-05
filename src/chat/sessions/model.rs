@@ -15,6 +15,7 @@
 
 use super::id::SessionId;
 use super::shell::{ShellSession, ShellStatus};
+use crate::chat::session::SessionTokenUsageRecord;
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -139,6 +140,7 @@ pub struct ManagedSessionView {
     pub status: ManagedStatus,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub token_usage_records: Vec<SessionTokenUsageRecord>,
 }
 
 /// Format an elapsed duration for compact chat display.
@@ -180,7 +182,7 @@ pub fn session_elapsed_label(view: &ManagedSessionView) -> String {
 /// vocabulary plus the v4 terminal sentinel `"interrupted"`) rather than the
 /// enum, so the persisted format stays decoupled from the in-memory enum and
 /// tolerant of future variants.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PersistedSessionSummary {
     /// Underlying session id (run UUID for agents, shell/pty id otherwise).
     pub id: String,
@@ -207,6 +209,10 @@ pub struct PersistedSessionSummary {
     /// Completion / failure summary body recorded by the run (may be empty).
     #[serde(default)]
     pub summary: String,
+    /// Optional child-session token usage records. Old persisted summaries do
+    /// not have this field; an empty vector means unknown/not-applicable, not 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub token_usage_records: Vec<SessionTokenUsageRecord>,
     /// When the child session started.
     pub created_at: DateTime<Utc>,
 }
@@ -246,6 +252,7 @@ impl PersistedSessionSummary {
             status,
             title: view.title.clone(),
             summary: summary.into(),
+            token_usage_records: view.token_usage_records.clone(),
             created_at: view.created_at,
         }
     }
@@ -299,6 +306,7 @@ pub fn project_run(run: &SubAgentRun, seq: u64) -> ManagedSessionView {
         status,
         created_at: run.started_at,
         updated_at,
+        token_usage_records: run.token_usage_records.clone(),
     }
 }
 
@@ -344,6 +352,7 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
         status,
         created_at: session.started_at,
         updated_at,
+        token_usage_records: Vec::new(),
     }
 }
 
@@ -382,6 +391,7 @@ pub fn project_pty(session: &super::pty::PtyShellSession, seq: u64) -> ManagedSe
         status,
         created_at: session.started_at,
         updated_at,
+        token_usage_records: Vec::new(),
     }
 }
 
@@ -425,6 +435,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "scope".into(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         };
         assert_eq!(project_run(&run, 1).origin, SessionOrigin::User);
         run.parent_run_id = Some("turn-1".into());
@@ -491,6 +502,7 @@ mod tests {
             status,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -543,6 +555,7 @@ mod tests {
             status: ManagedStatus::Completed,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -585,6 +598,10 @@ mod tests {
         assert_eq!(restored.origin, "user");
         assert_eq!(restored.id, "run-legacy");
         assert_eq!(restored.kind, "agent");
+        assert!(
+            restored.token_usage_records.is_empty(),
+            "legacy summaries without usage must deserialize as unknown, not zero"
+        );
     }
 
     #[test]

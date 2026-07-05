@@ -571,48 +571,27 @@ fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
     let total_prefix = if summary.has_estimates() { "~" } else { "" };
     let cost = if summary.cost_is_unknown() {
         if summary.known_cost_usd > 0.0 {
-            format!("cost unknown (known {})", format_cost_usd(summary.known_cost_usd))
+            format!(
+                "cost unknown (known {})",
+                session::format_cost_usd(summary.known_cost_usd)
+            )
         } else {
             "cost unknown".to_string()
         }
     } else {
-        format_cost_usd(summary.known_cost_usd)
+        session::format_cost_usd(summary.known_cost_usd)
     };
 
     format!(
         "Session cost:\n  Turns:             {}\n  Metered requests:  {}\n  Prompt tokens:     {}\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}",
         chat_session.turn_count(),
         summary.request_count,
-        format_token_count(summary.prompt_tokens),
-        format_token_count(summary.completion_tokens),
-        format_token_count(summary.total_tokens),
-        format_token_count(summary.reported_tokens),
-        format_token_count(summary.estimated_tokens),
+        session::format_token_count_compact(summary.prompt_tokens),
+        session::format_token_count_compact(summary.completion_tokens),
+        session::format_token_count_compact(summary.total_tokens),
+        session::format_token_count_compact(summary.reported_tokens),
+        session::format_token_count_compact(summary.estimated_tokens),
     )
-}
-
-fn format_token_count(tokens: u64) -> String {
-    if tokens >= 10_000_000 {
-        format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 10_000 {
-        format!("{}k", tokens / 1_000)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
-fn format_cost_usd(cost: f64) -> String {
-    if !cost.is_finite() || cost <= 0.0 {
-        "$0.0000".to_string()
-    } else if cost >= 1.0 {
-        format!("${cost:.2}")
-    } else {
-        format!("${cost:.4}")
-    }
 }
 
 pub fn format_clear_feedback(cleared: u32) -> String {

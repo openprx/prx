@@ -1,6 +1,6 @@
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    run_tool_call_loop,
+    run_tool_call_loop_traced,
 };
 use crate::channels::build_identity_prompt;
 use crate::config::Config;
@@ -552,7 +552,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             }
             _ => None,
         };
-        run_tool_call_loop(
+        run_tool_call_loop_traced(
             provider.as_ref(),
             &mut history,
             tools_registry.as_slice(),
@@ -608,13 +608,14 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
                     success: false,
                     output: String::new(),
                     error: Some(format!("Sub-agent timed out after {}s", manifest.timeout_seconds)),
+                    tokens_used: None,
                 });
             }
         }
     };
 
     let worker_result = match result {
-        Ok(output) => WorkerResult {
+        Ok((output, trace)) => WorkerResult {
             success: true,
             output: if output.trim().is_empty() {
                 "[Sub-agent produced no output]".to_string()
@@ -622,11 +623,13 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
                 output
             },
             error: None,
+            tokens_used: trace.tokens_used.has_any_tokens().then_some(trace.tokens_used),
         },
         Err(error) => WorkerResult {
             success: false,
             output: String::new(),
             error: Some(error.to_string()),
+            tokens_used: None,
         },
     };
 
@@ -978,6 +981,7 @@ pub async fn run_from_stdin(
                 success: false,
                 output: String::new(),
                 error: Some(format!("Invalid worker manifest JSON: {error}")),
+                tokens_used: None,
             };
             write_worker_result(&result)?;
             return Ok(());
@@ -1001,6 +1005,7 @@ pub async fn run_from_stdin(
             success: false,
             output: String::new(),
             error: Some(error.to_string()),
+            tokens_used: None,
         };
         write_worker_result(&result)?;
         return Ok(());
@@ -1012,6 +1017,7 @@ pub async fn run_from_stdin(
             success: false,
             output: String::new(),
             error: Some(error.to_string()),
+            tokens_used: None,
         },
     };
 
@@ -1357,6 +1363,7 @@ mod tests {
             success: true,
             output: "worker draft content".to_string(),
             error: None,
+            tokens_used: None,
         };
         let result_event = worker_fabric
             .record_worker_result(scope.clone(), result.output.clone(), None)
@@ -1487,6 +1494,7 @@ mod tests {
             success: true,
             output: "worker draft content".to_string(),
             error: None,
+            tokens_used: None,
         };
         let manifest = WorkerManifest {
             parent_capability: Some("capability".to_string()),

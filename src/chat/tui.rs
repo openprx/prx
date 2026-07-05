@@ -527,7 +527,7 @@ pub enum InputOutcome {
 ///
 /// Keeping the dispatch separate from the actual I/O loop lets us unit-test
 /// the keybindings without spinning up a terminal.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum KeyDispatch {
     /// Global shortcut handled or input-only change. The event loop should
     /// re-render but otherwise continue waiting for input.
@@ -871,6 +871,7 @@ pub fn transcript_switcher_entry() -> crate::chat::sessions::SwitcherEntry {
         title: "conversation transcript".to_string(),
         created_at: now,
         updated_at: now,
+        token_usage_records: Vec::new(),
     }
 }
 
@@ -3272,7 +3273,13 @@ fn render_sessions_strip_entry(
     let marker = session_active_marker(active_seq == Some(entry.seq), ascii);
     let glyph = session_status_glyph(entry, ascii);
     let elapsed = entry.elapsed_label();
-    let prefix = format!("{marker} {glyph} #{} {} {elapsed} ", entry.seq, entry.kind);
+    let usage = entry
+        .token_usage_summary()
+        .and_then(crate::chat::session::format_session_token_usage_inline);
+    let prefix = usage.map_or_else(
+        || format!("{marker} {glyph} #{} {} {elapsed} ", entry.seq, entry.kind),
+        |usage| format!("{marker} {glyph} #{} {} {elapsed} {usage} ", entry.seq, entry.kind),
+    );
     let prefix_cols = prefix.chars().count();
     let max = usize::from(max_width);
     if prefix_cols >= max {
@@ -3681,16 +3688,43 @@ fn render_switcher_row(
     let max_width = max_width as usize;
     // Fixed prefix (everything but the title), then fit the title into whatever
     // columns remain so the whole row stays within `max_width`.
+    let usage = entry
+        .token_usage_summary()
+        .and_then(crate::chat::session::format_session_token_usage_inline);
     let prefix = if narrow {
-        format!("{glyph} #{} {} {} ", entry.seq, entry.kind, entry.elapsed_label())
+        usage.map_or_else(
+            || format!("{glyph} #{} {} {} ", entry.seq, entry.kind, entry.elapsed_label()),
+            |usage| {
+                format!(
+                    "{glyph} #{} {} {} {usage} ",
+                    entry.seq,
+                    entry.kind,
+                    entry.elapsed_label()
+                )
+            },
+        )
     } else {
-        format!(
-            "{glyph} #{} {} {} {} {} ",
-            entry.seq,
-            entry.kind,
-            entry.origin,
-            entry.status,
-            entry.elapsed_label()
+        usage.map_or_else(
+            || {
+                format!(
+                    "{glyph} #{} {} {} {} {} ",
+                    entry.seq,
+                    entry.kind,
+                    entry.origin,
+                    entry.status,
+                    entry.elapsed_label()
+                )
+            },
+            |usage| {
+                format!(
+                    "{glyph} #{} {} {} {} {} {usage} ",
+                    entry.seq,
+                    entry.kind,
+                    entry.origin,
+                    entry.status,
+                    entry.elapsed_label()
+                )
+            },
         )
     };
     let prefix_cols = prefix.chars().count();
@@ -3862,37 +3896,7 @@ const fn cycle_chat_mode(mode: ChatMode) -> ChatMode {
 }
 
 fn render_main_token_usage(summary: MainSessionTokenUsageSummary) -> String {
-    let prefix = if summary.has_estimates() { "~" } else { "" };
-    let cost = if summary.cost_is_unknown() {
-        "cost unknown".to_string()
-    } else {
-        format_cost_usd(summary.known_cost_usd)
-    };
-    format!("{prefix}{} tok | {cost}", format_token_count(summary.total_tokens))
-}
-
-fn format_token_count(tokens: u64) -> String {
-    if tokens >= 10_000_000 {
-        format!("{}M", tokens / 1_000_000)
-    } else if tokens >= 1_000_000 {
-        format!("{:.1}M", tokens as f64 / 1_000_000.0)
-    } else if tokens >= 10_000 {
-        format!("{}k", tokens / 1_000)
-    } else if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
-fn format_cost_usd(cost: f64) -> String {
-    if !cost.is_finite() || cost <= 0.0 {
-        "$0.0000".to_string()
-    } else if cost >= 1.0 {
-        format!("${cost:.2}")
-    } else {
-        format!("${cost:.4}")
-    }
+    crate::chat::session::format_session_token_usage_inline(summary).unwrap_or_else(|| "0 tok | $0.0000".to_string())
 }
 
 /// Count the exact number of rows ratatui's word-wrapping
@@ -6216,6 +6220,7 @@ mod tests {
             title: "build release".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         for ch in "/kill ".chars() {
             assert_eq!(
@@ -6501,6 +6506,7 @@ mod tests {
             title: "child".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         assert!(matches!(
             dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut switcher),
@@ -6736,6 +6742,7 @@ mod tests {
             title: "child".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         state.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState {
             entries: vec![saved_picker_entry("only", "only session", false)],
@@ -7140,6 +7147,21 @@ mod tests {
             title: format!("task {seq}"),
             created_at: now,
             updated_at: now,
+            token_usage_records: Vec::new(),
+        }
+    }
+
+    fn usage_record(
+        source: crate::llm::route_decision::TokenUsageSource,
+    ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
+        crate::llm::route_decision::MeteredTokenUsageRecord {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            prompt_tokens: 8_000,
+            completion_tokens: 4_300,
+            total_tokens: 12_300,
+            source,
+            cost_usd: Some(0.0042),
         }
     }
 
@@ -7164,6 +7186,7 @@ mod tests {
             title: title.to_string(),
             created_at: now,
             updated_at: now,
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -7179,6 +7202,7 @@ mod tests {
             title: format!("elapsed task {seq}"),
             created_at,
             updated_at: created_at + chrono::Duration::seconds(elapsed_seconds),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -7198,6 +7222,38 @@ mod tests {
         let e = elapsed_entry(4, "running", 63);
         let row = render_switcher_row(&e, "⏳", false, 80);
         assert!(row.contains("1m03s"), "row carries compact elapsed: {row}");
+    }
+
+    #[test]
+    fn switcher_row_includes_subsession_token_usage() {
+        let mut e = elapsed_entry(4, "completed", 63);
+        e.token_usage_records = vec![usage_record(crate::llm::route_decision::TokenUsageSource::Reported)];
+
+        let row = render_switcher_row(&e, "✓", false, 96);
+
+        assert!(
+            row.contains("1m03s 12.3k tok | $0.0042"),
+            "row carries elapsed plus usage: {row}"
+        );
+    }
+
+    #[test]
+    fn sessions_strip_marks_estimated_subsession_usage() {
+        let mut e = elapsed_entry(4, "running", 63);
+        e.token_usage_records = vec![usage_record(crate::llm::route_decision::TokenUsageSource::Estimated)];
+
+        let line = render_sessions_strip_line(
+            &[e],
+            "",
+            crate::chat::sessions::FocusTarget::Session { seq: 4 },
+            true,
+            96,
+        );
+
+        assert!(
+            line.contains("1m03s ~12.3k tok | $0.0042"),
+            "strip carries estimated usage marker: {line}"
+        );
     }
 
     #[test]
@@ -7308,6 +7364,7 @@ mod tests {
             title: "监控任务执行状态和输出窗口".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         let width = 22;
         let line = render_sessions_strip_line(
@@ -8552,6 +8609,7 @@ mod tests {
                 title: "non-empty parity session".to_string(),
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
             state.ui.context_window_tokens = Some(10_000_000);

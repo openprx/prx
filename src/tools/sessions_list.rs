@@ -220,6 +220,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         }
     }
 

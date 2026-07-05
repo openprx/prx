@@ -244,6 +244,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                token_usage_records: Vec::new(),
             },
             SubAgentRun {
                 id: "r2".into(),
@@ -262,6 +263,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                token_usage_records: Vec::new(),
             },
             SubAgentRun {
                 id: "r3".into(),
@@ -280,6 +282,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                token_usage_records: Vec::new(),
             },
         ];
         let tool = make_tool_with_runs(runs);

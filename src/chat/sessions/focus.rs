@@ -85,7 +85,7 @@ pub struct PendingToolApprovalView {
 
 /// One row in the Ctrl+G session switcher. A plain display snapshot (no async,
 /// no registry handle) so the synchronous key thread can render and navigate it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitcherEntry {
     /// Display sequence `#N`.
     pub seq: u64,
@@ -102,6 +102,7 @@ pub struct SwitcherEntry {
     pub created_at: DateTime<Utc>,
     /// Live snapshot time for running sessions, final timestamp for terminal sessions.
     pub updated_at: DateTime<Utc>,
+    pub token_usage_records: Vec<crate::chat::session::SessionTokenUsageRecord>,
 }
 
 /// Pure render snapshot for the focused line-oriented child session viewport
@@ -166,7 +167,13 @@ impl SwitcherEntry {
             title: view.title.clone(),
             created_at: view.created_at,
             updated_at: view.updated_at,
+            token_usage_records: view.token_usage_records.clone(),
         }
+    }
+
+    #[must_use]
+    pub fn token_usage_summary(&self) -> Option<crate::chat::session::SessionTokenUsageSummary> {
+        crate::chat::session::summarize_session_token_usage(&self.token_usage_records)
     }
 
     /// A compact status glyph for accessibility / no-color rendering (§0.2.1 F):
@@ -248,7 +255,7 @@ pub fn adjacent_session_seq(entries: &[SwitcherEntry], current_seq: u64, directi
 
 /// The Ctrl+G session switcher overlay state. `None` (in `TuiState`) means the
 /// switcher is closed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SwitcherState {
     /// Snapshot of child TUI sessions at open time (refreshed from the cached
     /// 1s poll; the actual attach re-resolves the seq, so display staleness
@@ -429,6 +436,7 @@ mod tests {
             status,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -556,6 +564,7 @@ mod tests {
             title: "conversation transcript".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         entries.extend(switcher_entries(&[
             view(1, ManagedStatus::Running, "left"),
@@ -645,6 +654,7 @@ mod tests {
             status: ManagedStatus::Running,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 

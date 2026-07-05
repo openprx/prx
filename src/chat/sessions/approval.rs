@@ -370,6 +370,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "s".into(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         }
     }
 

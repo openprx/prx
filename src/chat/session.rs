@@ -36,21 +36,14 @@ pub struct ToolCallSummary {
     pub success: bool,
 }
 
-/// Per-provider-call token usage recorded for the main chat session.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct MainSessionTokenUsageRecord {
-    pub provider: String,
-    pub model: String,
-    pub prompt_tokens: u64,
-    pub completion_tokens: u64,
-    pub total_tokens: u64,
-    pub source: crate::llm::route_decision::TokenUsageSource,
-    /// Display cost computed from `[cost].prices`. `None` means the model is
-    /// intentionally unknown-priced for this UI pass, not zero cost.
-    pub cost_usd: Option<f64>,
-}
+/// Per-provider-call token usage recorded for a chat session or child agent
+/// session.
+pub type MainSessionTokenUsageRecord = crate::llm::route_decision::MeteredTokenUsageRecord;
 
-/// Cumulative main-session token/cost summary derived from usage records.
+/// Backward-compatible neutral name for child-session usage propagation.
+pub type SessionTokenUsageRecord = MainSessionTokenUsageRecord;
+
+/// Cumulative token/cost summary derived from usage records.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
 pub struct MainSessionTokenUsageSummary {
     pub prompt_tokens: u64,
@@ -62,6 +55,9 @@ pub struct MainSessionTokenUsageSummary {
     pub known_cost_usd: f64,
     pub unknown_cost_requests: u64,
 }
+
+/// Backward-compatible neutral name for shared token usage display.
+pub type SessionTokenUsageSummary = MainSessionTokenUsageSummary;
 
 impl MainSessionTokenUsageSummary {
     #[must_use]
@@ -105,70 +101,55 @@ impl MainSessionTokenUsageSummary {
     }
 }
 
-impl MainSessionTokenUsageRecord {
-    #[must_use]
-    pub fn from_provider_outcome(
-        outcome: &crate::llm::route_decision::ProviderExecutionOutcome,
-        cost_config: &crate::config::schema::CostConfig,
-    ) -> Option<Self> {
-        let usage = &outcome.tokens_used;
-        if !usage.has_any_tokens() {
-            return None;
-        }
-
-        let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
-        let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
-        let total_tokens = usage
-            .total_tokens
-            .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
-        if total_tokens == 0 && prompt_tokens == 0 && completion_tokens == 0 {
-            return None;
-        }
-
-        let cost_usd = usage_cost_usd(
-            &outcome.final_provider,
-            &outcome.final_model,
-            prompt_tokens,
-            completion_tokens,
-            cost_config,
-        );
-
-        Some(Self {
-            provider: outcome.final_provider.clone(),
-            model: outcome.final_model.clone(),
-            prompt_tokens,
-            completion_tokens,
-            total_tokens,
-            source: usage.source,
-            cost_usd,
-        })
+/// Compact token count used by status bars, `/cost`, and child-session rows.
+#[must_use]
+pub fn format_token_count_compact(tokens: u64) -> String {
+    if tokens >= 10_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
     }
 }
 
-fn usage_cost_usd(
-    provider: &str,
-    model: &str,
-    prompt_tokens: u64,
-    completion_tokens: u64,
-    cost_config: &crate::config::schema::CostConfig,
-) -> Option<f64> {
-    if provider.eq_ignore_ascii_case("ollama") {
+/// Format a non-negative USD cost for compact chat display.
+#[must_use]
+pub fn format_cost_usd(cost: f64) -> String {
+    if !cost.is_finite() || cost <= 0.0 {
+        "$0.0000".to_string()
+    } else if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else {
+        format!("${cost:.4}")
+    }
+}
+
+/// Display compact usage for one session row, returning `None` when no usage is
+/// known. Estimated totals get a leading `~`; known costs are shown, while
+/// unpriced requests explicitly render as unknown instead of `$0`.
+#[must_use]
+pub fn format_session_token_usage_inline(summary: SessionTokenUsageSummary) -> Option<String> {
+    if !summary.has_usage() {
         return None;
     }
-    let pricing_key = if model.contains('/') {
-        model.to_string()
+    let prefix = if summary.has_estimates() { "~" } else { "" };
+    let mut out = format!("{prefix}{} tok", format_token_count_compact(summary.total_tokens));
+    if summary.cost_is_unknown() {
+        out.push_str(" | cost unknown");
     } else {
-        format!("{provider}/{model}")
-    };
-    let pricing = cost_config.prices.get(&pricing_key)?;
-    let usage = crate::cost::types::TokenUsage::new(
-        pricing_key,
-        prompt_tokens,
-        completion_tokens,
-        pricing.input,
-        pricing.output,
-    );
-    Some(usage.cost())
+        out.push_str(" | ");
+        out.push_str(&format_cost_usd(summary.known_cost_usd));
+    }
+    Some(out)
+}
+
+#[must_use]
+pub fn summarize_session_token_usage(records: &[SessionTokenUsageRecord]) -> Option<SessionTokenUsageSummary> {
+    let summary = SessionTokenUsageSummary::from_records(records);
+    summary.has_usage().then_some(summary)
 }
 
 /// A complete chat session with versioned schema.
@@ -508,6 +489,7 @@ mod tests {
             status: status.to_string(),
             title: "do the thing".to_string(),
             summary: "all done".to_string(),
+            token_usage_records: Vec::new(),
             created_at: Utc::now(),
         }
     }

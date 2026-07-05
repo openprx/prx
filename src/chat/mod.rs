@@ -654,15 +654,18 @@ fn format_reloaded_background_sessions(sessions: &[crate::chat::sessions::Persis
         // operator-initiated ones. User-initiated sessions stay untagged to keep
         // the common case quiet (origin defaults to "user" for legacy blobs).
         let origin_tag = if s.origin == "model" { " [model]" } else { "" };
+        let usage = crate::chat::session::summarize_session_token_usage(&s.token_usage_records)
+            .and_then(crate::chat::session::format_session_token_usage_inline);
+        let usage = usage.map_or_else(String::new, |usage| format!(" {usage}"));
         if summary.is_empty() {
             out.push_str(&format!(
-                "\n  · {} #{}{} {} — {}",
-                s.kind, s.seq, origin_tag, s.status, s.title
+                "\n  · {} #{}{} {}{} — {}",
+                s.kind, s.seq, origin_tag, s.status, usage, s.title
             ));
         } else {
             out.push_str(&format!(
-                "\n  · {} #{}{} {} — {}: {}",
-                s.kind, s.seq, origin_tag, s.status, s.title, summary
+                "\n  · {} #{}{} {}{} — {}: {}",
+                s.kind, s.seq, origin_tag, s.status, usage, s.title, summary
             ));
         }
     }
@@ -675,13 +678,17 @@ fn format_managed_sessions_list(views: &[crate::chat::sessions::model::ManagedSe
     }
     let mut out = String::from("Background sessions:\n");
     for v in views {
+        let usage = crate::chat::session::summarize_session_token_usage(&v.token_usage_records)
+            .and_then(crate::chat::session::format_session_token_usage_inline);
+        let usage = usage.map_or_else(String::new, |usage| format!(" {usage}"));
         out.push_str(&format!(
-            "  #{} {} {} {} {} {}\n",
+            "  #{} {} {} {} {}{} {}\n",
             v.seq,
             v.kind.as_str(),
             v.origin.as_str(),
             v.status.as_str(),
             crate::chat::sessions::model::session_elapsed_label(v),
+            usage,
             v.title
         ));
     }
@@ -694,11 +701,14 @@ fn format_finished_session_announcement(fin: &crate::chat::sessions::runtime::Fi
     let elapsed = crate::chat::sessions::model::format_elapsed_compact(
         crate::chat::sessions::model::elapsed_seconds_between(fin.created_at, fin.updated_at),
     );
+    let usage = crate::chat::session::summarize_session_token_usage(&fin.token_usage_records)
+        .and_then(crate::chat::session::format_session_token_usage_inline);
+    let suffix = usage.map_or_else(|| elapsed.clone(), |usage| format!("{elapsed}, {usage}"));
     if summary.is_empty() {
-        format!("[{kind} session #{} {} {elapsed}]", fin.seq, fin.status.as_str())
+        format!("[{kind} session #{} {} {suffix}]", fin.seq, fin.status.as_str())
     } else {
         format!(
-            "[{kind} session #{} {} {elapsed}] {summary}",
+            "[{kind} session #{} {} {suffix}] {summary}",
             fin.seq,
             fin.status.as_str()
         )
@@ -811,6 +821,20 @@ mod runtime_display_tests {
             .with_timezone(&chrono::Utc)
     }
 
+    fn usage_record(
+        source: crate::llm::route_decision::TokenUsageSource,
+    ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
+        crate::llm::route_decision::MeteredTokenUsageRecord {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            prompt_tokens: 8_000,
+            completion_tokens: 4_300,
+            total_tokens: 12_300,
+            source,
+            cost_usd: Some(0.0042),
+        }
+    }
+
     #[test]
     fn sessions_list_rows_include_elapsed() {
         let view = ManagedSessionView {
@@ -822,11 +846,59 @@ mod runtime_display_tests {
             status: ManagedStatus::Running,
             created_at: ts("2026-07-04T12:00:00Z"),
             updated_at: ts("2026-07-04T12:00:03Z"),
+            token_usage_records: Vec::new(),
         };
 
         let out = format_managed_sessions_list(&[view]);
 
         assert!(out.contains("#9 agent model running 3s index workspace"), "{out}");
+    }
+
+    #[test]
+    fn sessions_list_rows_include_reported_usage() {
+        let view = ManagedSessionView {
+            id: SessionId::from_run_id("run-metered"),
+            seq: 9,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::Model,
+            title: "index workspace".to_string(),
+            status: ManagedStatus::Completed,
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:03Z"),
+            token_usage_records: vec![usage_record(crate::llm::route_decision::TokenUsageSource::Reported)],
+        };
+
+        let out = format_managed_sessions_list(&[view]);
+
+        assert!(
+            out.contains("#9 agent model completed 3s 12.3k tok | $0.0042 index workspace"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn sessions_list_marks_estimated_usage() {
+        let mut view = ManagedSessionView {
+            id: SessionId::from_run_id("run-estimated"),
+            seq: 10,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            title: "summarize".to_string(),
+            status: ManagedStatus::Completed,
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:03Z"),
+            token_usage_records: vec![usage_record(crate::llm::route_decision::TokenUsageSource::Estimated)],
+        };
+        if let Some(record) = view.token_usage_records.first_mut() {
+            record.cost_usd = None;
+        }
+
+        let out = format_managed_sessions_list(&[view]);
+
+        assert!(
+            out.contains("#10 agent user completed 3s ~12.3k tok | cost unknown summarize"),
+            "{out}"
+        );
     }
 
     #[test]
@@ -840,11 +912,32 @@ mod runtime_display_tests {
             summary: "done".to_string(),
             created_at: ts("2026-07-04T12:00:00Z"),
             updated_at: ts("2026-07-04T12:01:03Z"),
+            token_usage_records: Vec::new(),
         };
 
         assert_eq!(
             format_finished_session_announcement(&fin),
             "[agent session #4 completed 1m03s] done"
+        );
+    }
+
+    #[test]
+    fn completion_announcement_includes_elapsed_and_tokens() {
+        let fin = FinishedSession {
+            seq: 4,
+            run_id: "run-finished".to_string(),
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Completed,
+            summary: "done".to_string(),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:01:03Z"),
+            token_usage_records: vec![usage_record(crate::llm::route_decision::TokenUsageSource::Reported)],
+        };
+
+        assert_eq!(
+            format_finished_session_announcement(&fin),
+            "[agent session #4 completed 1m03s, 12.3k tok | $0.0042] done"
         );
     }
 
@@ -1792,6 +1885,7 @@ pub async fn run(
         config.router.clone(),
         config.model_routes.clone(),
     ))
+    .with_cost_config(config.cost.clone())
     .with_shared_memory(Arc::clone(&mem))
     .with_event_recording(config.memory.event_recording_config())
     .with_event_sink(session_event_sink.into_spawn_sink())
@@ -2620,6 +2714,7 @@ pub async fn run(
                                 status: fin.status.as_str().to_string(),
                                 title: String::new(),
                                 summary: fin.summary.clone(),
+                                token_usage_records: fin.token_usage_records.clone(),
                                 created_at: fin.created_at,
                             },
                             |view| crate::chat::sessions::PersistedSessionSummary::from_view(view, fin.summary.clone()),
@@ -9740,6 +9835,7 @@ mod p2_iss005_tests {
             status: ManagedStatus::Running,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -10113,6 +10209,7 @@ mod p3_directional_switch_tests {
             status: ManagedStatus::Running,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -10208,6 +10305,7 @@ mod p7b_branch_rewind_tests {
             status: "done".to_string(),
             title: "child".to_string(),
             summary: "summary".to_string(),
+            token_usage_records: Vec::new(),
             created_at: chrono::Utc::now(),
         }
     }
@@ -10393,6 +10491,7 @@ mod regfix_approval_switch_tests {
             title: "stale".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         }];
         let mut attached_follow = None;
         let mut attached_follow_seq = Some(7);
@@ -10593,6 +10692,7 @@ mod p6b1_transcript_tests {
 mod v4_reload_recap_tests {
     use super::format_reloaded_background_sessions;
     use crate::chat::sessions::PersistedSessionSummary;
+    use crate::llm::route_decision::{MeteredTokenUsageRecord, TokenUsageSource};
 
     fn summary(id: &str, status: &str, title: &str, body: &str) -> PersistedSessionSummary {
         PersistedSessionSummary {
@@ -10603,7 +10703,20 @@ mod v4_reload_recap_tests {
             status: status.to_string(),
             title: title.to_string(),
             summary: body.to_string(),
+            token_usage_records: Vec::new(),
             created_at: chrono::Utc::now(),
+        }
+    }
+
+    fn usage_record() -> MeteredTokenUsageRecord {
+        MeteredTokenUsageRecord {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            prompt_tokens: 100,
+            completion_tokens: 50,
+            total_tokens: 150,
+            source: TokenUsageSource::Reported,
+            cost_usd: Some(0.0004),
         }
     }
 
@@ -10632,6 +10745,20 @@ mod v4_reload_recap_tests {
         // No trailing ": " when there is no summary body.
         assert!(out.contains("cancelled — task"));
         assert!(!out.contains("task: "));
+        assert!(!out.contains("0 tok"), "missing usage must not render as zero: {out}");
+    }
+
+    #[test]
+    fn recap_displays_persisted_usage_when_present() {
+        let mut session = summary("a", "completed", "metered task", "done");
+        session.token_usage_records = vec![usage_record()];
+
+        let out = format_reloaded_background_sessions(&[session]);
+
+        assert!(
+            out.contains("completed 150 tok | $0.0004 — metered task: done"),
+            "{out}"
+        );
     }
 
     #[test]

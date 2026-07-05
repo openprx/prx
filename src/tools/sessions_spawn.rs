@@ -98,6 +98,7 @@ pub struct SubAgentRun {
     pub parent_run_id: Option<String>,
     pub session_scope_key: String,
     pub spawn_depth: usize,
+    pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
 }
 
 #[derive(Debug, Clone)]
@@ -347,6 +348,8 @@ pub struct SessionsSpawnTool {
     provider_runtime_options: providers::ProviderRuntimeOptions,
     /// Process-mode controls for workspace lifecycle.
     spawn_config: SessionsSpawnConfig,
+    /// Pricing table used only for recording/displaying child-agent token cost.
+    cost_config: crate::config::schema::CostConfig,
     /// Shared memory backend for normalized spawn lifecycle events.
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
@@ -450,6 +453,7 @@ impl SessionsSpawnTool {
             fallback_api_key,
             provider_runtime_options,
             spawn_config,
+            cost_config: crate::config::schema::CostConfig::default(),
             memory: None,
             event_recording: MemoryEventRecording::default(),
             event_sink: None,
@@ -459,6 +463,12 @@ impl SessionsSpawnTool {
 
     pub fn with_compaction_resolver(mut self, resolver: CompactionResolver) -> Self {
         self.compaction_resolver = resolver;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cost_config(mut self, cost_config: crate::config::schema::CostConfig) -> Self {
+        self.cost_config = cost_config;
         self
     }
 
@@ -1190,6 +1200,7 @@ impl Tool for SessionsSpawnTool {
                     parent_run_id: parent_run_id.clone(),
                     session_scope_key: session_scope_key.clone(),
                     spawn_depth,
+                    token_usage_records: Vec::new(),
                 });
             }
 
@@ -1262,6 +1273,7 @@ impl Tool for SessionsSpawnTool {
             let process_memory_fabric = memory_fabric.clone();
             let process_result_scope = spawn_scope_for_event.clone();
             let process_lineage = run_lineage.clone();
+            let process_cost_config = self.cost_config.clone();
 
             let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
                 tracing::info!(run_id = %rid, "Sub-agent process starting");
@@ -1292,16 +1304,35 @@ impl Tool for SessionsSpawnTool {
                 )
                 .await;
 
-                let (status, result_text) = match worker_result {
-                    Ok(result) if result.success => (SubAgentStatus::Completed(result.output.clone()), result.output),
+                let (status, result_text, token_usage_records) = match worker_result {
+                    Ok(result) if result.success => {
+                        let token_usage_records = result
+                            .tokens_used
+                            .as_ref()
+                            .and_then(|usage| {
+                                crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                                    &provider_name,
+                                    &model,
+                                    usage,
+                                    &process_cost_config,
+                                )
+                            })
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        (
+                            SubAgentStatus::Completed(result.output.clone()),
+                            result.output,
+                            token_usage_records,
+                        )
+                    }
                     Ok(result) => {
                         let error = result.error.unwrap_or_else(|| "worker failed".to_string());
                         let msg = format!("Sub-agent error: {error}");
-                        (SubAgentStatus::Failed(error), msg)
+                        (SubAgentStatus::Failed(error), msg, Vec::new())
                     }
                     Err(error) => {
                         let msg = format!("Sub-agent process error: {error}");
-                        (SubAgentStatus::Failed(error.to_string()), msg)
+                        (SubAgentStatus::Failed(error.to_string()), msg, Vec::new())
                     }
                 };
 
@@ -1320,6 +1351,7 @@ impl Tool for SessionsSpawnTool {
                     if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
                         run.finished_at = Some(Utc::now());
                         run.status = status;
+                        run.token_usage_records.extend(token_usage_records);
                         run.steer_tx = None;
                     }
                 }
@@ -1377,6 +1409,7 @@ impl Tool for SessionsSpawnTool {
                 parent_run_id: parent_run_id.clone(),
                 session_scope_key: session_scope_key.clone(),
                 spawn_depth,
+                token_usage_records: Vec::new(),
             });
         }
 
@@ -1446,6 +1479,7 @@ impl Tool for SessionsSpawnTool {
         let task_scope = spawn_scope.clone();
         let task_memory = self.memory.clone();
         let compaction_config = resolved_compaction.config.clone();
+        let cost_config = self.cost_config.clone();
         let task_execution_ctx = SpawnExecutionContext {
             run_id: rid.clone(),
             session_scope_key: session_scope_key.clone(),
@@ -1533,15 +1567,29 @@ impl Tool for SessionsSpawnTool {
             };
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
-            let (status, result_text) = match result {
-                Ok(Ok(text)) => (SubAgentStatus::Completed(text.clone()), text),
+            let (status, result_text, token_usage_records) = match result {
+                Ok(Ok(task_result)) => {
+                    let token_usage_records = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                        &provider_name,
+                        &model,
+                        &task_result.tokens_used,
+                        &cost_config,
+                    )
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                    (
+                        SubAgentStatus::Completed(task_result.output.clone()),
+                        task_result.output,
+                        token_usage_records,
+                    )
+                }
                 Ok(Err(e)) => {
                     let msg = format!("Sub-agent error: {e}");
-                    (SubAgentStatus::Failed(e.to_string()), msg)
+                    (SubAgentStatus::Failed(e.to_string()), msg, Vec::new())
                 }
                 Err(_) => {
                     let msg = format!("Sub-agent timed out after {timeout_secs}s");
-                    (SubAgentStatus::Failed("timeout".into()), msg)
+                    (SubAgentStatus::Failed("timeout".into()), msg, Vec::new())
                 }
             };
 
@@ -1561,6 +1609,7 @@ impl Tool for SessionsSpawnTool {
                 if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
                     run.finished_at = Some(Utc::now());
                     run.status = status;
+                    run.token_usage_records.extend(token_usage_records);
                     run.steer_tx = None; // drop sender — no more steering possible
                 }
             }
@@ -2266,6 +2315,11 @@ fn restore_run_to_running(runs: &mut [SubAgentRun], run_id: &str) {
     }
 }
 
+struct SubAgentTaskResult {
+    output: String,
+    tokens_used: crate::llm::route_decision::TokenUsage,
+}
+
 async fn run_sub_agent_task(
     task: &str,
     provider: Arc<dyn Provider>,
@@ -2296,7 +2350,7 @@ async fn run_sub_agent_task(
     // (channels / gateway), where suspension can never happen.
     active_runs: Option<Arc<RwLock<Vec<SubAgentRun>>>>,
     run_id: Option<String>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<SubAgentTaskResult> {
     // --- No-tools fallback: single-turn completion ---
     let Some(tools_registry) = tools else {
         let response = provider
@@ -2323,10 +2377,14 @@ async fn run_sub_agent_task(
             },
         ];
         *history_out.write().await = history;
-        return Ok(if response.trim().is_empty() {
+        let output = if response.trim().is_empty() {
             "[Sub-agent produced no output]".to_string()
         } else {
             response
+        };
+        return Ok(SubAgentTaskResult {
+            output,
+            tokens_used: crate::llm::route_decision::TokenUsage::default(),
         });
     };
 
@@ -2447,7 +2505,10 @@ async fn run_sub_agent_task(
                 false,
             )
             .await;
-            let result = loop_outcome.map(|(outcome, _trace)| outcome.into_text());
+            let result = loop_outcome.map(|(outcome, trace)| SubAgentTaskResult {
+                output: outcome.into_text(),
+                tokens_used: trace.tokens_used,
+            });
             (task_history, result)
         });
 
@@ -2460,11 +2521,12 @@ async fn run_sub_agent_task(
                 // Write final history to shared store
                 *history_out.write().await = chat_messages_to_history(&history);
                 return match result {
-                    Ok(text) => Ok(if text.trim().is_empty() {
-                        "[Sub-agent produced no output]".to_string()
-                    } else {
-                        text
-                    }),
+                    Ok(mut result) => {
+                        if result.output.trim().is_empty() {
+                            result.output = "[Sub-agent produced no output]".to_string();
+                        }
+                        Ok(result)
+                    }
                     Err(error) => Err(error),
                 };
             },
@@ -2500,11 +2562,12 @@ async fn run_sub_agent_task(
                         history = returned_history;
                         *history_out.write().await = chat_messages_to_history(&history);
                         return match result {
-                            Ok(text) => Ok(if text.trim().is_empty() {
-                                "[Sub-agent produced no output]".to_string()
-                            } else {
-                                text
-                            }),
+                            Ok(mut result) => {
+                                if result.output.trim().is_empty() {
+                                    result.output = "[Sub-agent produced no output]".to_string();
+                                }
+                                Ok(result)
+                            }
                             Err(error) => Err(error),
                         };
                     }
@@ -4104,6 +4167,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                token_usage_records: Vec::new(),
             });
         }
 
@@ -4273,6 +4337,7 @@ mod tests {
                 parent_run_id: None,
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
+                token_usage_records: Vec::new(),
             });
         }
 
@@ -4607,6 +4672,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "s".to_string(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         }
     }
 

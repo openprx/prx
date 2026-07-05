@@ -149,6 +149,95 @@ pub struct TokenUsage {
     pub source: TokenUsageSource,
 }
 
+/// Per-provider-call token usage with provider/model attribution and optional
+/// display cost. Shared by main chat sessions and sub-agent sessions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct MeteredTokenUsageRecord {
+    pub provider: String,
+    pub model: String,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+    pub source: TokenUsageSource,
+    /// Display cost computed from `[cost].prices`. `None` means the model is
+    /// intentionally unknown-priced for this UI pass, not zero cost.
+    pub cost_usd: Option<f64>,
+}
+
+impl MeteredTokenUsageRecord {
+    #[must_use]
+    pub fn from_provider_outcome(
+        outcome: &ProviderExecutionOutcome,
+        cost_config: &crate::config::schema::CostConfig,
+    ) -> Option<Self> {
+        Self::from_parts(
+            &outcome.final_provider,
+            &outcome.final_model,
+            &outcome.tokens_used,
+            cost_config,
+        )
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        provider: &str,
+        model: &str,
+        usage: &TokenUsage,
+        cost_config: &crate::config::schema::CostConfig,
+    ) -> Option<Self> {
+        if !usage.has_any_tokens() {
+            return None;
+        }
+
+        let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
+        let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
+        let total_tokens = usage
+            .total_tokens
+            .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
+        if total_tokens == 0 && prompt_tokens == 0 && completion_tokens == 0 {
+            return None;
+        }
+
+        let cost_usd = usage_cost_usd(provider, model, prompt_tokens, completion_tokens, cost_config);
+
+        Some(Self {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            source: usage.source,
+            cost_usd,
+        })
+    }
+}
+
+fn usage_cost_usd(
+    provider: &str,
+    model: &str,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cost_config: &crate::config::schema::CostConfig,
+) -> Option<f64> {
+    if provider.eq_ignore_ascii_case("ollama") {
+        return None;
+    }
+    let pricing_key = if model.contains('/') {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    };
+    let pricing = cost_config.prices.get(&pricing_key)?;
+    let usage = crate::cost::types::TokenUsage::new(
+        pricing_key,
+        prompt_tokens,
+        completion_tokens,
+        pricing.input,
+        pricing.output,
+    );
+    Some(usage.cost())
+}
+
 impl TokenUsage {
     #[must_use]
     pub const fn reported(

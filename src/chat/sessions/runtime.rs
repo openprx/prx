@@ -49,7 +49,7 @@ pub struct TailLine {
 
 /// A child session that has just reached a terminal state, surfaced once
 /// to the chat main loop for the v1b summary reflow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FinishedSession {
     /// Display sequence `#N`.
     pub seq: u64,
@@ -72,6 +72,7 @@ pub struct FinishedSession {
     pub created_at: chrono::DateTime<chrono::Utc>,
     /// When the child session reached its terminal state.
     pub updated_at: chrono::DateTime<chrono::Utc>,
+    pub token_usage_records: Vec<crate::chat::session::SessionTokenUsageRecord>,
 }
 
 /// Chat-side handle over the shared agent + shell registries.
@@ -396,6 +397,7 @@ impl ChatSessionsHandle {
                 summary,
                 created_at: run.started_at,
                 updated_at,
+                token_usage_records: run.token_usage_records.clone(),
             });
         }
         // Shells: same once-only terminal reporting, keyed by shell id.
@@ -430,6 +432,7 @@ impl ChatSessionsHandle {
                 summary,
                 created_at: shell.started_at,
                 updated_at: shell.finished_at().unwrap_or_else(chrono::Utc::now),
+                token_usage_records: Vec::new(),
             });
         }
         finished
@@ -642,6 +645,21 @@ mod tests {
             parent_run_id: None,
             session_scope_key: String::new(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
+        }
+    }
+
+    fn usage_record(
+        source: crate::llm::route_decision::TokenUsageSource,
+    ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
+        crate::llm::route_decision::MeteredTokenUsageRecord {
+            provider: "openai".to_string(),
+            model: "gpt-4o-mini".to_string(),
+            prompt_tokens: 8_000,
+            completion_tokens: 4_300,
+            total_tokens: 12_300,
+            source,
+            cost_usd: Some(0.0042),
         }
     }
 
@@ -819,6 +837,47 @@ mod tests {
         assert_eq!(finished[0].status, ManagedStatus::Completed);
         // Reported exactly once.
         assert!(handle.poll_finished(&mut reported).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn poll_finished_carries_agent_usage_and_never_fabricates_shell_usage() {
+        let mut agent = make_run(
+            "metered-agent",
+            "metered task",
+            SubAgentStatus::Completed("done".into()),
+        );
+        agent.token_usage_records = vec![usage_record(crate::llm::route_decision::TokenUsageSource::Reported)];
+        let runs = Arc::new(RwLock::new(vec![agent]));
+        let mut handle = ChatSessionsHandle::new(runs);
+
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let shell = super::super::shell::spawn_shell("exit 0", &sec, &sink).expect("test: spawn shell");
+        handle.add_shell(shell.clone());
+        for _ in 0..50 {
+            if shell.is_terminal() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let mut reported = std::collections::HashSet::new();
+        let finished = handle.poll_finished(&mut reported).await;
+        let agent = finished
+            .iter()
+            .find(|fin| fin.kind == ManagedKind::Agent)
+            .expect("test: agent completion present");
+        let shell = finished
+            .iter()
+            .find(|fin| fin.kind == ManagedKind::Shell)
+            .expect("test: shell completion present");
+
+        assert_eq!(agent.token_usage_records.len(), 1);
+        assert_eq!(agent.token_usage_records[0].total_tokens, 12_300);
+        assert!(
+            shell.token_usage_records.is_empty(),
+            "shell sessions have no LLM provider usage and must not fabricate tokens"
+        );
     }
 
     #[tokio::test]
@@ -1001,6 +1060,7 @@ mod tests {
             status,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
         };
         let views = vec![
             mk(1, ManagedStatus::Running),

@@ -405,6 +405,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         }
     }
 
@@ -545,6 +546,7 @@ mod tests {
             parent_run_id: None,
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         };
         let tool = SubagentsTool::new(Arc::new(RwLock::new(vec![run])));
 
@@ -578,6 +580,7 @@ mod tests {
             parent_run_id: Some("parent-b".to_string()),
             session_scope_key: "test-session".to_string(),
             spawn_depth: 0,
+            token_usage_records: Vec::new(),
         };
         let tool = SubagentsTool::with_security(
             Arc::new(RwLock::new(vec![run])),
