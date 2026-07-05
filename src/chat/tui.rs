@@ -220,14 +220,14 @@ impl SlashMenuState {
         self.filter.clear();
         self.filter.push_str(filter);
         self.entries = filtered_command_entries(filter);
-        self.clamp_selected();
+        self.selected = 0;
     }
 
     pub fn refresh_with_entries(&mut self, filter: &str, entries: Vec<SlashMenuEntry>) {
         self.filter.clear();
         self.filter.push_str(filter);
         self.entries = entries;
-        self.clamp_selected();
+        self.selected = 0;
     }
 
     pub fn clamp_selected(&mut self) {
@@ -356,6 +356,9 @@ fn filtered_command_entries(filter: &str) -> Vec<SlashMenuEntry> {
 fn command_matches_filter(spec: CommandSpec, needle: &str) -> bool {
     let name = spec.name.trim_start_matches('/').to_ascii_lowercase();
     if name.contains(needle) {
+        return true;
+    }
+    if spec.description.to_ascii_lowercase().contains(needle) {
         return true;
     }
     spec.aliases
@@ -628,10 +631,13 @@ pub(crate) fn sync_slash_menu_for_sources(
     };
     match context {
         SlashCursorContext::Command { filter } => {
-            if let Some(menu) = slash_menu.as_mut() {
+            let entries = filtered_command_entries(&filter);
+            if entries.is_empty() {
+                *slash_menu = None;
+            } else if let Some(menu) = slash_menu.as_mut() {
                 menu.refresh(&filter);
             } else {
-                *slash_menu = Some(SlashMenuState::new(&filter));
+                *slash_menu = Some(SlashMenuState::new_with_entries(&filter, entries));
             }
         }
         SlashCursorContext::Argument {
@@ -811,7 +817,18 @@ pub(crate) fn dispatch_slash_menu_key_with_sources(
     if (key.code == KeyCode::Enter || key.code == KeyCode::Tab) && key.modifiers == KeyModifiers::NONE {
         if let Some(entry) = slash_menu.as_ref().and_then(SlashMenuState::selected_entry).cloned() {
             match input.slash_cursor_context() {
-                Some(SlashCursorContext::Command { .. }) => input.replace_slash_command_token(&entry.insert_text),
+                Some(SlashCursorContext::Command { .. }) => {
+                    if key.code == KeyCode::Enter && entry.args_hint.is_empty() && input.slash_command_suffix_is_empty()
+                    {
+                        input.replace_slash_command_token(&entry.insert_text, false);
+                        let text = input.text();
+                        input.record_history(text.clone());
+                        input.clear();
+                        *slash_menu = None;
+                        return KeyDispatch::Submitted(text);
+                    }
+                    input.replace_slash_command_token(&entry.insert_text, true);
+                }
                 Some(SlashCursorContext::Argument { .. }) => {
                     input.replace_slash_argument_token(&entry.insert_text, entry.append_space);
                 }
@@ -1456,6 +1473,9 @@ impl TuiInput {
 
     fn slash_cursor_context(&self) -> Option<SlashCursorContext> {
         let (line_idx, cursor_offset) = self.cursor;
+        if line_idx != 0 {
+            return None;
+        }
         let line = self.lines.get(line_idx)?;
         if !line.starts_with('/') {
             return None;
@@ -1503,7 +1523,19 @@ impl TuiInput {
 
     /// Replace the current leading slash-command token with `command`, leaving a
     /// trailing space so the operator can immediately type arguments.
-    fn replace_slash_command_token(&mut self, command: &str) {
+    fn slash_command_suffix_is_empty(&self) -> bool {
+        let (line_idx, _cursor_offset) = self.cursor;
+        let Some(line) = self.lines.get(line_idx) else {
+            return false;
+        };
+        if !line.starts_with('/') {
+            return false;
+        }
+        let token_end = line.find(char::is_whitespace).unwrap_or(line.len());
+        line.get(token_end..).unwrap_or_default().trim().is_empty()
+    }
+
+    fn replace_slash_command_token(&mut self, command: &str, append_space: bool) {
         let (line_idx, _cursor_offset) = self.cursor;
         let Some(line) = self.lines.get_mut(line_idx) else {
             return;
@@ -1514,12 +1546,21 @@ impl TuiInput {
         let token_end = line.find(char::is_whitespace).unwrap_or(line.len());
         let suffix = line.get(token_end..).unwrap_or_default().trim_start();
         let replacement = if suffix.is_empty() {
-            format!("{command} ")
+            if append_space {
+                format!("{command} ")
+            } else {
+                command.to_string()
+            }
         } else {
             format!("{command} {suffix}")
         };
         *line = replacement;
-        self.cursor = (line_idx, command.len().saturating_add(1).min(line.len()));
+        let cursor = if append_space {
+            command.len().saturating_add(1)
+        } else {
+            command.len()
+        };
+        self.cursor = (line_idx, cursor.min(line.len()));
         self.history_pos = None;
         self.pending_draft = None;
         self.reverse_search = None;
@@ -3244,7 +3285,7 @@ fn render_fullscreen_overlays<V: BottomChromeView + ?Sized>(frame: &mut Frame, f
         return;
     }
     if let Some(menu) = state.slash_menu() {
-        let area = centered_overlay_rect(frame_area, 92, 85, BOTTOM_CHROME_MIN_HEIGHT);
+        let area = slash_menu_overlay_rect(frame_area, menu, fullscreen_bottom_chrome_height(state));
         frame.render_widget(Clear, area);
         render_slash_menu(frame, area, menu, state.ascii_fallback());
         return;
@@ -3274,6 +3315,27 @@ fn centered_overlay_rect(frame_area: Rect, width_pct: u16, height_pct: u16, min_
     let y = frame_area
         .y
         .saturating_add(frame_area.height.saturating_sub(height) / 2);
+    Rect { x, y, width, height }
+}
+
+fn slash_menu_overlay_rect(frame_area: Rect, menu: &SlashMenuState, bottom_chrome_height: u16) -> Rect {
+    let horizontal_margin = 2u16.min(frame_area.width.saturating_div(2));
+    let width = frame_area
+        .width
+        .saturating_sub(horizontal_margin.saturating_mul(2))
+        .min(80)
+        .max(1);
+    let visible_items = u16::try_from(menu.len().clamp(1, 10)).unwrap_or(10);
+    let height = visible_items
+        .saturating_add(2)
+        .min(frame_area.height.saturating_sub(bottom_chrome_height).max(1));
+    let x = frame_area.x.saturating_add(horizontal_margin);
+    let bottom_y = frame_area.y.saturating_add(
+        frame_area
+            .height
+            .saturating_sub(bottom_chrome_height.min(frame_area.height)),
+    );
+    let y = bottom_y.saturating_sub(height);
     Rect { x, y, width, height }
 }
 
@@ -6847,6 +6909,54 @@ mod tests {
     }
 
     #[test]
+    fn slash_menu_filters_command_descriptions() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/conversation".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        let menu = state.slash_menu.as_ref().expect("description match keeps menu open");
+        assert!(
+            menu.entries.iter().any(|entry| entry.label == "/clear"),
+            "description text should match /clear: {:?}",
+            menu.entries
+        );
+    }
+
+    #[test]
+    fn slash_menu_closes_when_filter_has_no_matches() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/zzzz".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(state.input.text(), "/zzzz");
+        assert!(state.slash_menu.is_none(), "no matching overlay must close");
+    }
+
+    #[test]
+    fn slash_menu_only_triggers_at_first_line_start() {
+        let mut state = TuiState::new("p", "m");
+        state.input.lines = vec!["open".to_string(), String::new()];
+        state.input.cursor = (1, 0);
+        for ch in "/usr/bin".chars() {
+            let _ = dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
+        }
+
+        assert_eq!(state.input.text(), "open\n/usr/bin");
+        assert!(
+            state.slash_menu.is_none(),
+            "second-line absolute path must not open slash menu"
+        );
+    }
+
+    #[test]
     fn slash_menu_navigation_and_enter_insert_command_name() {
         let mut state = TuiState::new("p", "m");
         for ch in "/".chars() {
@@ -6886,9 +6996,27 @@ mod tests {
     }
 
     #[test]
+    fn slash_menu_enter_submits_no_arg_command() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/he".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Submitted("/help".to_string())
+        );
+        assert!(state.input.is_empty());
+        assert!(state.slash_menu.is_none());
+    }
+
+    #[test]
     fn slash_menu_tab_inserts_command_and_esc_dismisses_without_clearing_input() {
         let mut tab_state = TuiState::new("p", "m");
-        for ch in "/ex".chars() {
+        for ch in "/expo".chars() {
             assert_eq!(
                 dispatch_global_key(key(KeyCode::Char(ch)), &mut tab_state),
                 KeyDispatch::Consumed

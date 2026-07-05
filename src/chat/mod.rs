@@ -2554,6 +2554,13 @@ pub async fn run(
     {
         dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
         dispatcher_shadow_state.ui.autonomy_level = config.autonomy.level;
+        dispatcher_shadow_state.ui.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
+        if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
+            dispatcher_shadow_state.ui.saved_sessions_cache = sessions
+                .iter()
+                .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
+                .collect();
+        }
     }
 
     // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
@@ -3815,6 +3822,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         crate::chat::action::Action::SavedSessionPickerOpened { entries },
                                         "chat.saved_session_picker_opened_resume",
                                     );
+                                    let sources = {
+                                        let mirror = chat_mirror.lock();
+                                        crate::chat::action::Action::SlashMenuSourcesUpdated {
+                                            saved_sessions: mirror.saved_sessions_cache.clone(),
+                                            provider_model_catalog: mirror.provider_model_catalog.clone(),
+                                        }
+                                    };
+                                    let _ = chat_dispatcher.dispatch_or_log(sources, "chat.slash_menu_sources_resume");
                                     if let Some(tx) = sessions_redraw_handle.as_ref() {
                                         let _ = tx.try_send(());
                                     }

@@ -251,6 +251,12 @@ pub enum Action {
     SessionsEntriesUpdated {
         entries: Vec<crate::chat::sessions::SwitcherEntry>,
     },
+    /// Slash-menu argument candidate sources that are not derivable from the
+    /// structured live-session strip.
+    SlashMenuSourcesUpdated {
+        saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+    },
     /// P2 active line-oriented child session viewport snapshot. `None` clears
     /// the child viewport when focus returns to main or PTY handoff resumes.
     ActiveSessionViewUpdated {
@@ -355,6 +361,7 @@ impl Action {
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
             Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
+            Self::SlashMenuSourcesUpdated { .. } => "SlashMenuSourcesUpdated",
             Self::ActiveSessionViewUpdated { .. } => "ActiveSessionViewUpdated",
             Self::ContextWindowUpdated { .. } => "ContextWindowUpdated",
             Self::ProviderUsageRecorded { .. } => "ProviderUsageRecorded",

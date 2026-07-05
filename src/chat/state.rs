@@ -297,6 +297,10 @@ pub struct UiState {
     /// P1 sessions strip entries. This is the same child TUI registry snapshot
     /// used by the Ctrl+G switcher, kept structured for rendering.
     pub sessions_entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// Saved chat-session candidates for `/resume` slash-menu arguments.
+    pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    /// Provider/model candidates for `/provider` and `/model` slash-menu args.
+    pub provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
     /// P2 active line-session viewport snapshot. `None` when the main chat or a
     /// PTY handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
@@ -518,6 +522,8 @@ impl ChatState {
                 last_submitted: None,
                 sessions_status: String::new(),
                 sessions_entries: Vec::new(),
+                saved_sessions_cache: Vec::new(),
+                provider_model_catalog: Vec::new(),
                 active_session_view: None,
                 pending_tool_approval: None,
                 context_window_tokens: None,
@@ -555,6 +561,21 @@ impl ChatState {
     #[allow(clippy::missing_const_for_fn)]
     fn new_input() -> TuiInput {
         Vec::new()
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn slash_menu_sources_from<'a>(
+        live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
+        saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
+        provider_model_catalog: &'a [crate::chat::tui::SlashProviderModelCatalog],
+        current_provider: &'a str,
+    ) -> crate::chat::tui::SlashMenuSources<'a> {
+        crate::chat::tui::SlashMenuSources {
+            live_sessions,
+            saved_sessions,
+            provider_model_catalog,
+            current_provider,
+        }
     }
 
     /// 构造当前状态对应的 [`UiSnapshot`].
@@ -796,6 +817,10 @@ impl ChatState {
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
             Action::SessionsEntriesUpdated { entries } => self.reduce_sessions_entries_updated(entries),
+            Action::SlashMenuSourcesUpdated {
+                saved_sessions,
+                provider_model_catalog,
+            } => self.reduce_slash_menu_sources_updated(saved_sessions, provider_model_catalog),
             Action::ActiveSessionViewUpdated { view } => self.reduce_active_session_view_updated(view),
             Action::ContextWindowUpdated { max_context_tokens } => {
                 self.reduce_context_window_updated(max_context_tokens)
@@ -836,12 +861,12 @@ impl ChatState {
         }
 
         if self.ui.slash_menu.is_some() {
-            let sources = crate::chat::tui::SlashMenuSources {
-                live_sessions: &self.ui.sessions_entries,
-                saved_sessions: &[],
-                provider_model_catalog: &[],
-                current_provider: self.session.provider.as_ref(),
-            };
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                self.session.provider.as_ref(),
+            );
             let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
                 &mut self.ui.input,
                 &mut self.ui.slash_menu,
@@ -892,12 +917,12 @@ impl ChatState {
             // 非空 buffer 转发为 Delete
             let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
             let _ = self.ui.input.handle_key(synthetic);
-            let sources = crate::chat::tui::SlashMenuSources {
-                live_sessions: &self.ui.sessions_entries,
-                saved_sessions: &[],
-                provider_model_catalog: &[],
-                current_provider: self.session.provider.as_ref(),
-            };
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                self.session.provider.as_ref(),
+            );
             crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
             return vec![Effect::RequestRedraw];
         }
@@ -913,12 +938,12 @@ impl ChatState {
                 self.reduce_input_cancelled()
             }
             crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
-                let sources = crate::chat::tui::SlashMenuSources {
-                    live_sessions: &self.ui.sessions_entries,
-                    saved_sessions: &[],
-                    provider_model_catalog: &[],
-                    current_provider: self.session.provider.as_ref(),
-                };
+                let sources = Self::slash_menu_sources_from(
+                    &self.ui.sessions_entries,
+                    &self.ui.saved_sessions_cache,
+                    &self.ui.provider_model_catalog,
+                    self.session.provider.as_ref(),
+                );
                 crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
                 vec![Effect::RequestRedraw]
             }
@@ -943,12 +968,12 @@ impl ChatState {
             return vec![Effect::RequestRedraw];
         }
         self.ui.input.paste(text);
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -985,12 +1010,12 @@ impl ChatState {
     fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
         self.ui.input.set_text(text);
         self.ui.input.clear_navigation_state();
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -1010,12 +1035,12 @@ impl ChatState {
             HistoryDir::Down => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         };
         let _ = self.ui.input.handle_key(key);
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -2072,6 +2097,38 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_slash_menu_sources_updated(
+        &mut self,
+        saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+    ) -> Vec<Effect> {
+        if self.ui.saved_sessions_cache == saved_sessions && self.ui.provider_model_catalog == provider_model_catalog {
+            return Vec::new();
+        }
+        self.ui.saved_sessions_cache = saved_sessions;
+        self.ui.provider_model_catalog = provider_model_catalog;
+        if self.ui.slash_menu.is_some() {
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                self.session.provider.as_ref(),
+            );
+            crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_slash_menu_sources_updated(
+        &mut self,
+        _saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        _provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+    ) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::ActiveSessionViewUpdated` — replace/clear the focused child
     /// viewport render snapshot.
     fn reduce_active_session_view_updated(
@@ -2508,6 +2565,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // identical writes, so this never churns frames.
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
+        | Action::SlashMenuSourcesUpdated { .. }
         | Action::ActiveSessionViewUpdated { .. }
         | Action::ContextWindowUpdated { .. }
         | Action::ProviderUsageRecorded { .. } => true,
@@ -2612,6 +2670,54 @@ mod tests {
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.sessions_status.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn slash_menu_sources_match_legacy_and_redux_for_same_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let catalog = vec![crate::chat::tui::SlashProviderModelCatalog {
+            provider: "test-provider".to_string(),
+            models: vec![crate::chat::tui::SlashModelCandidate {
+                name: "gpt-parity".to_string(),
+                description: "Parity model".to_string(),
+            }],
+        }];
+        let mut legacy = crate::chat::tui::TuiState::new("test-provider", "test-model");
+        legacy.provider_model_catalog = catalog.clone();
+        let mut redux = make_state();
+        let _ = redux.reduce(Action::SlashMenuSourcesUpdated {
+            saved_sessions: Vec::new(),
+            provider_model_catalog: catalog,
+        });
+
+        for ch in "/model ".chars() {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            let _ = crate::chat::tui::dispatch_global_key(key, &mut legacy);
+            let _ = redux.reduce_with_now(Action::KeyPressed(key), 1_000);
+        }
+
+        let legacy_labels = legacy
+            .slash_menu
+            .as_ref()
+            .expect("legacy model menu")
+            .entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        let redux_labels = redux
+            .ui
+            .slash_menu
+            .as_ref()
+            .expect("redux model menu")
+            .entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(legacy_labels, redux_labels);
+        assert_eq!(redux_labels, vec!["gpt-parity"]);
     }
 
     /// P1: SessionsEntriesUpdated writes structured strip entries and dedups
