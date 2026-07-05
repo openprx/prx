@@ -881,8 +881,8 @@ impl ChatState {
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
             return vec![Effect::Quit];
         }
-        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.ui.saved_session_picker.is_some() {
-            return self.reduce_saved_session_picker_closed();
+        if self.ui.saved_session_picker.is_some() {
+            return self.reduce_saved_session_picker_key_pressed(key);
         }
         if self.ui.switcher.is_some() {
             if key.code == KeyCode::Esc
@@ -899,6 +899,27 @@ impl ChatState {
             || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
         {
             return self.reduce_approval_key_pressed(key);
+        }
+
+        if self.ui.slash_menu.is_some() {
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                self.session.provider.as_ref(),
+            );
+            let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
+                &mut self.ui.input,
+                &mut self.ui.slash_menu,
+                key,
+                sources,
+            );
+            return match dispatch {
+                crate::chat::tui::KeyDispatch::Submitted(text) => self.reduce_input_submitted(text),
+                crate::chat::tui::KeyDispatch::Cancelled => self.reduce_input_cancelled(),
+                crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
+                _ => vec![Effect::RequestRedraw],
+            };
         }
 
         if key.modifiers == KeyModifiers::ALT {
@@ -936,27 +957,6 @@ impl ChatState {
                     });
                 return vec![Effect::RequestRedraw];
             }
-        }
-
-        if self.ui.slash_menu.is_some() {
-            let sources = Self::slash_menu_sources_from(
-                &self.ui.sessions_entries,
-                &self.ui.saved_sessions_cache,
-                &self.ui.provider_model_catalog,
-                self.session.provider.as_ref(),
-            );
-            let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
-                &mut self.ui.input,
-                &mut self.ui.slash_menu,
-                key,
-                sources,
-            );
-            return match dispatch {
-                crate::chat::tui::KeyDispatch::Submitted(text) => self.reduce_input_submitted(text),
-                crate::chat::tui::KeyDispatch::Cancelled => self.reduce_input_cancelled(),
-                crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
-                _ => vec![Effect::RequestRedraw],
-            };
         }
 
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
@@ -2416,6 +2416,34 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_saved_session_picker_key_pressed(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+        let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+        if up || down {
+            let Some(picker) = self.ui.saved_session_picker.as_mut() else {
+                return Vec::new();
+            };
+            if up {
+                picker.select_prev();
+            } else {
+                picker.select_next();
+            }
+            picker.clamp_selected();
+            return vec![Effect::RequestRedraw];
+        }
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+            return self.reduce_saved_session_picker_closed();
+        }
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            return self.reduce_saved_session_picker_closed();
+        }
+        Vec::new()
+    }
+
     /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
     ///
     /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
@@ -3126,6 +3154,95 @@ mod tests {
             state.ui.input.text(),
             "draft",
             "matching Alt+Enter must not insert a newline"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn slash_menu_captures_alt_arrows_before_strip_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![
+            crate::chat::sessions::SwitcherEntry {
+                seq: 1,
+                kind: "agent",
+                origin: "user",
+                status: "running",
+                title: "one".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
+                idle_warning: false,
+            },
+            crate::chat::sessions::SwitcherEntry {
+                seq: 2,
+                kind: "agent",
+                origin: "user",
+                status: "running",
+                title: "two".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
+                idle_warning: false,
+            },
+        ];
+        state.ui.input.set_text("/mo");
+        state.ui.slash_menu = Some(SlashMenuState::new("mo"));
+        state.ui.strip_selection = Some(2);
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+
+        assert!(
+            effects.iter().all(|effect| matches!(effect, Effect::RequestRedraw)),
+            "slash menu may redraw, but must not leak Alt+Up into strip navigation: {effects:?}"
+        );
+        assert_eq!(
+            state.ui.strip_selection,
+            Some(2),
+            "Alt+Up must not move the session strip while slash menu is open"
+        );
+        assert!(state.ui.slash_menu.is_some(), "slash menu remains open");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn saved_session_picker_captures_alt_enter_before_stale_strip_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            crate::chat::session::SavedSessionPickerEntry {
+                id: "saved-a".to_string(),
+                title: "saved a".to_string(),
+                turn_count: 1,
+                updated_at: chrono::Utc::now(),
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                is_current: false,
+            },
+        ]));
+        state.ui.strip_selection = Some(99);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(
+            effects.is_empty(),
+            "saved picker consumes Alt+Enter without reducer side effects"
+        );
+        assert!(
+            state.ui.saved_session_picker.is_some(),
+            "Alt+Enter is consumed, not treated as picker Enter"
+        );
+        assert_eq!(state.ui.strip_selection, Some(99));
+        assert_eq!(state.ui.input.text(), "draft");
+        assert!(
+            !matches!(
+                state.ui.conversation_lines.last(),
+                Some(crate::chat::tui::ConversationLine::System { content }) if content == "session gone"
+            ),
+            "stale strip selection must not receive Alt+Enter while picker is open"
         );
     }
 
