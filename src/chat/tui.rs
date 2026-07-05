@@ -1175,10 +1175,9 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             return KeyDispatch::StripSelectionChanged { selected };
         }
         if key.code == KeyCode::Enter {
-            return selected_strip_entry(&state.sessions_cache, state.strip_selection)
-                .map_or(KeyDispatch::Consumed, |entry| KeyDispatch::AttachSession {
-                    seq: entry.seq,
-                });
+            if let Some(entry) = selected_strip_entry(&state.sessions_cache, state.strip_selection) {
+                return KeyDispatch::AttachSession { seq: entry.seq };
+            }
         }
     }
     if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
@@ -6366,6 +6365,18 @@ mod tests {
     }
 
     #[test]
+    fn p2_10_alt_enter_inserts_newline() {
+        let mut input = TuiInput::new();
+        type_str(&mut input, "a");
+        let out = input.handle_key(key_mod(KeyCode::Enter, KeyModifiers::ALT));
+        assert_eq!(out, InputOutcome::Consumed);
+        type_str(&mut input, "b");
+        assert_eq!(input.text(), "a\nb");
+        assert_eq!(input.lines.len(), 2);
+        assert!(!input.is_single_line());
+    }
+
+    #[test]
     fn p2_10_cursor_moves_across_line_boundaries() {
         let mut input = TuiInput::new();
         type_str(&mut input, "ab");
@@ -7795,6 +7806,29 @@ mod tests {
                 "Alt+Enter reuses the single attach dispatch for {kind}"
             );
         }
+    }
+
+    #[test]
+    fn alt_enter_without_strip_selection_falls_through_to_newline_insert() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        dispatch_global_key(key(KeyCode::Char('a')), &mut state);
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
+            KeyDispatch::Consumed
+        );
+        dispatch_global_key(key(KeyCode::Char('b')), &mut state);
+        assert_eq!(state.input.text(), "a\nb");
+
+        let mut shift_state = TuiState::new("p", "m");
+        dispatch_global_key(key(KeyCode::Char('x')), &mut shift_state);
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::SHIFT), &mut shift_state),
+            KeyDispatch::Consumed
+        );
+        dispatch_global_key(key(KeyCode::Char('y')), &mut shift_state);
+        assert_eq!(shift_state.input.text(), "x\ny", "Shift+Enter still inserts newline");
     }
 
     #[test]
