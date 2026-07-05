@@ -22,7 +22,8 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::loop_::ChatMode;
@@ -495,6 +496,53 @@ pub const DIFF_SESSION_SEQ: u64 = 0;
 /// Bounded transcript viewport size. Conversation history remains authoritative
 /// elsewhere; the child TUI is only a scrollable display snapshot.
 pub const TRANSCRIPT_MAX_LINES: usize = 400;
+const ASSISTANT_MARKDOWN_CACHE_CAPACITY: usize = 128;
+
+static ASSISTANT_MARKDOWN_CACHE: LazyLock<Mutex<AssistantMarkdownCache>> =
+    LazyLock::new(|| Mutex::new(AssistantMarkdownCache::new(ASSISTANT_MARKDOWN_CACHE_CAPACITY)));
+
+#[derive(Debug)]
+struct AssistantMarkdownCache {
+    capacity: usize,
+    order: VecDeque<String>,
+    entries: HashMap<String, Arc<Vec<Line<'static>>>>,
+}
+
+impl AssistantMarkdownCache {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            order: VecDeque::new(),
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get_or_render(&mut self, content: &str) -> Arc<Vec<Line<'static>>> {
+        if let Some(lines) = self.entries.get(content) {
+            return Arc::clone(lines);
+        }
+        let rendered = Arc::new(render_assistant_markdown_lines(content));
+        if self.capacity == 0 {
+            return rendered;
+        }
+        while self.entries.len() >= self.capacity {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(content.to_string());
+        self.entries.insert(content.to_string(), Arc::clone(&rendered));
+        rendered
+    }
+
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.order.clear();
+        self.entries.clear();
+    }
+}
 
 /// Outcome of [`TuiInput::handle_key`].
 ///
@@ -4426,12 +4474,11 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             lines.push(Line::from(""));
         }
         ConversationLine::Assistant { content } => {
-            // Claude Code style: no prefix, no indicator. Content rendered at
-            // column 0 in the default terminal foreground, separated from the
-            // preceding user line by the trailing blank already pushed there.
-            for text_line in content.lines() {
-                lines.push(Line::from(text_line));
-            }
+            // Claude Code style: no prefix, no indicator. Finalized assistant
+            // markdown is cached so redraws do not re-run syntect on stable
+            // history.
+            let rendered = cached_finalized_assistant_markdown_lines(content);
+            lines.extend(rendered.iter().cloned());
             lines.push(Line::from(""));
         }
         ConversationLine::StreamingAssistant { content } => {
@@ -4439,20 +4486,7 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             // (`▌`, or `_` in ASCII mode) signals that more bytes are still
             // inbound; once the stream finalises the variant becomes
             // `Assistant` and the cursor disappears.
-            let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
-            let mut body_lines: Vec<&str> = content.lines().collect();
-            if body_lines.is_empty() {
-                body_lines.push("");
-            }
-            let last_idx = body_lines.len().saturating_sub(1);
-            for (i, text_line) in body_lines.iter().enumerate() {
-                let formatted = if i == last_idx {
-                    format!("{text_line}{cursor}")
-                } else {
-                    (*text_line).to_string()
-                };
-                lines.push(Line::from(formatted));
-            }
+            lines.extend(render_streaming_assistant_markdown_lines(content, ascii));
             lines.push(Line::from(""));
         }
         ConversationLine::System { content } => {
@@ -4499,6 +4533,165 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             char_count,
             folded,
         } => render_reasoning_card(lines, content, *char_count, *folded, ascii),
+    }
+}
+
+fn cached_finalized_assistant_markdown_lines(content: &str) -> Arc<Vec<Line<'static>>> {
+    ASSISTANT_MARKDOWN_CACHE.lock().get_or_render(content)
+}
+
+fn render_streaming_assistant_markdown_lines(content: &str, ascii: bool) -> Vec<Line<'static>> {
+    let mut lines = render_assistant_markdown_lines(content);
+    let cursor = if ascii { "_" } else { "\u{258C}" }; // ▌
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(Span::raw(cursor.to_string()));
+    } else {
+        lines.push(Line::from(cursor.to_string()));
+    }
+    lines
+}
+
+fn render_assistant_markdown_lines(content: &str) -> Vec<Line<'static>> {
+    let rendered = crate::chat::renderer::render_markdown_with_highlighting(content);
+    ansi_sgr_to_lines(&rendered)
+}
+
+fn ansi_sgr_to_lines(input: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut segment = String::new();
+    let mut style = Style::default();
+    let mut idx = 0usize;
+
+    while idx < input.len() {
+        if input[idx..].starts_with("\x1b[")
+            && let Some(end_rel) = input[idx + 2..].find('m')
+        {
+            flush_ansi_segment(&mut spans, &mut segment, style);
+            let codes = &input[idx + 2..idx + 2 + end_rel];
+            style = apply_sgr_codes(style, codes);
+            idx += 2 + end_rel + 1;
+            continue;
+        }
+
+        let Some(ch) = input[idx..].chars().next() else {
+            break;
+        };
+        idx += ch.len_utf8();
+        match ch {
+            '\n' => {
+                flush_ansi_segment(&mut spans, &mut segment, style);
+                lines.push(Line::from(std::mem::take(&mut spans)));
+            }
+            '\r' => {}
+            _ => segment.push(ch),
+        }
+    }
+
+    flush_ansi_segment(&mut spans, &mut segment, style);
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn flush_ansi_segment(spans: &mut Vec<Span<'static>>, segment: &mut String, style: Style) {
+    if segment.is_empty() {
+        return;
+    }
+    spans.push(Span::styled(std::mem::take(segment), style));
+}
+
+fn apply_sgr_codes(mut style: Style, codes: &str) -> Style {
+    let values = parse_sgr_values(codes);
+    if values.is_empty() {
+        return Style::default();
+    }
+    let mut idx = 0usize;
+    while idx < values.len() {
+        let Some(code) = values.get(idx).copied() else {
+            break;
+        };
+        match code {
+            0 => style = Style::default(),
+            1 => style = style.add_modifier(Modifier::BOLD),
+            3 => style = style.add_modifier(Modifier::ITALIC),
+            4 => style = style.add_modifier(Modifier::UNDERLINED),
+            22 => style = style.remove_modifier(Modifier::BOLD),
+            23 => style = style.remove_modifier(Modifier::ITALIC),
+            24 => style = style.remove_modifier(Modifier::UNDERLINED),
+            30..=37 => {
+                style = style.fg(ansi_basic_color(code, false));
+            }
+            39 => style = style.fg(Color::Reset),
+            90..=97 => {
+                style = style.fg(ansi_basic_color(code - 60, true));
+            }
+            40..=47 => {
+                style = style.bg(ansi_basic_color(code - 10, false));
+            }
+            49 => style = style.bg(Color::Reset),
+            100..=107 => {
+                style = style.bg(ansi_basic_color(code - 70, true));
+            }
+            38 | 48 => {
+                if let (Some(2), Some(r), Some(g), Some(b)) = (
+                    values.get(idx + 1).copied(),
+                    values.get(idx + 2).copied(),
+                    values.get(idx + 3).copied(),
+                    values.get(idx + 4).copied(),
+                ) {
+                    let color = Color::Rgb(r.min(255) as u8, g.min(255) as u8, b.min(255) as u8);
+                    if code == 38 {
+                        style = style.fg(color);
+                    } else {
+                        style = style.bg(color);
+                    }
+                    idx += 4;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    style
+}
+
+fn parse_sgr_values(codes: &str) -> Vec<u16> {
+    if codes.is_empty() {
+        return Vec::new();
+    }
+    codes
+        .split(';')
+        .filter_map(|part| {
+            if part.is_empty() {
+                Some(0)
+            } else {
+                part.parse::<u16>().ok()
+            }
+        })
+        .collect()
+}
+
+const fn ansi_basic_color(code: u16, bright: bool) -> Color {
+    match (code, bright) {
+        (30, false) => Color::Black,
+        (31, false) => Color::Red,
+        (32, false) => Color::Green,
+        (33, false) => Color::Yellow,
+        (34, false) => Color::Blue,
+        (35, false) => Color::Magenta,
+        (36, false) => Color::Cyan,
+        (37, false) => Color::Gray,
+        (30, true) => Color::DarkGray,
+        (31, true) => Color::LightRed,
+        (32, true) => Color::LightGreen,
+        (33, true) => Color::LightYellow,
+        (34, true) => Color::LightBlue,
+        (35, true) => Color::LightMagenta,
+        (36, true) => Color::LightCyan,
+        (37, true) => Color::White,
+        _ => Color::Reset,
     }
 }
 
@@ -5594,6 +5787,65 @@ mod tests {
             .get(line_idx)
             .and_then(|line| line.spans.get(span_idx))
             .and_then(|span| span.style.fg)
+    }
+
+    fn span_fg_for_content(lines: &[Line<'_>], content: &str) -> Option<Color> {
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == content)
+            .and_then(|span| span.style.fg)
+    }
+
+    #[test]
+    fn finalized_assistant_markdown_renders_inline_code_and_fenced_blocks() {
+        ASSISTANT_MARKDOWN_CACHE.lock().clear();
+        let line = ConversationLine::Assistant {
+            content: "Use `cargo build`\n```rust\nfn main() {}\n```".to_string(),
+        };
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut lines, &line, false);
+
+        let rendered = lines.iter().map(line_to_plain).collect::<Vec<_>>().join("\n");
+        assert!(
+            rendered.contains("Use cargo build"),
+            "inline text rendered: {rendered:?}"
+        );
+        assert!(rendered.contains("┌─rust"), "fenced code border rendered: {rendered:?}");
+        assert!(rendered.contains("fn main() {}"), "code body rendered: {rendered:?}");
+        assert_eq!(
+            span_fg_for_content(&lines, "cargo build"),
+            Some(Color::Yellow),
+            "inline code should bridge ANSI yellow into ratatui style"
+        );
+    }
+
+    #[test]
+    fn streaming_assistant_markdown_keeps_cursor_after_highlighted_content() {
+        let line = ConversationLine::StreamingAssistant {
+            content: "Use `cargo build`".to_string(),
+        };
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        render_conversation_line(&mut lines, &line, false);
+
+        let body = lines.first().map(line_to_plain).expect("streaming body rendered");
+        assert!(body.ends_with('\u{258C}'), "cursor remains at streaming tail: {body:?}");
+        assert_eq!(
+            span_fg_for_content(&lines, "cargo build"),
+            Some(Color::Yellow),
+            "streaming markdown should use the same ANSI bridge"
+        );
+    }
+
+    #[test]
+    fn finalized_assistant_markdown_uses_render_cache() {
+        ASSISTANT_MARKDOWN_CACHE.lock().clear();
+        let first = cached_finalized_assistant_markdown_lines("Use `cargo build`");
+        let second = cached_finalized_assistant_markdown_lines("Use `cargo build`");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "finalized assistant markdown should reuse cached rendered spans"
+        );
     }
 
     // ── P3-5: streaming-draft API tests ────────────────────────────────
