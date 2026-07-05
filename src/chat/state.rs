@@ -207,6 +207,11 @@ pub enum Effect {
         name: String,
         args: String,
     },
+    /// Resolve a pending foreground approval without going through a separate
+    /// `ToolApprovalReceived` Action. Used by pure key handling paths where the
+    /// reducer owns the key event and must return the approval decision to the
+    /// dispatcher/executor as an effect.
+    ResolveApproval { tool_id: String, approved: bool },
     /// 优雅退出主循环
     Quit,
 }
@@ -229,6 +234,7 @@ impl Effect {
             Self::AutoTitleSession(_) => "AutoTitleSession",
             Self::LogTrace { .. } => "LogTrace",
             Self::RequestApproval { .. } => "RequestApproval",
+            Self::ResolveApproval { .. } => "ResolveApproval",
             Self::Quit => "Quit",
         }
     }
@@ -865,14 +871,24 @@ impl ChatState {
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
             return vec![Effect::Quit];
         }
-        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
-            return self.reduce_cancel_requested();
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.ui.saved_session_picker.is_some() {
+            return self.reduce_saved_session_picker_closed();
         }
-
+        if self.ui.switcher.is_some() {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                return self.reduce_switcher_closed();
+            }
+            return vec![Effect::RequestRedraw];
+        }
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.ui.strip_selection.take().is_some() {
+            return vec![Effect::RequestRedraw];
+        }
         if self.ui.pending_tool_approval.is_some()
             || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
         {
-            return vec![Effect::RequestRedraw];
+            return self.reduce_approval_key_pressed(key);
         }
 
         if self.ui.slash_menu.is_some() {
@@ -894,6 +910,10 @@ impl ChatState {
                 crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
                 _ => vec![Effect::RequestRedraw],
             };
+        }
+
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
+            return self.reduce_cancel_requested();
         }
 
         // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
@@ -950,6 +970,42 @@ impl ChatState {
             }
             crate::chat::tui::InputOutcome::Ignored => Vec::new(),
         }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_approval_key_pressed(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(pending) = self.ui.pending_tool_approval.clone() else {
+            if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+                if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+                    self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+                }
+                return vec![Effect::RequestRedraw];
+            }
+            return vec![Effect::RequestRedraw];
+        };
+        if key.modifiers != KeyModifiers::NONE {
+            return vec![Effect::RequestRedraw];
+        }
+        let approved = match key.code {
+            KeyCode::Char('y' | 'Y') => Some(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+            _ => None,
+        };
+        let Some(approved) = approved else {
+            return vec![Effect::RequestRedraw];
+        };
+        self.ui.pending_tool_approval = None;
+        if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+            self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+        vec![
+            Effect::ResolveApproval {
+                tool_id: pending.tool_id,
+                approved,
+            },
+            Effect::RequestRedraw,
+        ]
     }
 
     /// 非 terminal-tui feature 下的占位（KeyEvent 仅在 crossterm 可用时存在）
@@ -1760,11 +1816,21 @@ impl ChatState {
         // 清除流式状态
         self.stream.draft = None;
         self.control.generating = false;
+        let pending_approval = self.ui.pending_tool_approval.take();
+        if pending_approval.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+            self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+        }
 
         let mut effects = Vec::new();
         // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
         if let Some(token) = cancel_opt {
             effects.push(Effect::CancelToken(token));
+        }
+        if let Some(pending) = pending_approval {
+            effects.push(Effect::ResolveApproval {
+                tool_id: pending.tool_id,
+                approved: false,
+            });
         }
         if let Some(draft_id) = draft_id_opt {
             effects.push(Effect::CancelDraft(draft_id));
@@ -3041,6 +3107,105 @@ mod tests {
         assert!(state.ui.pending_tool_approval.is_none());
         assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
         assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn redux_esc_approval_generating_denies_without_cancelling_turn() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-approval".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-esc-deny".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(
+            state.control.generating,
+            "Esc in approval must not cancel the active turn"
+        );
+        assert!(state.stream.draft.is_some(), "streaming draft stays active");
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-esc-deny"
+            )
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelToken(_) | Effect::CancelDraft(_))),
+            "approval Esc must not emit turn-cancel effects"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn redux_esc_generating_slash_menu_closes_menu_without_cancelling_turn() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-slash".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        state.ui.input.set_text("/mo");
+        state.ui.slash_menu = Some(SlashMenuState::new("mo"));
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(state.control.generating, "slash Esc must not cancel the active turn");
+        assert!(state.stream.draft.is_some(), "streaming draft stays active");
+        assert!(state.ui.slash_menu.is_none(), "Esc closes only the slash menu");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelToken(_) | Effect::CancelDraft(_))),
+            "slash Esc must not emit turn-cancel effects"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn cancel_requested_clears_pending_approval_and_resolves_false() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-cancel".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            tool_id: "call-cancel-deny".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::CancelRequested);
+
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::CancelToken(_))));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-cancel-deny"
+            )
+        }));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelDraft(draft_id) if draft_id == "draft-cancel"))
+        );
     }
 
     #[cfg(feature = "terminal-tui")]

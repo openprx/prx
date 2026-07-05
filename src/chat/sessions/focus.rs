@@ -351,20 +351,24 @@ pub enum EscAction {
 
 /// Pure, context-dependent resolution of the Esc key (plan §v1.1 P0-8).
 ///
-/// Priority order, deliberately layered so the established "non-empty input
-/// clears" behaviour is never weakened:
+/// Priority order, deliberately layered so modal/overlay cleanup stays above
+/// turn interruption. Callers handle slash menus, strip selection, and approval
+/// prompts before falling through to this resolver.
 /// 1. Switcher open → close the switcher.
-/// 2. Generating → interrupt the active turn.
-/// 3. Input non-empty → clear input (muscle memory preserved).
-/// 4. Input empty + session focused → detach.
-/// 5. Input empty + transcript focused → close transcript.
-/// 6. Input empty + approval focused → deny the pending tool.
+/// 2. Approval focus → deny the pending tool.
+/// 3. Generating → interrupt the active turn.
+/// 4. Input non-empty → clear input (muscle memory preserved).
+/// 5. Input empty + session focused → detach.
+/// 6. Input empty + transcript focused → close transcript.
 /// 7. Input empty + diff focused → close diff.
 /// 8. Input empty + main focus → cancel (unchanged legacy behaviour).
 #[must_use]
 pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: bool, generating: bool) -> EscAction {
     if switcher_open {
         return EscAction::CloseSwitcher;
+    }
+    if matches!(focus, FocusTarget::Approval) {
+        return EscAction::DenyApproval;
     }
     if generating {
         return EscAction::CancelGenerating;
@@ -375,7 +379,7 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     match focus {
         FocusTarget::Session { .. } => return EscAction::RequestDetach,
         FocusTarget::Transcript => return EscAction::CloseTranscript,
-        FocusTarget::Approval => return EscAction::DenyApproval,
+        FocusTarget::Approval => {}
         FocusTarget::Diff => return EscAction::CloseDiff,
         FocusTarget::Main => {}
     }
@@ -739,6 +743,18 @@ mod tests {
         assert_eq!(
             resolve_esc(true, FocusTarget::Diff, false, true),
             EscAction::CancelGenerating
+        );
+    }
+
+    #[test]
+    fn resolve_esc_approval_focus_takes_priority_over_generating() {
+        assert_eq!(
+            resolve_esc(true, FocusTarget::Approval, false, true),
+            EscAction::DenyApproval
+        );
+        assert_eq!(
+            resolve_esc(false, FocusTarget::Approval, false, true),
+            EscAction::DenyApproval
         );
     }
 

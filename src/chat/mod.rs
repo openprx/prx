@@ -1573,6 +1573,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
             Effect::DisplayMedia { .. } => "DisplayMedia",
             Effect::AutoTitleSession(_) => "AutoTitleSession",
             Effect::RequestApproval { .. } => "RequestApproval",
+            Effect::ResolveApproval { .. } => "ResolveApproval",
         })
         .collect();
 

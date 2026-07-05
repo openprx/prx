@@ -1080,6 +1080,9 @@ impl EffectExecutor {
                     }
                 });
             }
+            Effect::ResolveApproval { tool_id, approved } => {
+                deps.approval_router.resolve(&tool_id, approved);
+            }
             Effect::Quit => {
                 // 关停信号：真 cancel + drop 等隐式协议由 chat::run 收尾处理
                 tracing::info!("effect: Quit -> shutdown.cancel()");
@@ -3655,6 +3658,10 @@ mod integration_tests {
                 turn_spawn_ctx: None,
             },
             Effect::CancelToken(token),
+            Effect::ResolveApproval {
+                tool_id: "call-shadow".to_string(),
+                approved: false,
+            },
         ];
 
         for effect in effects {

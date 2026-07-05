@@ -1178,14 +1178,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if let Some(pending) = state.pending_tool_approval.clone()
         && matches!(state.focus, crate::chat::sessions::FocusTarget::Approval)
     {
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            state.pending_tool_approval = None;
-            state.focus = crate::chat::sessions::FocusTarget::Main;
-            return KeyDispatch::ToolApprovalDecision {
-                tool_id: pending.tool_id,
-                approved: false,
-            };
-        }
         if key.modifiers == KeyModifiers::NONE {
             match key.code {
                 KeyCode::Char('y' | 'Y') => {
@@ -4338,15 +4330,28 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
 }
 
 fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option<String> {
-    let streaming = state.streaming()?;
+    let running_tool = state.conversation_lines().iter().any(|line| {
+        matches!(
+            line,
+            ConversationLine::ToolResult {
+                status: ToolStatus::Running,
+                ..
+            }
+        )
+    });
+    let streaming = state.streaming();
+    if streaming.is_none() && !running_tool {
+        return None;
+    }
     let frames = if state.ascii_fallback() {
         ["-", "\\", "|", "/"]
     } else {
         ["⠋", "⠙", "⠹", "⠸"]
     };
-    let idx = usize::try_from(streaming.version % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
+    let tick = streaming.map_or(0, |draft| draft.version);
+    let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
     let frame = frames.get(idx).copied().unwrap_or("-");
-    Some(format!("{frame} generating 0s (esc to interrupt)"))
+    Some(format!("{frame} generating (esc to interrupt)"))
 }
 
 fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
@@ -8104,6 +8109,20 @@ mod tests {
     }
 
     #[test]
+    fn approval_child_ctrl_c_keeps_global_interrupt_semantics() {
+        let mut state = approval_state();
+
+        let out = dispatch_global_key(key_mod(KeyCode::Char('c'), KeyModifiers::CONTROL), &mut state);
+
+        assert_eq!(out, KeyDispatch::InterruptTurn);
+        assert!(
+            state.pending_tool_approval.is_some(),
+            "dispatch only requests interruption; reducer CancelRequested clears approval"
+        );
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+    }
+
+    #[test]
     fn overlay_open_ctrl_c_and_empty_ctrl_d_keep_global_semantics() {
         let mut state = TuiState::new("p", "m");
         for ch in "/mo".chars() {
@@ -9998,13 +10017,27 @@ mod tests {
 
         let line = render_status_bar_text(&state, 120);
 
+        assert!(line.contains("generating"), "status shows generation activity: {line}");
         assert!(
-            line.contains("generating 0s"),
-            "status shows generation activity: {line}"
+            !line.contains("generating 0s"),
+            "status must not fake elapsed time: {line}"
         );
         assert!(
             line.contains("(esc to interrupt)"),
             "status exposes esc interrupt affordance: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_generation_activity_for_running_tool_without_streaming() {
+        let mut state = TuiState::new("provider", "model");
+        state.push_tool_result_started("shell", "{}");
+
+        let line = render_status_bar_text(&state, 120);
+
+        assert!(
+            line.contains("generating") && line.contains("(esc to interrupt)"),
+            "running tool keeps generation activity visible: {line}"
         );
     }
 
