@@ -696,23 +696,72 @@ fn format_managed_sessions_list(views: &[crate::chat::sessions::model::ManagedSe
 }
 
 fn format_finished_session_announcement(fin: &crate::chat::sessions::runtime::FinishedSession) -> String {
-    let summary = fin.summary.trim();
     let kind = fin.kind.as_str();
+    let marker = match fin.status {
+        crate::chat::sessions::model::ManagedStatus::Completed => "✓",
+        crate::chat::sessions::model::ManagedStatus::Failed
+        | crate::chat::sessions::model::ManagedStatus::Cancelled => "✗",
+        crate::chat::sessions::model::ManagedStatus::Running
+        | crate::chat::sessions::model::ManagedStatus::NeedsInput => "•",
+    };
     let elapsed = crate::chat::sessions::model::format_elapsed_compact(
         crate::chat::sessions::model::elapsed_seconds_between(fin.created_at, fin.updated_at),
     );
-    let usage = crate::chat::session::summarize_session_token_usage(&fin.token_usage_records)
-        .and_then(crate::chat::session::format_session_token_usage_inline);
-    let suffix = usage.map_or_else(|| elapsed.clone(), |usage| format!("{elapsed}, {usage}"));
-    if summary.is_empty() {
-        format!("[{kind} session #{} {} {suffix}]", fin.seq, fin.status.as_str())
+    let usage = if fin.kind == crate::chat::sessions::model::ManagedKind::Agent {
+        crate::chat::session::summarize_session_token_usage(&fin.token_usage_records)
+            .and_then(crate::chat::session::format_session_token_usage_inline)
     } else {
-        format!(
-            "[{kind} session #{} {} {suffix}] {summary}",
-            fin.seq,
-            fin.status.as_str()
-        )
+        None
+    };
+    let suffix = usage.map_or_else(|| elapsed.clone(), |usage| format!("{elapsed} · {usage}"));
+    let summary = compact_child_completion_summary(&fin.summary);
+    if summary.is_empty() {
+        format!("[{kind} #{} {marker} {suffix}]", fin.seq)
+    } else {
+        format!("[{kind} #{} {marker} {suffix}] {summary}", fin.seq)
     }
+}
+
+const CHILD_COMPLETION_SUMMARY_MAX_CHARS: usize = 120;
+
+fn compact_child_completion_summary(text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|line| is_useful_completion_line(line)) else {
+        return String::new();
+    };
+    clamp_chars(line, CHILD_COMPLETION_SUMMARY_MAX_CHARS)
+}
+
+fn is_useful_completion_line(line: &str) -> bool {
+    !line.is_empty() && !line.starts_with("```") && !line.starts_with("~~~")
+}
+
+fn clamp_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() && max_chars > 0 {
+        out.pop();
+        out.push('…');
+    }
+    out
+}
+
+fn format_session_logs(seq: u64, lines: &[String], truncated: bool) -> String {
+    let mut out = format!("Session #{seq} logs (last {} lines):\n", lines.len());
+    if truncated {
+        out.push_str("  [output truncated]\n");
+    }
+    for line in lines {
+        out.push_str("  ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.trim_end().to_string()
 }
 
 /// Surface a background-session system message into the chat (v1b reflow).
@@ -915,10 +964,7 @@ mod runtime_display_tests {
             token_usage_records: Vec::new(),
         };
 
-        assert_eq!(
-            format_finished_session_announcement(&fin),
-            "[agent session #4 completed 1m03s] done"
-        );
+        assert_eq!(format_finished_session_announcement(&fin), "[agent #4 ✓ 1m03s] done");
     }
 
     #[test]
@@ -937,8 +983,106 @@ mod runtime_display_tests {
 
         assert_eq!(
             format_finished_session_announcement(&fin),
-            "[agent session #4 completed 1m03s, 12.3k tok | $0.0042] done"
+            "[agent #4 ✓ 1m03s · 12.3k tok | $0.0042] done"
         );
+    }
+
+    #[test]
+    fn agent_completion_announcement_uses_only_first_useful_line() {
+        let fin = FinishedSession {
+            seq: 4,
+            run_id: "run-finished".to_string(),
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Completed,
+            summary: "\n```text\nfirst useful line\nfull output remains in child session".to_string(),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:01:03Z"),
+            token_usage_records: Vec::new(),
+        };
+
+        assert_eq!(
+            format_finished_session_announcement(&fin),
+            "[agent #4 ✓ 1m03s] first useful line"
+        );
+        assert!(fin.summary.contains("full output remains in child session"));
+    }
+
+    #[test]
+    fn agent_completion_announcement_clamps_summary_to_120_chars() {
+        let fin = FinishedSession {
+            seq: 4,
+            run_id: "run-finished".to_string(),
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Completed,
+            summary: "x".repeat(CHILD_COMPLETION_SUMMARY_MAX_CHARS + 20),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:01:03Z"),
+            token_usage_records: Vec::new(),
+        };
+
+        let out = format_finished_session_announcement(&fin);
+        let summary = out.split_once("] ").map_or("", |(_, summary)| summary);
+
+        assert_eq!(summary.chars().count(), CHILD_COMPLETION_SUMMARY_MAX_CHARS);
+        assert!(summary.ends_with('…'), "{out}");
+    }
+
+    #[test]
+    fn failed_completion_announcement_uses_cross_and_compact_reason() {
+        let fin = FinishedSession {
+            seq: 4,
+            run_id: "run-finished".to_string(),
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Failed,
+            summary: "provider failed\nstack trace should stay in child logs".to_string(),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:01:03Z"),
+            token_usage_records: Vec::new(),
+        };
+
+        assert_eq!(
+            format_finished_session_announcement(&fin),
+            "[agent #4 ✗ 1m03s] provider failed"
+        );
+    }
+
+    #[test]
+    fn shell_completion_announcement_stays_compact_without_tokens() {
+        let fin = FinishedSession {
+            seq: 5,
+            run_id: "run-shell".to_string(),
+            kind: ManagedKind::Shell,
+            origin: SessionOrigin::User,
+            status: ManagedStatus::Completed,
+            summary: "exit 0\nstdout body".to_string(),
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:03Z"),
+            token_usage_records: vec![usage_record(crate::llm::route_decision::TokenUsageSource::Reported)],
+        };
+
+        let out = format_finished_session_announcement(&fin);
+
+        assert_eq!(out, "[shell #5 ✓ 3s] exit 0");
+        assert!(!out.contains("tok"), "{out}");
+    }
+
+    #[test]
+    fn session_logs_render_full_retained_output() {
+        let lines = vec![
+            "first retained line".to_string(),
+            "second retained line\nthird retained line".to_string(),
+        ];
+
+        let out = format_session_logs(4, &lines, true);
+
+        assert!(out.contains("Session #4 logs (last 2 lines):"));
+        assert!(out.contains("[output truncated]"));
+        assert!(out.contains("first retained line"));
+        assert!(out.contains("second retained line"));
+        assert!(out.contains("third retained line"));
     }
 
     #[test]
@@ -2691,6 +2835,7 @@ pub async fn run(
                 let views = chat_sessions.snapshot().await;
                 for fin in &finished {
                     let line = format_finished_session_announcement(fin);
+                    let compact_summary = compact_child_completion_summary(&fin.summary);
                     surface_session_message(
                         &chat_dispatcher,
                         sessions_redraw_handle.as_ref(),
@@ -2713,11 +2858,16 @@ pub async fn run(
                                 origin: fin.origin.as_str().to_string(),
                                 status: fin.status.as_str().to_string(),
                                 title: String::new(),
-                                summary: fin.summary.clone(),
+                                summary: compact_summary.clone(),
                                 token_usage_records: fin.token_usage_records.clone(),
                                 created_at: fin.created_at,
                             },
-                            |view| crate::chat::sessions::PersistedSessionSummary::from_view(view, fin.summary.clone()),
+                            |view| {
+                                crate::chat::sessions::PersistedSessionSummary::from_view(
+                                    view,
+                                    compact_summary.clone(),
+                                )
+                            },
                         );
                     // Legacy (non-TUI) persistence path serializes `chat_session`
                     // directly, so mirror the record there too. The Redux/TUI
@@ -4187,17 +4337,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                                     "Session #{seq} has no buffered output yet."
                                                 ));
                                             } else {
-                                                let mut out =
-                                                    format!("Session #{seq} logs (last {} lines):\n", lines.len());
-                                                if ring.is_truncated() {
-                                                    out.push_str("  [output truncated]\n");
-                                                }
-                                                for l in &lines {
-                                                    out.push_str("  ");
-                                                    out.push_str(l);
-                                                    out.push('\n');
-                                                }
-                                                emit_chat_output(out.trim_end());
+                                                let out = format_session_logs(seq, &lines, ring.is_truncated());
+                                                emit_chat_output(&out);
                                             }
                                         }
                                         None => {

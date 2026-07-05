@@ -1977,12 +1977,42 @@ fn memory_key_prefix(agent_name: &str, key: &str) -> String {
 }
 
 fn format_announce_message(rid: &str, status: &SubAgentStatus, result_text: &str) -> String {
+    let summary = compact_announce_summary(result_text);
     match status {
-        SubAgentStatus::Completed(_) => {
-            format!("🤖 Sub-agent `{rid}` completed:\n\n{result_text}")
-        }
-        _ => format!("🤖 Sub-agent `{rid}` FAILED:\n\n{result_text}"),
+        SubAgentStatus::Completed(_) if summary.is_empty() => format!("🤖 Sub-agent `{rid}` completed"),
+        SubAgentStatus::Completed(_) => format!("🤖 Sub-agent `{rid}` completed: {summary}"),
+        _ if summary.is_empty() => format!("🤖 Sub-agent `{rid}` FAILED"),
+        _ => format!("🤖 Sub-agent `{rid}` FAILED: {summary}"),
     }
+}
+
+const ANNOUNCE_SUMMARY_MAX_CHARS: usize = 120;
+
+fn compact_announce_summary(text: &str) -> String {
+    let Some(line) = text.lines().map(str::trim).find(|line| is_useful_announce_line(line)) else {
+        return String::new();
+    };
+    clamp_announce_chars(line, ANNOUNCE_SUMMARY_MAX_CHARS)
+}
+
+fn is_useful_announce_line(line: &str) -> bool {
+    !line.is_empty() && !line.starts_with("```") && !line.starts_with("~~~")
+}
+
+fn clamp_announce_chars(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let mut out = String::new();
+    for _ in 0..max_chars {
+        match chars.next() {
+            Some(ch) => out.push(ch),
+            None => return out,
+        }
+    }
+    if chars.next().is_some() && max_chars > 0 {
+        out.pop();
+        out.push('…');
+    }
+    out
 }
 
 #[derive(Clone)]
@@ -4233,6 +4263,24 @@ mod tests {
         );
     }
 
+    #[test]
+    fn announce_message_compacts_success_body() {
+        let status = SubAgentStatus::Completed("first line\nsecond line".to_string());
+        let message = format_announce_message("run-abc", &status, "first line\nsecond line");
+
+        assert_eq!(message, "🤖 Sub-agent `run-abc` completed: first line");
+        assert!(!message.contains("second line"));
+    }
+
+    #[test]
+    fn announce_message_compacts_failed_body() {
+        let status = SubAgentStatus::Failed("provider failure\nstack trace".to_string());
+        let message = format_announce_message("run-abc", &status, "provider failure\nstack trace");
+
+        assert_eq!(message, "🤖 Sub-agent `run-abc` FAILED: provider failure");
+        assert!(!message.contains("stack trace"));
+    }
+
     #[tokio::test]
     async fn active_runs_tracked() {
         let (ch, _) = RecordingChannel::new();
@@ -4720,8 +4768,17 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         let messages = sent.lock().await;
         assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("### SOUL.md"));
-        assert!(messages[0].contains("Identity Soul"));
+        assert!(messages[0].contains("completed:"), "{}", messages[0]);
+        assert!(!messages[0].contains("Identity Soul"), "{}", messages[0]);
+        drop(messages);
+
+        let runs = tool.active_runs_snapshot().await;
+        let run = runs.first().expect("spawned run should be retained");
+        let SubAgentStatus::Completed(full_output) = &run.status else {
+            panic!("spawned run should be completed");
+        };
+        assert!(full_output.contains("### SOUL.md"));
+        assert!(full_output.contains("Identity Soul"));
     }
 
     #[test]
