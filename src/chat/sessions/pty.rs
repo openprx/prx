@@ -282,6 +282,7 @@ impl Drop for PtyHandoffGuard {
         //     have clobbered, while the render loop is still parked so we are the
         //     sole writer of these escape/kernel operations. Best-effort.
         let _ = crossterm::terminal::enable_raw_mode();
+        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
         // 2 & 3. Arm the full redraw (to wipe PTY residue) and only THEN unpause,
@@ -308,10 +309,11 @@ impl Drop for PtyHandoffGuard {
 /// when nothing changed (or in the no-TUI fallback path) is harmless. Order is
 /// irrelevant (independent modes); grouped by concern:
 ///
-/// - `?1000l ?1002l ?1003l ?1005l ?1006l` — disable every X10/button/any-motion
-///   mouse tracking mode and the UTF-8/SGR extended-coordinate encodings, so a
-///   program that enabled mouse reporting (htop, vim with `set mouse=a`) can no
-///   longer make the terminal spew mouse escape bursts into chat's stdin.
+/// - `?1000l ?1002l ?1003l ?1005l ?1015l ?1006l` — disable every
+///   X10/button/any-motion mouse tracking mode and the UTF-8/RXVT/SGR
+///   extended-coordinate encodings, so a program that enabled mouse reporting
+///   (htop, vim with `set mouse=a`) can no longer make the terminal spew mouse
+///   escape bursts into chat's stdin.
 /// - `?1l` — DECCKM off: cursor keys send the normal `ESC [ A` form rather than
 ///   the application `ESC O A` form, so arrow keys behave in the chat line editor.
 /// - `ESC >` (DECKPNM) — numeric keypad mode, undoing a child's application
@@ -319,13 +321,19 @@ impl Drop for PtyHandoffGuard {
 /// - `?25h` — show the cursor, undoing a full-screen program that hid it.
 /// - `?1049l` then `?47l` — leave the alternate screen buffer (both the modern
 ///   1049 and the legacy 47 variants) so no alt-buffer residue is left behind.
+const CHAT_MOUSE_CAPTURE_ENABLE: &[u8] = b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h";
+const CHAT_MOUSE_CAPTURE_DISABLE: &[u8] = b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l";
 const HOST_MODE_RESET: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1l\x1b>\x1b[?25h\x1b[?1049l\x1b[?47l";
+    b"\x1b[?1006l\x1b[?1015l\x1b[?1005l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?1l\x1b>\x1b[?25h\x1b[?1049l\x1b[?47l";
 const CHAT_ALT_SCREEN_ENTER: &[u8] = b"\x1b[?1049h";
 const CHAT_ALT_SCREEN_LEAVE: &[u8] = b"\x1b[?1049l\x1b[?47l";
 
 pub(crate) fn write_chat_alt_screen_leave_for_handoff(out: &mut dyn std::io::Write) {
-    if let Err(e) = out.write_all(CHAT_ALT_SCREEN_LEAVE).and_then(|()| out.flush()) {
+    let result = out.write_all(CHAT_MOUSE_CAPTURE_DISABLE).and_then(|()| {
+        out.write_all(CHAT_ALT_SCREEN_LEAVE)?;
+        out.flush()
+    });
+    if let Err(e) = result {
         tracing::warn!(error = %e, "terminal handoff: failed to leave chat alternate screen");
     }
 }
@@ -333,6 +341,7 @@ pub(crate) fn write_chat_alt_screen_leave_for_handoff(out: &mut dyn std::io::Wri
 pub(crate) fn write_handoff_terminal_restore(out: &mut dyn std::io::Write) {
     let result = out.write_all(HOST_MODE_RESET).and_then(|()| {
         out.write_all(CHAT_ALT_SCREEN_ENTER)?;
+        out.write_all(CHAT_MOUSE_CAPTURE_ENABLE)?;
         out.flush()
     });
     if let Err(e) = result {
@@ -1505,11 +1514,12 @@ mod tests {
 
         // Mouse tracking off (X10 / button / any-motion / utf8 / sgr coords).
         for seq in [
-            "\x1b[?1000l",
-            "\x1b[?1002l",
-            "\x1b[?1003l",
-            "\x1b[?1005l",
             "\x1b[?1006l",
+            "\x1b[?1015l",
+            "\x1b[?1005l",
+            "\x1b[?1003l",
+            "\x1b[?1002l",
+            "\x1b[?1000l",
         ] {
             assert!(s.contains(seq), "host mode reset missing mouse-off seq {seq:?}: {s:?}");
         }
@@ -1541,32 +1551,44 @@ mod tests {
         write_handoff_terminal_restore(&mut b);
         assert_eq!(a, b, "host mode reset must be a deterministic constant");
         assert!(
-            a.starts_with(HOST_MODE_RESET) && a.ends_with(CHAT_ALT_SCREEN_ENTER),
-            "writer must reset child modes and re-enter chat alt-screen"
+            a.starts_with(HOST_MODE_RESET) && a.ends_with(CHAT_MOUSE_CAPTURE_ENABLE),
+            "writer must reset child modes, re-enter chat alt-screen, and re-enable chat mouse capture"
         );
     }
 
     #[test]
-    fn fullscreen_handoff_restore_resets_child_then_reenters_chat_alt_screen() {
+    fn fullscreen_handoff_restore_resets_child_then_reenters_chat_alt_screen_and_mouse() {
         let mut captured: Vec<u8> = Vec::new();
         write_handoff_terminal_restore(&mut captured);
         assert!(
             captured.starts_with(HOST_MODE_RESET),
             "fullscreen restore must first reset child terminal modes: {captured:?}"
         );
+        let alt_enter = captured
+            .windows(CHAT_ALT_SCREEN_ENTER.len())
+            .position(|window| window == CHAT_ALT_SCREEN_ENTER)
+            .expect("test: restore should re-enter chat alternate screen");
+        let mouse_enable = captured
+            .windows(CHAT_MOUSE_CAPTURE_ENABLE.len())
+            .position(|window| window == CHAT_MOUSE_CAPTURE_ENABLE)
+            .expect("test: restore should re-enable chat mouse capture");
         assert!(
-            captured.ends_with(CHAT_ALT_SCREEN_ENTER),
-            "fullscreen restore must re-enter chat alternate screen after reset: {captured:?}"
+            alt_enter < mouse_enable,
+            "fullscreen restore must re-enable chat mouse capture after alt-screen enter: {captured:?}"
         );
     }
 
     #[test]
-    fn fullscreen_attach_leave_emits_chat_alt_leave_sequences() {
+    fn fullscreen_attach_leave_disables_chat_mouse_before_alt_leave() {
         let mut captured: Vec<u8> = Vec::new();
         write_chat_alt_screen_leave_for_handoff(&mut captured);
-        assert_eq!(
-            captured, CHAT_ALT_SCREEN_LEAVE,
-            "fullscreen attach must leave chat alt-screen before child owns terminal"
+        assert!(
+            captured.starts_with(CHAT_MOUSE_CAPTURE_DISABLE),
+            "fullscreen attach must disable chat mouse capture before child owns terminal: {captured:?}"
+        );
+        assert!(
+            captured.ends_with(CHAT_ALT_SCREEN_LEAVE),
+            "fullscreen attach must leave chat alt-screen after disabling chat mouse capture: {captured:?}"
         );
     }
 

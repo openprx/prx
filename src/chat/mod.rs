@@ -764,6 +764,27 @@ fn format_session_logs(seq: u64, lines: &[String], truncated: bool) -> String {
     out.trim_end().to_string()
 }
 
+#[cfg(feature = "terminal-tui")]
+const MOUSE_WHEEL_TRANSCRIPT_ROWS: usize = 3;
+
+#[cfg(feature = "terminal-tui")]
+fn apply_fullscreen_mouse_scroll(
+    kind: crossterm::event::MouseEventKind,
+    fullscreen_scroll: &mut tui::FullscreenTranscriptScroll,
+) -> bool {
+    match kind {
+        crossterm::event::MouseEventKind::ScrollUp => {
+            fullscreen_scroll.page_up(MOUSE_WHEEL_TRANSCRIPT_ROWS);
+            true
+        }
+        crossterm::event::MouseEventKind::ScrollDown => {
+            fullscreen_scroll.page_down(MOUSE_WHEEL_TRANSCRIPT_ROWS);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Surface a background-session system message into the chat (v1b reflow).
 ///
 /// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
@@ -1492,6 +1513,7 @@ fn select_chat_tui(plain_mode: bool, stdin_is_terminal: bool, prx_tui_env: Optio
 struct TerminalGuardState {
     raw_mode_active: bool,
     bracketed_paste_active: bool,
+    mouse_capture_active: bool,
     alternate_screen_active: bool,
 }
 
@@ -1500,6 +1522,7 @@ impl TerminalGuardState {
         Self {
             raw_mode_active: false,
             bracketed_paste_active: false,
+            mouse_capture_active: false,
             alternate_screen_active: false,
         }
     }
@@ -1510,6 +1533,8 @@ trait TerminalModeOps {
     fn disable_raw_mode(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> std::io::Result<()>;
+    fn enable_mouse_capture(&mut self) -> std::io::Result<()>;
+    fn disable_mouse_capture(&mut self) -> std::io::Result<()>;
     fn enter_alternate_screen(&mut self) -> std::io::Result<()>;
     fn leave_alternate_screen(&mut self) -> std::io::Result<()>;
     fn show_cursor(&mut self) -> std::io::Result<()>;
@@ -1532,6 +1557,14 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 
     fn disable_bracketed_paste(&mut self) -> std::io::Result<()> {
         crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste).map(|_| ())
+    }
+
+    fn enable_mouse_capture(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture).map(|_| ())
+    }
+
+    fn disable_mouse_capture(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture).map(|_| ())
     }
 
     fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
@@ -1563,7 +1596,20 @@ fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Res
     }
     state.alternate_screen_active = true;
 
+    if let Err(e) = ops.enable_mouse_capture() {
+        if state.alternate_screen_active {
+            let _ = ops.leave_alternate_screen();
+            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
+        let _ = ops.disable_raw_mode();
+        return Err(e);
+    }
+    state.mouse_capture_active = true;
+
     if let Err(e) = ops.enable_bracketed_paste() {
+        if state.mouse_capture_active {
+            let _ = ops.disable_mouse_capture();
+        }
         if state.alternate_screen_active {
             let _ = ops.leave_alternate_screen();
             CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
@@ -1581,6 +1627,9 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
         let _ = ops.disable_bracketed_paste();
         let _ = ops.show_cursor();
     }
+    if state.mouse_capture_active {
+        let _ = ops.disable_mouse_capture();
+    }
     if state.alternate_screen_active {
         let _ = ops.leave_alternate_screen();
         CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
@@ -1594,6 +1643,7 @@ fn restore_terminal_state_with_ops(ops: &mut impl TerminalModeOps, leave_alterna
     let state = TerminalGuardState {
         raw_mode_active: true,
         bracketed_paste_active: true,
+        mouse_capture_active: true,
         alternate_screen_active: leave_alternate_screen,
     };
     leave_terminal_state_with_ops(ops, state);
@@ -1618,6 +1668,7 @@ fn restore_terminal_state() {
 pub struct TerminalGuard {
     raw_mode_active: std::sync::atomic::AtomicBool,
     bracketed_paste_active: std::sync::atomic::AtomicBool,
+    mouse_capture_active: std::sync::atomic::AtomicBool,
     alternate_screen_active: std::sync::atomic::AtomicBool,
 }
 
@@ -1629,6 +1680,7 @@ impl TerminalGuard {
         Ok(Self {
             raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
             bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
+            mouse_capture_active: std::sync::atomic::AtomicBool::new(state.mouse_capture_active),
             alternate_screen_active: std::sync::atomic::AtomicBool::new(state.alternate_screen_active),
         })
     }
@@ -1640,6 +1692,15 @@ impl TerminalGuard {
         let state = TerminalGuardState {
             bracketed_paste_active: self
                 .bracketed_paste_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            mouse_capture_active: self
+                .mouse_capture_active
                 .compare_exchange(
                     true,
                     false,
@@ -7564,8 +7625,13 @@ fn run_tui_unified_loop(
                 // immediately rather than waiting up to 50 ms for the next poll.
                 let _ = redraw_tx.try_send(());
             }
+            Event::Mouse(mouse) => {
+                if apply_fullscreen_mouse_scroll(mouse.kind, &mut fullscreen_scroll) {
+                    let _ = redraw_tx.try_send(());
+                }
+            }
             _ => {
-                // Focus / mouse / other events — ignore for now.
+                // Focus / other events — ignore for now.
             }
         }
     }
@@ -9365,6 +9431,7 @@ mod terminal_guard_tests {
     struct FakeTerminalModeOps {
         calls: Vec<&'static str>,
         fail_enable_bracketed_paste: bool,
+        fail_enable_mouse_capture: bool,
     }
 
     impl TerminalModeOps for FakeTerminalModeOps {
@@ -9392,6 +9459,20 @@ mod terminal_guard_tests {
             Ok(())
         }
 
+        fn enable_mouse_capture(&mut self) -> std::io::Result<()> {
+            self.calls.push("enable_mouse_capture");
+            if self.fail_enable_mouse_capture {
+                Err(std::io::Error::other("enable mouse capture failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn disable_mouse_capture(&mut self) -> std::io::Result<()> {
+            self.calls.push("disable_mouse_capture");
+            Ok(())
+        }
+
         fn enter_alternate_screen(&mut self) -> std::io::Result<()> {
             self.calls.push("enter_alternate_screen");
             Ok(())
@@ -9414,6 +9495,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(false),
             bracketed_paste_active: AtomicBool::new(false),
+            mouse_capture_active: AtomicBool::new(false),
             alternate_screen_active: AtomicBool::new(false),
         }
     }
@@ -9427,6 +9509,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(true),
             bracketed_paste_active: AtomicBool::new(true),
+            mouse_capture_active: AtomicBool::new(true),
             alternate_screen_active: AtomicBool::new(true),
         }
     }
@@ -9440,6 +9523,7 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
@@ -9448,15 +9532,18 @@ mod terminal_guard_tests {
         let guard = fake_active_guard();
         assert!(guard.raw_mode_active.load(Ordering::Acquire));
         assert!(guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(guard.alternate_screen_active.load(Ordering::Acquire));
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
         // Second leave is a no-op (CAS fails, no crossterm calls).
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
@@ -9492,9 +9579,33 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
+                "enable_mouse_capture",
                 "enable_bracketed_paste",
                 "disable_bracketed_paste",
                 "show_cursor",
+                "disable_mouse_capture",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_enter_rolls_back_alternate_screen_when_mouse_capture_fails() {
+        let mut ops = FakeTerminalModeOps {
+            fail_enable_mouse_capture: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let err = enter_terminal_state_with_ops(&mut ops).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "enable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -9516,7 +9627,9 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
+                "enable_mouse_capture",
                 "enable_bracketed_paste",
+                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -9529,7 +9642,12 @@ mod terminal_guard_tests {
         restore_terminal_state_with_ops(&mut inline_ops, false);
         assert_eq!(
             inline_ops.calls,
-            vec!["disable_bracketed_paste", "show_cursor", "disable_raw_mode"]
+            vec![
+                "disable_bracketed_paste",
+                "show_cursor",
+                "disable_mouse_capture",
+                "disable_raw_mode"
+            ]
         );
 
         let mut fullscreen_ops = FakeTerminalModeOps::default();
@@ -9539,10 +9657,35 @@ mod terminal_guard_tests {
             vec![
                 "disable_bracketed_paste",
                 "show_cursor",
+                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
         );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn mouse_wheel_scrolls_fullscreen_transcript_by_three_rows() {
+        let mut scroll = tui::FullscreenTranscriptScroll::default();
+
+        assert!(apply_fullscreen_mouse_scroll(
+            crossterm::event::MouseEventKind::ScrollUp,
+            &mut scroll
+        ));
+        assert_eq!(scroll.offset_from_bottom, MOUSE_WHEEL_TRANSCRIPT_ROWS);
+
+        assert!(apply_fullscreen_mouse_scroll(
+            crossterm::event::MouseEventKind::ScrollDown,
+            &mut scroll
+        ));
+        assert_eq!(scroll.offset_from_bottom, 0);
+
+        assert!(!apply_fullscreen_mouse_scroll(
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            &mut scroll
+        ));
+        assert_eq!(scroll.offset_from_bottom, 0);
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -9604,6 +9747,7 @@ mod terminal_guard_tests {
         // After the race both flags must be cleared exactly once.
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
 
@@ -10326,9 +10470,15 @@ mod p6b2_external_editor_tests {
             restore.contains("\x1b[?1049l") && restore.contains("\x1b[?47l"),
             "fullscreen editor restore must reset any child/editor alt-screen first: {restore:?}"
         );
+        let alt_enter = restore
+            .find("\x1b[?1049h")
+            .expect("test: fullscreen editor restore must re-enter chat alt-screen");
+        let mouse_enable = restore
+            .find("\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1015h\x1b[?1006h")
+            .expect("test: fullscreen editor restore must re-enable chat mouse capture");
         assert!(
-            restore.ends_with("\x1b[?1049h"),
-            "fullscreen editor restore must re-enter chat alt-screen last: {restore:?}"
+            alt_enter < mouse_enable,
+            "fullscreen editor restore must re-enable chat mouse capture after chat alt-screen: {restore:?}"
         );
     }
 }
