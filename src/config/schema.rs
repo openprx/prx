@@ -1573,6 +1573,14 @@ pub struct ModelPricing {
     /// Output price per 1M tokens
     #[serde(default)]
     pub output: f64,
+
+    /// Cache write/creation input price per 1M tokens.
+    #[serde(default)]
+    pub cache_write: f64,
+
+    /// Cache read input price per 1M tokens.
+    #[serde(default)]
+    pub cache_read: f64,
 }
 
 const fn default_daily_limit() -> f64 {
@@ -1610,6 +1618,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 3.0,
             output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
         },
     );
     prices.insert(
@@ -1617,6 +1627,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 15.0,
             output: 75.0,
+            cache_write: 18.75,
+            cache_read: 1.50,
         },
     );
     prices.insert(
@@ -1624,6 +1636,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 3.0,
             output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
         },
     );
     prices.insert(
@@ -1631,6 +1645,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.25,
             output: 1.25,
+            cache_write: 0.3125,
+            cache_read: 0.03,
         },
     );
 
@@ -1640,6 +1656,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 5.0,
             output: 15.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1647,6 +1665,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.15,
             output: 0.60,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1654,6 +1674,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 15.0,
             output: 60.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
 
@@ -1663,6 +1685,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.10,
             output: 0.40,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1670,6 +1694,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 1.25,
             output: 5.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
 

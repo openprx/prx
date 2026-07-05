@@ -583,8 +583,18 @@ fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
         session::format_cost_usd(summary.known_cost_usd)
     };
 
+    let cache_detail = if summary.cache_creation_input_tokens > 0 || summary.cache_read_input_tokens > 0 {
+        format!(
+            "\n  Cache write tokens: {}\n  Cache read tokens:  {}",
+            session::format_token_count_compact(summary.cache_creation_input_tokens),
+            session::format_token_count_compact(summary.cache_read_input_tokens)
+        )
+    } else {
+        String::new()
+    };
+
     format!(
-        "Session cost:\n  Turns:             {}\n  Metered requests:  {}\n  Prompt tokens:     {}\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}",
+        "Session cost:\n  Turns:             {}\n  Metered requests:  {}\n  Prompt tokens:     {} (incl. cache)\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}{cache_detail}",
         chat_session.turn_count(),
         summary.request_count,
         session::format_token_count_compact(summary.prompt_tokens),
@@ -701,6 +711,8 @@ struct ExportUsageTotals {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     real_tokens: u64,
     estimated_tokens: u64,
     request_count: u64,
@@ -718,6 +730,8 @@ struct ExportTurnUsage {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     source: crate::llm::route_decision::TokenUsageSource,
     cost_usd: Option<f64>,
 }
@@ -743,6 +757,8 @@ fn export_usage_metadata(session: &session::ChatSession) -> ExportUsageMetadata 
             prompt_tokens: record.prompt_tokens,
             completion_tokens: record.completion_tokens,
             total_tokens: record.total_tokens,
+            cache_creation_input_tokens: record.cache_creation_input_tokens,
+            cache_read_input_tokens: record.cache_read_input_tokens,
             source: record.source,
             cost_usd: record.cost_usd,
         })
@@ -753,6 +769,8 @@ fn export_usage_metadata(session: &session::ChatSession) -> ExportUsageMetadata 
             prompt_tokens: summary.prompt_tokens,
             completion_tokens: summary.completion_tokens,
             total_tokens: summary.total_tokens,
+            cache_creation_input_tokens: summary.cache_creation_input_tokens,
+            cache_read_input_tokens: summary.cache_read_input_tokens,
             real_tokens: summary.reported_tokens,
             estimated_tokens: summary.estimated_tokens,
             request_count: summary.request_count,
@@ -1295,6 +1313,8 @@ mod mode_tests {
                 prompt_tokens: 1_000,
                 completion_tokens: 500,
                 total_tokens: 1_500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.0105),
             });
@@ -1356,6 +1376,8 @@ mod mode_tests {
                 prompt_tokens: 1_000,
                 completion_tokens: 500,
                 total_tokens: 1_500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Estimated,
                 cost_usd: None,
             });
@@ -1389,6 +1411,8 @@ mod mode_tests {
                 prompt_tokens: 1_000,
                 completion_tokens: 500,
                 total_tokens: 1_500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: Some(0.0105),
             });
@@ -1407,7 +1431,7 @@ mod mode_tests {
             "cost should report 2 turns: {text}"
         );
         assert!(
-            text.contains("Prompt tokens:     1.0k"),
+            text.contains("Prompt tokens:     1.0k (incl. cache)"),
             "prompt tokens missing: {text}"
         );
         assert!(
@@ -1429,6 +1453,43 @@ mod mode_tests {
         );
     }
 
+    #[cfg(feature = "terminal-tui")]
+    #[tokio::test]
+    async fn slash_cost_reports_cache_token_breakdown_when_present() {
+        let memory = NoneMemory::new();
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut session = crate::chat::session::ChatSession::new("anthropic", "claude-sonnet-4-20250514");
+        session
+            .token_usage_records
+            .push(crate::chat::session::MainSessionTokenUsageRecord {
+                provider: "anthropic".to_string(),
+                model: "claude-sonnet-4-20250514".to_string(),
+                prompt_tokens: 1_500,
+                completion_tokens: 200,
+                total_tokens: 1_700,
+                cache_creation_input_tokens: 300,
+                cache_read_input_tokens: 700,
+                source: crate::llm::route_decision::TokenUsageSource::Reported,
+                cost_usd: Some(0.005_835),
+            });
+        let ctx = CommandContext {
+            model_name: "claude-sonnet-4-20250514",
+            provider_name: "anthropic",
+            chat_session: &session,
+            tools_registry: &tools,
+            mem: &memory,
+        };
+
+        let text = command_output(super::dispatch("/cost", &ctx).await);
+
+        assert!(
+            text.contains("Prompt tokens:     1.5k (incl. cache)"),
+            "prompt total should include cache tokens: {text}"
+        );
+        assert!(text.contains("Cache write tokens: 300"), "cache write missing: {text}");
+        assert!(text.contains("Cache read tokens:  700"), "cache read missing: {text}");
+    }
+
     /// Phase 3: estimated records are visibly marked with `~`.
     #[cfg(feature = "terminal-tui")]
     #[tokio::test]
@@ -1444,6 +1505,8 @@ mod mode_tests {
                 prompt_tokens: 0,
                 completion_tokens: 250,
                 total_tokens: 250,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Estimated,
                 cost_usd: Some(0.0001),
             });
@@ -1482,6 +1545,8 @@ mod mode_tests {
                 prompt_tokens: 100,
                 completion_tokens: 50,
                 total_tokens: 150,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
                 source: crate::llm::route_decision::TokenUsageSource::Reported,
                 cost_usd: None,
             });

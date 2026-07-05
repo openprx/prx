@@ -163,15 +163,56 @@ struct AnthropicUsage {
     input_tokens: Option<u32>,
     #[serde(default)]
     output_tokens: Option<u32>,
+    #[serde(default)]
+    cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    cache_read_input_tokens: Option<u32>,
 }
 
 impl AnthropicUsage {
     const fn into_reported(self) -> TokenUsage {
-        let total = match (self.input_tokens, self.output_tokens) {
+        let prompt = sum_optional_u32(
+            self.input_tokens,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        );
+        let total = match (prompt, self.output_tokens) {
             (Some(input), Some(output)) => Some(input.saturating_add(output)),
             _ => None,
         };
-        TokenUsage::reported(self.input_tokens, self.output_tokens, total)
+        TokenUsage::reported_with_cache(
+            prompt,
+            self.output_tokens,
+            total,
+            self.cache_creation_input_tokens,
+            self.cache_read_input_tokens,
+        )
+    }
+
+    const fn has_any_tokens(self) -> bool {
+        self.input_tokens.is_some()
+            || self.output_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
+    }
+}
+
+const fn sum_optional_u32(a: Option<u32>, b: Option<u32>, c: Option<u32>) -> Option<u32> {
+    match (a, b, c) {
+        (None, None, None) => None,
+        (a, b, c) => {
+            let mut total = 0u32;
+            if let Some(value) = a {
+                total = total.saturating_add(value);
+            }
+            if let Some(value) = b {
+                total = total.saturating_add(value);
+            }
+            if let Some(value) = c {
+                total = total.saturating_add(value);
+            }
+            Some(total)
+        }
     }
 }
 
@@ -1431,24 +1472,36 @@ impl Provider for AnthropicProvider {
                     };
                     match event {
                         AnthropicEvent::MessageStart(usage) => {
-                            if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                            if usage.has_any_tokens() {
                                 usage_seen = true;
                                 if usage.input_tokens.is_some() {
                                     usage_state.input_tokens = usage.input_tokens;
                                 }
                                 if usage.output_tokens.is_some() {
                                     usage_state.output_tokens = usage.output_tokens;
+                                }
+                                if usage.cache_creation_input_tokens.is_some() {
+                                    usage_state.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                                }
+                                if usage.cache_read_input_tokens.is_some() {
+                                    usage_state.cache_read_input_tokens = usage.cache_read_input_tokens;
                                 }
                             }
                         }
                         AnthropicEvent::MessageDelta(usage) => {
-                            if usage.input_tokens.is_some() || usage.output_tokens.is_some() {
+                            if usage.has_any_tokens() {
                                 usage_seen = true;
                                 if usage.input_tokens.is_some() {
                                     usage_state.input_tokens = usage.input_tokens;
                                 }
                                 if usage.output_tokens.is_some() {
                                     usage_state.output_tokens = usage.output_tokens;
+                                }
+                                if usage.cache_creation_input_tokens.is_some() {
+                                    usage_state.cache_creation_input_tokens = usage.cache_creation_input_tokens;
+                                }
+                                if usage.cache_read_input_tokens.is_some() {
+                                    usage_state.cache_read_input_tokens = usage.cache_read_input_tokens;
                                 }
                             }
                         }
@@ -2404,22 +2457,29 @@ mod tests {
     fn anthropic_non_streaming_response_usage_maps_reported() {
         let json = r#"{
             "content": [{"type": "text", "text": "Just an answer."}],
-            "usage": {"input_tokens": 64, "output_tokens": 11}
+            "usage": {
+                "input_tokens": 64,
+                "output_tokens": 11,
+                "cache_creation_input_tokens": 20,
+                "cache_read_input_tokens": 300
+            }
         }"#;
         let resp: NativeChatResponse = serde_json::from_str(json).unwrap();
         let usage = resp.usage.expect("usage expected").into_reported();
 
         assert_eq!(usage.source, crate::llm::route_decision::TokenUsageSource::Reported);
-        assert_eq!(usage.prompt_tokens, Some(64));
+        assert_eq!(usage.prompt_tokens, Some(384));
         assert_eq!(usage.completion_tokens, Some(11));
-        assert_eq!(usage.total_tokens, Some(75));
+        assert_eq!(usage.total_tokens, Some(395));
+        assert_eq!(usage.cache_creation_input_tokens, Some(20));
+        assert_eq!(usage.cache_read_input_tokens, Some(300));
     }
 
     #[test]
     fn anthropic_sse_usage_events_parse_reported_tokens() {
         let start = concat!(
             "event: message_start\n",
-            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1}}}\n\n"
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":100,\"output_tokens\":1,\"cache_creation_input_tokens\":25,\"cache_read_input_tokens\":400}}}\n\n"
         );
         let delta = concat!(
             "event: message_delta\n",
@@ -2437,18 +2497,24 @@ mod tests {
 
         assert_eq!(start_usage.input_tokens, Some(100));
         assert_eq!(start_usage.output_tokens, Some(1));
+        assert_eq!(start_usage.cache_creation_input_tokens, Some(25));
+        assert_eq!(start_usage.cache_read_input_tokens, Some(400));
         assert_eq!(delta_usage.input_tokens, None);
         assert_eq!(delta_usage.output_tokens, Some(23));
 
         let reported = AnthropicUsage {
             input_tokens: start_usage.input_tokens,
             output_tokens: delta_usage.output_tokens,
+            cache_creation_input_tokens: start_usage.cache_creation_input_tokens,
+            cache_read_input_tokens: start_usage.cache_read_input_tokens,
         }
         .into_reported();
         assert_eq!(reported.source, crate::llm::route_decision::TokenUsageSource::Reported);
-        assert_eq!(reported.prompt_tokens, Some(100));
+        assert_eq!(reported.prompt_tokens, Some(525));
         assert_eq!(reported.completion_tokens, Some(23));
-        assert_eq!(reported.total_tokens, Some(123));
+        assert_eq!(reported.total_tokens, Some(548));
+        assert_eq!(reported.cache_creation_input_tokens, Some(25));
+        assert_eq!(reported.cache_read_input_tokens, Some(400));
     }
 
     // ─── S3 T3-2-A: SSE tool_use incremental streaming ──────────────────────

@@ -49,6 +49,8 @@ pub struct MainSessionTokenUsageSummary {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
     pub reported_tokens: u64,
     pub estimated_tokens: u64,
     pub request_count: u64,
@@ -83,6 +85,12 @@ impl MainSessionTokenUsageSummary {
             summary.prompt_tokens = summary.prompt_tokens.saturating_add(record.prompt_tokens);
             summary.completion_tokens = summary.completion_tokens.saturating_add(record.completion_tokens);
             summary.total_tokens = summary.total_tokens.saturating_add(record.total_tokens);
+            summary.cache_creation_input_tokens = summary
+                .cache_creation_input_tokens
+                .saturating_add(record.cache_creation_input_tokens);
+            summary.cache_read_input_tokens = summary
+                .cache_read_input_tokens
+                .saturating_add(record.cache_read_input_tokens);
             match record.source {
                 crate::llm::route_decision::TokenUsageSource::Reported => {
                     summary.reported_tokens = summary.reported_tokens.saturating_add(record.total_tokens);

@@ -901,6 +901,43 @@ impl ChatState {
             return self.reduce_approval_key_pressed(key);
         }
 
+        if key.modifiers == KeyModifiers::ALT {
+            let direction = match key.code {
+                KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+                KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                self.ui.strip_selection = crate::chat::tui::move_strip_selection(
+                    &self.ui.sessions_entries,
+                    self.ui.strip_selection,
+                    self.ui.focus,
+                    direction,
+                );
+                return vec![Effect::RequestRedraw];
+            }
+            if key.code == KeyCode::Enter
+                && let Some(selected) = self.ui.strip_selection
+            {
+                if crate::chat::tui::selected_strip_entry(&self.ui.sessions_entries, Some(selected)).is_some() {
+                    return vec![
+                        Effect::LogTrace {
+                            level: tracing::Level::DEBUG,
+                            msg: format!("strip_alt_enter_attach seq={selected}"),
+                        },
+                        Effect::RequestRedraw,
+                    ];
+                }
+                self.ui.strip_selection = None;
+                self.ui
+                    .conversation_lines
+                    .push(crate::chat::tui::ConversationLine::System {
+                        content: "session gone".to_string(),
+                    });
+                return vec![Effect::RequestRedraw];
+            }
+        }
+
         if self.ui.slash_menu.is_some() {
             let sources = Self::slash_menu_sources_from(
                 &self.ui.sessions_entries,
@@ -3015,6 +3052,81 @@ mod tests {
         let effects = state.reduce(Action::StripSelectionChanged { selected: None });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert_eq!(state.ui.strip_selection, None);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn alt_enter_stale_strip_selection_clears_and_surfaces_session_gone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "user",
+            status: "running",
+            title: "task".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }];
+        state.ui.strip_selection = Some(2);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.strip_selection, None);
+        assert_eq!(
+            state.ui.input.text(),
+            "draft",
+            "stale Alt+Enter must not insert a newline"
+        );
+        assert!(
+            matches!(
+                state.ui.conversation_lines.last(),
+                Some(crate::chat::tui::ConversationLine::System { content }) if content == "session gone"
+            ),
+            "reducer should surface session gone"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn alt_enter_matching_strip_selection_uses_attach_branch_without_newline() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 2,
+            kind: "shell",
+            origin: "user",
+            status: "running",
+            title: "task".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }];
+        state.ui.strip_selection = Some(2);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::LogTrace { msg, .. }, Effect::RequestRedraw] if msg.contains("strip_alt_enter_attach seq=2")
+            ),
+            "matching Alt+Enter should take attach branch: {effects:?}"
+        );
+        assert_eq!(state.ui.strip_selection, Some(2));
+        assert_eq!(
+            state.ui.input.text(),
+            "draft",
+            "matching Alt+Enter must not insert a newline"
+        );
     }
 
     #[cfg(feature = "terminal-tui")]

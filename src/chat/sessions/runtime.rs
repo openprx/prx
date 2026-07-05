@@ -963,6 +963,8 @@ mod tests {
             prompt_tokens: 8_000,
             completion_tokens: 4_300,
             total_tokens: 12_300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source,
             cost_usd: Some(0.0042),
         }

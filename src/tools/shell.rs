@@ -5,8 +5,11 @@ use crate::security::traits::Sandbox;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
+use std::io;
+use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
@@ -102,6 +105,93 @@ impl ShellTool {
         ];
         protected_markers.iter().any(|marker| lowered.contains(marker))
     }
+}
+
+struct ManagedShellChild {
+    child: Option<tokio::process::Child>,
+    #[cfg(unix)]
+    pgid: Option<i32>,
+    reaped: bool,
+}
+
+impl ManagedShellChild {
+    async fn wait_with_output(mut self) -> io::Result<Output> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| io::Error::other("shell child already taken"))?;
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        let stdout_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stdout {
+                stream.read_to_end(&mut buf).await?;
+            }
+            io::Result::Ok(buf)
+        };
+        let stderr_fut = async move {
+            let mut buf = Vec::new();
+            if let Some(mut stream) = stderr {
+                stream.read_to_end(&mut buf).await?;
+            }
+            io::Result::Ok(buf)
+        };
+
+        let (status, stdout, stderr) = tokio::try_join!(child.wait(), stdout_fut, stderr_fut)?;
+        self.reaped = true;
+        #[cfg(unix)]
+        {
+            self.pgid = None;
+        }
+        self.child.take();
+        Ok(Output { status, stdout, stderr })
+    }
+}
+
+impl Drop for ManagedShellChild {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        if self.reaped || self.child.is_none() {
+            return;
+        }
+
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: `pgid` is the process-group id created for this child by
+            // `process_group(0)`. `killpg` sends a signal only; it dereferences
+            // no pointers and has no memory-safety preconditions.
+            let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
+            return;
+        }
+
+        if let Some(child) = &mut self.child {
+            let _ = child.start_kill();
+        }
+    }
+}
+
+fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io::Result<ManagedShellChild> {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0);
+
+    let child = cmd.spawn()?;
+    #[cfg(unix)]
+    let pgid = child
+        .id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .filter(|pid| *pid > 0);
+
+    Ok(ManagedShellChild {
+        child: Some(child),
+        #[cfg(unix)]
+        pgid,
+        reaped: false,
+    })
 }
 
 #[async_trait]
@@ -211,7 +301,18 @@ impl Tool for ShellTool {
             });
         }
 
-        let result = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), cmd.output()).await;
+        let child = match spawn_managed_shell_child(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output()).await;
 
         match result {
             Ok(Ok(output)) => {
@@ -713,5 +814,97 @@ mod tests {
             .expect("test: should execute");
         assert!(result.success);
         assert_eq!(result.output.trim(), "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[ignore = "real process-group abort check; spawns and cancels sleep processes"]
+    async fn shell_abort_kills_process_group() {
+        let dir = std::env::temp_dir().join(format!("prx-shell-abort-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test temp directory should be created");
+        let parent_pid_file = dir.join("parent.pid");
+        let child_pid_file = dir.join("child.pid");
+        let command = format!(
+            "echo $$ > {}; sleep 300 & echo $! > {}; sleep 300",
+            shell_quote_path(&parent_pid_file),
+            shell_quote_path(&child_pid_file)
+        );
+
+        let tool = ShellTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: dir.clone(),
+                ..SecurityPolicy::default()
+            }),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
+        let handle = tokio::spawn(async move { tool.execute(json!({"command": command})).await });
+
+        let parent_pid = wait_for_pid_file(&parent_pid_file).await;
+        let child_pid = wait_for_pid_file(&child_pid_file).await;
+        assert!(
+            process_exists(parent_pid),
+            "parent shell should be running before abort"
+        );
+        assert!(
+            process_exists(child_pid),
+            "background child should be running before abort"
+        );
+
+        handle.abort();
+        assert!(handle.await.is_err(), "aborted shell task should report cancellation");
+
+        wait_for_process_exit(child_pid).await;
+        wait_for_process_exit(parent_pid).await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[cfg(unix)]
+    fn shell_quote_path(path: &std::path::Path) -> String {
+        let value = path.to_string_lossy();
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_pid_file(path: &std::path::Path) -> i32 {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(contents) = tokio::fs::read_to_string(path).await {
+                if let Ok(pid) = contents.trim().parse::<i32>() {
+                    return pid;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for pid file {}",
+                path.display()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_process_exit(pid: i32) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while process_exists(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "process {pid} should exit after shell task abort"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[allow(unsafe_code)]
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: signal 0 probes process existence/permission and does not
+        // deliver a signal or dereference pointers.
+        let rc = unsafe { libc::kill(pid, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
     }
 }

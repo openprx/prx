@@ -964,7 +964,7 @@ fn switcher_entries_with_transcript(
     out
 }
 
-fn strip_selection_index(
+pub(crate) fn strip_selection_index(
     entries: &[crate::chat::sessions::SwitcherEntry],
     selected: Option<u64>,
     focus: crate::chat::sessions::FocusTarget,
@@ -978,7 +978,7 @@ fn strip_selection_index(
         })
 }
 
-fn move_strip_selection(
+pub(crate) fn move_strip_selection(
     entries: &[crate::chat::sessions::SwitcherEntry],
     selected: Option<u64>,
     focus: crate::chat::sessions::FocusTarget,
@@ -1002,7 +1002,7 @@ fn move_strip_selection(
     entries.get(target_idx).map(|entry| entry.seq)
 }
 
-fn selected_strip_entry<'a>(
+pub(crate) fn selected_strip_entry<'a>(
     entries: &'a [crate::chat::sessions::SwitcherEntry],
     selected: Option<u64>,
 ) -> Option<&'a crate::chat::sessions::SwitcherEntry> {
@@ -1233,8 +1233,13 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             return KeyDispatch::StripSelectionChanged { selected };
         }
         if key.code == KeyCode::Enter {
-            if let Some(entry) = selected_strip_entry(&state.sessions_cache, state.strip_selection) {
-                return KeyDispatch::AttachSession { seq: entry.seq };
+            if let Some(selected) = state.strip_selection {
+                if let Some(entry) = selected_strip_entry(&state.sessions_cache, Some(selected)) {
+                    return KeyDispatch::AttachSession { seq: entry.seq };
+                }
+                state.strip_selection = None;
+                state.push_system_message("session gone");
+                return KeyDispatch::Consumed;
             }
         }
     }
@@ -3110,6 +3115,7 @@ pub const ACTIVE_SESSION_VIEW_DESIRED_ROWS: u16 = 10;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FullscreenTranscriptScroll {
     pub offset_from_bottom: usize,
+    anchor_top_row: Option<usize>,
     last_tail_marker: usize,
     pub new_output_below: bool,
 }
@@ -3117,10 +3123,12 @@ pub struct FullscreenTranscriptScroll {
 impl FullscreenTranscriptScroll {
     pub fn page_up(&mut self, rows: usize) {
         self.offset_from_bottom = self.offset_from_bottom.saturating_add(rows.max(1));
+        self.anchor_top_row = None;
     }
 
     pub fn page_down(&mut self, rows: usize) {
         self.offset_from_bottom = self.offset_from_bottom.saturating_sub(rows.max(1));
+        self.anchor_top_row = None;
         if self.offset_from_bottom == 0 {
             self.new_output_below = false;
         }
@@ -3128,10 +3136,12 @@ impl FullscreenTranscriptScroll {
 
     pub const fn jump_top(&mut self) {
         self.offset_from_bottom = usize::MAX;
+        self.anchor_top_row = None;
     }
 
     pub const fn jump_bottom(&mut self) {
         self.offset_from_bottom = 0;
+        self.anchor_top_row = None;
         self.new_output_below = false;
     }
 }
@@ -3306,6 +3316,7 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
 ) {
     if area.height == 0 {
         scroll.offset_from_bottom = 0;
+        scroll.anchor_top_row = None;
         return;
     }
 
@@ -3330,15 +3341,33 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
     let visible_rows = usize::from(area.height.max(1));
     let max_scroll = total_rows.saturating_sub(visible_rows);
     let tail_marker = fullscreen_tail_marker(state);
-    if scroll.offset_from_bottom > 0 && tail_marker > scroll.last_tail_marker && scroll.last_tail_marker > 0 {
-        scroll.new_output_below = true;
-    }
-    scroll.offset_from_bottom = scroll.offset_from_bottom.min(max_scroll);
+    let tail_advanced = tail_marker > scroll.last_tail_marker && scroll.last_tail_marker > 0;
+
+    let top_scroll = if max_scroll == 0 {
+        scroll.offset_from_bottom = 0;
+        scroll.anchor_top_row = None;
+        0
+    } else if scroll.offset_from_bottom == 0 {
+        scroll.anchor_top_row = None;
+        max_scroll
+    } else if let Some(anchor_top_row) = scroll.anchor_top_row {
+        let top_scroll = anchor_top_row.min(max_scroll);
+        scroll.offset_from_bottom = max_scroll.saturating_sub(top_scroll);
+        top_scroll
+    } else {
+        scroll.offset_from_bottom = scroll.offset_from_bottom.min(max_scroll);
+        let top_scroll = max_scroll.saturating_sub(scroll.offset_from_bottom);
+        scroll.anchor_top_row = Some(top_scroll);
+        top_scroll
+    };
+
     if scroll.offset_from_bottom == 0 {
         scroll.new_output_below = false;
+        scroll.anchor_top_row = None;
+    } else if tail_advanced {
+        scroll.new_output_below = true;
     }
     scroll.last_tail_marker = tail_marker;
-    let top_scroll = max_scroll.saturating_sub(scroll.offset_from_bottom);
     let top_scroll = u16::try_from(top_scroll).unwrap_or(u16::MAX);
 
     let paragraph = Paragraph::new(Text::from(lines))
@@ -8622,6 +8651,28 @@ mod tests {
     }
 
     #[test]
+    fn alt_enter_stale_strip_selection_is_consumed_with_session_gone_status() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        state.strip_selection = Some(2);
+        dispatch_global_key(key(KeyCode::Char('a')), &mut state);
+
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.strip_selection, None);
+        assert_eq!(state.input.text(), "a", "stale Alt+Enter must not insert a newline");
+        assert!(
+            matches!(
+                state.conversation_lines.last(),
+                Some(ConversationLine::System { content }) if content == "session gone"
+            ),
+            "stale selection should surface a status message"
+        );
+    }
+
+    #[test]
     fn esc_clears_strip_selection_before_normal_cancel_or_detach() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1)];
@@ -8701,6 +8752,8 @@ mod tests {
             prompt_tokens: 8_000,
             completion_tokens: 4_300,
             total_tokens: 12_300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source,
             cost_usd: Some(0.0042),
         }
@@ -9672,6 +9725,48 @@ mod tests {
     }
 
     #[test]
+    fn fullscreen_scrolled_transcript_keeps_content_anchor_when_output_arrives() {
+        let mut state = TuiState::new("provider", "model");
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: (0..60)
+                .map(|idx| format!("anchor line {idx:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let mut scroll = FullscreenTranscriptScroll::default();
+        scroll.page_up(8);
+
+        let before_rows = fullscreen_rows(&state, 72, 14, &mut scroll);
+        let before_first = before_rows
+            .iter()
+            .find(|row| row.contains("anchor line"))
+            .map(|row| row.trim().to_string())
+            .expect("scrolled transcript should expose an anchor line");
+
+        state.conversation_lines.push(ConversationLine::Assistant {
+            content: (60..66)
+                .map(|idx| format!("anchor line {idx:03}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        });
+        let after_rows = fullscreen_rows(&state, 72, 14, &mut scroll);
+        let after_first = after_rows
+            .iter()
+            .find(|row| row.contains("anchor line"))
+            .map(|row| row.trim().to_string())
+            .expect("scrolled transcript should keep the anchor line visible");
+
+        assert_eq!(
+            after_first, before_first,
+            "new output should not push the reading position: before={before_rows:?}, after={after_rows:?}"
+        );
+        assert!(
+            !after_rows.iter().any(|row| row.contains("anchor line 065")),
+            "scrolled transcript should not jump to the new tail: {after_rows:?}"
+        );
+    }
+
+    #[test]
     fn fullscreen_home_end_jump_top_and_tail() {
         let mut state = TuiState::new("provider", "model");
         state.conversation_lines.push(ConversationLine::Assistant {
@@ -10039,6 +10134,8 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 500,
             total_tokens: 1_500,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             reported_tokens: 1_500,
             estimated_tokens: 0,
             request_count: 1,
@@ -10107,6 +10204,8 @@ mod tests {
             prompt_tokens: 1_000,
             completion_tokens: 1_000,
             total_tokens: 2_000,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             reported_tokens: 0,
             estimated_tokens: 2_000,
             request_count: 1,

@@ -1244,6 +1244,8 @@ mod runtime_display_tests {
             prompt_tokens: 8_000,
             completion_tokens: 4_300,
             total_tokens: 12_300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source,
             cost_usd: Some(0.0042),
         }
@@ -3483,7 +3485,23 @@ pub async fn run(
                     for entry in &mut entries {
                         entry.idle_warning = idle_warnings.contains(&entry.seq);
                     }
-                    chat_mirror.lock().sessions_cache = entries.clone();
+                    let stale_strip_selection = {
+                        let mut mirror = chat_mirror.lock();
+                        mirror.sessions_cache = entries.clone();
+                        let stale = mirror
+                            .strip_selection
+                            .filter(|selected| !entries.iter().any(|entry| entry.seq == *selected));
+                        if stale.is_some() {
+                            mirror.strip_selection = None;
+                        }
+                        stale
+                    };
+                    if stale_strip_selection.is_some() {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::StripSelectionChanged { selected: None },
+                            "chat.strip_selection_reaped",
+                        );
+                    }
                     if entries != last_sessions_entries {
                         last_sessions_entries = entries.clone();
                         let _ = chat_dispatcher.dispatch_or_log(
@@ -11681,6 +11699,8 @@ mod v4_reload_recap_tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source: TokenUsageSource::Reported,
             cost_usd: Some(0.0004),
         }
