@@ -255,7 +255,7 @@ pub enum Action {
     /// structured live-session strip.
     SlashMenuSourcesUpdated {
         saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
-        provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+        provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     },
     /// P2 active line-oriented child session viewport snapshot. `None` clears
     /// the child viewport when focus returns to main or PTY handoff resumes.

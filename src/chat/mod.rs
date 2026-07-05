@@ -59,6 +59,7 @@ pub mod error;
 pub mod sanitize;
 pub mod session;
 pub mod sessions;
+pub mod slash_types;
 pub mod state;
 pub mod terminal_proto;
 

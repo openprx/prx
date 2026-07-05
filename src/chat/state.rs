@@ -306,7 +306,7 @@ pub struct UiState {
     /// Saved chat-session candidates for `/resume` slash-menu arguments.
     pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
     /// Provider/model candidates for `/provider` and `/model` slash-menu args.
-    pub provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+    pub provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     /// P2 active line-session viewport snapshot. `None` when the main chat or a
     /// PTY handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
@@ -2216,7 +2216,7 @@ impl ChatState {
     fn reduce_slash_menu_sources_updated(
         &mut self,
         saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
-        provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+        provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     ) -> Vec<Effect> {
         if self.ui.saved_sessions_cache == saved_sessions && self.ui.provider_model_catalog == provider_model_catalog {
             return Vec::new();
@@ -2239,7 +2239,7 @@ impl ChatState {
     fn reduce_slash_menu_sources_updated(
         &mut self,
         _saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
-        _provider_model_catalog: Vec<crate::chat::tui::SlashProviderModelCatalog>,
+        _provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     ) -> Vec<Effect> {
         vec![Effect::RequestRedraw]
     }
