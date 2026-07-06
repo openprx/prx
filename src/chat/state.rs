@@ -155,6 +155,9 @@ pub enum Effect {
         /// `run_tool_call_loop_traced` wrapper in `chat::run`. `None` → no scope
         /// (sub-agents fall back to user origin, correct for non-turn callers).
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        /// Per-turn default route for `message_send` tool calls. `None` keeps
+        /// non-turn/test callers on the tool's legacy fallback slot.
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -784,7 +787,15 @@ impl ChatState {
                 compaction_config,
                 cancel,
                 turn_spawn_ctx,
-            } => self.reduce_start_llm_turn(draft_id, history, compaction_config, cancel, turn_spawn_ctx),
+                turn_message_send_ctx,
+            } => self.reduce_start_llm_turn(
+                draft_id,
+                history,
+                compaction_config,
+                cancel,
+                turn_spawn_ctx,
+                turn_message_send_ctx,
+            ),
             Action::StreamChunkReceived {
                 draft_id,
                 delta,
@@ -1332,6 +1343,7 @@ impl ChatState {
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -1356,6 +1368,7 @@ impl ChatState {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -1369,6 +1382,7 @@ impl ChatState {
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
         self.stream.draft = Some(StreamingDraft {
             draft_id: draft_id.clone(),
@@ -1393,6 +1407,7 @@ impl ChatState {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -5829,6 +5844,7 @@ mod tests {
                 compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
 
             // 状态变更：draft + active_cancel + generating
@@ -5865,6 +5881,7 @@ mod tests {
                 compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
             // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
             cancel.cancel();
@@ -5893,6 +5910,7 @@ mod tests {
                 compaction_config: Some(compaction_config),
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
@@ -5994,6 +6012,7 @@ mod tests {
                 compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
             assert!(state.control.generating);
 

@@ -793,6 +793,7 @@ impl EffectExecutor {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             } => {
                 // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
                 // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
@@ -871,7 +872,7 @@ impl EffectExecutor {
                     // dispatches `StartLLMTurn`), the driver runs unscoped and
                     // spawned sub-agents fall back to user origin — the correct
                     // behavior for those paths.
-                    let scoped_driver = async move {
+                    let scoped_spawn_driver = async move {
                         match turn_spawn_ctx {
                             Some(ctx) => {
                                 crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
@@ -879,6 +880,16 @@ impl EffectExecutor {
                                     .await;
                             }
                             None => driver.await,
+                        }
+                    };
+                    let scoped_driver = async move {
+                        match turn_message_send_ctx {
+                            Some(ctx) => {
+                                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                                    .scope(ctx, scoped_spawn_driver)
+                                    .await;
+                            }
+                            None => scoped_spawn_driver.await,
                         }
                     };
                     if let Some(timeout_budget) = turn_timeout_budget {
@@ -3840,6 +3851,7 @@ mod integration_tests {
                 cancel: token.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             },
             Effect::CancelToken(token),
             Effect::ResolveApproval {
@@ -4271,6 +4283,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4620,6 +4633,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
         // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
@@ -4685,6 +4699,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4774,6 +4789,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4908,6 +4924,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5015,6 +5032,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5110,6 +5128,7 @@ mod real_mode_tests {
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5841,6 +5860,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5970,6 +5990,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6125,6 +6146,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6328,6 +6350,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: Some(seed),
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6444,6 +6467,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6588,6 +6612,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6699,6 +6724,7 @@ mod real_mode_tests {
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6794,6 +6820,7 @@ mod real_mode_tests {
                 compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .into_iter()
             .find(|effect| matches!(effect, Effect::StartTurn { .. }))
@@ -6838,6 +6865,7 @@ mod real_mode_tests {
             compaction_config: None,
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
         });
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
@@ -7184,6 +7212,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7324,6 +7353,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7442,6 +7472,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7576,6 +7607,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7817,6 +7849,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7957,6 +7990,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8745,6 +8779,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8886,6 +8921,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9033,6 +9069,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9172,6 +9209,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9344,6 +9382,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9567,6 +9606,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9929,6 +9969,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -10026,6 +10067,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 

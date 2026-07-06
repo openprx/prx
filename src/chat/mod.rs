@@ -5684,6 +5684,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in tools_registry.iter() {
+            if tool.name() == "message_send" {
+                continue;
+            }
             tool.set_active_recipient("user").await;
             tool.set_active_channel(Arc::clone(&terminal) as Arc<dyn Channel>).await;
         }
@@ -6014,6 +6017,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 turn_run_id.clone(),
                 chat_session_key.clone(),
             );
+            let redux_turn_message_send_ctx = crate::tools::message_send::MessageSendExecutionContext::new(
+                Some("user".to_string()),
+                Arc::clone(&terminal) as Arc<dyn Channel>,
+            );
             let dispatch_result = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StartLLMTurn {
                     draft_id: d_id.clone(),
@@ -6021,6 +6028,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     compaction_config: Some(effective_compaction.config.clone()),
                     cancel: cancellation.clone(),
                     turn_spawn_ctx: Some(redux_turn_spawn_ctx),
+                    turn_message_send_ctx: Some(redux_turn_message_send_ctx),
                 },
                 "chat.start_llm_turn",
             );
@@ -6314,51 +6322,60 @@ Retry with a compatible model: /provider {new_provider} <model>"
             turn_run_id.clone(),
             chat_session_key.clone(),
         );
+        let turn_message_send_ctx = crate::tools::message_send::MessageSendExecutionContext::new(
+            Some("user".to_string()),
+            Arc::clone(&terminal) as Arc<dyn Channel>,
+        );
 
         let turn_outcome = loop {
             history_len_before_tools = history.len();
 
             let result = tokio::time::timeout(
                 timeout_budget,
-                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
-                    turn_spawn_ctx.clone(),
-                    run_tool_call_loop_traced(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        &hooks,
-                        provider_name,
-                        model_name,
-                        temperature,
-                        false,
-                        Some(&approval_manager),
-                        "terminal",
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        config.agent.parallel_tools,
-                        config.agent.read_only_tool_concurrency_window,
-                        config.agent.read_only_tool_timeout_secs,
-                        config.agent.priority_scheduling_enabled,
-                        config.agent.low_priority_tools.clone(),
-                        ToolConcurrencyGovernanceConfig {
-                            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-                            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-                        },
-                        Some(&effective_compaction.config),
-                        Some(cancellation.clone()),
-                        Some(delta_tx.clone()),
-                        Some(&scope_ctx),
-                        Some(tool_event_tx.clone()),
-                        Some(&config.tool_tiering),
-                        document_ingest.clone(),
-                        chat_session.mode,
+                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT.scope(
+                    turn_message_send_ctx.clone(),
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
+                        turn_spawn_ctx.clone(),
+                        run_tool_call_loop_traced(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &hooks,
+                            provider_name,
+                            model_name,
+                            temperature,
+                            false,
+                            Some(&approval_manager),
+                            "terminal",
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            config.agent.parallel_tools,
+                            config.agent.read_only_tool_concurrency_window,
+                            config.agent.read_only_tool_timeout_secs,
+                            config.agent.priority_scheduling_enabled,
+                            config.agent.low_priority_tools.clone(),
+                            ToolConcurrencyGovernanceConfig {
+                                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                                rollback_timeout_rate_threshold: config
+                                    .agent
+                                    .concurrency_rollback_timeout_rate_threshold,
+                                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
+                            },
+                            Some(&effective_compaction.config),
+                            Some(cancellation.clone()),
+                            Some(delta_tx.clone()),
+                            Some(&scope_ctx),
+                            Some(tool_event_tx.clone()),
+                            Some(&config.tool_tiering),
+                            document_ingest.clone(),
+                            chat_session.mode,
+                        ),
                     ),
                 ),
             )

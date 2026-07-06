@@ -120,6 +120,11 @@ pub enum Action {
         /// not originate a chat turn) — sub-agents then fall back to user origin,
         /// which is correct for non-turn paths such as the `/bg` slash command.
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        /// Per-turn default route for `message_send` tool calls. This mirrors
+        /// `turn_spawn_ctx`: the real Redux driver runs in a spawned task, so
+        /// the routing default must be carried through the reducer/effect
+        /// boundary and scoped at the actual tool execution site.
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     },
     /// 收到一个 streaming 增量块
     StreamChunkReceived {

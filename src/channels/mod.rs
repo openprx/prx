@@ -2626,6 +2626,9 @@ async fn process_channel_message(
     // Also update the active channel so channel-aware tools route replies back on the correct channel
     // (e.g., wacli for WhatsApp messages, not always Signal).
     for tool in ctx.tools_registry.iter() {
+        if tool.name() == "message_send" {
+            continue;
+        }
         tool.set_active_recipient(&msg.reply_target).await;
         if let Some(ref ch) = target_channel {
             tool.set_active_channel(Arc::clone(ch)).await;
@@ -3173,6 +3176,12 @@ async fn process_channel_message(
         turn_run_id.clone(),
         turn_spawn_session_scope_key,
     );
+    let turn_message_send_ctx = target_channel.as_ref().map(|channel| {
+        crate::tools::message_send::MessageSendExecutionContext::new(
+            Some(msg.reply_target.clone()),
+            Arc::clone(channel),
+        )
+    });
 
     let mut context_overflow_retries = 0usize;
     let mut timeout_retries = 0usize;
@@ -3183,9 +3192,10 @@ async fn process_channel_message(
             () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
             result = tokio::time::timeout(
                 Duration::from_secs(timeout_budget_secs),
-                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
-                turn_spawn_ctx.clone(),
-                crate::agent::loop_::run_tool_call_loop_outcome(
+                async {
+                    let scoped_tool_loop = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
+                        turn_spawn_ctx.clone(),
+                        crate::agent::loop_::run_tool_call_loop_outcome(
                     active_provider.as_ref(),
                     &mut history,
                     ctx.tools_registry.as_ref(),
@@ -3217,8 +3227,17 @@ async fn process_channel_message(
                     // expose_stay_silent: ONLY on smart group turns. DMs / non-smart
                     // never see the tool, so they can never short-circuit to Silent.
                     smart_group,
-                ),
-                ),
+                        ),
+                    );
+                    match turn_message_send_ctx.clone() {
+                        Some(message_ctx) => {
+                            crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                                .scope(message_ctx, scoped_tool_loop)
+                                .await
+                        }
+                        None => scoped_tool_loop.await,
+                    }
+                },
             ) => LlmExecutionResult::Completed(Box::new(result)),
         };
 
