@@ -500,6 +500,8 @@ pub const INPUT_MAX_VISIBLE_ROWS: usize = 10;
 pub const INPUT_MAX_BYTES: usize = 32 * 1024;
 const PASTE_FOLD_LINE_THRESHOLD: usize = 5;
 const PASTE_FOLD_BYTE_THRESHOLD: usize = 1024;
+const PASTE_CHIP_SENTINEL_START: char = '\u{E000}';
+const PASTE_CHIP_SENTINEL_END: char = '\u{E001}';
 
 /// Maximum number of submitted entries kept in the history ring.
 pub const INPUT_HISTORY_CAPACITY: usize = 200;
@@ -1517,6 +1519,7 @@ pub struct ReverseSearchState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PasteChip {
+    token: String,
     placeholder: String,
     content: String,
 }
@@ -1556,15 +1559,130 @@ impl TuiInput {
         self.expand_paste_chips(&self.lines.join("\n"))
     }
 
-    fn expand_paste_chips(&self, visible: &str) -> String {
+    fn expand_paste_chips(&self, stored: &str) -> String {
         if self.paste_chips.is_empty() {
-            return visible.to_string();
+            return stored.to_string();
         }
-        let mut expanded = visible.to_string();
+        let mut expanded = stored.to_string();
         for chip in &self.paste_chips {
-            expanded = expanded.replace(&chip.placeholder, &chip.content);
+            expanded = expanded.replace(&chip.token, &chip.content);
         }
         expanded
+    }
+
+    fn paste_chip_token(id: usize) -> String {
+        format!("{PASTE_CHIP_SENTINEL_START}paste:{id}{PASTE_CHIP_SENTINEL_END}")
+    }
+
+    fn chip_at_offset<'a>(&'a self, line: &str, offset: usize) -> Option<&'a PasteChip> {
+        let tail = line.get(offset..)?;
+        self.paste_chips.iter().find(|chip| tail.starts_with(&chip.token))
+    }
+
+    fn display_line(&self, line: &str) -> String {
+        if self.paste_chips.is_empty() {
+            return line.to_string();
+        }
+        let mut out = String::new();
+        let mut offset = 0usize;
+        while offset < line.len() {
+            if let Some(chip) = self.chip_at_offset(line, offset) {
+                out.push_str(&chip.placeholder);
+                offset = offset.saturating_add(chip.token.len());
+                continue;
+            }
+            let Some(ch) = line.get(offset..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
+            out.push(ch);
+            offset = offset.saturating_add(ch.len_utf8());
+        }
+        out
+    }
+
+    fn display_lines(&self) -> Vec<String> {
+        self.lines.iter().map(|line| self.display_line(line)).collect()
+    }
+
+    fn display_cursor_offset(&self, line_idx: usize, storage_cursor: usize) -> usize {
+        let Some(line) = self.lines.get(line_idx) else {
+            return 0;
+        };
+        let cursor = storage_cursor.min(line.len());
+        let mut storage_offset = 0usize;
+        let mut display_offset = 0usize;
+        while storage_offset < line.len() {
+            if cursor <= storage_offset {
+                return display_offset;
+            }
+            if let Some(chip) = self.chip_at_offset(line, storage_offset) {
+                let chip_end = storage_offset.saturating_add(chip.token.len());
+                if cursor < chip_end {
+                    return display_offset;
+                }
+                storage_offset = chip_end;
+                display_offset = display_offset.saturating_add(chip.placeholder.len());
+                continue;
+            }
+            let Some(ch) = line.get(storage_offset..).and_then(|tail| tail.chars().next()) else {
+                break;
+            };
+            storage_offset = storage_offset.saturating_add(ch.len_utf8());
+            display_offset = display_offset.saturating_add(ch.len_utf8());
+        }
+        display_offset
+    }
+
+    fn chip_range_matching<F>(&self, line: &str, mut matches: F) -> Option<(usize, usize)>
+    where
+        F: FnMut(usize, usize) -> bool,
+    {
+        for chip in &self.paste_chips {
+            for (start, _) in line.match_indices(&chip.token) {
+                let end = start.saturating_add(chip.token.len());
+                if matches(start, end) {
+                    return Some((start, end));
+                }
+            }
+        }
+        None
+    }
+
+    fn chip_range_containing_cursor(&self, line: &str, offset: usize) -> Option<(usize, usize)> {
+        self.chip_range_matching(line, |start, end| start < offset && offset < end)
+    }
+
+    fn chip_range_before_or_containing_cursor(&self, line: &str, offset: usize) -> Option<(usize, usize)> {
+        self.chip_range_matching(line, |start, end| start < offset && offset <= end)
+    }
+
+    fn chip_range_at_or_containing_cursor(&self, line: &str, offset: usize) -> Option<(usize, usize)> {
+        self.chip_range_matching(line, |start, end| start <= offset && offset < end)
+    }
+
+    fn remove_chip_range(&mut self, line_idx: usize, start: usize, end: usize) {
+        let removed = self
+            .lines
+            .get(line_idx)
+            .and_then(|line| line.get(start..end))
+            .map(str::to_string);
+        if let Some(line) = self.lines.get_mut(line_idx) {
+            line.replace_range(start..end, "");
+            self.cursor = (line_idx, start.min(line.len()));
+        }
+        if let Some(token) = removed {
+            self.paste_chips.retain(|chip| chip.token != token);
+        }
+    }
+
+    fn snap_cursor_after_chip(&mut self) {
+        let (line_idx, offset) = self.cursor;
+        let Some(line) = self.lines.get(line_idx) else {
+            return;
+        };
+        if let Some((_start, end)) = self.chip_range_containing_cursor(line, offset) {
+            self.cursor = (line_idx, end);
+        }
     }
 
     fn draft_snapshot(&self) -> InputDraftSnapshot {
@@ -1879,6 +1997,7 @@ impl TuiInput {
 
     /// Insert a single grapheme (`ch`) at the cursor.
     fn insert_char(&mut self, ch: char) -> bool {
+        self.snap_cursor_after_chip();
         if self.byte_len().saturating_add(ch.len_utf8()) > INPUT_MAX_BYTES {
             self.truncated = true;
             return false;
@@ -1905,6 +2024,7 @@ impl TuiInput {
         if text.is_empty() {
             return;
         }
+        self.snap_cursor_after_chip();
         self.history_pos = None;
         self.pending_draft = None;
         let remaining = INPUT_MAX_BYTES.saturating_sub(self.byte_len());
@@ -1947,14 +2067,14 @@ impl TuiInput {
         }
     }
 
-    fn insert_visible_chip(&mut self, placeholder: &str) {
+    fn insert_chip_token(&mut self, token: &str) {
         let (li, off) = self.cursor;
         if let Some(line) = self.lines.get_mut(li) {
             self.history_pos = None;
             self.pending_draft = None;
             let clamped = off.min(line.len());
-            line.insert_str(clamped, placeholder);
-            self.cursor = (li, clamped.saturating_add(placeholder.len()));
+            line.insert_str(clamped, token);
+            self.cursor = (li, clamped.saturating_add(token.len()));
         }
     }
 
@@ -1976,16 +2096,19 @@ impl TuiInput {
         let id = self.next_paste_chip_id;
         self.next_paste_chip_id = self.next_paste_chip_id.saturating_add(1);
         let line_count = pasted_line_count(&content);
+        let token = Self::paste_chip_token(id);
         let placeholder = format!("[Pasted text #{id}: {line_count} lines]");
         self.paste_chips.push(PasteChip {
+            token: token.clone(),
             placeholder: placeholder.clone(),
             content,
         });
-        self.insert_visible_chip(&placeholder);
+        self.insert_chip_token(&token);
     }
 
     /// Split the current line at the cursor (`Shift+Enter`).
     fn insert_newline(&mut self) {
+        self.snap_cursor_after_chip();
         if self.byte_len().saturating_add(1) > INPUT_MAX_BYTES {
             self.truncated = true;
             return;
@@ -2022,6 +2145,15 @@ impl TuiInput {
         self.pending_draft = None;
         let (li, off) = self.cursor;
         if off > 0 {
+            if let Some(line) = self.lines.get(li)
+                && let Some((start, end)) = self.chip_range_before_or_containing_cursor(line, off)
+            {
+                self.remove_chip_range(li, start, end);
+                if self.byte_len() < INPUT_MAX_BYTES {
+                    self.truncated = false;
+                }
+                return;
+            }
             if let Some(line) = self.lines.get_mut(li) {
                 let new_off = floor_char_boundary(line, off.saturating_sub(1));
                 line.replace_range(new_off..off, "");
@@ -2049,6 +2181,15 @@ impl TuiInput {
         let (li, off) = self.cursor;
         let line_len = self.lines.get(li).map_or(0, String::len);
         if off < line_len {
+            if let Some(line) = self.lines.get(li)
+                && let Some((start, end)) = self.chip_range_at_or_containing_cursor(line, off)
+            {
+                self.remove_chip_range(li, start, end);
+                if self.byte_len() < INPUT_MAX_BYTES {
+                    self.truncated = false;
+                }
+                return;
+            }
             if let Some(line) = self.lines.get_mut(li) {
                 // Find end of the char starting at `off`.
                 let mut end = off + 1;
@@ -2074,6 +2215,10 @@ impl TuiInput {
         let (li, off) = self.cursor;
         if off > 0 {
             if let Some(line) = self.lines.get(li) {
+                if let Some((start, _end)) = self.chip_range_before_or_containing_cursor(line, off) {
+                    self.cursor = (li, start);
+                    return;
+                }
                 let new_off = floor_char_boundary(line, off.saturating_sub(1));
                 self.cursor = (li, new_off);
             }
@@ -2089,6 +2234,10 @@ impl TuiInput {
         let line_len = self.lines.get(li).map_or(0, String::len);
         if off < line_len {
             if let Some(line) = self.lines.get(li) {
+                if let Some((_start, end)) = self.chip_range_at_or_containing_cursor(line, off) {
+                    self.cursor = (li, end);
+                    return;
+                }
                 let mut new_off = off + 1;
                 while new_off < line.len() && !line.is_char_boundary(new_off) {
                     new_off += 1;
@@ -2125,6 +2274,7 @@ impl TuiInput {
             .get(new_li)
             .map_or(target_off, |line| floor_char_boundary(line, target_off));
         self.cursor = (new_li, safe_off);
+        self.snap_cursor_after_chip();
         true
     }
 
@@ -2142,11 +2292,13 @@ impl TuiInput {
             .get(new_li)
             .map_or(target_off, |line| floor_char_boundary(line, target_off));
         self.cursor = (new_li, safe_off);
+        self.snap_cursor_after_chip();
         true
     }
 
     /// Delete from start of current line up to cursor (`Ctrl+U`).
     fn delete_to_line_start(&mut self) {
+        self.snap_cursor_after_chip();
         self.history_pos = None;
         self.pending_draft = None;
         let (li, off) = self.cursor;
@@ -5752,11 +5904,11 @@ fn focused_session_kind<V: BottomChromeView + ?Sized>(state: &V, seq: u64) -> Op
         .map(|entry| entry.kind)
 }
 
-struct WrappedInputRow<'a> {
+struct WrappedInputRow {
     logical_idx: usize,
     start: usize,
     end: usize,
-    text: &'a str,
+    text: String,
     first_for_logical: bool,
 }
 
@@ -5779,22 +5931,22 @@ fn input_visual_rows_for_width<V: BottomChromeView + ?Sized>(state: &V, total_wi
     let content_width = input_content_width(state, total_width);
     state
         .input()
-        .lines
+        .display_lines()
         .iter()
         .map(|line| wrap_line_ranges(line, content_width).len())
         .sum::<usize>()
         .max(1)
 }
 
-fn wrap_input_rows(input: &TuiInput, content_width: usize) -> Vec<WrappedInputRow<'_>> {
+fn wrap_input_rows(display_lines: &[String], content_width: usize) -> Vec<WrappedInputRow> {
     let mut rows = Vec::new();
-    for (logical_idx, line) in input.lines.iter().enumerate() {
+    for (logical_idx, line) in display_lines.iter().enumerate() {
         for (range_idx, (start, end)) in wrap_line_ranges(line, content_width).into_iter().enumerate() {
             rows.push(WrappedInputRow {
                 logical_idx,
                 start,
                 end,
-                text: line.get(start..end).unwrap_or(""),
+                text: line.get(start..end).unwrap_or("").to_string(),
                 first_for_logical: range_idx == 0,
             });
         }
@@ -5804,7 +5956,7 @@ fn wrap_input_rows(input: &TuiInput, content_width: usize) -> Vec<WrappedInputRo
             logical_idx: 0,
             start: 0,
             end: 0,
-            text: "",
+            text: String::new(),
             first_for_logical: true,
         });
     }
@@ -5852,12 +6004,14 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     let continuation = " ".repeat(prompt_width);
     let max_visible_rows = area.height.saturating_sub(1).max(1) as usize;
     let content_width = usize::from(area.width).saturating_sub(prompt_width).max(1);
-    let wrapped_rows = wrap_input_rows(input_ref, content_width);
+    let display_lines = input_ref.display_lines();
+    let wrapped_rows = wrap_input_rows(&display_lines, content_width);
     let cursor_line = input_ref.cursor.0.min(input_ref.lines.len().saturating_sub(1));
-    let cursor_offset = input_ref
+    let storage_cursor_offset = input_ref
         .lines
         .get(cursor_line)
         .map_or(0, |line| input_ref.cursor.1.min(line.len()));
+    let cursor_offset = input_ref.display_cursor_offset(cursor_line, storage_cursor_offset);
     let cursor_visual_row = wrapped_rows
         .iter()
         .position(|row| row.logical_idx == cursor_line && cursor_offset >= row.start && cursor_offset <= row.end)
@@ -5874,7 +6028,7 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
             } else {
                 Span::raw(continuation.clone())
             };
-            Line::from(vec![prefix, Span::raw(row.text)])
+            Line::from(vec![prefix, Span::raw(row.text.clone())])
         })
         .collect();
 
@@ -5901,19 +6055,15 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     // input-target indicator width, which varies between `main` and `agent #N`).
     let cursor_visible_row = cursor_visual_row.saturating_sub(first_visible_line);
     if cursor_line < input_ref.lines.len() && cursor_visible_row < max_visible_rows {
-        let row_text = input_ref.lines.get(cursor_line).map(String::as_str).unwrap_or("");
+        let row_text = display_lines.get(cursor_line).map(String::as_str).unwrap_or("");
         // Width-aware column: count *display* columns (not char count) up to
         // the byte offset. CJK and wide East-Asian glyphs occupy 2 columns,
         // so a `chars().count()` here would leave the cursor mid-glyph and
         // give the impression that input is broken. `unicode-width` matches
         // ratatui's own width algorithm for `Paragraph`.
-        let visual_col: usize = row_text
-            .get(
-                wrapped_rows[cursor_visual_row].start
-                    ..cursor_offset
-                        .min(wrapped_rows[cursor_visual_row].end)
-                        .min(row_text.len()),
-            )
+        let visual_col: usize = wrapped_rows
+            .get(cursor_visual_row)
+            .and_then(|row| row_text.get(row.start..cursor_offset.min(row.end).min(row_text.len())))
             .map_or(0, UnicodeWidthStr::width);
         let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
         let prefix_cols: u16 = u16::try_from(prompt_width).unwrap_or(2);
@@ -10024,7 +10174,7 @@ mod tests {
 
         input.paste(pasted);
 
-        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines]".to_string()]);
+        assert_eq!(input.display_lines(), vec!["[Pasted text #1: 6 lines]".to_string()]);
         assert_eq!(input.text(), pasted);
         match input.handle_key(key(KeyCode::Enter)) {
             InputOutcome::Submitted(submitted) => assert_eq!(submitted, pasted),
@@ -10043,13 +10193,59 @@ mod tests {
         input.paste(" ");
         input.paste(&second);
 
-        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]);
+        assert_eq!(
+            input.display_lines(),
+            vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]
+        );
         assert_eq!(input.text(), format!("{first} {second}"));
         assert!(input.history_prev(), "moves to history");
         assert_eq!(input.text(), "older");
         assert!(input.history_next(), "restores draft");
-        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]);
+        assert_eq!(
+            input.display_lines(),
+            vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]
+        );
         assert_eq!(input.text(), format!("{first} {second}"));
+    }
+
+    #[test]
+    fn folded_paste_backspace_removes_whole_chip_without_placeholder_leak() {
+        let mut input = TuiInput::new();
+        let pasted = "one\ntwo\nthree\nfour\nfive\nsix";
+        input.paste(pasted);
+
+        input.handle_key(key(KeyCode::Backspace));
+
+        assert_eq!(input.text(), "");
+        assert_eq!(input.display_lines(), vec![String::new()]);
+        assert!(
+            !input.text().contains("[Pasted text"),
+            "damaged placeholder must never leak into submitted payload"
+        );
+    }
+
+    #[test]
+    fn folded_paste_cursor_inside_chip_cannot_insert_into_chip() {
+        let mut input = TuiInput::new();
+        let pasted = "one\ntwo\nthree\nfour\nfive\nsix";
+        input.paste(pasted);
+        input.cursor = (0, 1);
+
+        assert!(input.insert_char('X'));
+
+        assert_eq!(input.text(), format!("{pasted}X"));
+        assert_eq!(input.display_lines(), vec!["[Pasted text #1: 6 lines]X".to_string()]);
+    }
+
+    #[test]
+    fn small_paste_matching_chip_placeholder_is_not_expanded() {
+        let mut input = TuiInput::new();
+        let literal = "[Pasted text #1: 6 lines]";
+
+        input.paste(literal);
+
+        assert_eq!(input.lines, vec![literal.to_string()]);
+        assert_eq!(input.text(), literal);
     }
 
     #[test]
