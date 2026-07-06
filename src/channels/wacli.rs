@@ -25,7 +25,7 @@
 //! mandatory; unsigned requests are only honored when `allow_unsigned_loopback`
 //! is explicitly set and the server binds a loopback address.
 
-use super::traits::{Channel, ChannelCapabilities, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelCapabilities, ChannelMessage, ChatKind, SendMessage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::{
@@ -535,6 +535,9 @@ async fn handle_wacli_webhook(
         channel: "wacli".to_string(),
         timestamp,
         thread_ts: None,
+        chat_kind: if is_group { ChatKind::Group } else { ChatKind::Dm },
+        chat_title: None,
+        sender_display: (!sender_display.trim().is_empty()).then(|| sender_display.to_string()),
         mentioned_uuids,
         mentioned,
         is_group_hint: is_group,

@@ -1,6 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatKind, SendMessage};
 use crate::config::{Config, StreamMode};
 use crate::security::pairing::PairingGuard;
 use anyhow::Context;
@@ -575,6 +575,7 @@ impl TelegramChannel {
         (!normalized.is_empty()).then_some(normalized)
     }
 
+    #[cfg(test)]
     fn is_group_message(message: &serde_json::Value) -> bool {
         message
             .get("chat")
@@ -757,6 +758,14 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             .and_then(serde_json::Value::as_str)
             .unwrap_or("unknown")
             .to_string();
+        let sender_display = message
+            .get("from")
+            .and_then(|from| from.get("first_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .or_else(|| (username != "unknown").then(|| username.clone()));
 
         let sender_id = message
             .get("from")
@@ -788,7 +797,23 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             return None;
         }
 
-        let is_group = Self::is_group_message(message);
+        let chat_type = message
+            .get("chat")
+            .and_then(|chat| chat.get("type"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("private");
+        let chat_kind = match chat_type {
+            "group" | "supergroup" | "channel" => ChatKind::Group,
+            _ => ChatKind::Dm,
+        };
+        let chat_title = message
+            .get("chat")
+            .and_then(|chat| chat.get("title"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+        let is_group = chat_kind.is_group_like();
         // Compute whether the bot is @-mentioned (used for both the legacy drop
         // gate and the smart-mode passthrough hint).
         let bot_mentioned = {
@@ -850,6 +875,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         } else {
             text.to_string()
         };
+        let content = if is_group {
+            let display = sender_display.as_deref().unwrap_or(sender_identity.as_str());
+            format!("[Telegram Group] {display}: {content}")
+        } else {
+            content
+        };
 
         Some(ChannelMessage {
             id: format!("telegram_{chat_id}_{message_id}"),
@@ -862,6 +893,9 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 .unwrap_or_default()
                 .as_secs(),
             thread_ts: None,
+            chat_kind,
+            chat_title,
+            sender_display,
             mentioned_uuids: vec![],
             // Smart-mode hints (only consulted centrally in smart mode).
             mentioned: bot_mentioned,
@@ -2719,17 +2753,22 @@ mod tests {
                 "text": "Hi @MyBot status please",
                 "from": {
                     "id": 555,
-                    "username": "alice"
+                    "username": "alice",
+                    "first_name": "Alice"
                 },
                 "chat": {
                     "id": -100_200_300,
-                    "type": "group"
+                    "type": "group",
+                    "title": "Build Room"
                 }
             }
         });
 
         let parsed = ch.parse_update_message(&update).expect("mention should parse");
-        assert_eq!(parsed.content, "Hi status please");
+        assert_eq!(parsed.content, "[Telegram Group] Alice: Hi status please");
+        assert_eq!(parsed.chat_kind, ChatKind::Group);
+        assert_eq!(parsed.chat_title.as_deref(), Some("Build Room"));
+        assert_eq!(parsed.sender_display.as_deref(), Some("Alice"));
 
         let empty_update = serde_json::json!({
             "update_id": 12,
@@ -2766,13 +2805,16 @@ mod tests {
             "message": {
                 "message_id": 60,
                 "text": "anyone seen the latest build?",
-                "from": { "id": 555, "username": "alice" },
-                "chat": { "id": -100_200_300, "type": "group" }
+                "from": { "id": 555, "username": "alice", "first_name": "Alice" },
+                "chat": { "id": -100_200_300, "type": "group", "title": "Build Room" }
             }
         });
 
         let parsed = ch.parse_update_message(&update).expect("smart mode must pass through");
-        assert_eq!(parsed.content, "anyone seen the latest build?");
+        assert_eq!(parsed.content, "[Telegram Group] Alice: anyone seen the latest build?");
+        assert_eq!(parsed.chat_kind, ChatKind::Group);
+        assert_eq!(parsed.chat_title.as_deref(), Some("Build Room"));
+        assert_eq!(parsed.sender_display.as_deref(), Some("Alice"));
         assert!(parsed.is_group_hint, "group message must be flagged");
         assert!(!parsed.mentioned, "no @-mention => mentioned=false");
     }
@@ -2791,14 +2833,17 @@ mod tests {
             "message": {
                 "message_id": 61,
                 "text": "hey @mybot what's the status?",
-                "from": { "id": 555, "username": "alice" },
-                "chat": { "id": -100_200_300, "type": "group" }
+                "from": { "id": 555, "username": "alice", "first_name": "Alice" },
+                "chat": { "id": -100_200_300, "type": "group", "title": "Build Room" }
             }
         });
 
         let parsed = ch.parse_update_message(&update).expect("smart mode must pass through");
         // Raw text preserved (not stripped) so the model sees the full message.
-        assert_eq!(parsed.content, "hey @mybot what's the status?");
+        assert_eq!(parsed.content, "[Telegram Group] Alice: hey @mybot what's the status?");
+        assert_eq!(parsed.chat_kind, ChatKind::Group);
+        assert_eq!(parsed.chat_title.as_deref(), Some("Build Room"));
+        assert_eq!(parsed.sender_display.as_deref(), Some("Alice"));
         assert!(parsed.is_group_hint);
         assert!(parsed.mentioned, "explicit @-mention => mentioned=true");
     }
@@ -2880,8 +2925,8 @@ mod tests {
             "message": {
                 "message_id": 71,
                 "text": "no mention here at all",
-                "from": { "id": 555, "username": "alice" },
-                "chat": { "id": -100_200_300, "type": "group" }
+                "from": { "id": 555, "username": "alice", "first_name": "Alice" },
+                "chat": { "id": -100_200_300, "type": "group", "title": "Build Room" }
             }
         });
 
@@ -2889,7 +2934,10 @@ mod tests {
             .parse_update_message(&update)
             .expect("explicit Off must receive every group message");
         // Off never strips the mention either — raw text preserved.
-        assert_eq!(parsed.content, "no mention here at all");
+        assert_eq!(parsed.content, "[Telegram Group] Alice: no mention here at all");
+        assert_eq!(parsed.chat_kind, ChatKind::Group);
+        assert_eq!(parsed.chat_title.as_deref(), Some("Build Room"));
+        assert_eq!(parsed.sender_display.as_deref(), Some("Alice"));
     }
 
     #[test]

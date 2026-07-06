@@ -1,4 +1,4 @@
-use super::traits::{Channel, ChannelMessage, SendMessage};
+use super::traits::{Channel, ChannelMessage, ChatKind, SendMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -385,6 +385,13 @@ impl Channel for DiscordChannel {
                     // excluded from PROACTIVE smart replies.
                     let author_is_bot =
                         d.get("author").and_then(|a| a.get("bot")).and_then(serde_json::Value::as_bool).unwrap_or(false);
+                    let sender_display = d
+                        .get("author")
+                        .and_then(|a| a.get("global_name").or_else(|| a.get("username")))
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(str::to_string);
                     // Skip bot messages entirely (unless listen_to_bots is enabled)
                     if !self.listen_to_bots && author_is_bot {
                         continue;
@@ -460,6 +467,9 @@ impl Channel for DiscordChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        chat_kind: if is_guild_message { ChatKind::Group } else { ChatKind::Dm },
+                        chat_title: None,
+                        sender_display,
                         mentioned_uuids: vec![],
                         // Smart-mode hints (only consulted centrally in smart mode).
                         mentioned: bot_mentioned,

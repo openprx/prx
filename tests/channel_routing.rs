@@ -18,7 +18,7 @@
 //! Verifies `sender/reply_target` field contracts to prevent field swaps.
 
 use async_trait::async_trait;
-use openprx::channels::traits::{Channel, ChannelMessage, SendMessage};
+use openprx::channels::traits::{Channel, ChannelMessage, ChatKind, SendMessage};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // ChannelMessage construction and field semantics
@@ -35,6 +35,9 @@ fn channel_message_sender_field_holds_platform_user_id() {
         channel: "telegram".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        chat_kind: ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
@@ -61,6 +64,9 @@ fn channel_message_reply_target_distinct_from_sender() {
         channel: "discord".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        chat_kind: ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
@@ -85,6 +91,9 @@ fn channel_message_fields_not_swapped() {
         channel: "test".into(),
         timestamp: 1700000000,
         thread_ts: None,
+        chat_kind: ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
@@ -112,6 +121,9 @@ fn channel_message_preserves_all_fields_on_clone() {
         channel: "test_channel".into(),
         timestamp: 1700000001,
         thread_ts: None,
+        chat_kind: ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
@@ -209,6 +221,9 @@ impl Channel for CapturingChannel {
             channel: "capturing".into(),
             timestamp: 1700000000,
             thread_ts: None,
+            chat_kind: ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
