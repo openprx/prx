@@ -10,6 +10,9 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const DEFAULT_NUM_CTX: usize = 8192;
+const MAX_NUM_CTX: usize = 65_536;
+
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
@@ -135,7 +138,7 @@ impl OllamaProvider {
         });
         let model_num_ctx = model_num_ctx
             .into_iter()
-            .filter(|(model, num_ctx)| !model.trim().is_empty() && *num_ctx > 0)
+            .filter(|(model, num_ctx)| !model.trim().is_empty() && *num_ctx > 0 && *num_ctx < 1_000_000)
             .collect();
 
         Self {
@@ -194,8 +197,7 @@ impl OllamaProvider {
     }
 
     fn resolve_num_ctx(&self, model: &str) -> usize {
-        const DEFAULT_NUM_CTX: usize = 8192;
-        let resolved = self
+        let requested = self
             .num_ctx
             .filter(|value| *value > 0)
             .or_else(|| self.model_num_ctx.get(model).copied())
@@ -205,7 +207,14 @@ impl OllamaProvider {
                     .and_then(|(_, bare_model)| self.model_num_ctx.get(bare_model).copied())
             })
             .unwrap_or(DEFAULT_NUM_CTX);
-        tracing::debug!(model = model, num_ctx = resolved, "applying Ollama num_ctx");
+        let resolved = requested.min(MAX_NUM_CTX);
+        tracing::debug!(
+            model = model,
+            requested_num_ctx = requested,
+            num_ctx = resolved,
+            cap = MAX_NUM_CTX,
+            "applying Ollama num_ctx"
+        );
         resolved
     }
 
@@ -1223,6 +1232,22 @@ mod tests {
     }
 
     #[test]
+    fn request_num_ctx_ignores_router_default_sentinel() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("llama3".to_string(), 1_000_000)]);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 8192);
+    }
+
+    #[test]
+    fn request_num_ctx_clamps_large_router_context_to_safe_cap() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("llama3".to_string(), 128_000)]);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
+    }
+
+    #[test]
     fn request_num_ctx_explicit_config_overrides_router_model_context() {
         let provider = OllamaProvider::new_with_runtime_options(
             None,
@@ -1231,6 +1256,13 @@ mod tests {
             Some(65_536),
             vec![("llama3".to_string(), 32_768)],
         );
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
+    }
+
+    #[test]
+    fn request_num_ctx_clamps_large_explicit_config_to_safe_cap() {
+        let provider = OllamaProvider::new_with_runtime_options(None, None, None, Some(128_000), Vec::new());
 
         assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
     }

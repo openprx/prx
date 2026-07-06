@@ -1095,10 +1095,15 @@ pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> P
 }
 
 fn ollama_model_num_ctx_from_router(router: &crate::config::RouterConfig) -> Vec<(String, usize)> {
+    const ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL: usize = 1_000_000;
     router
         .models
         .iter()
-        .filter(|model| model.provider.eq_ignore_ascii_case("ollama") && model.max_context > 0)
+        .filter(|model| {
+            model.provider.eq_ignore_ascii_case("ollama")
+                && model.max_context > 0
+                && model.max_context < ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL
+        })
         .map(|model| (model.model_id.clone(), model.max_context))
         .collect()
 }
