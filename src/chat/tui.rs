@@ -498,6 +498,8 @@ pub const INPUT_MAX_VISIBLE_ROWS: usize = 10;
 /// This keeps tmux key-flood paste paths bounded while still allowing the
 /// 10 KB manual paste scenario to pass with margin.
 pub const INPUT_MAX_BYTES: usize = 32 * 1024;
+const PASTE_FOLD_LINE_THRESHOLD: usize = 5;
+const PASTE_FOLD_BYTE_THRESHOLD: usize = 1024;
 
 /// Maximum number of submitted entries kept in the history ring.
 pub const INPUT_HISTORY_CAPACITY: usize = 200;
@@ -1491,7 +1493,11 @@ pub struct TuiInput {
     pub history_pos: Option<usize>,
     /// Snapshot of the in-flight buffer saved when entering history nav, so we
     /// can restore it when the user scrolls past the end of history.
-    pending_draft: Option<Vec<String>>,
+    pending_draft: Option<InputDraftSnapshot>,
+    /// Original payloads hidden behind folded paste chips in `lines`.
+    paste_chips: Vec<PasteChip>,
+    /// Monotonic display id for folded paste chips in this draft.
+    next_paste_chip_id: usize,
     /// True when text was ignored because the input reached INPUT_MAX_BYTES.
     pub truncated: bool,
     /// Active reverse history search state (`Ctrl+R`), if any.
@@ -1502,11 +1508,25 @@ pub struct TuiInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReverseSearchState {
     /// Draft buffer before the search started; restored on Esc.
-    saved_lines: Vec<String>,
+    saved_draft: InputDraftSnapshot,
     /// User-entered incremental search query.
     pub query: String,
     /// Currently selected history entry.
     pub match_pos: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasteChip {
+    placeholder: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputDraftSnapshot {
+    lines: Vec<String>,
+    paste_chips: Vec<PasteChip>,
+    next_paste_chip_id: usize,
+    truncated: bool,
 }
 
 impl Default for TuiInput {
@@ -1524,6 +1544,8 @@ impl TuiInput {
             history: Vec::new(),
             history_pos: None,
             pending_draft: None,
+            paste_chips: Vec::new(),
+            next_paste_chip_id: 1,
             truncated: false,
             reverse_search: None,
         }
@@ -1531,7 +1553,41 @@ impl TuiInput {
 
     /// Joined buffer contents (lines separated by '\n').
     pub fn text(&self) -> String {
-        self.lines.join("\n")
+        self.expand_paste_chips(&self.lines.join("\n"))
+    }
+
+    fn expand_paste_chips(&self, visible: &str) -> String {
+        if self.paste_chips.is_empty() {
+            return visible.to_string();
+        }
+        let mut expanded = visible.to_string();
+        for chip in &self.paste_chips {
+            expanded = expanded.replace(&chip.placeholder, &chip.content);
+        }
+        expanded
+    }
+
+    fn draft_snapshot(&self) -> InputDraftSnapshot {
+        InputDraftSnapshot {
+            lines: self.lines.clone(),
+            paste_chips: self.paste_chips.clone(),
+            next_paste_chip_id: self.next_paste_chip_id,
+            truncated: self.truncated,
+        }
+    }
+
+    fn restore_draft_snapshot(&mut self, snapshot: InputDraftSnapshot) {
+        self.lines = if snapshot.lines.is_empty() {
+            vec![String::new()]
+        } else {
+            snapshot.lines
+        };
+        self.paste_chips = snapshot.paste_chips;
+        self.next_paste_chip_id = snapshot.next_paste_chip_id.max(1);
+        self.truncated = snapshot.truncated;
+        let last_line_idx = self.lines.len().saturating_sub(1);
+        let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
+        self.cursor = (last_line_idx, last_len);
     }
 
     /// True when the buffer is logically empty (single empty line).
@@ -1775,8 +1831,7 @@ impl TuiInput {
 
     /// Current draft size in bytes, counting newline separators between rows.
     pub fn byte_len(&self) -> usize {
-        let content_bytes: usize = self.lines.iter().map(String::len).sum();
-        content_bytes.saturating_add(self.lines.len().saturating_sub(1))
+        self.text().len()
     }
 
     /// True if the user is currently editing a single logical line — used to
@@ -1798,6 +1853,8 @@ impl TuiInput {
         let last_line_idx = self.lines.len().saturating_sub(1);
         let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
         self.cursor = (last_line_idx, last_len);
+        self.paste_chips.clear();
+        self.next_paste_chip_id = 1;
         self.truncated = false;
     }
 
@@ -1814,6 +1871,8 @@ impl TuiInput {
         self.cursor = (0, 0);
         self.history_pos = None;
         self.pending_draft = None;
+        self.paste_chips.clear();
+        self.next_paste_chip_id = 1;
         self.truncated = false;
         self.reverse_search = None;
     }
@@ -1886,6 +1945,43 @@ impl TuiInput {
                 self.cursor = new_cursor;
             }
         }
+    }
+
+    fn insert_visible_chip(&mut self, placeholder: &str) {
+        let (li, off) = self.cursor;
+        if let Some(line) = self.lines.get_mut(li) {
+            self.history_pos = None;
+            self.pending_draft = None;
+            let clamped = off.min(line.len());
+            line.insert_str(clamped, placeholder);
+            self.cursor = (li, clamped.saturating_add(placeholder.len()));
+        }
+    }
+
+    fn insert_folded_paste(&mut self, text: &str) {
+        let remaining = INPUT_MAX_BYTES.saturating_sub(self.byte_len());
+        if remaining == 0 {
+            self.truncated = true;
+            return;
+        }
+        let content = if text.len() > remaining {
+            self.truncated = true;
+            clamp_str_to_byte_len(text, remaining).to_string()
+        } else {
+            text.to_string()
+        };
+        if content.is_empty() {
+            return;
+        }
+        let id = self.next_paste_chip_id;
+        self.next_paste_chip_id = self.next_paste_chip_id.saturating_add(1);
+        let line_count = pasted_line_count(&content);
+        let placeholder = format!("[Pasted text #{id}: {line_count} lines]");
+        self.paste_chips.push(PasteChip {
+            placeholder: placeholder.clone(),
+            content,
+        });
+        self.insert_visible_chip(&placeholder);
     }
 
     /// Split the current line at the cursor (`Shift+Enter`).
@@ -2098,7 +2194,7 @@ impl TuiInput {
     pub fn begin_or_cycle_reverse_search(&mut self) -> bool {
         if self.reverse_search.is_none() {
             self.reverse_search = Some(ReverseSearchState {
-                saved_lines: self.lines.clone(),
+                saved_draft: self.draft_snapshot(),
                 query: String::new(),
                 match_pos: None,
             });
@@ -2159,26 +2255,13 @@ impl TuiInput {
             let entry = entry.clone();
             self.set_text(&entry);
         } else {
-            let saved = search.saved_lines.clone();
-            self.lines = if saved.is_empty() { vec![String::new()] } else { saved };
-            let last_line_idx = self.lines.len().saturating_sub(1);
-            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
-            self.cursor = (last_line_idx, last_len);
-            self.truncated = false;
+            self.restore_draft_snapshot(search.saved_draft.clone());
         }
     }
 
     fn cancel_reverse_search(&mut self) {
         if let Some(search) = self.reverse_search.take() {
-            self.lines = if search.saved_lines.is_empty() {
-                vec![String::new()]
-            } else {
-                search.saved_lines
-            };
-            let last_line_idx = self.lines.len().saturating_sub(1);
-            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
-            self.cursor = (last_line_idx, last_len);
-            self.truncated = false;
+            self.restore_draft_snapshot(search.saved_draft);
         }
     }
 
@@ -2229,7 +2312,7 @@ impl TuiInput {
         }
         let next_pos = match self.history_pos {
             None => {
-                self.pending_draft = Some(self.lines.clone());
+                self.pending_draft = Some(self.draft_snapshot());
                 self.history.len().saturating_sub(1)
             }
             Some(0) => 0,
@@ -2253,14 +2336,14 @@ impl TuiInput {
             // Past the most recent entry → restore in-flight draft (if any).
             self.history_pos = None;
             if let Some(draft) = self.pending_draft.take() {
-                self.lines = if draft.is_empty() { vec![String::new()] } else { draft };
+                self.restore_draft_snapshot(draft);
             } else {
                 self.lines = vec![String::new()];
+                self.paste_chips.clear();
+                self.next_paste_chip_id = 1;
+                self.truncated = false;
+                self.cursor = (0, 0);
             }
-            let last_line_idx = self.lines.len().saturating_sub(1);
-            let last_len = self.lines.get(last_line_idx).map_or(0, String::len);
-            self.cursor = (last_line_idx, last_len);
-            self.truncated = false;
         } else {
             self.history_pos = Some(next_pos);
             if let Some(entry) = self.history.get(next_pos) {
@@ -2395,8 +2478,20 @@ impl TuiInput {
 
     /// Append pasted text verbatim. Newlines split into rows.
     pub fn paste(&mut self, text: &str) {
-        self.insert_str(text);
+        if should_fold_paste(text) {
+            self.insert_folded_paste(text);
+        } else {
+            self.insert_str(text);
+        }
     }
+}
+
+fn pasted_line_count(text: &str) -> usize {
+    if text.is_empty() { 0 } else { text.split('\n').count() }
+}
+
+fn should_fold_paste(text: &str) -> bool {
+    pasted_line_count(text) > PASTE_FOLD_LINE_THRESHOLD || text.len() > PASTE_FOLD_BYTE_THRESHOLD
 }
 
 fn clamp_str_to_byte_len(text: &str, max_bytes: usize) -> &str {
@@ -5657,10 +5752,15 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
         .and_then(|seq| focused_session_kind(state, seq));
     let (prompt_span, prompt_width) = prompt_indicator(state.focus(), state.ascii_fallback(), session_kind);
     let continuation = " ".repeat(prompt_width);
+    let max_visible_rows = area.height.saturating_sub(1).max(1) as usize;
+    let cursor_line = input_ref.cursor.0.min(input_ref.lines.len().saturating_sub(1));
+    let first_visible_line = cursor_line.saturating_add(1).saturating_sub(max_visible_rows);
     let rendered_lines: Vec<Line<'_>> = input_ref
         .lines
         .iter()
         .enumerate()
+        .skip(first_visible_line)
+        .take(max_visible_rows)
         .map(|(idx, content)| {
             let prefix = if idx == 0 {
                 prompt_span.clone()
@@ -5693,8 +5793,8 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     // `area.y + 1` and the prompt prefix takes `prompt_width` columns (the
     // input-target indicator width, which varies between `main` and `agent #N`).
     let (cursor_line, cursor_offset) = input_ref.cursor;
-    let max_visible_rows = area.height.saturating_sub(1) as usize;
-    if cursor_line < input_ref.lines.len() && cursor_line < max_visible_rows {
+    let cursor_visible_row = cursor_line.saturating_sub(first_visible_line);
+    if cursor_line < input_ref.lines.len() && cursor_visible_row < max_visible_rows {
         let row_text = input_ref.lines.get(cursor_line).map(String::as_str).unwrap_or("");
         // Width-aware column: count *display* columns (not char count) up to
         // the byte offset. CJK and wide East-Asian glyphs occupy 2 columns,
@@ -5706,7 +5806,7 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
             .map_or(0, UnicodeWidthStr::width);
         let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
         let prefix_cols: u16 = u16::try_from(prompt_width).unwrap_or(2);
-        let row_offset = u16::try_from(cursor_line).unwrap_or(u16::MAX);
+        let row_offset = u16::try_from(cursor_visible_row).unwrap_or(u16::MAX);
         let cx = area.x.saturating_add(prefix_cols).saturating_add(col_offset);
         let cy = area.y.saturating_add(1).saturating_add(row_offset);
         // Only place cursor if it falls within the box bounds.
@@ -9807,6 +9907,41 @@ mod tests {
     }
 
     #[test]
+    fn large_paste_folds_to_chip_but_submits_original_text() {
+        let mut input = TuiInput::new();
+        let pasted = "one\ntwo\nthree\nfour\nfive\nsix";
+
+        input.paste(pasted);
+
+        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines]".to_string()]);
+        assert_eq!(input.text(), pasted);
+        match input.handle_key(key(KeyCode::Enter)) {
+            InputOutcome::Submitted(submitted) => assert_eq!(submitted, pasted),
+            other => panic!("expected folded paste to submit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn folded_paste_chips_increment_and_restore_through_history_navigation() {
+        let mut input = TuiInput::new();
+        input.record_history("older".to_string());
+        let first = "a\nb\nc\nd\ne\nf";
+        let second = "x".repeat(PASTE_FOLD_BYTE_THRESHOLD + 1);
+
+        input.paste(first);
+        input.paste(" ");
+        input.paste(&second);
+
+        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]);
+        assert_eq!(input.text(), format!("{first} {second}"));
+        assert!(input.history_prev(), "moves to history");
+        assert_eq!(input.text(), "older");
+        assert!(input.history_next(), "restores draft");
+        assert_eq!(input.lines, vec!["[Pasted text #1: 6 lines] [Pasted text #2: 1 lines]"]);
+        assert_eq!(input.text(), format!("{first} {second}"));
+    }
+
+    #[test]
     fn paste_into_existing_buffer_preserves_suffix() {
         let mut input = TuiInput::new();
         type_str(&mut input, "abXY");
@@ -9819,6 +9954,26 @@ mod tests {
         assert_eq!(input.lines, vec!["ab1".to_string(), "2XY".to_string()]);
         // Cursor lands after "2", before "XY".
         assert_eq!(input.cursor, (1, 1));
+    }
+
+    #[test]
+    fn render_input_scrolls_visible_window_to_cursor() {
+        let mut state = TuiState::new("p", "m");
+        state.input.lines = (0..15).map(|idx| format!("scroll-line-{idx:02}")).collect();
+        state.input.cursor = (14, "scroll-line-14".len());
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 90, 24, &mut scroll);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("scroll-line-14"),
+            "cursor row should be visible: {joined}"
+        );
+        assert!(
+            !joined.contains("scroll-line-00"),
+            "top rows should scroll out once cursor is below visible input window: {joined}"
+        );
     }
 
     #[test]
