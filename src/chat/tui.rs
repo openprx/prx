@@ -379,9 +379,6 @@ fn command_matches_filter(spec: CommandSpec, needle: &str) -> bool {
     if name.contains(needle) {
         return true;
     }
-    if spec.description.to_ascii_lowercase().contains(needle) {
-        return true;
-    }
     spec.aliases
         .iter()
         .any(|alias| alias.trim_start_matches('/').to_ascii_lowercase().contains(needle))
@@ -7970,14 +7967,16 @@ mod tests {
         assert_eq!(menu.filter, "mo");
         assert!(menu.entries.iter().any(|entry| entry.label == "/model"));
         assert!(
-            menu.entries.iter().all(|entry| entry.label != "/provider"),
-            "P0 /mo filter should exclude unrelated commands: {:?}",
+            menu.entries
+                .iter()
+                .all(|entry| entry.label.trim_start_matches('/').contains("mo")),
+            "U5 /mo filter should only include matching command names: {:?}",
             menu.entries
         );
     }
 
     #[test]
-    fn slash_menu_filters_command_descriptions() {
+    fn slash_menu_ignores_description_only_matches() {
         let mut state = TuiState::new("p", "m");
         for ch in "/conversation".chars() {
             assert_eq!(
@@ -7986,11 +7985,10 @@ mod tests {
             );
         }
 
-        let menu = state.slash_menu.as_ref().expect("description match keeps menu open");
+        assert_eq!(state.input.text(), "/conversation");
         assert!(
-            menu.entries.iter().any(|entry| entry.label == "/clear"),
-            "description text should match /clear: {:?}",
-            menu.entries
+            state.slash_menu.is_none(),
+            "description-only matches must not keep slash menu open"
         );
     }
 
