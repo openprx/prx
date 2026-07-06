@@ -1984,15 +1984,32 @@ async fn drive_start_turn_stream(
         tracing::debug!(error = %e, "StartTurn: action_tx closed before StreamUsageMetered");
         return;
     }
-    let record = Action::RecordAssistantTurn(accumulated.clone());
-    if let Err(e) = action_tx.send(record).await {
-        tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
-        return;
+    let empty_assistant_response = crate::agent::loop_::is_empty_assistant_response(&accumulated, false);
+    if empty_assistant_response {
+        if let Err(e) = action_tx
+            .send(Action::SystemMessageAdded {
+                text: crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed before empty-response system message");
+            return;
+        }
+    } else {
+        let record = Action::RecordAssistantTurn(accumulated.clone());
+        if let Err(e) = action_tx.send(record).await {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
+            return;
+        }
     }
     let action = Action::StreamCompleted {
         draft_id,
         final_text: accumulated,
-        reasoning: reasoning_buf,
+        reasoning: if empty_assistant_response {
+            String::new()
+        } else {
+            reasoning_buf
+        },
     };
     if let Err(e) = action_tx.send(action).await {
         tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
@@ -4821,6 +4838,114 @@ mod real_mode_tests {
             }
             other => panic!("expected StreamCompleted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn real_mode_empty_stream_surfaces_system_message_without_assistant_record() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct ReasoningOnlyProvider;
+
+        #[async_trait]
+        impl Provider for ReasoningOnlyProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: Some("thinking only".to_string()),
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![
+                    Ok(StreamChunk::reasoning_delta("thinking only")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ReasoningOnlyProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                draft_id: "draft-empty".to_string(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+            })
+            .await;
+
+        let mut saw_system_message = false;
+        let mut saw_completion = false;
+        for _ in 0..5 {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("driver action within 1.5s")
+                .expect("driver action received");
+            match action {
+                Action::SystemMessageAdded { text } => {
+                    assert_eq!(text, crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE);
+                    saw_system_message = true;
+                }
+                Action::RecordAssistantTurn(text) => {
+                    panic!("empty response must not record assistant turn: {text:?}");
+                }
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                } => {
+                    assert_eq!(draft_id, "draft-empty");
+                    assert!(final_text.is_empty(), "empty response completion stays empty");
+                    assert!(
+                        reasoning.is_empty(),
+                        "reasoning-only empty response must not render a reasoning card"
+                    );
+                    saw_completion = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_system_message, "empty response must surface a system message");
+        assert!(saw_completion, "empty response must still complete and clear the draft");
     }
 
     /// Step 5a-2 — provider stream 产生 Err 时发 StreamFailed（含 retryable 判定）.

@@ -5972,6 +5972,47 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
                         redux_tokens_used = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
                     }
+                    if crate::agent::loop_::is_empty_assistant_response(&final_text, false) {
+                        if let Err(e) = terminal.cancel_draft("user", &d_id).await {
+                            tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+                        }
+                        let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+                            &route_decision,
+                            provider_started_at,
+                            redux_tokens_used.clone(),
+                        );
+                        if let Err(e) =
+                            record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to append provider.final_outcome message event for empty Redux driver turn"
+                            );
+                        }
+                        chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
+                        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+                            }
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::ProviderUsageRecorded { record },
+                                "chat.provider_usage_recorded_empty_response",
+                            );
+                            #[cfg(feature = "terminal-tui")]
+                            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                                let _ = tx.try_send(());
+                            }
+                        }
+                        surface_turn_elapsed_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            "completed",
+                            provider_outcome.started_at,
+                            provider_outcome.finished_at,
+                        );
+                        continue;
+                    }
                     // 1) 把 driver 流式累计的最终文本写回 LLM history（与 legacy 行尾
                     //    `history.push(ChatMessage::assistant(...))` 对齐）。
                     history.push(ChatMessage::assistant(final_text.clone()));
@@ -6572,6 +6613,62 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
         // ── Sanitize response: strip tool-call XML/JSON artifacts ──
         let response = sanitize_channel_response(&response, &tools_registry);
+
+        if crate::agent::loop_::is_empty_assistant_response(&response, false) {
+            if let Some(ref d_id) = draft_id {
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::StreamCompleted {
+                        draft_id: d_id.clone(),
+                        final_text: String::new(),
+                        reasoning: String::new(),
+                    },
+                    "chat.stream_completed_empty_response",
+                );
+                if let Err(e) = terminal.cancel_draft("user", d_id).await {
+                    tracing::debug!(error = %e, "cancel empty-response draft failed");
+                }
+            }
+            surface_session_message(
+                &chat_dispatcher,
+                sessions_redraw_handle.as_ref(),
+                crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+            );
+
+            let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
+            chat_session.add_user_turn(&sanitized_input);
+            if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                #[cfg(feature = "terminal-tui")]
+                {
+                    chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+                }
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::ProviderUsageRecorded { record },
+                    "chat.provider_usage_recorded_empty_response",
+                );
+                #[cfg(feature = "terminal-tui")]
+                if let Some(tx) = redraw_tx_for_main.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
+            if !dual_write_guard.is_active() {
+                if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+                    tracing::warn!("Failed to persist session after empty assistant response: {e}");
+                }
+                observer.record_event(&ObserverEvent::TurnComplete);
+                hooks
+                    .emit(
+                        HookEvent::TurnComplete,
+                        serde_json::json!({
+                            "mode": "chat",
+                            "response_chars": 0,
+                        }),
+                    )
+                    .await;
+            } else {
+                observer.record_event(&ObserverEvent::TurnComplete);
+            }
+            continue;
+        }
 
         if let Err(e) = record_chat_assistant_message_event(
             &memory_fabric,

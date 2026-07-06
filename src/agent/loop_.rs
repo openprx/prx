@@ -76,6 +76,12 @@ impl ChatMode {
     }
 }
 
+pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "model returned empty response";
+
+pub(crate) fn is_empty_assistant_response(text: &str, has_tool_calls: bool) -> bool {
+    text.trim().is_empty() && !has_tool_calls
+}
+
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
 pub enum ToolCallNotification {
@@ -5272,6 +5278,17 @@ pub(crate) async fn run_tool_call_loop_outcome(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
+            if is_empty_assistant_response(&response_text, false) {
+                tracing::warn!(
+                    provider = provider_name,
+                    model,
+                    user_message = EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+                    "model returned empty assistant response; suppressing assistant history turn"
+                );
+                last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
+                last_turn_trace.tokens_used = usage_accumulator.finish();
+                return Ok((ToolLoopOutcome::Text(String::new()), last_turn_trace));
+            }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
@@ -11697,6 +11714,64 @@ Let me check the result."#;
     mod stay_silent_outcome {
         use super::*;
         use crate::tools::StaySilentTool;
+
+        #[tokio::test]
+        async fn empty_assistant_response_writes_no_assistant_history() {
+            let provider = ScriptedProvider {
+                responses: Arc::new(Mutex::new(
+                    vec![ChatResponse {
+                        text: Some("   \n".to_string()),
+                        tool_calls: Vec::new(),
+                        reasoning_content: Some("thinking without content".to_string()),
+                    }]
+                    .into(),
+                )),
+            };
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+            let tmp = TempDir::new().unwrap();
+
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                false,
+                2,
+                30,
+                false,
+                Vec::new(),
+                ToolConcurrencyGovernanceConfig::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatMode::default(),
+                None,
+                false,
+            )
+            .await
+            .expect("empty response turn should complete");
+
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text.is_empty()));
+            assert_eq!(history.len(), 2, "empty assistant turn must not be appended");
+            assert!(
+                history.iter().all(|message| message.role != "assistant"),
+                "history must not contain an assistant turn after empty response: {history:?}"
+            );
+        }
 
         async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {
             let provider = ScriptedProvider::from_text_responses(vec![response]);
