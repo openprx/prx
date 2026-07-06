@@ -401,6 +401,12 @@ fn copy_success_message(selection: &CopySelection) -> String {
     }
 }
 
+fn mouse_capture_disabled_by_env(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Compact conversation history in-place to fit within context window limits.
 ///
 /// Preserves the system prompt (index 0), keeps the last [`COMPACT_KEEP_MESSAGES`]
@@ -1534,6 +1540,16 @@ mod runtime_display_tests {
     }
 
     #[test]
+    fn mouse_capture_disable_env_parser_is_explicit() {
+        for enabled in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(mouse_capture_disabled_by_env(Some(enabled)), "{enabled:?}");
+        }
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("no")] {
+            assert!(!mouse_capture_disabled_by_env(disabled), "{disabled:?}");
+        }
+    }
+
+    #[test]
     fn completion_announcement_includes_final_elapsed() {
         let fin = FinishedSession {
             seq: 4,
@@ -2444,15 +2460,18 @@ fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Res
     }
     state.alternate_screen_active = true;
 
-    if let Err(e) = ops.enable_mouse_capture() {
-        if state.alternate_screen_active {
-            let _ = ops.leave_alternate_screen();
-            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    let mouse_disabled = mouse_capture_disabled_by_env(std::env::var("PRX_TUI_DISABLE_MOUSE").ok().as_deref());
+    if !mouse_disabled {
+        if let Err(e) = ops.enable_mouse_capture() {
+            if state.alternate_screen_active {
+                let _ = ops.leave_alternate_screen();
+                CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            }
+            let _ = ops.disable_raw_mode();
+            return Err(e);
         }
-        let _ = ops.disable_raw_mode();
-        return Err(e);
+        state.mouse_capture_active = true;
     }
-    state.mouse_capture_active = true;
 
     match ops.supports_keyboard_enhancement() {
         Ok(true) => {

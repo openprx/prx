@@ -290,7 +290,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         name: "/copy",
         aliases: &[],
         args_hint: "[N]",
-        description: "Copy the most recent assistant reply",
+        description: "Copy latest or Nth previous assistant reply",
         arg: NO_ARG,
     },
     CommandSpec {

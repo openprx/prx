@@ -6205,7 +6205,7 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} Shift+Enter newline \u{00B7} \\+Enter continue \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} /copy latest \u{00B7} Shift/Option/Fn-drag select \u{00B7} Shift+Enter newline \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
@@ -10586,6 +10586,24 @@ mod tests {
         assert!(
             !joined.contains("HEAD"),
             "wrapped input should scroll old visual rows out when cursor is at tail: {joined}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_footer_advertises_copy_paths() {
+        let state = TuiState::new("p", "m");
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 180, 24, &mut scroll);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("/copy latest"),
+            "footer should advertise /copy: {joined}"
+        );
+        assert!(
+            joined.contains("Shift/Option/Fn-drag select"),
+            "footer should advertise native selection escape hatch: {joined}"
         );
     }
 
