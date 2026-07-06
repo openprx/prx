@@ -8983,6 +8983,26 @@ fn run_tui_unified_loop(
             Event::Mouse(mouse) => {
                 if apply_fullscreen_mouse_scroll(mouse.kind, &mut fullscreen_scroll) {
                     let _ = redraw_tx.try_send(());
+                } else if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                ) {
+                    if let Ok(size) = terminal.size() {
+                        let toggled = {
+                            let mut guard = mirror.lock();
+                            tui::toggle_reasoning_at_fullscreen_point(
+                                &mut guard,
+                                &fullscreen_scroll,
+                                size.width,
+                                size.height,
+                                mouse.column,
+                                mouse.row,
+                            )
+                        };
+                        if toggled {
+                            let _ = redraw_tx.try_send(());
+                        }
+                    }
                 }
             }
             _ => {

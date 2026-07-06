@@ -3522,6 +3522,17 @@ impl FullscreenTranscriptScroll {
     }
 }
 
+fn fullscreen_transcript_area<V: BottomChromeView + ?Sized>(state: &V, total_width: u16, total_height: u16) -> Rect {
+    let chrome_height = fullscreen_bottom_chrome_height_for_width(state, total_width).min(total_height);
+    let content_area = Rect {
+        x: 0,
+        y: 0,
+        width: total_width,
+        height: total_height.saturating_sub(chrome_height),
+    };
+    fullscreen_content_areas(content_area, state).0
+}
+
 fn fullscreen_tail_marker<V: BottomChromeView + ?Sized>(state: &V) -> usize {
     let finalized = state.conversation_lines().len().saturating_mul(1_000_000);
     let streaming_chars = state
@@ -3572,6 +3583,105 @@ pub fn fullscreen_transcript_scroll_available<V: BottomChromeView + ?Sized>(stat
         && state.pending_tool_approval().is_none()
         && state.active_session_view().is_none()
         && !state.focus().is_child_view()
+}
+
+/// Toggle a visible reasoning-card header at a fullscreen mouse coordinate.
+///
+/// This mirrors the transcript renderer's viewport math: frame dimensions are
+/// converted into the transcript area, the current scroll state chooses the
+/// top visible row, and only rows occupied by a `Reasoning` header are
+/// actionable. Body rows and other conversation lines are ignored.
+pub fn toggle_reasoning_at_fullscreen_point(
+    state: &mut TuiState,
+    scroll: &FullscreenTranscriptScroll,
+    total_width: u16,
+    total_height: u16,
+    column: u16,
+    row: u16,
+) -> bool {
+    let area = fullscreen_transcript_area(state, total_width, total_height);
+    if area.width == 0
+        || area.height == 0
+        || column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < area.y
+        || row >= area.y.saturating_add(area.height)
+    {
+        return false;
+    }
+
+    let top_scroll = fullscreen_transcript_top_scroll(state, scroll, area);
+    let clicked_row = top_scroll.saturating_add(usize::from(row.saturating_sub(area.y)));
+    reasoning_index_at_rendered_row(state, area.width.max(1), clicked_row).is_some_and(|idx| {
+        if let Some(ConversationLine::Reasoning { folded, .. }) = state.conversation_lines.get_mut(idx) {
+            *folded = !*folded;
+            return true;
+        }
+        false
+    })
+}
+
+fn fullscreen_transcript_top_scroll<V: BottomChromeView + ?Sized>(
+    state: &V,
+    scroll: &FullscreenTranscriptScroll,
+    area: Rect,
+) -> usize {
+    if area.height == 0 {
+        return 0;
+    }
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    push_conversation_transcript_lines(&mut lines, state);
+    let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
+        content: streaming.accumulated.clone(),
+    });
+    if let Some(streaming_line) = streaming_tail.as_ref() {
+        render_conversation_line(&mut lines, streaming_line, state.ascii_fallback());
+    }
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(transcript is empty)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    let total_rows = usize::from(measure_wrapped_rows(&lines, area.width.max(1)));
+    let visible_rows = usize::from(area.height.max(1));
+    let max_scroll = total_rows.saturating_sub(visible_rows);
+    if max_scroll == 0 {
+        return 0;
+    }
+    if scroll.offset_from_bottom == 0 {
+        return max_scroll;
+    }
+    if let Some(anchor_top_row) = scroll.anchor_top_row {
+        return anchor_top_row.min(max_scroll);
+    }
+    max_scroll.saturating_sub(scroll.offset_from_bottom.min(max_scroll))
+}
+
+fn push_conversation_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &'a V) {
+    for line in state.conversation_lines() {
+        render_conversation_line(lines, line, state.ascii_fallback());
+    }
+}
+
+fn reasoning_index_at_rendered_row(state: &TuiState, width: u16, rendered_row: usize) -> Option<usize> {
+    let mut cursor = 0usize;
+    for (idx, conv_line) in state.conversation_lines.iter().enumerate() {
+        let mut rendered = Vec::new();
+        render_conversation_line(&mut rendered, conv_line, state.ascii_fallback());
+        let line_rows = usize::from(measure_wrapped_rows(&rendered, width));
+        if let ConversationLine::Reasoning { .. } = conv_line {
+            let header_rows = rendered.first().map_or(1, |header| {
+                let header_lines = vec![header.clone()];
+                usize::from(measure_wrapped_rows(&header_lines, width))
+            });
+            if rendered_row >= cursor && rendered_row < cursor.saturating_add(header_rows) {
+                return Some(idx);
+            }
+        }
+        cursor = cursor.saturating_add(line_rows);
+    }
+    None
 }
 
 fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -3707,9 +3817,7 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
     }
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for line in state.conversation_lines() {
-        render_conversation_line(&mut lines, line, state.ascii_fallback());
-    }
+    push_conversation_transcript_lines(&mut lines, state);
     let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
         content: streaming.accumulated.clone(),
     });
@@ -7577,6 +7685,50 @@ mod tests {
         };
         // 1 header + 4 body lines = 5
         assert_eq!(estimate_line_height(&expanded), 5);
+    }
+
+    #[test]
+    fn mouse_click_on_reasoning_header_toggles_fold_state() {
+        let mut state = TuiState::new("p", "m");
+        assert!(state.push_reasoning("first step\nsecond step"));
+        let scroll = FullscreenTranscriptScroll::default();
+
+        assert!(toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 0));
+        match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "click expands folded card"),
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+
+        assert!(
+            !toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 1),
+            "clicking expanded body must not toggle"
+        );
+        match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(!*folded, "body click leaves card expanded"),
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+
+        assert!(toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 24, 0, 0));
+        match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(*folded, "second header click collapses"),
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mouse_click_outside_transcript_does_not_toggle_reasoning() {
+        let mut state = TuiState::new("p", "m");
+        assert!(state.push_reasoning("first step"));
+        let scroll = FullscreenTranscriptScroll::default();
+
+        assert!(
+            !toggle_reasoning_at_fullscreen_point(&mut state, &scroll, 80, 6, 0, 5),
+            "bottom chrome row is outside the transcript"
+        );
+        match state.conversation_lines.last() {
+            Some(ConversationLine::Reasoning { folded, .. }) => assert!(*folded, "outside click leaves default fold"),
+            other => panic!("test: expected Reasoning, got {other:?}"),
+        }
     }
 
     #[test]
