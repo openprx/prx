@@ -1460,6 +1460,15 @@ impl Channel for TelegramChannel {
         "telegram"
     }
 
+    fn bot_identity(&self) -> Option<String> {
+        self.bot_username
+            .lock()
+            .as_ref()
+            .map(|username| username.trim_start_matches('@'))
+            .filter(|username| !username.is_empty())
+            .map(|username| format!("@{username}"))
+    }
+
     fn supports_draft_updates(&self) -> bool {
         self.stream_mode != StreamMode::Off
     }

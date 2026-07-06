@@ -1,8 +1,8 @@
 use super::principal::{ChatType, MemoryWriteContext, Principal, Role, ScopeParam, Visibility, classify_memory};
 use super::traits::{
-    CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput, DocumentRecord,
-    DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry, MemoryEvent,
-    MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility,
+    ChatProfile, CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,
+    DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
+    MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility,
     MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
     validate_memory_write_target,
 };
@@ -793,6 +793,23 @@ impl PostgresMemory {
             CREATE INDEX IF NOT EXISTS idx_ib_channel_account
                 ON {schema_ident}.identity_bindings(channel, channel_account);
 
+            CREATE TABLE IF NOT EXISTS {schema_ident}.chat_profiles (
+                id          TEXT PRIMARY KEY,
+                channel     TEXT NOT NULL,
+                chat_id     TEXT NOT NULL,
+                chat_kind   TEXT NOT NULL,
+                title       TEXT,
+                purpose     TEXT,
+                notes       TEXT,
+                tags        TEXT NOT NULL DEFAULT '[]',
+                updated_by  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                UNIQUE(channel, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_profiles_lookup
+                ON {schema_ident}.chat_profiles(channel, chat_id);
+
             CREATE TABLE IF NOT EXISTS {schema_ident}.user_policies (
                 user_id             TEXT PRIMARY KEY,
                 role                TEXT NOT NULL DEFAULT 'guest',
@@ -1526,6 +1543,10 @@ impl PostgresMemory {
         self.schema_scoped_table("identity_bindings")
     }
 
+    fn qualified_chat_profiles_table(&self) -> String {
+        self.schema_scoped_table("chat_profiles")
+    }
+
     fn qualified_user_policies_table(&self) -> String {
         self.schema_scoped_table("user_policies")
     }
@@ -1972,10 +1993,129 @@ fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
+fn chat_profile_from_pg_row(row: &Row) -> ChatProfile {
+    let tags_json: String = row.get(7);
+    let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+    ChatProfile {
+        id: row.get(0),
+        channel: row.get(1),
+        chat_id: row.get(2),
+        chat_kind: row.get(3),
+        title: row.get(4),
+        purpose: row.get(5),
+        notes: row.get(6),
+        tags,
+        updated_by: row.get(8),
+        created_at: row.get(9),
+        updated_at: row.get(10),
+    }
+}
+
 #[async_trait]
 impl Memory for PostgresMemory {
     fn name(&self) -> &str {
         "postgres"
+    }
+
+    async fn upsert_chat_profile_metadata(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        title: Option<&str>,
+    ) -> Result<()> {
+        let client = self.client.clone();
+        let table = self.qualified_chat_profiles_table();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let chat_kind = chat_kind.to_string();
+        let title = title.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let now = Utc::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            let stmt = format!(
+                "INSERT INTO {table}
+                    (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, $5, NULL, NULL, '[]', 'auto', $6, $6)
+                 ON CONFLICT (channel, chat_id) DO UPDATE SET
+                    chat_kind = EXCLUDED.chat_kind,
+                    title = CASE
+                        WHEN EXCLUDED.title IS NOT NULL THEN EXCLUDED.title
+                        ELSE {table}.title
+                    END,
+                    updated_at = EXCLUDED.updated_at"
+            );
+            client.with_client(|client| {
+                client.execute(&stmt, &[&id, &channel, &chat_id, &chat_kind, &title, &now])?;
+                Ok(())
+            })
+        })
+        .await?
+    }
+
+    async fn update_chat_profile(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        purpose: Option<&str>,
+        notes: Option<&str>,
+        tags: Option<&[String]>,
+        updated_by: &str,
+    ) -> Result<ChatProfile> {
+        let client = self.client.clone();
+        let table = self.qualified_chat_profiles_table();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let chat_kind = chat_kind.to_string();
+        let purpose = purpose.map(str::to_string);
+        let notes = notes.map(str::to_string);
+        let tags_json = tags.map(serde_json::to_string).transpose()?;
+        let updated_by = updated_by.to_string();
+        tokio::task::spawn_blocking(move || -> Result<ChatProfile> {
+            let now = Utc::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            let stmt = format!(
+                "INSERT INTO {table}
+                    (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
+                 VALUES ($1, $2, $3, $4, NULL, $5, $6, COALESCE($7, '[]'), $8, $9, $9)
+                 ON CONFLICT (channel, chat_id) DO UPDATE SET
+                    chat_kind = EXCLUDED.chat_kind,
+                    purpose = COALESCE(EXCLUDED.purpose, {table}.purpose),
+                    notes = COALESCE(EXCLUDED.notes, {table}.notes),
+                    tags = COALESCE($7, {table}.tags),
+                    updated_by = EXCLUDED.updated_by,
+                    updated_at = EXCLUDED.updated_at
+                 RETURNING id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at"
+            );
+            client.with_client(|client| {
+                let row = client.query_one(
+                    &stmt,
+                    &[&id, &channel, &chat_id, &chat_kind, &purpose, &notes, &tags_json, &updated_by, &now],
+                )?;
+                Ok(chat_profile_from_pg_row(&row))
+            })
+        })
+        .await?
+    }
+
+    async fn get_chat_profile(&self, channel: &str, chat_id: &str) -> Result<Option<ChatProfile>> {
+        let client = self.client.clone();
+        let table = self.qualified_chat_profiles_table();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<ChatProfile>> {
+            let stmt = format!(
+                "SELECT id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at
+                 FROM {table}
+                 WHERE channel = $1 AND chat_id = $2"
+            );
+            client.with_client(|client| {
+                let row = client.query_opt(&stmt, &[&channel, &chat_id])?;
+                Ok(row.as_ref().map(chat_profile_from_pg_row))
+            })
+        })
+        .await?
     }
 
     async fn store(&self, key: &str, content: &str, category: MemoryCategory, session_id: Option<&str>) -> Result<()> {

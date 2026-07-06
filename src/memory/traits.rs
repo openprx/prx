@@ -32,6 +32,21 @@ pub struct MemoryEntry {
     pub compressed_from: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ChatProfile {
+    pub id: String,
+    pub channel: String,
+    pub chat_id: String,
+    pub chat_kind: String,
+    pub title: Option<String>,
+    pub purpose: Option<String>,
+    pub notes: Option<String>,
+    pub tags: Vec<String>,
+    pub updated_by: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 /// Verification state of a memory entry's factual quality.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -741,6 +756,41 @@ pub trait Memory: Send + Sync {
     /// tool output.
     fn supports_document_ingest(&self) -> bool {
         true
+    }
+
+    /// Upsert channel-provided metadata for the exact conversation without
+    /// touching self-maintained purpose/notes/tags.
+    async fn upsert_chat_profile_metadata(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        title: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let _ = (channel, chat_id, chat_kind, title);
+        Ok(())
+    }
+
+    /// Update the current conversation profile. The caller is responsible for
+    /// deriving channel/chat_id from trusted runtime scope.
+    async fn update_chat_profile(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        purpose: Option<&str>,
+        notes: Option<&str>,
+        tags: Option<&[String]>,
+        updated_by: &str,
+    ) -> anyhow::Result<ChatProfile> {
+        let _ = (channel, chat_id, chat_kind, purpose, notes, tags, updated_by);
+        Err(crate::memory::fabric::fail_fast(self.name(), "update_chat_profile"))
+    }
+
+    /// Load the exact conversation profile by `(channel, chat_id)`.
+    async fn get_chat_profile(&self, channel: &str, chat_id: &str) -> anyhow::Result<Option<ChatProfile>> {
+        let _ = (channel, chat_id);
+        Ok(None)
     }
 
     /// Append a persisted channel conversation turn.

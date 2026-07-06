@@ -580,6 +580,22 @@ impl Channel for WacliChannel {
         "wacli"
     }
 
+    fn bot_identity(&self) -> Option<String> {
+        self.config
+            .bot_jid
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                self.config
+                    .bot_number
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+            })
+            .map(str::to_string)
+    }
+
     async fn listen(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let cfg = self.config.clone();
 

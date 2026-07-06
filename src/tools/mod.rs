@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_list;
+pub mod chat_profile_update;
 pub mod composio;
 pub mod config_reload;
 pub mod cron;
@@ -59,6 +60,7 @@ pub mod web_search_tool;
 pub mod xin;
 
 pub use agents_list::AgentsListTool;
+pub use chat_profile_update::ChatProfileUpdateTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
@@ -347,6 +349,7 @@ pub fn all_tools_with_runtime_ext(
 
     // ── Memory module gates memory tools ──
     if modules.memory {
+        tool_arcs.push(Arc::new(ChatProfileUpdateTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemorySearchTool::new(

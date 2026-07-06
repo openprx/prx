@@ -6,7 +6,7 @@ use super::principal::{
 };
 use super::topic::resolve_topic;
 use super::traits::{
-    CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
+    ChatProfile, CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
     DocumentIngestInput, DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput,
     MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata,
     MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery,
@@ -243,6 +243,24 @@ pub struct SqliteMemory {
 }
 
 impl SqliteMemory {
+    fn chat_profile_from_row(row: &Row<'_>) -> rusqlite::Result<ChatProfile> {
+        let tags_json: String = row.get(7)?;
+        let tags = serde_json::from_str::<Vec<String>>(&tags_json).unwrap_or_default();
+        Ok(ChatProfile {
+            id: row.get(0)?,
+            channel: row.get(1)?,
+            chat_id: row.get(2)?,
+            chat_kind: row.get(3)?,
+            title: row.get(4)?,
+            purpose: row.get(5)?,
+            notes: row.get(6)?,
+            tags,
+            updated_by: row.get(8)?,
+            created_at: row.get(9)?,
+            updated_at: row.get(10)?,
+        })
+    }
+
     pub fn new(workspace_dir: &Path) -> anyhow::Result<Self> {
         Self::with_embedder_with_acl(
             workspace_dir,
@@ -597,6 +615,22 @@ impl SqliteMemory {
             );
             CREATE INDEX IF NOT EXISTS idx_ib_user ON identity_bindings(user_id);
             CREATE INDEX IF NOT EXISTS idx_ib_channel_account ON identity_bindings(channel, channel_account);
+
+            CREATE TABLE IF NOT EXISTS chat_profiles (
+                id          TEXT PRIMARY KEY,
+                channel     TEXT NOT NULL,
+                chat_id     TEXT NOT NULL,
+                chat_kind   TEXT NOT NULL,
+                title       TEXT,
+                purpose     TEXT,
+                notes       TEXT,
+                tags        TEXT NOT NULL DEFAULT '[]',
+                updated_by  TEXT NOT NULL,
+                created_at  TEXT NOT NULL,
+                updated_at  TEXT NOT NULL,
+                UNIQUE(channel, chat_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chat_profiles_lookup ON chat_profiles(channel, chat_id);
 
             CREATE TABLE IF NOT EXISTS agent_identity_bindings (
                 binding_id        TEXT PRIMARY KEY,
@@ -2609,6 +2643,102 @@ impl SqliteMemory {
 impl Memory for SqliteMemory {
     fn name(&self) -> &str {
         "sqlite"
+    }
+
+    async fn upsert_chat_profile_metadata(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        title: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let conn = self.conn.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let chat_kind = chat_kind.to_string();
+        let title = title.map(str::to_string);
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let now = Utc::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            let conn = conn.lock();
+            conn.execute(
+                "INSERT INTO chat_profiles
+                    (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, '[]', 'auto', ?6, ?6)
+                 ON CONFLICT(channel, chat_id) DO UPDATE SET
+                    chat_kind = excluded.chat_kind,
+                    title = CASE
+                        WHEN excluded.title IS NOT NULL THEN excluded.title
+                        ELSE chat_profiles.title
+                    END,
+                    updated_at = excluded.updated_at",
+                params![id, channel, chat_id, chat_kind, title, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
+    async fn update_chat_profile(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        chat_kind: &str,
+        purpose: Option<&str>,
+        notes: Option<&str>,
+        tags: Option<&[String]>,
+        updated_by: &str,
+    ) -> anyhow::Result<ChatProfile> {
+        let conn = self.conn.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let chat_kind = chat_kind.to_string();
+        let purpose = purpose.map(str::to_string);
+        let notes = notes.map(str::to_string);
+        let tags_json = tags.map(serde_json::to_string).transpose()?;
+        let updated_by = updated_by.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<ChatProfile> {
+            let now = Utc::now().to_rfc3339();
+            let id = Uuid::new_v4().to_string();
+            let conn = conn.lock();
+            let profile = conn.query_row(
+                "INSERT INTO chat_profiles
+                    (id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, COALESCE(?7, '[]'), ?8, ?9, ?9)
+                 ON CONFLICT(channel, chat_id) DO UPDATE SET
+                    chat_kind = excluded.chat_kind,
+                    purpose = COALESCE(excluded.purpose, chat_profiles.purpose),
+                    notes = COALESCE(excluded.notes, chat_profiles.notes),
+                    tags = COALESCE(?7, chat_profiles.tags),
+                    updated_by = excluded.updated_by,
+                    updated_at = excluded.updated_at
+                 RETURNING id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at",
+                params![id, channel, chat_id, chat_kind, purpose, notes, tags_json, updated_by, now],
+                Self::chat_profile_from_row,
+            )?;
+            Ok(profile)
+        })
+        .await?
+    }
+
+    async fn get_chat_profile(&self, channel: &str, chat_id: &str) -> anyhow::Result<Option<ChatProfile>> {
+        let conn = self.conn.clone();
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<ChatProfile>> {
+            let conn = conn.lock();
+            let profile = conn
+                .query_row(
+                    "SELECT id, channel, chat_id, chat_kind, title, purpose, notes, tags, updated_by, created_at, updated_at
+                     FROM chat_profiles
+                     WHERE channel = ?1 AND chat_id = ?2",
+                    params![channel, chat_id],
+                    Self::chat_profile_from_row,
+                )
+                .optional()?;
+            Ok(profile)
+        })
+        .await?
     }
 
     async fn store(
@@ -5283,6 +5413,44 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mem = SqliteMemory::new(tmp.path()).unwrap();
         (tmp, mem)
+    }
+
+    #[tokio::test]
+    async fn chat_profile_metadata_upsert_preserves_self_maintained_fields() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.upsert_chat_profile_metadata("telegram", "group-a", "group", Some("Initial"))
+            .await
+            .unwrap();
+        let profile = mem
+            .update_chat_profile(
+                "telegram",
+                "group-a",
+                "group",
+                Some("Release coordination"),
+                Some("Keep deploy notes here"),
+                Some(&["release".to_string()]),
+                "agent",
+            )
+            .await
+            .unwrap();
+        assert_eq!(profile.updated_by, "agent");
+
+        mem.upsert_chat_profile_metadata("telegram", "group-a", "thread", Some("Renamed"))
+            .await
+            .unwrap();
+        let profile = mem.get_chat_profile("telegram", "group-a").await.unwrap().unwrap();
+        assert_eq!(profile.chat_kind, "thread");
+        assert_eq!(profile.title.as_deref(), Some("Renamed"));
+        assert_eq!(profile.purpose.as_deref(), Some("Release coordination"));
+        assert_eq!(profile.notes.as_deref(), Some("Keep deploy notes here"));
+        assert_eq!(profile.tags, vec!["release"]);
+        assert_eq!(profile.updated_by, "agent");
+
+        mem.upsert_chat_profile_metadata("telegram", "group-a", "group", None)
+            .await
+            .unwrap();
+        let profile = mem.get_chat_profile("telegram", "group-a").await.unwrap().unwrap();
+        assert_eq!(profile.title.as_deref(), Some("Renamed"));
     }
 
     fn test_conversation_principal(session_key: &str, owner_id: Option<&str>) -> MemoryPrincipal {

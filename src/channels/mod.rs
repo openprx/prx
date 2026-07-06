@@ -75,7 +75,8 @@ use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
 use crate::memory::{
-    self, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility, MemoryWriteContext,
+    self, ChatProfile, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility,
+    MemoryWriteContext,
 };
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
@@ -893,8 +894,94 @@ fn stay_silent_tool_instructions() -> String {
     block
 }
 
-fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
-    let instructions = channel_runtime_instructions(channel_name);
+fn prompt_trim(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (idx, ch) in value.trim().chars().enumerate() {
+        if idx >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+const fn display_chat_kind(kind: ChatKind) -> &'static str {
+    match kind {
+        ChatKind::Dm => "dm",
+        ChatKind::Group => "group",
+        ChatKind::Thread => "thread",
+    }
+}
+
+fn build_current_conversation_prompt(
+    msg: &traits::ChannelMessage,
+    profile: Option<&ChatProfile>,
+    bot_identity: Option<&str>,
+) -> String {
+    let kind = profile
+        .map(|profile| profile.chat_kind.as_str())
+        .map(|value| match value {
+            "group" => "group",
+            "thread" => "thread",
+            _ => "dm",
+        })
+        .unwrap_or_else(|| display_chat_kind(chat_kind_from_message(msg)));
+    let title = msg
+        .chat_title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| profile.and_then(|profile| profile.title.as_deref()))
+        .unwrap_or("untitled");
+    let you = bot_identity.unwrap_or(msg.channel.as_str());
+    let mut block = format!(
+        "## Current Conversation\n- Platform: {} | You: {}\n- Type: {} | Chat: \"{}\" ({})",
+        msg.channel,
+        prompt_trim(you, 48),
+        kind,
+        prompt_trim(title, 80),
+        prompt_trim(&msg.reply_target, 96)
+    );
+    if let Some(profile) = profile {
+        if let Some(purpose) = profile.purpose.as_deref().filter(|value| !value.trim().is_empty()) {
+            let _ = write!(block, "\n- Purpose (self-maintained): {}", prompt_trim(purpose, 180));
+        }
+        let notes = profile.notes.as_deref().filter(|value| !value.trim().is_empty());
+        let tags = if profile.tags.is_empty() {
+            None
+        } else {
+            Some(profile.tags.join(", "))
+        };
+        if notes.is_some() || tags.is_some() {
+            let _ = write!(
+                block,
+                "\n- Notes: {} | Tags: {}",
+                notes
+                    .map(|value| prompt_trim(value, 240))
+                    .unwrap_or_else(|| "none".to_string()),
+                tags.as_deref()
+                    .map(|value| prompt_trim(value, 120))
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+    }
+    block.push_str("\n- Update via chat_profile_update when you learn what this chat is for.");
+    block
+}
+
+fn build_channel_system_prompt(
+    base_prompt: &str,
+    msg: &traits::ChannelMessage,
+    profile: Option<&ChatProfile>,
+    bot_identity: Option<&str>,
+) -> String {
+    let instructions = channel_runtime_instructions(&msg.channel);
+    let current_conversation = build_current_conversation_prompt(msg, profile, bot_identity);
+    let instructions = format!("{instructions}\n\n{current_conversation}");
     if base_prompt.is_empty() {
         instructions
     } else {
@@ -2687,6 +2774,23 @@ async fn process_channel_message(
     // share a single run_id (per-turn provenance, not per-session).
     let turn_run_id = uuid::Uuid::new_v4().to_string();
 
+    if let Err(error) = ctx
+        .memory
+        .upsert_chat_profile_metadata(
+            &msg.channel,
+            &msg.reply_target,
+            inferred_chat_type,
+            msg.chat_title.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            channel = %msg.channel,
+            chat_id = %msg.reply_target,
+            "failed to upsert chat profile metadata: {error}"
+        );
+    }
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
     let inbound_event = append_sender_turn(
@@ -2925,6 +3029,17 @@ async fn process_channel_message(
     )
     .await
     .preamble;
+    let chat_profile = match ctx.memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(
+                channel = %msg.channel,
+                chat_id = %msg.reply_target,
+                "failed to load chat profile for prompt: {error}"
+            );
+            None
+        }
+    };
 
     // When Skill RAG is enabled, select relevant skills per-message and rebuild
     // the system prompt (same as chat/mod.rs per-turn skill selection).
@@ -2968,7 +3083,13 @@ async fn process_channel_message(
         }
         prompt
     };
-    let mut system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
+    let bot_identity = target_channel.as_ref().and_then(|channel| channel.bot_identity());
+    let mut system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg,
+        chat_profile.as_ref(),
+        bot_identity.as_deref(),
+    );
     // Smart group-reply: override the default "respond directly / response is
     // automatically sent" guidance so the model knows it is one participant in a
     // group and may decline to speak via `stay_silent`. Only appended for smart
@@ -10048,7 +10169,14 @@ BTC is currently around $65,000 based on latest tool output."#
     fn channel_prompt_includes_channel_delivery_context() {
         let ws = make_workspace();
         let base_prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
-        let prompt = build_channel_system_prompt(&base_prompt, "telegram");
+        let msg = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "chat-1".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Ops".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_channel_system_prompt(&base_prompt, &msg, None, Some("@bot"));
 
         assert!(
             prompt.contains("## Channel Capabilities"),
@@ -10063,6 +10191,105 @@ BTC is currently around $65,000 based on latest tool output."#
             prompt.contains("When responding on Telegram"),
             "missing Telegram delivery guidance"
         );
+        assert!(
+            prompt.contains("## Current Conversation")
+                && prompt.contains("- Platform: telegram | You: @bot")
+                && prompt.contains("- Type: group | Chat: \"Ops\" (chat-1)"),
+            "missing current conversation context"
+        );
+    }
+
+    fn test_chat_profile(channel: &str, chat_id: &str, chat_kind: &str, purpose: &str) -> ChatProfile {
+        ChatProfile {
+            id: format!("{channel}-{chat_id}"),
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            chat_kind: chat_kind.to_string(),
+            title: Some(format!("title-{chat_id}")),
+            purpose: Some(purpose.to_string()),
+            notes: Some("shared operating notes".to_string()),
+            tags: vec!["ops".to_string(), "handoff".to_string()],
+            updated_by: "agent".to_string(),
+            created_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn current_conversation_prompt_cross_chat_isolation() {
+        let group_a = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "group-a".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Group A".to_string()),
+            ..Default::default()
+        };
+        let group_b = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "group-b".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Group B".to_string()),
+            ..Default::default()
+        };
+        let dm = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "dm-1".to_string(),
+            chat_kind: ChatKind::Dm,
+            chat_title: Some("Direct".to_string()),
+            ..Default::default()
+        };
+        let profile_a = test_chat_profile("telegram", "group-a", "group", "A-only release room");
+
+        let prompt_a = build_current_conversation_prompt(&group_a, Some(&profile_a), Some("@bot"));
+        let prompt_b = build_current_conversation_prompt(&group_b, None, Some("@bot"));
+        let prompt_dm = build_current_conversation_prompt(&dm, None, Some("@bot"));
+
+        assert!(prompt_a.contains("A-only release room"));
+        assert!(!prompt_b.contains("A-only release room"));
+        assert!(!prompt_dm.contains("A-only release room"));
+        assert!(prompt_b.contains("- Type: group | Chat: \"Group B\" (group-b)"));
+        assert!(prompt_dm.contains("- Type: dm | Chat: \"Direct\" (dm-1)"));
+    }
+
+    #[test]
+    fn current_conversation_prompt_snapshots_no_profile_with_profile_and_long_truncation() {
+        let msg = traits::ChannelMessage {
+            channel: "wacli".to_string(),
+            reply_target: "12345@g.us".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Release War Room".to_string()),
+            ..Default::default()
+        };
+        let no_profile = build_current_conversation_prompt(&msg, None, Some("99550001@s.whatsapp.net"));
+        assert!(no_profile.contains("- Platform: wacli | You: 99550001@s.whatsapp.net"));
+        assert!(no_profile.contains("- Type: group | Chat: \"Release War Room\" (12345@g.us)"));
+        assert!(!no_profile.contains("Purpose (self-maintained):"));
+
+        let mut profile = test_chat_profile("wacli", "12345@g.us", "group", "Coordinate release approvals");
+        let with_profile = build_current_conversation_prompt(&msg, Some(&profile), Some("99550001@s.whatsapp.net"));
+        assert!(with_profile.contains("- Purpose (self-maintained): Coordinate release approvals"));
+        assert!(with_profile.contains("- Notes: shared operating notes | Tags: ops, handoff"));
+
+        profile.purpose = Some("p".repeat(400));
+        profile.notes = Some("n".repeat(900));
+        let long = build_current_conversation_prompt(&msg, Some(&profile), Some("99550001@s.whatsapp.net"));
+        assert!(long.contains(&format!("{}...", "p".repeat(180))));
+        assert!(!long.contains(&"p".repeat(300)));
+        assert!(long.contains(&format!("{}...", "n".repeat(240))));
+        assert!(!long.contains(&"n".repeat(400)));
+    }
+
+    #[test]
+    fn current_conversation_prompt_renders_thread_self_consistently() {
+        let msg = traits::ChannelMessage {
+            channel: "slack".to_string(),
+            reply_target: "thread-1".to_string(),
+            chat_kind: ChatKind::Thread,
+            chat_title: Some("Thread".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_current_conversation_prompt(&msg, None, Some("prx"));
+        assert!(prompt.contains("- Type: thread | Chat: \"Thread\" (thread-1)"));
     }
 
     #[test]

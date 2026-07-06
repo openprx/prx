@@ -150,6 +150,11 @@ pub trait Channel: Send + Sync {
     /// Human-readable channel name
     fn name(&self) -> &str;
 
+    /// Bot account/name on this platform when known.
+    fn bot_identity(&self) -> Option<String> {
+        None
+    }
+
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
 
