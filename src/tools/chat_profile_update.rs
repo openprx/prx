@@ -109,7 +109,7 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Maintain the current conversation profile: what this group or direct chat is for, useful notes, and short tags. The target is always the current trusted runtime chat."
+        "Maintain the current conversation profile: what this group or direct chat is for, useful notes, and short tags. This is the correct tool to record what the current chat/group is for; prefer it over general memory tools for conversation purpose, notes, and tags. The target is always the current trusted runtime chat."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -242,7 +242,7 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     fn tier(&self) -> ToolTier {
-        ToolTier::Standard
+        ToolTier::Core
     }
 
     fn categories(&self) -> &'static [ToolCategory] {

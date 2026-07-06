@@ -159,6 +159,11 @@ mod tests {
         clippy::disallowed_methods
     )]
     use super::*;
+    use crate::memory::{Memory, SqliteMemory};
+    use crate::security::SecurityPolicy;
+    use crate::tools::ChatProfileUpdateTool;
+    use std::sync::Arc;
+    use tempfile::TempDir;
 
     #[test]
     fn classify_simple_greeting() {
@@ -198,5 +203,29 @@ mod tests {
         );
         assert!(cats.contains(&ToolCategory::WebBrowsing));
         assert!(cats.contains(&ToolCategory::Memory));
+    }
+
+    #[test]
+    fn chat_profile_update_is_offered_without_memory_keywords() {
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(ChatProfileUpdateTool::new(
+            memory,
+            Arc::new(SecurityPolicy::default()),
+        ))];
+
+        let selected = select_tools_for_intent(
+            &tools,
+            "\u{8fd9}\u{4e2a}\u{7fa4}\u{662f}\u{505a}\u{4ec0}\u{4e48}\u{7684}",
+            &[],
+            &[],
+        );
+        let names: HashSet<&str> = selected.iter().map(|tool| tool.name()).collect();
+
+        assert!(
+            names.contains("chat_profile_update"),
+            "chat_profile_update must be visible even when the message has no memory keywords"
+        );
+        assert_eq!(tools[0].tier(), ToolTier::Core);
     }
 }

@@ -969,7 +969,7 @@ fn build_current_conversation_prompt(
             );
         }
     }
-    block.push_str("\n- Update via chat_profile_update when you learn what this chat is for.");
+    block.push_str("\n- When you learn what this chat is for, use the chat_profile_update tool (not memory_store).");
     block
 }
 
@@ -10196,6 +10196,10 @@ BTC is currently around $65,000 based on latest tool output."#
                 && prompt.contains("- Platform: telegram | You: @bot")
                 && prompt.contains("- Type: group | Chat: \"Ops\" (chat-1)"),
             "missing current conversation context"
+        );
+        assert!(
+            prompt.contains("use the chat_profile_update tool (not memory_store)"),
+            "missing chat_profile_update preference hint"
         );
     }
 
