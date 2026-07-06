@@ -10466,8 +10466,9 @@ mod file_mention_tests {
         std::fs::write(temp.path().join("setup.rs"), "// setup\n").expect("write setup");
 
         #[cfg(unix)]
+        let outside = tempfile::tempdir().expect("outside");
+        #[cfg(unix)]
         {
-            let outside = tempfile::tempdir().expect("outside");
             std::fs::write(outside.path().join("secret.rs"), "secret\n").expect("write outside");
             std::os::unix::fs::symlink(outside.path().join("secret.rs"), temp.path().join("secret.rs"))
                 .expect("symlink");

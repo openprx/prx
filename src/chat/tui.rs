@@ -216,6 +216,10 @@ impl SlashMenuState {
     }
 
     pub fn refresh(&mut self, filter: &str) {
+        if self.filter == filter {
+            self.clamp_selected();
+            return;
+        }
         self.filter.clear();
         self.filter.push_str(filter);
         self.entries = filtered_command_entries(filter);
@@ -223,6 +227,10 @@ impl SlashMenuState {
     }
 
     pub fn refresh_with_entries(&mut self, filter: &str, entries: Vec<SlashMenuEntry>) {
+        if self.filter == filter && self.entries == entries {
+            self.clamp_selected();
+            return;
+        }
         self.filter.clear();
         self.filter.push_str(filter);
         self.entries = entries;
@@ -2723,6 +2731,9 @@ impl TuiState {
     }
 
     pub fn update_at_path_candidates(&mut self, candidates: Vec<AtPathCandidate>) {
+        if self.at_path_candidates == candidates {
+            return;
+        }
         self.at_path_candidates = candidates;
         let sources = SlashMenuSources {
             live_sessions: &self.sessions_cache,
@@ -8971,6 +8982,68 @@ mod tests {
         assert_eq!(
             dispatch_global_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut state),
             KeyDispatch::Exit
+        );
+    }
+
+    #[test]
+    fn slash_menu_refresh_preserves_selected_command_row() {
+        let mut state = TuiState::new("p", "m");
+        let _ = dispatch_global_key(key(KeyCode::Char('/')), &mut state);
+        assert!(state.slash_menu.as_ref().is_some_and(|menu| menu.len() > 1));
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(1));
+
+        state.update_at_path_candidates(Vec::new());
+
+        assert_eq!(
+            state.slash_menu.as_ref().map(|menu| menu.selected),
+            Some(1),
+            "unrelated @path refresh must not reset slash command selection"
+        );
+    }
+
+    #[test]
+    fn at_path_refresh_preserves_selected_candidate_for_enter() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("@s");
+        let candidates = vec![
+            AtPathCandidate {
+                path: "src/".to_string(),
+                is_dir: true,
+            },
+            AtPathCandidate {
+                path: "setup.rs".to_string(),
+                is_dir: false,
+            },
+        ];
+        state.update_at_path_candidates(candidates.clone());
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(0));
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.slash_menu.as_ref().map(|menu| menu.selected), Some(1));
+
+        state.update_at_path_candidates(candidates);
+        assert_eq!(
+            state.slash_menu.as_ref().map(|menu| menu.selected),
+            Some(1),
+            "unchanged @path refresh must keep the highlighted row"
+        );
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(
+            state.input.text(),
+            "@setup.rs ",
+            "Enter must insert the row that was still highlighted after refresh"
         );
     }
 
