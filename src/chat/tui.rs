@@ -3423,13 +3423,23 @@ fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V)
         .saturating_add(1)
 }
 
+fn fullscreen_bottom_chrome_height_for_width<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> u16 {
+    let visible_input_rows = input_visual_rows_for_width(state, width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
+    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
+    1u16.saturating_add(sessions_rows)
+        .saturating_add(input_height)
+        .saturating_add(1)
+        .clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
+}
+
 fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
     frame: &mut Frame,
     area: Rect,
     state: &V,
     show_new_output_below: bool,
 ) {
-    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
+    let visible_input_rows = input_visual_rows_for_width(state, area.width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
     let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
 
@@ -3469,7 +3479,7 @@ pub fn render_fullscreen_chat<V: BottomChromeView + ?Sized>(
     let frame_area = frame.area();
     frame.render_widget(Clear, frame_area);
 
-    let chrome_height = fullscreen_bottom_chrome_height(state).min(frame_area.height);
+    let chrome_height = fullscreen_bottom_chrome_height_for_width(state, frame_area.width).min(frame_area.height);
     let content_height = frame_area.height.saturating_sub(chrome_height);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -5742,6 +5752,94 @@ fn focused_session_kind<V: BottomChromeView + ?Sized>(state: &V, seq: u64) -> Op
         .map(|entry| entry.kind)
 }
 
+struct WrappedInputRow<'a> {
+    logical_idx: usize,
+    start: usize,
+    end: usize,
+    text: &'a str,
+    first_for_logical: bool,
+}
+
+fn input_prompt_width<V: BottomChromeView + ?Sized>(state: &V) -> usize {
+    let session_kind = state
+        .focus()
+        .session_seq()
+        .and_then(|seq| focused_session_kind(state, seq));
+    let (_, width) = prompt_indicator(state.focus(), state.ascii_fallback(), session_kind);
+    width
+}
+
+fn input_content_width<V: BottomChromeView + ?Sized>(state: &V, total_width: u16) -> usize {
+    usize::from(total_width)
+        .saturating_sub(input_prompt_width(state))
+        .max(1)
+}
+
+fn input_visual_rows_for_width<V: BottomChromeView + ?Sized>(state: &V, total_width: u16) -> usize {
+    let content_width = input_content_width(state, total_width);
+    state
+        .input()
+        .lines
+        .iter()
+        .map(|line| wrap_line_ranges(line, content_width).len())
+        .sum::<usize>()
+        .max(1)
+}
+
+fn wrap_input_rows(input: &TuiInput, content_width: usize) -> Vec<WrappedInputRow<'_>> {
+    let mut rows = Vec::new();
+    for (logical_idx, line) in input.lines.iter().enumerate() {
+        for (range_idx, (start, end)) in wrap_line_ranges(line, content_width).into_iter().enumerate() {
+            rows.push(WrappedInputRow {
+                logical_idx,
+                start,
+                end,
+                text: line.get(start..end).unwrap_or(""),
+                first_for_logical: range_idx == 0,
+            });
+        }
+    }
+    if rows.is_empty() {
+        rows.push(WrappedInputRow {
+            logical_idx: 0,
+            start: 0,
+            end: 0,
+            text: "",
+            first_for_logical: true,
+        });
+    }
+    rows
+}
+
+fn wrap_line_ranges(line: &str, width: usize) -> Vec<(usize, usize)> {
+    let width = width.max(1);
+    if line.is_empty() {
+        return vec![(0, 0)];
+    }
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut cols = 0usize;
+    for (idx, ch) in line.char_indices() {
+        let end = idx.saturating_add(ch.len_utf8());
+        let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if cols > 0 && cols.saturating_add(ch_width) > width {
+            ranges.push((start, idx));
+            start = idx;
+            cols = 0;
+        }
+        cols = cols.saturating_add(ch_width);
+        if cols >= width && end < line.len() {
+            ranges.push((start, end));
+            start = end;
+            cols = 0;
+        }
+    }
+    if start <= line.len() {
+        ranges.push((start, line.len()));
+    }
+    ranges
+}
+
 fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
     // Compose prompt lines: the first row gets the input-target indicator
     // (v1.1b), continuation rows are aligned with blanks of the same width.
@@ -5753,21 +5851,30 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     let (prompt_span, prompt_width) = prompt_indicator(state.focus(), state.ascii_fallback(), session_kind);
     let continuation = " ".repeat(prompt_width);
     let max_visible_rows = area.height.saturating_sub(1).max(1) as usize;
+    let content_width = usize::from(area.width).saturating_sub(prompt_width).max(1);
+    let wrapped_rows = wrap_input_rows(input_ref, content_width);
     let cursor_line = input_ref.cursor.0.min(input_ref.lines.len().saturating_sub(1));
-    let first_visible_line = cursor_line.saturating_add(1).saturating_sub(max_visible_rows);
-    let rendered_lines: Vec<Line<'_>> = input_ref
+    let cursor_offset = input_ref
         .lines
+        .get(cursor_line)
+        .map_or(0, |line| input_ref.cursor.1.min(line.len()));
+    let cursor_visual_row = wrapped_rows
+        .iter()
+        .position(|row| row.logical_idx == cursor_line && cursor_offset >= row.start && cursor_offset <= row.end)
+        .unwrap_or_else(|| wrapped_rows.len().saturating_sub(1));
+    let first_visible_line = cursor_visual_row.saturating_add(1).saturating_sub(max_visible_rows);
+    let rendered_lines: Vec<Line<'_>> = wrapped_rows
         .iter()
         .enumerate()
         .skip(first_visible_line)
         .take(max_visible_rows)
-        .map(|(idx, content)| {
-            let prefix = if idx == 0 {
+        .map(|(_visual_idx, row)| {
+            let prefix = if row.logical_idx == 0 && row.first_for_logical {
                 prompt_span.clone()
             } else {
                 Span::raw(continuation.clone())
             };
-            Line::from(vec![prefix, Span::raw(content.as_str())])
+            Line::from(vec![prefix, Span::raw(row.text)])
         })
         .collect();
 
@@ -5792,8 +5899,7 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     // Borders::TOP consumes the first row of `area`, so the body starts at
     // `area.y + 1` and the prompt prefix takes `prompt_width` columns (the
     // input-target indicator width, which varies between `main` and `agent #N`).
-    let (cursor_line, cursor_offset) = input_ref.cursor;
-    let cursor_visible_row = cursor_line.saturating_sub(first_visible_line);
+    let cursor_visible_row = cursor_visual_row.saturating_sub(first_visible_line);
     if cursor_line < input_ref.lines.len() && cursor_visible_row < max_visible_rows {
         let row_text = input_ref.lines.get(cursor_line).map(String::as_str).unwrap_or("");
         // Width-aware column: count *display* columns (not char count) up to
@@ -5802,7 +5908,12 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
         // give the impression that input is broken. `unicode-width` matches
         // ratatui's own width algorithm for `Paragraph`.
         let visual_col: usize = row_text
-            .get(..cursor_offset.min(row_text.len()))
+            .get(
+                wrapped_rows[cursor_visual_row].start
+                    ..cursor_offset
+                        .min(wrapped_rows[cursor_visual_row].end)
+                        .min(row_text.len()),
+            )
             .map_or(0, UnicodeWidthStr::width);
         let col_offset = u16::try_from(visual_col).unwrap_or(u16::MAX);
         let prefix_cols: u16 = u16::try_from(prompt_width).unwrap_or(2);
@@ -9973,6 +10084,54 @@ mod tests {
         assert!(
             !joined.contains("scroll-line-00"),
             "top rows should scroll out once cursor is below visible input window: {joined}"
+        );
+    }
+
+    #[test]
+    fn input_wrap_ranges_respect_unicode_display_width() {
+        let line = "ab你好c";
+        let ranges = wrap_line_ranges(line, 4);
+        let wrapped = ranges
+            .iter()
+            .map(|(start, end)| line.get(*start..*end).unwrap_or(""))
+            .collect::<Vec<_>>();
+
+        assert_eq!(wrapped, vec!["ab你", "好c"]);
+        assert!(
+            wrapped.iter().all(|row| UnicodeWidthStr::width(*row) <= 4),
+            "wrapped rows fit display width: {wrapped:?}"
+        );
+    }
+
+    #[test]
+    fn long_single_input_line_uses_wrapped_chrome_height() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text(&"abcdefghij".repeat(8));
+
+        let narrow = fullscreen_bottom_chrome_height_for_width(&state, 16);
+        let wide = fullscreen_bottom_chrome_height_for_width(&state, 120);
+
+        assert!(narrow > wide, "narrow input should reserve wrapped rows");
+        assert!(narrow <= BOTTOM_CHROME_MAX_HEIGHT);
+    }
+
+    #[test]
+    fn render_input_soft_wrap_scrolls_to_cursor_tail() {
+        let mut state = TuiState::new("p", "m");
+        let text = format!("HEAD-{}-TAIL", "abcdefghij".repeat(20));
+        state.input.set_text(&text);
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 14, 24, &mut scroll);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("TAIL"),
+            "wrapped cursor tail should be visible: {joined}"
+        );
+        assert!(
+            !joined.contains("HEAD"),
+            "wrapped input should scroll old visual rows out when cursor is at tail: {joined}"
         );
     }
 
