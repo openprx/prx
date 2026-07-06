@@ -345,6 +345,62 @@ fn truncate_utf8_to_byte_cap(input: &str, max_bytes: usize) -> (String, bool) {
     (input[..end].to_string(), true)
 }
 
+const COPY_OSC52_MAX_BYTES: usize = 74 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopySelection {
+    content: String,
+    ordinal: usize,
+    truncated: bool,
+}
+
+fn is_copy_command(input: &str) -> bool {
+    input == "/copy" || input.starts_with("/copy ")
+}
+
+fn select_copy_content(session: &session::ChatSession, input: &str) -> Result<CopySelection, String> {
+    let raw = input.strip_prefix("/copy").unwrap_or_default().trim();
+    let ordinal = if raw.is_empty() {
+        1
+    } else {
+        raw.parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Usage: /copy [N]".to_string())?
+    };
+    let Some(turn) = session
+        .turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.role == "assistant")
+        .nth(ordinal - 1)
+    else {
+        return Err("No assistant response to copy.".to_string());
+    };
+    let (content, truncated) = truncate_utf8_to_byte_cap(&turn.content, COPY_OSC52_MAX_BYTES);
+    Ok(CopySelection {
+        content,
+        ordinal,
+        truncated,
+    })
+}
+
+fn copy_success_message(selection: &CopySelection) -> String {
+    let suffix = if selection.truncated {
+        " (truncated to 74 KiB for OSC 52)"
+    } else {
+        ""
+    };
+    if selection.ordinal == 1 {
+        format!("Copied latest assistant response to clipboard{suffix}.")
+    } else {
+        format!(
+            "Copied assistant response #{} from the end to clipboard{suffix}.",
+            selection.ordinal
+        )
+    }
+}
+
 /// Compact conversation history in-place to fit within context window limits.
 ///
 /// Preserves the system prompt (index 0), keeps the last [`COMPACT_KEEP_MESSAGES`]
@@ -1432,6 +1488,48 @@ mod runtime_display_tests {
         assert!(
             out.contains("#10 agent user completed 3s ~12.3k tok | cost unknown summarize"),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn copy_command_selects_latest_and_numbered_assistant_turns() {
+        let mut session = session::ChatSession::new("provider", "model");
+        session.add_user_turn("question");
+        session.add_assistant_turn("first **markdown**", Vec::new());
+        session.add_user_turn("again");
+        session.add_assistant_turn("second `raw`", Vec::new());
+
+        let latest = select_copy_content(&session, "/copy").expect("latest copy");
+        assert_eq!(latest.content, "second `raw`");
+        assert_eq!(latest.ordinal, 1);
+        assert!(!latest.truncated);
+
+        let previous = select_copy_content(&session, "/copy 2").expect("previous copy");
+        assert_eq!(previous.content, "first **markdown**");
+        assert_eq!(previous.ordinal, 2);
+    }
+
+    #[test]
+    fn copy_command_validates_args_and_truncates_for_osc52() {
+        let mut session = session::ChatSession::new("provider", "model");
+        assert_eq!(
+            select_copy_content(&session, "/copy").expect_err("no assistant"),
+            "No assistant response to copy."
+        );
+        assert_eq!(
+            select_copy_content(&session, "/copy nope").expect_err("usage"),
+            "Usage: /copy [N]"
+        );
+
+        let oversized = format!("{}界", "x".repeat(COPY_OSC52_MAX_BYTES));
+        session.add_assistant_turn(&oversized, Vec::new());
+        let selected = select_copy_content(&session, "/copy").expect("copy oversized");
+        assert!(selected.truncated);
+        assert!(selected.content.len() <= COPY_OSC52_MAX_BYTES);
+        assert!(selected.content.is_char_boundary(selected.content.len()));
+        assert!(
+            !selected.content.ends_with('界'),
+            "truncate at UTF-8 boundary before wide char"
         );
     }
 
@@ -3999,6 +4097,21 @@ pub async fn run(
                 print_fallback_chat_output(text);
             }
         };
+
+        if is_copy_command(&user_input) {
+            match select_copy_content(&chat_session, &user_input) {
+                Ok(selection) if plain_mode => {
+                    println!("{}", selection.content);
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(selection) => match terminal_proto::copy_to_clipboard(&selection.content) {
+                    Ok(()) => emit_chat_output(&copy_success_message(&selection)),
+                    Err(error) => emit_chat_output(&format!("Copy failed: {error}")),
+                },
+                Err(message) => emit_chat_output(&message),
+            }
+            continue;
+        }
 
         // BUG-07: `/model <name>` 在线切换 model（同 provider 换 model）。
         //

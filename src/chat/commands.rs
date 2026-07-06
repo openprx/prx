@@ -287,6 +287,13 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         },
     },
     CommandSpec {
+        name: "/copy",
+        aliases: &[],
+        args_hint: "[N]",
+        description: "Copy the most recent assistant reply",
+        arg: NO_ARG,
+    },
+    CommandSpec {
         name: "/theme",
         aliases: &[],
         args_hint: "",
@@ -1111,6 +1118,7 @@ mod mode_tests {
             "/apply",
             "/memory",
             "/export",
+            "/copy",
             "/theme",
             "/clear",
             "/new",
