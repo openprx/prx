@@ -2100,7 +2100,7 @@ impl TuiInput {
         let placeholder = format!("[Pasted text #{id}: {line_count} lines]");
         self.paste_chips.push(PasteChip {
             token: token.clone(),
-            placeholder: placeholder.clone(),
+            placeholder,
             content,
         });
         self.insert_chip_token(&token);
@@ -8202,7 +8202,10 @@ mod tests {
 
         let menu = state.slash_menu.as_ref().expect("@path menu open");
         assert_eq!(menu.filter, "ca");
-        assert_eq!(menu.entries[0].label, "Cargo.toml");
+        assert_eq!(
+            menu.entries.first().map(|entry| entry.label.as_str()),
+            Some("Cargo.toml")
+        );
         assert_eq!(
             dispatch_global_key(key(KeyCode::Enter), &mut state),
             KeyDispatch::Consumed

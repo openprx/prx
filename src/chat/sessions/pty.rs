@@ -452,6 +452,7 @@ impl std::fmt::Debug for SinkInner {
             .field("emulator_rows", &rows)
             .field("emulator_cols", &cols)
             .field("ring_len", &self.ring.len())
+            .field("last_output_at", &self.last_output_at)
             .finish()
     }
 }

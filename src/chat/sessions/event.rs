@@ -315,7 +315,7 @@ impl SessionRing {
     }
 
     #[must_use]
-    pub fn last_pushed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+    pub const fn last_pushed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.last_pushed_at
     }
 
