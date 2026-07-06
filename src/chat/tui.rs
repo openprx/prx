@@ -937,6 +937,12 @@ pub(crate) fn dispatch_slash_menu_key_with_sources(
     }
 
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+        if matches!(
+            input.completion_cursor_context(),
+            Some(SlashCursorContext::Command { .. })
+        ) {
+            input.clear();
+        }
         *slash_menu = None;
         return KeyDispatch::Consumed;
     }
@@ -8254,7 +8260,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_menu_tab_inserts_command_and_esc_dismisses_without_clearing_input() {
+    fn slash_menu_tab_inserts_command_and_esc_clears_command_trigger() {
         let mut tab_state = TuiState::new("p", "m");
         for ch in "/expo".chars() {
             assert_eq!(
@@ -8286,8 +8292,34 @@ mod tests {
             dispatch_global_key(key(KeyCode::Esc), &mut esc_state),
             KeyDispatch::Consumed
         );
-        assert_eq!(esc_state.input.text(), "/mo");
-        assert!(esc_state.slash_menu.is_none(), "Esc closes menu only");
+        assert!(esc_state.input.is_empty(), "Esc clears slash-command draft");
+        assert!(esc_state.slash_menu.is_none(), "Esc closes menu");
+    }
+
+    #[test]
+    fn slash_command_submit_leaves_input_render_empty() {
+        let mut state = TuiState::new("p", "m");
+        for ch in "/help".chars() {
+            assert_eq!(
+                dispatch_global_key(key(KeyCode::Char(ch)), &mut state),
+                KeyDispatch::Consumed
+            );
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Submitted("/help".to_string())
+        );
+        assert!(state.input.is_empty());
+        assert_eq!(state.input.display_lines(), vec![String::new()]);
+
+        let mut scroll = FullscreenTranscriptScroll::default();
+        let rows = fullscreen_rows(&state, 90, 24, &mut scroll);
+        let joined = rows.join("\n");
+        assert!(
+            !joined.contains("/help"),
+            "submitted slash command must not remain as bright input text: {joined}"
+        );
     }
 
     #[test]
