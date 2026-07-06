@@ -276,6 +276,7 @@ pub struct SessionRing {
     buf: VecDeque<String>,
     cap: usize,
     truncated: bool,
+    last_pushed_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Lines already drained by an attached follower (the index past which new
     /// lines are "unseen"). Lets `/attach` print only newly-appended lines.
     drained: usize,
@@ -289,6 +290,7 @@ impl SessionRing {
             buf: VecDeque::new(),
             cap: cap.max(1),
             truncated: false,
+            last_pushed_at: None,
             drained: 0,
         }
     }
@@ -296,6 +298,12 @@ impl SessionRing {
     /// Append one line, dropping the oldest if at capacity (and flagging
     /// `truncated`). Pure main-loop state; no lock, no await.
     pub fn push(&mut self, line: String) {
+        self.push_at(line, chrono::Utc::now());
+    }
+
+    /// Append one line with an explicit timestamp. Production uses [`Self::push`];
+    /// tests use this to pin idle-warning decisions without sleeping.
+    pub fn push_at(&mut self, line: String, at: chrono::DateTime<chrono::Utc>) {
         if self.buf.len() >= self.cap {
             self.buf.pop_front();
             self.truncated = true;
@@ -303,6 +311,12 @@ impl SessionRing {
             self.drained = self.drained.saturating_sub(1);
         }
         self.buf.push_back(line);
+        self.last_pushed_at = Some(at);
+    }
+
+    #[must_use]
+    pub fn last_pushed_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.last_pushed_at
     }
 
     /// Whether any line has been dropped — either by this ring's own line
@@ -366,6 +380,7 @@ mod tests {
         let mut ring = SessionRing::with_capacity(10);
         ring.push("a".into());
         ring.push("b".into());
+        assert!(ring.last_pushed_at().is_some());
         assert_eq!(ring.drain_new(), vec!["a".to_string(), "b".to_string()]);
         // Nothing new yet.
         assert!(ring.drain_new().is_empty());

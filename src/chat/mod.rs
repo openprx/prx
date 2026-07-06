@@ -3800,7 +3800,9 @@ pub async fn run(
                 // is harmless: switcher Enter re-resolves the seq via /attach.
                 #[cfg(feature = "terminal-tui")]
                 {
-                    let idle_warnings = chat_sessions.idle_warning_seqs(&reap_policy, chrono::Utc::now()).await;
+                    let idle_warnings = chat_sessions
+                        .idle_warning_seqs(&reap_policy, chrono::Utc::now(), &session_rings)
+                        .await;
                     let mut entries = crate::chat::sessions::focus::switcher_entries(&views);
                     for entry in &mut entries {
                         entry.idle_warning = idle_warnings.contains(&entry.seq);

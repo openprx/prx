@@ -440,6 +440,8 @@ struct SinkInner {
     /// pop-front; capped at [`PTY_RING_CAPACITY`]. Diagnostic / fallback only since
     /// v3b-b; the visible re-attach redraw comes from `parser` instead.
     ring: std::collections::VecDeque<u8>,
+    /// Last time the drain reader delivered bytes from the PTY.
+    last_output_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl std::fmt::Debug for SinkInner {
@@ -473,6 +475,7 @@ impl PtySink {
             attached: false,
             parser,
             ring: std::collections::VecDeque::with_capacity(8192),
+            last_output_at: None,
         })))
     }
 
@@ -559,6 +562,10 @@ impl PtySink {
     fn screen_contents_for_test(&self) -> String {
         self.0.lock().parser.screen().contents()
     }
+
+    fn last_output_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.0.lock().last_output_at
+    }
 }
 
 impl std::io::Write for PtySink {
@@ -573,6 +580,7 @@ impl std::io::Write for PtySink {
         // Always feed the emulator so its screen grid tracks the current on-screen
         // state (used to redraw correctly on re-attach), even while detached.
         inner.parser.process(buf);
+        inner.last_output_at = Some(chrono::Utc::now());
         // Always append to the ring (diagnostic / fallback), trimming the oldest
         // bytes past the cap.
         inner.ring.extend(buf.iter().copied());
@@ -813,6 +821,11 @@ impl PtyShellSession {
     #[must_use]
     pub fn child_done_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.runtime.child_done)
+    }
+
+    #[must_use]
+    pub fn last_output_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.runtime.sink.last_output_at()
     }
 
     /// Begin an attach: under the sink lock, mark the sink attached (the drain
