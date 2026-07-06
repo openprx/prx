@@ -257,6 +257,12 @@ pub enum Action {
         saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
         provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     },
+    /// `@path` completion candidates sourced by the TUI loop after applying
+    /// the file-read security policy. Kept as an Action so the reducer path
+    /// never renders with an empty source while the legacy mirror has entries.
+    AtPathCandidatesUpdated {
+        candidates: Vec<crate::chat::slash_types::AtPathCandidate>,
+    },
     /// P2 active line-oriented child session viewport snapshot. `None` clears
     /// the child viewport when focus returns to main or PTY handoff resumes.
     ActiveSessionViewUpdated {
@@ -366,6 +372,7 @@ impl Action {
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
             Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
             Self::SlashMenuSourcesUpdated { .. } => "SlashMenuSourcesUpdated",
+            Self::AtPathCandidatesUpdated { .. } => "AtPathCandidatesUpdated",
             Self::ActiveSessionViewUpdated { .. } => "ActiveSessionViewUpdated",
             Self::ContextWindowUpdated { .. } => "ContextWindowUpdated",
             Self::ProviderUsageRecorded { .. } => "ProviderUsageRecorded",

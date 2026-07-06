@@ -3289,6 +3289,8 @@ pub async fn run(
                         chat_dispatcher.clone(),
                         snapshot_rx_for_tui.clone(),
                         Arc::clone(&pty_handoff),
+                        config.workspace_dir.clone(),
+                        Arc::clone(&security),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -7105,6 +7107,8 @@ fn spawn_tui_unified_loop(
     chat_dispatcher: dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
     handoff: Arc<crate::chat::sessions::pty::HandoffControl>,
+    workspace_dir: std::path::PathBuf,
+    security: Arc<crate::security::SecurityPolicy>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -7118,11 +7122,119 @@ fn spawn_tui_unified_loop(
             &chat_dispatcher,
             snapshot_rx,
             &handoff,
+            workspace_dir,
+            security,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
         }
     });
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_at_path_candidates_for_tui(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+    workspace_dir: &std::path::Path,
+    security: &crate::security::SecurityPolicy,
+) {
+    let candidates = {
+        let guard = mirror.lock();
+        collect_at_path_candidates(&guard.input, workspace_dir, security)
+    };
+    {
+        let mut guard = mirror.lock();
+        guard.update_at_path_candidates(candidates.clone());
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::AtPathCandidatesUpdated { candidates },
+        "chat.at_path_candidates_updated",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
+#[cfg(feature = "terminal-tui")]
+fn collect_at_path_candidates(
+    input: &tui::TuiInput,
+    workspace_dir: &std::path::Path,
+    security: &crate::security::SecurityPolicy,
+) -> Vec<tui::AtPathCandidate> {
+    const MAX_AT_PATH_CANDIDATES: usize = 50;
+
+    let Some(filter) = input.at_path_filter_at_cursor() else {
+        return Vec::new();
+    };
+    if filter.starts_with('/') || filter.starts_with('~') || !security.is_path_allowed(&filter) {
+        return Vec::new();
+    }
+    let normalized = filter.trim_start_matches("./");
+    let (base_rel, needle) = if normalized.ends_with('/') {
+        (normalized.trim_end_matches('/'), "")
+    } else if let Some((base, leaf)) = normalized.rsplit_once('/') {
+        (base, leaf)
+    } else {
+        ("", normalized)
+    };
+    let base_for_policy = if base_rel.is_empty() { "." } else { base_rel };
+    if !security.is_path_allowed(base_for_policy) {
+        return Vec::new();
+    }
+    let base_abs = if base_rel.is_empty() {
+        workspace_dir.to_path_buf()
+    } else {
+        workspace_dir.join(base_rel)
+    };
+    let Ok(base_resolved) = base_abs.canonicalize() else {
+        return Vec::new();
+    };
+    if !security.is_resolved_path_allowed(&base_resolved) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&base_resolved) else {
+        return Vec::new();
+    };
+    let needle = needle.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if file_name == "." || file_name == ".." {
+            continue;
+        }
+        let rel = if base_rel.is_empty() {
+            file_name.clone()
+        } else {
+            format!("{base_rel}/{file_name}")
+        };
+        let file_name_lower = file_name.to_ascii_lowercase();
+        let rel_lower = rel.to_ascii_lowercase();
+        if !needle.is_empty()
+            && !file_name_lower.contains(&needle)
+            && !rel_lower.contains(&needle)
+            && !tui::fuzzy_path_match(&rel_lower, &needle)
+        {
+            continue;
+        }
+        if !security.is_path_allowed(&rel) {
+            continue;
+        }
+        let Ok(resolved) = entry.path().canonicalize() else {
+            continue;
+        };
+        if !security.is_resolved_path_allowed(&resolved) {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        candidates.push(tui::AtPathCandidate {
+            path: if is_dir { format!("{rel}/") } else { rel },
+            is_dir,
+        });
+    }
+    candidates.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
+    candidates.truncate(MAX_AT_PATH_CANDIDATES);
+    candidates
 }
 
 /// Send a synthetic slash command from the TUI key thread to the async main
@@ -8210,6 +8322,8 @@ fn run_tui_unified_loop(
     chat_dispatcher: &dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    workspace_dir: std::path::PathBuf,
+    security: Arc<crate::security::SecurityPolicy>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
@@ -8353,6 +8467,13 @@ fn run_tui_unified_loop(
                         let _ =
                             chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_key_burst");
                         mirror.lock().input.paste(&text);
+                        refresh_at_path_candidates_for_tui(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            &workspace_dir,
+                            &security,
+                        );
                         skip_next_draw = true;
                         continue;
                     }
@@ -8394,6 +8515,11 @@ fn run_tui_unified_loop(
                 let _ = chat_dispatcher.dispatch_or_log(Action::KeyPressed(key), "chat.tui_key_pressed");
 
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                if !(key.code == crossterm::event::KeyCode::Esc
+                    && key.modifiers == crossterm::event::KeyModifiers::NONE)
+                {
+                    refresh_at_path_candidates_for_tui(&mirror, chat_dispatcher, &redraw_tx, &workspace_dir, &security);
+                }
                 // C1 fix: any consumed keystroke may have mutated visible
                 // state — typing in the input box, Tab folding a card,
                 // Ctrl+R reverse-searching history, Esc clearing the buffer,
@@ -8605,6 +8731,13 @@ fn run_tui_unified_loop(
                                     crate::chat::action::Action::InputReplaced(text),
                                     "chat.external_editor_input_replaced",
                                 );
+                                refresh_at_path_candidates_for_tui(
+                                    &mirror,
+                                    chat_dispatcher,
+                                    &redraw_tx,
+                                    &workspace_dir,
+                                    &security,
+                                );
                                 let _ = redraw_tx.try_send(());
                             }
                             ExternalEditorResult::Unchanged(reason) => {
@@ -8696,6 +8829,7 @@ fn run_tui_unified_loop(
                 }
                 let _ = chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_paste");
                 mirror.lock().input.paste(&text);
+                refresh_at_path_candidates_for_tui(&mirror, chat_dispatcher, &redraw_tx, &workspace_dir, &security);
                 // Paste mutates `input.lines` directly so the chrome must
                 // repaint; without this kick the next redraw is gated on
                 // the 50 ms poll.
@@ -10189,6 +10323,51 @@ mod file_mention_tests {
         let note = enriched.visible_note.expect("visible directory note");
         assert!(note.contains("@dir: unavailable"));
         assert!(enriched.prompt.starts_with("inspect @dir"));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn at_path_candidates_are_relative_sorted_and_security_filtered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("src")).expect("create src");
+        std::fs::write(temp.path().join("src").join("main.rs"), "fn main() {}\n").expect("write main");
+        std::fs::write(temp.path().join("setup.rs"), "// setup\n").expect("write setup");
+
+        #[cfg(unix)]
+        {
+            let outside = tempfile::tempdir().expect("outside");
+            std::fs::write(outside.path().join("secret.rs"), "secret\n").expect("write outside");
+            std::os::unix::fs::symlink(outside.path().join("secret.rs"), temp.path().join("secret.rs"))
+                .expect("symlink");
+        }
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: temp.path().to_path_buf(),
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let mut input = tui::TuiInput::new();
+        input.set_text("@s");
+
+        let candidates = collect_at_path_candidates(&input, temp.path(), &policy);
+
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.first().copied(), Some("src/"), "directories sort first");
+        assert!(paths.contains(&"setup.rs"));
+        assert!(
+            !paths.contains(&"secret.rs"),
+            "symlink escaping workspace must be filtered by resolved-path policy"
+        );
+
+        input.set_text("@../");
+        assert!(
+            collect_at_path_candidates(&input, temp.path(), &policy).is_empty(),
+            "traversal filter is blocked before directory enumeration"
+        );
     }
 
     #[tokio::test]

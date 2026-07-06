@@ -123,6 +123,8 @@ pub struct TuiState {
     pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
     /// Enumerable model candidates grouped by provider for slash-menu drill-down.
     pub provider_model_catalog: Vec<SlashProviderModelCatalog>,
+    /// Security-filtered `@path` completion candidates sourced by the TUI loop.
+    pub at_path_candidates: Vec<AtPathCandidate>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
@@ -158,12 +160,13 @@ pub struct SlashMenuEntry {
     pub append_space: bool,
 }
 
-pub use crate::chat::slash_types::{SlashModelCandidate, SlashProviderModelCatalog};
+pub use crate::chat::slash_types::{AtPathCandidate, SlashModelCandidate, SlashProviderModelCatalog};
 
 pub(crate) struct SlashMenuSources<'a> {
     pub live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
     pub saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
     pub provider_model_catalog: &'a [SlashProviderModelCatalog],
+    pub at_path_candidates: &'a [AtPathCandidate],
     pub current_provider: &'a str,
 }
 
@@ -177,6 +180,9 @@ enum SlashCursorContext {
         arg_index: usize,
         filter: String,
         previous_args: Vec<String>,
+    },
+    AtPath {
+        filter: String,
     },
 }
 
@@ -274,6 +280,20 @@ impl SlashMenuEntry {
             description: description.into(),
             insert_text: value,
             append_space: true,
+        }
+    }
+
+    fn at_path(candidate: &AtPathCandidate) -> Self {
+        Self {
+            label: candidate.path.clone(),
+            args_hint: String::new(),
+            description: if candidate.is_dir {
+                "directory".to_string()
+            } else {
+                "file".to_string()
+            },
+            insert_text: format!("@{}", candidate.path),
+            append_space: !candidate.is_dir,
         }
     }
 }
@@ -658,7 +678,7 @@ pub(crate) fn sync_slash_menu_for_sources(
     slash_menu: &mut Option<SlashMenuState>,
     sources: SlashMenuSources<'_>,
 ) {
-    let Some(context) = input.slash_cursor_context() else {
+    let Some(context) = input.completion_cursor_context() else {
         *slash_menu = None;
         return;
     };
@@ -680,6 +700,16 @@ pub(crate) fn sync_slash_menu_for_sources(
             previous_args,
         } => {
             let entries = argument_candidate_entries(&command, arg_index, &filter, &previous_args, sources);
+            if entries.is_empty() {
+                *slash_menu = None;
+            } else if let Some(menu) = slash_menu.as_mut() {
+                menu.refresh_with_entries(&filter, entries);
+            } else {
+                *slash_menu = Some(SlashMenuState::new_with_entries(&filter, entries));
+            }
+        }
+        SlashCursorContext::AtPath { filter } => {
+            let entries = at_path_candidate_entries(&filter, sources.at_path_candidates);
             if entries.is_empty() {
                 *slash_menu = None;
             } else if let Some(menu) = slash_menu.as_mut() {
@@ -812,6 +842,42 @@ fn model_candidate_entries(catalog: &[SlashProviderModelCatalog], provider: &str
         })
 }
 
+fn at_path_candidate_entries(filter: &str, candidates: &[AtPathCandidate]) -> Vec<SlashMenuEntry> {
+    let needle = filter.to_ascii_lowercase();
+    candidates
+        .iter()
+        .filter(|candidate| {
+            if needle.is_empty() {
+                return true;
+            }
+            let path = candidate.path.to_ascii_lowercase();
+            path.contains(&needle) || fuzzy_path_match(&path, &needle)
+        })
+        .take(50)
+        .map(SlashMenuEntry::at_path)
+        .collect()
+}
+
+pub(crate) fn fuzzy_path_match(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let mut chars = needle.chars();
+    let Some(mut wanted) = chars.next() else {
+        return true;
+    };
+    for ch in haystack.chars() {
+        if ch == wanted {
+            if let Some(next) = chars.next() {
+                wanted = next;
+            } else {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 pub(crate) fn dispatch_slash_menu_key_with_sources(
     input: &mut TuiInput,
     slash_menu: &mut Option<SlashMenuState>,
@@ -835,7 +901,7 @@ pub(crate) fn dispatch_slash_menu_key_with_sources(
 
     if (key.code == KeyCode::Enter || key.code == KeyCode::Tab) && key.modifiers == KeyModifiers::NONE {
         if let Some(entry) = slash_menu.as_ref().and_then(SlashMenuState::selected_entry).cloned() {
-            match input.slash_cursor_context() {
+            match input.completion_cursor_context() {
                 Some(SlashCursorContext::Command { .. }) => {
                     if key.code == KeyCode::Enter && entry.args_hint.is_empty() && input.slash_command_suffix_is_empty()
                     {
@@ -850,6 +916,9 @@ pub(crate) fn dispatch_slash_menu_key_with_sources(
                 }
                 Some(SlashCursorContext::Argument { .. }) => {
                     input.replace_slash_argument_token(&entry.insert_text, entry.append_space);
+                }
+                Some(SlashCursorContext::AtPath { .. }) => {
+                    input.replace_at_path_token(&entry.insert_text, entry.append_space);
                 }
                 None => {}
             }
@@ -1126,6 +1195,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             live_sessions: &state.sessions_cache,
             saved_sessions: &state.saved_sessions_cache,
             provider_model_catalog: &state.provider_model_catalog,
+            at_path_candidates: &state.at_path_candidates,
             current_provider: &state.provider,
         };
         return dispatch_slash_menu_key_with_sources(&mut state.input, &mut state.slash_menu, key, sources);
@@ -1478,6 +1548,19 @@ impl TuiInput {
         }
     }
 
+    /// Filter text after a word-start `@` token at the cursor, used by the
+    /// TUI loop to source file candidates through the file-read security gate.
+    pub(crate) fn at_path_filter_at_cursor(&self) -> Option<String> {
+        match self.at_path_cursor_context() {
+            Some(SlashCursorContext::AtPath { filter }) => Some(filter),
+            _ => None,
+        }
+    }
+
+    fn completion_cursor_context(&self) -> Option<SlashCursorContext> {
+        self.slash_cursor_context().or_else(|| self.at_path_cursor_context())
+    }
+
     fn slash_cursor_context(&self) -> Option<SlashCursorContext> {
         let (line_idx, cursor_offset) = self.cursor;
         if line_idx != 0 {
@@ -1525,6 +1608,29 @@ impl TuiInput {
             arg_index,
             filter,
             previous_args,
+        })
+    }
+
+    fn at_path_cursor_context(&self) -> Option<SlashCursorContext> {
+        let (line_idx, cursor_offset) = self.cursor;
+        let line = self.lines.get(line_idx)?;
+        let cursor = cursor_offset.min(line.len());
+        let mut token_start = 0;
+        for (offset, ch) in line.get(..cursor)?.char_indices() {
+            if ch.is_whitespace() {
+                token_start = offset.saturating_add(ch.len_utf8());
+            }
+        }
+        let token = line.get(token_start..cursor)?;
+        if !token.starts_with('@') {
+            return None;
+        }
+        let before = line.get(..token_start).unwrap_or_default();
+        if before.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+            return None;
+        }
+        Some(SlashCursorContext::AtPath {
+            filter: token.get(1..).unwrap_or_default().to_string(),
         })
     }
 
@@ -1628,6 +1734,40 @@ impl TuiInput {
         if !suffix.is_empty() && !line.ends_with(&suffix) {
             line.push_str(&suffix);
         }
+        self.history_pos = None;
+        self.pending_draft = None;
+        self.reverse_search = None;
+    }
+
+    fn replace_at_path_token(&mut self, value: &str, append_space: bool) {
+        let (line_idx, cursor_offset) = self.cursor;
+        let Some(line) = self.lines.get_mut(line_idx) else {
+            return;
+        };
+        let cursor = cursor_offset.min(line.len());
+        let mut token_start = 0;
+        for (offset, ch) in line.get(..cursor).unwrap_or_default().char_indices() {
+            if ch.is_whitespace() {
+                token_start = offset.saturating_add(ch.len_utf8());
+            }
+        }
+        let Some(token) = line.get(token_start..cursor) else {
+            return;
+        };
+        if !token.starts_with('@') {
+            return;
+        }
+        let token_end = line
+            .get(cursor..)
+            .and_then(|tail| tail.find(char::is_whitespace))
+            .map_or(line.len(), |offset| cursor.saturating_add(offset));
+        let insertion = if append_space {
+            format!("{value} ")
+        } else {
+            value.to_string()
+        };
+        line.replace_range(token_start..token_end, &insertion);
+        self.cursor = (line_idx, token_start.saturating_add(insertion.len()).min(line.len()));
         self.history_pos = None;
         self.pending_draft = None;
         self.reverse_search = None;
@@ -2315,6 +2455,7 @@ impl TuiState {
             sessions_cache: Vec::new(),
             saved_sessions_cache: Vec::new(),
             provider_model_catalog: Vec::new(),
+            at_path_candidates: Vec::new(),
             saved_session_picker: None,
             active_session_view: None,
             pending_tool_approval: None,
@@ -2332,6 +2473,18 @@ impl TuiState {
             self.focus = crate::chat::sessions::FocusTarget::Main;
         }
         had_pending || had_approval_focus
+    }
+
+    pub fn update_at_path_candidates(&mut self, candidates: Vec<AtPathCandidate>) {
+        self.at_path_candidates = candidates;
+        let sources = SlashMenuSources {
+            live_sessions: &self.sessions_cache,
+            saved_sessions: &self.saved_sessions_cache,
+            provider_model_catalog: &self.provider_model_catalog,
+            at_path_candidates: &self.at_path_candidates,
+            current_provider: &self.provider,
+        };
+        sync_slash_menu_for_sources(&self.input, &mut self.slash_menu, sources);
     }
 
     // ── P3-5: streaming-draft API ──────────────────────────────────────────
@@ -2427,6 +2580,7 @@ impl TuiState {
                     live_sessions: &self.sessions_cache,
                     saved_sessions: &self.saved_sessions_cache,
                     provider_model_catalog: &self.provider_model_catalog,
+                    at_path_candidates: &self.at_path_candidates,
                     current_provider: &self.provider,
                 };
                 sync_slash_menu_for_sources(&self.input, &mut self.slash_menu, sources);
@@ -7673,6 +7827,61 @@ mod tests {
         }
 
         assert!(state.slash_menu.is_none(), "free-text /bg should not force candidates");
+    }
+
+    #[test]
+    fn at_path_menu_opens_at_word_start_and_inserts_file_with_space() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("inspect @ca");
+
+        state.update_at_path_candidates(vec![AtPathCandidate {
+            path: "Cargo.toml".to_string(),
+            is_dir: false,
+        }]);
+
+        let menu = state.slash_menu.as_ref().expect("@path menu open");
+        assert_eq!(menu.filter, "ca");
+        assert_eq!(menu.entries[0].label, "Cargo.toml");
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "inspect @Cargo.toml ");
+        assert_eq!(state.input.cursor, (0, "inspect @Cargo.toml ".len()));
+    }
+
+    #[test]
+    fn at_path_menu_keeps_directory_candidate_open_for_drilldown() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("@s");
+
+        state.update_at_path_candidates(vec![AtPathCandidate {
+            path: "src/".to_string(),
+            is_dir: true,
+        }]);
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Tab), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "@src/");
+        assert!(
+            state.input.text().ends_with('/'),
+            "directory completion must not append a separating space"
+        );
+    }
+
+    #[test]
+    fn at_path_menu_requires_word_start() {
+        let mut state = TuiState::new("p", "m");
+        state.input.set_text("mail@example");
+
+        state.update_at_path_candidates(vec![AtPathCandidate {
+            path: "example.rs".to_string(),
+            is_dir: false,
+        }]);
+
+        assert!(state.slash_menu.is_none(), "email-like @ must not open path menu");
     }
 
     #[test]

@@ -50,6 +50,7 @@ use crate::agent::loop_::ChatMode;
 use crate::channels::traits::SendMessage;
 use crate::chat::action::{Action, CompactReason, HistoryDir};
 use crate::chat::session::{ChatSession, ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
+use crate::chat::slash_types::AtPathCandidate;
 use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
@@ -333,6 +334,8 @@ pub struct UiState {
     pub strip_selection: Option<u64>,
     /// Slash-command menu overlay. Derived from the current input command token.
     pub slash_menu: Option<SlashMenuState>,
+    /// Security-filtered `@path` completion source, delivered via Action.
+    pub at_path_candidates: Vec<AtPathCandidate>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
@@ -545,6 +548,7 @@ impl ChatState {
                 switcher: None,
                 strip_selection: None,
                 slash_menu: None,
+                at_path_candidates: Vec::new(),
                 saved_session_picker: None,
             },
             stream: StreamState {
@@ -581,12 +585,14 @@ impl ChatState {
         live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
         saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
         provider_model_catalog: &'a [crate::chat::tui::SlashProviderModelCatalog],
+        at_path_candidates: &'a [crate::chat::slash_types::AtPathCandidate],
         current_provider: &'a str,
     ) -> crate::chat::tui::SlashMenuSources<'a> {
         crate::chat::tui::SlashMenuSources {
             live_sessions,
             saved_sessions,
             provider_model_catalog,
+            at_path_candidates,
             current_provider,
         }
     }
@@ -836,6 +842,7 @@ impl ChatState {
                 saved_sessions,
                 provider_model_catalog,
             } => self.reduce_slash_menu_sources_updated(saved_sessions, provider_model_catalog),
+            Action::AtPathCandidatesUpdated { candidates } => self.reduce_at_path_candidates_updated(candidates),
             Action::ActiveSessionViewUpdated { view } => self.reduce_active_session_view_updated(view),
             Action::ContextWindowUpdated {
                 used_context_tokens,
@@ -906,6 +913,7 @@ impl ChatState {
                 &self.ui.sessions_entries,
                 &self.ui.saved_sessions_cache,
                 &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
                 self.session.provider.as_ref(),
             );
             let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
@@ -989,6 +997,7 @@ impl ChatState {
                 &self.ui.sessions_entries,
                 &self.ui.saved_sessions_cache,
                 &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
                 self.session.provider.as_ref(),
             );
             crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
@@ -1010,6 +1019,7 @@ impl ChatState {
                     &self.ui.sessions_entries,
                     &self.ui.saved_sessions_cache,
                     &self.ui.provider_model_catalog,
+                    &self.ui.at_path_candidates,
                     self.session.provider.as_ref(),
                 );
                 crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
@@ -1076,6 +1086,7 @@ impl ChatState {
             &self.ui.sessions_entries,
             &self.ui.saved_sessions_cache,
             &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
             self.session.provider.as_ref(),
         );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
@@ -1118,6 +1129,7 @@ impl ChatState {
             &self.ui.sessions_entries,
             &self.ui.saved_sessions_cache,
             &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
             self.session.provider.as_ref(),
         );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
@@ -1143,6 +1155,7 @@ impl ChatState {
             &self.ui.sessions_entries,
             &self.ui.saved_sessions_cache,
             &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
             self.session.provider.as_ref(),
         );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
@@ -2228,10 +2241,33 @@ impl ChatState {
                 &self.ui.sessions_entries,
                 &self.ui.saved_sessions_cache,
                 &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
                 self.session.provider.as_ref(),
             );
             crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_at_path_candidates_updated(&mut self, candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
+        if self.ui.at_path_candidates == candidates {
+            return Vec::new();
+        }
+        self.ui.at_path_candidates = candidates;
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
+            self.session.provider.as_ref(),
+        );
+        crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_at_path_candidates_updated(&mut self, _candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
         vec![Effect::RequestRedraw]
     }
 
@@ -2716,6 +2752,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
         | Action::SlashMenuSourcesUpdated { .. }
+        | Action::AtPathCandidatesUpdated { .. }
         | Action::ActiveSessionViewUpdated { .. }
         | Action::ContextWindowUpdated { .. }
         | Action::ProviderUsageRecorded { .. } => true,
@@ -2868,6 +2905,41 @@ mod tests {
 
         assert_eq!(legacy_labels, redux_labels);
         assert_eq!(redux_labels, vec!["gpt-parity"]);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn at_path_candidates_action_opens_redux_menu_and_tab_inserts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        let _ = state.reduce(Action::InputReplaced("inspect @ca".to_string()));
+        assert!(
+            state.ui.slash_menu.is_none(),
+            "input alone has no candidates and must not render a stale menu"
+        );
+
+        let effects = state.reduce(Action::AtPathCandidatesUpdated {
+            candidates: vec![AtPathCandidate {
+                path: "Cargo.toml".to_string(),
+                is_dir: false,
+            }],
+        });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(
+            state
+                .ui
+                .slash_menu
+                .as_ref()
+                .expect("@path menu")
+                .entries
+                .first()
+                .map(|entry| entry.label.as_str()),
+            Some("Cargo.toml")
+        );
+        let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(state.ui.input.text(), "inspect @Cargo.toml ");
     }
 
     /// P1: SessionsEntriesUpdated writes structured strip entries and dedups
