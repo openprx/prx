@@ -1720,6 +1720,27 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         },
     );
 
+    // Kimi API Platform models. Kimi publishes a cache-hit input price, but no
+    // separate cache-write tier; treat cache writes as ordinary cache-miss input.
+    let mut insert_kimi = |provider: &str, model: &str, input: f64, output: f64, cache_read: f64| {
+        prices.insert(
+            format!("{provider}/{model}"),
+            ModelPricing {
+                input,
+                output,
+                cache_write: input,
+                cache_read,
+            },
+        );
+    };
+    insert_kimi("kimi-code", "kimi-k2.7-code", 0.95, 4.0, 0.19);
+    insert_kimi("kimi-code", "kimi-k2.7-code-highspeed", 1.90, 8.0, 0.38);
+    insert_kimi("kimi-code", "kimi2.6", 0.95, 4.0, 0.16);
+    insert_kimi("kimi-code", "kimi-k2.6", 0.95, 4.0, 0.16);
+    insert_kimi("kimi-code", "kimi-k2.5", 0.60, 3.0, 0.10);
+    insert_kimi("moonshot", "kimi-k2.6", 0.95, 4.0, 0.16);
+    insert_kimi("moonshot", "kimi-k2.5", 0.60, 3.0, 0.10);
+
     prices
 }
 

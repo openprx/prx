@@ -587,6 +587,32 @@ mod tests {
     }
 
     #[test]
+    fn provider_usage_record_computes_kimi_code_cost() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("kimi-code", "kimi-k2.7-code");
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            Utc::now(),
+            crate::llm::route_decision::TokenUsage::reported(Some(1_000), Some(500), Some(1_500)),
+        );
+
+        let record =
+            MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &crate::config::schema::CostConfig::default())
+                .expect("reported usage should produce a record");
+
+        assert_eq!(record.prompt_tokens, 1_000);
+        assert_eq!(record.completion_tokens, 500);
+        assert_eq!(record.total_tokens, 1_500);
+        assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        let cost = record
+            .cost_usd
+            .expect("default kimi-code/kimi-k2.7-code price should compute cost");
+        assert!(
+            (cost - 0.002_95).abs() < 0.000_000_1,
+            "kimi-code cost should use default pricing: {cost}"
+        );
+    }
+
+    #[test]
     fn provider_usage_record_marks_ollama_cost_unknown() {
         let decision = crate::llm::route_decision::RouteDecision::single_candidate("ollama", "llama3");
         let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
