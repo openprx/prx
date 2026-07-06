@@ -436,16 +436,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             .with_audit_config(config.security.audit.clone()),
     );
 
-    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = crate::providers::provider_runtime_options_from_config(&config);
 
     let provider: Arc<dyn Provider> = Arc::from(crate::providers::create_resilient_provider_with_options(
         &manifest.provider_name,

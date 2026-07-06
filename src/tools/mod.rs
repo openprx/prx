@@ -502,16 +502,7 @@ pub fn all_tools_with_runtime_ext(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                openprx_dir: root_config.config_path.parent().map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                codex_auth_json_path: Some(root_config.auth.codex_auth_json_path.clone()),
-                codex_auth_json_auto_import: root_config.auth.codex_auth_json_auto_import,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                codex_stream_idle_timeout_secs: root_config.runtime.codex_stream_idle_timeout_secs,
-                codex_reasoning_effort: root_config.runtime.codex_reasoning_effort.clone(),
-            },
+            crate::providers::provider_runtime_options_from_config(root_config),
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone())

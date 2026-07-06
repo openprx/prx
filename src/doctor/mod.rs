@@ -930,16 +930,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         config.default_provider.as_deref().unwrap_or("openrouter"),
         config.api_key.as_deref(),
         &config.reliability,
-        &crate::providers::ProviderRuntimeOptions {
-            auth_profile_override: None,
-            openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-            secrets_encrypt: config.secrets.encrypt,
-            codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-            codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-            reasoning_enabled: config.runtime.reasoning_enabled,
-            codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-            codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-        },
+        &crate::providers::provider_runtime_options_from_config(config),
     );
     if availability.degraded {
         items.push(DiagItem::warn(

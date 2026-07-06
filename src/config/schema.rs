@@ -221,6 +221,10 @@ pub struct Config {
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// Provider-specific runtime options (`[providers.<name>]`).
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -425,6 +429,7 @@ impl std::fmt::Debug for Config {
             .field("default_provider", &self.default_provider)
             .field("default_model", &self.default_model)
             .field("default_temperature", &self.default_temperature)
+            .field("providers", &self.providers)
             .field("observability", &self.observability)
             .field("autonomy", &self.autonomy)
             .field("runtime", &self.runtime)
@@ -715,6 +720,22 @@ pub struct RouterModelConfig {
     /// Initial Elo rating.
     #[serde(default = "default_router_elo")]
     pub elo_rating: f32,
+}
+
+/// Provider-specific runtime configuration (`[providers]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProvidersConfig {
+    /// Ollama-specific request options (`[providers.ollama]`).
+    #[serde(default)]
+    pub ollama: OllamaProviderConfig,
+}
+
+/// Ollama-specific request options (`[providers.ollama]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OllamaProviderConfig {
+    /// Explicit context window sent as Ollama `options.num_ctx`.
+    #[serde(default)]
+    pub num_ctx: Option<usize>,
 }
 
 /// Remote node proxy configuration for core-side RPC calls and node daemon defaults.
@@ -5167,6 +5188,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             default_temperature: 0.7,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -6253,6 +6275,7 @@ min_chars = 12
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -6456,6 +6479,19 @@ connect_timeout_secs = 12
     }
 
     #[test]
+    async fn ollama_provider_num_ctx_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[providers.ollama]
+num_ctx = 32768
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.providers.ollama.num_ctx, Some(32_768));
+    }
+
+    #[test]
     async fn runtime_reasoning_enabled_deserializes() {
         let raw = r#"
 default_temperature = 0.7
@@ -6641,6 +6677,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
