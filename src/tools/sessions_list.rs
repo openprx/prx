@@ -53,7 +53,7 @@ impl Tool for SessionsListTool {
 
     fn description(&self) -> &str {
         "List active and recently completed sub-agent sessions. \
-         Shows run_id, status, age, and task for each session spawned via sessions_spawn. \
+         Shows run_id, source/manageability, origin, agent_index_hint, status, age, usage, and task for each session spawned via sessions_spawn. \
          Use this to check what sub-agents are running or have recently finished."
     }
 
@@ -119,7 +119,8 @@ impl Tool for SessionsListTool {
 
         let mut lines: Vec<String> = filtered
             .iter()
-            .map(|r| {
+            .enumerate()
+            .map(|(idx, r)| {
                 let status = match &r.status {
                     SubAgentStatus::Running => "🔄 running".to_string(),
                     SubAgentStatus::AwaitingInput { prompt } => {
@@ -133,7 +134,13 @@ impl Tool for SessionsListTool {
                     SubAgentStatus::Failed(e) => format!("❌ failed: {e}"),
                 };
                 let age = (Utc::now() - r.started_at).num_seconds();
-                format!("• `{}` [{age}s ago] {status}\n  task: {}", r.id, r.task)
+                let origin = if r.parent_run_id.is_some() { "model" } else { "user" };
+                let agent_index_hint = idx.saturating_add(1);
+                let usage = format_run_usage(&r.token_usage_records);
+                format!(
+                    "• `{}` [agent_index_hint=#{agent_index_hint}, source=runtime, manageable=true, origin={origin}, usage={usage}, {age}s ago] {status}\n  task: {}",
+                    r.id, r.task
+                )
             })
             .collect();
 
@@ -190,14 +197,67 @@ fn format_recovered_run(run: &RecoveredTaskRun) -> String {
         .map(|owner| format!("\n  owner: {owner}"))
         .unwrap_or_default();
     format!(
-        "• `{}` [memory at {}] {status}\n  task: {task}{owner}",
+        "• `{}` [source=memory, manageable=false, usage=unknown, memory at {}] {status}\n  task: {task}{owner}\n  note: recovered from memory only; not killable/steerable in the current runtime registry",
         run.run_id, run.last_event_at
     )
+}
+
+pub(crate) fn format_run_usage(records: &[crate::llm::route_decision::MeteredTokenUsageRecord]) -> String {
+    let mut total_tokens = 0u64;
+    let mut estimated_tokens = 0u64;
+    let mut known_cost_usd = 0.0f64;
+    let mut unknown_cost_requests = 0u64;
+    for record in records {
+        total_tokens = total_tokens.saturating_add(record.total_tokens);
+        if record.source == crate::llm::route_decision::TokenUsageSource::Estimated {
+            estimated_tokens = estimated_tokens.saturating_add(record.total_tokens);
+        }
+        if let Some(cost) = record.cost_usd.filter(|cost| cost.is_finite() && *cost >= 0.0) {
+            known_cost_usd += cost;
+        } else {
+            unknown_cost_requests = unknown_cost_requests.saturating_add(1);
+        }
+    }
+    if total_tokens == 0 {
+        return "unknown".to_string();
+    }
+    let prefix = if estimated_tokens > 0 { "~" } else { "" };
+    let mut out = format!("{prefix}{} tok", format_token_count_compact(total_tokens));
+    if unknown_cost_requests > 0 {
+        out.push_str(" | cost unknown");
+    } else {
+        out.push_str(" | ");
+        out.push_str(&format_cost_usd(known_cost_usd));
+    }
+    out
+}
+
+fn format_token_count_compact(tokens: u64) -> String {
+    if tokens >= 10_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000_000 {
+        format!("{:.1}M", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn format_cost_usd(cost: f64) -> String {
+    if !cost.is_finite() || cost <= 0.0 {
+        "$0.0000".to_string()
+    } else if cost >= 1.0 {
+        format!("${cost:.2}")
+    } else {
+        format!("${cost:.4}")
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::route_decision::TokenUsageSource;
     use crate::memory::{MemoryEventInput, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
     use chrono::Utc;
@@ -253,6 +313,52 @@ mod tests {
         assert!(result.output.contains("aaa"));
         assert!(result.output.contains("bbb"));
         assert!(result.output.contains("task A"));
+    }
+
+    #[tokio::test]
+    async fn lists_origin_and_agent_index_hint() {
+        let mut run = make_run("model-run", SubAgentStatus::Running, "model task");
+        run.parent_run_id = Some("turn-root".to_string());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let tool = SessionsListTool::new(runs);
+
+        let result = tool.execute(json!({})).await.unwrap();
+
+        assert!(result.success);
+        assert!(
+            result.output.contains("agent_index_hint=#1") && result.output.contains("origin=model"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result.output.contains("source=runtime, manageable=true"),
+            "{}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn lists_runtime_usage_when_reported() {
+        let mut run = make_run("usage-run", SubAgentStatus::Completed("done".into()), "usage task");
+        run.token_usage_records
+            .push(crate::llm::route_decision::MeteredTokenUsageRecord {
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                prompt_tokens: 1000,
+                completion_tokens: 500,
+                total_tokens: 1500,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                source: TokenUsageSource::Reported,
+                cost_usd: Some(0.0042),
+            });
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let tool = SessionsListTool::new(runs);
+
+        let result = tool.execute(json!({"status": "completed"})).await.unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("usage=1.5k tok | $0.0042"), "{}", result.output);
     }
 
     #[tokio::test]
@@ -320,6 +426,18 @@ mod tests {
         assert!(result.output.contains("mem-run-1"));
         assert!(result.output.contains("recover me"));
         assert!(result.output.contains("owner-a"));
+        assert!(
+            result.output.contains("source=memory, manageable=false"),
+            "{}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("not killable/steerable in the current runtime registry"),
+            "{}",
+            result.output
+        );
 
         let visible = memory
             .list_memory_events_since(

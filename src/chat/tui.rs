@@ -27,6 +27,7 @@ use std::sync::{Arc, LazyLock};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::agent::loop_::ChatMode;
+use crate::chat::action::{MainQueueStatus, ProviderWorkerRowState, ProviderWorkerStatus, ProviderWorkerStatusRow};
 use crate::chat::commands::{CommandArgCandidate, CommandArgSource, CommandSpec, command_specs};
 use crate::chat::session::MainSessionTokenUsageSummary;
 use crate::chat::terminal_proto::{
@@ -119,6 +120,10 @@ pub struct TuiState {
     /// chat main loop's 1s sessions tick. The key thread reads this (it cannot
     /// run async registry queries) when opening the switcher with Ctrl+G.
     pub sessions_cache: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// Main-session input backlog status for orchestration observation.
+    pub main_queue_status: MainQueueStatus,
+    /// Main-session provider worker status for orchestration observation.
+    pub provider_worker_status: ProviderWorkerStatus,
     /// Cached saved chat sessions for `/resume` slash-menu argument candidates.
     pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
     /// Enumerable model candidates grouped by provider for slash-menu drill-down.
@@ -515,6 +520,10 @@ pub const INPUT_HISTORY_CAPACITY: usize = 200;
 pub const TRANSCRIPT_SESSION_SEQ: u64 = 0;
 /// Synthetic display id for the read-only diff child TUI.
 pub const DIFF_SESSION_SEQ: u64 = 0;
+/// Synthetic switcher-only provider worker rows live outside the managed session
+/// sequence space so Enter can route to `/workers` instead of `/attach`.
+const PROVIDER_WORKER_SWITCHER_SEQ_BASE: u64 = u64::MAX - 10_000;
+const PROVIDER_WORKER_SWITCHER_KIND: &str = "worker";
 
 /// Bounded transcript viewport size. Conversation history remains authoritative
 /// elsewhere; the child TUI is only a scrollable display snapshot.
@@ -672,6 +681,10 @@ pub enum KeyDispatch {
     OpenTranscriptViewer,
     /// P6b1: close the read-only transcript child TUI.
     CloseTranscriptViewer,
+    /// P6Y: open the read-only main provider worker detail TUI.
+    OpenProviderWorkerView { sequence: u64 },
+    /// P6Y: close the read-only main provider worker detail TUI.
+    CloseProviderWorkerView,
     /// P6c2: close the read-only diff child TUI.
     CloseDiffViewer,
     /// P6b2: open the current draft in an external editor.
@@ -1015,6 +1028,94 @@ fn switcher_entries_with_transcript(
     out
 }
 
+fn switcher_entries_with_transcript_and_workers(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    workers: ProviderWorkerStatus,
+    focus: crate::chat::sessions::FocusTarget,
+) -> Vec<crate::chat::sessions::SwitcherEntry> {
+    let worker_entries = provider_worker_switcher_entries(workers, focus);
+    let mut out = Vec::with_capacity(entries.len().saturating_add(worker_entries.len()).saturating_add(1));
+    out.push(transcript_switcher_entry());
+    out.extend(worker_entries);
+    out.extend(entries.iter().filter(|entry| !entry.is_transcript()).cloned());
+    out
+}
+
+fn provider_worker_switcher_entries(
+    workers: ProviderWorkerStatus,
+    focus: crate::chat::sessions::FocusTarget,
+) -> Vec<crate::chat::sessions::SwitcherEntry> {
+    let focused_worker = focus.worker_sequence();
+    workers
+        .rows
+        .iter()
+        .filter(|row| row.is_active() || focused_worker == Some(row.sequence))
+        .map(provider_worker_switcher_entry)
+        .collect()
+}
+
+fn provider_worker_switcher_entry(row: &ProviderWorkerStatusRow) -> crate::chat::sessions::SwitcherEntry {
+    let now = chrono::Utc::now();
+    let created_at = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(row.started_at_ms).unwrap_or(now);
+    let status = match row.state {
+        ProviderWorkerRowState::Running => "running",
+        ProviderWorkerRowState::Cancelling => "cancelling",
+        ProviderWorkerRowState::AwaitingCommit => "awaiting-commit",
+        ProviderWorkerRowState::Committed => "completed",
+        ProviderWorkerRowState::Cancelled => "cancelled",
+        ProviderWorkerRowState::Failed => "failed",
+    };
+    let mut title = format!(
+        "main provider w#{} {} task={}",
+        row.sequence,
+        crate::chat::action::provider_worker_row_kind_label(row.kind),
+        row.task_id
+    );
+    if let Some(tokens) = row.finalized_total_tokens.filter(|tokens| *tokens > 0) {
+        title.push_str(" tokens=");
+        title.push_str(&format_worker_tokens_compact(tokens));
+    }
+    crate::chat::sessions::SwitcherEntry {
+        seq: PROVIDER_WORKER_SWITCHER_SEQ_BASE.saturating_add(row.sequence),
+        kind: PROVIDER_WORKER_SWITCHER_KIND,
+        origin: "provider",
+        status,
+        title,
+        created_at,
+        updated_at: now,
+        token_usage_records: Vec::new(),
+        idle_warning: false,
+    }
+}
+
+fn is_provider_worker_switcher_entry(entry: &crate::chat::sessions::SwitcherEntry) -> bool {
+    entry.kind == PROVIDER_WORKER_SWITCHER_KIND
+}
+
+const fn provider_worker_sequence_from_switcher_seq(seq: u64) -> Option<u64> {
+    if seq >= PROVIDER_WORKER_SWITCHER_SEQ_BASE {
+        Some(seq.saturating_sub(PROVIDER_WORKER_SWITCHER_SEQ_BASE))
+    } else {
+        None
+    }
+}
+
+fn switcher_entry_display_id(entry: &crate::chat::sessions::SwitcherEntry) -> String {
+    if is_provider_worker_switcher_entry(entry) {
+        format!("w#{}", entry.seq.saturating_sub(PROVIDER_WORKER_SWITCHER_SEQ_BASE))
+    } else {
+        format!("#{}", entry.seq)
+    }
+}
+
+fn focus_active_entry_seq(focus: crate::chat::sessions::FocusTarget) -> Option<u64> {
+    focus.session_seq().or_else(|| {
+        focus
+            .worker_sequence()
+            .map(|sequence| PROVIDER_WORKER_SWITCHER_SEQ_BASE.saturating_add(sequence))
+    })
+}
+
 pub(crate) fn strip_selection_index(
     entries: &[crate::chat::sessions::SwitcherEntry],
     selected: Option<u64>,
@@ -1022,11 +1123,78 @@ pub(crate) fn strip_selection_index(
 ) -> Option<usize> {
     selected
         .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
-        .or_else(|| {
-            focus
-                .session_seq()
-                .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
-        })
+        .or_else(|| focus_active_entry_seq(focus).and_then(|seq| entries.iter().position(|entry| entry.seq == seq)))
+}
+
+const MAIN_SESSION_SELECTION_SEQ: u64 = 0;
+
+fn bottom_list_selection_index(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    selected: Option<u64>,
+    focus: crate::chat::sessions::FocusTarget,
+) -> usize {
+    if selected == Some(MAIN_SESSION_SELECTION_SEQ) {
+        return 0;
+    }
+    if let Some(idx) = selected.and_then(|seq| entries.iter().position(|entry| entry.seq == seq)) {
+        return idx.saturating_add(1);
+    }
+    focus_active_entry_seq(focus)
+        .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
+        .map_or(0, |idx| idx.saturating_add(1))
+}
+
+fn bottom_list_seq_at(entries: &[crate::chat::sessions::SwitcherEntry], idx: usize) -> Option<u64> {
+    if idx == 0 {
+        Some(MAIN_SESSION_SELECTION_SEQ)
+    } else {
+        entries.get(idx.saturating_sub(1)).map(|entry| entry.seq)
+    }
+}
+
+fn move_bottom_list_selection(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    selected: Option<u64>,
+    focus: crate::chat::sessions::FocusTarget,
+    direction: crate::chat::sessions::SessionDirection,
+) -> Option<u64> {
+    if entries.is_empty() {
+        return None;
+    }
+    let total = entries.len().saturating_add(1);
+    let current = bottom_list_selection_index(entries, selected, focus).min(total.saturating_sub(1));
+    let target_idx = match direction {
+        crate::chat::sessions::SessionDirection::Previous => {
+            current.checked_sub(1).unwrap_or_else(|| total.saturating_sub(1))
+        }
+        crate::chat::sessions::SessionDirection::Next => {
+            let next = current.saturating_add(1);
+            if next >= total { 0 } else { next }
+        }
+    };
+    bottom_list_seq_at(entries, target_idx)
+}
+
+fn bottom_chrome_session_entries(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    focus: crate::chat::sessions::FocusTarget,
+) -> Vec<crate::chat::sessions::SwitcherEntry> {
+    let active_seq = focus_active_entry_seq(focus);
+    entries
+        .iter()
+        .filter(|entry| entry.is_transcript() || !entry.is_terminal() || active_seq == Some(entry.seq))
+        .cloned()
+        .collect()
+}
+
+fn bottom_chrome_session_entries_with_workers(
+    entries: &[crate::chat::sessions::SwitcherEntry],
+    workers: ProviderWorkerStatus,
+    focus: crate::chat::sessions::FocusTarget,
+) -> Vec<crate::chat::sessions::SwitcherEntry> {
+    let mut out = provider_worker_switcher_entries(workers, focus);
+    out.extend(bottom_chrome_session_entries(entries, focus));
+    out
 }
 
 pub(crate) fn move_strip_selection(
@@ -1118,6 +1286,102 @@ fn transcript_lines_from_conversation(conversation: &[ConversationLine]) -> (Vec
         }
     }
     (lines, false)
+}
+
+const PROVIDER_WORKER_IO_MAX_SOURCE_ITEMS: usize = 12;
+const PROVIDER_WORKER_IO_LINE_MAX_CHARS: u16 = 180;
+const PROVIDER_WORKER_IO_RESULT_LINES: usize = 3;
+
+fn provider_worker_io_clip(text: &str) -> String {
+    truncate_chars_with_ellipsis(text.trim(), PROVIDER_WORKER_IO_LINE_MAX_CHARS, false)
+}
+
+/// Build compact live IO lines for the read-only provider worker detail view.
+///
+/// This is intentionally derived from the same conversation/tool cards the main
+/// transcript renders, so the worker view stays an observation surface and does
+/// not introduce a second history writer.
+#[must_use]
+pub fn provider_worker_io_lines_from_conversation(
+    conversation: &[ConversationLine],
+    streaming: Option<&StreamingDraft>,
+    max_lines: usize,
+) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for item in conversation
+        .iter()
+        .rev()
+        .take(PROVIDER_WORKER_IO_MAX_SOURCE_ITEMS)
+        .rev()
+    {
+        match item {
+            ConversationLine::ToolResult {
+                tool_name,
+                args_preview,
+                args_full,
+                result,
+                status,
+                elapsed_ms,
+                ..
+            } => {
+                let args = if args_preview.trim().is_empty() {
+                    args_full
+                } else {
+                    args_preview
+                };
+                let mut head = format!(
+                    "run {} {}: {}",
+                    tool_name,
+                    tool_status_name(*status),
+                    provider_worker_io_clip(args)
+                );
+                if let Some(elapsed_ms) = elapsed_ms {
+                    head.push_str(&format!(" ({elapsed_ms}ms)"));
+                }
+                lines.push(head);
+                if let Some(result) = result {
+                    for part in result.lines().take(PROVIDER_WORKER_IO_RESULT_LINES) {
+                        lines.push(format!("output: {}", provider_worker_io_clip(part)));
+                    }
+                } else if matches!(status, ToolStatus::Running) {
+                    lines.push("output: pending".to_string());
+                }
+            }
+            ConversationLine::Tool { name, success } => {
+                let status = if *success { "done" } else { "error" };
+                lines.push(format!("run {name} {status}"));
+            }
+            ConversationLine::StreamingAssistant { content } => {
+                if !content.trim().is_empty() {
+                    lines.push(format!("assistant streaming: {}", provider_worker_io_clip(content)));
+                }
+            }
+            ConversationLine::Assistant { content } => {
+                if !content.trim().is_empty() {
+                    lines.push(format!("assistant: {}", provider_worker_io_clip(content)));
+                }
+            }
+            ConversationLine::Reasoning { char_count, .. } => {
+                lines.push(format!("thinking: {char_count} chars"));
+            }
+            ConversationLine::User { .. } | ConversationLine::System { .. } => {}
+        }
+    }
+    if let Some(streaming) = streaming
+        && !streaming.accumulated.trim().is_empty()
+    {
+        lines.push(format!(
+            "assistant streaming: {}",
+            provider_worker_io_clip(&streaming.accumulated)
+        ));
+    }
+    if lines.len() > max_lines {
+        lines.drain(0..lines.len().saturating_sub(max_lines));
+    }
+    lines
 }
 
 /// Build the read-only transcript child viewport from current conversation lines.
@@ -1269,9 +1533,56 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // Never falls through to the input box. Opening an empty switcher is still
     // valid — it shows the "no child TUI sessions" hint with an Esc to close.
     if key.code == KeyCode::Char('g') && key.modifiers == KeyModifiers::CONTROL {
-        let entries = switcher_entries_with_transcript(&state.sessions_cache);
+        let entries = switcher_entries_with_transcript_and_workers(
+            &state.sessions_cache,
+            state.provider_worker_status.clone(),
+            state.focus,
+        );
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
         return KeyDispatch::SwitcherOpened { entries };
+    }
+    if state.input.is_empty()
+        && key.modifiers == KeyModifiers::NONE
+        && matches!(state.focus, crate::chat::sessions::FocusTarget::Main)
+    {
+        let bottom_entries = bottom_chrome_session_entries_with_workers(
+            &state.sessions_cache,
+            state.provider_worker_status.clone(),
+            state.focus,
+        );
+        let direction = match key.code {
+            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            if bottom_entries.is_empty() {
+                return KeyDispatch::Consumed;
+            }
+            let selected = move_bottom_list_selection(&bottom_entries, state.strip_selection, state.focus, direction);
+            state.strip_selection = selected;
+            return KeyDispatch::StripSelectionChanged { selected };
+        }
+        if key.code == KeyCode::Enter
+            && let Some(selected) = state.strip_selection
+        {
+            if selected == MAIN_SESSION_SELECTION_SEQ {
+                state.strip_selection = None;
+                return KeyDispatch::Consumed;
+            }
+            if let Some(entry) = selected_strip_entry(&bottom_entries, Some(selected)) {
+                state.strip_selection = None;
+                if is_provider_worker_switcher_entry(entry)
+                    && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                {
+                    return KeyDispatch::OpenProviderWorkerView { sequence };
+                }
+                return KeyDispatch::AttachSession { seq: entry.seq };
+            }
+            state.strip_selection = None;
+            state.push_system_message("session gone");
+            return KeyDispatch::Consumed;
+        }
     }
     if key.modifiers == KeyModifiers::ALT {
         let direction = match key.code {
@@ -1280,13 +1591,33 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             _ => None,
         };
         if let Some(direction) = direction {
-            let selected = move_strip_selection(&state.sessions_cache, state.strip_selection, state.focus, direction);
+            let entries = bottom_chrome_session_entries_with_workers(
+                &state.sessions_cache,
+                state.provider_worker_status.clone(),
+                state.focus,
+            );
+            let selected = move_bottom_list_selection(&entries, state.strip_selection, state.focus, direction);
             state.strip_selection = selected;
             return KeyDispatch::StripSelectionChanged { selected };
         }
         if key.code == KeyCode::Enter {
             if let Some(selected) = state.strip_selection {
-                if let Some(entry) = selected_strip_entry(&state.sessions_cache, Some(selected)) {
+                let entries = bottom_chrome_session_entries_with_workers(
+                    &state.sessions_cache,
+                    state.provider_worker_status.clone(),
+                    state.focus,
+                );
+                if selected == MAIN_SESSION_SELECTION_SEQ {
+                    state.strip_selection = None;
+                    return KeyDispatch::RequestDetach;
+                }
+                if let Some(entry) = selected_strip_entry(&entries, Some(selected)) {
+                    state.strip_selection = None;
+                    if is_provider_worker_switcher_entry(entry)
+                        && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                    {
+                        return KeyDispatch::OpenProviderWorkerView { sequence };
+                    }
                     return KeyDispatch::AttachSession { seq: entry.seq };
                 }
                 state.strip_selection = None;
@@ -1332,13 +1663,65 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         && key.modifiers == KeyModifiers::NONE
     {
         let direction = match key.code {
-            KeyCode::Left => Some(crate::chat::sessions::SessionDirection::Previous),
-            KeyCode::Right => Some(crate::chat::sessions::SessionDirection::Next),
+            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
             _ => None,
         };
         if let Some(direction) = direction {
-            return crate::chat::sessions::focus::adjacent_session_seq(&state.sessions_cache, current_seq, direction)
-                .map_or(KeyDispatch::Consumed, |seq| KeyDispatch::SwitchSession { seq });
+            let bottom_entries = bottom_chrome_session_entries_with_workers(
+                &state.sessions_cache,
+                state.provider_worker_status.clone(),
+                state.focus,
+            );
+            let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
+            return match selected {
+                Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::RequestDetach,
+                Some(seq) => {
+                    if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq))
+                        && is_provider_worker_switcher_entry(entry)
+                        && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                    {
+                        return KeyDispatch::OpenProviderWorkerView { sequence };
+                    }
+                    if seq != current_seq {
+                        return KeyDispatch::SwitchSession { seq };
+                    }
+                    KeyDispatch::Consumed
+                }
+                None => KeyDispatch::Consumed,
+            };
+        }
+    }
+    if matches!(state.focus, crate::chat::sessions::FocusTarget::Worker { .. })
+        && state.input.is_empty()
+        && key.modifiers == KeyModifiers::NONE
+    {
+        let direction = match key.code {
+            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+            _ => None,
+        };
+        if let Some(direction) = direction {
+            let bottom_entries = bottom_chrome_session_entries_with_workers(
+                &state.sessions_cache,
+                state.provider_worker_status.clone(),
+                state.focus,
+            );
+            let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
+            return match selected {
+                Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::CloseProviderWorkerView,
+                Some(seq) => {
+                    if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq)) {
+                        if is_provider_worker_switcher_entry(entry)
+                            && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                        {
+                            return KeyDispatch::OpenProviderWorkerView { sequence };
+                        }
+                    }
+                    KeyDispatch::SwitchSession { seq }
+                }
+                None => KeyDispatch::Consumed,
+            };
         }
     }
     if state.focus.is_child_view() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
@@ -1374,6 +1757,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 return KeyDispatch::Cancelled;
             }
             EscAction::CloseDiff => return KeyDispatch::CloseDiffViewer,
+            EscAction::CloseWorker => return KeyDispatch::CloseProviderWorkerView,
             EscAction::Cancel => {
                 // Empty buffer + main focus → unchanged legacy cancel semantics.
                 let _ = state.handle_input_key(key);
@@ -1385,7 +1769,9 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     }
     if matches!(
         state.focus,
-        crate::chat::sessions::FocusTarget::Transcript | crate::chat::sessions::FocusTarget::Diff
+        crate::chat::sessions::FocusTarget::Transcript
+            | crate::chat::sessions::FocusTarget::Diff
+            | crate::chat::sessions::FocusTarget::Worker { .. }
     ) && key.code == KeyCode::Enter
         && key.modifiers == KeyModifiers::NONE
     {
@@ -1432,6 +1818,12 @@ fn dispatch_switcher_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         return selected.map_or(KeyDispatch::SwitcherClosed, |entry| {
             if entry.is_transcript() {
                 return KeyDispatch::OpenTranscriptViewer;
+            }
+            if is_provider_worker_switcher_entry(&entry) {
+                return provider_worker_sequence_from_switcher_seq(entry.seq)
+                    .map_or(KeyDispatch::SwitcherClosed, |sequence| {
+                        KeyDispatch::OpenProviderWorkerView { sequence }
+                    });
             }
             // The key loop closes the snapshot switcher *and* sends the synthetic
             // `/attach`, so signal the attach here; the close rides along.
@@ -2711,6 +3103,8 @@ impl TuiState {
             strip_selection: None,
             slash_menu: None,
             sessions_cache: Vec::new(),
+            main_queue_status: MainQueueStatus::default(),
+            provider_worker_status: ProviderWorkerStatus::default(),
             saved_sessions_cache: Vec::new(),
             provider_model_catalog: Vec::new(),
             at_path_candidates: Vec::new(),
@@ -2876,6 +3270,11 @@ impl TuiState {
         self.conversation_lines.push(ConversationLine::System {
             content: content.to_string(),
         });
+    }
+
+    #[must_use]
+    pub fn execution_activity_active(&self) -> bool {
+        execution_activity_active_for_view(self)
     }
 
     /// Replace the persistent child-session status line (v1b).
@@ -3224,22 +3623,25 @@ fn estimate_line_height(line: &ConversationLine) -> u16 {
         ConversationLine::System { content } => content.lines().count().max(1) + 1,
         ConversationLine::Tool { .. } => 1,
         ConversationLine::ToolResult {
-            folded,
-            args_full,
-            result,
-            status,
-            ..
+            folded, result, status, ..
         } => {
             // Claude-Code style: bullet header (1 row) + an optional follow-on
             // block. While running there is no follow-on yet.
             if matches!(status, ToolStatus::Running) {
                 1
             } else if *folded {
-                // header + `⎿ ✓ metrics` summary row
-                2
+                // header + `⎿ output ✓ metrics` summary row + bounded preview.
+                let result_text = result.as_deref().unwrap_or("");
+                let preview_rows = if result_text.trim().is_empty() {
+                    0
+                } else {
+                    let total = result_text.lines().count();
+                    total.min(TOOL_FOLDED_RESULT_PREVIEW_LINES) + usize::from(total > TOOL_FOLDED_RESULT_PREVIEW_LINES)
+                };
+                2 + preview_rows
             } else {
                 // header + input row + output/error label + bounded body rows
-                let body = result.as_deref().filter(|s| !s.is_empty()).unwrap_or(args_full);
+                let body = result.as_deref().filter(|s| !s.is_empty()).unwrap_or("");
                 let body_line_count = body.lines().count();
                 let body_rows = body_line_count.clamp(1, TOOL_EXPANDED_OUTPUT_MAX_LINES);
                 let trunc_row = usize::from(body_line_count > TOOL_EXPANDED_OUTPUT_MAX_LINES);
@@ -3316,6 +3718,10 @@ pub trait BottomChromeView {
     fn sessions_status(&self) -> &str;
     /// Structured child-session entries for the always-visible P1 strip.
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry];
+    /// Main-session input backlog status.
+    fn main_queue_status(&self) -> MainQueueStatus;
+    /// Main-session provider worker status.
+    fn provider_worker_status(&self) -> ProviderWorkerStatus;
     /// UI-only bottom-strip selection, separate from input-routing focus.
     fn strip_selection(&self) -> Option<u64>;
     /// Focused line-session viewport (P2), if any.
@@ -3375,6 +3781,12 @@ impl BottomChromeView for TuiState {
     }
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         &self.sessions_cache
+    }
+    fn main_queue_status(&self) -> MainQueueStatus {
+        self.main_queue_status
+    }
+    fn provider_worker_status(&self) -> ProviderWorkerStatus {
+        self.provider_worker_status.clone()
     }
     fn strip_selection(&self) -> Option<u64> {
         self.strip_selection
@@ -3444,6 +3856,12 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn sessions_entries(&self) -> &[crate::chat::sessions::SwitcherEntry] {
         self.sessions_entries.as_slice()
+    }
+    fn main_queue_status(&self) -> MainQueueStatus {
+        self.main_queue_status
+    }
+    fn provider_worker_status(&self) -> ProviderWorkerStatus {
+        self.provider_worker_status.clone()
     }
     fn strip_selection(&self) -> Option<u64> {
         self.strip_selection
@@ -3547,23 +3965,35 @@ fn fullscreen_tail_marker<V: BottomChromeView + ?Sized>(state: &V) -> usize {
     finalized.saturating_add(streaming_chars)
 }
 
-/// Whether the persistent child-session status row should be shown.
-///
-/// Hidden when empty (no child TUI sessions). As a narrow/short-terminal
-/// degrade rule (plan §v1b), the row is also dropped first when the rest of the
-/// chrome (status + streaming + input + footer) would otherwise meet or exceed
-/// [`BOTTOM_CHROME_MAX_HEIGHT`], so the input box and footer never lose rows to
-/// the sessions line.
-fn sessions_status_visible<V: BottomChromeView + ?Sized>(state: &V) -> bool {
-    if state.sessions_status().is_empty() && state.sessions_entries().is_empty() {
-        return false;
+fn session_footer_has_sessions<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    let entries = bottom_chrome_session_entries_with_workers(
+        state.sessions_entries(),
+        state.provider_worker_status(),
+        state.focus(),
+    );
+    if entries.is_empty() {
+        return !state.sessions_status().is_empty();
     }
-    let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
-    let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let without_sessions: u16 = 1u16 // status row
-        .saturating_add(input_height)
-        .saturating_add(1); // footer row
-    without_sessions < BOTTOM_CHROME_MAX_HEIGHT
+    true
+}
+
+fn session_footer_desired_rows<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
+    if !session_footer_has_sessions(state) {
+        return 1;
+    }
+    let visible_entries = bottom_chrome_session_entries_with_workers(
+        state.sessions_entries(),
+        state.provider_worker_status(),
+        state.focus(),
+    );
+    let rows = if visible_entries.is_empty() && !state.sessions_entries().is_empty() {
+        0
+    } else if visible_entries.is_empty() {
+        1
+    } else {
+        visible_entries.len().saturating_add(1)
+    };
+    u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
 
 /// Height of the pinned bottom chrome in fullscreen mode.
@@ -3693,19 +4123,16 @@ fn reasoning_index_at_rendered_row(state: &TuiState, width: u16, rendered_row: u
 fn fullscreen_bottom_chrome_base_height<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     let visible_input_rows = state.input().lines.len().clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
-    1u16.saturating_add(sessions_rows)
-        .saturating_add(input_height)
-        .saturating_add(1)
+    let footer_rows = session_footer_desired_rows(state);
+    1u16.saturating_add(input_height).saturating_add(footer_rows)
 }
 
 fn fullscreen_bottom_chrome_height_for_width<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> u16 {
     let visible_input_rows = input_visual_rows_for_width(state, width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
-    1u16.saturating_add(sessions_rows)
-        .saturating_add(input_height)
-        .saturating_add(1)
+    let footer_rows = session_footer_desired_rows(state);
+    1u16.saturating_add(input_height)
+        .saturating_add(footer_rows)
         .clamp(BOTTOM_CHROME_MIN_HEIGHT, BOTTOM_CHROME_MAX_HEIGHT)
 }
 
@@ -3717,33 +4144,27 @@ fn render_fullscreen_bottom_chrome_at<V: BottomChromeView + ?Sized>(
 ) {
     let visible_input_rows = input_visual_rows_for_width(state, area.width).clamp(1, INPUT_MAX_VISIBLE_ROWS);
     let input_height = u16::try_from(visible_input_rows.saturating_add(1)).unwrap_or(2);
-    let sessions_rows = if sessions_status_visible(state) { 1 } else { 0 };
+    let max_footer_rows = area.height.saturating_sub(1).saturating_sub(input_height).max(1);
+    let footer_rows = session_footer_desired_rows(state).min(max_footer_rows);
 
-    let fixed_rows = 1u16
-        .saturating_add(sessions_rows)
-        .saturating_add(input_height)
-        .saturating_add(1);
+    let fixed_rows = 1u16.saturating_add(input_height).saturating_add(footer_rows);
     let spacer_rows = area.height.saturating_sub(fixed_rows);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(sessions_rows),
             Constraint::Length(spacer_rows),
             Constraint::Length(input_height),
-            Constraint::Length(1),
+            Constraint::Length(footer_rows),
         ])
         .split(area);
 
     #[allow(clippy::indexing_slicing)]
     {
         render_status_bar(frame, chunks[0], state);
-        if sessions_rows > 0 {
-            render_sessions_status(frame, chunks[1], state);
-        }
-        render_input(frame, chunks[3], state);
-        render_fullscreen_footer(frame, chunks[4], state.ascii_fallback(), show_new_output_below);
+        render_input(frame, chunks[2], state);
+        render_fullscreen_footer(frame, chunks[3], state, show_new_output_below);
     }
 }
 
@@ -3937,27 +4358,6 @@ fn slash_menu_overlay_rect(frame_area: Rect, menu: &SlashMenuState, bottom_chrom
     Rect { x, y, width, height }
 }
 
-/// Render the persistent child-session status row (v1b).
-///
-/// Single line, distinct dim style from the main status bar. The text is
-/// truncated to the row width so a narrow terminal degrades gracefully rather
-/// than wrapping into the input box.
-fn render_sessions_status<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) {
-    let line = render_sessions_strip_styled_line(
-        state.sessions_entries(),
-        state.sessions_status(),
-        state.focus(),
-        state.strip_selection(),
-        state.ascii_fallback(),
-        area.width,
-    );
-    if line.spans.is_empty() {
-        return;
-    }
-    let widget = Paragraph::new(Text::from(line)).style(Style::default().fg(Color::Cyan).bg(Color::Black));
-    frame.render_widget(widget, area);
-}
-
 fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> String {
     let max = usize::from(max_width);
     if max == 0 {
@@ -3986,12 +4386,8 @@ fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> Str
     truncated
 }
 
-const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
-    if active {
-        if ascii { ">" } else { "\u{25B8}" }
-    } else {
-        " "
-    }
+const fn session_active_marker(active: bool, _ascii: bool) -> &'static str {
+    if active { ">" } else { " " }
 }
 
 fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
@@ -4044,9 +4440,10 @@ fn render_sessions_strip_entry(
         SESSION_STRIP_CHIP_MAX_WIDTH
     };
     let chip_width = max_width.min(chip_cap);
+    let display_id = switcher_entry_display_id(entry);
     let prefix = usage.map_or_else(
-        || format!("{marker}{glyph} #{} {} {elapsed}{idle}", entry.seq, entry.kind),
-        |usage| format!("{marker}{glyph} #{} {} {elapsed}{idle} {usage}", entry.seq, entry.kind),
+        || format!("{marker}{glyph} {display_id} {} {elapsed}{idle}", entry.kind),
+        |usage| format!("{marker}{glyph} {display_id} {} {elapsed}{idle} {usage}", entry.kind),
     );
     let prefix_cols = UnicodeWidthStr::width(prefix.as_str());
     let max = usize::from(chip_width);
@@ -4066,6 +4463,135 @@ fn render_sessions_strip_entry(
     } else {
         format!("{prefix} {title}")
     }
+}
+
+fn render_sessions_list_entry_line(
+    entry: &crate::chat::sessions::SwitcherEntry,
+    active_seq: Option<u64>,
+    strip_selection: Option<u64>,
+    ascii: bool,
+    width: u16,
+) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let active = active_seq == Some(entry.seq);
+    let selected = strip_selection == Some(entry.seq);
+    let marker = session_active_marker(active, ascii);
+    let idle = if entry.idle_warning {
+        if ascii { " [idle]" } else { " ⚠ idle" }
+    } else {
+        ""
+    };
+    let usage = entry
+        .token_usage_summary()
+        .and_then(crate::chat::session::format_session_token_usage_inline)
+        .unwrap_or_else(|| "0 tok | $0.0000".to_string());
+    let sep = if ascii { " | " } else { " · " };
+    let display_id = switcher_entry_display_id(entry);
+    let prefix = format!(
+        "{marker} {display_id} {} {} {}{}{}{}",
+        entry.kind,
+        entry.origin,
+        entry.status,
+        sep,
+        entry.elapsed_label(),
+        idle
+    );
+    let mut text = format!("{prefix}{sep}{usage}");
+    if !entry.title.is_empty() {
+        text.push_str(sep);
+        text.push_str(&entry.title);
+    }
+    let text = truncate_chars_with_ellipsis(&text, width, ascii);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else if entry.is_terminal() {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn render_main_session_list_line<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> Line<'static> {
+    let ascii = state.ascii_fallback();
+    let active = matches!(state.focus(), crate::chat::sessions::FocusTarget::Main);
+    let selected = state.strip_selection() == Some(MAIN_SESSION_SELECTION_SEQ);
+    let marker = session_active_marker(active, ascii);
+    let sep = if ascii { " | " } else { " · " };
+    let usage = render_main_token_usage(state.token_usage_summary());
+    let text = format!(
+        "{marker} main chat {}{}{}{}{}/{}",
+        if active { "active" } else { "ready" },
+        sep,
+        usage,
+        sep,
+        state.provider(),
+        state.model()
+    );
+    let text = truncate_chars_with_ellipsis(&text, width, ascii);
+    let style = if selected {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if active {
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Line::from(Span::styled(text, style))
+}
+
+fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
+    state: &V,
+    width: u16,
+    max_rows: usize,
+) -> Vec<Line<'static>> {
+    let summary = state.sessions_status();
+    let focus = state.focus();
+    let entries =
+        bottom_chrome_session_entries_with_workers(state.sessions_entries(), state.provider_worker_status(), focus);
+    let strip_selection = state.strip_selection();
+    let ascii = state.ascii_fallback();
+    if width == 0 || max_rows == 0 {
+        return Vec::new();
+    }
+    if entries.is_empty() {
+        if summary.is_empty() {
+            return Vec::new();
+        }
+        return vec![render_main_session_list_line(state, width)];
+    }
+    let active_seq = focus_active_entry_seq(focus);
+    let total = entries.len().saturating_add(1);
+    let target_idx = bottom_list_selection_index(&entries, strip_selection, focus).min(total.saturating_sub(1));
+    let start = if total <= max_rows {
+        0
+    } else {
+        target_idx.saturating_add(1).saturating_sub(max_rows)
+    };
+    let mut lines = Vec::new();
+    for idx in start..total.min(start.saturating_add(max_rows)) {
+        if idx == 0 {
+            lines.push(render_main_session_list_line(state, width));
+        } else if let Some(entry) = entries.get(idx.saturating_sub(1)) {
+            lines.push(render_sessions_list_entry_line(
+                entry,
+                active_seq,
+                strip_selection,
+                ascii,
+                width,
+            ));
+        }
+    }
+    lines
 }
 
 fn render_sessions_strip_line(
@@ -4116,7 +4642,7 @@ fn render_sessions_strip_styled_line(
         return Line::from(vec![Span::raw(" "), Span::raw(text)]);
     }
 
-    let active_seq = focus.session_seq();
+    let active_seq = focus_active_entry_seq(focus);
     let target_idx = strip_selection_index(entries, strip_selection, focus);
     let start = target_idx
         .map(|target| sessions_strip_window_start(entries, active_seq, ascii, content_width, target))
@@ -4187,7 +4713,7 @@ fn sessions_strip_visible_indices(
         let segment =
             render_sessions_strip_entry(entry, active_seq, ascii, u16::try_from(available).unwrap_or(u16::MAX));
         let segment_cols = UnicodeWidthStr::width(segment.as_str());
-        let seq_marker = format!("#{}", entry.seq);
+        let seq_marker = switcher_entry_display_id(entry);
         if segment.is_empty()
             || segment_cols == 0
             || !segment.contains(seq_marker.as_str())
@@ -4343,6 +4869,8 @@ fn render_active_session_view(
         format!("{marker} transcript ")
     } else if view.kind == crate::chat::sessions::model::ManagedKind::Diff.as_str() {
         format!("{marker} diff ")
+    } else if view.kind == crate::chat::sessions::model::ManagedKind::Worker.as_str() {
+        format!("{marker} worker w#{} ", view.seq)
     } else {
         format!("{marker} attached #{} {} ", view.seq, view.kind)
     };
@@ -4666,24 +5194,17 @@ fn render_switcher_row(
     let usage = entry
         .token_usage_summary()
         .and_then(crate::chat::session::format_session_token_usage_inline);
+    let display_id = switcher_entry_display_id(entry);
     let prefix = if narrow {
         usage.map_or_else(
-            || format!("{glyph} #{} {} {} ", entry.seq, entry.kind, entry.elapsed_label()),
-            |usage| {
-                format!(
-                    "{glyph} #{} {} {} {usage} ",
-                    entry.seq,
-                    entry.kind,
-                    entry.elapsed_label()
-                )
-            },
+            || format!("{glyph} {display_id} {} {} ", entry.kind, entry.elapsed_label()),
+            |usage| format!("{glyph} {display_id} {} {} {usage} ", entry.kind, entry.elapsed_label()),
         )
     } else {
         usage.map_or_else(
             || {
                 format!(
-                    "{glyph} #{} {} {} {} {} ",
-                    entry.seq,
+                    "{glyph} {display_id} {} {} {} {} ",
                     entry.kind,
                     entry.origin,
                     entry.status,
@@ -4692,8 +5213,7 @@ fn render_switcher_row(
             },
             |usage| {
                 format!(
-                    "{glyph} #{} {} {} {} {} {usage} ",
-                    entry.seq,
+                    "{glyph} {display_id} {} {} {} {} {usage} ",
                     entry.kind,
                     entry.origin,
                     entry.status,
@@ -4795,9 +5315,9 @@ fn render_switcher(frame: &mut Frame, area: Rect, switcher: &crate::chat::sessio
     // Hint / overflow row.
     let hidden = total.saturating_sub(end).saturating_add(start);
     let hint = if hidden > 0 {
-        format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter attach \u{00B7} Esc close \u{00B7} {hidden} more ")
+        format!(" \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter open \u{00B7} Esc close \u{00B7} {hidden} more ")
     } else {
-        " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter attach \u{00B7} Esc close ".to_string()
+        " \u{2191}\u{2193}/Ctrl+N/P move \u{00B7} Enter open \u{00B7} Esc close ".to_string()
     };
     let hint = if ascii {
         hint.replace('\u{2191}', "Up").replace('\u{2193}', "Down")
@@ -4816,6 +5336,7 @@ fn render_status_bar<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect
     frame.render_widget(status, area);
 }
 
+#[allow(clippy::option_if_let_else)]
 fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> String {
     let title_str = state.session_title();
     let title = if title_str.is_empty() {
@@ -4829,6 +5350,20 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
         state.context_used_tokens(),
         state.context_window_tokens(),
     );
+    let queue = render_main_queue_status(state.main_queue_status());
+    let usage = if let Some(queue) = queue.as_deref() {
+        format!("{usage} | {queue}")
+    } else {
+        usage
+    };
+    let worker_status = state.provider_worker_status();
+    let workers = render_provider_worker_status(worker_status.clone());
+    let workers_compact = render_provider_worker_status_compact(worker_status);
+    let usage = if let Some(workers) = workers.as_deref() {
+        format!("{usage} | {workers}")
+    } else {
+        usage
+    };
     let activity = render_generation_activity(state);
     let permissions = render_permission_status(state.chat_mode(), state.autonomy_level());
     let full = activity.as_deref().map_or_else(
@@ -4877,23 +5412,28 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
 
     let minimal = activity.as_deref().map_or_else(
         || format!(" PRX | {permissions} | {usage} "),
-        |activity| format!(" PRX | {permissions} | {activity} "),
+        |activity| {
+            if let Some(queue) = queue.as_deref() {
+                format!(" PRX | {permissions} | {queue} | {activity} ")
+            } else if let Some(workers) = workers.as_deref() {
+                let detailed = format!(" PRX | {permissions} | {workers} | {activity} ");
+                if detailed.chars().count() <= usize::from(width) {
+                    detailed
+                } else if let Some(workers) = workers_compact.as_deref() {
+                    format!(" PRX | {permissions} | {workers} | {activity} ")
+                } else {
+                    detailed
+                }
+            } else {
+                format!(" PRX | {permissions} | {activity} ")
+            }
+        },
     );
     truncate_chars_with_ellipsis(&minimal, width, state.ascii_fallback())
 }
 
 fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option<String> {
-    let running_tool = state.conversation_lines().iter().any(|line| {
-        matches!(
-            line,
-            ConversationLine::ToolResult {
-                status: ToolStatus::Running,
-                ..
-            }
-        )
-    });
-    let streaming = state.streaming();
-    if streaming.is_none() && !running_tool {
+    if !execution_activity_active_for_view(state) {
         return None;
     }
     let frames = if state.ascii_fallback() {
@@ -4909,6 +5449,152 @@ fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option
     let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
     let frame = frames.get(idx).copied().unwrap_or("-");
     Some(format!("{frame} generating (esc to interrupt)"))
+}
+
+fn render_main_queue_status(status: MainQueueStatus) -> Option<String> {
+    if status.queued == 0 && status.priority == 0 {
+        return None;
+    }
+    if status.priority > 0 {
+        Some(format!("queue:{} priority:{}", status.queued, status.priority))
+    } else {
+        Some(format!("queue:{}", status.queued))
+    }
+}
+
+fn render_provider_worker_status(status: ProviderWorkerStatus) -> Option<String> {
+    render_provider_worker_status_with_rows(status, true)
+}
+
+fn render_provider_worker_status_compact(status: ProviderWorkerStatus) -> Option<String> {
+    render_provider_worker_status_with_rows(status, false)
+}
+
+fn render_provider_worker_status_with_rows(status: ProviderWorkerStatus, include_rows: bool) -> Option<String> {
+    if status.running == 0 && status.cancelling == 0 && status.awaiting_commit == 0 && status.finalized_payloads == 0 {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if status.running > 0 {
+        parts.push(format!("workers:{}", status.running));
+    }
+    if status.cancelling > 0 {
+        parts.push(format!("cancelling:{}", status.cancelling));
+    }
+    if status.awaiting_commit > 0 {
+        parts.push(format!("commit:{}", status.awaiting_commit));
+    }
+    if let Some(started_at_ms) = status.oldest_started_at_ms {
+        let elapsed = provider_worker_elapsed_label(started_at_ms);
+        parts.push(format!("welapsed:{elapsed}"));
+    }
+    if status.finalized_total_tokens > 0 {
+        parts.push(format!(
+            "wtok:{}",
+            format_worker_tokens_compact(status.finalized_total_tokens)
+        ));
+    } else if status.finalized_payloads > 0 {
+        parts.push(format!("wpayload:{}", status.finalized_payloads));
+    }
+    if include_rows && let Some(rows) = render_provider_worker_rows(&status) {
+        parts.push(rows);
+    }
+    Some(parts.join(" "))
+}
+
+fn render_provider_worker_rows(status: &ProviderWorkerStatus) -> Option<String> {
+    if status.rows.is_empty() {
+        return None;
+    }
+    let mut rendered = Vec::new();
+    let active_rows = status.rows.iter().filter(|row| row.is_active());
+    for row in active_rows.take(2) {
+        rendered.push(render_provider_worker_row(row));
+    }
+    let remaining = status
+        .rows
+        .iter()
+        .filter(|row| row.is_active())
+        .count()
+        .saturating_sub(rendered.len());
+    if remaining > 0 {
+        rendered.push(format!("+{remaining}w"));
+    }
+    (!rendered.is_empty()).then(|| rendered.join(" "))
+}
+
+fn render_provider_worker_row(row: &ProviderWorkerStatusRow) -> String {
+    let state = if row.completion_ready
+        && matches!(
+            row.state,
+            ProviderWorkerRowState::Running | ProviderWorkerRowState::Cancelling
+        ) {
+        "ready"
+    } else {
+        match row.state {
+            ProviderWorkerRowState::Running => "run",
+            ProviderWorkerRowState::Cancelling => "cancel",
+            ProviderWorkerRowState::AwaitingCommit => "commit",
+            ProviderWorkerRowState::Committed => "done",
+            ProviderWorkerRowState::Cancelled => "cancelled",
+            ProviderWorkerRowState::Failed => "failed",
+        }
+    };
+    let mut label = format!(
+        "w#{}:{}:{state}",
+        row.sequence,
+        crate::chat::action::provider_worker_row_kind_compact(row.kind)
+    );
+    match row.state {
+        ProviderWorkerRowState::Running | ProviderWorkerRowState::Cancelling => {
+            label.push(':');
+            label.push_str(&provider_worker_elapsed_label(row.started_at_ms));
+        }
+        ProviderWorkerRowState::AwaitingCommit
+        | ProviderWorkerRowState::Committed
+        | ProviderWorkerRowState::Cancelled
+        | ProviderWorkerRowState::Failed => {
+            if let Some(tokens) = row.finalized_total_tokens.filter(|tokens| *tokens > 0) {
+                label.push(':');
+                label.push_str(&format_worker_tokens_compact(tokens));
+            }
+        }
+    }
+    label
+}
+
+fn provider_worker_elapsed_label(started_at_ms: i64) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+    let elapsed_secs = u64::try_from(elapsed_ms / 1000).unwrap_or_default();
+    crate::chat::sessions::model::format_elapsed_compact(elapsed_secs)
+}
+
+fn format_worker_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        let whole = tokens / 1_000;
+        let decimal = (tokens % 1_000) / 100;
+        if decimal == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{decimal}k")
+        }
+    } else {
+        tokens.to_string()
+    }
+}
+
+pub fn execution_activity_active_for_view<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    state.streaming().is_some()
+        || state.conversation_lines().iter().any(|line| {
+            matches!(
+                line,
+                ConversationLine::ToolResult {
+                    status: ToolStatus::Running,
+                    ..
+                }
+            )
+        })
 }
 
 fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
@@ -5040,19 +5726,19 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             lines.push(Line::from(""));
         }
         ConversationLine::Assistant { content } => {
-            // Claude Code style: no prefix, no indicator. Finalized assistant
-            // markdown is cached so redraws do not re-run syntect on stable
-            // history.
+            // PRX chat uses an explicit actor marker for assistant-authored
+            // prose so it is visually distinct from tool IO and child-session
+            // output when scanning a dense orchestration transcript.
             let rendered = cached_finalized_assistant_markdown_lines(content);
-            lines.extend(rendered.iter().cloned());
+            push_assistant_rendered_lines(lines, rendered.iter().cloned(), ascii);
             lines.push(Line::from(""));
         }
         ConversationLine::StreamingAssistant { content } => {
-            // Same shape as Assistant (no prefix). A trailing cursor glyph
-            // (`▌`, or `_` in ASCII mode) signals that more bytes are still
-            // inbound; once the stream finalises the variant becomes
+            // Same actor marker as finalized assistant text. A trailing cursor
+            // glyph (`▌`, or `_` in ASCII mode) signals that more bytes are
+            // still inbound; once the stream finalises the variant becomes
             // `Assistant` and the cursor disappears.
-            lines.extend(render_streaming_assistant_markdown_lines(content, ascii));
+            push_assistant_rendered_lines(lines, render_streaming_assistant_markdown_lines(content, ascii), ascii);
             lines.push(Line::from(""));
         }
         ConversationLine::System { content } => {
@@ -5099,6 +5785,30 @@ fn render_conversation_line<'a>(lines: &mut Vec<Line<'a>>, conv_line: &'a Conver
             char_count,
             folded,
         } => render_reasoning_card(lines, content, *char_count, *folded, ascii),
+    }
+}
+
+fn push_assistant_rendered_lines<'a, I>(lines: &mut Vec<Line<'a>>, rendered: I, ascii: bool)
+where
+    I: IntoIterator<Item = Line<'static>>,
+{
+    let marker = if ascii { "o" } else { "\u{25CB}" }; // ○
+    let marker_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let continuation_style = Style::default().fg(Color::DarkGray);
+    let mut any = false;
+    for (idx, line) in rendered.into_iter().enumerate() {
+        any = true;
+        let mut spans: Vec<Span<'a>> = Vec::with_capacity(line.spans.len().saturating_add(1));
+        if idx == 0 {
+            spans.push(Span::styled(format!("{marker} "), marker_style));
+        } else {
+            spans.push(Span::styled("  ", continuation_style));
+        }
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
+    if !any {
+        lines.push(Line::from(Span::styled(format!("{marker} "), marker_style)));
     }
 }
 
@@ -5291,11 +6001,11 @@ const fn ansi_basic_color(code: u16, bright: bool) -> Color {
 ///
 /// Folded layout (default):
 /// ```text
-/// ✓ shell(command="ls /tmp")
-///   ⎿ ✓ 234ms · 12 lines · 1.4kB
+/// ✓ run shell(command="ls /tmp")
+///   ⎿ output ✓ 234ms · 12 lines · 1.4kB
 /// ```
 /// Expanded layout shows readable input plus bounded output/error rows. While
-/// `Running` no follow-on row is shown — just the header `● shell(...)`.
+/// `Running` no follow-on row is shown — just the header `● run shell(...)`.
 #[allow(clippy::too_many_arguments)]
 fn render_tool_result<'a>(
     lines: &mut Vec<Line<'a>>,
@@ -5328,6 +6038,16 @@ fn render_tool_result<'a>(
     };
     lines.push(Line::from(vec![
         Span::styled(format!("{status_glyph} "), Style::default().fg(status_color)),
+        Span::styled(
+            "run ",
+            Style::default()
+                .fg(if matches!(status, ToolStatus::Error) {
+                    Color::Red
+                } else {
+                    Color::Green
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
         Span::raw(header),
     ]));
 
@@ -5357,34 +6077,24 @@ fn push_folded_tool_summary<'a>(
     let (status_glyph, status_color) = tool_status_marker(status, ascii);
     let metrics_style = Style::default().fg(Color::DarkGray);
     let result_text = result.unwrap_or("");
-    let metrics = match status {
-        ToolStatus::Done => {
-            let line_count = tool_result_line_count(result_text);
-            let byte_count = result_text.len();
-            let mut parts = Vec::new();
-            if let Some(ms) = elapsed_ms {
-                parts.push(format!("{ms}ms"));
-            }
-            parts.push(format!(
-                "{line_count} {}",
-                if line_count == 1 { "line" } else { "lines" }
-            ));
-            parts.push(format_bytes(byte_count));
-            parts.join(" \u{00B7} ")
-        }
-        ToolStatus::Error => {
-            let mut parts = Vec::new();
-            if let Some(ms) = elapsed_ms {
-                parts.push(format!("{ms}ms"));
-            }
-            parts.push(tool_error_reason(result_text, ascii));
-            parts.join(" \u{00B7} ")
-        }
-        ToolStatus::Running => String::new(),
+    let metrics = tool_card_metrics(status, elapsed_ms, result_text, ascii);
+    let label = if matches!(status, ToolStatus::Error) {
+        "error"
+    } else {
+        "output"
     };
+    let label_style = Style::default()
+        .fg(if matches!(status, ToolStatus::Error) {
+            Color::Red
+        } else {
+            Color::Green
+        })
+        .add_modifier(Modifier::BOLD);
 
     lines.push(Line::from(vec![
         Span::styled(format!("  {hook} "), metrics_style),
+        Span::styled(label, label_style),
+        Span::styled(" ", metrics_style),
         Span::styled(status_glyph, Style::default().fg(status_color)),
         Span::styled(format!(" {metrics}"), metrics_style),
     ]));
@@ -5401,17 +6111,18 @@ fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &
         ARGS_PREVIEW_ELLIPSIS
     };
     let body_style = Style::default().fg(Color::DarkGray);
+    let pipe = if ascii { "|" } else { "\u{2502}" };
     let result_lines = result_text.lines().collect::<Vec<_>>();
     let total_lines = result_lines.len();
     for body in result_lines.iter().take(TOOL_FOLDED_RESULT_PREVIEW_LINES) {
         let rendered = truncate_chars_with_ellipsis(body, TOOL_FOLDED_RESULT_PREVIEW_CHARS as u16, ascii);
-        lines.push(Line::from(Span::styled(format!("    {rendered}"), body_style)));
+        lines.push(Line::from(Span::styled(format!("    {pipe} {rendered}"), body_style)));
     }
     let hidden_lines = total_lines.saturating_sub(TOOL_FOLDED_RESULT_PREVIEW_LINES);
     if hidden_lines > 0 {
         lines.push(Line::from(Span::styled(
             format!(
-                "    {ellipsis} +{hidden_lines} {}",
+                "    {pipe} {ellipsis} +{hidden_lines} {}",
                 if hidden_lines == 1 { "line" } else { "lines" }
             ),
             body_style,
@@ -5442,7 +6153,11 @@ fn push_expanded_tool_io<'a>(
         display_preview.to_string()
     };
     let body_style = Style::default().fg(Color::DarkGray);
-    lines.push(Line::from(Span::styled(format!("  {hook} input: {input}"), body_style)));
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {hook} "), body_style),
+        Span::styled("input", Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {input}"), body_style),
+    ]));
 
     let label = if matches!(status, ToolStatus::Error) {
         "error"
@@ -5452,14 +6167,18 @@ fn push_expanded_tool_io<'a>(
     let label_color = if matches!(status, ToolStatus::Error) {
         Color::Red
     } else {
-        Color::DarkGray
+        Color::Green
     };
-    lines.push(Line::from(Span::styled(
-        format!("    {label}:"),
-        Style::default().fg(label_color),
-    )));
-
     let result_text = result.unwrap_or("");
+    let metrics = tool_card_metrics(status, None, result_text, ascii);
+    let (status_glyph, status_color) = tool_status_marker(status, ascii);
+    lines.push(Line::from(vec![
+        Span::styled(format!("  {hook} "), body_style),
+        Span::styled(label, Style::default().fg(label_color).add_modifier(Modifier::BOLD)),
+        Span::styled(" ", body_style),
+        Span::styled(status_glyph, Style::default().fg(status_color)),
+        Span::styled(format!(" {metrics}"), body_style),
+    ]));
     if result_text.is_empty() {
         lines.push(Line::from(Span::styled("    (empty)", body_style)));
         return;
@@ -5501,6 +6220,34 @@ fn push_expanded_tool_io<'a>(
     }
 }
 
+fn tool_card_metrics(status: ToolStatus, elapsed_ms: Option<u64>, result_text: &str, ascii: bool) -> String {
+    match status {
+        ToolStatus::Done => {
+            let line_count = tool_result_line_count(result_text);
+            let byte_count = result_text.len();
+            let mut parts = Vec::new();
+            if let Some(ms) = elapsed_ms {
+                parts.push(format!("{ms}ms"));
+            }
+            parts.push(format!(
+                "{line_count} {}",
+                if line_count == 1 { "line" } else { "lines" }
+            ));
+            parts.push(format_bytes(byte_count));
+            parts.join(" \u{00B7} ")
+        }
+        ToolStatus::Error => {
+            let mut parts = Vec::new();
+            if let Some(ms) = elapsed_ms {
+                parts.push(format!("{ms}ms"));
+            }
+            parts.push(tool_error_reason(result_text, ascii));
+            parts.join(" \u{00B7} ")
+        }
+        ToolStatus::Running => String::new(),
+    }
+}
+
 fn tool_result_line_count(result_text: &str) -> usize {
     if result_text.is_empty() {
         0
@@ -5533,7 +6280,7 @@ fn format_bytes(bytes: usize) -> String {
     format!("{:.1}MB", bytes as f64 / 1_000_000.0)
 }
 
-fn build_tool_args_preview(tool_name: &str, raw: &str, max_chars: usize, ellipsis: &str) -> String {
+pub(crate) fn build_tool_args_preview(tool_name: &str, raw: &str, max_chars: usize, ellipsis: &str) -> String {
     let parsed = serde_json::from_str::<serde_json::Value>(raw);
     let Ok(value) = parsed else {
         return build_args_preview(raw, max_chars, ellipsis);
@@ -5547,6 +6294,7 @@ fn build_tool_args_preview(tool_name: &str, raw: &str, max_chars: usize, ellipsi
         "file_write" => format_file_write_preview(map),
         "file_edit" => format_file_edit_preview(map),
         "shell" => format_shell_preview(map),
+        "managed_session" => format_managed_session_preview(map),
         "sessions_spawn" | "delegate" | "subagents" | "session_worker" | "nodes" => {
             format_session_tool_preview(tool_name, map)
         }
@@ -5630,6 +6378,21 @@ fn format_session_tool_preview(tool_name: &str, map: &serde_json::Map<String, se
     } else {
         Some(fields.join(", "))
     }
+}
+
+fn format_managed_session_preview(map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
+    let action = json_string_field(map, &["action"])?;
+    let mut fields = vec![format!("action={action}")];
+    if let Some(command) = json_string_field(map, &["command"]) {
+        fields.push(format!(
+            "command={}",
+            quoted_summary(&command, TOOL_ARG_VALUE_MAX_CHARS)
+        ));
+    }
+    if let Some(session_id) = json_string_field(map, &["session_id"]) {
+        fields.push(format!("session={}", one_line_summary(&session_id, 12)));
+    }
+    Some(fields.join(", "))
 }
 
 fn format_web_preview(tool_name: &str, map: &serde_json::Map<String, serde_json::Value>) -> Option<String> {
@@ -6012,6 +6775,13 @@ fn prompt_indicator(
             let span = Span::styled(label, Style::default().fg(Color::Green).add_modifier(Modifier::BOLD));
             (span, width)
         }
+        crate::chat::sessions::FocusTarget::Worker { sequence } => {
+            let arrow = if ascii { ">" } else { "\u{25B8}" }; // ▸
+            let label = format!("worker w#{sequence} {arrow} ");
+            let width = UnicodeWidthStr::width(label.as_str());
+            let span = Span::styled(label, Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD));
+            (span, width)
+        }
     }
 }
 
@@ -6205,20 +6975,41 @@ fn render_footer(frame: &mut Frame, area: Rect) {
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} /copy latest \u{00B7} Shift/Option/Fn-drag select \u{00B7} Shift+Enter newline \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
+        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} /copy latest \u{00B7} drag select/copy \u{00B7} Shift+Enter newline \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
     )
     .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
-fn render_fullscreen_footer(frame: &mut Frame, area: Rect, ascii: bool, show_new_output_below: bool) {
+fn render_session_list_footer<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, state: &V) -> bool {
+    if !session_footer_has_sessions(state) {
+        return false;
+    }
+    let lines = render_sessions_list_lines(state, area.width, usize::from(area.height));
+    if lines.is_empty() {
+        return false;
+    }
+    let widget = Paragraph::new(Text::from(lines)).style(Style::default().bg(Color::Black));
+    frame.render_widget(widget, area);
+    true
+}
+
+fn render_fullscreen_footer<V: BottomChromeView + ?Sized>(
+    frame: &mut Frame,
+    area: Rect,
+    state: &V,
+    show_new_output_below: bool,
+) {
     if show_new_output_below {
-        let sep = if ascii { " | " } else { " \u{00B7} " };
+        let sep = if state.ascii_fallback() { " | " } else { " \u{00B7} " };
         let footer = Paragraph::new(format!(
             " New output below{sep}End jumps to tail{sep}Home top{sep}PageUp/PageDown scroll "
         ))
         .style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
         frame.render_widget(footer, area);
+        return;
+    }
+    if render_session_list_footer(frame, area, state) {
         return;
     }
     render_footer(frame, area);
@@ -7014,8 +7805,8 @@ mod tests {
             folded: true,
         };
         render_conversation_line(&mut lines, &card, false);
-        // Claude-Code style: while running we render just the bullet header
-        // (`● shell(ls)`) with no follow-on summary row yet.
+        // Claude-Code style: while running we render just the run header
+        // (`● run shell(ls)`) with no follow-on summary row yet.
         assert_eq!(lines.len(), 1, "running folded card renders to 1 line");
         let rendered: String = lines
             .first()
@@ -7025,6 +7816,7 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(rendered.contains("\u{25CF}"), "uses ● bullet: {rendered}");
+        assert!(rendered.contains("run "), "shows run marker: {rendered}");
         assert!(
             rendered.contains(r#"shell(command="ls")"#),
             "shows Tool(args) preview: {rendered}"
@@ -7034,8 +7826,8 @@ mod tests {
 
     #[test]
     fn render_folded_tool_card_done_shows_hook_summary() {
-        // Claude-Code style follow-on: `  ⎿ ✓ 234ms · 3 lines · 5B` under the
-        // bullet header once the tool finishes.
+        // Claude-Code style follow-on: `  ⎿ output ✓ 234ms · 3 lines · 5B`
+        // under the run header once the tool finishes.
         let mut lines: Vec<Line<'_>> = Vec::new();
         let card = ConversationLine::ToolResult {
             tool_name: "shell".to_string(),
@@ -7056,16 +7848,17 @@ mod tests {
             .map(|s| s.content.as_ref())
             .collect();
         assert!(summary.contains("\u{23BF}"), "uses ⎿ hook glyph: {summary}");
+        assert!(summary.contains("output"), "labels output stream: {summary}");
         assert!(summary.contains("\u{2713}"), "shows success check: {summary}");
         assert!(summary.contains("234ms"), "shows elapsed ms: {summary}");
         assert!(summary.contains("3 lines"), "shows result line count: {summary}");
         assert!(summary.contains("5B"), "shows result byte count: {summary}");
-        assert_eq!(line_to_plain(lines.get(2).expect("test: preview line")), "    a");
-        assert_eq!(line_to_plain(lines.get(3).expect("test: preview line")), "    b");
-        assert_eq!(line_to_plain(lines.get(4).expect("test: preview line")), "    c");
+        assert_eq!(line_to_plain(lines.get(2).expect("test: preview line")), "    │ a");
+        assert_eq!(line_to_plain(lines.get(3).expect("test: preview line")), "    │ b");
+        assert_eq!(line_to_plain(lines.get(4).expect("test: preview line")), "    │ c");
         assert_eq!(span_fg(&lines, 0, 0), Some(Color::Green));
         assert_eq!(span_fg(&lines, 1, 1), Some(Color::Green));
-        assert_eq!(span_fg(&lines, 1, 2), Some(Color::DarkGray));
+        assert_eq!(span_fg(&lines, 1, 3), Some(Color::Green));
     }
 
     #[test]
@@ -7093,11 +7886,11 @@ mod tests {
 
         let first_preview = line_to_plain(lines.get(2).expect("first preview line"));
         assert!(
-            first_preview.starts_with("        let value"),
+            first_preview.starts_with("    │     let value"),
             "folded preview should preserve original code indentation: {first_preview:?}"
         );
         assert!(
-            UnicodeWidthStr::width(first_preview.trim_start()) <= TOOL_FOLDED_RESULT_PREVIEW_CHARS,
+            UnicodeWidthStr::width(first_preview.trim_start_matches("    │ ")) <= TOOL_FOLDED_RESULT_PREVIEW_CHARS,
             "folded preview should be width-bounded, not char-count bounded: {first_preview:?}"
         );
         let hidden = line_to_plain(lines.get(5).expect("hidden line count"));
@@ -7121,21 +7914,21 @@ mod tests {
         let header = line_to_plain(lines.first().expect("test: header"));
         let summary = line_to_plain(lines.get(1).expect("test: summary"));
 
-        assert!(header.starts_with("\u{2717} "), "error header marker: {header}");
+        assert!(header.starts_with("\u{2717} run "), "error header marker: {header}");
         assert!(
-            summary.contains("\u{2717} 50ms \u{00B7} permission denied"),
+            summary.contains("error \u{2717} 50ms \u{00B7} permission denied"),
             "error summary: {summary}"
         );
         assert_eq!(span_fg(&lines, 0, 0), Some(Color::Red));
         assert_eq!(span_fg(&lines, 1, 1), Some(Color::Red));
         assert_eq!(
             line_to_plain(lines.get(2).expect("error preview first line")),
-            "    permission denied",
+            "    │ permission denied",
             "folded error cards should preview the error body"
         );
         assert_eq!(
             line_to_plain(lines.get(3).expect("error preview second line")),
-            "    stack trace",
+            "    │ stack trace",
             "folded error cards should preview follow-up error lines"
         );
     }
@@ -7154,9 +7947,9 @@ mod tests {
         };
         render_conversation_line(&mut lines, &card, false);
         // Claude-Code style expanded:
-        //   row 0  `✓ shell(command="ls -la /tmp")`
-        //   row 1  `  ⎿ input: command="ls -la /tmp"`
-        //   row 2  `    output:`
+        //   row 0  `✓ run shell(command="ls -la /tmp")`
+        //   row 1  `  ⎿ input  command="ls -la /tmp"`
+        //   row 2  `  ⎿ output ✓ 2 lines · 20B`
         //   row 3+ output body
         assert_eq!(lines.len(), 5, "expanded card line count: {}", lines.len());
         let join = |i: usize| -> String {
@@ -7169,6 +7962,7 @@ mod tests {
                 .collect()
         };
         assert!(join(0).contains("\u{2713}"), "uses ✓ marker: {}", join(0));
+        assert!(join(0).contains("run "), "uses run marker: {}", join(0));
         assert!(
             join(0).contains("shell(command=\"ls -la /tmp\")"),
             "shows readable args: {}",
@@ -7176,11 +7970,12 @@ mod tests {
         );
         assert!(join(1).contains("\u{23BF}"), "uses ⎿ hook on input row: {}", join(1));
         assert!(
-            join(1).contains("input: command=\"ls -la /tmp\""),
+            join(1).contains("input  command=\"ls -la /tmp\""),
             "input row: {}",
             join(1)
         );
-        assert!(join(2).contains("output:"), "output label: {}", join(2));
+        assert!(join(2).contains("output"), "output label: {}", join(2));
+        assert!(join(2).contains("2 lines"), "output metrics: {}", join(2));
         assert!(join(3).contains("total 24"), "first body row: {}", join(3));
         assert!(join(4).contains("drwxrwxrwt"), "second body row: {}", join(4));
     }
@@ -7252,7 +8047,7 @@ mod tests {
         };
         render_conversation_line(&mut done_lines, &done_card, true);
         let done_header = done_lines.first().expect("test: done header");
-        assert!(line_to_plain(done_header).starts_with("v "), "ASCII success marker");
+        assert!(line_to_plain(done_header).starts_with("v run "), "ASCII success marker");
     }
 
     #[test]
@@ -7292,6 +8087,15 @@ mod tests {
                 ARGS_PREVIEW_ELLIPSIS
             ),
             "task=\"Audit session UX\", agent=reviewer, model=kimi-2.6"
+        );
+        assert_eq!(
+            build_tool_args_preview(
+                "managed_session",
+                r#"{"action":"shell","command":"for i in 1 2 3; do echo ok; sleep 1; done"}"#,
+                ARGS_PREVIEW_MAX_CHARS,
+                ARGS_PREVIEW_ELLIPSIS
+            ),
+            "action=shell, command=\"for i in 1 2 3; do echo ok; sleep 1; done\""
         );
         assert_eq!(
             build_tool_args_preview(
@@ -9418,15 +10222,40 @@ mod tests {
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
-            KeyDispatch::Consumed,
-            "main+empty must not switch child sessions"
+            KeyDispatch::StripSelectionChanged { selected: Some(1) },
+            "main+empty Right selects the first bottom-rail session"
         );
+        state.strip_selection = None;
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) },
+            "main+empty Down selects the first bottom-list session"
+        );
+        assert_eq!(state.strip_selection, Some(1));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::StripSelectionChanged {
+                selected: Some(MAIN_SESSION_SELECTION_SEQ)
+            },
+            "main+empty Up moves from first child back to main"
+        );
+        assert_eq!(state.strip_selection, Some(MAIN_SESSION_SELECTION_SEQ));
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
-            KeyDispatch::Consumed,
-            "main+empty must preserve prompt key semantics"
+            KeyDispatch::StripSelectionChanged { selected: Some(3) },
+            "main+empty Left wraps from main to the last child session"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::AttachSession { seq: 3 },
+            "main+empty Enter attaches the selected bottom-rail session"
+        );
+        assert_eq!(
+            state.strip_selection, None,
+            "attach consumes the UI-only strip selection so Esc detaches the child view next"
         );
 
+        state.strip_selection = None;
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
@@ -9434,9 +10263,15 @@ mod tests {
             "session+empty Right switches to the visual neighbor on the right"
         );
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Left), &mut state),
+            dispatch_global_key(key(KeyCode::Up), &mut state),
             KeyDispatch::SwitchSession { seq: 1 },
-            "session+empty Left switches to the visual neighbor on the left"
+            "session+empty Up switches to the visual neighbor above"
+        );
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::RequestDetach,
+            "first child+empty Up switches back to main"
         );
 
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
@@ -9487,6 +10322,40 @@ mod tests {
             dispatch_global_key(key(KeyCode::Right), &mut state),
             KeyDispatch::Consumed,
             "switcher-open keys must not leak to directional session switching"
+        );
+    }
+
+    #[test]
+    fn bottom_directional_selection_skips_completed_history_rows() {
+        let mut state = TuiState::new("p", "m");
+        let mut completed = entry(1);
+        completed.status = "completed";
+        state.sessions_cache = vec![completed, entry(2)];
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(2) },
+            "bare Down should select the first active child, not completed history"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            KeyDispatch::AttachSession { seq: 2 },
+            "Enter attaches the visible active child"
+        );
+
+        let mut history_only = TuiState::new("p", "m");
+        let mut done = entry(1);
+        done.status = "completed";
+        history_only.sessions_cache = vec![done];
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Char('x')), &mut history_only),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(
+            history_only.input.text(),
+            "x",
+            "history-only completed sessions must not swallow normal input"
         );
     }
 
@@ -9583,6 +10452,10 @@ mod tests {
                 dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
                 KeyDispatch::AttachSession { seq },
                 "Alt+Enter reuses the single attach dispatch for {kind}"
+            );
+            assert_eq!(
+                state.strip_selection, None,
+                "Alt+Enter attach consumes the UI-only strip selection for {kind}"
             );
         }
     }
@@ -9765,7 +10638,7 @@ mod tests {
     fn long_strip_entries(count: u64) -> Vec<crate::chat::sessions::SwitcherEntry> {
         (1..=count)
             .map(|seq| {
-                let mut entry = elapsed_entry(seq, "completed", i64::try_from(seq).unwrap_or(i64::MAX));
+                let mut entry = elapsed_entry(seq, "running", i64::try_from(seq).unwrap_or(i64::MAX));
                 entry.title =
                     format!("List 3 strengths of a terminal chat UI. Return only concise bullets for run {seq}");
                 entry
@@ -9858,7 +10731,7 @@ mod tests {
     #[test]
     fn sessions_strip_empty_state_is_hidden() {
         let state = TuiState::new("p", "m");
-        assert!(!sessions_status_visible(&state));
+        assert!(!session_footer_has_sessions(&state));
         assert!(render_sessions_strip_line(&[], "", crate::chat::sessions::FocusTarget::Main, false, 40).is_empty());
     }
 
@@ -10289,6 +11162,151 @@ mod tests {
         assert!(state.switcher.is_some(), "switcher opened in mirror");
     }
 
+    fn provider_worker_status_fixture() -> ProviderWorkerStatus {
+        ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_sub(2_000)),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: 42,
+                sequence: 3,
+                kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn ctrl_g_includes_provider_worker_rows_and_enter_opens_worker_view() {
+        let mut state = TuiState::new("p", "m");
+        state.provider_worker_status = provider_worker_status_fixture();
+
+        let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
+        match out {
+            KeyDispatch::SwitcherOpened { entries } => {
+                assert_eq!(entries.len(), 2, "transcript plus worker row: {entries:?}");
+                let worker = entries.get(1).expect("worker row");
+                assert_eq!(worker.kind, PROVIDER_WORKER_SWITCHER_KIND);
+                assert_eq!(worker.origin, "provider");
+                assert_eq!(worker.status, "running");
+                assert!(
+                    worker.title.contains("w#3 foreground_awaited task=42"),
+                    "worker title: {}",
+                    worker.title
+                );
+                let row = render_switcher_row(worker, "⏳", false, 120);
+                assert!(row.contains("w#3 worker provider running"), "worker row: {row}");
+                assert!(row.contains("foreground_awaited task=42"), "worker row: {row}");
+                assert!(
+                    !row.contains(&worker.seq.to_string()),
+                    "synthetic seq must not leak into worker row: {row}"
+                );
+            }
+            other => panic!("expected SwitcherOpened, got {other:?}"),
+        }
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::SwitcherMoved { selected: 1 }
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+
+        assert_eq!(out, KeyDispatch::OpenProviderWorkerView { sequence: 3 });
+        assert!(state.switcher.is_none(), "switcher closed after worker detail route");
+    }
+
+    #[test]
+    fn bottom_direction_selects_provider_worker_and_enter_opens_worker_view() {
+        let mut state = TuiState::new("p", "m");
+        state.provider_worker_status = provider_worker_status_fixture();
+        let out = dispatch_global_key(key(KeyCode::Down), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::StripSelectionChanged {
+                selected: Some(PROVIDER_WORKER_SWITCHER_SEQ_BASE + 3)
+            }
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(out, KeyDispatch::OpenProviderWorkerView { sequence: 3 });
+        assert_eq!(state.strip_selection, None);
+    }
+
+    #[test]
+    fn provider_worker_focus_direction_and_esc_are_read_only_view_controls() {
+        let mut state = TuiState::new("p", "m");
+        state.provider_worker_status = provider_worker_status_fixture();
+        state.sessions_cache = vec![entry(7)];
+        state.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 3 };
+        let out = dispatch_global_key(key(KeyCode::Up), &mut state);
+        assert_eq!(out, KeyDispatch::CloseProviderWorkerView);
+        let out = dispatch_global_key(key(KeyCode::Down), &mut state);
+        assert_eq!(out, KeyDispatch::SwitchSession { seq: 7 });
+        let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
+        assert_eq!(out, KeyDispatch::CloseProviderWorkerView);
+    }
+
+    #[test]
+    fn provider_worker_active_view_uses_worker_kind_and_lines() {
+        let status = provider_worker_status_fixture();
+        let view = crate::chat::action::build_provider_worker_active_view(&status, 3, 0);
+        assert_eq!(view.kind, crate::chat::sessions::model::ManagedKind::Worker.as_str());
+        assert_eq!(view.seq, 3);
+        assert!(view.lines.iter().any(|line| line == "worker: w#3"));
+        assert!(view.lines.iter().any(|line| line == "task: 42"));
+        assert!(view.lines.iter().any(|line| line == "kind: foreground_awaited"));
+        assert!(view.lines.iter().any(|line| line == "state: running"));
+        assert!(view.lines.iter().any(|line| line == "completion: pending"));
+    }
+
+    #[test]
+    fn provider_worker_io_lines_include_tool_output_and_streaming_text() {
+        let conversation = vec![
+            ConversationLine::User {
+                content: "run a shell command".to_string(),
+            },
+            ConversationLine::ToolResult {
+                tool_name: "shell".to_string(),
+                args_preview: "sleep 1 && echo done".to_string(),
+                args_full: "{\"command\":\"sleep 1 && echo done\"}".to_string(),
+                result: Some("done\nsecond line".to_string()),
+                status: ToolStatus::Done,
+                elapsed_ms: Some(1004),
+                folded: true,
+            },
+            ConversationLine::Assistant {
+                content: "tool finished".to_string(),
+            },
+        ];
+        let streaming = StreamingDraft {
+            draft_id: "d".to_string(),
+            accumulated: "partial answer".to_string(),
+            version: 1,
+        };
+
+        let lines = provider_worker_io_lines_from_conversation(&conversation, Some(&streaming), 8);
+
+        assert!(lines.iter().any(|line| line.contains("run shell done: sleep 1")));
+        assert!(lines.iter().any(|line| line == "output: done"));
+        assert!(lines.iter().any(|line| line == "output: second line"));
+        assert!(lines.iter().any(|line| line == "assistant: tool finished"));
+        assert!(lines.iter().any(|line| line == "assistant streaming: partial answer"));
+
+        let view = crate::chat::action::build_provider_worker_active_view_with_io(
+            &provider_worker_status_fixture(),
+            3,
+            0,
+            lines,
+        );
+        assert!(view.lines.iter().any(|line| line == "io: recent provider turn"));
+        assert!(view.lines.iter().any(|line| line.starts_with("run shell done:")));
+    }
+
     #[test]
     fn switcher_navigation_and_enter_attaches_selected() {
         let mut state = TuiState::new("p", "m");
@@ -10602,8 +11620,92 @@ mod tests {
             "footer should advertise /copy: {joined}"
         );
         assert!(
-            joined.contains("Shift/Option/Fn-drag select"),
-            "footer should advertise native selection escape hatch: {joined}"
+            joined.contains("drag select/copy"),
+            "footer should advertise native selection: {joined}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_footer_becomes_session_list_when_sessions_exist() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![entry(1)];
+        state.sessions_status = "sessions: 1 running".to_string();
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 100, 24, &mut scroll);
+        let joined = rows.join("\n");
+        let bottom = rows.last().cloned().unwrap_or_default();
+
+        assert!(
+            joined.contains("main chat"),
+            "bottom list should include the main session: {rows:?}"
+        );
+        assert!(bottom.contains("#1"), "bottom list should show session seq: {rows:?}");
+        assert!(
+            bottom.contains("agent"),
+            "bottom list should show session kind: {rows:?}"
+        );
+        assert!(
+            bottom.contains("0 tok"),
+            "bottom list should show cumulative token usage: {rows:?}"
+        );
+        assert!(
+            bottom.contains("task 1"),
+            "bottom list should show the running task title, not shortcut-only chrome: {rows:?}"
+        );
+        assert!(
+            !bottom.contains("Ctrl+G sessions"),
+            "session list should replace shortcut footer while sessions exist: {rows:?}"
+        );
+        assert_eq!(
+            joined.matches("#1").count(),
+            1,
+            "session should render once below input, never duplicated above it: {rows:?}"
+        );
+        assert!(
+            !joined.contains('⏳') && !joined.contains('✓'),
+            "session list should use text status rather than status icons: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_footer_hides_completed_sessions_from_active_bottom_list() {
+        let mut state = TuiState::new("p", "m");
+        let mut done = entry(1);
+        done.status = "completed";
+        state.sessions_cache = vec![done];
+        state.sessions_status = "sessions: 1 completed".to_string();
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 100, 24, &mut scroll);
+        let joined = rows.join("\n");
+
+        assert!(
+            !joined.contains("#1"),
+            "completed child sessions should leave the active bottom list: {rows:?}"
+        );
+        assert!(
+            joined.contains("Ctrl+G sessions"),
+            "history-only sessions should restore the normal footer: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_footer_keeps_focused_completed_session_until_detach() {
+        let mut state = TuiState::new("p", "m");
+        let mut done = entry(1);
+        done.status = "completed";
+        state.sessions_cache = vec![done];
+        state.sessions_status = "sessions: 1 completed".to_string();
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
+        let mut scroll = FullscreenTranscriptScroll::default();
+
+        let rows = fullscreen_rows(&state, 100, 24, &mut scroll);
+        let joined = rows.join("\n");
+
+        assert!(
+            joined.contains("#1") && joined.contains("completed"),
+            "the focused terminal child remains visible until the user detaches: {rows:?}"
         );
     }
 
@@ -10622,6 +11724,28 @@ mod tests {
         // Pushing system messages must not bump the *user* turn counter
         // (that drives the status-bar "N turns" display).
         assert_eq!(state.turn_count, 0);
+    }
+
+    #[test]
+    fn execution_activity_active_tracks_streaming_and_running_tools() {
+        let mut state = TuiState::new("p", "m");
+        assert!(!state.execution_activity_active());
+
+        state.start_stream("d1");
+        assert!(state.execution_activity_active());
+        state.cancel_stream("d1");
+        assert!(!state.execution_activity_active());
+
+        state.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: String::new(),
+            args_full: String::new(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: false,
+        });
+        assert!(state.execution_activity_active());
     }
 
     #[test]
@@ -10993,7 +12117,7 @@ mod tests {
         );
         assert!(
             rows.last().is_some_and(|row| row.contains("Ctrl+G")),
-            "footer remains pinned after multiline input: {rows:?}"
+            "shortcut footer remains pinned after multiline input without child sessions: {rows:?}"
         );
     }
 
@@ -11208,50 +12332,52 @@ mod tests {
     }
 
     #[test]
-    fn sessions_status_row_adds_height_only_when_present() {
+    fn session_list_footer_adds_one_row_per_extra_session() {
         let mut state = TuiState::new("p", "m");
         let idle = fullscreen_bottom_chrome_height(&state);
-        assert!(!sessions_status_visible(&state), "empty status row hidden");
+        assert!(!session_footer_has_sessions(&state), "empty session footer hidden");
 
-        state.set_sessions_status("sessions: 1 running");
-        assert!(sessions_status_visible(&state), "non-empty status row shown");
-        let with_row = fullscreen_bottom_chrome_height(&state);
+        state.sessions_cache = vec![entry(1)];
+        assert!(session_footer_has_sessions(&state), "non-empty session footer shown");
+        let with_one = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
-            with_row,
+            with_one,
             idle.saturating_add(1),
-            "sessions status row adds exactly one row"
+            "one child session adds one row because the list also includes main"
         );
 
-        // Clearing the status hides the row again.
-        state.set_sessions_status("");
-        assert!(!sessions_status_visible(&state));
+        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
+        let with_three = fullscreen_bottom_chrome_height(&state);
+        assert_eq!(
+            with_three,
+            idle.saturating_add(3),
+            "session list adds one row per child while retaining main"
+        );
+
+        state.sessions_cache.clear();
+        assert!(!session_footer_has_sessions(&state));
         assert_eq!(fullscreen_bottom_chrome_height(&state), idle);
     }
 
     #[test]
-    fn sessions_status_row_stays_within_height_budget() {
-        // With current constants the busiest fullscreen chrome is
-        // status(1)+input(1+10)+footer(1), so adding the 1-row sessions line
-        // still fits under BOTTOM_CHROME_MAX_HEIGHT (24).
+    fn session_list_footer_stays_within_height_budget() {
         let mut state = TuiState::new("p", "m");
-        state.set_sessions_status("sessions: 9 running");
+        state.sessions_cache = long_strip_entries(30);
         state.start_stream("d");
         for _ in 0..(INPUT_MAX_VISIBLE_ROWS + 4) {
             state.input.lines.push(String::new());
         }
         assert!(
-            sessions_status_visible(&state),
-            "the sessions row fits within the height budget under real inputs"
+            session_footer_has_sessions(&state),
+            "the session list remains available under real inputs"
         );
         assert!(fullscreen_bottom_chrome_height(&state) <= BOTTOM_CHROME_MAX_HEIGHT);
     }
 
     #[test]
-    fn sessions_status_row_degrades_when_budget_exhausted() {
-        // Forward-compat guard: when the rest of the chrome already meets/exceeds
-        // the max height, the sessions row is the first thing dropped so the
-        // input box and footer never lose rows. We exercise the guard directly
-        // via its documented threshold (without depending on specific constants).
+    fn session_list_footer_degrades_within_budget() {
+        // Forward-compat guard: even an oversized session list cannot grow the
+        // pinned chrome beyond the hard maximum.
         let without_sessions = 1u16 // status
             + u16::try_from(INPUT_MAX_VISIBLE_ROWS + 1).unwrap_or(11)
             + 1; // footer
@@ -11304,6 +12430,168 @@ mod tests {
         assert!(
             !line.contains("bypass"),
             "status copy must not imply permissions are bypassed: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_main_queue_status_when_present() {
+        let mut state = TuiState::new("provider", "model");
+        state.main_queue_status = MainQueueStatus { queued: 4, priority: 1 };
+
+        let line = render_status_bar_text(&state, 140);
+
+        assert!(
+            line.contains("queue:4 priority:1"),
+            "status should expose main input backlog: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_provider_worker_status_when_present() {
+        let mut state = TuiState::new("provider", "model");
+        state.main_queue_status = MainQueueStatus { queued: 2, priority: 0 };
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 1,
+            awaiting_commit: 1,
+            finalized_payloads: 1,
+            finalized_total_tokens: 1_250,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000)),
+            rows: vec![
+                ProviderWorkerStatusRow {
+                    task_id: 77,
+                    sequence: 7,
+                    kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                    state: ProviderWorkerRowState::Running,
+                    started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+                ProviderWorkerStatusRow {
+                    task_id: 88,
+                    sequence: 8,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: ProviderWorkerRowState::Committed,
+                    started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(9_000),
+                    finalized_total_tokens: Some(1_250),
+                    completion_ready: true,
+                },
+            ],
+        };
+
+        let line = render_status_bar_text(&state, 220);
+
+        assert!(line.contains("queue:2"), "status should retain queue status: {line}");
+        assert!(
+            line.contains("workers:1"),
+            "status should expose running provider workers: {line}"
+        );
+        assert!(
+            line.contains("cancelling:1"),
+            "status should expose cancelling provider workers: {line}"
+        );
+        assert!(
+            line.contains("commit:1"),
+            "status should expose commit-pending provider workers: {line}"
+        );
+        assert!(
+            line.contains("welapsed:"),
+            "status should expose provider worker elapsed time: {line}"
+        );
+        assert!(
+            line.contains("wtok:1.2k"),
+            "status should expose finalized provider worker tokens: {line}"
+        );
+        assert!(
+            line.contains("w#7:fg:run:"),
+            "status should expose per-worker running detail: {line}"
+        );
+        assert!(
+            !line.contains("w#8:detached:done:1.2k"),
+            "status should not keep completed workers in the switchable row list: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_renders_completion_ready_worker_row() {
+        let mut state = TuiState::new("provider", "model");
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_sub(3_000)),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: 77,
+                sequence: 7,
+                kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
+                finalized_total_tokens: None,
+                completion_ready: true,
+            }],
+        };
+
+        let line = render_status_bar_text(&state, 180);
+
+        assert!(
+            line.contains("w#7:detached:ready:"),
+            "completion-ready workers should not look like still-running provider execution: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_keeps_queue_status_when_generating_and_compact() {
+        let mut state = TuiState::new("provider-with-long-name", "model-with-long-name");
+        state.session_title = "long running orchestration title".to_string();
+        state.main_queue_status = MainQueueStatus { queued: 5, priority: 0 };
+        state.start_stream("draft-queue");
+
+        let line = render_status_bar_text(&state, 72);
+
+        assert!(
+            line.contains("queue:5"),
+            "compact active status should retain queue: {line}"
+        );
+        assert!(
+            line.contains("generating"),
+            "compact active status should retain activity: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_keeps_provider_worker_status_when_generating_and_compact() {
+        let mut state = TuiState::new("provider-with-long-name", "model-with-long-name");
+        state.session_title = "long running orchestration title".to_string();
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_sub(2_000)),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: 1,
+                sequence: 1,
+                kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        };
+        state.start_stream("draft-worker");
+
+        let line = render_status_bar_text(&state, 72);
+
+        assert!(
+            line.contains("workers:1"),
+            "compact active status should retain worker status: {line}"
+        );
+        assert!(
+            line.contains("generating"),
+            "compact active status should retain activity: {line}"
         );
     }
 
@@ -11528,9 +12816,10 @@ mod tests {
             }
         }
         let trimmed = row0.trim_end();
-        // 你好世界▌ — all chars contiguous in diff output.
+        // Assistant text now has an actor marker prefix; the CJK payload before
+        // the cursor must still be contiguous in the diff output.
         assert!(
-            trimmed.starts_with("你好世界"),
+            trimmed.contains("你好世界"),
             "streaming CJK diff should be contiguous, got {trimmed:?}"
         );
         assert!(

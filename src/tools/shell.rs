@@ -1,4 +1,4 @@
-use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
+use super::traits::{TOOL_EXECUTION_CANCELLED, Tool, ToolCategory, ToolResult, ToolTier};
 use crate::runtime::RuntimeAdapter;
 use crate::security::policy::ApprovalGrant;
 use crate::security::traits::Sandbox;
@@ -10,6 +10,7 @@ use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
+use tokio_util::sync::CancellationToken;
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
@@ -104,6 +105,144 @@ impl ShellTool {
             "memory/",
         ];
         protected_markers.iter().any(|marker| lowered.contains(marker))
+    }
+
+    async fn execute_inner(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+
+        if self.acl_enabled && Self::references_protected_memory_path(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Access denied: shell command references ACL-protected memory path".into()),
+            });
+        }
+
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
+
+        match SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
+            self.name(),
+            command,
+            approval_grant.as_ref(),
+        ) {
+            Ok(_) => {}
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".into()),
+            });
+        }
+
+        let mut cmd = match self.runtime.build_shell_command(command, &self.security.workspace_dir) {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build runtime command: {e}")),
+                });
+            }
+        };
+        cmd.env_clear();
+
+        for var in SAFE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                cmd.env(var, val);
+            }
+        }
+        cmd.env("PATH", self.build_shell_path());
+
+        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Sandbox failed to wrap command: {e}")),
+            });
+        }
+
+        let child = match spawn_managed_shell_child(cmd) {
+            Ok(child) => child,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to execute command: {e}")),
+                });
+            }
+        };
+
+        let wait = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output());
+        let result = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
+                    });
+                }
+                result = wait => result,
+            }
+        } else {
+            wait.await
+        };
+
+        match result {
+            Ok(Ok(output)) => {
+                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
+                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+                if stdout.len() > MAX_OUTPUT_BYTES {
+                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stdout.push_str("\n... [output truncated at 1MB]");
+                }
+                if stderr.len() > MAX_OUTPUT_BYTES {
+                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
+                    stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                Ok(ToolResult {
+                    success: output.status.success(),
+                    output: stdout,
+                    error: if stderr.is_empty() { None } else { Some(stderr) },
+                })
+            }
+            Ok(Err(e)) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to execute command: {e}")),
+            }),
+            Err(_) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")),
+            }),
+        }
     }
 }
 
@@ -218,134 +357,15 @@ impl Tool for ShellTool {
     }
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
-        let command = args
-            .get("command")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
+        self.execute_inner(args, None).await
+    }
 
-        if self.acl_enabled && Self::references_protected_memory_path(command) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Access denied: shell command references ACL-protected memory path".into()),
-            });
-        }
-
-        if self.security.is_rate_limited() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
-            });
-        }
-
-        match SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
-            self.name(),
-            command,
-            approval_grant.as_ref(),
-        ) {
-            Ok(_) => {}
-            Err(reason) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(reason),
-                });
-            }
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Rate limit exceeded: action budget exhausted".into()),
-            });
-        }
-
-        // Execute with timeout to prevent hanging commands.
-        // Clear the environment to prevent leaking API keys and other secrets
-        // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self.runtime.build_shell_command(command, &self.security.workspace_dir) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
-                });
-            }
-        };
-        cmd.env_clear();
-
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-        // Override PATH with a hardened default to prevent execution of binaries
-        // from untrusted directories. The inherited PATH may include user-writable
-        // dirs. When the operator has opted into `extra_path_dirs`, those (and only
-        // those) trusted directories are prepended — and the sandbox grants matching
-        // execute access — so toolchains like ~/.cargo/bin become usable (Bug #2).
-        cmd.env("PATH", self.build_shell_path());
-
-        // Apply sandbox isolation before execution.
-        // The Sandbox trait operates on std::process::Command, so we use
-        // as_std_mut() to access the inner command from tokio::process::Command.
-        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Sandbox failed to wrap command: {e}")),
-            });
-        }
-
-        let child = match spawn_managed_shell_child(cmd) {
-            Ok(child) => child,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute command: {e}")),
-                });
-            }
-        };
-
-        let result = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output()).await;
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                // Truncate output to prevent OOM
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
-                Ok(ToolResult {
-                    success: output.status.success(),
-                    output: stdout,
-                    error: if stderr.is_empty() { None } else { Some(stderr) },
-                })
-            }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")),
-            }),
-        }
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.execute_inner(args, cancellation).await
     }
 
     fn tier(&self) -> ToolTier {
@@ -814,6 +834,61 @@ mod tests {
             .expect("test: should execute");
         assert!(result.success);
         assert_eq!(result.output.trim(), "done");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn shell_cancellation_token_kills_process_group() {
+        let dir = std::env::temp_dir().join(format!("prx-shell-cancel-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&dir)
+            .await
+            .expect("test temp directory should be created");
+        let child_pid_file = dir.join("child.pid");
+        let marker_file = dir.join("should-not-exist.txt");
+        let command = format!(
+            "sleep 30 & echo $! > {}; sleep 2; echo SHOULD_NOT_PRINT > {}",
+            shell_quote_path(&child_pid_file),
+            shell_quote_path(&marker_file)
+        );
+
+        let tool = ShellTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: dir.clone(),
+                ..SecurityPolicy::default()
+            }),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
+        let cancellation = CancellationToken::new();
+        let tool_cancellation = cancellation.clone();
+        let handle = tokio::spawn(async move {
+            tool.execute_with_cancellation(json!({"command": command}), Some(tool_cancellation))
+                .await
+        });
+
+        let child_pid = wait_for_pid_file(&child_pid_file).await;
+        assert!(
+            process_exists(child_pid),
+            "background child should be running before cancellation"
+        );
+        cancellation.cancel();
+
+        let result = handle
+            .await
+            .expect("shell task should join")
+            .expect("shell tool should return a cancelled result");
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some(TOOL_EXECUTION_CANCELLED));
+
+        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        assert!(
+            tokio::fs::metadata(&marker_file).await.is_err(),
+            "cancelled shell command must not continue far enough to write marker"
+        );
+        wait_for_process_exit(child_pid).await;
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 
     #[cfg(unix)]

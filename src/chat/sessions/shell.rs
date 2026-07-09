@@ -38,6 +38,7 @@ use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -65,6 +66,7 @@ const SAFE_ENV_VARS: &[&str] = &[
 const HARDENED_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
 #[cfg(target_os = "windows")]
 const HARDENED_PATH: &str = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
+const OUTPUT_BUFFER_LINES: usize = 500;
 
 /// Terminal/running state of a background shell session.
 ///
@@ -83,6 +85,15 @@ pub enum ShellStatus {
     Cancelled,
 }
 
+/// Who started a background shell session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellOrigin {
+    /// Started by an operator slash command such as `/shell`.
+    User,
+    /// Started by the model through a chat tool call.
+    Model,
+}
+
 /// A single background shell session: handle to the running process group plus
 /// the bookkeeping the chat side reads for `/sessions`, `/kill`, and `/logs`.
 ///
@@ -94,6 +105,8 @@ pub struct ShellSession {
     pub id: SessionId,
     /// The command line (for display in `/sessions`).
     pub command: String,
+    /// Who initiated the session.
+    pub origin: ShellOrigin,
     /// Working directory the command runs in.
     pub cwd: PathBuf,
     /// When the session was spawned.
@@ -116,6 +129,11 @@ pub struct ShellSession {
     /// `tokio::sync::Mutex` because it is held across `.await`. The `Option` is
     /// taken by whichever of `kill`/the reaper-watcher gets there first.
     reaper: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    /// Recent output copy for model-callable managed-session tools. The TUI
+    /// continues to use the main-loop SessionRing; this avoids coupling tools
+    /// to TUI-local state.
+    output: Arc<Mutex<VecDeque<String>>>,
+    output_truncated: Arc<Mutex<bool>>,
 }
 
 impl ShellSession {
@@ -174,6 +192,18 @@ impl ShellSession {
             }
         }
         Ok(())
+    }
+
+    #[must_use]
+    pub fn recent_output(&self, max: usize) -> Vec<String> {
+        let output = self.output.lock();
+        let start = output.len().saturating_sub(max);
+        output.iter().skip(start).cloned().collect()
+    }
+
+    #[must_use]
+    pub fn output_truncated(&self) -> bool {
+        *self.output_truncated.lock()
     }
 }
 
@@ -251,6 +281,16 @@ fn process_group_alive(pgid: i32) -> bool {
 ///
 /// Returns a clonable [`ShellSession`] handle for the chat registry.
 pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &SessionEventSink) -> Result<ShellSession> {
+    spawn_shell_with_origin(command, security, sink, ShellOrigin::User)
+}
+
+/// Spawn a background shell command with an explicit initiator.
+pub fn spawn_shell_with_origin(
+    command: &str,
+    security: &Arc<SecurityPolicy>,
+    sink: &SessionEventSink,
+    origin: ShellOrigin,
+) -> Result<ShellSession> {
     // 1. Security gate — identical policy to ShellTool. The operator typed
     //    `/shell`, but high-risk commands (rm -rf /, mkfs, dd, …) are still
     //    blocked unless the policy allows them; we never bypass the gate.
@@ -306,6 +346,8 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
     let status = Arc::new(Mutex::new(ShellStatus::Running));
     let finished_at = Arc::new(Mutex::new(None));
     let cancel = CancellationToken::new();
+    let output_buffer = Arc::new(Mutex::new(VecDeque::with_capacity(OUTPUT_BUFFER_LINES)));
+    let output_truncated = Arc::new(Mutex::new(false));
 
     // 3. Stream stdout/stderr line-by-line into the event bridge. The sink's
     //    drainer guarantees these `.send().await`s never back-pressure us into a
@@ -313,10 +355,22 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
     let (delta_tx, _tool_tx) = sink.attach_run(id.clone());
     let mut readers: Vec<JoinHandle<()>> = Vec::with_capacity(2);
     if let Some(out) = child.stdout.take() {
-        readers.push(spawn_line_reader(BufReader::new(out), delta_tx.clone(), cancel.clone()));
+        readers.push(spawn_line_reader(
+            BufReader::new(out),
+            delta_tx.clone(),
+            cancel.clone(),
+            Arc::clone(&output_buffer),
+            Arc::clone(&output_truncated),
+        ));
     }
     if let Some(err) = child.stderr.take() {
-        readers.push(spawn_line_reader(BufReader::new(err), delta_tx.clone(), cancel.clone()));
+        readers.push(spawn_line_reader(
+            BufReader::new(err),
+            delta_tx.clone(),
+            cancel.clone(),
+            Arc::clone(&output_buffer),
+            Arc::clone(&output_truncated),
+        ));
     }
 
     // 4. Reaper: await exit (or cancellation), perform the kill on cancel, record
@@ -332,11 +386,14 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
         cancel: cancel.clone(),
         pgid: Arc::clone(&pgid_cell),
         delta_tx,
+        output: Arc::clone(&output_buffer),
+        output_truncated: Arc::clone(&output_truncated),
     });
 
     Ok(ShellSession {
         id,
         command: command.to_string(),
+        origin,
         cwd,
         started_at: Utc::now(),
         finished_at,
@@ -344,6 +401,8 @@ pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &Session
         cancel,
         pgid: pgid_cell,
         reaper: Arc::new(tokio::sync::Mutex::new(Some(reaper))),
+        output: output_buffer,
+        output_truncated,
     })
 }
 
@@ -364,6 +423,8 @@ fn spawn_line_reader<R>(
     reader: BufReader<R>,
     delta_tx: tokio::sync::mpsc::Sender<String>,
     cancel: CancellationToken,
+    output: Arc<Mutex<VecDeque<String>>>,
+    output_truncated: Arc<Mutex<bool>>,
 ) -> JoinHandle<()>
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -375,6 +436,7 @@ where
                 () = cancel.cancelled() => break,
                 next = lines.next_line() => match next {
                     Ok(Some(line)) => {
+                        push_output_line(&output, &output_truncated, line.clone());
                         // The drainer never blocks us for long (drop-on-full),
                         // so this `.await` cannot deadlock the reader.
                         if delta_tx.send(line).await.is_err() {
@@ -383,7 +445,9 @@ where
                     }
                     Ok(None) => break, // EOF
                     Err(e) => {
-                        let _ = delta_tx.send(format!("[read error: {e}]")).await;
+                        let line = format!("[read error: {e}]");
+                        push_output_line(&output, &output_truncated, line.clone());
+                        let _ = delta_tx.send(line).await;
                         break;
                     }
                 },
@@ -402,6 +466,8 @@ struct ReaperCtx {
     cancel: CancellationToken,
     pgid: Arc<Mutex<Option<i32>>>,
     delta_tx: tokio::sync::mpsc::Sender<String>,
+    output: Arc<Mutex<VecDeque<String>>>,
+    output_truncated: Arc<Mutex<bool>>,
 }
 
 /// Await process exit (or cancellation), perform the kill on cancel, record the
@@ -431,6 +497,8 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
         cancel,
         pgid,
         delta_tx,
+        output,
+        output_truncated,
     } = ctx;
     tokio::spawn(async move {
         let final_line = tokio::select! {
@@ -484,8 +552,18 @@ fn spawn_reaper(ctx: ReaperCtx) -> JoinHandle<()> {
         // Best-effort final marker for live followers; ignored if the drainer is
         // gone (chat shut down). The status line / `/logs` carry the result
         // authoritatively regardless of whether this marker lands.
+        push_output_line(&output, &output_truncated, final_line.clone());
         let _ = delta_tx.send(final_line).await;
     })
+}
+
+fn push_output_line(output: &Arc<Mutex<VecDeque<String>>>, truncated: &Arc<Mutex<bool>>, line: String) {
+    let mut guard = output.lock();
+    if guard.len() >= OUTPUT_BUFFER_LINES {
+        guard.pop_front();
+        *truncated.lock() = true;
+    }
+    guard.push_back(line);
 }
 
 /// Terminate the child: kill the whole process group on Unix (`killpg` with a

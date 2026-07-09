@@ -3886,7 +3886,7 @@ async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    let tool_future = tool.execute(call_arguments);
+    let tool_future = tool.execute_with_cancellation(call_arguments, cancellation_token.cloned());
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -3898,6 +3898,9 @@ async fn execute_one_tool(
 
     match tool_result {
         Ok(r) => {
+            if crate::tools::traits::is_tool_cancelled_result(&r) {
+                return Err(ToolLoopCancelled.into());
+            }
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration: start.elapsed(),

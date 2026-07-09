@@ -48,7 +48,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::ChatMode;
 use crate::channels::traits::SendMessage;
-use crate::chat::action::{Action, CompactReason, HistoryDir};
+use crate::chat::action::{Action, CompactReason, HistoryDir, MainQueueStatus, ProviderWorkerStatus};
 use crate::chat::session::{ChatSession, ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
 use crate::chat::slash_types::AtPathCandidate;
 use crate::hooks::HookEvent;
@@ -132,6 +132,8 @@ pub enum Effect {
     /// Step 5a-2 起 `EffectExecutor` 在 deps 模式下真调 `provider.stream_chat_with_history`，
     /// 流式 chunk 通过 `EffectDeps::action_tx` 回投到 reducer。
     StartTurn {
+        /// Main turn scheduler identity for the real provider execution task.
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<ChatMessage>,
         /// Optional persisted/original-history source used for compaction patch
@@ -307,6 +309,10 @@ pub struct UiState {
     /// P1 sessions strip entries. This is the same child TUI registry snapshot
     /// used by the Ctrl+G switcher, kept structured for rendering.
     pub sessions_entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// Main-session input backlog status for orchestration observation.
+    pub main_queue_status: MainQueueStatus,
+    /// Main-session provider worker status for orchestration observation.
+    pub provider_worker_status: ProviderWorkerStatus,
     /// Saved chat-session candidates for `/resume` slash-menu arguments.
     pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
     /// Provider/model candidates for `/provider` and `/model` slash-menu args.
@@ -386,6 +392,10 @@ pub struct UiSnapshot {
     pub sessions_status: Arc<str>,
     /// P1 sessions strip entries, cloned from reducer-owned UI state.
     pub sessions_entries: Arc<Vec<crate::chat::sessions::SwitcherEntry>>,
+    /// Main-session input backlog status.
+    pub main_queue_status: MainQueueStatus,
+    /// Main-session provider worker status.
+    pub provider_worker_status: ProviderWorkerStatus,
     /// P2 active line-session viewport snapshot.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
     /// P6c1 foreground tool approval prompt.
@@ -429,6 +439,8 @@ impl UiSnapshot {
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
+            main_queue_status: MainQueueStatus::default(),
+            provider_worker_status: ProviderWorkerStatus::default(),
             active_session_view: None,
             pending_tool_approval: None,
             context_used_tokens: None,
@@ -507,6 +519,7 @@ struct SnapshotDirtyFields {
     approval_visible: bool,
     focus: crate::chat::sessions::FocusTarget,
     token_usage_summary: MainSessionTokenUsageSummary,
+    main_queue_status: MainQueueStatus,
 }
 
 impl ChatState {
@@ -540,6 +553,8 @@ impl ChatState {
                 last_submitted: None,
                 sessions_status: String::new(),
                 sessions_entries: Vec::new(),
+                main_queue_status: MainQueueStatus::default(),
+                provider_worker_status: ProviderWorkerStatus::default(),
                 saved_sessions_cache: Vec::new(),
                 provider_model_catalog: Vec::new(),
                 active_session_view: None,
@@ -633,6 +648,8 @@ impl ChatState {
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
+            main_queue_status: self.ui.main_queue_status,
+            provider_worker_status: self.ui.provider_worker_status.clone(),
             active_session_view: self.ui.active_session_view.clone(),
             pending_tool_approval: self.ui.pending_tool_approval.clone(),
             context_used_tokens: self.ui.context_used_tokens,
@@ -702,6 +719,7 @@ impl ChatState {
             approval_visible: self.ui.pending_tool_approval.is_some(),
             focus: self.ui.focus,
             token_usage_summary: self.ui.token_usage_summary,
+            main_queue_status: self.ui.main_queue_status,
         }
     }
 
@@ -782,6 +800,7 @@ impl ChatState {
             // ── LLM 流式 (Step 3) ─────────────────────────────────
             Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
             Action::StartLLMTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_config,
@@ -789,6 +808,7 @@ impl ChatState {
                 turn_spawn_ctx,
                 turn_message_send_ctx,
             } => self.reduce_start_llm_turn(
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_config,
@@ -849,6 +869,8 @@ impl ChatState {
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
             Action::SessionsEntriesUpdated { entries } => self.reduce_sessions_entries_updated(entries),
+            Action::MainQueueStatusUpdated { status } => self.reduce_main_queue_status_updated(status),
+            Action::ProviderWorkerStatusUpdated { status } => self.reduce_provider_worker_status_updated(status),
             Action::SlashMenuSourcesUpdated {
                 saved_sessions,
                 provider_model_catalog,
@@ -1119,6 +1141,7 @@ impl ChatState {
         self.ui.turn_count = self.ui.turn_count.saturating_add(1);
         let log_msg = format!("input_submitted len={}", text.chars().count());
         self.ui.last_submitted = Some(text);
+        self.ui.input.clear();
         // S2.5 P1-B: 兜底清理本轮 tool_calls 缓冲（幂等：新一轮 turn 入口前清空，
         // 防御上一轮 stream 异常终止时未走 Completed/Cancelled/Failed 清理路径）.
         self.control.current_turn_tool_calls.clear();
@@ -1338,6 +1361,7 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_start_llm_turn(
         &mut self,
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1361,6 +1385,7 @@ impl ChatState {
                 msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
             },
             Effect::StartTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_guard_history: Some(self.session.history.clone()),
@@ -1377,6 +1402,7 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_start_llm_turn(
         &mut self,
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1400,6 +1426,7 @@ impl ChatState {
                 msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
             },
             Effect::StartTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_guard_history: Some(self.session.history.clone()),
@@ -1434,6 +1461,7 @@ impl ChatState {
         }
         draft.accumulated.push_str(delta);
         draft.version = version;
+        self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
@@ -1476,7 +1504,7 @@ impl ChatState {
             return vec![];
         }
         self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
+        self.remove_pending_tool_cards();
         self.control.active_cancel = None;
         self.control.generating = false;
         if !final_text.is_empty() {
@@ -1492,6 +1520,7 @@ impl ChatState {
                 folded: true,
             });
         }
+        self.refresh_provider_worker_view_if_focused();
         let chars = final_text.chars().count();
         let effects = vec![
             Effect::NotifyHook {
@@ -1518,7 +1547,7 @@ impl ChatState {
             return vec![];
         }
         self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
+        self.remove_pending_tool_cards();
         self.control.active_cancel = None;
         self.control.generating = false;
         if !final_text.is_empty() {
@@ -1558,7 +1587,7 @@ impl ChatState {
         }
         let orphan_user_removed = self.rollback_trailing_answerless_user_turn();
         self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
+        self.finalize_pending_tool_cards(false, Some("turn failed before tool finish event"));
         self.control.active_cancel = None;
         self.control.generating = false;
         // S2.5 P1-B: stream 失败丢弃本轮 tool 缓冲（无 RecordAssistantTurn 可回填，
@@ -1599,7 +1628,7 @@ impl ChatState {
         }
         self.rollback_trailing_answerless_user_turn();
         self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
+        self.finalize_pending_tool_cards(false, Some("turn cancelled before tool finish event"));
         self.control.active_cancel = None;
         self.control.generating = false;
         // S2.5 P1-B: cancel 丢弃本轮 tool 缓冲（同 failed 路径语义）.
@@ -1632,16 +1661,72 @@ impl ChatState {
         true
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn remove_pending_tool_cards(&mut self) {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut indices: Vec<usize> = self.stream.pending_tool_cards.drain(..).collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
+        for idx in indices {
+            if matches!(
+                self.ui.conversation_lines.get(idx),
+                Some(ConversationLine::ToolResult {
+                    status: ToolStatus::Running,
+                    ..
+                })
+            ) {
+                self.ui.conversation_lines.remove(idx);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn remove_pending_tool_cards(&mut self) {
+        self.stream.pending_tool_cards.clear();
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn finalize_pending_tool_cards(&mut self, success: bool, fallback_result: Option<&'static str>) {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        for idx in self.stream.pending_tool_cards.drain(..) {
+            let Some(ConversationLine::ToolResult {
+                status,
+                result,
+                elapsed_ms,
+                ..
+            }) = self.ui.conversation_lines.get_mut(idx)
+            else {
+                continue;
+            };
+            if *status != ToolStatus::Running {
+                continue;
+            }
+            *status = if success { ToolStatus::Done } else { ToolStatus::Error };
+            if result.is_none()
+                && let Some(fallback_result) = fallback_result
+            {
+                *result = Some(fallback_result.to_string());
+            }
+            if elapsed_ms.is_none() {
+                *elapsed_ms = Some(0);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn finalize_pending_tool_cards(&mut self, _success: bool, _fallback_result: Option<&'static str>) {
+        self.stream.pending_tool_cards.clear();
+    }
+
     /// `Action::ToolStarted` — 追加 Running 状态的 ToolResult 卡片 + 记录索引.
     #[cfg(feature = "terminal-tui")]
     fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
-        use crate::chat::tui::{ConversationLine, ToolStatus};
-        let args_preview = if args.chars().count() > 80 {
-            let prefix: String = args.chars().take(80).collect();
-            format!("{prefix}…")
-        } else {
-            args.clone()
+        use crate::chat::tui::{
+            ARGS_PREVIEW_ELLIPSIS, ARGS_PREVIEW_MAX_CHARS, ConversationLine, ToolStatus, build_tool_args_preview,
         };
+        let args_preview = build_tool_args_preview(&name, &args, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
         // S2.5 P1-B: 暂存 args_preview，ToolFinished 时取出 push 到 current_turn_tool_calls.
         self.control
             .current_turn_tool_args
@@ -1657,6 +1742,7 @@ impl ChatState {
         });
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
         self.stream.pending_tool_cards.push(idx);
+        self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
@@ -1726,6 +1812,7 @@ impl ChatState {
             }
             self.stream.pending_tool_cards.remove(pending_pos);
         }
+        self.refresh_provider_worker_view_if_focused();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -1890,11 +1977,14 @@ impl ChatState {
         let cancel_opt = self.control.active_cancel.take();
         // 清除流式状态
         self.stream.draft = None;
+        self.finalize_pending_tool_cards(false, Some("turn cancelled by cancel request"));
         self.control.generating = false;
         let pending_approval = self.ui.pending_tool_approval.take();
         if pending_approval.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
             self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         }
+        self.control.current_turn_tool_calls.clear();
+        self.control.current_turn_tool_args.clear();
 
         let mut effects = Vec::new();
         // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
@@ -2239,6 +2329,69 @@ impl ChatState {
         self.ui.sessions_entries = entries;
         vec![Effect::RequestRedraw]
     }
+
+    fn reduce_main_queue_status_updated(&mut self, status: MainQueueStatus) -> Vec<Effect> {
+        if self.ui.main_queue_status == status {
+            return Vec::new();
+        }
+        self.ui.main_queue_status = status;
+        vec![Effect::RequestRedraw]
+    }
+
+    fn reduce_provider_worker_status_updated(&mut self, status: ProviderWorkerStatus) -> Vec<Effect> {
+        if self.ui.provider_worker_status == status {
+            return Vec::new();
+        }
+        let worker_view = self.ui.focus.worker_sequence().map(|sequence| {
+            let scroll_offset = self
+                .ui
+                .active_session_view
+                .as_ref()
+                .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
+                .map_or(0, |view| view.scroll_offset);
+            #[cfg(feature = "terminal-tui")]
+            let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
+                &self.ui.conversation_lines,
+                self.stream.draft.as_ref(),
+                12,
+            );
+            #[cfg(not(feature = "terminal-tui"))]
+            let io_lines = Vec::new();
+            crate::chat::action::build_provider_worker_active_view_with_io(&status, sequence, scroll_offset, io_lines)
+        });
+        self.ui.provider_worker_status = status;
+        if let Some(view) = worker_view {
+            self.ui.active_session_view = Some(view);
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn refresh_provider_worker_view_if_focused(&mut self) {
+        let Some(sequence) = self.ui.focus.worker_sequence() else {
+            return;
+        };
+        let scroll_offset = self
+            .ui
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
+            .map_or(0, |view| view.scroll_offset);
+        let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
+            &self.ui.conversation_lines,
+            self.stream.draft.as_ref(),
+            12,
+        );
+        self.ui.active_session_view = Some(crate::chat::action::build_provider_worker_active_view_with_io(
+            &self.ui.provider_worker_status,
+            sequence,
+            scroll_offset,
+            io_lines,
+        ));
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn refresh_provider_worker_view_if_focused(&mut self) {}
 
     #[cfg(feature = "terminal-tui")]
     fn reduce_slash_menu_sources_updated(
@@ -2766,6 +2919,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // identical writes, so this never churns frames.
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
+        | Action::MainQueueStatusUpdated { .. }
+        | Action::ProviderWorkerStatusUpdated { .. }
         | Action::SlashMenuSourcesUpdated { .. }
         | Action::AtPathCandidatesUpdated { .. }
         | Action::ActiveSessionViewUpdated { .. }
@@ -2872,6 +3027,96 @@ mod tests {
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.sessions_status.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn main_queue_status_updated_writes_snapshot_and_dedups() {
+        let mut state = make_state();
+        let status = MainQueueStatus { queued: 3, priority: 1 };
+
+        let effects = state.reduce(Action::MainQueueStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.main_queue_status, status);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.main_queue_status, status);
+
+        let effects = state.reduce(Action::MainQueueStatusUpdated { status });
+        assert!(effects.is_empty(), "identical queue status must not emit an effect");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_updated_writes_snapshot_and_dedups() {
+        let mut state = make_state();
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 1,
+            awaiting_commit: 2,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: None,
+            rows: Vec::new(),
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status: status.clone() });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.provider_worker_status, status);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.provider_worker_status, status);
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+        assert!(
+            effects.is_empty(),
+            "identical provider worker status must not emit an effect"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_update_refreshes_open_worker_view_with_io() {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut state = make_state();
+        state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 2 };
+        state.ui.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "echo P6Z".to_string(),
+            args_full: "{\"command\":\"echo P6Z\"}".to_string(),
+            result: Some("P6Z\n".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(12),
+            folded: true,
+        });
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            rows: vec![crate::chat::action::ProviderWorkerStatusRow {
+                task_id: 7,
+                sequence: 2,
+                kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                state: crate::chat::action::ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let view = state.ui.active_session_view.as_ref().expect("worker view refreshed");
+        assert_eq!(view.kind, crate::chat::action::PROVIDER_WORKER_VIEW_KIND);
+        assert!(view.lines.iter().any(|line| line == "task: 7"));
+        assert!(view.lines.iter().any(|line| line == "io: recent provider turn"));
+        assert!(view.lines.iter().any(|line| line.starts_with("run shell done:")));
+        assert!(view.lines.iter().any(|line| line == "output: P6Z"));
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -3930,6 +4175,7 @@ mod tests {
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
             assert_eq!(state.ui.last_submitted.as_deref(), Some(bounded.as_str()));
+            assert!(state.ui.input.is_empty());
         }
 
         /// 9. TerminalResized → RequestRedraw
@@ -3948,6 +4194,7 @@ mod tests {
             let effects = state.reduce(Action::InputSubmitted("hello world".to_string()));
             assert_eq!(state.ui.turn_count, 1);
             assert_eq!(state.ui.last_submitted.as_deref(), Some("hello world"));
+            assert!(state.ui.input.is_empty());
             assert!(has_log_trace(&effects));
             assert!(has_request_redraw(&effects));
         }
@@ -4537,6 +4784,109 @@ mod tests {
                 state.ui.conversation_lines.len(),
                 lines_before,
                 "cancel 不应 push 任何 conversation line"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn stream_cancelled_finalizes_pending_running_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-cancel".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::StreamCancelled {
+                draft_id: "d-tool-cancel".to_string(),
+            });
+
+            assert!(state.stream.pending_tool_cards.is_empty());
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "cancelled turn must not leave a running tool card driving the status bar"
+            );
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Error,
+                        ..
+                    } if tool_name == "shell"
+                )),
+                "pending shell tool card should be finalized as an error/cancelled card"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn cancel_requested_finalizes_pending_running_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-cancel-request".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(state.stream.pending_tool_cards.is_empty());
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "cancel request must not leave a running tool card driving the status bar"
+            );
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Error,
+                        result: Some(result),
+                        ..
+                    } if tool_name == "shell" && result.contains("cancel request")
+                )),
+                "cancel request should finalize the shell tool card"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn stream_completed_removes_unfinished_pending_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-complete".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d-tool-complete".to_string(),
+                final_text: "done".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert!(state.stream.pending_tool_cards.is_empty());
+            assert!(
+                !state
+                    .ui
+                    .conversation_lines
+                    .iter()
+                    .any(|line| matches!(line, crate::chat::tui::ConversationLine::ToolResult { .. })),
+                "completed turn should remove unfinished placeholder tool cards"
+            );
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "completed turn must not leave placeholder tool cards driving the status bar"
             );
         }
 
@@ -5839,6 +6189,7 @@ mod tests {
             let history = vec![ChatMessage::system("you are helpful"), ChatMessage::user("hi")];
 
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-1".to_string(),
                 history,
                 compaction_config: None,
@@ -5876,6 +6227,7 @@ mod tests {
             let mut state = s();
             let cancel = CancellationToken::new();
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: None,
@@ -5905,6 +6257,7 @@ mod tests {
             };
 
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
                 draft_id: "d-budget".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: Some(compaction_config),
@@ -5915,6 +6268,7 @@ mod tests {
 
             let carried = effects.iter().find_map(|effect| match effect {
                 Effect::StartTurn {
+                    provider_turn_task_id: None,
                     compaction_config: Some(config),
                     ..
                 } => Some(config),
@@ -5923,6 +6277,35 @@ mod tests {
             let config = carried.expect("StartTurn effect must carry compaction config");
             assert_eq!(config.max_context_tokens, 120);
             assert_eq!(config.reserve_tokens, 10);
+        }
+
+        #[test]
+        fn start_llm_turn_carries_provider_turn_task_id_to_effect() {
+            let mut state = s();
+            let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let task_id = scheduler.enqueue(
+                "provider identity",
+                crate::chat::turn_scheduler::TurnPriority::Normal,
+                0,
+            );
+
+            let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                draft_id: "d-worker".to_string(),
+                history: vec![ChatMessage::user("x")],
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+
+            let carried = effects.iter().find_map(|effect| match effect {
+                Effect::StartTurn {
+                    provider_turn_task_id, ..
+                } => Some(*provider_turn_task_id),
+                _ => None,
+            });
+            assert_eq!(carried, Some(Some(task_id)));
         }
 
         /// Phase A-3: TurnStarted（旧 Action）保持原行为 — 不发射 Effect::StartTurn
@@ -6007,6 +6390,7 @@ mod tests {
             let mut state = s();
             let cancel = CancellationToken::new();
             let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
                 compaction_config: None,

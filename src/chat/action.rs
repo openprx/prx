@@ -13,6 +13,175 @@ use crate::agent::loop_::ChatMode;
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord};
 use crate::llm::route_decision::TokenUsage;
 
+/// Main-session input backlog status for human-visible orchestration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MainQueueStatus {
+    pub queued: usize,
+    pub priority: usize,
+}
+
+/// Main-session provider worker lifecycle status for human-visible orchestration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderWorkerStatus {
+    pub running: usize,
+    pub cancelling: usize,
+    pub awaiting_commit: usize,
+    pub finalized_payloads: usize,
+    pub finalized_total_tokens: u64,
+    pub oldest_started_at_ms: Option<i64>,
+    pub rows: Vec<ProviderWorkerStatusRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderWorkerStatusRow {
+    pub task_id: u64,
+    pub sequence: u64,
+    pub kind: ProviderWorkerRowKind,
+    pub state: ProviderWorkerRowState,
+    pub started_at_ms: i64,
+    pub finalized_total_tokens: Option<u64>,
+    pub completion_ready: bool,
+}
+
+impl ProviderWorkerStatusRow {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self.state,
+            ProviderWorkerRowState::Running
+                | ProviderWorkerRowState::Cancelling
+                | ProviderWorkerRowState::AwaitingCommit
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWorkerRowKind {
+    ForegroundAwaited,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWorkerRowState {
+    Running,
+    Cancelling,
+    AwaitingCommit,
+    Committed,
+    Cancelled,
+    Failed,
+}
+
+pub const PROVIDER_WORKER_VIEW_KIND: &str = "worker";
+const PROVIDER_WORKER_VIEW_DESIRED_ROWS: usize = 24;
+
+pub fn build_provider_worker_active_view(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    scroll_offset: usize,
+) -> crate::chat::sessions::ActiveSessionView {
+    build_provider_worker_active_view_with_io(status, sequence, scroll_offset, Vec::new())
+}
+
+pub fn build_provider_worker_active_view_with_io(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    scroll_offset: usize,
+    io_lines: Vec<String>,
+) -> crate::chat::sessions::ActiveSessionView {
+    let row = status.rows.iter().find(|row| row.sequence == sequence).copied();
+    let title = format!("main provider w#{sequence}");
+    let mut lines = Vec::new();
+    if let Some(row) = row {
+        lines.push(format!("worker: w#{}", row.sequence));
+        lines.push(format!("task: {}", row.task_id));
+        lines.push(format!("kind: {}", provider_worker_row_kind_label(row.kind)));
+        lines.push(format!("state: {}", provider_worker_row_state_label(row.state)));
+        lines.push(format!(
+            "completion: {}",
+            if row.completion_ready { "ready" } else { "pending" }
+        ));
+        lines.push(format!("elapsed: {}", provider_worker_elapsed_label(row.started_at_ms)));
+        lines.push(match row.finalized_total_tokens {
+            Some(tokens) if tokens > 0 => format!("tokens: {}", format_provider_worker_tokens_compact(tokens)),
+            _ => "tokens: pending".to_string(),
+        });
+        lines.push(format!(
+            "summary: {} running, {} cancelling, {} awaiting commit",
+            status.running, status.cancelling, status.awaiting_commit
+        ));
+        lines.push(format!(
+            "finalized: {} payloads, {} tokens",
+            status.finalized_payloads,
+            format_provider_worker_tokens_compact(status.finalized_total_tokens)
+        ));
+    } else {
+        lines.push(format!("worker: w#{sequence}"));
+        lines.push("state: no longer retained".to_string());
+        lines.push("detail: use /workers for the current retained provider worker report".to_string());
+    }
+    if !io_lines.is_empty() {
+        lines.push("io: recent provider turn".to_string());
+        lines.extend(io_lines);
+    }
+    lines.push("view: read-only provider worker detail".to_string());
+    lines.push("keys: PageUp/PageDown scroll, Esc returns to main".to_string());
+    crate::chat::sessions::ActiveSessionView {
+        seq: sequence,
+        kind: PROVIDER_WORKER_VIEW_KIND.to_string(),
+        title,
+        lines,
+        truncated: false,
+        scroll_offset,
+    }
+    .clamped_for_height(PROVIDER_WORKER_VIEW_DESIRED_ROWS)
+}
+
+pub const fn provider_worker_row_state_label(state: ProviderWorkerRowState) -> &'static str {
+    match state {
+        ProviderWorkerRowState::Running => "running",
+        ProviderWorkerRowState::Cancelling => "cancelling",
+        ProviderWorkerRowState::AwaitingCommit => "awaiting_commit",
+        ProviderWorkerRowState::Committed => "committed",
+        ProviderWorkerRowState::Cancelled => "cancelled",
+        ProviderWorkerRowState::Failed => "failed",
+    }
+}
+
+pub const fn provider_worker_row_kind_label(kind: ProviderWorkerRowKind) -> &'static str {
+    match kind {
+        ProviderWorkerRowKind::ForegroundAwaited => "foreground_awaited",
+        ProviderWorkerRowKind::Detached => "detached",
+    }
+}
+
+pub const fn provider_worker_row_kind_compact(kind: ProviderWorkerRowKind) -> &'static str {
+    match kind {
+        ProviderWorkerRowKind::ForegroundAwaited => "fg",
+        ProviderWorkerRowKind::Detached => "detached",
+    }
+}
+
+fn provider_worker_elapsed_label(started_at_ms: i64) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+    let elapsed_secs = u64::try_from(elapsed_ms / 1000).unwrap_or_default();
+    crate::chat::sessions::model::format_elapsed_compact(elapsed_secs)
+}
+
+pub fn format_provider_worker_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        let whole = tokens / 1_000;
+        let decimal = (tokens % 1_000) / 100;
+        if decimal == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{decimal}k")
+        }
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// 历史导航方向。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
@@ -103,6 +272,10 @@ pub enum Action {
     /// Phase A 阶段两者并存，主循环仍由旧路径主导；Phase B 之后旧路径删除，
     /// `TurnStarted` 由 `StartLLMTurn` 完全取代。
     StartLLMTurn {
+        /// Main turn scheduler identity for this provider execution. `None`
+        /// preserves non-chat/test callers, but live chat should pass the
+        /// `TurnTaskId` that owns this provider worker.
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         /// P5 proactive budgeting: resolved context budget for this turn.
@@ -132,8 +305,8 @@ pub enum Action {
         delta: String,
         version: u64,
     },
-    /// Provider-reported or estimated usage for the active streaming turn.
-    StreamUsageMetered { usage: TokenUsage },
+    /// Provider-reported or estimated usage for a streaming turn.
+    StreamUsageMetered { draft_id: String, usage: TokenUsage },
     /// streaming 完成，携带最终文本和 reasoning 摘要
     StreamCompleted {
         draft_id: String,
@@ -256,6 +429,13 @@ pub enum Action {
     SessionsEntriesUpdated {
         entries: Vec<crate::chat::sessions::SwitcherEntry>,
     },
+    /// Main-session input backlog status. Updated by the chat main loop when
+    /// active-turn input is drained or queued input is popped.
+    MainQueueStatusUpdated { status: MainQueueStatus },
+    /// Main-session provider worker status. Updated by the chat main loop from
+    /// `ProviderTurnWorkerRegistry` so the TUI can show foreground/detached
+    /// provider lifecycle progress without parsing logs.
+    ProviderWorkerStatusUpdated { status: ProviderWorkerStatus },
     /// Slash-menu argument candidate sources that are not derivable from the
     /// structured live-session strip.
     SlashMenuSourcesUpdated {
@@ -376,6 +556,8 @@ impl Action {
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
             Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
+            Self::MainQueueStatusUpdated { .. } => "MainQueueStatusUpdated",
+            Self::ProviderWorkerStatusUpdated { .. } => "ProviderWorkerStatusUpdated",
             Self::SlashMenuSourcesUpdated { .. } => "SlashMenuSourcesUpdated",
             Self::AtPathCandidatesUpdated { .. } => "AtPathCandidatesUpdated",
             Self::ActiveSessionViewUpdated { .. } => "ActiveSessionViewUpdated",

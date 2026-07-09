@@ -271,6 +271,13 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
         arg: NO_ARG,
     },
     CommandSpec {
+        name: "/workers",
+        aliases: &[],
+        args_hint: "",
+        description: "Show main provider worker status",
+        arg: NO_ARG,
+    },
+    CommandSpec {
         name: "/compact",
         aliases: &[],
         args_hint: "",
@@ -289,7 +296,7 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     CommandSpec {
         name: "/copy",
         aliases: &[],
-        args_hint: "[N]",
+        args_hint: "[latest|N]",
         description: "Copy latest or Nth previous assistant reply",
         arg: NO_ARG,
     },
@@ -467,6 +474,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
         "/auto" => CommandResult::SetMode(ChatMode::Auto),
         "/tools" => CommandResult::HandledWithOutput(format_tools_feedback(ctx.tools_registry)),
         "/cost" => CommandResult::HandledWithOutput(format_cost_feedback(ctx.chat_session)),
+        "/workers" => CommandResult::HandledWithOutput("No main provider workers are active.".to_string()),
         "/model" => CommandResult::HandledWithOutput(format_model_feedback(ctx.model_name)),
         "/provider" => CommandResult::HandledWithOutput(format!("Current provider: {}", ctx.provider_name)),
         "/resume" => CommandResult::ResumeAction(ResumeCommand::List),
@@ -574,7 +582,7 @@ pub async fn dispatch(input: &str, ctx: &CommandContext<'_>) -> CommandResult {
     }
 }
 
-fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
+pub(crate) fn format_cost_feedback(chat_session: &session::ChatSession) -> String {
     let summary = chat_session.token_usage_summary();
     let total_prefix = if summary.has_estimates() { "~" } else { "" };
     let cost = if summary.cost_is_unknown() {
@@ -1110,6 +1118,7 @@ mod mode_tests {
             "/auto",
             "/tools",
             "/cost",
+            "/workers",
             "/model",
             "/provider",
             "/resume",

@@ -163,6 +163,29 @@ impl Tool for ArcDelegatingTool {
         self.inner.execute(args).await
     }
 
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_cancellation(args, cancellation).await
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.inner.execute_named(name, args).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner
+            .execute_named_with_cancellation(name, args, cancellation)
+            .await
+    }
+
     fn tier(&self) -> ToolTier {
         self.inner.tier()
     }

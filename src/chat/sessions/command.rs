@@ -205,6 +205,10 @@ pub fn steer_unsupported_message(kind: super::model::ManagedKind, seq: u64) -> O
             "Steer is not supported for the read-only diff viewer. Close it with Esc to return to main chat."
                 .to_string(),
         ),
+        ManagedKind::Worker => Some(
+            "Steer is not supported for the read-only provider worker viewer. Close it with Esc to return to main chat."
+                .to_string(),
+        ),
     }
 }
 

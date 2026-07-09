@@ -43,6 +43,9 @@ pub enum FocusTarget {
     /// Read-only workspace diff viewer. It is a child TUI surface but never a
     /// steerable managed session.
     Diff,
+    /// Read-only main provider worker detail viewer. It is a child TUI surface
+    /// but never a steerable managed session.
+    Worker { sequence: u64 },
 }
 
 impl FocusTarget {
@@ -57,7 +60,7 @@ impl FocusTarget {
     pub const fn is_child_view(self) -> bool {
         matches!(
             self,
-            Self::Session { .. } | Self::Transcript | Self::Approval | Self::Diff
+            Self::Session { .. } | Self::Transcript | Self::Approval | Self::Diff | Self::Worker { .. }
         )
     }
 
@@ -65,8 +68,17 @@ impl FocusTarget {
     #[must_use]
     pub const fn session_seq(self) -> Option<u64> {
         match self {
-            Self::Main | Self::Transcript | Self::Approval | Self::Diff => None,
+            Self::Main | Self::Transcript | Self::Approval | Self::Diff | Self::Worker { .. } => None,
             Self::Session { seq } => Some(seq),
+        }
+    }
+
+    /// The focused provider worker sequence, if any.
+    #[must_use]
+    pub const fn worker_sequence(self) -> Option<u64> {
+        match self {
+            Self::Worker { sequence } => Some(sequence),
+            Self::Main | Self::Session { .. } | Self::Transcript | Self::Approval | Self::Diff => None,
         }
     }
 }
@@ -345,6 +357,8 @@ pub enum EscAction {
     DenyApproval,
     /// Input is empty and the read-only diff viewer is focused → close it.
     CloseDiff,
+    /// Input is empty and the read-only provider worker viewer is focused → close it.
+    CloseWorker,
     /// Input is empty and focus is main → the existing cancel semantics.
     Cancel,
 }
@@ -370,6 +384,9 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
     if matches!(focus, FocusTarget::Approval) {
         return EscAction::DenyApproval;
     }
+    if matches!(focus, FocusTarget::Worker { .. }) && input_empty {
+        return EscAction::CloseWorker;
+    }
     if generating {
         return EscAction::CancelGenerating;
     }
@@ -381,6 +398,7 @@ pub const fn resolve_esc(input_empty: bool, focus: FocusTarget, switcher_open: b
         FocusTarget::Transcript => return EscAction::CloseTranscript,
         FocusTarget::Approval => {}
         FocusTarget::Diff => return EscAction::CloseDiff,
+        FocusTarget::Worker { .. } => return EscAction::CloseWorker,
         FocusTarget::Main => {}
     }
     EscAction::Cancel
@@ -743,6 +761,14 @@ mod tests {
         assert_eq!(
             resolve_esc(true, FocusTarget::Diff, false, true),
             EscAction::CancelGenerating
+        );
+    }
+
+    #[test]
+    fn resolve_esc_worker_view_closes_before_generating_cancel() {
+        assert_eq!(
+            resolve_esc(true, FocusTarget::Worker { sequence: 1 }, false, true),
+            EscAction::CloseWorker
         );
     }
 

@@ -726,8 +726,10 @@ impl ChatSessionsHandle {
                 seq,
                 run_id: key,
                 kind: ManagedKind::Shell,
-                // Shells are always operator-initiated (`/shell`).
-                origin: super::model::SessionOrigin::User,
+                origin: match shell.origin {
+                    super::shell::ShellOrigin::User => super::model::SessionOrigin::User,
+                    super::shell::ShellOrigin::Model => super::model::SessionOrigin::Model,
+                },
                 status,
                 summary,
                 created_at: shell.started_at,
