@@ -6776,7 +6776,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
                             }
                             let _ = chat_dispatcher.dispatch_or_log(
-                                crate::chat::action::Action::ProviderUsageRecorded { record },
+                                crate::chat::action::Action::ProviderUsageRecorded {
+                                    task_id: provider_turn_task_id,
+                                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                                    record,
+                                },
                                 "chat.provider_usage_recorded_empty_response",
                             );
                             #[cfg(feature = "terminal-tui")]
@@ -6867,7 +6871,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
                         }
                         let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::ProviderUsageRecorded { record },
+                            crate::chat::action::Action::ProviderUsageRecorded {
+                                task_id: provider_turn_task_id,
+                                usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                                record,
+                            },
                             "chat.provider_usage_recorded",
                         );
                         #[cfg(feature = "terminal-tui")]
@@ -7474,7 +7482,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
                 }
                 let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::ProviderUsageRecorded { record },
+                    crate::chat::action::Action::ProviderUsageRecorded {
+                        task_id: provider_turn_task_id,
+                        usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                        record,
+                    },
                     "chat.provider_usage_recorded_empty_response",
                 );
                 #[cfg(feature = "terminal-tui")]
@@ -7648,7 +7660,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
             }
             let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::ProviderUsageRecorded { record },
+                crate::chat::action::Action::ProviderUsageRecorded {
+                    task_id: provider_turn_task_id,
+                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                    record,
+                },
                 "chat.provider_usage_recorded",
             );
             #[cfg(feature = "terminal-tui")]

@@ -234,6 +234,18 @@ pub enum CompactReason {
     Manual,
 }
 
+/// Identity for main-session provider usage records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderUsageRecordKind {
+    /// A final per-turn aggregate produced when provider completion is consumed.
+    FinalAggregate,
+    /// A non-final metering segment. These are intentionally not deduped by task
+    /// id. No production path emits this yet; it is reserved for future
+    /// incremental metering and its "not deduped" contract is locked by tests so
+    /// the dedup rule stays scoped to `FinalAggregate` only.
+    Incremental,
+}
+
 /// 单一事件代数，所有状态变更必须通过 reduce 应用.
 ///
 /// `Send + Sync`（通过 channel 跨任务传递），无 `Box<dyn>` 即可表达全部 case。
@@ -506,7 +518,11 @@ pub enum Action {
         max_context_tokens: Option<usize>,
     },
     /// Main-session provider usage has been recorded for a successful turn.
-    ProviderUsageRecorded { record: MainSessionTokenUsageRecord },
+    ProviderUsageRecorded {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        usage_kind: ProviderUsageRecordKind,
+        record: MainSessionTokenUsageRecord,
+    },
     /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
     /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
     /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进

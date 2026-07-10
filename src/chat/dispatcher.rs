@@ -419,6 +419,9 @@ impl TurnCompletionSignal {
             .and_then(|slot| slot.outcome.take())
     }
 
+    /// Consume the task-scoped final aggregate collected for one provider turn.
+    /// Session-level dedup happens when this aggregate is recorded as
+    /// `ProviderUsageRecordKind::FinalAggregate`.
     pub fn consume_turn_usage(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> TokenUsage {
         let mut keyed = self.keyed.lock();
         let Some(slot) = keyed.slots.get_mut(&task_id) else {
