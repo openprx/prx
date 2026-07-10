@@ -6485,9 +6485,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 Some("user".to_string()),
                 Arc::clone(&terminal) as Arc<dyn Channel>,
             );
+            let provider_turn_sequence =
+                provider_turn_task_id.and_then(|id| turn_scheduler.task(id).map(|task| task.sequence));
             let dispatch_result = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StartLLMTurn {
                     provider_turn_task_id,
+                    provider_turn_sequence,
                     draft_id: d_id.clone(),
                     history: history.clone(),
                     compaction_config: Some(effective_compaction.config.clone()),

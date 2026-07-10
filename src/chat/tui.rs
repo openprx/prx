@@ -12869,6 +12869,7 @@ mod tests {
 
     mod s4_a_2 {
         use super::*;
+        use crate::chat::action::Action;
         use crate::chat::state::ChatState;
         use std::sync::Arc;
         use tokio_util::sync::CancellationToken;
@@ -12899,7 +12900,7 @@ mod tests {
             tui.turn_count = state.ui.turn_count;
             tui.ascii_fallback = state.ui.ascii_fallback;
             tui.conversation_lines = state.ui.conversation_lines.clone();
-            tui.streaming.clone_from(&state.stream.draft);
+            tui.streaming = state.stream.primary_streaming_draft().cloned();
             tui.input = state.ui.input.clone();
 
             assert_eq!(
@@ -12913,9 +12914,13 @@ mod tests {
         #[test]
         fn s4_a_2_fullscreen_bottom_chrome_height_parity_streaming() {
             let mut state = make_state_with_lines();
-            state.stream.draft = Some(StreamingDraft {
+            let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d-1".to_string(),
-                accumulated: "streaming…".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "d-1".to_string(),
+                delta: "streaming…".to_string(),
                 version: 3,
             });
             let snap = state.build_ui_snapshot(2);
@@ -12925,7 +12930,7 @@ mod tests {
             tui.turn_count = state.ui.turn_count;
             tui.ascii_fallback = state.ui.ascii_fallback;
             tui.conversation_lines = state.ui.conversation_lines.clone();
-            tui.streaming.clone_from(&state.stream.draft);
+            tui.streaming = state.stream.primary_streaming_draft().cloned();
             tui.input = state.ui.input.clone();
 
             let h_tui = fullscreen_bottom_chrome_height(&tui);
@@ -12984,7 +12989,7 @@ mod tests {
             tui.turn_count = state.ui.turn_count;
             tui.ascii_fallback = state.ui.ascii_fallback;
             tui.conversation_lines = state.ui.conversation_lines.clone();
-            tui.streaming.clone_from(&state.stream.draft);
+            tui.streaming = state.stream.primary_streaming_draft().cloned();
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
             tui.strip_selection = Some(7);
@@ -13198,7 +13203,7 @@ mod tests {
             tui.turn_count = state.ui.turn_count;
             tui.ascii_fallback = state.ui.ascii_fallback;
             tui.conversation_lines = state.ui.conversation_lines.clone();
-            tui.streaming.clone_from(&state.stream.draft);
+            tui.streaming = state.stream.primary_streaming_draft().cloned();
             tui.input = state.ui.input.clone();
 
             assert_eq!(

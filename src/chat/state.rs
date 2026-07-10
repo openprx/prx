@@ -455,13 +455,85 @@ impl UiSnapshot {
     }
 }
 
+/// One keyed visible streaming turn draft.
+///
+/// Phase 1 is structural only: the live chat loop still keeps visible provider
+/// turns safe-serial via admission guard, but the reducer can now represent
+/// multiple drafts without a single global draft slot.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingTurnDraft {
+    pub task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    /// Scheduler sequence; lower sequence renders as the primary/earlier draft.
+    pub sequence: u64,
+    pub prompt_preview: String,
+    pub draft: StreamingDraft,
+}
+
 /// 流式推理中间态（每轮重置）.
 #[allow(dead_code)]
 pub struct StreamState {
-    /// 当前 in-flight streaming draft（Step 3 起由 reducer 接管版本号防护）
-    pub draft: Option<StreamingDraft>,
+    /// Keyed in-flight visible streaming drafts.
+    ///
+    /// This is the single source of truth for streaming draft state. The legacy
+    /// single-draft snapshot is computed from [`Self::primary_draft`].
+    pub visible_drafts: Vec<StreamingTurnDraft>,
     /// 当前回合中处于 Running 状态的工具卡片索引列表
     pub pending_tool_cards: Vec<usize>,
+}
+
+impl StreamState {
+    #[must_use]
+    pub fn primary_draft(&self) -> Option<&StreamingTurnDraft> {
+        self.visible_drafts.first()
+    }
+
+    #[must_use]
+    pub fn primary_streaming_draft(&self) -> Option<&StreamingDraft> {
+        self.primary_draft().map(|turn| &turn.draft)
+    }
+
+    fn insert_visible_draft(&mut self, draft: StreamingTurnDraft) {
+        self.visible_drafts
+            .retain(|existing| existing.draft.draft_id != draft.draft.draft_id);
+        let insert_at = self
+            .visible_drafts
+            .iter()
+            .position(|existing| existing.sequence > draft.sequence)
+            .unwrap_or(self.visible_drafts.len());
+        self.visible_drafts.insert(insert_at, draft);
+    }
+
+    fn visible_draft_mut(&mut self, draft_id: &str) -> Option<&mut StreamingTurnDraft> {
+        self.visible_drafts
+            .iter_mut()
+            .find(|turn| turn.draft.draft_id == draft_id)
+    }
+
+    fn remove_visible_draft(&mut self, draft_id: &str) -> Option<StreamingTurnDraft> {
+        let idx = self
+            .visible_drafts
+            .iter()
+            .position(|turn| turn.draft.draft_id == draft_id)?;
+        Some(self.visible_drafts.remove(idx))
+    }
+
+    fn clear_visible_drafts(&mut self) {
+        self.visible_drafts.clear();
+    }
+
+    #[must_use]
+    const fn has_visible_drafts(&self) -> bool {
+        !self.visible_drafts.is_empty()
+    }
+
+    #[must_use]
+    fn versions_fingerprint(&self) -> Vec<(String, u64)> {
+        self.visible_drafts
+            .iter()
+            .map(|turn| (turn.draft.draft_id.clone(), turn.draft.version))
+            .collect()
+    }
 }
 
 /// 取消/关停控制状态.
@@ -503,12 +575,11 @@ pub struct ChatState {
 }
 
 #[cfg(feature = "terminal-tui")]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 struct SnapshotDirtyFields {
     conversation_len: usize,
     conversation_generation: u64,
-    has_stream_draft: bool,
-    draft_version: u64,
+    draft_versions: Vec<(String, u64)>,
     input_lines: usize,
     context_used_tokens: Option<usize>,
     context_window_tokens: Option<usize>,
@@ -570,7 +641,7 @@ impl ChatState {
                 saved_session_picker: None,
             },
             stream: StreamState {
-                draft: None,
+                visible_drafts: Vec::new(),
                 pending_tool_cards: Vec::new(),
             },
             control: ControlState {
@@ -644,7 +715,7 @@ impl ChatState {
             ascii_fallback: self.ui.ascii_fallback,
             conversation_lines: lines,
             conversation_generation: self.ui.conversation_generation,
-            streaming: self.stream.draft.clone(),
+            streaming: self.stream.primary_streaming_draft().cloned(),
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
@@ -703,12 +774,10 @@ impl ChatState {
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
     fn snapshot_dirty_fields(&self) -> SnapshotDirtyFields {
-        let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
         SnapshotDirtyFields {
             conversation_len: self.ui.conversation_lines.len(),
             conversation_generation: self.ui.conversation_generation,
-            has_stream_draft: self.stream.draft.is_some(),
-            draft_version: draft_ver,
+            draft_versions: self.stream.versions_fingerprint(),
             input_lines: self.ui.input.lines.len(),
             context_used_tokens: self.ui.context_used_tokens,
             context_window_tokens: self.ui.context_window_tokens,
@@ -801,6 +870,7 @@ impl ChatState {
             Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
             Action::StartLLMTurn {
                 provider_turn_task_id,
+                provider_turn_sequence,
                 draft_id,
                 history,
                 compaction_config,
@@ -809,6 +879,7 @@ impl ChatState {
                 turn_message_send_ctx,
             } => self.reduce_start_llm_turn(
                 provider_turn_task_id,
+                provider_turn_sequence,
                 draft_id,
                 history,
                 compaction_config,
@@ -1311,14 +1382,43 @@ impl ChatState {
     // FIFO，counter 足够保证 monotonic）。Reducer 接管后版本号机制只在一处，
     // 杜绝双写期竞争。
 
+    fn visible_draft_sequence(task_id: Option<crate::chat::turn_scheduler::TurnTaskId>, sequence: Option<u64>) -> u64 {
+        sequence
+            .or_else(|| task_id.map(crate::chat::turn_scheduler::TurnTaskId::get))
+            .unwrap_or(0)
+    }
+
+    fn prompt_preview_from_history(history: &[ChatMessage]) -> String {
+        history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map_or_else(String::new, |message| truncate_with_ellipsis(&message.content, 96))
+    }
+
+    fn insert_visible_streaming_draft(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        draft_id: String,
+        prompt_preview: String,
+    ) {
+        self.stream.insert_visible_draft(StreamingTurnDraft {
+            task_id,
+            sequence: Self::visible_draft_sequence(task_id, sequence),
+            prompt_preview,
+            draft: StreamingDraft {
+                draft_id,
+                accumulated: String::new(),
+                version: 0,
+            },
+        });
+    }
+
     /// `Action::TurnStarted` — 初始化 streaming draft + 注册取消令牌.
     #[cfg(feature = "terminal-tui")]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
+        self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
         self.control.active_cancel = Some(cancel);
         self.control.generating = true;
         vec![
@@ -1332,11 +1432,7 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
+        self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
         self.control.active_cancel = Some(cancel);
         self.control.generating = true;
         vec![
@@ -1362,6 +1458,7 @@ impl ChatState {
     fn reduce_start_llm_turn(
         &mut self,
         provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1369,11 +1466,12 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
+        self.insert_visible_streaming_draft(
+            provider_turn_task_id,
+            provider_turn_sequence,
+            draft_id.clone(),
+            Self::prompt_preview_from_history(&history),
+        );
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
@@ -1403,6 +1501,7 @@ impl ChatState {
     fn reduce_start_llm_turn(
         &mut self,
         provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
@@ -1410,11 +1509,12 @@ impl ChatState {
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
         turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
+        self.insert_visible_streaming_draft(
+            provider_turn_task_id,
+            provider_turn_sequence,
+            draft_id.clone(),
+            Self::prompt_preview_from_history(&history),
+        );
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
@@ -1447,14 +1547,11 @@ impl ChatState {
     /// - 丢弃时 → `[]`（静默；调用方可通过比较 draft.version 前后是否变化判断）
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
-        let Some(draft) = self.stream.draft.as_mut() else {
+        let Some(turn) = self.stream.visible_draft_mut(draft_id) else {
             // 已 finalize — chunk 视为 stale，丢弃
             return vec![];
         };
-        if draft.draft_id != draft_id {
-            // 跨 turn stale
-            return vec![];
-        }
+        let draft = &mut turn.draft;
         if version <= draft.version {
             // 严格单调：等于或更小都视为乱序/重复，丢弃
             return vec![];
@@ -1467,12 +1564,10 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
-        let Some(draft) = self.stream.draft.as_mut() else {
+        let Some(turn) = self.stream.visible_draft_mut(draft_id) else {
             return vec![];
         };
-        if draft.draft_id != draft_id {
-            return vec![];
-        }
+        let draft = &mut turn.draft;
         if version <= draft.version {
             return vec![];
         }
@@ -1499,14 +1594,15 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
-        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
-        if !matches {
+        if self.stream.remove_visible_draft(draft_id).is_none() {
             return vec![];
         }
-        self.stream.draft = None;
-        self.remove_pending_tool_cards();
-        self.control.active_cancel = None;
-        self.control.generating = false;
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.remove_pending_tool_cards();
+            self.control.active_cancel = None;
+            self.control.generating = false;
+        }
         if !final_text.is_empty() {
             self.ui.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.clone(),
@@ -1535,21 +1631,24 @@ impl ChatState {
         ];
         // S2.5 P1-B: 兜底清理本轮 tool 缓冲（RecordAssistantTurn 正常已 mem::take 清空，
         // 此处防御 driver 漏发 RecordAssistantTurn 的边缘情况）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        if no_visible_drafts {
+            self.control.current_turn_tool_calls.clear();
+            self.control.current_turn_tool_args.clear();
+        }
         effects
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
-        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
-        if !matches {
+        if self.stream.remove_visible_draft(draft_id).is_none() {
             return vec![];
         }
-        self.stream.draft = None;
-        self.remove_pending_tool_cards();
-        self.control.active_cancel = None;
-        self.control.generating = false;
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.remove_pending_tool_cards();
+            self.control.active_cancel = None;
+            self.control.generating = false;
+        }
         if !final_text.is_empty() {
             self.ui.conversation_lines.push(final_text.clone());
         }
@@ -1569,8 +1668,10 @@ impl ChatState {
             Effect::RequestRedraw,
         ];
         // S2.5 P1-B: 同 terminal-tui 分支兜底清理.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        if no_visible_drafts {
+            self.control.current_turn_tool_calls.clear();
+            self.control.current_turn_tool_args.clear();
+        }
         effects
     }
 
@@ -1581,19 +1682,26 @@ impl ChatState {
     /// retryable 字段由 EffectExecutor 上层（chat::run 主循环重试逻辑）观察决定是否重发；
     /// hook 一律触发，因为对外可见的"本轮失败"是确定事件。
     fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
-        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
-        if !matches {
+        if self.stream.remove_visible_draft(draft_id).is_none() {
             return vec![];
         }
-        let orphan_user_removed = self.rollback_trailing_answerless_user_turn();
-        self.stream.draft = None;
-        self.finalize_pending_tool_cards(false, Some("turn failed before tool finish event"));
-        self.control.active_cancel = None;
-        self.control.generating = false;
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        let orphan_user_removed = if no_visible_drafts {
+            self.rollback_trailing_answerless_user_turn()
+        } else {
+            false
+        };
+        if no_visible_drafts {
+            self.finalize_pending_tool_cards(false, Some("turn failed before tool finish event"));
+            self.control.active_cancel = None;
+            self.control.generating = false;
+        }
         // S2.5 P1-B: stream 失败丢弃本轮 tool 缓冲（无 RecordAssistantTurn 可回填，
         // 失败后本轮 tool_calls 不可信，下轮入口由 reduce_input_submitted 兜底再清一次）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        if no_visible_drafts {
+            self.control.current_turn_tool_calls.clear();
+            self.control.current_turn_tool_args.clear();
+        }
         #[cfg(feature = "terminal-tui")]
         self.ui
             .conversation_lines
@@ -1622,18 +1730,21 @@ impl ChatState {
 
     /// `Action::StreamCancelled` — 用户主动取消，仅清除 draft.
     fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
-        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
-        if !matches {
+        if self.stream.remove_visible_draft(draft_id).is_none() {
             return vec![];
         }
-        self.rollback_trailing_answerless_user_turn();
-        self.stream.draft = None;
-        self.finalize_pending_tool_cards(false, Some("turn cancelled before tool finish event"));
-        self.control.active_cancel = None;
-        self.control.generating = false;
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.rollback_trailing_answerless_user_turn();
+            self.finalize_pending_tool_cards(false, Some("turn cancelled before tool finish event"));
+            self.control.active_cancel = None;
+            self.control.generating = false;
+        }
         // S2.5 P1-B: cancel 丢弃本轮 tool 缓冲（同 failed 路径语义）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        if no_visible_drafts {
+            self.control.current_turn_tool_calls.clear();
+            self.control.current_turn_tool_args.clear();
+        }
         vec![Effect::RequestRedraw]
     }
 
@@ -1944,17 +2055,6 @@ impl ChatState {
         ]
     }
 
-    /// Helper：判断当前 draft 的 id 是否匹配传入值（处理 terminal-tui 和占位两种 StreamingDraft 类型）.
-    #[cfg(feature = "terminal-tui")]
-    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
-        draft.is_some_and(|d| d.draft_id == draft_id)
-    }
-
-    #[cfg(not(feature = "terminal-tui"))]
-    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
-        draft.is_some_and(|d| d.draft_id == draft_id)
-    }
-
     // ── Step 4 子函数（退出 + 会话） ─────────────────────────────────────────────
 
     /// `Action::CancelRequested` — 单击 Ctrl+C，取消当前流式回合（如有）.
@@ -1975,8 +2075,9 @@ impl ChatState {
         // 取出 draft id（如有）+ cancel token（如有）用于 Effect
         let draft_id_opt = Self::take_draft_id(&self.stream);
         let cancel_opt = self.control.active_cancel.take();
-        // 清除流式状态
-        self.stream.draft = None;
+        if let Some(draft_id) = draft_id_opt.as_deref() {
+            let _ = self.stream.remove_visible_draft(draft_id);
+        }
         self.finalize_pending_tool_cards(false, Some("turn cancelled by cancel request"));
         self.control.generating = false;
         let pending_approval = self.ui.pending_tool_approval.take();
@@ -2021,7 +2122,7 @@ impl ChatState {
         let (draft_id_opt, cancel_opt) = if self.control.generating {
             let id = Self::take_draft_id(&self.stream);
             let tok = self.control.active_cancel.take();
-            self.stream.draft = None;
+            self.stream.clear_visible_drafts();
             self.control.generating = false;
             (id, tok)
         } else {
@@ -2095,7 +2196,7 @@ impl ChatState {
         self.ui.switcher = None;
         self.ui.slash_menu = None;
         self.ui.saved_session_picker = None;
-        self.stream.draft = None;
+        self.stream.clear_visible_drafts();
         self.stream.pending_tool_cards.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
@@ -2352,7 +2453,7 @@ impl ChatState {
             #[cfg(feature = "terminal-tui")]
             let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
                 &self.ui.conversation_lines,
-                self.stream.draft.as_ref(),
+                self.stream.primary_streaming_draft(),
                 12,
             );
             #[cfg(not(feature = "terminal-tui"))]
@@ -2379,7 +2480,7 @@ impl ChatState {
             .map_or(0, |view| view.scroll_offset);
         let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
             &self.ui.conversation_lines,
-            self.stream.draft.as_ref(),
+            self.stream.primary_streaming_draft(),
             12,
         );
         self.ui.active_session_view = Some(crate::chat::action::build_provider_worker_active_view_with_io(
@@ -2774,12 +2875,12 @@ impl ChatState {
     /// 辅助：从 StreamState 中取出当前 draft 的 id（不同 feature 下结构不同）.
     #[cfg(feature = "terminal-tui")]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.draft.as_ref().map(|d| d.draft_id.clone())
+        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.draft.as_ref().map(|d| d.draft_id.clone())
+        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
     }
 }
 
@@ -2998,7 +3099,7 @@ mod tests {
     #[test]
     fn test_chatstate_new_default_stream() {
         let state = make_state();
-        assert!(state.stream.draft.is_none());
+        assert!(state.stream.primary_streaming_draft().is_none());
         assert!(state.stream.pending_tool_cards.is_empty());
     }
 
@@ -3740,7 +3841,10 @@ mod tests {
             state.control.generating,
             "Esc in approval must not cancel the active turn"
         );
-        assert!(state.stream.draft.is_some(), "streaming draft stays active");
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "streaming draft stays active"
+        );
         assert!(state.ui.pending_tool_approval.is_none());
         assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
         assert!(effects.iter().any(|effect| {
@@ -3774,7 +3878,10 @@ mod tests {
         )));
 
         assert!(state.control.generating, "slash Esc must not cancel the active turn");
-        assert!(state.stream.draft.is_some(), "streaming draft stays active");
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "streaming draft stays active"
+        );
         assert!(state.ui.slash_menu.is_none(), "Esc closes only the slash menu");
         assert!(
             !effects
@@ -3862,7 +3969,7 @@ mod tests {
         assert_eq!(state.ui.context_used_tokens, None);
         assert!(!state.ui.input.is_reverse_search_active());
         assert_eq!(state.ui.turn_count, 2);
-        assert!(state.stream.draft.is_none());
+        assert!(state.stream.primary_streaming_draft().is_none());
         assert!(!state.control.generating);
         assert!(state.control.active_cancel.is_none());
         assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
@@ -3879,7 +3986,7 @@ mod tests {
             cancel: cancel.clone(),
         });
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
         assert!(state.control.active_cancel.is_some());
 
         let mut loaded = ChatSession::new("prov-new", "model-new");
@@ -3889,7 +3996,7 @@ mod tests {
 
         assert_eq!(state.session.id, "sess-old");
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
         assert!(state.control.active_cancel.is_some());
         assert!(!cancel.is_cancelled());
         assert!(!effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
@@ -4514,19 +4621,19 @@ mod tests {
         #[test]
         fn test_redux_turn_started_sets_stream_state() {
             let mut state = s();
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(state.control.active_cancel.is_none());
             assert!(!state.control.generating);
             let effects = state.reduce(Action::TurnStarted {
                 draft_id: "d1".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert!(state.stream.draft.is_some());
+            assert!(state.stream.primary_streaming_draft().is_some());
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.draft_id.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.draft_id.clone()),
                 Some("d1".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(0));
             assert!(state.control.active_cancel.is_some());
             assert!(state.control.generating);
             assert!(has_request_redraw(&effects));
@@ -4548,10 +4655,10 @@ mod tests {
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("hello".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(1));
 
             // 第二个有效 chunk → 累积
             let effects = state.reduce(Action::StreamChunkReceived {
@@ -4561,10 +4668,10 @@ mod tests {
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("hello world".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
         }
 
         /// Step3-3: stale version（version=1 在 version=2 之后到达）→ 丢弃
@@ -4582,10 +4689,10 @@ mod tests {
                 version: 2,
             });
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
             // 后来才到 version=1 → 丢弃
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -4594,11 +4701,11 @@ mod tests {
             });
             assert!(effects.is_empty(), "stale version 应返回空 effects");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string()),
                 "accumulated 应保持不变"
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
 
             // 重复 version=2 → 也丢弃（strict-monotonic）
             let effects = state.reduce(Action::StreamChunkReceived {
@@ -4608,7 +4715,7 @@ mod tests {
             });
             assert!(effects.is_empty(), "重复 version 应丢弃");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string())
             );
         }
@@ -4634,10 +4741,10 @@ mod tests {
             });
             assert!(effects.is_empty(), "draft_id 不匹配应返回空");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("ok".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(1));
         }
 
         /// Step3-5: finalize 后再到达的 chunk → 丢弃
@@ -4658,7 +4765,10 @@ mod tests {
                 final_text: "complete".to_string(),
                 reasoning: String::new(),
             });
-            assert!(state.stream.draft.is_none(), "finalize 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "finalize 后 draft 应清空"
+            );
             // 此后 chunk 视为 stale
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -4666,7 +4776,7 @@ mod tests {
                 version: 2,
             });
             assert!(effects.is_empty(), "finalize 后 chunk 应丢弃");
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
         }
 
         /// Step3-6: StreamCompleted 清除 draft + push assistant + NotifyHook
@@ -4684,7 +4794,7 @@ mod tests {
                 final_text: "final answer".to_string(),
                 reasoning: String::new(),
             });
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             assert!(state.control.active_cancel.is_none());
             assert!(!state.control.generating);
             assert_eq!(
@@ -4748,7 +4858,7 @@ mod tests {
                 err: "network".to_string(),
                 retryable: true,
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(!state.control.generating);
             assert!(has_request_redraw(&effects));
             assert!(
@@ -4776,7 +4886,7 @@ mod tests {
             let effects = state.reduce(Action::StreamCancelled {
                 draft_id: "d1".to_string(),
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
             assert!(has_request_redraw(&effects));
@@ -5040,7 +5150,7 @@ mod tests {
                 reasoning: String::new(),
             });
             assert!(e1.is_empty() && e2.is_empty() && e3.is_empty());
-            assert!(state.stream.draft.is_some(), "原 draft 应保留");
+            assert!(state.stream.primary_streaming_draft().is_some(), "原 draft 应保留");
             assert!(state.control.generating, "generating 标志应保留");
         }
 
@@ -5177,13 +5287,13 @@ mod tests {
                 err: "boom".to_string(),
                 retryable: true,
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             // 重试：开一个新 turn (相同 draft_id 也 OK，draft.version 从 0 起)
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d1".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(0));
             // version=1 应被接受（不被前一轮的 5 影响 — 因为 draft 已重建）
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -5192,7 +5302,7 @@ mod tests {
             });
             assert!(has_request_redraw(&effects), "新 turn 的 v=1 应被接受");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("retry".to_string())
             );
         }
@@ -5277,13 +5387,13 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             assert!(state.control.generating);
-            assert!(state.stream.draft.is_some());
+            assert!(state.stream.primary_streaming_draft().is_some());
 
             let effects = state.reduce(Action::CancelRequested);
 
             // 状态应已清除
             assert!(!state.control.generating, "generating 应清为 false");
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             assert!(state.control.active_cancel.is_none(), "active_cancel 应清空");
             // effects 应含 CancelDraft + LogTrace + RequestRedraw
             assert!(
@@ -5322,7 +5432,7 @@ mod tests {
             let effects = state.reduce(Action::ShutdownRequested);
 
             assert!(!state.control.generating, "generating 应清除");
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             // S2-B Step 2: effect 顺序变为 [CancelToken, CancelDraft, Quit].
             // CancelToken 在前（真取消底层 turn），CancelDraft 紧随（同步 channel UI），
             // Quit 在最后（外壳调 shutdown.cancel()）。
@@ -6190,6 +6300,7 @@ mod tests {
 
             let effects = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "draft-1".to_string(),
                 history,
                 compaction_config: None,
@@ -6199,7 +6310,10 @@ mod tests {
             });
 
             // 状态变更：draft + active_cancel + generating
-            assert!(state.stream.draft.is_some(), "stream.draft 必须被设置");
+            assert!(
+                state.stream.primary_streaming_draft().is_some(),
+                "stream.draft 必须被设置"
+            );
             assert!(state.control.active_cancel.is_some(), "active_cancel 必须被注册");
             assert!(state.control.generating, "generating 必须置 true");
 
@@ -6228,6 +6342,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let effects = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: None,
@@ -6258,6 +6373,7 @@ mod tests {
 
             let effects = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d-budget".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: Some(compaction_config),
@@ -6291,6 +6407,7 @@ mod tests {
 
             let effects = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: None,
                 draft_id: "d-worker".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: None,
@@ -6316,7 +6433,10 @@ mod tests {
                 draft_id: "legacy".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert!(state.stream.draft.is_some(), "TurnStarted 同样初始化 draft");
+            assert!(
+                state.stream.primary_streaming_draft().is_some(),
+                "TurnStarted 同样初始化 draft"
+            );
             assert!(
                 !has_start_turn(&effects),
                 "TurnStarted 不应发 Effect::StartTurn（旧路径仍由 chat::run 主导）"
@@ -6391,6 +6511,7 @@ mod tests {
             let cancel = CancellationToken::new();
             let _ = state.reduce(Action::StartLLMTurn {
                 provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
                 compaction_config: None,
@@ -6407,7 +6528,202 @@ mod tests {
                 "CancelRequested(generating=true) 应发 CancelDraft"
             );
             assert!(!state.control.generating, "cancel 后 generating 必须复位");
-            assert!(state.stream.draft.is_none(), "cancel 后 draft 必须清理");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "cancel 后 draft 必须清理"
+            );
+        }
+
+        fn start_phase1_draft(state: &mut ChatState, draft_id: &str, sequence: u64, prompt: &str) {
+            let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: vec![ChatMessage::user(prompt)],
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+            assert!(has_start_turn(&effects), "phase1 draft start must still emit StartTurn");
+        }
+
+        fn visible_draft_ids(state: &ChatState) -> Vec<&str> {
+            state
+                .stream
+                .visible_drafts
+                .iter()
+                .map(|turn| turn.draft.draft_id.as_str())
+                .collect()
+        }
+
+        fn draft_text(state: &ChatState, draft_id: &str) -> Option<String> {
+            state
+                .stream
+                .visible_drafts
+                .iter()
+                .find(|turn| turn.draft.draft_id == draft_id)
+                .map(|turn| turn.draft.accumulated.clone())
+        }
+
+        #[test]
+        fn phase1_two_visible_drafts_start_without_overwriting() {
+            let mut state = s();
+
+            start_phase1_draft(&mut state, "draft-b", 20, "second prompt");
+            start_phase1_draft(&mut state, "draft-a", 10, "first prompt");
+
+            assert_eq!(visible_draft_ids(&state), vec!["draft-a", "draft-b"]);
+            assert_eq!(
+                state
+                    .stream
+                    .primary_draft()
+                    .map(|turn| (turn.sequence, turn.prompt_preview.as_str())),
+                Some((10, "first prompt"))
+            );
+            assert!(state.control.generating);
+        }
+
+        #[test]
+        fn phase1_stream_chunks_route_by_draft_id() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let b_effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B1".to_string(),
+                version: 1,
+            });
+            let a_effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A1".to_string(),
+                version: 1,
+            });
+
+            assert!(has_request_redraw(&b_effects));
+            assert!(has_request_redraw(&a_effects));
+            assert_eq!(draft_text(&state, "draft-a"), Some("A1".to_string()));
+            assert_eq!(draft_text(&state, "draft-b"), Some("B1".to_string()));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-a", "draft-b"]);
+        }
+
+        #[test]
+        fn phase1_stream_completed_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "answer a".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert!(has_save_session(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "remaining draft keeps structural generating state"
+            );
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-b")
+            );
+        }
+
+        #[test]
+        fn phase1_stale_chunk_for_completed_draft_is_ignored() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "answer a".to_string(),
+                reasoning: String::new(),
+            });
+
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "late".to_string(),
+                version: 1,
+            });
+
+            assert!(effects.is_empty(), "completed draft must reject late chunks");
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert_eq!(draft_text(&state, "draft-b"), Some(String::new()));
+        }
+
+        #[test]
+        fn phase1_stream_cancelled_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "draft-a".to_string(),
+            });
+
+            assert!(has_request_redraw(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "cancelling one structural draft must not stop the other"
+            );
+        }
+
+        #[test]
+        fn phase1_stream_failed_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "draft-a".to_string(),
+                err: "failed a".to_string(),
+                retryable: false,
+            });
+
+            assert!(has_notify_hook(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "failing one structural draft must not stop the other"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase1_snapshot_dirty_changes_when_non_primary_draft_version_changes() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let before = state.snapshot_dirty_fields();
+
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B1".to_string(),
+                version: 1,
+            });
+            let after = state.snapshot_dirty_fields();
+
+            assert!(has_request_redraw(&effects));
+            assert_ne!(
+                before, after,
+                "non-primary draft version must affect snapshot dirty fingerprint"
+            );
+            assert_eq!(draft_text(&state, "draft-b"), Some("B1".to_string()));
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-a"),
+                "non-primary chunk must not change primary selection"
+            );
         }
 
         // ─── S2-A: chat::run stream-path → Redux dispatch wiring tests ─────
@@ -6457,8 +6773,7 @@ mod tests {
             // 核心验收点：旧路径 accumulated == reducer 内部 accumulated
             let redux_accumulated = state
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: stream.draft must exist after StreamChunkReceived");
             assert_eq!(
@@ -6466,7 +6781,7 @@ mod tests {
                 "S2-A M2 验收：reducer accumulated 必须等于旧路径 update_draft 传入的累计串"
             );
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.version),
+                state.stream.primary_streaming_draft().map(|d| d.version),
                 Some(version),
                 "reducer version 必须等于 draft_updater 内 counter 终值"
             );
@@ -6497,7 +6812,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "completed 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "completed 后 draft 应清空"
+            );
             assert!(!state.control.generating, "completed 后 generating=false");
             assert!(state.control.active_cancel.is_none(), "active_cancel 复位");
 
@@ -6733,7 +7051,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "failed 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "failed 后 draft 应清空"
+            );
             assert!(!state.control.generating);
 
             // Effect 序列断言（按 reduce_stream_failed 的发射顺序）
@@ -6793,7 +7114,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "cancelled 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "cancelled 后 draft 应清空"
+            );
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
 
@@ -6889,14 +7213,12 @@ mod tests {
             // 核心不变量：draft.accumulated 完全相同（tool 事件不污染流式文本）
             let acc_a = state_a
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: scenario A draft must exist");
             let acc_b = state_b
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: scenario B draft must exist");
             assert_eq!(
@@ -6910,11 +7232,11 @@ mod tests {
 
             // version 也必须相等（tool 事件不动 version）
             assert_eq!(
-                state_a.stream.draft.as_ref().map(|d| d.version),
-                state_b.stream.draft.as_ref().map(|d| d.version),
+                state_a.stream.primary_streaming_draft().map(|d| d.version),
+                state_b.stream.primary_streaming_draft().map(|d| d.version),
                 "tool 事件不应推进 stream.version"
             );
-            assert_eq!(state_a.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state_a.stream.primary_streaming_draft().map(|d| d.version), Some(2));
 
             // tool 卡片在两边都已落地，且 ToolFinished 后已从 pending 移除
             assert_eq!(
@@ -6976,7 +7298,10 @@ mod tests {
 
             // control 状态必须清干净
             assert!(!state.control.generating, "CancelRequested 后 generating=false");
-            assert!(state.stream.draft.is_none(), "CancelRequested 后 draft 清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "CancelRequested 后 draft 清空"
+            );
             assert!(
                 state.control.active_cancel.is_none(),
                 "CancelRequested 后 active_cancel 清空（token 已交给 Effect::CancelToken）"
@@ -7377,7 +7702,7 @@ mod tests {
             );
             // control 已清
             assert!(!state.control.generating);
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
 
             // 2. chat::run 主循环检测到 cancellation → 投递 StreamCancelled 终态
             let terminal_effects = state.reduce(Action::StreamCancelled {
@@ -7471,7 +7796,7 @@ mod tests {
             // 终态：generating=false, active_cancel=None, draft=None — 不留残留
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
 
             // 反向 race 验证：构造另一份 state，先 Shutdown 再 Cancel —
             // 同样只能发 1 个 CancelToken（首发 take 走 token，后续 Cancel 在

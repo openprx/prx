@@ -276,6 +276,10 @@ pub enum Action {
         /// preserves non-chat/test callers, but live chat should pass the
         /// `TurnTaskId` that owns this provider worker.
         provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        /// Scheduler sequence for visible ordering. `None` preserves tests and
+        /// non-chat callers; live chat should pass the sequence from
+        /// `TurnScheduler`.
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         /// P5 proactive budgeting: resolved context budget for this turn.

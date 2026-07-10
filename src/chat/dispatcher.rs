@@ -7101,6 +7101,7 @@ mod real_mode_tests {
         let start_effect = state
             .reduce(Action::StartLLMTurn {
                 provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "draft-timeout".to_string(),
                 history: Vec::new(),
                 compaction_config: None,
@@ -7112,7 +7113,7 @@ mod real_mode_tests {
             .find(|effect| matches!(effect, Effect::StartTurn { .. }))
             .expect("StartLLMTurn must emit StartTurn");
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
 
         executor.execute(start_effect).await;
         let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
@@ -7136,7 +7137,7 @@ mod real_mode_tests {
         let _ = state.reduce(action);
         assert!(!state.control.generating, "StreamFailed must clear generating");
         assert!(state.control.active_cancel.is_none());
-        assert!(state.stream.draft.is_none());
+        assert!(state.stream.primary_streaming_draft().is_none());
     }
 
     /// P0-1 简化版: try_dispatch ChannelClosed 时返回 ChannelClosed
@@ -7147,6 +7148,7 @@ mod real_mode_tests {
         drop(rx);
         let result = dispatcher.try_dispatch(Action::StartLLMTurn {
             provider_turn_task_id: None,
+            provider_turn_sequence: None,
             draft_id: "d1".to_string(),
             history: Vec::new(),
             compaction_config: None,
