@@ -136,6 +136,34 @@ pub fn build_provider_worker_active_view_with_io(
     .clamped_for_height(PROVIDER_WORKER_VIEW_DESIRED_ROWS)
 }
 
+#[must_use]
+pub fn build_provider_worker_active_view_with_io_preserving_scroll(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    previous: Option<&crate::chat::sessions::ActiveSessionView>,
+    io_lines: Vec<String>,
+) -> crate::chat::sessions::ActiveSessionView {
+    let mut view = build_provider_worker_active_view_with_io(status, sequence, 0, io_lines);
+    view.scroll_offset = provider_worker_refresh_scroll_offset(previous, &view);
+    view.clamped_for_height(PROVIDER_WORKER_VIEW_DESIRED_ROWS)
+}
+
+fn provider_worker_refresh_scroll_offset(
+    previous: Option<&crate::chat::sessions::ActiveSessionView>,
+    refreshed: &crate::chat::sessions::ActiveSessionView,
+) -> usize {
+    let Some(previous) = previous
+        .filter(|view| view.kind == PROVIDER_WORKER_VIEW_KIND && view.seq == refreshed.seq && view.scroll_offset > 0)
+    else {
+        return 0;
+    };
+    let appended = refreshed.lines.len().saturating_sub(previous.lines.len());
+    previous
+        .scroll_offset
+        .saturating_add(appended)
+        .min(refreshed.max_scroll_offset(PROVIDER_WORKER_VIEW_DESIRED_ROWS))
+}
+
 pub const fn provider_worker_row_state_label(state: ProviderWorkerRowState) -> &'static str {
     match state {
         ProviderWorkerRowState::Running => "running",
@@ -580,5 +608,56 @@ impl Action {
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_status(sequence: u64) -> ProviderWorkerStatus {
+        ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: sequence,
+                sequence,
+                kind: ProviderWorkerRowKind::Detached,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn phase2_provider_worker_scroll_preserves_top_on_append_and_follows_tail_at_bottom() {
+        let status = worker_status(7);
+        let old_io: Vec<String> = (0..30).map(|idx| format!("old io {idx}")).collect();
+        let old_view = build_provider_worker_active_view_with_io(&status, 7, 3, old_io);
+        assert_eq!(old_view.scroll_offset, 3);
+
+        let new_io: Vec<String> = (0..32).map(|idx| format!("new io {idx}")).collect();
+        let refreshed =
+            build_provider_worker_active_view_with_io_preserving_scroll(&status, 7, Some(&old_view), new_io);
+        assert_eq!(
+            refreshed.scroll_offset, 5,
+            "two appended lines should compensate tail-relative offset"
+        );
+
+        let tail_view =
+            build_provider_worker_active_view_with_io(&status, 7, 0, (0..30).map(|idx| idx.to_string()).collect());
+        let tail_refreshed = build_provider_worker_active_view_with_io_preserving_scroll(
+            &status,
+            7,
+            Some(&tail_view),
+            (0..32).map(|idx| idx.to_string()).collect(),
+        );
+        assert_eq!(tail_refreshed.scroll_offset, 0, "tail-follow offset must remain pinned");
     }
 }

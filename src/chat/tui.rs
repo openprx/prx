@@ -92,6 +92,8 @@ pub struct TuiState {
     /// persisted history. On `finalize_stream` the text is lifted into
     /// `conversation_lines`.
     pub streaming: Option<StreamingDraft>,
+    /// In-flight visible drafts keyed by real provider worker sequence.
+    pub visible_streaming_drafts: Arc<Vec<crate::chat::state::VisibleStreamingDraftView>>,
     /// Persistent child-session status line (v1b). Empty when there are
     /// no child TUI sessions, in which case the bottom chrome omits the
     /// extra row. Written only by the chat main loop (via
@@ -1382,6 +1384,17 @@ pub fn provider_worker_io_lines_from_conversation(
         lines.drain(0..lines.len().saturating_sub(max_lines));
     }
     lines
+}
+
+#[must_use]
+pub fn provider_worker_io_lines_for_streaming_draft(
+    conversation: &[ConversationLine],
+    streaming: Option<&StreamingDraft>,
+    max_lines: usize,
+) -> Vec<String> {
+    streaming.map_or_else(Vec::new, |streaming| {
+        provider_worker_io_lines_from_conversation(conversation, Some(streaming), max_lines)
+    })
 }
 
 /// Build the read-only transcript child viewport from current conversation lines.
@@ -3097,6 +3110,7 @@ impl TuiState {
             input: TuiInput::new(),
             ascii_fallback: false,
             streaming: None,
+            visible_streaming_drafts: Arc::new(Vec::new()),
             sessions_status: String::new(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
@@ -3116,6 +3130,14 @@ impl TuiState {
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             external_editor_prefix_armed: false,
         }
+    }
+
+    #[must_use]
+    pub fn streaming_draft_for_worker(&self, sequence: u64) -> Option<&StreamingDraft> {
+        self.visible_streaming_drafts
+            .iter()
+            .find(|draft| draft.sequence == sequence)
+            .map(|draft| &draft.draft)
     }
 
     pub fn clear_pending_tool_approval(&mut self) -> bool {
@@ -11222,9 +11244,17 @@ mod tests {
     }
 
     #[test]
-    fn bottom_direction_selects_provider_worker_and_enter_opens_worker_view() {
+    fn phase2_bottom_direction_selects_provider_worker_and_enter_opens_worker_view() {
         let mut state = TuiState::new("p", "m");
         state.provider_worker_status = provider_worker_status_fixture();
+        state.visible_streaming_drafts = Arc::new(vec![crate::chat::state::VisibleStreamingDraftView {
+            sequence: 3,
+            draft: StreamingDraft {
+                draft_id: "draft-worker-3".to_string(),
+                accumulated: "worker 3 live".to_string(),
+                version: 1,
+            },
+        }]);
         let out = dispatch_global_key(key(KeyCode::Down), &mut state);
         assert_eq!(
             out,
@@ -11234,7 +11264,38 @@ mod tests {
         );
         let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
         assert_eq!(out, KeyDispatch::OpenProviderWorkerView { sequence: 3 });
+        assert_eq!(
+            state
+                .streaming_draft_for_worker(3)
+                .map(|draft| draft.accumulated.as_str()),
+            Some("worker 3 live")
+        );
+        assert!(
+            state
+                .streaming_draft_for_worker(PROVIDER_WORKER_SWITCHER_SEQ_BASE + 3)
+                .is_none(),
+            "synthetic switcher seq must not be used for draft lookup"
+        );
         assert_eq!(state.strip_selection, None);
+    }
+
+    #[test]
+    fn phase2_provider_worker_io_none_is_empty_not_history_fallback() {
+        let conversation = vec![
+            ConversationLine::User {
+                content: "run command".to_string(),
+            },
+            ConversationLine::Assistant {
+                content: "history assistant must not appear".to_string(),
+            },
+        ];
+
+        let lines = provider_worker_io_lines_for_streaming_draft(&conversation, None, 8);
+
+        assert!(
+            lines.is_empty(),
+            "missing worker draft must not replay transcript: {lines:?}"
+        );
     }
 
     #[test]

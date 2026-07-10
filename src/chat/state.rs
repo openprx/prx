@@ -386,6 +386,8 @@ pub struct UiSnapshot {
     pub conversation_generation: u64,
     /// 当前 in-flight streaming draft（None 表示空闲）.
     pub streaming: Option<StreamingDraft>,
+    /// In-flight visible streaming drafts keyed by provider worker sequence.
+    pub visible_streaming_drafts: Arc<Vec<VisibleStreamingDraftView>>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
     /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
@@ -436,6 +438,7 @@ impl UiSnapshot {
             conversation_lines: Arc::new(Vec::new()),
             conversation_generation: 0,
             streaming: None,
+            visible_streaming_drafts: Arc::new(Vec::new()),
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
@@ -455,6 +458,17 @@ impl UiSnapshot {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+impl UiSnapshot {
+    #[must_use]
+    pub fn streaming_draft_for_worker(&self, sequence: u64) -> Option<&StreamingDraft> {
+        self.visible_streaming_drafts
+            .iter()
+            .find(|draft| draft.sequence == sequence)
+            .map(|draft| &draft.draft)
+    }
+}
+
 /// One keyed visible streaming turn draft.
 ///
 /// Phase 1 is structural only: the live chat loop still keeps visible provider
@@ -467,6 +481,12 @@ pub struct StreamingTurnDraft {
     /// Scheduler sequence; lower sequence renders as the primary/earlier draft.
     pub sequence: u64,
     pub prompt_preview: String,
+    pub draft: StreamingDraft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleStreamingDraftView {
+    pub sequence: u64,
     pub draft: StreamingDraft,
 }
 
@@ -491,6 +511,25 @@ impl StreamState {
     #[must_use]
     pub fn primary_streaming_draft(&self) -> Option<&StreamingDraft> {
         self.primary_draft().map(|turn| &turn.draft)
+    }
+
+    #[must_use]
+    pub fn streaming_draft_for_worker(&self, sequence: u64) -> Option<&StreamingDraft> {
+        self.visible_drafts
+            .iter()
+            .find(|turn| turn.sequence == sequence)
+            .map(|turn| &turn.draft)
+    }
+
+    #[must_use]
+    fn visible_streaming_draft_views(&self) -> Vec<VisibleStreamingDraftView> {
+        self.visible_drafts
+            .iter()
+            .map(|turn| VisibleStreamingDraftView {
+                sequence: turn.sequence,
+                draft: turn.draft.clone(),
+            })
+            .collect()
     }
 
     fn insert_visible_draft(&mut self, draft: StreamingTurnDraft) {
@@ -716,6 +755,7 @@ impl ChatState {
             conversation_lines: lines,
             conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.primary_streaming_draft().cloned(),
+            visible_streaming_drafts: Arc::new(self.stream.visible_streaming_draft_views()),
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
@@ -2444,21 +2484,25 @@ impl ChatState {
             return Vec::new();
         }
         let worker_view = self.ui.focus.worker_sequence().map(|sequence| {
-            let scroll_offset = self
+            let previous_view = self
                 .ui
                 .active_session_view
                 .as_ref()
-                .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
-                .map_or(0, |view| view.scroll_offset);
+                .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
             #[cfg(feature = "terminal-tui")]
-            let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
+            let io_lines = crate::chat::tui::provider_worker_io_lines_for_streaming_draft(
                 &self.ui.conversation_lines,
-                self.stream.primary_streaming_draft(),
+                self.stream.streaming_draft_for_worker(sequence),
                 12,
             );
             #[cfg(not(feature = "terminal-tui"))]
             let io_lines = Vec::new();
-            crate::chat::action::build_provider_worker_active_view_with_io(&status, sequence, scroll_offset, io_lines)
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &status,
+                sequence,
+                previous_view,
+                io_lines,
+            )
         });
         self.ui.provider_worker_status = status;
         if let Some(view) = worker_view {
@@ -2472,23 +2516,24 @@ impl ChatState {
         let Some(sequence) = self.ui.focus.worker_sequence() else {
             return;
         };
-        let scroll_offset = self
+        let previous_view = self
             .ui
             .active_session_view
             .as_ref()
-            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
-            .map_or(0, |view| view.scroll_offset);
-        let io_lines = crate::chat::tui::provider_worker_io_lines_from_conversation(
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = crate::chat::tui::provider_worker_io_lines_for_streaming_draft(
             &self.ui.conversation_lines,
-            self.stream.primary_streaming_draft(),
+            self.stream.streaming_draft_for_worker(sequence),
             12,
         );
-        self.ui.active_session_view = Some(crate::chat::action::build_provider_worker_active_view_with_io(
-            &self.ui.provider_worker_status,
-            sequence,
-            scroll_offset,
-            io_lines,
-        ));
+        self.ui.active_session_view = Some(
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &self.ui.provider_worker_status,
+                sequence,
+                previous_view,
+                io_lines,
+            ),
+        );
     }
 
     #[cfg(not(feature = "terminal-tui"))]
@@ -6564,6 +6609,163 @@ mod tests {
                 .iter()
                 .find(|turn| turn.draft.draft_id == draft_id)
                 .map(|turn| turn.draft.accumulated.clone())
+        }
+
+        fn provider_worker_status(sequences: &[u64]) -> ProviderWorkerStatus {
+            ProviderWorkerStatus {
+                running: sequences.len(),
+                cancelling: 0,
+                awaiting_commit: 0,
+                finalized_payloads: 0,
+                finalized_total_tokens: 0,
+                oldest_started_at_ms: Some(0),
+                rows: sequences
+                    .iter()
+                    .map(|sequence| crate::chat::action::ProviderWorkerStatusRow {
+                        task_id: *sequence,
+                        sequence: *sequence,
+                        kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                        state: crate::chat::action::ProviderWorkerRowState::Running,
+                        started_at_ms: 0,
+                        finalized_total_tokens: None,
+                        completion_ready: false,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn active_worker_view_text(state: &ChatState) -> String {
+            state
+                .ui
+                .active_session_view
+                .as_ref()
+                .map(|view| view.lines.join("\n"))
+                .unwrap_or_default()
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_snapshot_exposes_worker_drafts_and_keeps_primary_streaming() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A live".to_string(),
+                version: 1,
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B live".to_string(),
+                version: 1,
+            });
+
+            let snapshot = state.build_ui_snapshot(42);
+
+            assert_eq!(
+                snapshot.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
+            assert_eq!(
+                snapshot
+                    .streaming_draft_for_worker(20)
+                    .map(|draft| draft.accumulated.as_str()),
+                Some("B live")
+            );
+            assert!(snapshot.streaming_draft_for_worker(30).is_none());
+            assert_eq!(
+                snapshot
+                    .visible_streaming_drafts
+                    .iter()
+                    .map(|draft| draft.sequence)
+                    .collect::<Vec<_>>(),
+                vec![10, 20]
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_worker_pane_focus_uses_matching_draft_not_primary() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A live".to_string(),
+                version: 1,
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B live".to_string(),
+                version: 1,
+            });
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 10 };
+            let _ = state.reduce(Action::ProviderWorkerStatusUpdated {
+                status: provider_worker_status(&[10, 20]),
+            });
+            let view_a = active_worker_view_text(&state);
+            assert!(view_a.contains("assistant streaming: A live"), "{view_a}");
+            assert!(!view_a.contains("B live"), "{view_a}");
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 20 };
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: " B2".to_string(),
+                version: 2,
+            });
+            let view_b = active_worker_view_text(&state);
+            assert!(view_b.contains("assistant streaming: B live B2"), "{view_b}");
+            assert!(!view_b.contains("A live"), "{view_b}");
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_worker_pane_missing_draft_uses_empty_io_not_history_or_primary() {
+            let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::User {
+                content: "history user".to_string(),
+            });
+            state.ui.conversation_lines.push(ConversationLine::Assistant {
+                content: "history assistant must not leak".to_string(),
+            });
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "primary live must not leak".to_string(),
+                version: 1,
+            });
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 30 };
+            let _ = state.reduce(Action::ProviderWorkerStatusUpdated {
+                status: provider_worker_status(&[30]),
+            });
+            let view = active_worker_view_text(&state);
+
+            assert!(!view.contains("io: recent provider turn"), "{view}");
+            assert!(!view.contains("history assistant must not leak"), "{view}");
+            assert!(!view.contains("primary live must not leak"), "{view}");
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_main_transcript_primary_streaming_path_is_unchanged() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            let snapshot = state.build_ui_snapshot(1);
+
+            assert_eq!(
+                snapshot.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
         }
 
         #[test]

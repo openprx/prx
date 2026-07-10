@@ -7902,25 +7902,31 @@ fn sync_key_mirror_observation_state(render_source: &RenderSource, mirror: &Arc<
     let status = snapshot.provider_worker_status.clone();
     let conversation_lines = snapshot.conversation_lines.as_ref().clone();
     let streaming = snapshot.streaming.clone();
+    let visible_streaming_drafts = Arc::clone(&snapshot.visible_streaming_drafts);
     drop(snapshot);
     let mut guard = mirror.lock();
     guard.provider_worker_status = status.clone();
     guard.conversation_lines = conversation_lines;
     guard.streaming = streaming;
+    guard.visible_streaming_drafts = visible_streaming_drafts;
     if let crate::chat::sessions::FocusTarget::Worker { sequence } = guard.focus {
-        let scroll_offset = guard
+        let previous_view = guard
             .active_session_view
             .as_ref()
-            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
-            .map_or(0, |view| view.scroll_offset);
-        let io_lines =
-            tui::provider_worker_io_lines_from_conversation(&guard.conversation_lines, guard.streaming.as_ref(), 12);
-        guard.active_session_view = Some(crate::chat::action::build_provider_worker_active_view_with_io(
-            &status,
-            sequence,
-            scroll_offset,
-            io_lines,
-        ));
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = tui::provider_worker_io_lines_for_streaming_draft(
+            &guard.conversation_lines,
+            guard.streaming_draft_for_worker(sequence),
+            12,
+        );
+        guard.active_session_view = Some(
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &status,
+                sequence,
+                previous_view,
+                io_lines,
+            ),
+        );
     }
 }
 
@@ -10201,17 +10207,19 @@ fn open_provider_worker_view(
 ) {
     let (view, focus) = {
         let mut guard = mirror.lock();
-        let previous_offset = guard
+        let previous_view = guard
             .active_session_view
             .as_ref()
-            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence)
-            .map_or(0, |view| view.scroll_offset);
-        let io_lines =
-            tui::provider_worker_io_lines_from_conversation(&guard.conversation_lines, guard.streaming.as_ref(), 12);
-        let view = crate::chat::action::build_provider_worker_active_view_with_io(
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = tui::provider_worker_io_lines_for_streaming_draft(
+            &guard.conversation_lines,
+            guard.streaming_draft_for_worker(sequence),
+            12,
+        );
+        let view = crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
             &guard.provider_worker_status,
             sequence,
-            previous_offset,
+            previous_view,
             io_lines,
         );
         let focus = crate::chat::sessions::FocusTarget::Worker { sequence };
@@ -13805,6 +13813,122 @@ mod s4_a_4 {
         let status = mirror.lock().provider_worker_status.clone();
         assert_eq!(status.running, 1);
         assert_eq!(status.rows.first().map(|row| row.sequence), Some(7));
+    }
+
+    #[test]
+    fn phase2_snapshot_mirror_sync_uses_focused_worker_draft_not_primary() {
+        let mirror = Arc::new(parking_lot::Mutex::new(TuiState::new("p", "m")));
+        {
+            let mut guard = mirror.lock();
+            guard.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 20 };
+        }
+        let mut state = ChatState::new(Arc::from("ps"), Arc::from("ms"), CancellationToken::new());
+        state.ui.provider_worker_status = crate::chat::action::ProviderWorkerStatus {
+            running: 2,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 10,
+                    sequence: 10,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: crate::chat::action::ProviderWorkerRowState::Running,
+                    started_at_ms: 0,
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 20,
+                    sequence: 20,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: crate::chat::action::ProviderWorkerRowState::Running,
+                    started_at_ms: 0,
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+            ],
+        };
+        let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
+            provider_turn_task_id: None,
+            provider_turn_sequence: Some(10),
+            draft_id: "draft-a".to_string(),
+            history: vec![crate::providers::ChatMessage::user("first")],
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
+            provider_turn_task_id: None,
+            provider_turn_sequence: Some(20),
+            draft_id: "draft-b".to_string(),
+            history: vec![crate::providers::ChatMessage::user("second")],
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
+            draft_id: "draft-a".to_string(),
+            delta: "A primary live".to_string(),
+            version: 1,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
+            draft_id: "draft-b".to_string(),
+            delta: "B focused live".to_string(),
+            version: 1,
+        });
+        let snap = Arc::new(state.build_ui_snapshot(1));
+        assert_eq!(
+            snap.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+            Some("draft-a")
+        );
+        assert_eq!(
+            snap.streaming_draft_for_worker(20)
+                .map(|draft| draft.accumulated.as_str()),
+            Some("B focused live")
+        );
+        let (_tx, rx) = watch::channel(snap);
+        let src = RenderSource::Snapshot(rx);
+
+        sync_key_mirror_observation_state(&src, &mirror);
+
+        let guard = mirror.lock();
+        assert_eq!(
+            guard
+                .streaming_draft_for_worker(20)
+                .map(|draft| draft.accumulated.as_str()),
+            Some("B focused live")
+        );
+        let view = guard.active_session_view.as_ref().expect("focused worker view");
+        let text = view.lines.join("\n");
+        assert!(text.contains("assistant streaming: B focused live"), "{text}");
+        assert!(!text.contains("A primary live"), "{text}");
+        drop(guard);
+
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+        open_provider_worker_view(&mirror, &dispatcher, None, 20);
+        match action_rx.try_recv().expect("switcher close action") {
+            crate::chat::action::Action::SwitcherClosed => {}
+            other => panic!("expected SwitcherClosed, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Worker { sequence: 20 });
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active worker view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                let text = view.expect("worker view").lines.join("\n");
+                assert!(text.contains("assistant streaming: B focused live"), "{text}");
+                assert!(!text.contains("A primary live"), "{text}");
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
     }
 
     #[test]
