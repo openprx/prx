@@ -357,6 +357,14 @@ pub enum Action {
         final_text: String,
         reasoning: String,
     },
+    /// Provider turn completed, but assistant/session persistence must wait for
+    /// the ordered commit gate. The dispatcher records this as a turn
+    /// completion signal and the reducer intentionally performs no state change.
+    ProviderTurnReadyForCommit {
+        draft_id: String,
+        final_text: String,
+        reasoning: String,
+    },
     /// streaming 失败
     StreamFailed {
         draft_id: String,
@@ -592,6 +600,7 @@ impl Action {
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",
             Self::StreamUsageMetered { .. } => "StreamUsageMetered",
             Self::StreamCompleted { .. } => "StreamCompleted",
+            Self::ProviderTurnReadyForCommit { .. } => "ProviderTurnReadyForCommit",
             Self::StreamFailed { .. } => "StreamFailed",
             Self::StreamCancelled { .. } => "StreamCancelled",
             Self::ToolStarted { .. } => "ToolStarted",

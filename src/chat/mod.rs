@@ -171,13 +171,13 @@ struct ProviderTurnCompletionContext {
 }
 
 #[cfg(feature = "terminal-tui")]
-struct PendingReduxTurn {
+struct PerTurnContext {
     task_id: crate::chat::turn_scheduler::TurnTaskId,
     draft_id: String,
     delta_tx: mpsc::Sender<String>,
     tool_event_tx: mpsc::Sender<ToolCallNotification>,
     draft_updater: Option<tokio::task::JoinHandle<()>>,
-    tool_event_forwarder: tokio::task::JoinHandle<()>,
+    tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
     user_input: String,
     turn_run_id: String,
     route_scope: MessageEventScope,
@@ -198,6 +198,7 @@ struct ResolvedProviderTurnCompletion {
 enum ProviderTurnTerminalPlan {
     Completed {
         final_text: String,
+        reasoning: String,
         recorded_response: String,
         empty_response: bool,
         usage: crate::llm::route_decision::TokenUsage,
@@ -4108,10 +4109,8 @@ pub async fn run(
         ProviderTurnCompletionContext,
     > = std::collections::HashMap::new();
     #[cfg(feature = "terminal-tui")]
-    let mut pending_redux_turns: std::collections::HashMap<
-        crate::chat::turn_scheduler::TurnTaskId,
-        PendingReduxTurn,
-    > = std::collections::HashMap::new();
+    let mut per_turn_contexts: std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext> =
+        std::collections::HashMap::new();
     #[cfg(feature = "terminal-tui")]
     let mut deferred_resume_saved_session_ids: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
@@ -4207,8 +4206,8 @@ pub async fn run(
             }};
         }
         #[cfg(feature = "terminal-tui")]
-        if finalize_ready_pending_redux_turns(
-            &mut pending_redux_turns,
+        if finalize_ready_per_turn_contexts(
+            &mut per_turn_contexts,
             &mut pending_provider_completion_events,
             &turn_signal,
             &mut provider_turn_completion_contexts,
@@ -4236,7 +4235,7 @@ pub async fn run(
         }
         if !input_events_open && input_backlog.is_empty() {
             #[cfg(feature = "terminal-tui")]
-            if should_continue_event_pump_after_input_closed(pending_redux_turns.len()) {
+            if should_continue_event_pump_after_input_closed(per_turn_contexts.len()) {
                 // Keep lifecycle/completion arms alive until the detached Redux turn
                 // resolves; this mirrors the old inner wait, which ignored closed
                 // input while the active turn was still running.
@@ -4266,7 +4265,7 @@ pub async fn run(
         }
         #[cfg(feature = "terminal-tui")]
         if should_drain_deferred_resume_after_visible_inputs(
-            pending_redux_turns.len(),
+            per_turn_contexts.len(),
             &input_backlog,
             &provider_turn_workers,
         ) && let Some(id) = deferred_resume_saved_session_ids.pop_front()
@@ -4279,7 +4278,7 @@ pub async fn run(
                 let Some(msg) = msg else {
                     #[cfg(feature = "terminal-tui")]
                     {
-                        if !pending_redux_turns.is_empty() {
+                        if !per_turn_contexts.is_empty() {
                             input_events_open = false;
                             continue;
                         }
@@ -4287,7 +4286,7 @@ pub async fn run(
                     break None;
                 };
                 #[cfg(feature = "terminal-tui")]
-                if let Some(active_task_id) = pending_redux_turns.keys().next().copied() {
+                if let Some(active_task_id) = per_turn_contexts.keys().next().copied() {
                     let mut emit_active_turn_output =
                         |text: &str| surface_active_turn_message(&chat_dispatcher, redraw_tx_for_main.as_ref(), text);
                     process_active_turn_input_batch(
@@ -4359,8 +4358,8 @@ pub async fn run(
                 );
                 #[cfg(feature = "terminal-tui")]
                 {
-                    let _ = finalize_ready_pending_redux_turns(
-                        &mut pending_redux_turns,
+                    let _ = finalize_ready_per_turn_contexts(
+                        &mut per_turn_contexts,
                         &mut pending_provider_completion_events,
                         &turn_signal,
                         &mut provider_turn_completion_contexts,
@@ -4389,9 +4388,9 @@ pub async fn run(
             _ = shutdown.cancelled() => {
                 #[cfg(feature = "terminal-tui")]
                 {
-                    if !pending_redux_turns.is_empty() {
-                        finalize_all_pending_redux_turns_as_cancelled(
-                            &mut pending_redux_turns,
+                    if !per_turn_contexts.is_empty() {
+                        finalize_all_per_turn_contexts_as_cancelled(
+                            &mut per_turn_contexts,
                             &turn_signal,
                             &mut provider_turn_completion_contexts,
                             &mut history,
@@ -4426,7 +4425,7 @@ pub async fn run(
                     ChatControlEvent::ResumeSavedSession { id } => {
                         #[cfg(feature = "terminal-tui")]
                         if defer_resume_saved_session_if_provider_turn_pending(
-                            pending_redux_turns.len(),
+                            per_turn_contexts.len(),
                             &mut deferred_resume_saved_session_ids,
                             id.clone(),
                         ) {
@@ -6807,16 +6806,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
 
             if let Some(task_id) = provider_turn_task_id {
-                if pending_redux_turns
+                if per_turn_contexts
                     .insert(
                         task_id,
-                        PendingReduxTurn {
+                        PerTurnContext {
                             task_id,
                             draft_id: d_id.clone(),
                             delta_tx,
                             tool_event_tx,
                             draft_updater,
-                            tool_event_forwarder,
+                            tool_event_forwarder: Some(tool_event_forwarder),
                             user_input: user_input.clone(),
                             turn_run_id: turn_run_id.clone(),
                             route_scope: route_scope.clone(),
@@ -8963,7 +8962,7 @@ fn provider_turn_terminal_plan_from_completion(
     tools_registry: &[Box<dyn Tool>],
 ) -> ProviderTurnTerminalPlan {
     match resolved.outcome {
-        Some(dispatcher::TurnOutcomeKind::Completed { final_text }) => {
+        Some(dispatcher::TurnOutcomeKind::Completed { final_text, reasoning }) => {
             let mut usage = resolved.usage;
             if !usage.has_any_tokens() {
                 let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
@@ -8972,6 +8971,7 @@ fn provider_turn_terminal_plan_from_completion(
             if crate::agent::loop_::is_empty_assistant_response(&final_text, false) {
                 ProviderTurnTerminalPlan::Completed {
                     final_text,
+                    reasoning: String::new(),
                     recorded_response: String::new(),
                     empty_response: true,
                     usage,
@@ -8986,6 +8986,7 @@ fn provider_turn_terminal_plan_from_completion(
                 let recorded_response_chars = recorded_response.chars().count();
                 ProviderTurnTerminalPlan::Completed {
                     final_text,
+                    reasoning,
                     final_text_chars,
                     recorded_response_chars,
                     recorded_response,
@@ -9124,9 +9125,37 @@ fn enqueue_provider_turn_finalizer_event(
 }
 
 #[cfg(feature = "terminal-tui")]
+fn dispatch_ordered_provider_turn_commit(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: &str,
+    final_text: &str,
+    reasoning: &str,
+    empty_response: bool,
+) {
+    if !empty_response {
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordAssistantTurn {
+                task_id: Some(task_id),
+                content: final_text.to_string(),
+            },
+            "chat.ordered_record_assistant_turn",
+        );
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::StreamCompleted {
+            draft_id: draft_id.to_string(),
+            final_text: final_text.to_string(),
+            reasoning: reasoning.to_string(),
+        },
+        "chat.ordered_stream_completed",
+    );
+}
+
+#[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
-async fn finalize_pending_redux_turn(
-    pending: PendingReduxTurn,
+async fn finalize_per_turn_context(
+    mut pending: PerTurnContext,
     completion_event: Option<ProviderTurnCompletionEvent>,
     turn_signal: &dispatcher::TurnCompletionSignal,
     provider_turn_completion_contexts: &mut std::collections::HashMap<
@@ -9160,6 +9189,15 @@ async fn finalize_pending_redux_turn(
     );
     let terminal_plan =
         provider_turn_terminal_plan_from_completion(resolved_completion, completion_history_len, tools_registry);
+    tracing::debug!(
+        task_id = pending.task_id.get(),
+        draft_id = %pending.draft_id,
+        turn_run_id = %pending.turn_run_id,
+        provider_name = %pending.provider_name,
+        model_name = %pending.model_name,
+        history_len_before_user_turn = pending.history_len_before_user_turn,
+        "finalizing provider turn context"
+    );
     enqueue_provider_turn_finalizer_event(
         provider_turn_finalizer_events,
         provider_turn_task_id,
@@ -9183,14 +9221,17 @@ async fn finalize_pending_redux_turn(
 
     drop(pending.delta_tx);
     drop(pending.tool_event_tx);
-    if let Some(handle) = pending.draft_updater {
+    if let Some(handle) = pending.draft_updater.take() {
         let _ = handle.await;
     }
-    let _ = pending.tool_event_forwarder.await;
+    if let Some(handle) = pending.tool_event_forwarder.take() {
+        let _ = handle.await;
+    }
 
     match terminal_plan {
         ProviderTurnTerminalPlan::Completed {
             final_text,
+            reasoning,
             recorded_response,
             empty_response,
             usage: redux_tokens_used,
@@ -9213,6 +9254,14 @@ async fn finalize_pending_redux_turn(
                 if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
                     tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
                 }
+                dispatch_ordered_provider_turn_commit(
+                    chat_dispatcher,
+                    pending.task_id,
+                    &pending.draft_id,
+                    &final_text,
+                    &reasoning,
+                    empty_response,
+                );
                 if let Err(e) =
                     record_provider_outcome_events(memory_fabric, pending.route_scope.clone(), &provider_outcome).await
                 {
@@ -9265,6 +9314,14 @@ async fn finalize_pending_redux_turn(
             if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
                 tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
             }
+            dispatch_ordered_provider_turn_commit(
+                chat_dispatcher,
+                pending.task_id,
+                &pending.draft_id,
+                &final_text,
+                &reasoning,
+                empty_response,
+            );
             if let Err(e) = record_chat_assistant_message_event(
                 memory_fabric,
                 chat_session_key,
@@ -9352,8 +9409,8 @@ async fn finalize_pending_redux_turn(
 
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
-async fn finalize_ready_pending_redux_turns(
-    pending_redux_turns: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PendingReduxTurn>,
+async fn finalize_ready_per_turn_contexts(
+    per_turn_contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext>,
     pending_provider_completion_events: &mut std::collections::HashMap<
         crate::chat::turn_scheduler::TurnTaskId,
         ProviderTurnCompletionEvent,
@@ -9381,7 +9438,7 @@ async fn finalize_ready_pending_redux_turns(
     plain_mode: bool,
     plain_mode_turn_failed: &mut bool,
 ) -> bool {
-    let ready_task_ids: Vec<_> = pending_redux_turns
+    let ready_task_ids: Vec<_> = per_turn_contexts
         .keys()
         .copied()
         .filter(|task_id| pending_provider_completion_events.contains_key(task_id))
@@ -9390,11 +9447,11 @@ async fn finalize_ready_pending_redux_turns(
         return false;
     }
     for task_id in ready_task_ids {
-        let Some(pending) = pending_redux_turns.remove(&task_id) else {
+        let Some(pending) = per_turn_contexts.remove(&task_id) else {
             continue;
         };
         let completion = pending_provider_completion_events.remove(&task_id);
-        finalize_pending_redux_turn(
+        finalize_per_turn_context(
             pending,
             completion,
             turn_signal,
@@ -9424,8 +9481,8 @@ async fn finalize_ready_pending_redux_turns(
 
 #[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
-async fn finalize_all_pending_redux_turns_as_cancelled(
-    pending_redux_turns: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PendingReduxTurn>,
+async fn finalize_all_per_turn_contexts_as_cancelled(
+    per_turn_contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext>,
     turn_signal: &dispatcher::TurnCompletionSignal,
     provider_turn_completion_contexts: &mut std::collections::HashMap<
         crate::chat::turn_scheduler::TurnTaskId,
@@ -9449,9 +9506,9 @@ async fn finalize_all_pending_redux_turns_as_cancelled(
     plain_mode: bool,
     plain_mode_turn_failed: &mut bool,
 ) {
-    let pending_turns: Vec<_> = pending_redux_turns.drain().map(|(_, pending)| pending).collect();
+    let pending_turns: Vec<_> = per_turn_contexts.drain().map(|(_, pending)| pending).collect();
     for pending in pending_turns {
-        finalize_pending_redux_turn(
+        finalize_per_turn_context(
             pending,
             None,
             turn_signal,
@@ -15810,6 +15867,7 @@ mod p3_directional_switch_tests {
             task_id: second,
             outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                 final_text: "second done".to_string(),
+                reasoning: String::new(),
             }),
             usage: crate::llm::route_decision::TokenUsage {
                 total_tokens: Some(42),
@@ -15875,6 +15933,7 @@ mod p3_directional_switch_tests {
             task_id,
             outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                 final_text: "current done".to_string(),
+                reasoning: String::new(),
             }),
             usage: crate::llm::route_decision::TokenUsage {
                 total_tokens: Some(43),
@@ -15934,6 +15993,7 @@ mod p3_directional_switch_tests {
             task_id,
             outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                 final_text: "done".to_string(),
+                reasoning: String::new(),
             }),
             usage: crate::llm::route_decision::TokenUsage {
                 total_tokens: Some(9),
@@ -16004,6 +16064,7 @@ mod p3_directional_switch_tests {
                 task_id,
                 outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                     final_text: "ready finalizer".to_string(),
+                    reasoning: String::new(),
                 }),
                 usage: crate::llm::route_decision::TokenUsage {
                     total_tokens: Some(64),
@@ -16054,6 +16115,164 @@ mod p3_directional_switch_tests {
             row.state,
             crate::chat::turn_worker::ProviderTurnWorkerState::Committed
         ));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4b1_ready_signal_is_noop_until_ordered_commit_dispatches_save() {
+        use crate::chat::action::Action;
+        use crate::chat::state::{ChatState, Effect};
+        use std::sync::Arc;
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("ordered commit", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(task_id).expect("task starts");
+        let sequence = scheduler.task(task_id).expect("task snapshot").sequence;
+        let mut state = ChatState::new(Arc::from("provider"), Arc::from("model"), CancellationToken::new());
+        let _ = state.reduce(Action::RecordUserTurn("question".to_string()));
+        let _ = state.reduce(Action::StartLLMTurn {
+            provider_turn_task_id: Some(task_id),
+            provider_turn_sequence: Some(sequence),
+            draft_id: "draft-p4b1".to_string(),
+            history: Vec::new(),
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+
+        let ready_effects = state.reduce(Action::ProviderTurnReadyForCommit {
+            draft_id: "draft-p4b1".to_string(),
+            final_text: "answer".to_string(),
+            reasoning: "reason".to_string(),
+        });
+        assert!(ready_effects.is_empty(), "ready signal must not emit SaveSession");
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "ready signal must leave reducer draft open until ordered commit"
+        );
+
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+        dispatch_ordered_provider_turn_commit(&dispatcher, task_id, "draft-p4b1", "answer", "reason", false);
+
+        let record = rx.try_recv().expect("ordered RecordAssistantTurn action");
+        match record {
+            Action::RecordAssistantTurn { task_id: seen, content } => {
+                assert_eq!(seen, Some(task_id));
+                assert_eq!(content, "answer");
+                let effects = state.reduce(Action::RecordAssistantTurn { task_id: seen, content });
+                assert!(
+                    !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+                    "RecordAssistantTurn alone must not save before terminal commit"
+                );
+            }
+            other => panic!("expected ordered RecordAssistantTurn, got {other:?}"),
+        }
+
+        let terminal = rx.try_recv().expect("ordered StreamCompleted action");
+        match terminal {
+            Action::StreamCompleted {
+                draft_id,
+                final_text,
+                reasoning,
+            } => {
+                assert_eq!(draft_id, "draft-p4b1");
+                assert_eq!(final_text, "answer");
+                assert_eq!(reasoning, "reason");
+                let effects = state.reduce(Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                });
+                assert!(
+                    effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+                    "SaveSession must be emitted only by ordered StreamCompleted"
+                );
+            }
+            other => panic!("expected ordered StreamCompleted, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "ordered commit helper should emit exactly record + terminal actions"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4b1_failed_and_cancelled_skip_do_not_emit_persistence_actions() {
+        use crate::chat::action::Action;
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let failed = scheduler.enqueue("failed", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let cancelled = scheduler.enqueue("cancelled", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(failed).expect("failed task starts");
+        scheduler.start_task(cancelled).expect("cancelled task starts");
+        scheduler.request_cancel(cancelled).expect("cancel request accepted");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(failed).expect("failed task snapshot"))
+            .expect("failed task registers");
+        coordinator
+            .register_task(scheduler.task(cancelled).expect("cancelled task snapshot"))
+            .expect("cancelled task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for task_id in [failed, cancelled] {
+            workers
+                .start_from_task(
+                    scheduler.task(task_id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers
+                .record_execution_started(task_id, 70)
+                .expect("worker execution starts");
+            workers
+                .record_completion_ready(task_id)
+                .expect("worker completion ready");
+        }
+        workers
+            .request_cancel(cancelled)
+            .expect("worker cancellation requested");
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(failed),
+            ProviderTurnTerminalPlan::Failed {
+                err: "failed".to_string(),
+                history_commit_len: 0,
+                summary: "test failed skip".to_string(),
+            },
+        );
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(cancelled),
+            ProviderTurnTerminalPlan::Cancelled {
+                summary: "test cancelled skip",
+            },
+        );
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+
+        let results = drain_provider_turn_finalizer_events_and_publish(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            &mut queue,
+            &dispatcher,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].terminal_status, "failed");
+        assert_eq!(results[1].terminal_status, "cancelled");
+        assert!(results.iter().all(|result| result.finalized));
+        while let Ok(action) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    action,
+                    Action::RecordAssistantTurn { .. } | Action::StreamCompleted { .. }
+                ),
+                "skip decisions must not emit assistant/session persistence actions: {action:?}"
+            );
+        }
     }
 
     #[test]
@@ -16232,6 +16451,7 @@ mod p3_directional_switch_tests {
             ResolvedProviderTurnCompletion {
                 outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                     final_text: "context done".to_string(),
+                    reasoning: String::new(),
                 }),
                 usage: crate::llm::route_decision::TokenUsage::default(),
             },
@@ -16403,6 +16623,7 @@ mod p3_directional_switch_tests {
             task_id,
             outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                 final_text: "event wins".to_string(),
+                reasoning: String::new(),
             }),
             usage: crate::llm::route_decision::TokenUsage {
                 total_tokens: Some(12),
@@ -16413,7 +16634,7 @@ mod p3_directional_switch_tests {
         let resolved = resolve_provider_turn_completion(&signal, Some(task_id), Some(event));
 
         match resolved.outcome {
-            Some(dispatcher::TurnOutcomeKind::Completed { final_text }) => {
+            Some(dispatcher::TurnOutcomeKind::Completed { final_text, .. }) => {
                 assert_eq!(final_text, "event wins");
             }
             other => panic!("unexpected outcome: {other:?}"),
@@ -16562,6 +16783,7 @@ mod p3_directional_switch_tests {
                 task_id: Some(task_id),
                 plan: ProviderTurnTerminalPlan::Completed {
                     final_text: "done".to_string(),
+                    reasoning: String::new(),
                     recorded_response: "done".to_string(),
                     empty_response: false,
                     usage: crate::llm::route_decision::TokenUsage {
@@ -16747,6 +16969,7 @@ mod p3_directional_switch_tests {
             Some(second),
             ProviderTurnTerminalPlan::Completed {
                 final_text: "second done".to_string(),
+                reasoning: String::new(),
                 recorded_response: "second done".to_string(),
                 empty_response: false,
                 usage: crate::llm::route_decision::TokenUsage {
@@ -16811,6 +17034,7 @@ mod p3_directional_switch_tests {
             Some(task_id),
             ProviderTurnTerminalPlan::Completed {
                 final_text: "published".to_string(),
+                reasoning: String::new(),
                 recorded_response: "published".to_string(),
                 empty_response: false,
                 usage: crate::llm::route_decision::TokenUsage {
@@ -16857,6 +17081,7 @@ mod p3_directional_switch_tests {
         let resolved = ResolvedProviderTurnCompletion {
             outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                 final_text: "P7J terminal plan".to_string(),
+                reasoning: "kept reasoning".to_string(),
             }),
             usage: crate::llm::route_decision::TokenUsage {
                 total_tokens: Some(77),
@@ -16870,6 +17095,7 @@ mod p3_directional_switch_tests {
             ProviderTurnTerminalPlan::Completed {
                 final_text,
                 recorded_response,
+                reasoning,
                 empty_response,
                 usage,
                 history_commit_len,
@@ -16879,6 +17105,7 @@ mod p3_directional_switch_tests {
             } => {
                 assert_eq!(final_text, "P7J terminal plan");
                 assert_eq!(recorded_response, "P7J terminal plan");
+                assert_eq!(reasoning, "kept reasoning");
                 assert!(!empty_response);
                 assert_eq!(usage.total_tokens, Some(77));
                 assert_eq!(history_commit_len, 5);
@@ -16897,6 +17124,7 @@ mod p3_directional_switch_tests {
             ResolvedProviderTurnCompletion {
                 outcome: Some(dispatcher::TurnOutcomeKind::Completed {
                     final_text: "   ".to_string(),
+                    reasoning: "hidden reasoning".to_string(),
                 }),
                 usage: crate::llm::route_decision::TokenUsage::default(),
             },

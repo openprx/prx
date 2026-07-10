@@ -1080,6 +1080,7 @@ impl ChatState {
                 final_text,
                 reasoning,
             } => self.reduce_stream_completed(&draft_id, final_text, reasoning),
+            Action::ProviderTurnReadyForCommit { .. } => vec![],
             Action::StreamFailed {
                 draft_id,
                 err,
@@ -3317,7 +3318,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolStarted { .. }
         | Action::ToolFinished { .. } => true,
         // 仅 LogTrace，不变 UI
-        Action::StreamRetryAttempt { .. } | Action::StreamUsageMetered { .. } => false,
+        Action::StreamRetryAttempt { .. }
+        | Action::StreamUsageMetered { .. }
+        | Action::ProviderTurnReadyForCommit { .. } => false,
         Action::ToolProgress { .. } => true,
         // Foreground approval writes pending view + focus.
         Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {

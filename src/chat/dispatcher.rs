@@ -278,8 +278,10 @@ impl ChatDispatcher {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TurnOutcomeKind {
-    /// LLM 流式成功完成；`final_text` 为最终累计可见文本.
-    Completed { final_text: String },
+    /// LLM 流式成功完成；`final_text` 为最终累计可见文本，`reasoning`
+    /// carries the final reasoning card payload that must be replayed when an
+    /// ordered commit gate releases the reducer terminal action.
+    Completed { final_text: String, reasoning: String },
     /// LLM 流式失败；`err` 为 [`Action::StreamFailed`] 携带的错误描述，
     /// `retryable` 反映 [`stream_error_is_retryable`] 判定结果。
     Failed { err: String, retryable: bool },
@@ -490,8 +492,14 @@ impl std::fmt::Debug for TurnCompletionSignal {
 #[allow(dead_code)]
 pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
     match action {
-        Action::StreamCompleted { final_text, .. } => Some(TurnOutcomeKind::Completed {
+        Action::StreamCompleted {
+            final_text, reasoning, ..
+        }
+        | Action::ProviderTurnReadyForCommit {
+            final_text, reasoning, ..
+        } => Some(TurnOutcomeKind::Completed {
             final_text: final_text.clone(),
+            reasoning: reasoning.clone(),
         }),
         Action::StreamFailed { err, retryable, .. } => Some(TurnOutcomeKind::Failed {
             err: err.clone(),
@@ -515,6 +523,7 @@ pub fn extract_turn_draft_id(action: &Action) -> Option<&str> {
     match action {
         Action::StreamUsageMetered { draft_id, .. }
         | Action::StreamCompleted { draft_id, .. }
+        | Action::ProviderTurnReadyForCommit { draft_id, .. }
         | Action::StreamFailed { draft_id, .. }
         | Action::StreamCancelled { draft_id } => Some(draft_id),
         _ => None,
@@ -547,7 +556,10 @@ fn record_turn_signal_action(
 pub const fn is_turn_terminal_action(action: &Action) -> bool {
     matches!(
         action,
-        Action::StreamCompleted { .. } | Action::StreamFailed { .. } | Action::StreamCancelled { .. }
+        Action::StreamCompleted { .. }
+            | Action::ProviderTurnReadyForCommit { .. }
+            | Action::StreamFailed { .. }
+            | Action::StreamCancelled { .. }
     )
 }
 
@@ -2217,9 +2229,12 @@ async fn drive_start_turn_stream(
         }
     }
 
-    // T3-3-fixB B5：先 RecordAssistantTurn 再 StreamCompleted，让 reducer
-    // reduce_stream_completed emit Effect::SaveSession 时 session.turns 已
-    // 含本轮 assistant。与 fixA P0-1 legacy 路径修同款时序契约。
+    // P4b-1: task-scoped visible provider turns are persisted only after the
+    // ordered commit gate in chat::run. The dispatcher still emits usage and
+    // empty-response notices immediately, but its successful terminal action is
+    // a reducer no-op that only wakes TurnCompletionSignal. Non task-scoped
+    // tests/legacy paths keep the original RecordAssistantTurn -> StreamCompleted
+    // contract.
     let tokens_used = usage_accumulator.finish();
     if tokens_used.is_reported()
         && let Err(e) = action_tx
@@ -2243,7 +2258,7 @@ async fn drive_start_turn_stream(
             tracing::debug!(error = %e, "StartTurn: action_tx closed before empty-response system message");
             return;
         }
-    } else {
+    } else if provider_turn_task_id.is_none() {
         let record = Action::RecordAssistantTurn {
             task_id: provider_turn_task_id,
             content: accumulated.clone(),
@@ -2253,14 +2268,23 @@ async fn drive_start_turn_stream(
             return;
         }
     }
-    let action = Action::StreamCompleted {
-        draft_id,
-        final_text: accumulated,
-        reasoning: if empty_assistant_response {
-            String::new()
-        } else {
-            reasoning_buf
-        },
+    let reasoning = if empty_assistant_response {
+        String::new()
+    } else {
+        reasoning_buf
+    };
+    let action = if provider_turn_task_id.is_some() {
+        Action::ProviderTurnReadyForCommit {
+            draft_id,
+            final_text: accumulated,
+            reasoning,
+        }
+    } else {
+        Action::StreamCompleted {
+            draft_id,
+            final_text: accumulated,
+            reasoning,
+        }
     };
     if let Err(e) = action_tx.send(action).await {
         tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
@@ -5143,6 +5167,113 @@ mod real_mode_tests {
     }
 
     #[tokio::test]
+    async fn task_scoped_start_turn_emits_ready_for_ordered_commit() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct FakeTaskScopedStreamProvider;
+
+        #[async_trait]
+        impl Provider for FakeTaskScopedStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks: Vec<StreamResult<StreamChunk>> = vec![
+                    Ok(StreamChunk::delta("ordered ")),
+                    Ok(StreamChunk::reasoning_delta("gate")),
+                    Ok(StreamChunk::delta("commit")),
+                    Ok(StreamChunk::final_chunk()),
+                ];
+                stream::iter(chunks).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("task scoped", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(task_id).expect("task starts");
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FakeTaskScopedStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: Some(task_id),
+                draft_id: "draft-task-scoped".to_string(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            })
+            .await;
+
+        for expected_delta in ["ordered ", "commit"] {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("stream action within 1.5s")
+                .expect("stream action received");
+            match action {
+                Action::StreamChunkReceived { delta, .. } => assert_eq!(delta, expected_delta),
+                other => panic!("expected StreamChunkReceived, got {other:?}"),
+            }
+        }
+
+        let terminal = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("ready signal within 1.5s")
+            .expect("ready signal received");
+        match terminal {
+            Action::ProviderTurnReadyForCommit {
+                draft_id,
+                final_text,
+                reasoning,
+            } => {
+                assert_eq!(draft_id, "draft-task-scoped");
+                assert_eq!(final_text, "ordered commit");
+                assert_eq!(reasoning, "gate");
+            }
+            other => panic!("task-scoped completion must wait for ordered commit gate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn real_mode_empty_stream_surfaces_system_message_without_assistant_record() {
         use crate::providers::traits::{
             ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
@@ -6227,6 +6358,7 @@ mod real_mode_tests {
             "draft-keyed",
             TurnOutcomeKind::Completed {
                 final_text: "done".to_string(),
+                reasoning: "because".to_string(),
             },
         ));
         tokio::time::timeout(std::time::Duration::from_secs(1), notified)
@@ -6236,7 +6368,10 @@ mod real_mode_tests {
         let keyed_usage = signal.consume_turn_usage(task_id);
         assert_eq!(keyed_usage.total_tokens, Some(15));
         match signal.consume_turn_outcome(task_id) {
-            Some(TurnOutcomeKind::Completed { final_text }) => assert_eq!(final_text, "done"),
+            Some(TurnOutcomeKind::Completed { final_text, reasoning }) => {
+                assert_eq!(final_text, "done");
+                assert_eq!(reasoning, "because");
+            }
             other => panic!("expected keyed completed outcome, got {other:?}"),
         }
         assert!(
