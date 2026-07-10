@@ -3545,9 +3545,21 @@ mod tests {
         let view = state.ui.active_session_view.as_ref().expect("worker view refreshed");
         assert_eq!(view.kind, crate::chat::action::PROVIDER_WORKER_VIEW_KIND);
         assert!(view.lines.iter().any(|line| line == "task: 7"));
-        assert!(view.lines.iter().any(|line| line == "io: recent provider turn"));
-        assert!(view.lines.iter().any(|line| line.starts_with("run shell done:")));
-        assert!(view.lines.iter().any(|line| line == "output: P6Z"));
+        assert!(
+            !view.lines.iter().any(|line| line == "io: recent provider turn"),
+            "non-streaming worker views must not replay transcript history: {:?}",
+            view.lines
+        );
+        assert!(
+            !view.lines.iter().any(|line| line.starts_with("run shell done:")),
+            "completed tool cards without a matching streaming draft stay out of worker IO: {:?}",
+            view.lines
+        );
+        assert!(
+            !view.lines.iter().any(|line| line == "output: P6Z"),
+            "completed tool output without a matching streaming draft stays out of worker IO: {:?}",
+            view.lines
+        );
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -8751,7 +8763,7 @@ mod tests {
             let call: &ToolCallSummary = last.tool_calls.first().expect("test: tool_calls[0]");
             assert_eq!(call.name, "shell");
             assert!(call.success);
-            assert_eq!(call.args_preview, r#"{"cmd":"ls"}"#);
+            assert_eq!(call.args_preview, r#"command="ls""#);
 
             // 回填后 ControlState 缓冲必须清空（mem::take + clear）.
             assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));

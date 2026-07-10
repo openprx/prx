@@ -1569,12 +1569,12 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
             _ => None,
         };
         if let Some(direction) = direction {
-            if bottom_entries.is_empty() {
-                return KeyDispatch::Consumed;
+            if !bottom_entries.is_empty() {
+                let selected =
+                    move_bottom_list_selection(&bottom_entries, state.strip_selection, state.focus, direction);
+                state.strip_selection = selected;
+                return KeyDispatch::StripSelectionChanged { selected };
             }
-            let selected = move_bottom_list_selection(&bottom_entries, state.strip_selection, state.focus, direction);
-            state.strip_selection = selected;
-            return KeyDispatch::StripSelectionChanged { selected };
         }
         if key.code == KeyCode::Enter
             && let Some(selected) = state.strip_selection
@@ -1609,7 +1609,7 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 state.provider_worker_status.clone(),
                 state.focus,
             );
-            let selected = move_bottom_list_selection(&entries, state.strip_selection, state.focus, direction);
+            let selected = move_strip_selection(&entries, state.strip_selection, state.focus, direction);
             state.strip_selection = selected;
             return KeyDispatch::StripSelectionChanged { selected };
         }
@@ -1686,23 +1686,25 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 state.provider_worker_status.clone(),
                 state.focus,
             );
-            let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
-            return match selected {
-                Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::RequestDetach,
-                Some(seq) => {
-                    if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq))
-                        && is_provider_worker_switcher_entry(entry)
-                        && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                    {
-                        return KeyDispatch::OpenProviderWorkerView { sequence };
+            if !bottom_entries.is_empty() {
+                let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
+                return match selected {
+                    Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::RequestDetach,
+                    Some(seq) => {
+                        if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq))
+                            && is_provider_worker_switcher_entry(entry)
+                            && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                        {
+                            return KeyDispatch::OpenProviderWorkerView { sequence };
+                        }
+                        if seq != current_seq {
+                            return KeyDispatch::SwitchSession { seq };
+                        }
+                        KeyDispatch::Consumed
                     }
-                    if seq != current_seq {
-                        return KeyDispatch::SwitchSession { seq };
-                    }
-                    KeyDispatch::Consumed
-                }
-                None => KeyDispatch::Consumed,
-            };
+                    None => KeyDispatch::Consumed,
+                };
+            }
         }
     }
     if matches!(state.focus, crate::chat::sessions::FocusTarget::Worker { .. })
@@ -1720,21 +1722,23 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                 state.provider_worker_status.clone(),
                 state.focus,
             );
-            let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
-            return match selected {
-                Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::CloseProviderWorkerView,
-                Some(seq) => {
-                    if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq)) {
-                        if is_provider_worker_switcher_entry(entry)
-                            && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                        {
-                            return KeyDispatch::OpenProviderWorkerView { sequence };
+            if !bottom_entries.is_empty() {
+                let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
+                return match selected {
+                    Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::CloseProviderWorkerView,
+                    Some(seq) => {
+                        if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq)) {
+                            if is_provider_worker_switcher_entry(entry)
+                                && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+                            {
+                                return KeyDispatch::OpenProviderWorkerView { sequence };
+                            }
                         }
+                        KeyDispatch::SwitchSession { seq }
                     }
-                    KeyDispatch::SwitchSession { seq }
-                }
-                None => KeyDispatch::Consumed,
-            };
+                    None => KeyDispatch::Consumed,
+                };
+            }
         }
     }
     if state.focus.is_child_view() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
@@ -3993,10 +3997,7 @@ fn session_footer_has_sessions<V: BottomChromeView + ?Sized>(state: &V) -> bool 
         state.provider_worker_status(),
         state.focus(),
     );
-    if entries.is_empty() {
-        return !state.sessions_status().is_empty();
-    }
-    true
+    !entries.is_empty()
 }
 
 fn session_footer_desired_rows<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
@@ -4408,8 +4409,14 @@ fn truncate_chars_with_ellipsis(input: &str, max_width: u16, ascii: bool) -> Str
     truncated
 }
 
-const fn session_active_marker(active: bool, _ascii: bool) -> &'static str {
-    if active { ">" } else { " " }
+const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
+    if !active {
+        " "
+    } else if ascii {
+        ">"
+    } else {
+        "\u{25B8}"
+    }
 }
 
 fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
@@ -9153,12 +9160,24 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.input.history.push("older command".to_string());
 
+        // Contract B: with no bottom strip entries, bare Up/Down still reach
+        // input history.
         assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
         assert_eq!(state.input.text(), "older command");
         assert!(state.slash_menu.is_none());
         assert_eq!(
             dispatch_global_key(key(KeyCode::Down), &mut state),
             KeyDispatch::Consumed
+        );
+        assert!(state.input.is_empty());
+
+        // Once the strip has navigable entries, bare arrows drive the strip
+        // instead of recalling history.
+        state.sessions_cache = vec![entry(1)];
+        state.input.history.push("newer command".to_string());
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) }
         );
         assert!(state.input.is_empty());
     }
@@ -9423,6 +9442,8 @@ mod tests {
         state.input.history.push("one".to_string());
         state.input.history.push("two".to_string());
 
+        // Contract B: input history remains reachable when there are no
+        // bottom strip entries for bare arrows to navigate.
         assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
         assert_eq!(state.input.text(), "two");
         assert_eq!(
@@ -9843,6 +9864,8 @@ mod tests {
     fn saved_session_picker_closed_keeps_up_down_input_history_behavior() {
         let mut state = TuiState::new("p", "m");
         state.input.history = vec!["alpha".to_string(), "beta".to_string()];
+        // Contract B: closing the saved-session picker restores normal input
+        // history when no bottom strip entries are present.
         assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
         assert_eq!(state.input.text(), "beta");
         assert_eq!(
@@ -9850,6 +9873,13 @@ mod tests {
             KeyDispatch::Consumed
         );
         assert!(state.input.is_empty());
+
+        state.sessions_cache = vec![entry(1)];
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) },
+            "with strip entries present, bare arrows return to strip navigation"
+        );
     }
 
     #[test]
@@ -10148,6 +10178,8 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
 
+        // Contract B: with no bottom strip entries, child focus keeps bare
+        // Up/Down available for child viewport scrolling.
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
             KeyDispatch::ScrollSessionUp
@@ -10164,6 +10196,14 @@ mod tests {
             dispatch_global_key(key(KeyCode::PageDown), &mut state),
             KeyDispatch::PageSessionDown
         );
+
+        state.sessions_cache = vec![entry(9), entry(10)];
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::SwitchSession { seq: 10 },
+            "with bottom entries present, bare Down navigates child sessions"
+        );
+        state.sessions_cache.clear();
 
         state.focus = crate::chat::sessions::FocusTarget::Main;
         assert_eq!(
@@ -10558,9 +10598,21 @@ mod tests {
             KeyDispatch::Submitted("a".to_string())
         );
 
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::StripSelectionChanged { selected: Some(1) },
+            "Contract B: with strip entries present, bare Up navigates the strip"
+        );
+        assert!(state.input.is_empty(), "strip navigation must not recall history");
+        assert_eq!(state.strip_selection, Some(1));
+
+        state.sessions_cache.clear();
         assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
-        assert_eq!(state.input.text(), "a", "bare Up still recalls input history");
-        assert_eq!(state.strip_selection, Some(2));
+        assert_eq!(
+            state.input.text(),
+            "a",
+            "when strip entries are absent, bare Up still recalls input history"
+        );
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
@@ -10583,6 +10635,11 @@ mod tests {
             dispatch_global_key(key(KeyCode::PageUp), &mut state),
             KeyDispatch::PageSessionUp,
             "PageUp keeps the focused child scroll binding"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::ScrollSessionUp,
+            "with no bottom entries, bare Up keeps the focused child scroll binding"
         );
     }
 
@@ -12373,6 +12430,17 @@ mod tests {
             "newer",
             "Up still navigates input history and is not a transcript-scroll key"
         );
+
+        let mut strip_state = TuiState::new("provider", "model");
+        strip_state.sessions_cache = vec![entry(1)];
+        strip_state.input.history = vec!["older".to_string(), "newer".to_string()];
+        let out = dispatch_global_key(key(KeyCode::Down), &mut strip_state);
+        assert_eq!(
+            out,
+            KeyDispatch::StripSelectionChanged { selected: Some(1) },
+            "Contract B: strip entries make bare arrows navigate the strip before input history"
+        );
+        assert!(strip_state.input.is_empty());
 
         let mut child_state = TuiState::new("provider", "model");
         child_state.focus = crate::chat::sessions::FocusTarget::Session { seq: 3 };
