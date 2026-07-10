@@ -1040,6 +1040,7 @@ impl EffectExecutor {
                     }
                     let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
                     let driver = drive_start_turn_stream(
+                        provider_turn_task_id,
                         provider,
                         history,
                         compaction_guard_history,
@@ -1239,7 +1240,14 @@ impl EffectExecutor {
             Effect::AutoTitleSession(title) => {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
-            Effect::RequestApproval { tool_id, name, args } => {
+            Effect::RequestApproval {
+                task_id,
+                tool_id,
+                name,
+                args,
+            } => {
+                #[cfg(not(feature = "terminal-tui"))]
+                let _ = task_id;
                 #[cfg(feature = "terminal-tui")]
                 {
                     let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
@@ -1247,8 +1255,12 @@ impl EffectExecutor {
                         if let Some(mirror) = deps.tui_mirror.as_ref() {
                             {
                                 let mut state = mirror.lock();
-                                state.pending_tool_approval =
-                                    Some(crate::chat::sessions::PendingToolApprovalView { tool_id, name, args });
+                                state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+                                    task_id,
+                                    tool_id,
+                                    name,
+                                    args,
+                                });
                                 state.focus = crate::chat::sessions::FocusTarget::Approval;
                                 state.switcher = None;
                             }
@@ -1792,6 +1804,7 @@ fn trim_redux_driver_context_budget_after_summary(
     )
 )]
 async fn drive_start_turn_stream(
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
     mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
@@ -2128,6 +2141,7 @@ async fn drive_start_turn_stream(
                     }
                     let call_name = call.name.clone();
                     let outcome = execute_single_tool_call(
+                        provider_turn_task_id,
                         registry,
                         &call,
                         &cancel,
@@ -2227,7 +2241,10 @@ async fn drive_start_turn_stream(
             return;
         }
     } else {
-        let record = Action::RecordAssistantTurn(accumulated.clone());
+        let record = Action::RecordAssistantTurn {
+            task_id: provider_turn_task_id,
+            content: accumulated.clone(),
+        };
         if let Err(e) = action_tx.send(record).await {
             tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
             return;
@@ -2361,6 +2378,7 @@ fn plan_preview_args(raw_args: &str) -> String {
 /// 拆出后逻辑/borrow 都更清晰。返回值告诉调用方下一步行为（继续 / 取消 / 退出）。
 #[allow(clippy::too_many_arguments)]
 async fn execute_single_tool_call(
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
     call: &ResolvedToolCall,
     cancel: &CancellationToken,
@@ -2389,6 +2407,9 @@ async fn execute_single_tool_call(
         history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
         if let Err(e) = action_tx
             .send(Action::ToolFinished {
+                task_id: provider_turn_task_id,
+                sequence: None,
+                tool_call_id: Some(call.id.clone()),
                 name: call.name.clone(),
                 success: true,
                 duration_ms: 0,
@@ -2413,6 +2434,7 @@ async fn execute_single_tool_call(
             if registered {
                 if let Err(e) = action_tx
                     .send(Action::ToolApprovalRequested {
+                        task_id: provider_turn_task_id,
                         tool_id: call.id.clone(),
                         name: call.name.clone(),
                         args: call.args.clone(),
@@ -2450,6 +2472,9 @@ async fn execute_single_tool_call(
                 history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
                 if let Err(e) = action_tx
                     .send(Action::ToolFinished {
+                        task_id: provider_turn_task_id,
+                        sequence: None,
+                        tool_call_id: Some(call.id.clone()),
                         name: call.name.clone(),
                         success: false,
                         duration_ms: 0,
@@ -2480,6 +2505,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             if let Err(e) = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2500,6 +2528,9 @@ async fn execute_single_tool_call(
     // 2) 发 ToolStarted（reducer/UI 感知）.
     if let Err(e) = action_tx
         .send(Action::ToolStarted {
+            task_id: provider_turn_task_id,
+            sequence: None,
+            tool_call_id: Some(call.id.clone()),
             name: call.name.clone(),
             args: call.args.clone(),
         })
@@ -2522,6 +2553,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             let _ = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2547,6 +2581,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             let _ = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2644,6 +2681,9 @@ async fn execute_single_tool_call(
     };
     let _ = action_tx
         .send(Action::ToolFinished {
+            task_id: provider_turn_task_id,
+            sequence: None,
+            tool_call_id: Some(call.id.clone()),
             name: call.name.clone(),
             success: ok_flag,
             duration_ms,
@@ -3860,7 +3900,10 @@ mod integration_tests {
             DispatchResult::Sent
         );
         assert_eq!(
-            dispatcher.try_dispatch(Action::RecordAssistantTurn("hello user, response complete".to_string())),
+            dispatcher.try_dispatch(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "hello user, response complete".to_string(),
+            }),
             DispatchResult::Sent
         );
 
@@ -4121,7 +4164,10 @@ mod integration_tests {
         for i in 0..50u64 {
             let _ = dispatcher.try_dispatch(Action::InputSubmitted(format!("msg{i}")));
             let _ = dispatcher.try_dispatch(Action::RecordUserTurn(format!("user{i}")));
-            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn(format!("assist{i}")));
+            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn {
+                task_id: None,
+                content: format!("assist{i}"),
+            });
         }
 
         shutdown.cancel();
@@ -4389,7 +4435,10 @@ mod real_mode_tests {
                 draft_id: format!("d-{tag}"),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a".to_string(),
+            });
             let effects = state.reduce(Action::StreamCompleted {
                 draft_id: format!("d-{tag}"),
                 final_text: "a".to_string(),
@@ -4533,10 +4582,13 @@ mod real_mode_tests {
                 .expect("driver action within 1.5s")
                 .expect("action received");
             match action {
-                Action::RecordAssistantTurn(text) => {
+                Action::RecordAssistantTurn { content: text, .. } => {
                     assert!(!saw_record, "RecordAssistantTurn 应只发一次");
                     saw_record = true;
-                    let _ = state.reduce(Action::RecordAssistantTurn(text));
+                    let _ = state.reduce(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: text,
+                    });
                 }
                 Action::StreamCompleted {
                     draft_id,
@@ -4756,6 +4808,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::RequestApproval {
+                task_id: None,
                 tool_id: "call-tui".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"echo secure"}"#.to_string(),
@@ -4815,6 +4868,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::RequestApproval {
+                task_id: None,
                 tool_id: "call-tui-override".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"echo secure"}"#.to_string(),
@@ -4889,7 +4943,7 @@ mod real_mode_tests {
             .expect("RecordAssistantTurn within 1s")
             .expect("RecordAssistantTurn received");
         match action {
-            Action::RecordAssistantTurn(_) => {}
+            Action::RecordAssistantTurn { .. } => {}
             other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
         }
 
@@ -5060,7 +5114,7 @@ mod real_mode_tests {
             .expect("RecordAssistantTurn within 1.5s")
             .expect("RecordAssistantTurn received");
         match a_record {
-            Action::RecordAssistantTurn(text) => {
+            Action::RecordAssistantTurn { content: text, .. } => {
                 assert_eq!(text, "hello world", "RecordAssistantTurn 内容应与 final_text 一致");
             }
             other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
@@ -5170,7 +5224,7 @@ mod real_mode_tests {
                     assert_eq!(text, crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE);
                     saw_system_message = true;
                 }
-                Action::RecordAssistantTurn(text) => {
+                Action::RecordAssistantTurn { content: text, .. } => {
                     panic!("empty response must not record assistant turn: {text:?}");
                 }
                 Action::StreamCompleted {
@@ -9849,7 +9903,13 @@ mod real_mode_tests {
                     maybe = action_rx.recv() => {
                         match maybe {
                             Some(action) => {
-                                if let Action::ToolApprovalRequested { tool_id, name, args } = &action {
+                                if let Action::ToolApprovalRequested {
+                                    task_id,
+                                    tool_id,
+                                    name,
+                                    args,
+                                } = &action
+                                {
                                     #[cfg(not(feature = "terminal-tui"))]
                                     let _ = (name, args);
                                     #[cfg(feature = "terminal-tui")]
@@ -9858,6 +9918,7 @@ mod real_mode_tests {
                                         tui.focus = crate::chat::sessions::FocusTarget::Approval;
                                         tui.pending_tool_approval =
                                             Some(crate::chat::sessions::PendingToolApprovalView {
+                                                task_id: *task_id,
                                                 tool_id: tool_id.clone(),
                                                 name: name.clone(),
                                                 args: args.clone(),
@@ -9996,6 +10057,7 @@ mod real_mode_tests {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10131,6 +10193,7 @@ mod real_mode_tests {
         });
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10851,6 +10914,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10937,6 +11001,7 @@ mod s4_a_3 {
         ];
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -11008,6 +11073,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -11076,6 +11142,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),

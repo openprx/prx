@@ -34,6 +34,10 @@ pub struct ToolCallSummary {
     pub name: String,
     pub args_preview: String,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 /// Per-provider-call token usage recorded for a chat session or child agent
@@ -469,6 +473,8 @@ mod tests {
                 name: "shell".to_string(),
                 args_preview: "ls -la".to_string(),
                 success: true,
+                task_id: None,
+                sequence: None,
             }],
         );
 

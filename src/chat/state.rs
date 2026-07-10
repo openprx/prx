@@ -209,6 +209,7 @@ pub enum Effect {
     /// 数据流为单向 fire-and-forget（driver 通过 `approval_response_tx` mpsc 反向
     /// 接收响应）。Effect 不要求响应。
     RequestApproval {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         tool_id: String,
         name: String,
         args: String,
@@ -498,8 +499,6 @@ pub struct StreamState {
     /// This is the single source of truth for streaming draft state. The legacy
     /// single-draft snapshot is computed from [`Self::primary_draft`].
     pub visible_drafts: Vec<StreamingTurnDraft>,
-    /// 当前回合中处于 Running 状态的工具卡片索引列表
-    pub pending_tool_cards: Vec<usize>,
 }
 
 impl StreamState {
@@ -575,6 +574,45 @@ impl StreamState {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolTaskKey {
+    Task(crate::chat::turn_scheduler::TurnTaskId),
+    Primary,
+}
+
+impl ToolTaskKey {
+    #[must_use]
+    pub const fn from_task_id(task_id: Option<crate::chat::turn_scheduler::TurnTaskId>) -> Self {
+        match task_id {
+            Some(id) => Self::Task(id),
+            None => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ToolInvocationKey {
+    pub tool_call_id: Option<String>,
+    pub name: String,
+}
+
+impl ToolInvocationKey {
+    #[must_use]
+    fn new(tool_call_id: Option<String>, name: &str) -> Self {
+        Self {
+            tool_call_id,
+            name: name.to_string(),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct TaskToolBuffer {
+    pub pending_tool_cards: Vec<usize>,
+    pub tool_calls: Vec<crate::chat::session::ToolCallSummary>,
+    pub tool_args: std::collections::HashMap<ToolInvocationKey, String>,
+}
+
 /// 取消/关停控制状态.
 #[allow(dead_code)]
 pub struct ControlState {
@@ -584,12 +622,54 @@ pub struct ControlState {
     pub shutdown: CancellationToken,
     /// 是否正在生成（用于 CancelRequested 分支判断）
     pub generating: bool,
-    /// S2.5 P1-B: 本轮累积的 tool_calls — ToolStarted/Finished 期间累积，
-    /// RecordAssistantTurn 用 mem::take 回填到 session.turns.last_mut().tool_calls.
-    pub current_turn_tool_calls: Vec<crate::chat::session::ToolCallSummary>,
-    /// S2.5 P1-B: ToolStarted 的 args_preview 暂存 — ToolFinished 时 remove 并 push
-    /// 到 current_turn_tool_calls（key 用 tool name，回避 ToolStarted 缺 id 的局限）.
-    pub current_turn_tool_args: std::collections::HashMap<String, String>,
+    /// P3a: tool state is keyed by turn task so concurrent visible workers do
+    /// not share running card indices, argument previews, or persisted summaries.
+    pub tool_buffers: std::collections::HashMap<ToolTaskKey, TaskToolBuffer>,
+}
+
+impl ControlState {
+    fn tool_buffer_mut(&mut self, key: ToolTaskKey) -> &mut TaskToolBuffer {
+        self.tool_buffers.entry(key).or_default()
+    }
+
+    fn take_tool_calls(&mut self, key: ToolTaskKey) -> Vec<crate::chat::session::ToolCallSummary> {
+        let Some(buffer) = self.tool_buffers.get_mut(&key) else {
+            return Vec::new();
+        };
+        let calls = std::mem::take(&mut buffer.tool_calls);
+        buffer.tool_args.clear();
+        let remove_buffer =
+            buffer.pending_tool_cards.is_empty() && buffer.tool_calls.is_empty() && buffer.tool_args.is_empty();
+        if remove_buffer {
+            self.tool_buffers.remove(&key);
+        }
+        calls
+    }
+
+    fn clear_tool_buffer(&mut self, key: ToolTaskKey) {
+        self.tool_buffers.remove(&key);
+    }
+
+    fn clear_all_tool_buffers(&mut self) {
+        self.tool_buffers.clear();
+    }
+
+    #[cfg(test)]
+    fn pending_tool_card_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers
+            .get(&key)
+            .map_or(0, |buffer| buffer.pending_tool_cards.len())
+    }
+
+    #[cfg(test)]
+    fn tool_call_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers.get(&key).map_or(0, |buffer| buffer.tool_calls.len())
+    }
+
+    #[cfg(test)]
+    fn tool_arg_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers.get(&key).map_or(0, |buffer| buffer.tool_args.len())
+    }
 }
 
 // ─── ChatState ────────────────────────────────────────────────────────────────
@@ -681,14 +761,12 @@ impl ChatState {
             },
             stream: StreamState {
                 visible_drafts: Vec::new(),
-                pending_tool_cards: Vec::new(),
             },
             control: ControlState {
                 active_cancel: None,
                 shutdown,
                 generating: false,
-                current_turn_tool_calls: Vec::new(),
-                current_turn_tool_args: std::collections::HashMap::new(),
+                tool_buffers: std::collections::HashMap::new(),
             },
             #[cfg(feature = "terminal-tui")]
             cached_lines_arc: None,
@@ -946,17 +1024,29 @@ impl ChatState {
             Action::StreamCancelled { draft_id } => self.reduce_stream_cancelled(&draft_id),
 
             // ── 工具事件 (Step 3) ─────────────────────────────────
-            Action::ToolStarted { name, args } => self.reduce_tool_started(name, args),
+            Action::ToolStarted {
+                task_id,
+                sequence,
+                tool_call_id,
+                name,
+                args,
+            } => self.reduce_tool_started(task_id, sequence, tool_call_id, name, args),
             Action::ToolFinished {
+                task_id,
+                sequence,
+                tool_call_id,
                 name,
                 success,
                 duration_ms,
                 result,
-            } => self.reduce_tool_finished(name, success, duration_ms, result),
+            } => self.reduce_tool_finished(task_id, sequence, tool_call_id, name, success, duration_ms, result),
             Action::ToolProgress { iteration, max } => self.reduce_tool_progress(iteration, max),
-            Action::ToolApprovalRequested { tool_id, name, args } => {
-                self.reduce_tool_approval_requested(tool_id, name, args)
-            }
+            Action::ToolApprovalRequested {
+                task_id,
+                tool_id,
+                name,
+                args,
+            } => self.reduce_tool_approval_requested(task_id, tool_id, name, args),
             Action::ToolApprovalReceived { tool_id, approved } => {
                 self.reduce_tool_approval_received(&tool_id, approved)
             }
@@ -968,7 +1058,7 @@ impl ChatState {
             Action::SessionSaved { id } => self.reduce_session_saved(id),
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
             Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
-            Action::RecordAssistantTurn(content) => self.reduce_record_assistant_turn(content),
+            Action::RecordAssistantTurn { task_id, content } => self.reduce_record_assistant_turn(task_id, content),
             Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
             Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),
 
@@ -1253,10 +1343,9 @@ impl ChatState {
         let log_msg = format!("input_submitted len={}", text.chars().count());
         self.ui.last_submitted = Some(text);
         self.ui.input.clear();
-        // S2.5 P1-B: 兜底清理本轮 tool_calls 缓冲（幂等：新一轮 turn 入口前清空，
-        // 防御上一轮 stream 异常终止时未走 Completed/Cancelled/Failed 清理路径）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        // Legacy main-turn entry only clears the Primary tool bucket; keyed
+        // worker buckets must survive until their own terminal event.
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -1455,10 +1544,23 @@ impl ChatState {
         });
     }
 
+    #[must_use]
+    fn sequence_for_tool_key(&self, key: ToolTaskKey) -> Option<u64> {
+        let ToolTaskKey::Task(task_id) = key else {
+            return None;
+        };
+        self.stream
+            .visible_drafts
+            .iter()
+            .find(|draft| draft.task_id == Some(task_id))
+            .map(|draft| draft.sequence)
+    }
+
     /// `Action::TurnStarted` — 初始化 streaming draft + 注册取消令牌.
     #[cfg(feature = "terminal-tui")]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
         self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
         self.control.active_cancel = Some(cancel);
         self.control.generating = true;
         vec![
@@ -1473,6 +1575,7 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
         self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
         self.control.active_cancel = Some(cancel);
         self.control.generating = true;
         vec![
@@ -1512,6 +1615,8 @@ impl ChatState {
             draft_id.clone(),
             Self::prompt_preview_from_history(&history),
         );
+        self.control
+            .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
@@ -1555,6 +1660,8 @@ impl ChatState {
             draft_id.clone(),
             Self::prompt_preview_from_history(&history),
         );
+        self.control
+            .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
         self.control.active_cancel = Some(cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
@@ -1634,12 +1741,13 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
-        if self.stream.remove_visible_draft(draft_id).is_none() {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
-        }
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.remove_pending_tool_cards(tool_key);
         if no_visible_drafts {
-            self.remove_pending_tool_cards();
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -1669,23 +1777,21 @@ impl ChatState {
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ];
-        // S2.5 P1-B: 兜底清理本轮 tool 缓冲（RecordAssistantTurn 正常已 mem::take 清空，
-        // 此处防御 driver 漏发 RecordAssistantTurn 的边缘情况）.
-        if no_visible_drafts {
-            self.control.current_turn_tool_calls.clear();
-            self.control.current_turn_tool_args.clear();
-        }
+        // Fallback for drivers that miss RecordAssistantTurn: only the completed
+        // task's buffer is discarded.
+        self.control.clear_tool_buffer(tool_key);
         effects
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
-        if self.stream.remove_visible_draft(draft_id).is_none() {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
-        }
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.remove_pending_tool_cards(tool_key);
         if no_visible_drafts {
-            self.remove_pending_tool_cards();
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -1707,11 +1813,7 @@ impl ChatState {
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ];
-        // S2.5 P1-B: 同 terminal-tui 分支兜底清理.
-        if no_visible_drafts {
-            self.control.current_turn_tool_calls.clear();
-            self.control.current_turn_tool_args.clear();
-        }
+        self.control.clear_tool_buffer(tool_key);
         effects
     }
 
@@ -1722,26 +1824,22 @@ impl ChatState {
     /// retryable 字段由 EffectExecutor 上层（chat::run 主循环重试逻辑）观察决定是否重发；
     /// hook 一律触发，因为对外可见的"本轮失败"是确定事件。
     fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
-        if self.stream.remove_visible_draft(draft_id).is_none() {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
-        }
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         let no_visible_drafts = !self.stream.has_visible_drafts();
         let orphan_user_removed = if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn()
         } else {
             false
         };
+        self.finalize_pending_tool_cards(tool_key, false, Some("turn failed before tool finish event"));
         if no_visible_drafts {
-            self.finalize_pending_tool_cards(false, Some("turn failed before tool finish event"));
             self.control.active_cancel = None;
             self.control.generating = false;
         }
-        // S2.5 P1-B: stream 失败丢弃本轮 tool 缓冲（无 RecordAssistantTurn 可回填，
-        // 失败后本轮 tool_calls 不可信，下轮入口由 reduce_input_submitted 兜底再清一次）.
-        if no_visible_drafts {
-            self.control.current_turn_tool_calls.clear();
-            self.control.current_turn_tool_args.clear();
-        }
+        self.control.clear_tool_buffer(tool_key);
         #[cfg(feature = "terminal-tui")]
         self.ui
             .conversation_lines
@@ -1770,21 +1868,18 @@ impl ChatState {
 
     /// `Action::StreamCancelled` — 用户主动取消，仅清除 draft.
     fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
-        if self.stream.remove_visible_draft(draft_id).is_none() {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
-        }
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.finalize_pending_tool_cards(tool_key, false, Some("turn cancelled before tool finish event"));
         if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn();
-            self.finalize_pending_tool_cards(false, Some("turn cancelled before tool finish event"));
             self.control.active_cancel = None;
             self.control.generating = false;
         }
-        // S2.5 P1-B: cancel 丢弃本轮 tool 缓冲（同 failed 路径语义）.
-        if no_visible_drafts {
-            self.control.current_turn_tool_calls.clear();
-            self.control.current_turn_tool_args.clear();
-        }
+        self.control.clear_tool_buffer(tool_key);
         vec![Effect::RequestRedraw]
     }
 
@@ -1813,10 +1908,15 @@ impl ChatState {
     }
 
     #[cfg(feature = "terminal-tui")]
-    fn remove_pending_tool_cards(&mut self) {
+    fn remove_pending_tool_cards(&mut self, key: ToolTaskKey) {
         use crate::chat::tui::{ConversationLine, ToolStatus};
 
-        let mut indices: Vec<usize> = self.stream.pending_tool_cards.drain(..).collect();
+        let mut indices = self
+            .control
+            .tool_buffers
+            .get_mut(&key)
+            .map(|buffer| buffer.pending_tool_cards.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
         indices.sort_unstable_by(|a, b| b.cmp(a));
         indices.dedup();
         for idx in indices {
@@ -1833,15 +1933,20 @@ impl ChatState {
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn remove_pending_tool_cards(&mut self) {
-        self.stream.pending_tool_cards.clear();
+    fn remove_pending_tool_cards(&mut self, key: ToolTaskKey) {
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&key) {
+            buffer.pending_tool_cards.clear();
+        }
     }
 
     #[cfg(feature = "terminal-tui")]
-    fn finalize_pending_tool_cards(&mut self, success: bool, fallback_result: Option<&'static str>) {
+    fn finalize_pending_tool_cards(&mut self, key: ToolTaskKey, success: bool, fallback_result: Option<&'static str>) {
         use crate::chat::tui::{ConversationLine, ToolStatus};
 
-        for idx in self.stream.pending_tool_cards.drain(..) {
+        let Some(buffer) = self.control.tool_buffers.get_mut(&key) else {
+            return;
+        };
+        for idx in buffer.pending_tool_cards.drain(..) {
             let Some(ConversationLine::ToolResult {
                 status,
                 result,
@@ -1867,21 +1972,37 @@ impl ChatState {
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn finalize_pending_tool_cards(&mut self, _success: bool, _fallback_result: Option<&'static str>) {
-        self.stream.pending_tool_cards.clear();
+    fn finalize_pending_tool_cards(
+        &mut self,
+        key: ToolTaskKey,
+        _success: bool,
+        _fallback_result: Option<&'static str>,
+    ) {
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&key) {
+            buffer.pending_tool_cards.clear();
+        }
     }
 
     /// `Action::ToolStarted` — 追加 Running 状态的 ToolResult 卡片 + 记录索引.
     #[cfg(feature = "terminal-tui")]
-    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
+    fn reduce_tool_started(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        _sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
         use crate::chat::tui::{
             ARGS_PREVIEW_ELLIPSIS, ARGS_PREVIEW_MAX_CHARS, ConversationLine, ToolStatus, build_tool_args_preview,
         };
         let args_preview = build_tool_args_preview(&name, &args, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
-        // S2.5 P1-B: 暂存 args_preview，ToolFinished 时取出 push 到 current_turn_tool_calls.
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
         self.control
-            .current_turn_tool_args
-            .insert(name.clone(), args_preview.clone());
+            .tool_buffer_mut(tool_key)
+            .tool_args
+            .insert(invocation_key, args_preview.clone());
         self.ui.conversation_lines.push(ConversationLine::ToolResult {
             tool_name: name,
             args_preview,
@@ -1892,24 +2013,35 @@ impl ChatState {
             folded: true,
         });
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
-        self.stream.pending_tool_cards.push(idx);
+        self.control.tool_buffer_mut(tool_key).pending_tool_cards.push(idx);
         self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
-        // S2.5 P1-B: 占位 feature 下也累积 args_preview，便于 parity 测试在两种 feature 走通.
+    fn reduce_tool_started(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        _sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
         let args_preview = if args.chars().count() > 80 {
             let prefix: String = args.chars().take(80).collect();
             format!("{prefix}…")
         } else {
             args.clone()
         };
-        self.control.current_turn_tool_args.insert(name.clone(), args_preview);
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        self.control
+            .tool_buffer_mut(tool_key)
+            .tool_args
+            .insert(invocation_key, args_preview);
         self.ui.conversation_lines.push(format!("tool_started:{name}:{args}"));
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
-        self.stream.pending_tool_cards.push(idx);
+        self.control.tool_buffer_mut(tool_key).pending_tool_cards.push(idx);
         vec![Effect::RequestRedraw]
     }
 
@@ -1917,6 +2049,9 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_tool_finished(
         &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
@@ -1924,30 +2059,35 @@ impl ChatState {
     ) -> Vec<Effect> {
         use crate::chat::session::ToolCallSummary;
         use crate::chat::tui::{ConversationLine, ToolStatus};
-        // S2.5 P1-B: 取出 ToolStarted 暂存的 args_preview（没有则空串，例如 driver
-        // 在 supervised 模式下漏发 ToolStarted 的边缘情况），push 到本轮累积列表.
-        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
-        self.control.current_turn_tool_calls.push(ToolCallSummary {
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let sequence = sequence.or_else(|| self.sequence_for_tool_key(tool_key));
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        let buffer = self.control.tool_buffer_mut(tool_key);
+        let args_preview = buffer.tool_args.remove(&invocation_key).unwrap_or_default();
+        buffer.tool_calls.push(ToolCallSummary {
             name: name.clone(),
             args_preview,
             success,
+            task_id: task_id.map(crate::chat::turn_scheduler::TurnTaskId::get),
+            sequence,
         });
         // 第 1 步：从 pending_tool_cards 反向查找最近一个 name 匹配 + Running 的卡片
         // （只借用 conversation_lines，不持 mut 引用，避免 result 跨循环 move 冲突）
-        let target_pos = self
-            .stream
-            .pending_tool_cards
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(pos, &idx)| match self.ui.conversation_lines.get(idx) {
-                Some(ConversationLine::ToolResult { tool_name, status, .. })
-                    if tool_name == &name && *status == ToolStatus::Running =>
-                {
-                    Some((pos, idx))
-                }
-                _ => None,
-            });
+        let target_pos = self.control.tool_buffers.get(&tool_key).and_then(|buffer| {
+            buffer
+                .pending_tool_cards
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(pos, &idx)| match self.ui.conversation_lines.get(idx) {
+                    Some(ConversationLine::ToolResult { tool_name, status, .. })
+                        if tool_name == &name && *status == ToolStatus::Running =>
+                    {
+                        Some((pos, idx))
+                    }
+                    _ => None,
+                })
+        });
         // 第 2 步：找到目标后再做 mut 更新 + 从 pending 移除
         if let Some((pending_pos, line_idx)) = target_pos {
             if let Some(ConversationLine::ToolResult {
@@ -1961,7 +2101,9 @@ impl ChatState {
                 *elapsed_ms = Some(duration_ms);
                 *result_slot = result;
             }
-            self.stream.pending_tool_cards.remove(pending_pos);
+            if let Some(buffer) = self.control.tool_buffers.get_mut(&tool_key) {
+                buffer.pending_tool_cards.remove(pending_pos);
+            }
         }
         self.refresh_provider_worker_view_if_focused();
         vec![
@@ -1976,22 +2118,32 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_tool_finished(
         &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
         _result: Option<String>,
     ) -> Vec<Effect> {
         use crate::chat::session::ToolCallSummary;
-        // S2.5 P1-B: 同 terminal-tui 分支，回填本轮累积列表.
-        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
-        self.control.current_turn_tool_calls.push(ToolCallSummary {
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let sequence = sequence.or_else(|| self.sequence_for_tool_key(tool_key));
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        let buffer = self.control.tool_buffer_mut(tool_key);
+        let args_preview = buffer.tool_args.remove(&invocation_key).unwrap_or_default();
+        buffer.tool_calls.push(ToolCallSummary {
             name: name.clone(),
             args_preview,
             success,
+            task_id: task_id.map(crate::chat::turn_scheduler::TurnTaskId::get),
+            sequence,
         });
         // 占位 feature 下仅记录 + 弹出最后一个 pending 索引
-        if !self.stream.pending_tool_cards.is_empty() {
-            self.stream.pending_tool_cards.pop();
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&tool_key)
+            && !buffer.pending_tool_cards.is_empty()
+        {
+            buffer.pending_tool_cards.pop();
         }
         vec![
             Effect::RequestRedraw,
@@ -2026,8 +2178,15 @@ impl ChatState {
     /// 等响应（dispatcher 把 `ToolApprovalReceived` 转写到 driver 的接收 channel）。
     /// reducer only owns display state. The driver/router remains the single
     /// approval owner and execution gate.
-    fn reduce_tool_approval_requested(&mut self, tool_id: String, name: String, args: String) -> Vec<Effect> {
+    fn reduce_tool_approval_requested(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_id: String,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
         self.ui.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            task_id,
             tool_id: tool_id.clone(),
             name: name.clone(),
             args: args.clone(),
@@ -2039,7 +2198,12 @@ impl ChatState {
                 level: tracing::Level::DEBUG,
                 msg: format!("tool_approval_requested tool_id={tool_id} name={name}"),
             },
-            Effect::RequestApproval { tool_id, name, args },
+            Effect::RequestApproval {
+                task_id,
+                tool_id,
+                name,
+                args,
+            },
         ]
     }
 
@@ -2118,14 +2282,13 @@ impl ChatState {
         if let Some(draft_id) = draft_id_opt.as_deref() {
             let _ = self.stream.remove_visible_draft(draft_id);
         }
-        self.finalize_pending_tool_cards(false, Some("turn cancelled by cancel request"));
+        self.finalize_pending_tool_cards(ToolTaskKey::Primary, false, Some("turn cancelled by cancel request"));
         self.control.generating = false;
         let pending_approval = self.ui.pending_tool_approval.take();
         if pending_approval.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
             self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         }
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
 
         let mut effects = Vec::new();
         // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
@@ -2237,11 +2400,9 @@ impl ChatState {
         self.ui.slash_menu = None;
         self.ui.saved_session_picker = None;
         self.stream.clear_visible_drafts();
-        self.stream.pending_tool_cards.clear();
+        self.control.clear_all_tool_buffers();
         self.control.generating = false;
         self.control.active_cancel = None;
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -2340,15 +2501,18 @@ impl ChatState {
         }]
     }
 
-    /// `Action::RecordAssistantTurn(text)` — 请求 reducer 持久化助手回合到 session 记录和 LLM history.
+    /// `Action::RecordAssistantTurn` — 请求 reducer 持久化助手回合到 session 记录和 LLM history.
     ///
     /// 对齐 `session.add_assistant_turn` 语义：
     /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
-    /// - S2.5 P1-B: tool_calls 由 reducer 内 ControlState.current_turn_tool_calls
-    ///   缓冲 mem::take 回填（关闭原 FIXME(S2.5)，方案 C reducer 回填，不改 Action 签名）.
-    fn reduce_record_assistant_turn(&mut self, content: String) -> Vec<Effect> {
-        let tool_calls = std::mem::take(&mut self.control.current_turn_tool_calls);
-        self.control.current_turn_tool_args.clear();
+    /// - P3a: tool_calls come from the matching task bucket. Legacy callers use
+    ///   the Primary bucket, so main transcript behavior stays unchanged.
+    fn reduce_record_assistant_turn(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        content: String,
+    ) -> Vec<Effect> {
+        let tool_calls = self.control.take_tool_calls(ToolTaskKey::from_task_id(task_id));
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "assistant".to_string(),
             content: content.clone(),
@@ -3046,7 +3210,7 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // compaction feedback is `SystemMessageAdded`; budget UI refresh is
         // `ContextWindowUpdated`, so the history patch itself is not snapshot-dirty.
         Action::RecordUserTurn(_)
-        | Action::RecordAssistantTurn(_)
+        | Action::RecordAssistantTurn { .. }
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. }
@@ -3145,7 +3309,7 @@ mod tests {
     fn test_chatstate_new_default_stream() {
         let state = make_state();
         assert!(state.stream.primary_streaming_draft().is_none());
-        assert!(state.stream.pending_tool_cards.is_empty());
+        assert!(state.control.tool_buffers.is_empty());
     }
 
     /// v1b: SessionsStatusUpdated 写入 ui.sessions_status 并经快照反映；相同内容 no-op.
@@ -3823,6 +3987,7 @@ mod tests {
     fn tool_approval_requested_opens_approval_child_view() {
         let mut state = make_state();
         let effects = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-approve".to_string(),
             name: "shell".to_string(),
             args: r#"{"cmd":"printf secure"}"#.to_string(),
@@ -3850,6 +4015,7 @@ mod tests {
     fn tool_approval_received_closes_approval_child_view() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-deny".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -3872,6 +4038,7 @@ mod tests {
             cancel: CancellationToken::new(),
         });
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-esc-deny".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -3945,6 +4112,7 @@ mod tests {
             cancel: CancellationToken::new(),
         });
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-cancel-deny".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -3973,6 +4141,7 @@ mod tests {
     fn tool_approval_focus_paste_does_not_edit_input() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-paste".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -3988,6 +4157,7 @@ mod tests {
     fn session_loaded_resets_transient_holder_set() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-stale".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -4951,6 +5121,9 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"command":"sleep 10"}"#.to_string(),
             });
@@ -4959,7 +5132,7 @@ mod tests {
                 draft_id: "d-tool-cancel".to_string(),
             });
 
-            assert!(state.stream.pending_tool_cards.is_empty());
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
             assert!(
                 !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
                 "cancelled turn must not leave a running tool card driving the status bar"
@@ -4986,13 +5159,16 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"command":"sleep 10"}"#.to_string(),
             });
 
             let _ = state.reduce(Action::CancelRequested);
 
-            assert!(state.stream.pending_tool_cards.is_empty());
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
             assert!(
                 !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
                 "cancel request must not leave a running tool card driving the status bar"
@@ -5020,6 +5196,9 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"command":"sleep 10"}"#.to_string(),
             });
@@ -5030,7 +5209,7 @@ mod tests {
                 reasoning: String::new(),
             });
 
-            assert!(state.stream.pending_tool_cards.is_empty());
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
             assert!(
                 !state
                     .ui
@@ -5144,7 +5323,10 @@ mod tests {
                 draft_id: "d-ok".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("real answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "real answer".to_string(),
+            });
             let completion_effects = state.reduce(Action::StreamCompleted {
                 draft_id: "d-ok".to_string(),
                 final_text: "real answer".to_string(),
@@ -5205,12 +5387,15 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let effects = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(state.ui.conversation_lines.len(), 1);
-            assert_eq!(state.stream.pending_tool_cards.len(), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 1);
             if let Some(ConversationLine::ToolResult { tool_name, status, .. }) = state.ui.conversation_lines.last() {
                 assert_eq!(tool_name, "shell");
                 assert_eq!(*status, ToolStatus::Running);
@@ -5225,17 +5410,27 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             let effects = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: true,
                 duration_ms: 42,
                 result: Some("ok".to_string()),
             });
             assert!(has_request_redraw(&effects));
-            assert!(state.stream.pending_tool_cards.is_empty(), "pending 应被清空");
+            assert_eq!(
+                state.control.pending_tool_card_count(ToolTaskKey::Primary),
+                0,
+                "pending 应被清空"
+            );
             if let Some(ConversationLine::ToolResult {
                 status,
                 elapsed_ms,
@@ -5257,10 +5452,16 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: false,
                 duration_ms: 10,
@@ -5814,7 +6015,10 @@ mod tests {
         fn test_redux_record_assistant_turn_grows_history() {
             let mut state = s();
             let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
-            let effects = state.reduce(Action::RecordAssistantTurn("Rust is fast.".to_string()));
+            let effects = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "Rust is fast.".to_string(),
+            });
             assert_eq!(state.session.turns.len(), 2, "turns 增长至 2");
             assert_eq!(state.session.history.len(), 2, "history 增长至 2");
             assert_eq!(
@@ -6183,7 +6387,10 @@ mod tests {
                 patch,
                 compaction_config: config,
             });
-            let _ = state.reduce(Action::RecordAssistantTurn(assistant_reply.to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: assistant_reply.to_string(),
+            });
 
             assert_eq!(
                 state.session.turns.len(),
@@ -7048,7 +7255,10 @@ mod tests {
                 draft_id: "draft-T3-3c".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "answer".to_string(),
+            });
             let effects = state.reduce(Action::StreamCompleted {
                 draft_id: "draft-T3-3c".to_string(),
                 final_text: "answer".to_string(),
@@ -7138,7 +7348,10 @@ mod tests {
                 draft_id: "d-fwd".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state_a.reduce(Action::RecordAssistantTurn("a-fwd".to_string()));
+            let _ = state_a.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a-fwd".to_string(),
+            });
             let fwd_effects = state_a.reduce(Action::StreamCompleted {
                 draft_id: "d-fwd".to_string(),
                 final_text: "a-fwd".to_string(),
@@ -7168,7 +7381,10 @@ mod tests {
                 final_text: "a-rev".to_string(),
                 reasoning: String::new(),
             });
-            let _ = state_b.reduce(Action::RecordAssistantTurn("a-rev".to_string()));
+            let _ = state_b.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a-rev".to_string(),
+            });
             let rev_snap = rev_effects
                 .iter()
                 .find_map(|e| match e {
@@ -7370,10 +7586,16 @@ mod tests {
                 version: 1,
             });
             let _ = state_a.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: "{\"q\":\"openprx\"}".to_string(),
             });
             let _ = state_a.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 42,
@@ -7402,10 +7624,16 @@ mod tests {
                 version: 2,
             });
             let _ = state_b.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: "{\"q\":\"openprx\"}".to_string(),
             });
             let _ = state_b.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 42,
@@ -7442,12 +7670,12 @@ mod tests {
 
             // tool 卡片在两边都已落地，且 ToolFinished 后已从 pending 移除
             assert_eq!(
-                state_a.stream.pending_tool_cards.len(),
-                state_b.stream.pending_tool_cards.len(),
+                state_a.control.pending_tool_card_count(ToolTaskKey::Primary),
+                state_b.control.pending_tool_card_count(ToolTaskKey::Primary),
                 "两个序列 pending_tool_cards 数量必须一致"
             );
             assert!(
-                state_a.stream.pending_tool_cards.is_empty(),
+                state_a.control.pending_tool_card_count(ToolTaskKey::Primary) == 0,
                 "ToolFinished 后 pending_tool_cards 应清空"
             );
 
@@ -7702,7 +7930,10 @@ mod tests {
                     legacy.add_user_turn(text);
                 } else {
                     // 测试输入闭包所有 role 都是 "user" / "assistant"，else 分支即 assistant
-                    let _ = state.reduce(Action::RecordAssistantTurn(text.to_string()));
+                    let _ = state.reduce(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: text.to_string(),
+                    });
                     legacy.add_assistant_turn(text, Vec::new());
                 }
             }
@@ -7762,7 +7993,10 @@ mod tests {
             }
 
             // 4) RecordAssistantTurn → append assistant
-            let _ = state.reduce(Action::RecordAssistantTurn("a1".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a1".to_string(),
+            });
             legacy.push(ChatMessage::assistant("a1"));
 
             // 5) RecordSystemMessage → append system 到末尾（/clear 后场景）
@@ -7801,7 +8035,10 @@ mod tests {
             assert_eq!(state.session.turns.len(), 1);
             assert_eq!(state.session.history.len(), 1, "history 也应同步增长（reducer 单写）");
 
-            let _ = state.reduce(Action::RecordAssistantTurn("hi back".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "hi back".to_string(),
+            });
             assert_eq!(state.session.turns.len(), 2, "user + assistant 两条，无重复");
             assert_eq!(state.session.history.len(), 2, "history 也应是 user+assistant 两条");
 
@@ -8152,7 +8389,10 @@ mod tests {
             assert_eq!(state.session.turns.len(), 1, "session.turns 也应增长（user）");
 
             // RecordAssistantTurn → append assistant
-            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r1".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "assistant-r1".to_string(),
+            });
             assert_eq!(state.session.history.len(), 3);
             let h2 = state.session.history.get(2).expect("test: history[2] = assistant");
             assert_eq!(h2.role, "assistant");
@@ -8161,7 +8401,10 @@ mod tests {
 
             // 再来一轮 — 顺序应仍稳定 system, user, assistant, user, assistant
             let _ = state.reduce(Action::RecordUserTurn("user-q2".to_string()));
-            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r2".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "assistant-r2".to_string(),
+            });
             assert_eq!(state.session.history.len(), 5);
             let roles: Vec<&str> = state.session.history.iter().map(|m| m.role.as_str()).collect();
             assert_eq!(
@@ -8361,16 +8604,25 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: true,
                 duration_ms: 12,
                 result: Some("ok".to_string()),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "answer".to_string(),
+            });
 
             let last = state.session.turns.last().expect("test: assistant turn");
             assert_eq!(last.role, "assistant");
@@ -8381,8 +8633,7 @@ mod tests {
             assert_eq!(call.args_preview, r#"{"cmd":"ls"}"#);
 
             // 回填后 ControlState 缓冲必须清空（mem::take + clear）.
-            assert!(state.control.current_turn_tool_calls.is_empty());
-            assert!(state.control.current_turn_tool_args.is_empty());
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
         }
 
         /// S2.5 P1-B: 多个 tool 在同一 turn 内按顺序聚合.
@@ -8396,17 +8647,26 @@ mod tests {
             for (i, ok) in [(1u8, true), (2, false), (3, true)] {
                 let name = format!("tool{i}");
                 let _ = state.reduce(Action::ToolStarted {
+                    task_id: None,
+                    sequence: None,
+                    tool_call_id: None,
                     name: name.clone(),
                     args: format!("args-{i}"),
                 });
                 let _ = state.reduce(Action::ToolFinished {
+                    task_id: None,
+                    sequence: None,
+                    tool_call_id: None,
                     name,
                     success: ok,
                     duration_ms: 10,
                     result: None,
                 });
             }
-            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a".to_string(),
+            });
 
             let last = state.session.turns.last().expect("test: assistant turn");
             assert_eq!(last.tool_calls.len(), 3);
@@ -8432,31 +8692,46 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "leftover".to_string(),
                 args: "x".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "leftover".to_string(),
                 success: true,
                 duration_ms: 1,
                 result: None,
             });
-            assert_eq!(state.control.current_turn_tool_calls.len(), 1);
+            assert_eq!(
+                state
+                    .control
+                    .tool_buffers
+                    .get(&ToolTaskKey::Primary)
+                    .map_or(0, |buffer| buffer.tool_calls.len()),
+                1
+            );
             let _ = state.reduce(Action::StreamCompleted {
                 draft_id: "d-p1b-3a".to_string(),
                 final_text: "x".to_string(),
                 reasoning: String::new(),
             });
             // StreamCompleted 兜底 clear 后缓冲为空.
-            assert!(state.control.current_turn_tool_calls.is_empty());
-            assert!(state.control.current_turn_tool_args.is_empty());
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
 
             // Turn 2：RecordAssistantTurn 应得到空 tool_calls（未被 Turn 1 残留污染）.
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d-p1b-3b".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("clean".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "clean".to_string(),
+            });
             let last = state.session.turns.last().expect("test: turn 2 assistant");
             assert_eq!(last.tool_calls.len(), 0, "Turn 2 不能继承 Turn 1 残留 tool_calls");
         }
@@ -8470,22 +8745,28 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "partial".to_string(),
                 args: "...".to_string(),
             });
             // 此时 args 暂存有内容
-            assert_eq!(state.control.current_turn_tool_args.len(), 1);
+            assert_eq!(
+                state
+                    .control
+                    .tool_buffers
+                    .get(&ToolTaskKey::Primary)
+                    .map_or(0, |buffer| buffer.tool_args.len()),
+                1
+            );
 
             let _ = state.reduce(Action::StreamCancelled {
                 draft_id: "d-p1b-4".to_string(),
             });
             assert!(
-                state.control.current_turn_tool_calls.is_empty(),
+                !state.control.tool_buffers.contains_key(&ToolTaskKey::Primary),
                 "cancel 后缓冲必须清空"
-            );
-            assert!(
-                state.control.current_turn_tool_args.is_empty(),
-                "cancel 后 args 暂存必须清空"
             );
 
             // 同理验证 StreamFailed.
@@ -8495,6 +8776,9 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state2.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "partial2".to_string(),
                 args: "...".to_string(),
             });
@@ -8503,8 +8787,7 @@ mod tests {
                 err: "timeout".to_string(),
                 retryable: true,
             });
-            assert!(state2.control.current_turn_tool_calls.is_empty());
-            assert!(state2.control.current_turn_tool_args.is_empty());
+            assert!(!state2.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
         }
 
         /// S2.5 P1-B: 扩展 fixB C1 parity 模式 — RecordAssistantTurn 后
@@ -8521,26 +8804,41 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: r#"{"q":"x"}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 5,
                 result: Some("hit".to_string()),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "fetch".to_string(),
                 args: "url".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "fetch".to_string(),
                 success: false,
                 duration_ms: 30,
                 result: Some("404".to_string()),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("done".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "done".to_string(),
+            });
             let _ = state.reduce(Action::StreamCompleted {
                 draft_id: "d-parity".to_string(),
                 final_text: "done".to_string(),
@@ -8576,6 +8874,208 @@ mod tests {
                 2,
                 "build_session_snapshot 落盘的 turns 必须携带 tool_calls"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod p3a_task_aware_tool_buffers {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskId};
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn task_pair() -> ((TurnTaskId, u64), (TurnTaskId, u64)) {
+            let mut scheduler = TurnScheduler::new();
+            let a = scheduler.enqueue("a", TurnPriority::Normal, 0);
+            let b = scheduler.enqueue("b", TurnPriority::Normal, 0);
+            let a_seq = scheduler.task(a).expect("test: task a").sequence;
+            let b_seq = scheduler.task(b).expect("test: task b").sequence;
+            ((a, a_seq), (b, b_seq))
+        }
+
+        fn start_task(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, draft_id: &str) {
+            let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: Vec::new(),
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+        }
+
+        fn start_tool(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, name: &str, args: &str) {
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: Some(task_id),
+                sequence: Some(sequence),
+                tool_call_id: None,
+                name: name.to_string(),
+                args: args.to_string(),
+            });
+        }
+
+        fn finish_tool(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, name: &str, success: bool) {
+            let _ = state.reduce(Action::ToolFinished {
+                task_id: Some(task_id),
+                sequence: Some(sequence),
+                tool_call_id: None,
+                name: name.to_string(),
+                success,
+                duration_ms: 7,
+                result: Some(format!("{name}-result")),
+            });
+        }
+
+        #[test]
+        fn p3a_cancelled_task_finalizes_only_its_tool_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "shell", r#"{"cmd":"sleep 1"}"#);
+            start_tool(&mut state, task_b, seq_b, "grep", r#"{"q":"needle"}"#);
+
+            let _ = state.reduce(Action::StreamCancelled {
+                draft_id: "draft-a".to_string(),
+            });
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_a)), 0);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Running,
+                        ..
+                    } if tool_name == "grep"
+                )),
+                "task B running tool card must survive task A cancellation"
+            );
+        }
+
+        #[test]
+        fn p3a_completed_task_clears_only_matching_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "search", r#"{"q":"a"}"#);
+            finish_tool(&mut state, task_a, seq_a, "search", true);
+            start_tool(&mut state, task_b, seq_b, "fetch", r#"{"url":"b"}"#);
+
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "a done".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_a)), 0);
+            assert_eq!(state.control.tool_arg_count(ToolTaskKey::Task(task_b)), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+        }
+
+        #[test]
+        fn p3a_record_assistant_turn_drains_only_requested_task_calls() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "search", r#"{"q":"a"}"#);
+            finish_tool(&mut state, task_a, seq_a, "search", true);
+            start_tool(&mut state, task_b, seq_b, "fetch", r#"{"url":"b"}"#);
+            finish_tool(&mut state, task_b, seq_b, "fetch", false);
+
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: Some(task_b),
+                content: "b answer".to_string(),
+            });
+
+            let last = state.session.turns.last().expect("test: assistant turn");
+            assert_eq!(last.tool_calls.len(), 1);
+            let call = last.tool_calls.first().expect("test: tool call");
+            assert_eq!(call.name, "fetch");
+            assert!(!call.success);
+            assert_eq!(call.task_id, Some(task_b.get()));
+            assert_eq!(call.sequence, Some(seq_b));
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_a)), 1);
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_b)), 0);
+        }
+
+        #[test]
+        fn p3a_same_tool_name_args_are_isolated_by_task() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "shell", r#"{"cmd":"echo a"}"#);
+            start_tool(&mut state, task_b, seq_b, "shell", r#"{"cmd":"echo b"}"#);
+
+            finish_tool(&mut state, task_b, seq_b, "shell", true);
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_a)), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 0);
+            let b_call = state
+                .control
+                .tool_buffers
+                .get(&ToolTaskKey::Task(task_b))
+                .and_then(|buffer| buffer.tool_calls.first())
+                .expect("test: task b call");
+            assert!(b_call.args_preview.contains("echo b"));
+            assert_eq!(state.control.tool_arg_count(ToolTaskKey::Task(task_a)), 1);
+
+            finish_tool(&mut state, task_a, seq_a, "shell", true);
+            let a_call = state
+                .control
+                .tool_buffers
+                .get(&ToolTaskKey::Task(task_a))
+                .and_then(|buffer| buffer.tool_calls.first())
+                .expect("test: task a call");
+            assert!(a_call.args_preview.contains("echo a"));
+        }
+
+        #[test]
+        fn p3a_legacy_primary_tool_buffer_path_still_records_tool_calls() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "primary-draft".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                args: r#"{"cmd":"ls"}"#.to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                success: true,
+                duration_ms: 3,
+                result: Some("ok".to_string()),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "primary answer".to_string(),
+            });
+
+            let last = state.session.turns.last().expect("test: primary assistant turn");
+            assert_eq!(last.tool_calls.len(), 1);
+            let call = last.tool_calls.first().expect("test: primary tool call");
+            assert_eq!(call.name, "shell");
+            assert!(call.success);
+            assert_eq!(call.task_id, None);
+            assert_eq!(call.sequence, None);
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
         }
     }
 
@@ -8728,10 +9228,16 @@ mod tests {
             });
             let _ = state.reduce(Action::UserMessageEchoed("hello".to_string()));
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 args: "{\"cmd\":\"ls\"}".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 success: true,
                 duration_ms: 50,
@@ -8879,10 +9385,16 @@ mod tests {
             });
             let _ = state.reduce(Action::UserMessageEchoed("hi".to_string()));
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 args: "{}".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 success: true,
                 duration_ms: 10,
@@ -8974,7 +9486,10 @@ mod tests {
                         draft_id: "d1".to_string(),
                         cancel: CancellationToken::new(),
                     },
-                    Action::RecordAssistantTurn("ok".to_string()),
+                    Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: "ok".to_string(),
+                    },
                     Action::StreamCompleted {
                         draft_id: "d1".to_string(),
                         final_text: "ok".to_string(),

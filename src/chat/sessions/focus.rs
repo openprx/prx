@@ -90,6 +90,7 @@ impl FocusTarget {
 /// human decision back as `Action::ToolApprovalReceived`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingToolApprovalView {
+    pub task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     pub tool_id: String,
     pub name: String,
     pub args: String,

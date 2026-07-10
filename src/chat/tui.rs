@@ -9883,6 +9883,7 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.focus = crate::chat::sessions::FocusTarget::Approval;
         state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            task_id: None,
             tool_id: "call-1".to_string(),
             name: "shell".to_string(),
             args: r#"{"cmd":"echo hi"}"#.to_string(),
@@ -12285,6 +12286,7 @@ mod tests {
         });
         state.focus = crate::chat::sessions::FocusTarget::Approval;
         state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            task_id: None,
             tool_id: "tool-1".to_string(),
             name: "danger_tool".to_string(),
             args: "{\"path\":\"/tmp/demo\"}".to_string(),
@@ -13139,6 +13141,7 @@ mod tests {
         fn s4_a_2_pending_tool_approval_parity() {
             let mut state = make_state_with_lines();
             let pending = crate::chat::sessions::PendingToolApprovalView {
+                task_id: None,
                 tool_id: "call-approval".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"rm -rf /tmp/nope"}"#.to_string(),
@@ -13351,6 +13354,9 @@ mod tests {
         fn s4_a_5_pure_tool_card_appears_in_snapshot() {
             let mut state = ChatState::new(Arc::from("p"), Arc::from("m"), CancellationToken::new());
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 args: "{\"cmd\":\"ls\"}".to_string(),
             });

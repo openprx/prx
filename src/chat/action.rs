@@ -356,9 +356,18 @@ pub enum Action {
 
     // ── 工具事件 ────────────────────────────────────────────────
     /// 工具调用开始
-    ToolStarted { name: String, args: String },
+    ToolStarted {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    },
     /// 工具调用结束
     ToolFinished {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
@@ -372,6 +381,7 @@ pub enum Action {
     /// `tool_id` 即 LLM 给出的 `tool_call_id`，用于将响应 [`Self::ToolApprovalReceived`]
     /// 关联到具体 pending oneshot。
     ToolApprovalRequested {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         tool_id: String,
         name: String,
         args: String,
@@ -403,7 +413,10 @@ pub enum Action {
     /// 请求 reducer 持久化用户回合（写入 session.turns + LLM history）
     RecordUserTurn(String),
     /// 请求 reducer 持久化助手回合（写入 session.turns + LLM history）
-    RecordAssistantTurn(String),
+    RecordAssistantTurn {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        content: String,
+    },
     /// 请求 reducer append 一条 system 消息到 `session.history`（用于 `/clear` 后
     /// 重建 system prompt 等场景）.
     ///
@@ -576,7 +589,7 @@ impl Action {
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",
             Self::RecordUserTurn(_) => "RecordUserTurn",
-            Self::RecordAssistantTurn(_) => "RecordAssistantTurn",
+            Self::RecordAssistantTurn { .. } => "RecordAssistantTurn",
             Self::RecordSystemMessage { .. } => "RecordSystemMessage",
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
             Self::HistoryCompacted { .. } => "HistoryCompacted",

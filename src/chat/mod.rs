@@ -5317,6 +5317,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 .to_string();
                                 let dispatch_result = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::ToolApprovalRequested {
+                                        task_id: None,
                                         tool_id: tool_id.clone(),
                                         name: "rewind_chat_session".to_string(),
                                         args,
@@ -7541,7 +7542,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
         // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
         let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordAssistantTurn(history_response.clone()),
+            crate::chat::action::Action::RecordAssistantTurn {
+                task_id: provider_turn_task_id,
+                content: history_response.clone(),
+            },
             "chat.record_assistant_turn",
         );
 
@@ -11715,6 +11719,7 @@ fn request_diff_apply_approval(
     let args = plan.approval_args_json();
     let dispatch_result = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: tool_id.clone(),
             name: "apply_fenced_diff".to_string(),
             args,
@@ -16351,6 +16356,7 @@ mod regfix_approval_switch_tests {
         {
             let mut mirror = chat_mirror.lock();
             mirror.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+                task_id: None,
                 tool_id: "tool-live".to_string(),
                 name: "shell".to_string(),
                 args: "{}".to_string(),
