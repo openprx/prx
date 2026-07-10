@@ -1117,6 +1117,45 @@ fn s4_a_p1_pure_exit_after_turn_chat_run_level() {
     );
 }
 
+/// P4a: detached Redux turns are finalized by the outer event pump while
+/// visible admission remains N=1. Two sequential turns must complete and exit
+/// cleanly through the same PTY transcript path as the P3c runtime.
+#[test]
+#[serial(prx_chat_pty)]
+fn p4a_event_pump_two_sequential_turns_complete_and_exit() {
+    let sentinel = "[MOCK-P4A-SEQUENTIAL]";
+    let first_message = "p4a first visible turn";
+    let second_message = "p4a second visible turn";
+    let (mut sg, _guard) = spawn_chat(&[], &[("OPENPRX_MOCK_RESPONSE", sentinel)]);
+    let session = sg.session();
+    read_until_with_dsr(session, "mock/mock", STARTUP_TIMEOUT);
+    drain_with_dsr(session, Duration::from_millis(200));
+
+    session
+        .send(format!("{first_message}\r").as_str())
+        .expect("send first turn");
+    let first = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        first.contains(sentinel),
+        "P4a first turn should complete. captured:\n{first}"
+    );
+
+    session
+        .send(format!("{second_message}\r").as_str())
+        .expect("send second turn");
+    let second = read_until_with_dsr(session, sentinel, TURN_TIMEOUT);
+    assert!(
+        second.contains(sentinel),
+        "P4a second sequential turn should complete. captured:\n{second}"
+    );
+
+    session.send("/exit\r").expect("send /exit");
+    assert!(
+        wait_for_exit(session, EXIT_TIMEOUT),
+        "P4a sequential turn session should exit"
+    );
+}
+
 #[test]
 #[ignore = "expectrl/scripted harness does not observe saved sessions reliably in this environment; manual deployed chat-demo and lower-level session tests cover resume persistence"]
 #[serial(prx_chat_pty)]

@@ -1012,9 +1012,7 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
             if trimmed.is_empty() {
                 continue;
             }
-            if trimmed == "/quit" || trimmed == "/exit" {
-                break;
-            }
+            let should_exit_input_loop = trimmed == "/quit" || trimmed == "/exit";
 
             let timestamp = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1039,6 +1037,9 @@ async fn terminal_input_loop(tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
             };
 
             if tx.blocking_send(msg).is_err() {
+                break;
+            }
+            if should_exit_input_loop {
                 break;
             }
         }
