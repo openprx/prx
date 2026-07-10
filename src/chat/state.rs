@@ -625,9 +625,55 @@ pub struct ControlState {
     /// P3a: tool state is keyed by turn task so concurrent visible workers do
     /// not share running card indices, argument previews, or persisted summaries.
     pub tool_buffers: std::collections::HashMap<ToolTaskKey, TaskToolBuffer>,
+    /// P3b: graceful provider cancellation tokens keyed by turn task. Legacy
+    /// Primary callers keep using `active_cancel` until the runtime fully
+    /// migrates away from the pre-scheduler path.
+    pub turn_cancels: std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, CancellationToken>,
 }
 
 impl ControlState {
+    fn register_turn_cancel(&mut self, key: ToolTaskKey, cancel: CancellationToken) {
+        match key {
+            ToolTaskKey::Task(task_id) => {
+                self.turn_cancels.insert(task_id, cancel);
+            }
+            ToolTaskKey::Primary => {
+                self.active_cancel = Some(cancel);
+            }
+        }
+    }
+
+    fn take_turn_cancel(&mut self, key: ToolTaskKey) -> Option<CancellationToken> {
+        match key {
+            ToolTaskKey::Task(task_id) => self.turn_cancels.remove(&task_id),
+            ToolTaskKey::Primary => self.active_cancel.take(),
+        }
+    }
+
+    fn remove_turn_cancel(&mut self, key: ToolTaskKey) {
+        match key {
+            ToolTaskKey::Task(task_id) => {
+                self.turn_cancels.remove(&task_id);
+            }
+            ToolTaskKey::Primary => {
+                self.active_cancel = None;
+            }
+        }
+    }
+
+    fn has_task_turn_cancels(&self) -> bool {
+        !self.turn_cancels.is_empty()
+    }
+
+    fn drain_turn_cancels(&mut self) -> Vec<CancellationToken> {
+        let mut tokens = Vec::new();
+        if let Some(token) = self.active_cancel.take() {
+            tokens.push(token);
+        }
+        tokens.extend(self.turn_cancels.drain().map(|(_, token)| token));
+        tokens
+    }
+
     fn tool_buffer_mut(&mut self, key: ToolTaskKey) -> &mut TaskToolBuffer {
         self.tool_buffers.entry(key).or_default()
     }
@@ -767,6 +813,7 @@ impl ChatState {
                 shutdown,
                 generating: false,
                 tool_buffers: std::collections::HashMap::new(),
+                turn_cancels: std::collections::HashMap::new(),
             },
             #[cfg(feature = "terminal-tui")]
             cached_lines_arc: None,
@@ -1561,7 +1608,7 @@ impl ChatState {
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
         self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
         self.control.clear_tool_buffer(ToolTaskKey::Primary);
-        self.control.active_cancel = Some(cancel);
+        self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
         vec![
             Effect::LogTrace {
@@ -1576,7 +1623,7 @@ impl ChatState {
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
         self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
         self.control.clear_tool_buffer(ToolTaskKey::Primary);
-        self.control.active_cancel = Some(cancel);
+        self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
         vec![
             Effect::LogTrace {
@@ -1617,7 +1664,8 @@ impl ChatState {
         );
         self.control
             .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
-        self.control.active_cancel = Some(cancel.clone());
+        self.control
+            .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
@@ -1662,7 +1710,8 @@ impl ChatState {
         );
         self.control
             .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
-        self.control.active_cancel = Some(cancel.clone());
+        self.control
+            .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
@@ -1745,9 +1794,10 @@ impl ChatState {
             return vec![];
         };
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
         self.remove_pending_tool_cards(tool_key);
-        if no_visible_drafts {
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -1789,9 +1839,10 @@ impl ChatState {
             return vec![];
         };
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
         self.remove_pending_tool_cards(tool_key);
-        if no_visible_drafts {
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -1828,6 +1879,7 @@ impl ChatState {
             return vec![];
         };
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
         let orphan_user_removed = if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn()
@@ -1835,7 +1887,7 @@ impl ChatState {
             false
         };
         self.finalize_pending_tool_cards(tool_key, false, Some("turn failed before tool finish event"));
-        if no_visible_drafts {
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -1872,10 +1924,13 @@ impl ChatState {
             return vec![];
         };
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
         self.finalize_pending_tool_cards(tool_key, false, Some("turn cancelled before tool finish event"));
         if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn();
+        }
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
             self.control.generating = false;
         }
@@ -2276,34 +2331,69 @@ impl ChatState {
             // 空闲时取消无意义 — no-op
             return vec![];
         }
-        // 取出 draft id（如有）+ cancel token（如有）用于 Effect
-        let draft_id_opt = Self::take_draft_id(&self.stream);
-        let cancel_opt = self.control.active_cancel.take();
-        if let Some(draft_id) = draft_id_opt.as_deref() {
-            let _ = self.stream.remove_visible_draft(draft_id);
+        let Some((tool_key, draft_id)) = self.primary_cancel_target() else {
+            return vec![];
+        };
+        self.cancel_task(tool_key, draft_id, "turn cancelled by cancel request")
+    }
+
+    fn primary_cancel_target(&self) -> Option<(ToolTaskKey, String)> {
+        self.stream
+            .primary_draft()
+            .map(|turn| (ToolTaskKey::from_task_id(turn.task_id), turn.draft.draft_id.clone()))
+    }
+
+    fn clear_target_pending_approval(
+        &mut self,
+        tool_key: ToolTaskKey,
+    ) -> Option<crate::chat::sessions::PendingToolApprovalView> {
+        let should_clear = self
+            .ui
+            .pending_tool_approval
+            .as_ref()
+            .is_some_and(|pending| ToolTaskKey::from_task_id(pending.task_id) == tool_key);
+        if !should_clear {
+            return None;
         }
-        self.finalize_pending_tool_cards(ToolTaskKey::Primary, false, Some("turn cancelled by cancel request"));
-        self.control.generating = false;
-        let pending_approval = self.ui.pending_tool_approval.take();
-        if pending_approval.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+        let pending = self.ui.pending_tool_approval.take();
+        if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
             self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         }
-        self.control.clear_tool_buffer(ToolTaskKey::Primary);
+        pending
+    }
+
+    fn cancel_task(&mut self, tool_key: ToolTaskKey, draft_id: String, reason: &'static str) -> Vec<Effect> {
+        let cancel_opt = self.control.take_turn_cancel(tool_key);
+        let _ = self.stream.remove_visible_draft(&draft_id);
+        self.finalize_pending_tool_cards(tool_key, false, Some(reason));
+        self.control.clear_tool_buffer(tool_key);
+        let target_pending_approval = self.clear_target_pending_approval(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        let no_task_cancels = !self.control.has_task_turn_cancels();
+        let global_pending_approval = if no_visible_drafts && no_task_cancels {
+            self.control.active_cancel = None;
+            self.control.generating = false;
+            let pending = self.ui.pending_tool_approval.take();
+            if pending.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+                self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+            }
+            pending
+        } else {
+            None
+        };
 
         let mut effects = Vec::new();
         // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
         if let Some(token) = cancel_opt {
             effects.push(Effect::CancelToken(token));
         }
-        if let Some(pending) = pending_approval {
+        for pending in target_pending_approval.into_iter().chain(global_pending_approval) {
             effects.push(Effect::ResolveApproval {
                 tool_id: pending.tool_id,
                 approved: false,
             });
         }
-        if let Some(draft_id) = draft_id_opt {
-            effects.push(Effect::CancelDraft(draft_id));
-        }
+        effects.push(Effect::CancelDraft(draft_id));
         effects.push(Effect::LogTrace {
             level: tracing::Level::INFO,
             msg: "Turn cancelled by CancelRequested".to_string(),
@@ -2322,18 +2412,18 @@ impl ChatState {
     /// 必须发 `Effect::CancelToken` 让 EffectExecutor 真调 token.cancel()，否则
     /// 底层 LLM 流不会立刻收到 cancel 信号。
     fn reduce_shutdown_requested(&mut self) -> Vec<Effect> {
-        let (draft_id_opt, cancel_opt) = if self.control.generating {
+        let (draft_id_opt, cancel_tokens) = if self.control.generating {
             let id = Self::take_draft_id(&self.stream);
-            let tok = self.control.active_cancel.take();
+            let tokens = self.control.drain_turn_cancels();
             self.stream.clear_visible_drafts();
             self.control.generating = false;
-            (id, tok)
+            (id, tokens)
         } else {
-            (None, None)
+            (None, Vec::new())
         };
 
         let mut effects = Vec::new();
-        if let Some(token) = cancel_opt {
+        for token in cancel_tokens {
             effects.push(Effect::CancelToken(token));
         }
         if let Some(draft_id) = draft_id_opt {
@@ -2401,6 +2491,7 @@ impl ChatState {
         self.ui.saved_session_picker = None;
         self.stream.clear_visible_drafts();
         self.control.clear_all_tool_buffers();
+        self.control.turn_cancels.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
         vec![
@@ -9076,6 +9167,186 @@ mod tests {
             assert_eq!(call.task_id, None);
             assert_eq!(call.sequence, None);
             assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
+        }
+    }
+
+    #[cfg(test)]
+    mod p3b_task_aware_cancel_tokens {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskId};
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn task_pair() -> ((TurnTaskId, u64), (TurnTaskId, u64)) {
+            let mut scheduler = TurnScheduler::new();
+            let a = scheduler.enqueue("a", TurnPriority::Normal, 0);
+            let b = scheduler.enqueue("b", TurnPriority::Normal, 0);
+            let a_seq = scheduler.task(a).expect("test: task a").sequence;
+            let b_seq = scheduler.task(b).expect("test: task b").sequence;
+            ((a, a_seq), (b, b_seq))
+        }
+
+        fn start_task(
+            state: &mut ChatState,
+            task_id: TurnTaskId,
+            sequence: u64,
+            draft_id: &str,
+            cancel: CancellationToken,
+        ) {
+            let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: Vec::new(),
+                compaction_config: None,
+                cancel,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+        }
+
+        fn cancel_tokens(effects: Vec<Effect>) -> Vec<CancellationToken> {
+            effects
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::CancelToken(token) => Some(token),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn p3b_two_task_tokens_are_independent() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let tokens = cancel_tokens(state.reduce(Action::CancelRequested));
+
+            assert_eq!(tokens.len(), 1);
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token_a.is_cancelled(), "primary task A token must be emitted");
+            assert!(!token_b.is_cancelled(), "task B token must remain untouched");
+            assert!(!state.control.turn_cancels.contains_key(&task_a));
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+        }
+
+        #[test]
+        fn p3b_cancel_primary_does_not_clear_other_task_tool_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a", CancellationToken::new());
+            start_task(&mut state, task_b, seq_b, "draft-b", CancellationToken::new());
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: Some(task_b),
+                sequence: Some(seq_b),
+                tool_call_id: None,
+                name: "grep".to_string(),
+                args: r#"{"q":"needle"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(state.control.generating, "task B still keeps generation active");
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .any(|draft| draft.task_id == Some(task_b))
+            );
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+        }
+
+        #[test]
+        fn p3b_global_state_clears_only_after_all_visible_tasks_are_cancelled() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a", CancellationToken::new());
+            start_task(&mut state, task_b, seq_b, "draft-b", CancellationToken::new());
+            let _ = state.reduce(Action::ToolApprovalRequested {
+                task_id: Some(task_b),
+                tool_id: "tool-b".to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(state.control.generating, "B remains visible after cancelling A");
+            assert!(
+                state.control.active_cancel.is_none(),
+                "task turns do not use legacy active_cancel"
+            );
+            assert!(
+                state.ui.pending_tool_approval.is_some(),
+                "B approval must not be globally cleared"
+            );
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(!state.control.generating);
+            assert!(state.control.active_cancel.is_none());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(state.stream.visible_drafts.is_empty());
+            assert!(state.ui.pending_tool_approval.is_none());
+        }
+
+        #[test]
+        fn p3b_shutdown_cancels_all_task_tokens() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let effects = state.reduce(Action::ShutdownRequested);
+            let tokens = cancel_tokens(effects);
+
+            assert_eq!(tokens.len(), 2, "shutdown must emit both task cancel tokens");
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token_a.is_cancelled());
+            assert!(token_b.is_cancelled());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(!state.control.generating);
+            assert!(state.stream.visible_drafts.is_empty());
+        }
+
+        #[test]
+        fn p3b_single_legacy_turn_ctrl_c_still_uses_primary_active_cancel() {
+            let mut state = s();
+            let token = CancellationToken::new();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "primary-draft".to_string(),
+                cancel: token.clone(),
+            });
+
+            let effects = state.reduce(Action::CancelRequested);
+            let tokens = cancel_tokens(effects);
+
+            assert_eq!(tokens.len(), 1);
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token.is_cancelled());
+            assert!(state.control.active_cancel.is_none());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(!state.control.generating);
+            assert!(state.stream.primary_streaming_draft().is_none());
         }
     }
 
