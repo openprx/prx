@@ -195,6 +195,39 @@ mod tests {
     use super::*;
     use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler};
 
+    fn started_task(scheduler: &mut TurnScheduler, input: &str, history_base_len: usize) -> TurnTaskId {
+        let task_id = scheduler.enqueue(input, TurnPriority::Normal, history_base_len);
+        scheduler.start_task(task_id).unwrap();
+        task_id
+    }
+
+    fn register_tasks(coordinator: &mut HistoryCommitCoordinator, scheduler: &TurnScheduler, tasks: &[TurnTaskId]) {
+        for task_id in tasks {
+            coordinator.register_task(scheduler.task(*task_id).unwrap()).unwrap();
+        }
+    }
+
+    fn record_terminal_outcome(
+        coordinator: &mut HistoryCommitCoordinator,
+        scheduler: &TurnScheduler,
+        task_id: TurnTaskId,
+    ) {
+        coordinator
+            .record_outcome(HistoryCommitOutcome::from_terminal_task(scheduler.task(task_id).unwrap()).unwrap())
+            .unwrap();
+    }
+
+    fn decision_sequences(decisions: &[HistoryCommitDecision]) -> Vec<u64> {
+        decisions
+            .iter()
+            .map(|decision| match decision {
+                HistoryCommitDecision::Commit { sequence, .. } | HistoryCommitDecision::Skip { sequence, .. } => {
+                    *sequence
+                }
+            })
+            .collect()
+    }
+
     #[test]
     fn later_completion_waits_for_earlier_turn() {
         let mut scheduler = TurnScheduler::new();
@@ -358,5 +391,265 @@ mod tests {
                 actual: 11,
             }
         );
+    }
+
+    #[test]
+    fn three_task_out_of_order_completions_release_only_contiguous_prefix() {
+        let mut scheduler = TurnScheduler::new();
+        let first = started_task(&mut scheduler, "first", 10);
+        let second = started_task(&mut scheduler, "second", 12);
+        let third = started_task(&mut scheduler, "third", 14);
+        let mut commits = HistoryCommitCoordinator::new();
+        register_tasks(&mut commits, &scheduler, &[first, second, third]);
+
+        scheduler.mark_completed(third, 18, "third done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, third);
+        assert!(
+            commits.drain_ready().is_empty(),
+            "third cannot release before first and second"
+        );
+        assert_eq!(commits.pending_tasks(), 3);
+        assert_eq!(commits.pending_outcomes(), 1);
+
+        scheduler.mark_completed(first, 12, "first done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, first);
+        let first_decisions = commits.drain_ready();
+        assert_eq!(
+            decision_sequences(&first_decisions),
+            vec![1],
+            "only the first contiguous completed prefix is ready"
+        );
+        assert!(matches!(
+            first_decisions[0],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 1,
+                history_commit_len: 12,
+                ..
+            } if task_id == first
+        ));
+        assert_eq!(commits.pending_tasks(), 2);
+        assert_eq!(commits.pending_outcomes(), 1);
+
+        scheduler.mark_completed(second, 16, "second done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, second);
+        let remaining = commits.drain_ready();
+        assert_eq!(
+            decision_sequences(&remaining),
+            vec![2, 3],
+            "recording second should release second and the held third in order"
+        );
+        assert!(matches!(
+            remaining[0],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 2,
+                history_commit_len: 16,
+                ..
+            } if task_id == second
+        ));
+        assert!(matches!(
+            remaining[1],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 3,
+                history_commit_len: 18,
+                ..
+            } if task_id == third
+        ));
+        assert_eq!(commits.pending_tasks(), 0);
+        assert_eq!(commits.pending_outcomes(), 0);
+    }
+
+    #[test]
+    fn three_task_middle_cancel_unblocks_later_commit_in_sequence() {
+        let mut scheduler = TurnScheduler::new();
+        let first = started_task(&mut scheduler, "first completes", 10);
+        let second = started_task(&mut scheduler, "second cancels", 12);
+        let third = started_task(&mut scheduler, "third completes", 12);
+        let mut commits = HistoryCommitCoordinator::new();
+        register_tasks(&mut commits, &scheduler, &[first, second, third]);
+
+        scheduler.mark_completed(third, 14, "third done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, third);
+        assert!(commits.drain_ready().is_empty());
+        assert_eq!(commits.pending_outcomes(), 1);
+
+        scheduler.request_cancel(second).unwrap();
+        scheduler.mark_cancelled(second, "second cancelled").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, second);
+        assert!(
+            commits.drain_ready().is_empty(),
+            "middle skip still waits for the earlier first turn"
+        );
+        assert_eq!(commits.pending_outcomes(), 2);
+
+        scheduler.mark_completed(first, 12, "first done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, first);
+        let decisions = commits.drain_ready();
+        assert_eq!(decision_sequences(&decisions), vec![1, 2, 3]);
+        assert!(matches!(
+            decisions[0],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 1,
+                history_commit_len: 12,
+                ..
+            } if task_id == first
+        ));
+        assert!(matches!(
+            decisions[1],
+            HistoryCommitDecision::Skip {
+                task_id,
+                sequence: 2,
+                rollback_to: 12,
+                status: HistoryCommitStatus::Cancelled,
+                ..
+            } if task_id == second
+        ));
+        assert!(matches!(
+            decisions[2],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 3,
+                history_commit_len: 14,
+                ..
+            } if task_id == third
+        ));
+        assert_eq!(commits.pending_tasks(), 0);
+        assert_eq!(commits.pending_outcomes(), 0);
+    }
+
+    #[test]
+    fn three_task_first_failure_skips_then_releases_later_commits() {
+        let mut scheduler = TurnScheduler::new();
+        let first = started_task(&mut scheduler, "first fails", 4);
+        let second = started_task(&mut scheduler, "second completes", 4);
+        let third = started_task(&mut scheduler, "third completes", 6);
+        let mut commits = HistoryCommitCoordinator::new();
+        register_tasks(&mut commits, &scheduler, &[first, second, third]);
+
+        scheduler.mark_completed(third, 10, "third done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, third);
+        scheduler.mark_completed(second, 8, "second done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, second);
+        assert!(
+            commits.drain_ready().is_empty(),
+            "later completions wait for the failed first turn outcome"
+        );
+        assert_eq!(commits.pending_outcomes(), 2);
+
+        scheduler.mark_failed(first, 4, "first failed").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, first);
+        let decisions = commits.drain_ready();
+        assert_eq!(decision_sequences(&decisions), vec![1, 2, 3]);
+        assert!(matches!(
+            decisions[0],
+            HistoryCommitDecision::Skip {
+                task_id,
+                sequence: 1,
+                rollback_to: 4,
+                status: HistoryCommitStatus::Failed,
+                ..
+            } if task_id == first
+        ));
+        assert!(matches!(
+            decisions[1],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 2,
+                history_commit_len: 8,
+                ..
+            } if task_id == second
+        ));
+        assert!(matches!(
+            decisions[2],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 3,
+                history_commit_len: 10,
+                ..
+            } if task_id == third
+        ));
+        assert_eq!(commits.pending_tasks(), 0);
+        assert_eq!(commits.pending_outcomes(), 0);
+    }
+
+    #[test]
+    fn four_task_mixed_outcomes_release_only_ordered_ready_prefixes() {
+        let mut scheduler = TurnScheduler::new();
+        let first = started_task(&mut scheduler, "first completes", 20);
+        let second = started_task(&mut scheduler, "second cancels", 22);
+        let third = started_task(&mut scheduler, "third fails", 22);
+        let fourth = started_task(&mut scheduler, "fourth completes", 22);
+        let mut commits = HistoryCommitCoordinator::new();
+        register_tasks(&mut commits, &scheduler, &[first, second, third, fourth]);
+
+        scheduler.mark_completed(fourth, 24, "fourth done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, fourth);
+        assert!(commits.drain_ready().is_empty());
+        assert_eq!(commits.pending_tasks(), 4);
+        assert_eq!(commits.pending_outcomes(), 1);
+
+        scheduler.request_cancel(second).unwrap();
+        scheduler.mark_cancelled(second, "second cancelled").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, second);
+        assert!(
+            commits.drain_ready().is_empty(),
+            "second skip cannot release before first"
+        );
+        assert_eq!(commits.pending_outcomes(), 2);
+
+        scheduler.mark_completed(first, 22, "first done").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, first);
+        let first_prefix = commits.drain_ready();
+        assert_eq!(decision_sequences(&first_prefix), vec![1, 2]);
+        assert!(matches!(
+            first_prefix[0],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 1,
+                history_commit_len: 22,
+                ..
+            } if task_id == first
+        ));
+        assert!(matches!(
+            first_prefix[1],
+            HistoryCommitDecision::Skip {
+                task_id,
+                sequence: 2,
+                rollback_to: 22,
+                status: HistoryCommitStatus::Cancelled,
+                ..
+            } if task_id == second
+        ));
+        assert_eq!(commits.pending_tasks(), 2);
+        assert_eq!(commits.pending_outcomes(), 1);
+
+        scheduler.mark_failed(third, 22, "third failed").unwrap();
+        record_terminal_outcome(&mut commits, &scheduler, third);
+        let final_prefix = commits.drain_ready();
+        assert_eq!(decision_sequences(&final_prefix), vec![3, 4]);
+        assert!(matches!(
+            final_prefix[0],
+            HistoryCommitDecision::Skip {
+                task_id,
+                sequence: 3,
+                rollback_to: 22,
+                status: HistoryCommitStatus::Failed,
+                ..
+            } if task_id == third
+        ));
+        assert!(matches!(
+            final_prefix[1],
+            HistoryCommitDecision::Commit {
+                task_id,
+                sequence: 4,
+                history_commit_len: 24,
+                ..
+            } if task_id == fourth
+        ));
+        assert_eq!(commits.pending_tasks(), 0);
+        assert_eq!(commits.pending_outcomes(), 0);
     }
 }

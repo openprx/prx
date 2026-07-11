@@ -17949,6 +17949,261 @@ mod p3_directional_switch_tests {
         ));
     }
 
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions() {
+        use crate::chat::action::Action;
+
+        fn completed_plan(final_text: &str, total_tokens: u32, history_commit_len: usize) -> ProviderTurnTerminalPlan {
+            ProviderTurnTerminalPlan::Completed {
+                final_text: final_text.to_string(),
+                reasoning: String::new(),
+                recorded_response: final_text.to_string(),
+                empty_response: false,
+                usage: crate::llm::route_decision::TokenUsage {
+                    total_tokens: Some(total_tokens),
+                    ..Default::default()
+                },
+                history_commit_len,
+                final_text_chars: final_text.chars().count(),
+                recorded_response_chars: final_text.chars().count(),
+                summary: "test n3 completed",
+            }
+        }
+
+        fn pending_commit_for(
+            task_id: crate::chat::turn_scheduler::TurnTaskId,
+            draft_id: &str,
+            user_input: &str,
+            plan: ProviderTurnTerminalPlan,
+        ) -> PendingOrderedProviderTurnCommit {
+            PendingOrderedProviderTurnCommit {
+                context: PerTurnContext {
+                    task_id,
+                    draft_id: draft_id.to_string(),
+                    delta_tx: None,
+                    tool_event_tx: None,
+                    draft_updater: None,
+                    tool_event_forwarder: None,
+                    user_input: user_input.to_string(),
+                    turn_run_id: format!("test-run-{}", task_id.get()),
+                    route_scope: crate::memory::MessageEventScope::new(
+                        "chat",
+                        crate::memory::MemoryVisibility::Workspace,
+                    ),
+                    route_decision: RouteDecision::single_candidate("mock", "mock"),
+                    provider_started_at: chrono::Utc::now(),
+                    provider_name: "mock".to_string(),
+                    model_name: "mock".to_string(),
+                    history_len_before_user_turn: 0,
+                    history_user_message: ChatMessage::user(user_input.to_string()),
+                },
+                terminal_plan: plan,
+            }
+        }
+
+        fn dispatch_ready_for_test(
+            results: Vec<ProviderTurnFinalizerResult>,
+            pending: &mut std::collections::HashMap<
+                crate::chat::turn_scheduler::TurnTaskId,
+                PendingOrderedProviderTurnCommit,
+            >,
+            dispatcher: &dispatcher::ChatDispatcher,
+        ) {
+            for result in results {
+                if !result.finalized || result.terminal_status != "completed" {
+                    continue;
+                }
+                let task_id = result.task_id.expect("finalized result has task id");
+                let pending_commit = pending.remove(&task_id).expect("pending commit payload");
+                let ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning,
+                    empty_response,
+                    ..
+                } = pending_commit.terminal_plan
+                else {
+                    panic!("expected completed terminal plan");
+                };
+                dispatch_ordered_provider_turn_commit(
+                    dispatcher,
+                    task_id,
+                    &pending_commit.context.draft_id,
+                    &pending_commit.context.user_input,
+                    &final_text,
+                    &reasoning,
+                    empty_response,
+                );
+            }
+        }
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("alpha prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let second = scheduler.enqueue("bravo prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let third = scheduler.enqueue("charlie prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        for task_id in [first, second, third] {
+            scheduler.start_task(task_id).expect("task starts");
+        }
+
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        for task_id in [first, second, third] {
+            coordinator
+                .register_task(scheduler.task(task_id).expect("task snapshot"))
+                .expect("history task registers");
+        }
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for (task_id, lease) in [(first, 101), (second, 102), (third, 103)] {
+            workers
+                .start_from_task(
+                    scheduler.task(task_id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers
+                .record_execution_started(task_id, lease)
+                .expect("execution starts");
+            workers.record_completion_ready(task_id).expect("completion ready");
+        }
+
+        let first_plan = completed_plan("alpha answer", 11, 2);
+        let second_plan = completed_plan("bravo answer", 12, 4);
+        let third_plan = completed_plan("charlie answer", 13, 6);
+        let mut pending_ordered_provider_turn_commits = std::collections::HashMap::from([
+            (
+                first,
+                pending_commit_for(first, "draft-alpha", "alpha prompt", first_plan.clone()),
+            ),
+            (
+                second,
+                pending_commit_for(second, "draft-bravo", "bravo prompt", second_plan.clone()),
+            ),
+            (
+                third,
+                pending_commit_for(third, "draft-charlie", "charlie prompt", third_plan.clone()),
+            ),
+        ]);
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+
+        let third_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(third),
+                plan: third_plan,
+            },
+        );
+        assert_eq!(
+            third_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(third),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "third completion must stay held until first and second are terminal"
+        );
+        dispatch_ready_for_test(third_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+        assert!(
+            rx.try_recv().is_err(),
+            "held third turn must emit no persistence actions"
+        );
+        assert!(matches!(
+            workers.worker(third).expect("third worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_)
+        ));
+
+        let second_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(second),
+                plan: second_plan,
+            },
+        );
+        assert_eq!(
+            second_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(second),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "second completion must stay held until first is terminal"
+        );
+        dispatch_ready_for_test(second_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+        assert!(
+            rx.try_recv().is_err(),
+            "held second turn must emit no persistence actions"
+        );
+
+        let first_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(first),
+                plan: first_plan,
+            },
+        );
+        assert_eq!(
+            first_results
+                .iter()
+                .map(|result| (result.task_id, result.terminal_status, result.finalized))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(first), "completed", true),
+                (Some(second), "completed", true),
+                (Some(third), "completed", true),
+            ],
+            "first completion must release all held completed turns in dispatch order"
+        );
+        dispatch_ready_for_test(first_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+
+        for (expected_user, expected_assistant, expected_draft, expected_task) in [
+            ("alpha prompt", "alpha answer", "draft-alpha", first),
+            ("bravo prompt", "bravo answer", "draft-bravo", second),
+            ("charlie prompt", "charlie answer", "draft-charlie", third),
+        ] {
+            match rx.try_recv().expect("ordered user action") {
+                Action::RecordUserTurn(content) => assert_eq!(content, expected_user),
+                other => panic!("expected RecordUserTurn, got {other:?}"),
+            }
+            match rx.try_recv().expect("ordered assistant action") {
+                Action::RecordAssistantTurn { task_id, content } => {
+                    assert_eq!(task_id, Some(expected_task));
+                    assert_eq!(content, expected_assistant);
+                }
+                other => panic!("expected RecordAssistantTurn, got {other:?}"),
+            }
+            match rx.try_recv().expect("ordered stream completed action") {
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                } => {
+                    assert_eq!(draft_id, expected_draft);
+                    assert_eq!(final_text, expected_assistant);
+                    assert!(reasoning.is_empty());
+                }
+                other => panic!("expected StreamCompleted, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "ordered dispatch should emit exactly three action triplets"
+        );
+        assert!(pending_ordered_provider_turn_commits.is_empty());
+        assert_eq!(coordinator.pending_tasks(), 0);
+        assert_eq!(coordinator.pending_outcomes(), 0);
+        for task_id in [first, second, third] {
+            assert!(matches!(
+                workers.worker(task_id).expect("worker").state,
+                crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn provider_turn_finalizer_drain_helper_publishes_queue_and_worker_status() {
         let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
