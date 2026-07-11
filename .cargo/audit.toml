@@ -8,10 +8,6 @@ ignore = [
     "RUSTSEC-2024-0388",
     # proc-macro-error2 unmaintained — transitive via matrix-sdk (vodozemac/aquamarine), no maintained alternative
     "RUSTSEC-2026-0173",
-    # RUSTSEC-2026-0189 rmcp 0.14 streamable-http SERVER DNS-rebinding — NOT reachable:
-    # PRX uses rmcp client-only (StreamableHttpClientTransport, src/tools/mcp.rs); no ServerHandler / server transport instantiated.
-    # Tracked follow-up: upgrade rmcp to >=1.4.0 (major, breaking) or drop the unused `server` feature.
-    "RUSTSEC-2026-0189",
 ]
 informational_warnings = ["unmaintained"]
 severity_threshold = "low"

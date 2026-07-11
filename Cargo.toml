@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -118,7 +118,7 @@ notify-debouncer-mini = "0.7.0"
 # Async traits
 async-trait = "0.1"
 # MCP client (stdio + streamable HTTP)
-rmcp = { version = "0.14", features = ["client", "server", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "transport-child-process", "transport-streamable-http-client", "transport-streamable-http-client-reqwest"] }
 
 # HMAC-SHA256 (Zhipu/GLM JWT auth)
 ring = "0.17"
