@@ -32,7 +32,7 @@ pub struct ProviderWorkerStatus {
     pub rows: Vec<ProviderWorkerStatusRow>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderWorkerStatusRow {
     pub task_id: u64,
     pub sequence: u64,
@@ -41,11 +41,12 @@ pub struct ProviderWorkerStatusRow {
     pub started_at_ms: i64,
     pub finalized_total_tokens: Option<u64>,
     pub completion_ready: bool,
+    pub recent_tool_call: Option<String>,
 }
 
 impl ProviderWorkerStatusRow {
     #[must_use]
-    pub const fn is_active(self) -> bool {
+    pub const fn is_active(&self) -> bool {
         matches!(
             self.state,
             ProviderWorkerRowState::Running
@@ -88,7 +89,7 @@ pub fn build_provider_worker_active_view_with_io(
     scroll_offset: usize,
     io_lines: Vec<String>,
 ) -> crate::chat::sessions::ActiveSessionView {
-    let row = status.rows.iter().find(|row| row.sequence == sequence).copied();
+    let row = status.rows.iter().find(|row| row.sequence == sequence);
     let title = format!("main provider w#{sequence}");
     let mut lines = Vec::new();
     if let Some(row) = row {
@@ -674,6 +675,7 @@ mod tests {
                 started_at_ms: 0,
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         }
     }

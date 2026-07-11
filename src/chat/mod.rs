@@ -8771,6 +8771,7 @@ fn provider_worker_status(
                 started_at_ms: worker.started_at_ms,
                 finalized_total_tokens: worker.finalized_total_tokens,
                 completion_ready: worker.completion_ready,
+                recent_tool_call: None,
             });
         }
         match worker.state {
@@ -11841,11 +11842,13 @@ fn run_tui_unified_loop(
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
 
     let mut skip_next_draw = false;
+    let mut deferred_redraw_requested = false;
     let mut pending_events = VecDeque::new();
 
-    // 50 ms event poll → ~20 fps idle redraw cap. Streaming wakes via
-    // `redraw_rx` so this is just a floor, not an upper bound.
-    let poll = Duration::from_millis(50);
+    // 150 ms only while an on-screen animation is active. Idle mode uses a long
+    // poll so a completed/empty TUI does not keep a fixed redraw/tick cadence.
+    let active_animation_poll = Duration::from_millis(150);
+    let idle_poll = Duration::from_millis(1_000);
 
     loop {
         if shutdown.is_cancelled() {
@@ -11877,6 +11880,7 @@ fn run_tui_unified_loop(
                 tracing::warn!(error = %e, "post-PTY terminal clear failed");
             }
             skip_next_draw = false;
+            deferred_redraw_requested = true;
         }
 
         // ── 1. Drain coalesced redraw wakeups, then redraw fullscreen frame ─
@@ -11884,20 +11888,32 @@ fn run_tui_unified_loop(
         while redraw_rx.try_recv().is_ok() {
             redraw_requested = true;
         }
+        redraw_requested |= deferred_redraw_requested;
+        deferred_redraw_requested = false;
+        let periodic_redraw_active = render_source.with_view(|view| tui::periodic_redraw_active_for_view(view))
+            || mirror.lock().periodic_redraw_active();
         if skip_next_draw && !redraw_requested {
             skip_next_draw = false;
-        } else if let Err(e) = terminal.draw(|f| {
-            render_source.with_view(|view| {
-                tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
-            });
-        }) {
-            tracing::warn!(error = %e, "TUI draw failed");
+            deferred_redraw_requested = true;
+        } else if redraw_requested || periodic_redraw_active {
+            if let Err(e) = terminal.draw(|f| {
+                render_source.with_view(|view| {
+                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
+                });
+            }) {
+                tracing::warn!(error = %e, "TUI draw failed");
+            }
         }
 
         // ── 2. Wait for the next input event, with a 50 ms floor ──────
         let ev = if let Some(ev) = pending_events.pop_front() {
             ev
         } else {
+            let poll = if periodic_redraw_active {
+                active_animation_poll
+            } else {
+                idle_poll
+            };
             if !crossterm::event::poll(poll)? {
                 continue;
             }
@@ -14911,6 +14927,7 @@ mod s4_a_4 {
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         };
         let snap = Arc::new(state.build_ui_snapshot(1));
@@ -14948,6 +14965,7 @@ mod s4_a_4 {
                     started_at_ms: 0,
                     finalized_total_tokens: None,
                     completion_ready: false,
+                    recent_tool_call: None,
                 },
                 crate::chat::action::ProviderWorkerStatusRow {
                     task_id: 20,
@@ -14957,6 +14975,7 @@ mod s4_a_4 {
                     started_at_ms: 0,
                     finalized_total_tokens: None,
                     completion_ready: false,
+                    recent_tool_call: None,
                 },
             ],
         };
@@ -16264,6 +16283,7 @@ mod p3_directional_switch_tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(1_000),
                     finalized_total_tokens: None,
                     completion_ready: false,
+                    recent_tool_call: None,
                 },
                 crate::chat::action::ProviderWorkerStatusRow {
                     task_id: 2,
@@ -16273,6 +16293,7 @@ mod p3_directional_switch_tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(9_000),
                     finalized_total_tokens: Some(1_250),
                     completion_ready: true,
+                    recent_tool_call: None,
                 },
             ],
         };
@@ -18866,6 +18887,7 @@ mod regfix_approval_switch_tests {
                 tool_id: "tool-live".to_string(),
                 name: "shell".to_string(),
                 args: "{}".to_string(),
+                selected_approval: false,
             });
             mirror.context_used_tokens = Some(2_500);
             mirror.context_window_tokens = Some(10_000_000);

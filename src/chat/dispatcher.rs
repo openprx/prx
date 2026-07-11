@@ -1275,6 +1275,7 @@ impl EffectExecutor {
                                     tool_id,
                                     name,
                                     args,
+                                    selected_approval: false,
                                 });
                                 state.focus = crate::chat::sessions::FocusTarget::Approval;
                                 state.switcher = None;
@@ -10060,6 +10061,7 @@ mod real_mode_tests {
                                                 tool_id: tool_id.clone(),
                                                 name: name.clone(),
                                                 args: args.clone(),
+                                                selected_approval: false,
                                             });
                                         let decision = crate::chat::tui::dispatch_global_key(
                                             crossterm::event::KeyEvent::new(

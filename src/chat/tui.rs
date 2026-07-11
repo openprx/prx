@@ -1077,6 +1077,12 @@ fn provider_worker_switcher_entry(row: &ProviderWorkerStatusRow) -> crate::chat:
         title.push_str(" tokens=");
         title.push_str(&format_worker_tokens_compact(tokens));
     }
+    if row.is_active()
+        && let Some(summary) = row.recent_tool_call.as_deref().filter(|summary| !summary.is_empty())
+    {
+        title.push_str(" · ");
+        title.push_str(summary);
+    }
     crate::chat::sessions::SwitcherEntry {
         seq: PROVIDER_WORKER_SWITCHER_SEQ_BASE.saturating_add(row.sequence),
         kind: PROVIDER_WORKER_SWITCHER_KIND,
@@ -1298,6 +1304,59 @@ fn provider_worker_io_clip(text: &str) -> String {
     truncate_chars_with_ellipsis(text.trim(), PROVIDER_WORKER_IO_LINE_MAX_CHARS, false)
 }
 
+const PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS: u16 = 64;
+
+#[must_use]
+pub fn latest_provider_worker_tool_summary_from_conversation(
+    conversation: &[ConversationLine],
+    ascii: bool,
+) -> Option<String> {
+    conversation
+        .iter()
+        .rev()
+        .take(PROVIDER_WORKER_IO_MAX_SOURCE_ITEMS)
+        .find_map(|item| match item {
+            ConversationLine::ToolResult {
+                tool_name,
+                args_preview,
+                args_full,
+                status,
+                ..
+            } => {
+                let args = if args_preview.trim().is_empty() {
+                    args_full
+                } else {
+                    args_preview
+                };
+                let summary = format!(
+                    "run {} {}: {}",
+                    tool_name,
+                    tool_status_name(*status),
+                    provider_worker_io_clip(args)
+                );
+                Some(truncate_chars_with_ellipsis(
+                    &summary,
+                    PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS,
+                    ascii,
+                ))
+            }
+            ConversationLine::Tool { name, success } => {
+                let status = if *success { "done" } else { "error" };
+                let summary = format!("run {name} {status}");
+                Some(truncate_chars_with_ellipsis(
+                    &summary,
+                    PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS,
+                    ascii,
+                ))
+            }
+            ConversationLine::User { .. }
+            | ConversationLine::Assistant { .. }
+            | ConversationLine::StreamingAssistant { .. }
+            | ConversationLine::System { .. }
+            | ConversationLine::Reasoning { .. } => None,
+        })
+}
+
 /// Build compact live IO lines for the read-only provider worker detail view.
 ///
 /// This is intentionally derived from the same conversation/tool cards the main
@@ -1517,6 +1576,26 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                     return KeyDispatch::ToolApprovalDecision {
                         tool_id: pending.tool_id,
                         approved: false,
+                    };
+                }
+                KeyCode::Left | KeyCode::Up => {
+                    if let Some(pending) = state.pending_tool_approval.as_mut() {
+                        pending.selected_approval = false;
+                    }
+                    return KeyDispatch::Consumed;
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    if let Some(pending) = state.pending_tool_approval.as_mut() {
+                        pending.selected_approval = true;
+                    }
+                    return KeyDispatch::Consumed;
+                }
+                KeyCode::Enter => {
+                    state.pending_tool_approval = None;
+                    state.focus = crate::chat::sessions::FocusTarget::Main;
+                    return KeyDispatch::ToolApprovalDecision {
+                        tool_id: pending.tool_id,
+                        approved: pending.selected_approval,
                     };
                 }
                 _ => return KeyDispatch::Consumed,
@@ -3303,6 +3382,11 @@ impl TuiState {
         execution_activity_active_for_view(self)
     }
 
+    #[must_use]
+    pub fn periodic_redraw_active(&self) -> bool {
+        periodic_redraw_active_for_view(self)
+    }
+
     /// Replace the persistent child-session status line (v1b).
     ///
     /// An empty `summary` hides the extra status row entirely.
@@ -4014,7 +4098,7 @@ fn session_footer_desired_rows<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     } else if visible_entries.is_empty() {
         1
     } else {
-        visible_entries.len().saturating_add(1)
+        visible_entries.len().saturating_add(2)
     };
     u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
@@ -4248,7 +4332,14 @@ fn render_fullscreen_panel<V: BottomChromeView + ?Sized>(frame: &mut Frame, area
     };
     frame.render_widget(Clear, area);
     if let Some(approval) = state.pending_tool_approval() {
-        render_approval(frame, area, &approval.name, &approval.args, state.ascii_fallback());
+        render_approval(
+            frame,
+            area,
+            &approval.name,
+            &approval.args,
+            approval.selected_approval,
+            state.ascii_fallback(),
+        );
     } else if let Some(view) = state.active_session_view() {
         render_active_session_view(frame, area, view, state.ascii_fallback());
     }
@@ -4419,13 +4510,37 @@ const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
     }
 }
 
-fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+const SPINNER_FRAME_MS: u64 = 150;
+const ASCII_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+const UNICODE_SPINNER_FRAMES: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+
+fn current_animation_tick() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis() / u128::from(SPINNER_FRAME_MS)).unwrap_or(u64::MAX)
+        })
+}
+
+fn spinner_frame_for_tick(ascii: bool, tick: u64) -> &'static str {
+    let frames = if ascii {
+        &ASCII_SPINNER_FRAMES
+    } else {
+        &UNICODE_SPINNER_FRAMES
+    };
+    let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
+    frames.get(idx).copied().unwrap_or("-")
+}
+
+fn session_status_glyph_for_tick(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool, tick: u64) -> &'static str {
     if entry.is_transcript() {
         return if ascii { "[T]" } else { "T" };
     }
+    if entry.status == "running" {
+        return spinner_frame_for_tick(ascii, tick);
+    }
     if ascii {
         match entry.status {
-            "running" => "[~]",
             "needs-input" => "[?]",
             "completed" => "[x]",
             "cancelled" => "[-]",
@@ -4434,6 +4549,10 @@ fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: boo
     } else {
         entry.status_glyph()
     }
+}
+
+fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+    session_status_glyph_for_tick(entry, ascii, current_animation_tick())
 }
 
 const SESSION_STRIP_CHIP_MAX_WIDTH: u16 = 24;
@@ -4507,6 +4626,7 @@ fn render_sessions_list_entry_line(
     let active = active_seq == Some(entry.seq);
     let selected = strip_selection == Some(entry.seq);
     let marker = session_active_marker(active, ascii);
+    let glyph = session_status_glyph(entry, ascii);
     let idle = if entry.idle_warning {
         if ascii { " [idle]" } else { " ⚠ idle" }
     } else {
@@ -4519,7 +4639,7 @@ fn render_sessions_list_entry_line(
     let sep = if ascii { " | " } else { " · " };
     let display_id = switcher_entry_display_id(entry);
     let prefix = format!(
-        "{marker} {display_id} {} {} {}{}{}{}",
+        "{marker}{glyph} {display_id} {} {} {}{}{}{}",
         entry.kind,
         entry.origin,
         entry.status,
@@ -4578,6 +4698,19 @@ fn render_main_session_list_line<V: BottomChromeView + ?Sized>(state: &V, width:
     Line::from(Span::styled(text, style))
 }
 
+const fn sessions_navigation_hint(ascii: bool) -> &'static str {
+    if ascii {
+        " Up/Down sessions | Enter attach/open "
+    } else {
+        " \u{2191}\u{2193} sessions \u{00B7} Enter attach/open "
+    }
+}
+
+fn render_sessions_navigation_hint_line(ascii: bool, width: u16) -> Line<'static> {
+    let text = truncate_chars_with_ellipsis(sessions_navigation_hint(ascii), width, ascii);
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
+}
+
 fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
     state: &V,
     width: u16,
@@ -4600,14 +4733,15 @@ fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
     }
     let active_seq = focus_active_entry_seq(focus);
     let total = entries.len().saturating_add(1);
+    let list_rows = max_rows.saturating_sub(1).max(1);
     let target_idx = bottom_list_selection_index(&entries, strip_selection, focus).min(total.saturating_sub(1));
-    let start = if total <= max_rows {
+    let start = if total <= list_rows {
         0
     } else {
-        target_idx.saturating_add(1).saturating_sub(max_rows)
+        target_idx.saturating_add(1).saturating_sub(list_rows)
     };
     let mut lines = Vec::new();
-    for idx in start..total.min(start.saturating_add(max_rows)) {
+    for idx in start..total.min(start.saturating_add(list_rows)) {
         if idx == 0 {
             lines.push(render_main_session_list_line(state, width));
         } else if let Some(entry) = entries.get(idx.saturating_sub(1)) {
@@ -4619,6 +4753,9 @@ fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
                 width,
             ));
         }
+    }
+    if lines.len() < max_rows {
+        lines.push(render_sessions_navigation_hint_line(ascii, width));
     }
     lines
 }
@@ -5465,18 +5602,7 @@ fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option
     if !execution_activity_active_for_view(state) {
         return None;
     }
-    let frames = if state.ascii_fallback() {
-        ["-", "\\", "|", "/"]
-    } else {
-        ["⠋", "⠙", "⠹", "⠸"]
-    };
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis() / 50).unwrap_or(u64::MAX)
-        });
-    let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
-    let frame = frames.get(idx).copied().unwrap_or("-");
+    let frame = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
     Some(format!("{frame} generating (esc to interrupt)"))
 }
 
@@ -5624,6 +5750,16 @@ pub fn execution_activity_active_for_view<V: BottomChromeView + ?Sized>(state: &
                 }
             )
         })
+}
+
+pub fn bottom_running_entry_active_for_view<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    bottom_chrome_session_entries_with_workers(state.sessions_entries(), state.provider_worker_status(), state.focus())
+        .iter()
+        .any(|entry| entry.status == "running")
+}
+
+pub fn periodic_redraw_active_for_view<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    execution_activity_active_for_view(state) || bottom_running_entry_active_for_view(state)
 }
 
 fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
@@ -6998,15 +7134,30 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn footer_text(ascii: bool, show_session_hint: bool) -> String {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
-    let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} /copy latest \u{00B7} drag select/copy \u{00B7} Shift+Enter newline \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+    let sep = if ascii { " | " } else { " \u{00B7} " };
+    let mut parts = Vec::from([
+        "Ctrl+G sessions",
+        "Ctrl+O transcript",
+        "/copy latest",
+        "drag select/copy",
+        "Shift+Enter newline",
+        "Ctrl+X Ctrl+E edit",
+        "Tab fold",
+        "Esc cancel",
+    ]);
+    if show_session_hint {
+        parts.insert(1, sessions_navigation_hint(ascii).trim());
+    }
+    format!(" {} ", parts.join(sep))
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, ascii: bool, show_session_hint: bool) {
+    let footer = Paragraph::new(footer_text(ascii, show_session_hint)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
@@ -7041,15 +7192,41 @@ fn render_fullscreen_footer<V: BottomChromeView + ?Sized>(
     if render_session_list_footer(frame, area, state) {
         return;
     }
-    render_footer(frame, area);
+    render_footer(frame, area, state.ascii_fallback(), session_footer_has_sessions(state));
 }
 
 /// Render a tool approval prompt.
-pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &str, ascii: bool) {
+pub fn render_approval(
+    frame: &mut Frame,
+    area: Rect,
+    tool_name: &str,
+    args: &str,
+    selected_approval: bool,
+    ascii: bool,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let marker = if ascii { ">" } else { "\u{25B8}" };
+    let approve_marker = if selected_approval { marker } else { " " };
+    let deny_marker = if selected_approval { " " } else { marker };
+    let approve_style = if selected_approval {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    };
+    let deny_style = if selected_approval {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    };
+    let select_hint = if ascii { "Left/Right" } else { "\u{2190}/\u{2192}" };
     let approval_text = vec![
         Line::from(vec![
             Span::styled(
@@ -7064,18 +7241,28 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{approve_marker} [y]"), approve_style),
             Span::raw(" approve  "),
-            Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{deny_marker} [n]"), deny_style),
             Span::raw(" deny  "),
             Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw(" deny"),
         ]),
+        Line::from(Span::styled(
+            format!("{select_hint} select · Enter confirm"),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
+    let selected_label = if selected_approval { "approve" } else { "deny" };
+    let title = if ascii {
+        format!(" Tool Approval - selected: {selected_label} - Left/Right select - Enter confirm ")
+    } else {
+        format!(" Tool Approval - selected: {selected_label} - ←/→ select - Enter confirm ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Tool Approval ")
+        .title(title)
         .border_style(Style::default().fg(Color::Yellow));
 
     let paragraph = Paragraph::new(approval_text).block(block).wrap(Wrap { trim: false });
@@ -9917,6 +10104,7 @@ mod tests {
             tool_id: "call-1".to_string(),
             name: "shell".to_string(),
             args: r#"{"cmd":"echo hi"}"#.to_string(),
+            selected_approval: false,
         });
         state
     }
@@ -9954,18 +10142,83 @@ mod tests {
     }
 
     #[test]
-    fn approval_child_text_enter_does_not_submit_or_steer() {
-        for key_event in [key(KeyCode::Char('x')), key(KeyCode::Enter)] {
-            let mut state = approval_state();
-            let out = dispatch_global_key(key_event, &mut state);
-            assert_eq!(out, KeyDispatch::Consumed);
-            assert!(state.input.is_empty(), "approval focus must not edit the main input");
-            assert!(
-                state.pending_tool_approval.is_some(),
-                "text/Enter must not close approval"
-            );
-            assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
-        }
+    fn approval_child_text_does_not_submit_or_steer() {
+        let mut state = approval_state();
+        let out = dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_empty(), "approval focus must not edit the main input");
+        assert!(
+            state.pending_tool_approval.is_some(),
+            "plain text must not close approval"
+        );
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+    }
+
+    #[test]
+    fn approval_child_arrows_select_and_enter_confirms() {
+        let mut state = approval_state();
+        assert!(
+            !state
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval starts pending")
+                .selected_approval,
+            "approval defaults to the safe deny choice"
+        );
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert!(
+            state
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval remains pending after navigation")
+                .selected_approval,
+            "Right selects approve"
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: true
+            }
+        );
+        assert!(state.pending_tool_approval.is_none());
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+    }
+
+    #[test]
+    fn approval_child_enter_uses_default_deny_and_left_selects_deny() {
+        let mut default_state = approval_state();
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut default_state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: false
+            }
+        );
+
+        let mut state = approval_state();
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: false
+            }
+        );
     }
 
     #[test]
@@ -10826,7 +11079,10 @@ mod tests {
             80,
         );
         assert!(line.contains('\u{25B8}'), "active marker visible: {line}");
-        assert!(line.contains('⏳'), "status glyph visible: {line}");
+        assert!(
+            UNICODE_SPINNER_FRAMES.iter().any(|frame| line.contains(frame)),
+            "running status spinner visible: {line}"
+        );
         assert!(line.contains("#1"), "seq visible: {line}");
         assert!(line.contains("agent"), "kind visible: {line}");
         assert!(line.contains("task 1"), "title visible: {line}");
@@ -10941,6 +11197,143 @@ mod tests {
         assert!(
             line.contains('>') && line.contains('+'),
             "ASCII right overflow/count affordance appears when entries remain hidden: {line}"
+        );
+    }
+
+    #[test]
+    fn running_status_glyph_animates_with_shared_spinner_frames() {
+        let running = elapsed_entry(1, "running", 0);
+        assert_eq!(session_status_glyph_for_tick(&running, false, 0), "⠋");
+        assert_eq!(session_status_glyph_for_tick(&running, false, 1), "⠙");
+        assert_eq!(session_status_glyph_for_tick(&running, true, 0), "-");
+        assert_eq!(session_status_glyph_for_tick(&running, true, 1), "\\");
+
+        let completed = elapsed_entry(2, "completed", 0);
+        assert_eq!(
+            session_status_glyph_for_tick(&completed, false, 0),
+            session_status_glyph_for_tick(&completed, false, 1),
+            "non-running rows must stay static"
+        );
+    }
+
+    #[test]
+    fn periodic_redraw_tracks_running_bottom_entries_only() {
+        let mut state = TuiState::new("p", "m");
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "idle chat has no animation tick"
+        );
+
+        state.sessions_cache = vec![elapsed_entry(1, "completed", 0)];
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "completed bottom entries do not drive periodic redraw"
+        );
+
+        state.sessions_cache = vec![elapsed_entry(1, "running", 0)];
+        assert!(
+            periodic_redraw_active_for_view(&state),
+            "running bottom sessions drive the spinner redraw"
+        );
+
+        state.sessions_cache.clear();
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: 9,
+                sequence: 9,
+                kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+                recent_tool_call: None,
+            }],
+        };
+        assert!(
+            periodic_redraw_active_for_view(&state),
+            "running provider workers also drive the bottom spinner redraw"
+        );
+
+        let row = state
+            .provider_worker_status
+            .rows
+            .first_mut()
+            .expect("test status has one row");
+        row.state = ProviderWorkerRowState::Committed;
+        state.provider_worker_status.running = 0;
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "terminal worker rows do not keep the periodic redraw alive"
+        );
+    }
+
+    #[test]
+    fn session_list_footer_includes_navigation_hint_when_entries_exist() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![elapsed_entry(1, "running", 0)];
+
+        let lines = render_sessions_list_lines(&state, 100, 4);
+        let rows = lines.iter().map(line_to_plain).collect::<Vec<_>>();
+
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("↑↓ sessions") && row.contains("Enter attach/open")),
+            "session footer should expose arrow navigation and Enter behavior: {rows:?}"
+        );
+        assert!(
+            footer_text(false, true).contains("↑↓ sessions"),
+            "static footer text helper also includes the dynamic hint"
+        );
+    }
+
+    #[test]
+    fn provider_worker_switcher_title_appends_latest_tool_summary_for_running_rows() {
+        let conversation = vec![ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls -la /tmp/demo".to_string(),
+            args_full: "{\"command\":\"ls -la /tmp/demo\"}".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        }];
+        let summary =
+            latest_provider_worker_tool_summary_from_conversation(&conversation, false).expect("tool summary");
+        assert!(
+            summary.contains("run shell running: ls -la /tmp/demo"),
+            "summary uses the compact provider worker IO wording: {summary}"
+        );
+
+        let running = ProviderWorkerStatusRow {
+            task_id: 3,
+            sequence: 3,
+            kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+            state: ProviderWorkerRowState::Running,
+            started_at_ms: 0,
+            finalized_total_tokens: None,
+            completion_ready: false,
+            recent_tool_call: Some(summary.clone()),
+        };
+        let entry = provider_worker_switcher_entry(&running);
+        assert!(
+            entry.title.contains(&summary),
+            "running worker title should include latest tool summary: {}",
+            entry.title
+        );
+
+        let mut completed = running;
+        completed.state = ProviderWorkerRowState::Committed;
+        let entry = provider_worker_switcher_entry(&completed);
+        assert!(
+            !entry.title.contains(&summary),
+            "terminal worker titles stay unchanged: {}",
+            entry.title
         );
     }
 
@@ -11258,6 +11651,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         }
     }
@@ -11753,7 +12147,7 @@ mod tests {
 
         let rows = fullscreen_rows(&state, 100, 24, &mut scroll);
         let joined = rows.join("\n");
-        let bottom = rows.last().cloned().unwrap_or_default();
+        let bottom = rows.iter().find(|row| row.contains("#1")).cloned().unwrap_or_default();
 
         assert!(
             joined.contains("main chat"),
@@ -11773,6 +12167,11 @@ mod tests {
             "bottom list should show the running task title, not shortcut-only chrome: {rows:?}"
         );
         assert!(
+            rows.iter()
+                .any(|row| row.contains("↑↓ sessions") && row.contains("Enter attach/open")),
+            "session list footer should expose navigation hint: {rows:?}"
+        );
+        assert!(
             !bottom.contains("Ctrl+G sessions"),
             "session list should replace shortcut footer while sessions exist: {rows:?}"
         );
@@ -11782,8 +12181,8 @@ mod tests {
             "session should render once below input, never duplicated above it: {rows:?}"
         );
         assert!(
-            !joined.contains('⏳') && !joined.contains('✓'),
-            "session list should use text status rather than status icons: {rows:?}"
+            UNICODE_SPINNER_FRAMES.iter().any(|frame| joined.contains(frame)) && !joined.contains('✓'),
+            "running session list rows should use animated spinner without terminal success icon: {rows:?}"
         );
     }
 
@@ -12347,6 +12746,7 @@ mod tests {
             tool_id: "tool-1".to_string(),
             name: "danger_tool".to_string(),
             args: "{\"path\":\"/tmp/demo\"}".to_string(),
+            selected_approval: false,
         });
         let mut scroll = FullscreenTranscriptScroll::default();
         scroll.jump_top();
@@ -12355,6 +12755,11 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("Tool Approval")),
             "approval panel visible outside transcript scroll: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("selected: deny") && row.contains("Enter confirm")),
+            "approval panel exposes arrow selection state and Enter confirmation: {rows:?}"
         );
         assert!(
             rows.iter().any(|row| row.contains("danger_tool")),
@@ -12473,16 +12878,16 @@ mod tests {
         let with_one = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
             with_one,
-            idle.saturating_add(1),
-            "one child session adds one row because the list also includes main"
+            idle.saturating_add(2),
+            "one child session adds one row plus the session navigation hint"
         );
 
         state.sessions_cache = vec![entry(1), entry(2), entry(3)];
         let with_three = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
             with_three,
-            idle.saturating_add(3),
-            "session list adds one row per child while retaining main"
+            idle.saturating_add(4),
+            "session list adds one row per child plus the navigation hint"
         );
 
         state.sessions_cache.clear();
@@ -12597,6 +13002,7 @@ mod tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
                     finalized_total_tokens: None,
                     completion_ready: false,
+                    recent_tool_call: None,
                 },
                 ProviderWorkerStatusRow {
                     task_id: 88,
@@ -12606,6 +13012,7 @@ mod tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(9_000),
                     finalized_total_tokens: Some(1_250),
                     completion_ready: true,
+                    recent_tool_call: None,
                 },
             ],
         };
@@ -12661,6 +13068,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
                 finalized_total_tokens: None,
                 completion_ready: true,
+                recent_tool_call: None,
             }],
         };
 
@@ -12710,6 +13118,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         };
         state.start_stream("draft-worker");
@@ -13213,6 +13622,7 @@ mod tests {
                 tool_id: "call-approval".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"rm -rf /tmp/nope"}"#.to_string(),
+                selected_approval: false,
             };
             state.ui.pending_tool_approval = Some(pending.clone());
             state.ui.focus = crate::chat::sessions::FocusTarget::Approval;

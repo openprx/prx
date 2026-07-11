@@ -1351,6 +1351,19 @@ impl ChatState {
         let approved = match key.code {
             KeyCode::Char('y' | 'Y') => Some(true),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+            KeyCode::Enter => Some(pending.selected_approval),
+            KeyCode::Left | KeyCode::Up => {
+                if let Some(pending) = self.ui.pending_tool_approval.as_mut() {
+                    pending.selected_approval = false;
+                }
+                return vec![Effect::RequestRedraw];
+            }
+            KeyCode::Right | KeyCode::Down => {
+                if let Some(pending) = self.ui.pending_tool_approval.as_mut() {
+                    pending.selected_approval = true;
+                }
+                return vec![Effect::RequestRedraw];
+            }
             _ => None,
         };
         let Some(approved) = approved else {
@@ -2268,6 +2281,7 @@ impl ChatState {
             tool_id: tool_id.clone(),
             name: name.clone(),
             args: args.clone(),
+            selected_approval: false,
         });
         self.ui.focus = crate::chat::sessions::FocusTarget::Approval;
         self.ui.switcher = None;
@@ -2776,6 +2790,21 @@ impl ChatState {
     }
 
     fn reduce_provider_worker_status_updated(&mut self, status: ProviderWorkerStatus) -> Vec<Effect> {
+        #[cfg(feature = "terminal-tui")]
+        let status = {
+            let mut status = status;
+            if let Some(summary) = crate::chat::tui::latest_provider_worker_tool_summary_from_conversation(
+                &self.ui.conversation_lines,
+                self.ui.ascii_fallback,
+            ) {
+                for row in &mut status.rows {
+                    if row.is_active() {
+                        row.recent_tool_call = Some(summary.clone());
+                    }
+                }
+            }
+            status
+        };
         if self.ui.provider_worker_status == status {
             return Vec::new();
         }
@@ -3558,6 +3587,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         };
 
@@ -3581,6 +3611,56 @@ mod tests {
             !view.lines.iter().any(|line| line == "output: P6Z"),
             "completed tool output without a matching streaming draft stays out of worker IO: {:?}",
             view.lines
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_update_enriches_running_rows_with_recent_tool_summary() {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut state = make_state();
+        state.ui.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls /tmp/demo".to_string(),
+            args_full: "{\"command\":\"ls /tmp/demo\"}".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        });
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![crate::chat::action::ProviderWorkerStatusRow {
+                task_id: 7,
+                sequence: 2,
+                kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                state: crate::chat::action::ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+                recent_tool_call: None,
+            }],
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let summary = state
+            .ui
+            .provider_worker_status
+            .rows
+            .first()
+            .and_then(|row| row.recent_tool_call.as_deref())
+            .expect("running row should receive latest tool summary");
+        assert!(
+            summary.contains("run shell running: ls /tmp/demo"),
+            "summary should use the compact tool-call wording: {summary}"
         );
     }
 
@@ -4163,6 +4243,49 @@ mod tests {
         assert_eq!(pending.tool_id, "call-approve");
         assert_eq!(pending.name, "shell");
         assert!(pending.args.contains("printf secure"));
+        assert!(
+            !pending.selected_approval,
+            "approval selection defaults to the safe deny choice"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn redux_approval_arrows_select_and_enter_resolves() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
+            tool_id: "call-arrow-approve".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+        assert!(
+            state
+                .ui
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval remains pending after arrow")
+                .selected_approval,
+            "Right selects approve"
+        );
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: true } if tool_id == "call-arrow-approve"
+            )
+        }));
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -6994,6 +7117,7 @@ mod tests {
                         started_at_ms: 0,
                         finalized_total_tokens: None,
                         completion_ready: false,
+                        recent_tool_call: None,
                     })
                     .collect(),
             }

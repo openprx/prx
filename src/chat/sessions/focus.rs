@@ -94,6 +94,9 @@ pub struct PendingToolApprovalView {
     pub tool_id: String,
     pub name: String,
     pub args: String,
+    /// True selects Approve, false selects Deny. The default is deny so Enter
+    /// never approves a tool before the operator moves the selection.
+    pub selected_approval: bool,
 }
 
 /// One row in the Ctrl+G session switcher. A plain display snapshot (no async,
