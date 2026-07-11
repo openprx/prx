@@ -14,7 +14,7 @@
 //! Gated behind the `terminal-tui` feature.
 
 use async_trait::async_trait;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use parking_lot::Mutex;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
@@ -110,11 +110,6 @@ pub struct TuiState {
     /// Owned by the synchronous key thread (opened/navigated/closed in
     /// `dispatch_global_key`); rendered as a bottom-chrome popup.
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
-    /// UI-only bottom-strip selection for direct Alt+arrow navigation. This is
-    /// deliberately separate from [`crate::chat::sessions::FocusTarget`]: it
-    /// highlights a strip entry but never changes input routing until Alt+Enter
-    /// reuses the existing synthetic `/attach N` path.
-    pub strip_selection: Option<u64>,
     /// Open slash-command menu overlay, or `None` when the cursor is not inside
     /// a leading command token.
     pub slash_menu: Option<SlashMenuState>,
@@ -661,13 +656,22 @@ pub enum KeyDispatch {
     /// key loop sends a synthetic `/attach <seq>` through the input channel so
     /// the async main loop performs the attach via its existing handler.
     AttachSession { seq: u64 },
-    /// Phase B: the bottom strip's UI-only selection changed. `None` clears the
-    /// highlight without changing input-routing focus.
-    StripSelectionChanged { selected: Option<u64> },
     /// v1.1b: detach the focused child session (Esc on empty input while a
     /// session is focused). The key loop sends a synthetic `/detach` through the
     /// input channel so the async main loop performs the detach.
     RequestDetach,
+    /// Scroll the main fullscreen transcript one line up from tail.
+    ScrollTranscriptUp,
+    /// Scroll the main fullscreen transcript one line down toward tail.
+    ScrollTranscriptDown,
+    /// Page the main fullscreen transcript up from tail.
+    PageTranscriptUp,
+    /// Page the main fullscreen transcript down toward tail.
+    PageTranscriptDown,
+    /// Jump the main fullscreen transcript to the oldest visible content.
+    TranscriptHome,
+    /// Jump the main fullscreen transcript to the tail.
+    TranscriptEnd,
     /// P2: scroll the focused child-session viewport one line up from tail.
     ScrollSessionUp,
     /// P2: scroll the focused child-session viewport one line down toward tail.
@@ -676,6 +680,10 @@ pub enum KeyDispatch {
     PageSessionUp,
     /// P2: page the focused child-session viewport down toward tail.
     PageSessionDown,
+    /// P2: jump the focused child-session viewport to the oldest retained line.
+    SessionHome,
+    /// P2: jump the focused child-session viewport to the tail.
+    SessionEnd,
     /// P3: switch to an adjacent live child session through the single `/attach`
     /// owner path.
     SwitchSession { seq: u64 },
@@ -1077,6 +1085,12 @@ fn provider_worker_switcher_entry(row: &ProviderWorkerStatusRow) -> crate::chat:
         title.push_str(" tokens=");
         title.push_str(&format_worker_tokens_compact(tokens));
     }
+    if row.is_active()
+        && let Some(summary) = row.recent_tool_call.as_deref().filter(|summary| !summary.is_empty())
+    {
+        title.push_str(" · ");
+        title.push_str(summary);
+    }
     crate::chat::sessions::SwitcherEntry {
         seq: PROVIDER_WORKER_SWITCHER_SEQ_BASE.saturating_add(row.sequence),
         kind: PROVIDER_WORKER_SWITCHER_KIND,
@@ -1118,29 +1132,19 @@ fn focus_active_entry_seq(focus: crate::chat::sessions::FocusTarget) -> Option<u
     })
 }
 
-pub(crate) fn strip_selection_index(
+pub(crate) fn focus_entry_index(
     entries: &[crate::chat::sessions::SwitcherEntry],
-    selected: Option<u64>,
     focus: crate::chat::sessions::FocusTarget,
 ) -> Option<usize> {
-    selected
-        .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
-        .or_else(|| focus_active_entry_seq(focus).and_then(|seq| entries.iter().position(|entry| entry.seq == seq)))
+    focus_active_entry_seq(focus).and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
 }
 
 const MAIN_SESSION_SELECTION_SEQ: u64 = 0;
 
 fn bottom_list_selection_index(
     entries: &[crate::chat::sessions::SwitcherEntry],
-    selected: Option<u64>,
     focus: crate::chat::sessions::FocusTarget,
 ) -> usize {
-    if selected == Some(MAIN_SESSION_SELECTION_SEQ) {
-        return 0;
-    }
-    if let Some(idx) = selected.and_then(|seq| entries.iter().position(|entry| entry.seq == seq)) {
-        return idx.saturating_add(1);
-    }
     focus_active_entry_seq(focus)
         .and_then(|seq| entries.iter().position(|entry| entry.seq == seq))
         .map_or(0, |idx| idx.saturating_add(1))
@@ -1156,7 +1160,6 @@ fn bottom_list_seq_at(entries: &[crate::chat::sessions::SwitcherEntry], idx: usi
 
 fn move_bottom_list_selection(
     entries: &[crate::chat::sessions::SwitcherEntry],
-    selected: Option<u64>,
     focus: crate::chat::sessions::FocusTarget,
     direction: crate::chat::sessions::SessionDirection,
 ) -> Option<u64> {
@@ -1164,7 +1167,7 @@ fn move_bottom_list_selection(
         return None;
     }
     let total = entries.len().saturating_add(1);
-    let current = bottom_list_selection_index(entries, selected, focus).min(total.saturating_sub(1));
+    let current = bottom_list_selection_index(entries, focus).min(total.saturating_sub(1));
     let target_idx = match direction {
         crate::chat::sessions::SessionDirection::Previous => {
             current.checked_sub(1).unwrap_or_else(|| total.saturating_sub(1))
@@ -1199,36 +1202,73 @@ fn bottom_chrome_session_entries_with_workers(
     out
 }
 
-pub(crate) fn move_strip_selection(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    selected: Option<u64>,
-    focus: crate::chat::sessions::FocusTarget,
-    direction: crate::chat::sessions::SessionDirection,
-) -> Option<u64> {
-    if entries.is_empty() {
-        return None;
-    }
-    let current = strip_selection_index(entries, selected, focus);
-    let target_idx = match (current, direction) {
-        (Some(idx), crate::chat::sessions::SessionDirection::Previous) => {
-            idx.checked_sub(1).unwrap_or_else(|| entries.len().saturating_sub(1))
-        }
-        (Some(idx), crate::chat::sessions::SessionDirection::Next) => {
-            let next = idx.saturating_add(1);
-            if next >= entries.len() { 0 } else { next }
-        }
-        (None, crate::chat::sessions::SessionDirection::Previous) => entries.len().saturating_sub(1),
-        (None, crate::chat::sessions::SessionDirection::Next) => 0,
-    };
-    entries.get(target_idx).map(|entry| entry.seq)
-}
-
 pub(crate) fn selected_strip_entry<'a>(
     entries: &'a [crate::chat::sessions::SwitcherEntry],
     selected: Option<u64>,
 ) -> Option<&'a crate::chat::sessions::SwitcherEntry> {
     let seq = selected?;
     entries.iter().find(|entry| entry.seq == seq)
+}
+
+fn dispatch_bottom_entry_activation(
+    entry: &crate::chat::sessions::SwitcherEntry,
+    current_focus: crate::chat::sessions::FocusTarget,
+) -> KeyDispatch {
+    if is_provider_worker_switcher_entry(entry)
+        && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
+    {
+        return KeyDispatch::OpenProviderWorkerView { sequence };
+    }
+    if current_focus.session_seq() == Some(entry.seq) {
+        return KeyDispatch::Consumed;
+    }
+    if matches!(current_focus, crate::chat::sessions::FocusTarget::Main) {
+        KeyDispatch::AttachSession { seq: entry.seq }
+    } else {
+        KeyDispatch::SwitchSession { seq: entry.seq }
+    }
+}
+
+fn dispatch_main_bottom_switch(state: &TuiState, direction: crate::chat::sessions::SessionDirection) -> KeyDispatch {
+    let bottom_entries = bottom_chrome_session_entries_with_workers(
+        &state.sessions_cache,
+        state.provider_worker_status.clone(),
+        state.focus,
+    );
+    let Some(selected) = move_bottom_list_selection(&bottom_entries, state.focus, direction) else {
+        return KeyDispatch::Consumed;
+    };
+    if selected == MAIN_SESSION_SELECTION_SEQ {
+        return KeyDispatch::Consumed;
+    }
+    selected_strip_entry(&bottom_entries, Some(selected)).map_or(KeyDispatch::Consumed, |entry| {
+        dispatch_bottom_entry_activation(entry, state.focus)
+    })
+}
+
+fn dispatch_child_bottom_switch(state: &TuiState, direction: crate::chat::sessions::SessionDirection) -> KeyDispatch {
+    let bottom_entries = bottom_chrome_session_entries_with_workers(
+        &state.sessions_cache,
+        state.provider_worker_status.clone(),
+        state.focus,
+    );
+    let Some(selected) = move_bottom_list_selection(&bottom_entries, state.focus, direction) else {
+        return KeyDispatch::Consumed;
+    };
+    if selected == MAIN_SESSION_SELECTION_SEQ {
+        return match state.focus {
+            crate::chat::sessions::FocusTarget::Worker { .. } => KeyDispatch::CloseProviderWorkerView,
+            crate::chat::sessions::FocusTarget::Transcript => KeyDispatch::CloseTranscriptViewer,
+            crate::chat::sessions::FocusTarget::Diff => KeyDispatch::CloseDiffViewer,
+            crate::chat::sessions::FocusTarget::Session { .. } => KeyDispatch::RequestDetach,
+            crate::chat::sessions::FocusTarget::Main | crate::chat::sessions::FocusTarget::Approval => {
+                KeyDispatch::Consumed
+            }
+        };
+    }
+    selected_strip_entry(&bottom_entries, Some(selected)).map_or(KeyDispatch::Consumed, |entry| {
+        dispatch_bottom_entry_activation(entry, state.focus)
+    })
 }
 
 const fn tool_status_name(status: ToolStatus) -> &'static str {
@@ -1296,6 +1336,59 @@ const PROVIDER_WORKER_IO_RESULT_LINES: usize = 3;
 
 fn provider_worker_io_clip(text: &str) -> String {
     truncate_chars_with_ellipsis(text.trim(), PROVIDER_WORKER_IO_LINE_MAX_CHARS, false)
+}
+
+const PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS: u16 = 64;
+
+#[must_use]
+pub fn latest_provider_worker_tool_summary_from_conversation(
+    conversation: &[ConversationLine],
+    ascii: bool,
+) -> Option<String> {
+    conversation
+        .iter()
+        .rev()
+        .take(PROVIDER_WORKER_IO_MAX_SOURCE_ITEMS)
+        .find_map(|item| match item {
+            ConversationLine::ToolResult {
+                tool_name,
+                args_preview,
+                args_full,
+                status,
+                ..
+            } => {
+                let args = if args_preview.trim().is_empty() {
+                    args_full
+                } else {
+                    args_preview
+                };
+                let summary = format!(
+                    "run {} {}: {}",
+                    tool_name,
+                    tool_status_name(*status),
+                    provider_worker_io_clip(args)
+                );
+                Some(truncate_chars_with_ellipsis(
+                    &summary,
+                    PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS,
+                    ascii,
+                ))
+            }
+            ConversationLine::Tool { name, success } => {
+                let status = if *success { "done" } else { "error" };
+                let summary = format!("run {name} {status}");
+                Some(truncate_chars_with_ellipsis(
+                    &summary,
+                    PROVIDER_WORKER_TITLE_TOOL_MAX_CHARS,
+                    ascii,
+                ))
+            }
+            ConversationLine::User { .. }
+            | ConversationLine::Assistant { .. }
+            | ConversationLine::StreamingAssistant { .. }
+            | ConversationLine::System { .. }
+            | ConversationLine::Reasoning { .. } => None,
+        })
 }
 
 /// Build compact live IO lines for the read-only provider worker detail view.
@@ -1519,6 +1612,26 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
                         approved: false,
                     };
                 }
+                KeyCode::Left | KeyCode::Up => {
+                    if let Some(pending) = state.pending_tool_approval.as_mut() {
+                        pending.selected_approval = false;
+                    }
+                    return KeyDispatch::Consumed;
+                }
+                KeyCode::Right | KeyCode::Down => {
+                    if let Some(pending) = state.pending_tool_approval.as_mut() {
+                        pending.selected_approval = true;
+                    }
+                    return KeyDispatch::Consumed;
+                }
+                KeyCode::Enter => {
+                    state.pending_tool_approval = None;
+                    state.focus = crate::chat::sessions::FocusTarget::Main;
+                    return KeyDispatch::ToolApprovalDecision {
+                        tool_id: pending.tool_id,
+                        approved: pending.selected_approval,
+                    };
+                }
                 _ => return KeyDispatch::Consumed,
             }
         }
@@ -1554,89 +1667,38 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         state.switcher = Some(crate::chat::sessions::SwitcherState::new(entries.clone()));
         return KeyDispatch::SwitcherOpened { entries };
     }
+    if key.modifiers == KeyModifiers::NONE && matches!(state.focus, crate::chat::sessions::FocusTarget::Main) {
+        match key.code {
+            KeyCode::PageUp => return KeyDispatch::PageTranscriptUp,
+            KeyCode::PageDown => return KeyDispatch::PageTranscriptDown,
+            KeyCode::Home => return KeyDispatch::TranscriptHome,
+            KeyCode::End => return KeyDispatch::TranscriptEnd,
+            _ => {}
+        }
+    }
+    if key.modifiers == KeyModifiers::NONE && state.focus.is_child_view() {
+        match key.code {
+            KeyCode::PageUp => return KeyDispatch::PageSessionUp,
+            KeyCode::PageDown => return KeyDispatch::PageSessionDown,
+            KeyCode::Home => return KeyDispatch::SessionHome,
+            KeyCode::End => return KeyDispatch::SessionEnd,
+            _ => {}
+        }
+    }
     if state.input.is_empty()
         && key.modifiers == KeyModifiers::NONE
         && matches!(state.focus, crate::chat::sessions::FocusTarget::Main)
     {
-        let bottom_entries = bottom_chrome_session_entries_with_workers(
-            &state.sessions_cache,
-            state.provider_worker_status.clone(),
-            state.focus,
-        );
-        let direction = match key.code {
-            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
-            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
-            _ => None,
-        };
-        if let Some(direction) = direction {
-            if !bottom_entries.is_empty() {
-                let selected =
-                    move_bottom_list_selection(&bottom_entries, state.strip_selection, state.focus, direction);
-                state.strip_selection = selected;
-                return KeyDispatch::StripSelectionChanged { selected };
+        match key.code {
+            KeyCode::Up => return KeyDispatch::ScrollTranscriptUp,
+            KeyCode::Down => return KeyDispatch::ScrollTranscriptDown,
+            KeyCode::Left if key.kind == KeyEventKind::Repeat => return KeyDispatch::Consumed,
+            KeyCode::Right if key.kind == KeyEventKind::Repeat => return KeyDispatch::Consumed,
+            KeyCode::Left => {
+                return dispatch_main_bottom_switch(state, crate::chat::sessions::SessionDirection::Previous);
             }
-        }
-        if key.code == KeyCode::Enter
-            && let Some(selected) = state.strip_selection
-        {
-            if selected == MAIN_SESSION_SELECTION_SEQ {
-                state.strip_selection = None;
-                return KeyDispatch::Consumed;
-            }
-            if let Some(entry) = selected_strip_entry(&bottom_entries, Some(selected)) {
-                state.strip_selection = None;
-                if is_provider_worker_switcher_entry(entry)
-                    && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                {
-                    return KeyDispatch::OpenProviderWorkerView { sequence };
-                }
-                return KeyDispatch::AttachSession { seq: entry.seq };
-            }
-            state.strip_selection = None;
-            state.push_system_message("session gone");
-            return KeyDispatch::Consumed;
-        }
-    }
-    if key.modifiers == KeyModifiers::ALT {
-        let direction = match key.code {
-            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
-            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
-            _ => None,
-        };
-        if let Some(direction) = direction {
-            let entries = bottom_chrome_session_entries_with_workers(
-                &state.sessions_cache,
-                state.provider_worker_status.clone(),
-                state.focus,
-            );
-            let selected = move_strip_selection(&entries, state.strip_selection, state.focus, direction);
-            state.strip_selection = selected;
-            return KeyDispatch::StripSelectionChanged { selected };
-        }
-        if key.code == KeyCode::Enter {
-            if let Some(selected) = state.strip_selection {
-                let entries = bottom_chrome_session_entries_with_workers(
-                    &state.sessions_cache,
-                    state.provider_worker_status.clone(),
-                    state.focus,
-                );
-                if selected == MAIN_SESSION_SELECTION_SEQ {
-                    state.strip_selection = None;
-                    return KeyDispatch::RequestDetach;
-                }
-                if let Some(entry) = selected_strip_entry(&entries, Some(selected)) {
-                    state.strip_selection = None;
-                    if is_provider_worker_switcher_entry(entry)
-                        && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                    {
-                        return KeyDispatch::OpenProviderWorkerView { sequence };
-                    }
-                    return KeyDispatch::AttachSession { seq: entry.seq };
-                }
-                state.strip_selection = None;
-                state.push_system_message("session gone");
-                return KeyDispatch::Consumed;
-            }
+            KeyCode::Right => return dispatch_main_bottom_switch(state, crate::chat::sessions::SessionDirection::Next),
+            _ => {}
         }
     }
     if key.code == KeyCode::Char('o') && key.modifiers == KeyModifiers::CONTROL {
@@ -1671,82 +1733,23 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         let _ = state.handle_input_key(synthetic);
         return KeyDispatch::Consumed;
     }
-    if let Some(current_seq) = state.focus.session_seq()
-        && state.input.is_empty()
-        && key.modifiers == KeyModifiers::NONE
-    {
+    if state.focus.is_child_view() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
         let direction = match key.code {
-            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
-            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+            KeyCode::Left => Some(crate::chat::sessions::SessionDirection::Previous),
+            KeyCode::Right => Some(crate::chat::sessions::SessionDirection::Next),
             _ => None,
         };
         if let Some(direction) = direction {
-            let bottom_entries = bottom_chrome_session_entries_with_workers(
-                &state.sessions_cache,
-                state.provider_worker_status.clone(),
-                state.focus,
-            );
-            if !bottom_entries.is_empty() {
-                let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
-                return match selected {
-                    Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::RequestDetach,
-                    Some(seq) => {
-                        if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq))
-                            && is_provider_worker_switcher_entry(entry)
-                            && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                        {
-                            return KeyDispatch::OpenProviderWorkerView { sequence };
-                        }
-                        if seq != current_seq {
-                            return KeyDispatch::SwitchSession { seq };
-                        }
-                        KeyDispatch::Consumed
-                    }
-                    None => KeyDispatch::Consumed,
-                };
+            if key.kind == KeyEventKind::Repeat {
+                return KeyDispatch::Consumed;
             }
-        }
-    }
-    if matches!(state.focus, crate::chat::sessions::FocusTarget::Worker { .. })
-        && state.input.is_empty()
-        && key.modifiers == KeyModifiers::NONE
-    {
-        let direction = match key.code {
-            KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
-            KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
-            _ => None,
-        };
-        if let Some(direction) = direction {
-            let bottom_entries = bottom_chrome_session_entries_with_workers(
-                &state.sessions_cache,
-                state.provider_worker_status.clone(),
-                state.focus,
-            );
-            if !bottom_entries.is_empty() {
-                let selected = move_bottom_list_selection(&bottom_entries, None, state.focus, direction);
-                return match selected {
-                    Some(MAIN_SESSION_SELECTION_SEQ) => KeyDispatch::CloseProviderWorkerView,
-                    Some(seq) => {
-                        if let Some(entry) = selected_strip_entry(&bottom_entries, Some(seq)) {
-                            if is_provider_worker_switcher_entry(entry)
-                                && let Some(sequence) = provider_worker_sequence_from_switcher_seq(entry.seq)
-                            {
-                                return KeyDispatch::OpenProviderWorkerView { sequence };
-                            }
-                        }
-                        KeyDispatch::SwitchSession { seq }
-                    }
-                    None => KeyDispatch::Consumed,
-                };
-            }
+            return dispatch_child_bottom_switch(state, direction);
         }
     }
     if state.focus.is_child_view() && state.input.is_empty() && key.modifiers == KeyModifiers::NONE {
         match key.code {
             KeyCode::Up => return KeyDispatch::ScrollSessionUp,
             KeyCode::Down => return KeyDispatch::ScrollSessionDown,
-            KeyCode::PageUp => return KeyDispatch::PageSessionUp,
-            KeyCode::PageDown => return KeyDispatch::PageSessionDown,
             _ => {}
         }
     }
@@ -1755,9 +1758,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     // between the established "non-empty clears input" muscle memory and the new
     // "empty + session focused → detach" behaviour, never weakening the former.
     if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
-        if state.strip_selection.take().is_some() {
-            return KeyDispatch::StripSelectionChanged { selected: None };
-        }
         use crate::chat::sessions::focus::{EscAction, resolve_esc};
         match resolve_esc(state.input.is_empty(), state.focus, false, state.streaming.is_some()) {
             EscAction::CancelGenerating => return KeyDispatch::InterruptTurn,
@@ -2936,6 +2936,26 @@ impl TuiInput {
             return self.handle_reverse_search_key(key);
         }
 
+        if ctrl && !alt {
+            match key.code {
+                KeyCode::Char('p' | 'P') => {
+                    return if self.history_prev() {
+                        InputOutcome::Consumed
+                    } else {
+                        InputOutcome::Unhandled
+                    };
+                }
+                KeyCode::Char('n' | 'N') => {
+                    return if self.history_next() {
+                        InputOutcome::Consumed
+                    } else {
+                        InputOutcome::Unhandled
+                    };
+                }
+                _ => {}
+            }
+        }
+
         match key.code {
             KeyCode::Enter => {
                 if shift || alt {
@@ -3009,27 +3029,14 @@ impl TuiInput {
                 InputOutcome::Consumed
             }
             KeyCode::Up => {
-                // Single-line buffer → history; multi-line → cursor up.
-                if self.is_single_line() {
-                    if self.history_prev() {
-                        InputOutcome::Consumed
-                    } else {
-                        InputOutcome::Unhandled
-                    }
-                } else if self.move_cursor_up() {
+                if !self.is_single_line() && self.move_cursor_up() {
                     InputOutcome::Consumed
                 } else {
                     InputOutcome::Unhandled
                 }
             }
             KeyCode::Down => {
-                if self.is_single_line() {
-                    if self.history_next() {
-                        InputOutcome::Consumed
-                    } else {
-                        InputOutcome::Unhandled
-                    }
-                } else if self.move_cursor_down() {
+                if !self.is_single_line() && self.move_cursor_down() {
                     InputOutcome::Consumed
                 } else {
                     InputOutcome::Unhandled
@@ -3118,7 +3125,6 @@ impl TuiState {
             sessions_status: String::new(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
-            strip_selection: None,
             slash_menu: None,
             sessions_cache: Vec::new(),
             main_queue_status: MainQueueStatus::default(),
@@ -3301,6 +3307,11 @@ impl TuiState {
     #[must_use]
     pub fn execution_activity_active(&self) -> bool {
         execution_activity_active_for_view(self)
+    }
+
+    #[must_use]
+    pub fn periodic_redraw_active(&self) -> bool {
+        periodic_redraw_active_for_view(self)
     }
 
     /// Replace the persistent child-session status line (v1b).
@@ -3748,8 +3759,6 @@ pub trait BottomChromeView {
     fn main_queue_status(&self) -> MainQueueStatus;
     /// Main-session provider worker status.
     fn provider_worker_status(&self) -> ProviderWorkerStatus;
-    /// UI-only bottom-strip selection, separate from input-routing focus.
-    fn strip_selection(&self) -> Option<u64>;
     /// Focused line-session viewport (P2), if any.
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView>;
     /// Foreground tool approval prompt (P6c1), if any.
@@ -3813,9 +3822,6 @@ impl BottomChromeView for TuiState {
     }
     fn provider_worker_status(&self) -> ProviderWorkerStatus {
         self.provider_worker_status.clone()
-    }
-    fn strip_selection(&self) -> Option<u64> {
-        self.strip_selection
     }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
@@ -3889,9 +3895,6 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     fn provider_worker_status(&self) -> ProviderWorkerStatus {
         self.provider_worker_status.clone()
     }
-    fn strip_selection(&self) -> Option<u64> {
-        self.strip_selection
-    }
     fn active_session_view(&self) -> Option<&crate::chat::sessions::ActiveSessionView> {
         self.active_session_view.as_ref()
     }
@@ -3947,6 +3950,14 @@ pub struct FullscreenTranscriptScroll {
 }
 
 impl FullscreenTranscriptScroll {
+    pub fn line_up(&mut self) {
+        self.page_up(1);
+    }
+
+    pub fn line_down(&mut self) {
+        self.page_down(1);
+    }
+
     pub fn page_up(&mut self, rows: usize) {
         self.offset_from_bottom = self.offset_from_bottom.saturating_add(rows.max(1));
         self.anchor_top_row = None;
@@ -4014,7 +4025,7 @@ fn session_footer_desired_rows<V: BottomChromeView + ?Sized>(state: &V) -> u16 {
     } else if visible_entries.is_empty() {
         1
     } else {
-        visible_entries.len().saturating_add(1)
+        visible_entries.len().saturating_add(2)
     };
     u16::try_from(rows).unwrap_or(u16::MAX).max(1)
 }
@@ -4248,7 +4259,14 @@ fn render_fullscreen_panel<V: BottomChromeView + ?Sized>(frame: &mut Frame, area
     };
     frame.render_widget(Clear, area);
     if let Some(approval) = state.pending_tool_approval() {
-        render_approval(frame, area, &approval.name, &approval.args, state.ascii_fallback());
+        render_approval(
+            frame,
+            area,
+            &approval.name,
+            &approval.args,
+            approval.selected_approval,
+            state.ascii_fallback(),
+        );
     } else if let Some(view) = state.active_session_view() {
         render_active_session_view(frame, area, view, state.ascii_fallback());
     }
@@ -4419,13 +4437,37 @@ const fn session_active_marker(active: bool, ascii: bool) -> &'static str {
     }
 }
 
-fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+const SPINNER_FRAME_MS: u64 = 150;
+const ASCII_SPINNER_FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
+const UNICODE_SPINNER_FRAMES: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
+
+fn current_animation_tick() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| {
+            u64::try_from(duration.as_millis() / u128::from(SPINNER_FRAME_MS)).unwrap_or(u64::MAX)
+        })
+}
+
+fn spinner_frame_for_tick(ascii: bool, tick: u64) -> &'static str {
+    let frames = if ascii {
+        &ASCII_SPINNER_FRAMES
+    } else {
+        &UNICODE_SPINNER_FRAMES
+    };
+    let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
+    frames.get(idx).copied().unwrap_or("-")
+}
+
+fn session_status_glyph_for_tick(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool, tick: u64) -> &'static str {
     if entry.is_transcript() {
         return if ascii { "[T]" } else { "T" };
     }
+    if entry.status == "running" {
+        return spinner_frame_for_tick(ascii, tick);
+    }
     if ascii {
         match entry.status {
-            "running" => "[~]",
             "needs-input" => "[?]",
             "completed" => "[x]",
             "cancelled" => "[-]",
@@ -4434,6 +4476,10 @@ fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: boo
     } else {
         entry.status_glyph()
     }
+}
+
+fn session_status_glyph(entry: &crate::chat::sessions::SwitcherEntry, ascii: bool) -> &'static str {
+    session_status_glyph_for_tick(entry, ascii, current_animation_tick())
 }
 
 const SESSION_STRIP_CHIP_MAX_WIDTH: u16 = 24;
@@ -4497,7 +4543,6 @@ fn render_sessions_strip_entry(
 fn render_sessions_list_entry_line(
     entry: &crate::chat::sessions::SwitcherEntry,
     active_seq: Option<u64>,
-    strip_selection: Option<u64>,
     ascii: bool,
     width: u16,
 ) -> Line<'static> {
@@ -4505,8 +4550,8 @@ fn render_sessions_list_entry_line(
         return Line::default();
     }
     let active = active_seq == Some(entry.seq);
-    let selected = strip_selection == Some(entry.seq);
     let marker = session_active_marker(active, ascii);
+    let glyph = session_status_glyph(entry, ascii);
     let idle = if entry.idle_warning {
         if ascii { " [idle]" } else { " ⚠ idle" }
     } else {
@@ -4519,7 +4564,7 @@ fn render_sessions_list_entry_line(
     let sep = if ascii { " | " } else { " · " };
     let display_id = switcher_entry_display_id(entry);
     let prefix = format!(
-        "{marker} {display_id} {} {} {}{}{}{}",
+        "{marker}{glyph} {display_id} {} {} {}{}{}{}",
         entry.kind,
         entry.origin,
         entry.status,
@@ -4533,12 +4578,7 @@ fn render_sessions_list_entry_line(
         text.push_str(&entry.title);
     }
     let text = truncate_chars_with_ellipsis(&text, width, ascii);
-    let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if active {
+    let style = if active {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else if entry.is_terminal() {
         Style::default().fg(Color::DarkGray)
@@ -4551,7 +4591,6 @@ fn render_sessions_list_entry_line(
 fn render_main_session_list_line<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> Line<'static> {
     let ascii = state.ascii_fallback();
     let active = matches!(state.focus(), crate::chat::sessions::FocusTarget::Main);
-    let selected = state.strip_selection() == Some(MAIN_SESSION_SELECTION_SEQ);
     let marker = session_active_marker(active, ascii);
     let sep = if ascii { " | " } else { " · " };
     let usage = render_main_token_usage(state.token_usage_summary());
@@ -4565,17 +4604,30 @@ fn render_main_session_list_line<V: BottomChromeView + ?Sized>(state: &V, width:
         state.model()
     );
     let text = truncate_chars_with_ellipsis(&text, width, ascii);
-    let style = if selected {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if active {
+    let style = if active {
         Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     };
     Line::from(Span::styled(text, style))
+}
+
+const fn sessions_navigation_hint(ascii: bool, child_focus: bool) -> &'static str {
+    match (ascii, child_focus) {
+        (true, true) => " Up/Down scroll | Left/Right switch | Esc back ",
+        (false, true) => " \u{2191}/\u{2193} scroll \u{00B7} \u{2190}/\u{2192} switch \u{00B7} Esc back ",
+        (true, false) => " Left/Right session ",
+        (false, false) => " \u{2190}/\u{2192} session ",
+    }
+}
+
+fn render_sessions_navigation_hint_line(
+    ascii: bool,
+    focus: crate::chat::sessions::FocusTarget,
+    width: u16,
+) -> Line<'static> {
+    let text = truncate_chars_with_ellipsis(sessions_navigation_hint(ascii, focus.is_child_view()), width, ascii);
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
 fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
@@ -4587,7 +4639,6 @@ fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
     let focus = state.focus();
     let entries =
         bottom_chrome_session_entries_with_workers(state.sessions_entries(), state.provider_worker_status(), focus);
-    let strip_selection = state.strip_selection();
     let ascii = state.ascii_fallback();
     if width == 0 || max_rows == 0 {
         return Vec::new();
@@ -4600,25 +4651,23 @@ fn render_sessions_list_lines<V: BottomChromeView + ?Sized>(
     }
     let active_seq = focus_active_entry_seq(focus);
     let total = entries.len().saturating_add(1);
-    let target_idx = bottom_list_selection_index(&entries, strip_selection, focus).min(total.saturating_sub(1));
-    let start = if total <= max_rows {
+    let list_rows = max_rows.saturating_sub(1).max(1);
+    let target_idx = bottom_list_selection_index(&entries, focus).min(total.saturating_sub(1));
+    let start = if total <= list_rows {
         0
     } else {
-        target_idx.saturating_add(1).saturating_sub(max_rows)
+        target_idx.saturating_add(1).saturating_sub(list_rows)
     };
     let mut lines = Vec::new();
-    for idx in start..total.min(start.saturating_add(max_rows)) {
+    for idx in start..total.min(start.saturating_add(list_rows)) {
         if idx == 0 {
             lines.push(render_main_session_list_line(state, width));
         } else if let Some(entry) = entries.get(idx.saturating_sub(1)) {
-            lines.push(render_sessions_list_entry_line(
-                entry,
-                active_seq,
-                strip_selection,
-                ascii,
-                width,
-            ));
+            lines.push(render_sessions_list_entry_line(entry, active_seq, ascii, width));
         }
+    }
+    if lines.len() < max_rows {
+        lines.push(render_sessions_navigation_hint_line(ascii, focus, width));
     }
     lines
 }
@@ -4630,18 +4679,7 @@ fn render_sessions_strip_line(
     ascii: bool,
     width: u16,
 ) -> String {
-    render_sessions_strip_line_with_selection(entries, summary, focus, None, ascii, width)
-}
-
-fn render_sessions_strip_line_with_selection(
-    entries: &[crate::chat::sessions::SwitcherEntry],
-    summary: &str,
-    focus: crate::chat::sessions::FocusTarget,
-    strip_selection: Option<u64>,
-    ascii: bool,
-    width: u16,
-) -> String {
-    render_sessions_strip_styled_line(entries, summary, focus, strip_selection, ascii, width)
+    render_sessions_strip_styled_line(entries, summary, focus, ascii, width)
         .spans
         .iter()
         .map(|span| span.content.as_ref())
@@ -4652,7 +4690,6 @@ fn render_sessions_strip_styled_line(
     entries: &[crate::chat::sessions::SwitcherEntry],
     summary: &str,
     focus: crate::chat::sessions::FocusTarget,
-    strip_selection: Option<u64>,
     ascii: bool,
     width: u16,
 ) -> Line<'static> {
@@ -4672,7 +4709,7 @@ fn render_sessions_strip_styled_line(
     }
 
     let active_seq = focus_active_entry_seq(focus);
-    let target_idx = strip_selection_index(entries, strip_selection, focus);
+    let target_idx = focus_entry_index(entries, focus);
     let start = target_idx
         .map(|target| sessions_strip_window_start(entries, active_seq, ascii, content_width, target))
         .unwrap_or(0);
@@ -4681,7 +4718,6 @@ fn render_sessions_strip_styled_line(
         entries,
         start,
         active_seq,
-        strip_selection,
         ascii,
         content_width,
     ));
@@ -4764,7 +4800,6 @@ fn render_sessions_strip_window(
     entries: &[crate::chat::sessions::SwitcherEntry],
     start: usize,
     active_seq: Option<u64>,
-    strip_selection: Option<u64>,
     ascii: bool,
     width: u16,
 ) -> Vec<Span<'static>> {
@@ -4810,18 +4845,7 @@ fn render_sessions_strip_window(
         {
             break;
         }
-        let selected = strip_selection == Some(entry.seq);
-        if selected {
-            spans.push(Span::styled(
-                segment,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::raw(segment));
-        }
+        spans.push(Span::raw(segment));
         used_cols = used_cols.saturating_add(segment_cols);
     }
 
@@ -5465,18 +5489,7 @@ fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option
     if !execution_activity_active_for_view(state) {
         return None;
     }
-    let frames = if state.ascii_fallback() {
-        ["-", "\\", "|", "/"]
-    } else {
-        ["⠋", "⠙", "⠹", "⠸"]
-    };
-    let tick = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| {
-            u64::try_from(duration.as_millis() / 50).unwrap_or(u64::MAX)
-        });
-    let idx = usize::try_from(tick % u64::try_from(frames.len()).unwrap_or(1)).unwrap_or(0);
-    let frame = frames.get(idx).copied().unwrap_or("-");
+    let frame = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
     Some(format!("{frame} generating (esc to interrupt)"))
 }
 
@@ -5624,6 +5637,16 @@ pub fn execution_activity_active_for_view<V: BottomChromeView + ?Sized>(state: &
                 }
             )
         })
+}
+
+pub fn bottom_running_entry_active_for_view<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    bottom_chrome_session_entries_with_workers(state.sessions_entries(), state.provider_worker_status(), state.focus())
+        .iter()
+        .any(|entry| entry.status == "running")
+}
+
+pub fn periodic_redraw_active_for_view<V: BottomChromeView + ?Sized>(state: &V) -> bool {
+    execution_activity_active_for_view(state) || bottom_running_entry_active_for_view(state)
 }
 
 fn render_permission_status(mode: ChatMode, autonomy: AutonomyLevel) -> String {
@@ -6998,15 +7021,36 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     }
 }
 
-fn render_footer(frame: &mut Frame, area: Rect) {
+fn footer_text(ascii: bool, show_session_hint: bool) -> String {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
-    let footer = Paragraph::new(
-        " Ctrl+G sessions \u{00B7} Ctrl+O transcript \u{00B7} /copy latest \u{00B7} drag select/copy \u{00B7} Shift+Enter newline \u{00B7} Ctrl+X Ctrl+E edit \u{00B7} Tab fold \u{00B7} Esc cancel ",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+    let sep = if ascii { " | " } else { " \u{00B7} " };
+    let mut parts = Vec::from([
+        if ascii {
+            "Up/Down scroll"
+        } else {
+            "\u{2191}/\u{2193} scroll"
+        },
+        "Ctrl+P/N history",
+        "Ctrl+G sessions",
+        "Ctrl+O transcript",
+        "/copy latest",
+        "drag select/copy",
+        "Shift+Enter newline",
+        "Ctrl+X Ctrl+E edit",
+        "Tab fold",
+        "Esc cancel",
+    ]);
+    if show_session_hint {
+        parts.insert(1, sessions_navigation_hint(ascii, false).trim());
+    }
+    format!(" {} ", parts.join(sep))
+}
+
+fn render_footer(frame: &mut Frame, area: Rect, ascii: bool, show_session_hint: bool) {
+    let footer = Paragraph::new(footer_text(ascii, show_session_hint)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
@@ -7041,15 +7085,41 @@ fn render_fullscreen_footer<V: BottomChromeView + ?Sized>(
     if render_session_list_footer(frame, area, state) {
         return;
     }
-    render_footer(frame, area);
+    render_footer(frame, area, state.ascii_fallback(), session_footer_has_sessions(state));
 }
 
 /// Render a tool approval prompt.
-pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &str, ascii: bool) {
+pub fn render_approval(
+    frame: &mut Frame,
+    area: Rect,
+    tool_name: &str,
+    args: &str,
+    selected_approval: bool,
+    ascii: bool,
+) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let marker = if ascii { ">" } else { "\u{25B8}" };
+    let approve_marker = if selected_approval { marker } else { " " };
+    let deny_marker = if selected_approval { " " } else { marker };
+    let approve_style = if selected_approval {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)
+    };
+    let deny_style = if selected_approval {
+        Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Red)
+            .add_modifier(Modifier::BOLD)
+    };
+    let select_hint = if ascii { "Left/Right" } else { "\u{2190}/\u{2192}" };
     let approval_text = vec![
         Line::from(vec![
             Span::styled(
@@ -7064,18 +7134,28 @@ pub fn render_approval(frame: &mut Frame, area: Rect, tool_name: &str, args: &st
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("[y]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{approve_marker} [y]"), approve_style),
             Span::raw(" approve  "),
-            Span::styled("[n]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{deny_marker} [n]"), deny_style),
             Span::raw(" deny  "),
             Span::styled("[Esc]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
             Span::raw(" deny"),
         ]),
+        Line::from(Span::styled(
+            format!("{select_hint} select · Enter confirm"),
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
 
+    let selected_label = if selected_approval { "approve" } else { "deny" };
+    let title = if ascii {
+        format!(" Tool Approval - selected: {selected_label} - Left/Right select - Enter confirm ")
+    } else {
+        format!(" Tool Approval - selected: {selected_label} - ←/→ select - Enter confirm ")
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Tool Approval ")
+        .title(title)
         .border_style(Style::default().fg(Color::Yellow));
 
     let paragraph = Paragraph::new(approval_text).block(block).wrap(Wrap { trim: false });
@@ -8604,6 +8684,15 @@ mod tests {
         KeyEvent::new(code, m)
     }
 
+    fn key_repeat(code: KeyCode) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Repeat,
+            state: crossterm::event::KeyEventState::NONE,
+        }
+    }
+
     fn saved_picker_entry(id: &str, title: &str, is_current: bool) -> crate::chat::session::SavedSessionPickerEntry {
         crate::chat::session::SavedSessionPickerEntry {
             id: id.to_string(),
@@ -8699,22 +8788,20 @@ mod tests {
     }
 
     #[test]
-    fn p2_10_history_up_recalls_last_submission() {
+    fn p2_10_history_ctrl_p_recalls_last_submission() {
         let mut input = TuiInput::new();
         type_str(&mut input, "first");
         input.handle_key(key(KeyCode::Enter));
         type_str(&mut input, "second");
         input.handle_key(key(KeyCode::Enter));
-        // Single-line buffer → Up walks history backward.
-        let out = input.handle_key(key(KeyCode::Up));
+        let out = input.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(out, InputOutcome::Consumed);
         assert_eq!(input.text(), "second");
-        input.handle_key(key(KeyCode::Up));
+        input.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(input.text(), "first");
-        // Down → second → fresh empty.
-        input.handle_key(key(KeyCode::Down));
+        input.handle_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(input.text(), "second");
-        input.handle_key(key(KeyCode::Down));
+        input.handle_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert!(input.is_empty(), "back to fresh draft");
     }
 
@@ -8723,11 +8810,12 @@ mod tests {
         let mut input = TuiInput::new();
         type_str(&mut input, "old");
         input.handle_key(key(KeyCode::Enter));
-        // Start typing a new draft, then navigate up & back down.
+        // Start typing a new draft, then navigate back through history and
+        // forward to the draft with Ctrl+P/N.
         type_str(&mut input, "wip");
-        input.handle_key(key(KeyCode::Up));
+        input.handle_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(input.text(), "old");
-        input.handle_key(key(KeyCode::Down));
+        input.handle_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(input.text(), "wip", "draft restored");
     }
 
@@ -9156,28 +9244,40 @@ mod tests {
     }
 
     #[test]
-    fn input_history_up_down_still_work_when_slash_menu_closed() {
+    fn input_history_moves_to_ctrl_p_n_when_slash_menu_closed() {
         let mut state = TuiState::new("p", "m");
         state.input.history.push("older command".to_string());
 
-        // Contract B: with no bottom strip entries, bare Up/Down still reach
-        // input history.
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::ScrollTranscriptUp
+        );
+        assert!(state.input.is_empty());
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::ScrollTranscriptDown
+        );
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
         assert_eq!(state.input.text(), "older command");
         assert!(state.slash_menu.is_none());
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
+            dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state),
             KeyDispatch::Consumed
         );
         assert!(state.input.is_empty());
 
-        // Once the strip has navigable entries, bare arrows drive the strip
-        // instead of recalling history.
         state.sessions_cache = vec![entry(1)];
         state.input.history.push("newer command".to_string());
         assert_eq!(
             dispatch_global_key(key(KeyCode::Down), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) }
+            KeyDispatch::ScrollTranscriptDown
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::AttachSession { seq: 1 }
         );
         assert!(state.input.is_empty());
     }
@@ -9437,34 +9537,41 @@ mod tests {
     }
 
     #[test]
-    fn input_history_edit_then_up_down_steps_clean_entries() {
+    fn input_history_edit_then_ctrl_p_n_steps_clean_entries() {
         let mut state = TuiState::new("p", "m");
         state.input.history.push("one".to_string());
         state.input.history.push("two".to_string());
 
-        // Contract B: input history remains reachable when there are no
-        // bottom strip entries for bare arrows to navigate.
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
         assert_eq!(state.input.text(), "two");
         assert_eq!(
             dispatch_global_key(key(KeyCode::Char('!')), &mut state),
             KeyDispatch::Consumed
         );
         assert_eq!(state.input.text(), "two!");
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
-        assert_eq!(state.input.text(), "two", "Up restarts from a clean history entry");
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(state.input.text(), "two", "Ctrl+P restarts from a clean history entry");
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
         assert_eq!(state.input.text(), "one");
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
+            dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state),
             KeyDispatch::Consumed
         );
         assert_eq!(state.input.text(), "two");
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
+            dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state),
             KeyDispatch::Consumed
         );
-        assert_eq!(state.input.text(), "two!", "Down restores the edited draft");
+        assert_eq!(state.input.text(), "two!", "Ctrl+N restores the edited draft");
     }
 
     #[test]
@@ -9861,15 +9968,21 @@ mod tests {
     }
 
     #[test]
-    fn saved_session_picker_closed_keeps_up_down_input_history_behavior() {
+    fn saved_session_picker_closed_keeps_ctrl_p_n_input_history_behavior() {
         let mut state = TuiState::new("p", "m");
         state.input.history = vec!["alpha".to_string(), "beta".to_string()];
-        // Contract B: closing the saved-session picker restores normal input
-        // history when no bottom strip entries are present.
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Up), &mut state),
+            KeyDispatch::ScrollTranscriptUp
+        );
+        assert!(state.input.is_empty());
+        assert_eq!(
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
+        );
         assert_eq!(state.input.text(), "beta");
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
+            dispatch_global_key(key_mod(KeyCode::Char('n'), KeyModifiers::CONTROL), &mut state),
             KeyDispatch::Consumed
         );
         assert!(state.input.is_empty());
@@ -9877,8 +9990,8 @@ mod tests {
         state.sessions_cache = vec![entry(1)];
         assert_eq!(
             dispatch_global_key(key(KeyCode::Down), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) },
-            "with strip entries present, bare arrows return to strip navigation"
+            KeyDispatch::ScrollTranscriptDown,
+            "bare Down keeps transcript scroll even when bottom entries exist"
         );
     }
 
@@ -9917,6 +10030,7 @@ mod tests {
             tool_id: "call-1".to_string(),
             name: "shell".to_string(),
             args: r#"{"cmd":"echo hi"}"#.to_string(),
+            selected_approval: false,
         });
         state
     }
@@ -9954,18 +10068,83 @@ mod tests {
     }
 
     #[test]
-    fn approval_child_text_enter_does_not_submit_or_steer() {
-        for key_event in [key(KeyCode::Char('x')), key(KeyCode::Enter)] {
-            let mut state = approval_state();
-            let out = dispatch_global_key(key_event, &mut state);
-            assert_eq!(out, KeyDispatch::Consumed);
-            assert!(state.input.is_empty(), "approval focus must not edit the main input");
-            assert!(
-                state.pending_tool_approval.is_some(),
-                "text/Enter must not close approval"
-            );
-            assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
-        }
+    fn approval_child_text_does_not_submit_or_steer() {
+        let mut state = approval_state();
+        let out = dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(out, KeyDispatch::Consumed);
+        assert!(state.input.is_empty(), "approval focus must not edit the main input");
+        assert!(
+            state.pending_tool_approval.is_some(),
+            "plain text must not close approval"
+        );
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Approval);
+    }
+
+    #[test]
+    fn approval_child_arrows_select_and_enter_confirms() {
+        let mut state = approval_state();
+        assert!(
+            !state
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval starts pending")
+                .selected_approval,
+            "approval defaults to the safe deny choice"
+        );
+
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert!(
+            state
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval remains pending after navigation")
+                .selected_approval,
+            "Right selects approve"
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: true
+            }
+        );
+        assert!(state.pending_tool_approval.is_none());
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
+    }
+
+    #[test]
+    fn approval_child_enter_uses_default_deny_and_left_selects_deny() {
+        let mut default_state = approval_state();
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut default_state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: false
+            }
+        );
+
+        let mut state = approval_state();
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed
+        );
+        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        assert_eq!(
+            out,
+            KeyDispatch::ToolApprovalDecision {
+                tool_id: "call-1".to_string(),
+                approved: false
+            }
+        );
     }
 
     #[test]
@@ -10153,7 +10332,7 @@ mod tests {
         for ch in "abc".chars() {
             dispatch_global_key(key(KeyCode::Char(ch)), &mut state);
         }
-        dispatch_global_key(key(KeyCode::Home), &mut state);
+        dispatch_global_key(key_mod(KeyCode::Char('a'), KeyModifiers::CONTROL), &mut state);
         assert_eq!(state.input.text(), "abc");
         // Ctrl+D should forward-delete 'a' instead of exiting.
         let out = dispatch_global_key(key_mod(KeyCode::Char('d'), KeyModifiers::CONTROL), &mut state);
@@ -10162,15 +10341,44 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_pageup_pagedown_are_consumed_without_scroll() {
-        // Transcript scroll is owned by the outer fullscreen event loop. The
-        // pure dispatcher consumes the key without mutating input.
+    fn dispatch_page_home_end_scroll_main_transcript_even_with_input() {
         let mut state = TuiState::new("p", "m");
         let out = dispatch_global_key(key(KeyCode::PageUp), &mut state);
-        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(out, KeyDispatch::PageTranscriptUp);
         let out = dispatch_global_key(key(KeyCode::PageDown), &mut state);
-        assert_eq!(out, KeyDispatch::Consumed);
+        assert_eq!(out, KeyDispatch::PageTranscriptDown);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Home), &mut state),
+            KeyDispatch::TranscriptHome
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::End), &mut state),
+            KeyDispatch::TranscriptEnd
+        );
         assert!(state.input.is_empty(), "PgUp/PgDn must not leak into input");
+
+        dispatch_global_key(key(KeyCode::Char('x')), &mut state);
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageUp), &mut state),
+            KeyDispatch::PageTranscriptUp,
+            "PageUp still scrolls transcript with a draft present"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::PageDown), &mut state),
+            KeyDispatch::PageTranscriptDown,
+            "PageDown still scrolls transcript with a draft present"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Home), &mut state),
+            KeyDispatch::TranscriptHome,
+            "Home still jumps transcript with a draft present"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::End), &mut state),
+            KeyDispatch::TranscriptEnd,
+            "End still jumps transcript with a draft present"
+        );
+        assert_eq!(state.input.text(), "x", "Page/Home/End must not edit the draft");
     }
 
     #[test]
@@ -10178,8 +10386,6 @@ mod tests {
         let mut state = TuiState::new("p", "m");
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 9 };
 
-        // Contract B: with no bottom strip entries, child focus keeps bare
-        // Up/Down available for child viewport scrolling.
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
             KeyDispatch::ScrollSessionUp
@@ -10196,20 +10402,33 @@ mod tests {
             dispatch_global_key(key(KeyCode::PageDown), &mut state),
             KeyDispatch::PageSessionDown
         );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Home), &mut state),
+            KeyDispatch::SessionHome
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::End), &mut state),
+            KeyDispatch::SessionEnd
+        );
 
         state.sessions_cache = vec![entry(9), entry(10)];
         assert_eq!(
             dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::ScrollSessionDown,
+            "with bottom entries present, bare Down still scrolls child output"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Right), &mut state),
             KeyDispatch::SwitchSession { seq: 10 },
-            "with bottom entries present, bare Down navigates child sessions"
+            "bare Right switches child sessions"
         );
         state.sessions_cache.clear();
 
         state.focus = crate::chat::sessions::FocusTarget::Main;
         assert_eq!(
             dispatch_global_key(key(KeyCode::PageUp), &mut state),
-            KeyDispatch::Consumed,
-            "main focus must not route PgUp into child viewport scrolling"
+            KeyDispatch::PageTranscriptUp,
+            "main focus routes PgUp into transcript scrolling"
         );
 
         state.focus = crate::chat::sessions::FocusTarget::Transcript;
@@ -10263,8 +10482,18 @@ mod tests {
         assert_eq!(state.input.text(), "x");
         assert_eq!(
             dispatch_global_key(key(KeyCode::PageDown), &mut state),
-            KeyDispatch::Consumed,
-            "non-empty input keeps edit/history semantics instead of child scroll"
+            KeyDispatch::PageSessionDown,
+            "PageDown still scrolls child output with a draft present"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Home), &mut state),
+            KeyDispatch::SessionHome,
+            "Home still jumps child output with a draft present"
+        );
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::End), &mut state),
+            KeyDispatch::SessionEnd,
+            "End still jumps child output with a draft present"
         );
 
         state.input.clear();
@@ -10285,40 +10514,30 @@ mod tests {
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) },
-            "main+empty Right selects the first bottom-rail session"
+            KeyDispatch::AttachSession { seq: 1 },
+            "main+empty Right immediately attaches the first bottom entry"
         );
-        state.strip_selection = None;
-        assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) },
-            "main+empty Down selects the first bottom-list session"
-        );
-        assert_eq!(state.strip_selection, Some(1));
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
-            KeyDispatch::StripSelectionChanged {
-                selected: Some(MAIN_SESSION_SELECTION_SEQ)
-            },
-            "main+empty Up moves from first child back to main"
+            KeyDispatch::ScrollTranscriptUp,
+            "main+empty Up scrolls the transcript"
         );
-        assert_eq!(state.strip_selection, Some(MAIN_SESSION_SELECTION_SEQ));
+        assert_eq!(
+            dispatch_global_key(key(KeyCode::Down), &mut state),
+            KeyDispatch::ScrollTranscriptDown,
+            "main+empty Down scrolls the transcript"
+        );
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(3) },
-            "main+empty Left wraps from main to the last child session"
-        );
-        assert_eq!(
-            dispatch_global_key(key(KeyCode::Enter), &mut state),
             KeyDispatch::AttachSession { seq: 3 },
-            "main+empty Enter attaches the selected bottom-rail session"
+            "main+empty Left wraps from main to the last bottom entry"
         );
         assert_eq!(
-            state.strip_selection, None,
-            "attach consumes the UI-only strip selection so Esc detaches the child view next"
+            dispatch_global_key(key_repeat(KeyCode::Left), &mut state),
+            KeyDispatch::Consumed,
+            "held Left/Right repeats are debounced before synthetic attach"
         );
 
-        state.strip_selection = None;
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
@@ -10327,14 +10546,20 @@ mod tests {
         );
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
-            KeyDispatch::SwitchSession { seq: 1 },
-            "session+empty Up switches to the visual neighbor above"
+            KeyDispatch::ScrollSessionUp,
+            "session+empty Up scrolls the child viewport"
         );
         state.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Up), &mut state),
+            dispatch_global_key(key(KeyCode::Left), &mut state),
             KeyDispatch::RequestDetach,
-            "first child+empty Up switches back to main"
+            "first child+empty Left switches back to main"
+        );
+        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
+        assert_eq!(
+            dispatch_global_key(key_repeat(KeyCode::Right), &mut state),
+            KeyDispatch::Consumed,
+            "held Right repeat is debounced for focused sessions"
         );
 
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
@@ -10358,25 +10583,25 @@ mod tests {
         state.focus = crate::chat::sessions::FocusTarget::Transcript;
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
-            KeyDispatch::Consumed,
-            "transcript focus must not switch to real sessions with Right"
+            KeyDispatch::SwitchSession { seq: 1 },
+            "transcript focus can switch to bottom entries with Right"
         );
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
-            KeyDispatch::Consumed,
-            "transcript focus must not switch to real sessions with Left"
+            KeyDispatch::SwitchSession { seq: 3 },
+            "transcript focus can switch to bottom entries with Left"
         );
 
         state.focus = crate::chat::sessions::FocusTarget::Diff;
         assert_eq!(
             dispatch_global_key(key(KeyCode::Right), &mut state),
-            KeyDispatch::Consumed,
-            "diff focus must not switch to real sessions with Right"
+            KeyDispatch::SwitchSession { seq: 1 },
+            "diff focus can switch to bottom entries with Right"
         );
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
-            KeyDispatch::Consumed,
-            "diff focus must not switch to real sessions with Left"
+            KeyDispatch::SwitchSession { seq: 3 },
+            "diff focus can switch to bottom entries with Left"
         );
 
         dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
@@ -10389,21 +10614,16 @@ mod tests {
     }
 
     #[test]
-    fn bottom_directional_selection_skips_completed_history_rows() {
+    fn bottom_directional_switch_skips_completed_history_rows() {
         let mut state = TuiState::new("p", "m");
         let mut completed = entry(1);
         completed.status = "completed";
         state.sessions_cache = vec![completed, entry(2)];
 
         assert_eq!(
-            dispatch_global_key(key(KeyCode::Down), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(2) },
-            "bare Down should select the first active child, not completed history"
-        );
-        assert_eq!(
-            dispatch_global_key(key(KeyCode::Enter), &mut state),
+            dispatch_global_key(key(KeyCode::Right), &mut state),
             KeyDispatch::AttachSession { seq: 2 },
-            "Enter attaches the visible active child"
+            "bare Right should attach the first active child, not completed history"
         );
 
         let mut history_only = TuiState::new("p", "m");
@@ -10450,81 +10670,22 @@ mod tests {
         }
     }
 
-    fn kind_entry(seq: u64, kind: &'static str) -> crate::chat::sessions::SwitcherEntry {
-        let mut entry = entry(seq);
-        entry.kind = kind;
-        entry
-    }
-
     #[test]
-    fn alt_arrows_move_ui_only_strip_selection_without_focus_change() {
+    fn alt_arrows_do_not_change_bottom_focus() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1), entry(2), entry(3)];
 
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) }
-        );
-        assert_eq!(state.strip_selection, Some(1));
-        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
-
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(2) }
-        );
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Left, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) }
-        );
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Up, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(3) }
-        );
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Down, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) }
-        );
-        assert_eq!(
-            state.focus,
-            crate::chat::sessions::FocusTarget::Main,
-            "strip selection must not change input-routing focus"
-        );
-    }
-
-    #[test]
-    fn alt_arrows_seed_from_focused_session_when_no_strip_selection_exists() {
-        let mut state = TuiState::new("p", "m");
-        state.sessions_cache = vec![entry(1), entry(2), entry(3)];
-        state.focus = crate::chat::sessions::FocusTarget::Session { seq: 2 };
-
-        assert_eq!(
-            dispatch_global_key(key_mod(KeyCode::Right, KeyModifiers::ALT), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(3) }
-        );
-        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Session { seq: 2 });
-    }
-
-    #[test]
-    fn alt_enter_attaches_selected_strip_entry_for_all_session_kinds() {
-        for (seq, kind) in [(1, "agent"), (2, "shell"), (3, "pty")] {
-            let mut state = TuiState::new("p", "m");
-            state.sessions_cache = vec![kind_entry(seq, kind)];
-            state.strip_selection = Some(seq);
-
+        for code in [KeyCode::Left, KeyCode::Right, KeyCode::Up, KeyCode::Down] {
             assert_eq!(
-                dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
-                KeyDispatch::AttachSession { seq },
-                "Alt+Enter reuses the single attach dispatch for {kind}"
-            );
-            assert_eq!(
-                state.strip_selection, None,
-                "Alt+Enter attach consumes the UI-only strip selection for {kind}"
+                dispatch_global_key(key_mod(code, KeyModifiers::ALT), &mut state),
+                KeyDispatch::Consumed
             );
         }
+        assert_eq!(state.focus, crate::chat::sessions::FocusTarget::Main);
     }
 
     #[test]
-    fn alt_enter_without_strip_selection_falls_through_to_newline_insert() {
+    fn alt_enter_still_inserts_newline() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1)];
         dispatch_global_key(key(KeyCode::Char('a')), &mut state);
@@ -10547,51 +10708,36 @@ mod tests {
     }
 
     #[test]
-    fn alt_enter_stale_strip_selection_is_consumed_with_session_gone_status() {
+    fn alt_enter_does_not_attach_bottom_entry() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1)];
-        state.strip_selection = Some(2);
         dispatch_global_key(key(KeyCode::Char('a')), &mut state);
 
         assert_eq!(
             dispatch_global_key(key_mod(KeyCode::Enter, KeyModifiers::ALT), &mut state),
             KeyDispatch::Consumed
         );
-        assert_eq!(state.strip_selection, None);
-        assert_eq!(state.input.text(), "a", "stale Alt+Enter must not insert a newline");
-        assert!(
-            matches!(
-                state.conversation_lines.last(),
-                Some(ConversationLine::System { content }) if content == "session gone"
-            ),
-            "stale selection should surface a status message"
-        );
+        assert_eq!(state.input.text(), "a\n", "Alt+Enter remains a newline chord");
+        assert!(state.conversation_lines.is_empty());
     }
 
     #[test]
-    fn esc_clears_strip_selection_before_normal_cancel_or_detach() {
+    fn esc_keeps_normal_cancel_or_detach_semantics() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1)];
-        state.strip_selection = Some(1);
         dispatch_global_key(key(KeyCode::Char('x')), &mut state);
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Esc), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: None }
+            KeyDispatch::Cancelled
         );
-        assert_eq!(state.strip_selection, None);
-        assert_eq!(
-            state.input.text(),
-            "x",
-            "Esc clears strip highlight before touching input"
-        );
+        assert_eq!(state.input.text(), "", "Esc now follows normal input cancel semantics");
     }
 
     #[test]
-    fn bare_arrows_history_cursor_and_child_scroll_are_not_stolen_by_strip_selection() {
+    fn bare_arrows_scroll_transcript_and_child_views_not_history() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1), entry(2)];
-        state.strip_selection = Some(2);
         dispatch_global_key(key(KeyCode::Char('a')), &mut state);
         assert_eq!(
             dispatch_global_key(key(KeyCode::Enter), &mut state),
@@ -10600,19 +10746,17 @@ mod tests {
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Up), &mut state),
-            KeyDispatch::StripSelectionChanged { selected: Some(1) },
-            "Contract B: with strip entries present, bare Up navigates the strip"
+            KeyDispatch::ScrollTranscriptUp,
+            "main+empty bare Up scrolls transcript even with bottom entries present"
         );
-        assert!(state.input.is_empty(), "strip navigation must not recall history");
-        assert_eq!(state.strip_selection, Some(1));
+        assert!(state.input.is_empty(), "bare Up must not recall history");
 
         state.sessions_cache.clear();
-        assert_eq!(dispatch_global_key(key(KeyCode::Up), &mut state), KeyDispatch::Consumed);
         assert_eq!(
-            state.input.text(),
-            "a",
-            "when strip entries are absent, bare Up still recalls input history"
+            dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut state),
+            KeyDispatch::Consumed
         );
+        assert_eq!(state.input.text(), "a", "Ctrl+P recalls input history");
 
         assert_eq!(
             dispatch_global_key(key(KeyCode::Left), &mut state),
@@ -10644,16 +10788,14 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_g_still_opens_switcher_when_strip_selection_exists() {
+    fn ctrl_g_still_opens_switcher() {
         let mut state = TuiState::new("p", "m");
         state.sessions_cache = vec![entry(1), entry(2)];
-        state.strip_selection = Some(2);
 
         let out = dispatch_global_key(key_mod(KeyCode::Char('g'), KeyModifiers::CONTROL), &mut state);
 
         assert!(matches!(out, KeyDispatch::SwitcherOpened { .. }));
         assert!(state.switcher.is_some(), "Ctrl+G modal remains available");
-        assert_eq!(state.strip_selection, Some(2), "modal does not reuse routing focus");
     }
 
     fn usage_record(
@@ -10826,7 +10968,10 @@ mod tests {
             80,
         );
         assert!(line.contains('\u{25B8}'), "active marker visible: {line}");
-        assert!(line.contains('⏳'), "status glyph visible: {line}");
+        assert!(
+            UNICODE_SPINNER_FRAMES.iter().any(|frame| line.contains(frame)),
+            "running status spinner visible: {line}"
+        );
         assert!(line.contains("#1"), "seq visible: {line}");
         assert!(line.contains("agent"), "kind visible: {line}");
         assert!(line.contains("task 1"), "title visible: {line}");
@@ -10881,32 +11026,23 @@ mod tests {
     }
 
     #[test]
-    fn sessions_strip_selection_beyond_initial_window_is_visible_and_highlighted() {
+    fn sessions_strip_active_entry_beyond_initial_window_is_visible_and_marked() {
         let entries = long_strip_entries(8);
         let line = render_sessions_strip_styled_line(
             &entries,
             "",
-            crate::chat::sessions::FocusTarget::Main,
-            Some(8),
+            crate::chat::sessions::FocusTarget::Session { seq: 8 },
             false,
             58,
         );
         let plain = line_to_plain(&line);
 
-        assert!(plain.contains("#8"), "selected seq is windowed into view: {plain}");
+        assert!(plain.contains("#8"), "active seq is windowed into view: {plain}");
         assert!(
             plain.contains('\u{2039}'),
             "leading overflow indicator appears: {plain}"
         );
-
-        let selected = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains("#8"))
-            .expect("test: selected span");
-        assert_eq!(selected.style.bg, Some(Color::Cyan));
-        assert_eq!(selected.style.fg, Some(Color::Black));
-        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+        assert!(plain.contains('\u{25B8}'), "active marker remains visible: {plain}");
     }
 
     #[test]
@@ -10928,16 +11064,15 @@ mod tests {
     #[test]
     fn sessions_strip_overflow_indicator_has_ascii_fallback() {
         let entries = long_strip_entries(8);
-        let line = render_sessions_strip_line_with_selection(
+        let line = render_sessions_strip_line(
             &entries,
             "",
-            crate::chat::sessions::FocusTarget::Main,
-            Some(3),
+            crate::chat::sessions::FocusTarget::Session { seq: 3 },
             true,
             58,
         );
 
-        assert!(line.contains("#3"), "selected seq is visible in ASCII mode: {line}");
+        assert!(line.contains("#3"), "active seq is visible in ASCII mode: {line}");
         assert!(
             line.contains('>') && line.contains('+'),
             "ASCII right overflow/count affordance appears when entries remain hidden: {line}"
@@ -10945,27 +11080,161 @@ mod tests {
     }
 
     #[test]
+    fn running_status_glyph_animates_with_shared_spinner_frames() {
+        let running = elapsed_entry(1, "running", 0);
+        assert_eq!(session_status_glyph_for_tick(&running, false, 0), "⠋");
+        assert_eq!(session_status_glyph_for_tick(&running, false, 1), "⠙");
+        assert_eq!(session_status_glyph_for_tick(&running, true, 0), "-");
+        assert_eq!(session_status_glyph_for_tick(&running, true, 1), "\\");
+
+        let completed = elapsed_entry(2, "completed", 0);
+        assert_eq!(
+            session_status_glyph_for_tick(&completed, false, 0),
+            session_status_glyph_for_tick(&completed, false, 1),
+            "non-running rows must stay static"
+        );
+    }
+
+    #[test]
+    fn periodic_redraw_tracks_running_bottom_entries_only() {
+        let mut state = TuiState::new("p", "m");
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "idle chat has no animation tick"
+        );
+
+        state.sessions_cache = vec![elapsed_entry(1, "completed", 0)];
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "completed bottom entries do not drive periodic redraw"
+        );
+
+        state.sessions_cache = vec![elapsed_entry(1, "running", 0)];
+        assert!(
+            periodic_redraw_active_for_view(&state),
+            "running bottom sessions drive the spinner redraw"
+        );
+
+        state.sessions_cache.clear();
+        state.provider_worker_status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: 9,
+                sequence: 9,
+                kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+                recent_tool_call: None,
+            }],
+        };
+        assert!(
+            periodic_redraw_active_for_view(&state),
+            "running provider workers also drive the bottom spinner redraw"
+        );
+
+        let row = state
+            .provider_worker_status
+            .rows
+            .first_mut()
+            .expect("test status has one row");
+        row.state = ProviderWorkerRowState::Committed;
+        state.provider_worker_status.running = 0;
+        assert!(
+            !periodic_redraw_active_for_view(&state),
+            "terminal worker rows do not keep the periodic redraw alive"
+        );
+    }
+
+    #[test]
+    fn session_list_footer_includes_navigation_hint_when_entries_exist() {
+        let mut state = TuiState::new("p", "m");
+        state.sessions_cache = vec![elapsed_entry(1, "running", 0)];
+
+        let lines = render_sessions_list_lines(&state, 100, 4);
+        let rows = lines.iter().map(line_to_plain).collect::<Vec<_>>();
+
+        assert!(
+            rows.iter().any(|row| row.contains("←/→ session")),
+            "session footer should expose horizontal session navigation: {rows:?}"
+        );
+        assert!(
+            footer_text(false, true).contains("←/→ session") && footer_text(false, true).contains("Ctrl+P/N history"),
+            "static footer text helper also includes the dynamic hint"
+        );
+    }
+
+    #[test]
+    fn provider_worker_switcher_title_appends_latest_tool_summary_for_running_rows() {
+        let conversation = vec![ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls -la /tmp/demo".to_string(),
+            args_full: "{\"command\":\"ls -la /tmp/demo\"}".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        }];
+        let summary =
+            latest_provider_worker_tool_summary_from_conversation(&conversation, false).expect("tool summary");
+        assert!(
+            summary.contains("run shell running: ls -la /tmp/demo"),
+            "summary uses the compact provider worker IO wording: {summary}"
+        );
+
+        let running = ProviderWorkerStatusRow {
+            task_id: 3,
+            sequence: 3,
+            kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+            state: ProviderWorkerRowState::Running,
+            started_at_ms: 0,
+            finalized_total_tokens: None,
+            completion_ready: false,
+            recent_tool_call: Some(summary.clone()),
+        };
+        let entry = provider_worker_switcher_entry(&running);
+        assert!(
+            entry.title.contains(&summary),
+            "running worker title should include latest tool summary: {}",
+            entry.title
+        );
+
+        let mut completed = running;
+        completed.state = ProviderWorkerRowState::Committed;
+        let entry = provider_worker_switcher_entry(&completed);
+        assert!(
+            !entry.title.contains(&summary),
+            "terminal worker titles stay unchanged: {}",
+            entry.title
+        );
+    }
+
+    #[test]
     fn sessions_strip_zero_width_and_one_entry_edge_cases_do_not_panic() {
         let entries = long_strip_entries(1);
-        let empty = render_sessions_strip_line_with_selection(
+        let empty = render_sessions_strip_line(
             &entries,
             "",
             crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            Some(1),
             false,
             0,
         );
         assert!(empty.is_empty());
 
-        let one = render_sessions_strip_line_with_selection(
+        let one = render_sessions_strip_line(
             &entries,
             "",
             crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            Some(1),
             false,
             18,
         );
-        assert!(one.contains("#1"), "single selected chip still renders: {one}");
+        assert!(one.contains("#1"), "single active chip still renders: {one}");
         assert!(
             UnicodeWidthStr::width(one.as_str()) <= 18,
             "single-chip strip must fit narrow width: {one}"
@@ -10973,28 +11242,18 @@ mod tests {
     }
 
     #[test]
-    fn sessions_strip_selected_entry_is_highlighted_separately_from_focus() {
+    fn sessions_strip_focus_drives_active_marker_without_selection_highlight() {
         let entries = vec![entry(1), entry(2)];
         let line = render_sessions_strip_styled_line(
             &entries,
             "",
             crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            Some(2),
             false,
             96,
         );
         let plain = line_to_plain(&line);
         assert!(plain.contains("#1"), "focused entry remains visible: {plain}");
-        assert!(plain.contains("#2"), "selected entry remains visible: {plain}");
-
-        let selected = line
-            .spans
-            .iter()
-            .find(|span| span.content.contains("#2"))
-            .expect("test: selected span");
-        assert_eq!(selected.style.bg, Some(Color::Cyan));
-        assert_eq!(selected.style.fg, Some(Color::Black));
-        assert!(selected.style.add_modifier.contains(Modifier::BOLD));
+        assert!(plain.contains("#2"), "neighbor entry remains visible: {plain}");
 
         let focused = line
             .spans
@@ -11005,6 +11264,7 @@ mod tests {
             focused.style.bg, None,
             "input-routing focus uses the active marker, not selected highlight"
         );
+        assert!(plain.contains('\u{25B8}'), "focused entry has active marker: {plain}");
     }
 
     #[test]
@@ -11258,6 +11518,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         }
     }
@@ -11302,7 +11563,7 @@ mod tests {
     }
 
     #[test]
-    fn phase2_bottom_direction_selects_provider_worker_and_enter_opens_worker_view() {
+    fn phase2_bottom_direction_opens_provider_worker_view_immediately() {
         let mut state = TuiState::new("p", "m");
         state.provider_worker_status = provider_worker_status_fixture();
         state.visible_streaming_drafts = Arc::new(vec![crate::chat::state::VisibleStreamingDraftView {
@@ -11313,14 +11574,7 @@ mod tests {
                 version: 1,
             },
         }]);
-        let out = dispatch_global_key(key(KeyCode::Down), &mut state);
-        assert_eq!(
-            out,
-            KeyDispatch::StripSelectionChanged {
-                selected: Some(PROVIDER_WORKER_SWITCHER_SEQ_BASE + 3)
-            }
-        );
-        let out = dispatch_global_key(key(KeyCode::Enter), &mut state);
+        let out = dispatch_global_key(key(KeyCode::Right), &mut state);
         assert_eq!(out, KeyDispatch::OpenProviderWorkerView { sequence: 3 });
         assert_eq!(
             state
@@ -11334,7 +11588,6 @@ mod tests {
                 .is_none(),
             "synthetic switcher seq must not be used for draft lookup"
         );
-        assert_eq!(state.strip_selection, None);
     }
 
     #[test]
@@ -11363,8 +11616,10 @@ mod tests {
         state.sessions_cache = vec![entry(7)];
         state.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 3 };
         let out = dispatch_global_key(key(KeyCode::Up), &mut state);
-        assert_eq!(out, KeyDispatch::CloseProviderWorkerView);
+        assert_eq!(out, KeyDispatch::ScrollSessionUp);
         let out = dispatch_global_key(key(KeyCode::Down), &mut state);
+        assert_eq!(out, KeyDispatch::ScrollSessionDown);
+        let out = dispatch_global_key(key(KeyCode::Right), &mut state);
         assert_eq!(out, KeyDispatch::SwitchSession { seq: 7 });
         let out = dispatch_global_key(key(KeyCode::Esc), &mut state);
         assert_eq!(out, KeyDispatch::CloseProviderWorkerView);
@@ -11753,7 +12008,7 @@ mod tests {
 
         let rows = fullscreen_rows(&state, 100, 24, &mut scroll);
         let joined = rows.join("\n");
-        let bottom = rows.last().cloned().unwrap_or_default();
+        let bottom = rows.iter().find(|row| row.contains("#1")).cloned().unwrap_or_default();
 
         assert!(
             joined.contains("main chat"),
@@ -11773,6 +12028,10 @@ mod tests {
             "bottom list should show the running task title, not shortcut-only chrome: {rows:?}"
         );
         assert!(
+            rows.iter().any(|row| row.contains("←/→ session")),
+            "session list footer should expose navigation hint: {rows:?}"
+        );
+        assert!(
             !bottom.contains("Ctrl+G sessions"),
             "session list should replace shortcut footer while sessions exist: {rows:?}"
         );
@@ -11782,8 +12041,8 @@ mod tests {
             "session should render once below input, never duplicated above it: {rows:?}"
         );
         assert!(
-            !joined.contains('⏳') && !joined.contains('✓'),
-            "session list should use text status rather than status icons: {rows:?}"
+            UNICODE_SPINNER_FRAMES.iter().any(|frame| joined.contains(frame)) && !joined.contains('✓'),
+            "running session list rows should use animated spinner without terminal success icon: {rows:?}"
         );
     }
 
@@ -12347,6 +12606,7 @@ mod tests {
             tool_id: "tool-1".to_string(),
             name: "danger_tool".to_string(),
             args: "{\"path\":\"/tmp/demo\"}".to_string(),
+            selected_approval: false,
         });
         let mut scroll = FullscreenTranscriptScroll::default();
         scroll.jump_top();
@@ -12355,6 +12615,11 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("Tool Approval")),
             "approval panel visible outside transcript scroll: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("selected: deny") && row.contains("Enter confirm")),
+            "approval panel exposes arrow selection state and Enter confirmation: {rows:?}"
         );
         assert!(
             rows.iter().any(|row| row.contains("danger_tool")),
@@ -12424,12 +12689,11 @@ mod tests {
         let mut history_state = TuiState::new("provider", "model");
         history_state.input.history = vec!["older".to_string(), "newer".to_string()];
         let out = dispatch_global_key(key(KeyCode::Up), &mut history_state);
+        assert_eq!(out, KeyDispatch::ScrollTranscriptUp);
+        assert!(history_state.input.is_empty());
+        let out = dispatch_global_key(key_mod(KeyCode::Char('p'), KeyModifiers::CONTROL), &mut history_state);
         assert_eq!(out, KeyDispatch::Consumed);
-        assert_eq!(
-            history_state.input.text(),
-            "newer",
-            "Up still navigates input history and is not a transcript-scroll key"
-        );
+        assert_eq!(history_state.input.text(), "newer", "Ctrl+P navigates input history");
 
         let mut strip_state = TuiState::new("provider", "model");
         strip_state.sessions_cache = vec![entry(1)];
@@ -12437,8 +12701,8 @@ mod tests {
         let out = dispatch_global_key(key(KeyCode::Down), &mut strip_state);
         assert_eq!(
             out,
-            KeyDispatch::StripSelectionChanged { selected: Some(1) },
-            "Contract B: strip entries make bare arrows navigate the strip before input history"
+            KeyDispatch::ScrollTranscriptDown,
+            "bottom entries do not steal bare Down from transcript scrolling"
         );
         assert!(strip_state.input.is_empty());
 
@@ -12473,16 +12737,16 @@ mod tests {
         let with_one = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
             with_one,
-            idle.saturating_add(1),
-            "one child session adds one row because the list also includes main"
+            idle.saturating_add(2),
+            "one child session adds one row plus the session navigation hint"
         );
 
         state.sessions_cache = vec![entry(1), entry(2), entry(3)];
         let with_three = fullscreen_bottom_chrome_height(&state);
         assert_eq!(
             with_three,
-            idle.saturating_add(3),
-            "session list adds one row per child while retaining main"
+            idle.saturating_add(4),
+            "session list adds one row per child plus the navigation hint"
         );
 
         state.sessions_cache.clear();
@@ -12597,6 +12861,7 @@ mod tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
                     finalized_total_tokens: None,
                     completion_ready: false,
+                    recent_tool_call: None,
                 },
                 ProviderWorkerStatusRow {
                     task_id: 88,
@@ -12606,6 +12871,7 @@ mod tests {
                     started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(9_000),
                     finalized_total_tokens: Some(1_250),
                     completion_ready: true,
+                    recent_tool_call: None,
                 },
             ],
         };
@@ -12661,6 +12927,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(3_000),
                 finalized_total_tokens: None,
                 completion_ready: true,
+                recent_tool_call: None,
             }],
         };
 
@@ -12710,6 +12977,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(2_000),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         };
         state.start_stream("draft-worker");
@@ -13090,7 +13358,6 @@ mod tests {
                 idle_warning: false,
             };
             state.ui.sessions_entries = vec![session_entry.clone()];
-            state.ui.strip_selection = Some(7);
             state.ui.context_used_tokens = Some(2_500);
             state.ui.context_window_tokens = Some(10_000_000);
             state.ui.chat_mode = ChatMode::Auto;
@@ -13123,7 +13390,6 @@ mod tests {
             tui.streaming = state.stream.primary_streaming_draft().cloned();
             tui.input = state.ui.input.clone();
             tui.sessions_cache = vec![session_entry];
-            tui.strip_selection = Some(7);
             tui.chat_mode = ChatMode::Auto;
             tui.autonomy_level = AutonomyLevel::ReadOnly;
             tui.focus = crate::chat::sessions::FocusTarget::Diff;
@@ -13173,10 +13439,6 @@ mod tests {
             );
             assert_eq!(BottomChromeView::focus(&tui), BottomChromeView::focus(&snap));
             assert_eq!(
-                BottomChromeView::strip_selection(&tui),
-                BottomChromeView::strip_selection(&snap)
-            );
-            assert_eq!(
                 BottomChromeView::pending_tool_approval(&tui),
                 BottomChromeView::pending_tool_approval(&snap)
             );
@@ -13213,6 +13475,7 @@ mod tests {
                 tool_id: "call-approval".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"rm -rf /tmp/nope"}"#.to_string(),
+                selected_approval: false,
             };
             state.ui.pending_tool_approval = Some(pending.clone());
             state.ui.focus = crate::chat::sessions::FocusTarget::Approval;

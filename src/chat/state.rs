@@ -341,9 +341,6 @@ pub struct UiState {
     /// Ctrl+G session switcher 弹层状态（v1.1b），关闭时为 `None`。由 key 线程
     /// 经 `Action::SwitcherOpened` / `SwitcherMoved` / `SwitcherClosed` 写入。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
-    /// UI-only bottom-strip selection for direct Alt+arrow navigation. Separate
-    /// from `focus`: this highlights an entry but does not route input there.
-    pub strip_selection: Option<u64>,
     /// Slash-command menu overlay. Derived from the current input command token.
     pub slash_menu: Option<SlashMenuState>,
     /// Security-filtered `@path` completion source, delivered via Action.
@@ -415,8 +412,6 @@ pub struct UiSnapshot {
     pub focus: crate::chat::sessions::FocusTarget,
     /// Ctrl+G switcher 弹层（v1.1b），`None` 表示关闭。renderer 据此画弹层。
     pub switcher: Option<crate::chat::sessions::SwitcherState>,
-    /// UI-only bottom-strip selection. `None` means no highlighted strip entry.
-    pub strip_selection: Option<u64>,
     /// Slash-command menu overlay.
     pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker overlay.
@@ -454,7 +449,6 @@ impl UiSnapshot {
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             focus: crate::chat::sessions::FocusTarget::Main,
             switcher: None,
-            strip_selection: None,
             slash_menu: None,
             saved_session_picker: None,
         }
@@ -816,7 +810,6 @@ impl ChatState {
                 token_usage_summary: MainSessionTokenUsageSummary::default(),
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
-                strip_selection: None,
                 slash_menu: None,
                 at_path_candidates: Vec::new(),
                 saved_session_picker: None,
@@ -910,7 +903,6 @@ impl ChatState {
             token_usage_summary: self.ui.token_usage_summary,
             focus: self.ui.focus,
             switcher: self.ui.switcher.clone(),
-            strip_selection: self.ui.strip_selection,
             slash_menu: self.ui.slash_menu.clone(),
             saved_session_picker: self.ui.saved_session_picker.clone(),
         }
@@ -1157,7 +1149,6 @@ impl ChatState {
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
             Action::SwitcherMoved { selected } => self.reduce_switcher_moved(selected),
             Action::SwitcherClosed => self.reduce_switcher_closed(),
-            Action::StripSelectionChanged { selected } => self.reduce_strip_selection_changed(selected),
             Action::SavedSessionPickerOpened { entries } => self.reduce_saved_session_picker_opened(entries),
             Action::SavedSessionPickerMoved { selected } => self.reduce_saved_session_picker_moved(selected),
             Action::SavedSessionPickerClosed => self.reduce_saved_session_picker_closed(),
@@ -1203,9 +1194,6 @@ impl ChatState {
             }
             return vec![Effect::RequestRedraw];
         }
-        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.ui.strip_selection.take().is_some() {
-            return vec![Effect::RequestRedraw];
-        }
         if self.ui.pending_tool_approval.is_some()
             || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
         {
@@ -1232,43 +1220,6 @@ impl ChatState {
                 crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
                 _ => vec![Effect::RequestRedraw],
             };
-        }
-
-        if key.modifiers == KeyModifiers::ALT {
-            let direction = match key.code {
-                KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
-                KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
-                _ => None,
-            };
-            if let Some(direction) = direction {
-                self.ui.strip_selection = crate::chat::tui::move_strip_selection(
-                    &self.ui.sessions_entries,
-                    self.ui.strip_selection,
-                    self.ui.focus,
-                    direction,
-                );
-                return vec![Effect::RequestRedraw];
-            }
-            if key.code == KeyCode::Enter
-                && let Some(selected) = self.ui.strip_selection
-            {
-                if crate::chat::tui::selected_strip_entry(&self.ui.sessions_entries, Some(selected)).is_some() {
-                    return vec![
-                        Effect::LogTrace {
-                            level: tracing::Level::DEBUG,
-                            msg: format!("strip_alt_enter_attach seq={selected}"),
-                        },
-                        Effect::RequestRedraw,
-                    ];
-                }
-                self.ui.strip_selection = None;
-                self.ui
-                    .conversation_lines
-                    .push(crate::chat::tui::ConversationLine::System {
-                        content: "session gone".to_string(),
-                    });
-                return vec![Effect::RequestRedraw];
-            }
         }
 
         if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
@@ -1351,6 +1302,19 @@ impl ChatState {
         let approved = match key.code {
             KeyCode::Char('y' | 'Y') => Some(true),
             KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+            KeyCode::Enter => Some(pending.selected_approval),
+            KeyCode::Left | KeyCode::Up => {
+                if let Some(pending) = self.ui.pending_tool_approval.as_mut() {
+                    pending.selected_approval = false;
+                }
+                return vec![Effect::RequestRedraw];
+            }
+            KeyCode::Right | KeyCode::Down => {
+                if let Some(pending) = self.ui.pending_tool_approval.as_mut() {
+                    pending.selected_approval = true;
+                }
+                return vec![Effect::RequestRedraw];
+            }
             _ => None,
         };
         let Some(approved) = approved else {
@@ -2268,6 +2232,7 @@ impl ChatState {
             tool_id: tool_id.clone(),
             name: name.clone(),
             args: args.clone(),
+            selected_approval: false,
         });
         self.ui.focus = crate::chat::sessions::FocusTarget::Approval;
         self.ui.switcher = None;
@@ -2776,6 +2741,21 @@ impl ChatState {
     }
 
     fn reduce_provider_worker_status_updated(&mut self, status: ProviderWorkerStatus) -> Vec<Effect> {
+        #[cfg(feature = "terminal-tui")]
+        let status = {
+            let mut status = status;
+            if let Some(summary) = crate::chat::tui::latest_provider_worker_tool_summary_from_conversation(
+                &self.ui.conversation_lines,
+                self.ui.ascii_fallback,
+            ) {
+                for row in &mut status.rows {
+                    if row.is_active() {
+                        row.recent_tool_call = Some(summary.clone());
+                    }
+                }
+            }
+            status
+        };
         if self.ui.provider_worker_status == status {
             return Vec::new();
         }
@@ -3021,16 +3001,6 @@ impl ChatState {
             return Vec::new();
         }
         self.ui.switcher = None;
-        vec![Effect::RequestRedraw]
-    }
-
-    /// `Action::StripSelectionChanged` — update the UI-only bottom-strip
-    /// highlight without changing input-routing focus.
-    fn reduce_strip_selection_changed(&mut self, selected: Option<u64>) -> Vec<Effect> {
-        if self.ui.strip_selection == selected {
-            return Vec::new();
-        }
-        self.ui.strip_selection = selected;
         vec![Effect::RequestRedraw]
     }
 
@@ -3385,7 +3355,6 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::SwitcherOpened { .. }
         | Action::SwitcherMoved { .. }
         | Action::SwitcherClosed
-        | Action::StripSelectionChanged { .. }
         | Action::SavedSessionPickerOpened { .. }
         | Action::SavedSessionPickerMoved { .. }
         | Action::SavedSessionPickerClosed => true,
@@ -3558,6 +3527,7 @@ mod tests {
                 started_at_ms: chrono::Utc::now().timestamp_millis(),
                 finalized_total_tokens: None,
                 completion_ready: false,
+                recent_tool_call: None,
             }],
         };
 
@@ -3581,6 +3551,56 @@ mod tests {
             !view.lines.iter().any(|line| line == "output: P6Z"),
             "completed tool output without a matching streaming draft stays out of worker IO: {:?}",
             view.lines
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_update_enriches_running_rows_with_recent_tool_summary() {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut state = make_state();
+        state.ui.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "ls /tmp/demo".to_string(),
+            args_full: "{\"command\":\"ls /tmp/demo\"}".to_string(),
+            result: None,
+            status: ToolStatus::Running,
+            elapsed_ms: None,
+            folded: true,
+        });
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![crate::chat::action::ProviderWorkerStatusRow {
+                task_id: 7,
+                sequence: 2,
+                kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                state: crate::chat::action::ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+                recent_tool_call: None,
+            }],
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let summary = state
+            .ui
+            .provider_worker_status
+            .rows
+            .first()
+            .and_then(|row| row.recent_tool_call.as_deref())
+            .expect("running row should receive latest tool summary");
+        assert!(
+            summary.contains("run shell running: ls /tmp/demo"),
+            "summary should use the compact tool-call wording: {summary}"
         );
     }
 
@@ -3857,32 +3877,7 @@ mod tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn strip_selection_changed_writes_snapshot_without_focus_change() {
-        let mut state = make_state();
-        state.ui.focus = crate::chat::sessions::FocusTarget::Session { seq: 1 };
-
-        let effects = state.reduce(Action::StripSelectionChanged { selected: Some(2) });
-
-        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert_eq!(state.ui.strip_selection, Some(2));
-        assert_eq!(
-            state.ui.focus,
-            crate::chat::sessions::FocusTarget::Session { seq: 1 },
-            "strip selection is not input routing focus"
-        );
-        assert_eq!(state.build_ui_snapshot(1).strip_selection, Some(2));
-
-        let effects = state.reduce(Action::StripSelectionChanged { selected: Some(2) });
-        assert!(effects.is_empty(), "unchanged strip selection is a reducer no-op");
-
-        let effects = state.reduce(Action::StripSelectionChanged { selected: None });
-        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert_eq!(state.ui.strip_selection, None);
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn alt_enter_stale_strip_selection_clears_and_surfaces_session_gone() {
+    fn alt_enter_no_longer_surfaces_session_gone() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut state = make_state();
@@ -3897,30 +3892,22 @@ mod tests {
             token_usage_records: Vec::new(),
             idle_warning: false,
         }];
-        state.ui.strip_selection = Some(2);
         state.ui.input.set_text("draft");
 
         let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
 
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
-        assert_eq!(state.ui.strip_selection, None);
         assert_eq!(
             state.ui.input.text(),
-            "draft",
-            "stale Alt+Enter must not insert a newline"
+            "draft\n",
+            "Alt+Enter is only an input newline chord"
         );
-        assert!(
-            matches!(
-                state.ui.conversation_lines.last(),
-                Some(crate::chat::tui::ConversationLine::System { content }) if content == "session gone"
-            ),
-            "reducer should surface session gone"
-        );
+        assert!(state.ui.conversation_lines.is_empty());
     }
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn alt_enter_matching_strip_selection_uses_attach_branch_without_newline() {
+    fn alt_enter_with_sessions_no_longer_uses_attach_branch() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut state = make_state();
@@ -3935,29 +3922,21 @@ mod tests {
             token_usage_records: Vec::new(),
             idle_warning: false,
         }];
-        state.ui.strip_selection = Some(2);
         state.ui.input.set_text("draft");
 
         let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
 
-        assert!(
-            matches!(
-                effects.as_slice(),
-                [Effect::LogTrace { msg, .. }, Effect::RequestRedraw] if msg.contains("strip_alt_enter_attach seq=2")
-            ),
-            "matching Alt+Enter should take attach branch: {effects:?}"
-        );
-        assert_eq!(state.ui.strip_selection, Some(2));
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert_eq!(
             state.ui.input.text(),
-            "draft",
-            "matching Alt+Enter must not insert a newline"
+            "draft\n",
+            "matching Alt+Enter no longer attaches strip selection"
         );
     }
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn alt_enter_without_strip_selection_falls_through_to_newline_insert() {
+    fn alt_enter_falls_through_to_newline_insert() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut state = make_state();
@@ -3980,7 +3959,7 @@ mod tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn slash_menu_captures_alt_arrows_before_strip_selection() {
+    fn slash_menu_captures_alt_arrows_before_bottom_navigation() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut state = make_state();
@@ -4010,7 +3989,6 @@ mod tests {
         ];
         state.ui.input.set_text("/mo");
         state.ui.slash_menu = Some(SlashMenuState::new("mo"));
-        state.ui.strip_selection = Some(2);
 
         let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
 
@@ -4018,17 +3996,12 @@ mod tests {
             effects.iter().all(|effect| matches!(effect, Effect::RequestRedraw)),
             "slash menu may redraw, but must not leak Alt+Up into strip navigation: {effects:?}"
         );
-        assert_eq!(
-            state.ui.strip_selection,
-            Some(2),
-            "Alt+Up must not move the session strip while slash menu is open"
-        );
         assert!(state.ui.slash_menu.is_some(), "slash menu remains open");
     }
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn saved_session_picker_captures_alt_enter_before_stale_strip_selection() {
+    fn saved_session_picker_captures_alt_enter_before_input_newline() {
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
         let mut state = make_state();
@@ -4043,7 +4016,6 @@ mod tests {
                 is_current: false,
             },
         ]));
-        state.ui.strip_selection = Some(99);
         state.ui.input.set_text("draft");
 
         let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
@@ -4056,7 +4028,6 @@ mod tests {
             state.ui.saved_session_picker.is_some(),
             "Alt+Enter is consumed, not treated as picker Enter"
         );
-        assert_eq!(state.ui.strip_selection, Some(99));
         assert_eq!(state.ui.input.text(), "draft");
         assert!(
             !matches!(
@@ -4163,6 +4134,49 @@ mod tests {
         assert_eq!(pending.tool_id, "call-approve");
         assert_eq!(pending.name, "shell");
         assert!(pending.args.contains("printf secure"));
+        assert!(
+            !pending.selected_approval,
+            "approval selection defaults to the safe deny choice"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn redux_approval_arrows_select_and_enter_resolves() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
+            tool_id: "call-arrow-approve".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+        assert!(
+            state
+                .ui
+                .pending_tool_approval
+                .as_ref()
+                .expect("approval remains pending after arrow")
+                .selected_approval,
+            "Right selects approve"
+        );
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: true } if tool_id == "call-arrow-approve"
+            )
+        }));
     }
 
     #[cfg(feature = "terminal-tui")]
@@ -6994,6 +7008,7 @@ mod tests {
                         started_at_ms: 0,
                         finalized_total_tokens: None,
                         completion_ready: false,
+                        recent_tool_call: None,
                     })
                     .collect(),
             }
