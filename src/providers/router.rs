@@ -296,6 +296,8 @@ pub(crate) struct MockEnvProvider {
     flavor: Option<String>,
     /// S5 P0-1: 每个 chunk 间的延迟（ms），cancel-mid-stream 测试窗口用。
     delay_ms_per_chunk: u64,
+    /// Prompt-substring keyed initial stream delay for visible-turn concurrency demos.
+    delay_ms_by_prompt: Vec<(String, u64)>,
 }
 
 #[cfg(any(test, feature = "test-mock"))]
@@ -366,6 +368,48 @@ fn script_chunk_to_stream(mc: &MockChunk, idx: usize) -> StreamChunk {
 }
 
 #[cfg(any(test, feature = "test-mock"))]
+fn parse_mock_delay_ms_by_prompt(raw: &str) -> Vec<(String, u64)> {
+    raw.split([';', ','])
+        .filter_map(|entry| {
+            let (needle, delay) = entry.split_once('=')?;
+            let needle = needle.trim();
+            let delay = delay.trim().parse::<u64>().ok()?;
+            (!needle.is_empty()).then(|| (needle.to_string(), delay))
+        })
+        .collect()
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+fn mock_delay_ms_for_messages(rules: &[(String, u64)], messages: &[ChatMessage]) -> u64 {
+    let prompt = messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map_or("", |message| message.content.as_str());
+    rules
+        .iter()
+        .find_map(|(needle, delay)| prompt.contains(needle).then_some(*delay))
+        .unwrap_or(0)
+}
+
+#[cfg(any(test, feature = "test-mock"))]
+fn mock_stream_with_initial_delay(
+    chunks: Vec<StreamResult<StreamChunk>>,
+    delay_ms: u64,
+) -> futures::stream::BoxStream<'static, StreamResult<StreamChunk>> {
+    use futures::StreamExt as _;
+    futures::stream::iter(chunks)
+        .enumerate()
+        .then(move |(idx, chunk)| async move {
+            if idx == 0 && delay_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            chunk
+        })
+        .boxed()
+}
+
+#[cfg(any(test, feature = "test-mock"))]
 impl MockEnvProvider {
     /// Read response sentinel from `OPENPRX_MOCK_RESPONSE` (default
     /// `[MOCK-DEFAULT-RESPONSE][MOCK-END]`).
@@ -424,6 +468,10 @@ impl MockEnvProvider {
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(0);
+        let delay_ms_by_prompt = std::env::var("OPENPRX_MOCK_DELAY_MS_BY_PROMPT")
+            .ok()
+            .map(|raw| parse_mock_delay_ms_by_prompt(&raw))
+            .unwrap_or_default();
         Self {
             response,
             tool_call_spec,
@@ -431,6 +479,7 @@ impl MockEnvProvider {
             script,
             flavor,
             delay_ms_per_chunk,
+            delay_ms_by_prompt,
         }
     }
 }
@@ -501,7 +550,7 @@ impl Provider for MockEnvProvider {
     /// 返回 `response` 文本作为最终答复，turn 闭环。
     fn stream_chat_with_history(
         &self,
-        _messages: &[ChatMessage],
+        messages: &[ChatMessage],
         _model: &str,
         _temperature: f64,
         _options: StreamOptions,
@@ -511,6 +560,7 @@ impl Provider for MockEnvProvider {
 
         let counter_val = self.call_counter.fetch_add(1, Ordering::SeqCst);
         let response = self.response.clone();
+        let initial_delay = mock_delay_ms_for_messages(&self.delay_ms_by_prompt, messages);
 
         // S5 P0-1: SCRIPT 路径优先 — 按脚本顺序 emit chunks，支持 reasoning / tool / delta /
         // is_final 混搭。flavor 仅记日志（实际协议适配由 driver 与各 provider impl 负责）。
@@ -539,11 +589,15 @@ impl Provider for MockEnvProvider {
                 out.push(Ok(StreamChunk::final_chunk()));
                 out
             };
-            let delay = self.delay_ms_per_chunk;
+            let chunk_delay = self.delay_ms_per_chunk;
             return futures::stream::iter(chunks)
-                .then(move |c| async move {
-                    if delay > 0 {
-                        tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                .enumerate()
+                .then(move |(idx, c)| async move {
+                    if idx == 0 && initial_delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(initial_delay)).await;
+                    }
+                    if chunk_delay > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(chunk_delay)).await;
                     }
                     c
                 })
@@ -560,26 +614,27 @@ impl Provider for MockEnvProvider {
                 spec.args.clone(),
                 0,
             )];
-            return futures::stream::iter(vec![
-                Ok(StreamChunk::tool_call_chunk(calls)),
-                Ok(StreamChunk::final_chunk()),
-            ])
-            .boxed();
+            return mock_stream_with_initial_delay(
+                vec![Ok(StreamChunk::tool_call_chunk(calls)), Ok(StreamChunk::final_chunk())],
+                initial_delay,
+            );
         }
 
         // Default path / subsequent call → text response.
-        futures::stream::iter(vec![
-            Ok(StreamChunk {
-                delta: response,
-                reasoning: None,
-                is_final: false,
-                token_count: 0,
-                usage: None,
-                tool_calls: Vec::new(),
-            }),
-            Ok(StreamChunk::final_chunk()),
-        ])
-        .boxed()
+        mock_stream_with_initial_delay(
+            vec![
+                Ok(StreamChunk {
+                    delta: response,
+                    reasoning: None,
+                    is_final: false,
+                    token_count: 0,
+                    usage: None,
+                    tool_calls: Vec::new(),
+                }),
+                Ok(StreamChunk::final_chunk()),
+            ],
+            initial_delay,
+        )
     }
 
     fn supports_streaming(&self) -> bool {
@@ -813,6 +868,24 @@ mod tests {
         let (idx, model) = router.resolve("hint:reasoning").unwrap();
         assert_eq!(idx, 1);
         assert_eq!(model, "claude-opus");
+    }
+
+    #[test]
+    fn mock_delay_ms_by_prompt_matches_last_user_message() {
+        let rules = parse_mock_delay_ms_by_prompt("A=5000; B = 1000,ignored");
+        let messages = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("prompt A"),
+            ChatMessage::assistant("old"),
+            ChatMessage::user("prompt B"),
+        ];
+
+        assert_eq!(mock_delay_ms_for_messages(&rules, &messages), 1000);
+        assert_eq!(
+            mock_delay_ms_for_messages(&rules, &[ChatMessage::user("prompt A")]),
+            5000
+        );
+        assert_eq!(mock_delay_ms_for_messages(&rules, &[ChatMessage::user("prompt C")]), 0);
     }
 
     #[test]

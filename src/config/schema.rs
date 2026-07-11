@@ -5186,12 +5186,22 @@ pub struct QQConfig {
 
 /// Interactive chat configuration (`[chat]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ChatConfig {}
+pub struct ChatConfig {
+    /// Maximum concurrent visible provider turns in the TUI Redux driver.
+    #[serde(default = "default_chat_max_concurrent_visible_turns")]
+    pub max_concurrent_visible_turns: usize,
+}
 
 impl Default for ChatConfig {
     fn default() -> Self {
-        Self {}
+        Self {
+            max_concurrent_visible_turns: default_chat_max_concurrent_visible_turns(),
+        }
     }
+}
+
+const fn default_chat_max_concurrent_visible_turns() -> usize {
+    2
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -6265,12 +6275,14 @@ min_chars = 12
     async fn chat_config_defaults_to_empty_fullscreen_config() {
         let config = ChatConfig::default();
 
-        assert_eq!(config, ChatConfig {});
+        assert_eq!(config.max_concurrent_visible_turns, 2);
     }
 
     #[test]
     async fn chat_config_roundtrips_without_renderer_mode() {
-        let config = ChatConfig {};
+        let config = ChatConfig {
+            max_concurrent_visible_turns: 3,
+        };
 
         let encoded = toml::to_string(&config).unwrap();
         assert!(
@@ -6278,10 +6290,10 @@ min_chars = 12
             "renderer selection is no longer a persisted config field: {encoded}"
         );
         let decoded: ChatConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded, ChatConfig {});
+        assert_eq!(decoded.max_concurrent_visible_turns, 3);
 
         let defaulted: ChatConfig = toml::from_str("").unwrap();
-        assert_eq!(defaulted, ChatConfig {});
+        assert_eq!(defaulted.max_concurrent_visible_turns, 2);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
