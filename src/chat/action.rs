@@ -569,6 +569,10 @@ pub enum Action {
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
     CancelRequested,
+    /// Cancel a specific visible provider turn by scheduler task id.
+    CancelProviderTurn {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+    },
     /// 双击 Ctrl+C / Ctrl+D / SIGTERM — 优雅退出
     ShutdownRequested,
     /// 兜底强制退出
@@ -643,6 +647,7 @@ impl Action {
             Self::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
             Self::SavedSessionPickerClosed => "SavedSessionPickerClosed",
             Self::CancelRequested => "CancelRequested",
+            Self::CancelProviderTurn { .. } => "CancelProviderTurn",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",
         }

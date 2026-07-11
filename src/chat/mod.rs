@@ -4962,7 +4962,25 @@ pub async fn run(
         }
 
         if is_queue_command(&user_input) {
-            emit_chat_output(&format_input_backlog_report(&input_backlog, 8));
+            emit_chat_output(&format_input_backlog_report(&input_backlog, &turn_scheduler, 8));
+            continue;
+        }
+
+        if is_workers_command(&user_input) {
+            if let Some((output, signal_cancel)) = provider_workers_cancel_output_for_input(
+                &user_input,
+                &mut turn_scheduler,
+                &mut provider_turn_workers,
+                None,
+            ) {
+                emit_chat_output(&output);
+                publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                dispatch_provider_worker_cancel_signal(&chat_dispatcher, signal_cancel);
+            } else {
+                emit_chat_output(&format_provider_worker_report(&provider_worker_status(
+                    &provider_turn_workers,
+                )));
+            }
             continue;
         }
 
@@ -10201,6 +10219,7 @@ fn format_active_turn_local_notice(input: &str) -> String {
 async fn active_turn_local_command_output(
     msg: &crate::channels::traits::ChannelMessage,
     backlog: &std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
     chat_session: &session::ChatSession,
     provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
@@ -10211,7 +10230,7 @@ async fn active_turn_local_command_output(
 ) -> Option<String> {
     let (_priority, content) = classify_input_priority(msg);
     if is_queue_command(&content) {
-        return Some(format_input_backlog_report(backlog, 8));
+        return Some(format_input_backlog_report(backlog, scheduler, 8));
     }
     if is_cost_command(&content) {
         return Some(commands::format_cost_feedback(chat_session));
@@ -10256,17 +10275,13 @@ async fn process_active_turn_input_message(
     {
         emit_chat_output(&output);
         publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
-        if signal_cancel {
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::CancelRequested,
-                "chat.workers_cancel_current_turn",
-            );
-        }
+        dispatch_provider_worker_cancel_signal(chat_dispatcher, signal_cancel);
         return;
     }
     if let Some(output) = active_turn_local_command_output(
         &msg,
         backlog,
+        scheduler,
         chat_session,
         provider_turn_workers,
         chat_sessions,
@@ -10344,6 +10359,14 @@ enum ProviderWorkerCancelCommand {
     Cancel { sequence: u64 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderWorkerCancelSignal {
+    CancelRequested,
+    CancelProviderTurn {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+    },
+}
+
 fn parse_workers_cancel_command(input: &str) -> ProviderWorkerCancelCommand {
     let mut parts = input.split_whitespace();
     if parts.next() != Some("/workers") {
@@ -10390,13 +10413,22 @@ fn active_turn_workers_cancel_output(
     scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
     workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
-) -> Option<(String, bool)> {
+) -> Option<(String, Option<ProviderWorkerCancelSignal>)> {
     let (_priority, content) = classify_input_priority(msg);
-    match parse_workers_cancel_command(&content) {
+    provider_workers_cancel_output_for_input(&content, scheduler, workers, provider_turn_task_id)
+}
+
+fn provider_workers_cancel_output_for_input(
+    input: &str,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+) -> Option<(String, Option<ProviderWorkerCancelSignal>)> {
+    match parse_workers_cancel_command(input) {
         ProviderWorkerCancelCommand::NotCancel => None,
         ProviderWorkerCancelCommand::Invalid(error) => Some((
             format!("Workers cancel failed: {error}.\nUsage: /workers cancel w#N"),
-            false,
+            None,
         )),
         ProviderWorkerCancelCommand::Cancel { sequence } => {
             let Some(worker) = workers
@@ -10406,7 +10438,7 @@ fn active_turn_workers_cancel_output(
             else {
                 return Some((
                     format!("Workers cancel failed: provider worker w#{sequence} is not retained."),
-                    false,
+                    None,
                 ));
             };
             if !matches!(
@@ -10419,17 +10451,7 @@ fn active_turn_workers_cancel_output(
                         "Workers cancel ignored: provider worker w#{sequence} is already {}.",
                         provider_turn_worker_state_label(worker.state)
                     ),
-                    false,
-                ));
-            }
-            let is_current_foreground = provider_turn_task_id == Some(worker.task_id);
-            if !is_current_foreground {
-                return Some((
-                    format!(
-                        "Workers cancel failed: provider worker w#{sequence} task={} is not the foreground awaited turn yet.",
-                        worker.task_id.get()
-                    ),
-                    false,
+                    None,
                 ));
             }
             request_provider_turn_cancel(
@@ -10448,10 +10470,36 @@ fn active_turn_workers_cancel_output(
                     worker.task_id.get(),
                     provider_turn_worker_kind_label(worker.kind),
                 ),
-                true,
+                Some(
+                    if provider_turn_task_id == Some(worker.task_id)
+                        && worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
+                    {
+                        ProviderWorkerCancelSignal::CancelRequested
+                    } else {
+                        ProviderWorkerCancelSignal::CancelProviderTurn {
+                            task_id: worker.task_id,
+                        }
+                    },
+                ),
             ))
         }
     }
+}
+
+fn dispatch_provider_worker_cancel_signal(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    signal_cancel: Option<ProviderWorkerCancelSignal>,
+) {
+    let Some(signal) = signal_cancel else {
+        return;
+    };
+    let action = match signal {
+        ProviderWorkerCancelSignal::CancelRequested => crate::chat::action::Action::CancelRequested,
+        ProviderWorkerCancelSignal::CancelProviderTurn { task_id } => {
+            crate::chat::action::Action::CancelProviderTurn { task_id }
+        }
+    };
+    let _ = chat_dispatcher.dispatch_or_log(action, "chat.workers_cancel_provider_turn");
 }
 
 const fn provider_turn_worker_kind_label(kind: crate::chat::turn_worker::ProviderTurnWorkerKind) -> &'static str {
@@ -10559,11 +10607,15 @@ fn local_session_command(input: &str) -> Option<crate::chat::sessions::SessionCo
     }
 }
 
-fn format_input_backlog_report(backlog: &std::collections::VecDeque<QueuedInputMessage>, max_preview: usize) -> String {
-    let status = input_backlog_status(backlog);
+fn format_input_backlog_report(
+    backlog: &std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    max_preview: usize,
+) -> String {
+    let status = scheduler.status();
     let mut lines = vec![format!(
-        "Main input queue: {} queued, {} priority.",
-        status.queued, status.priority
+        "Main queue: {} queued ({} priority), {} running.",
+        status.queued, status.priority_queued, status.running
     )];
     if backlog.is_empty() {
         lines.push("Queue is empty.".to_string());
@@ -15698,12 +15750,18 @@ mod p3_directional_switch_tests {
     #[test]
     fn queue_report_summarizes_backlog_with_preview() {
         let mut backlog = std::collections::VecDeque::new();
-        enqueue_input_message(&mut backlog, input_msg("normal one"));
-        enqueue_input_message(&mut backlog, input_msg("/priority urgent two"));
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 3);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 3);
+        let running = scheduler.enqueue("running turn", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(running).expect("running turn starts");
 
-        let report = format_input_backlog_report(&backlog, 8);
+        let report = format_input_backlog_report(&backlog, &scheduler, 8);
 
-        assert!(report.contains("Main input queue: 2 queued, 1 priority."), "{report}");
+        assert!(
+            report.contains("Main queue: 2 queued (1 priority), 1 running."),
+            "{report}"
+        );
         assert!(report.contains("1. [normal] normal one"), "{report}");
         assert!(report.contains("2. [priority] urgent two"), "{report}");
     }
@@ -15711,7 +15769,10 @@ mod p3_directional_switch_tests {
     #[tokio::test]
     async fn active_turn_queue_command_is_handled_without_enqueue() {
         let mut backlog = std::collections::VecDeque::new();
-        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 3);
+        let running = scheduler.enqueue("active turn", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(running).expect("active turn starts");
         let msg = input_msg("/now /queue");
         let chat_session = session::ChatSession::new("p", "m");
         let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
@@ -15725,6 +15786,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,
@@ -15736,7 +15798,10 @@ mod p3_directional_switch_tests {
         .await
         .expect("queue command output");
 
-        assert!(output.contains("Main input queue: 1 queued, 0 priority."), "{output}");
+        assert!(
+            output.contains("Main queue: 1 queued (0 priority), 1 running."),
+            "{output}"
+        );
         assert_eq!(backlog.len(), 1, "read-only queue command must not mutate backlog");
     }
 
@@ -15744,6 +15809,7 @@ mod p3_directional_switch_tests {
     async fn active_turn_cost_command_is_handled_without_enqueue() {
         let mut backlog = std::collections::VecDeque::new();
         enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
         let msg = input_msg("/now /cost");
         let chat_session = session::ChatSession::new("p", "m");
         let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
@@ -15757,6 +15823,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,
@@ -15799,6 +15866,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,
@@ -15859,7 +15927,11 @@ mod p3_directional_switch_tests {
             active_turn_workers_cancel_output(&msg, &mut scheduler, &mut provider_turn_workers, Some(task_id))
                 .expect("workers cancel output");
 
-        assert!(signal_cancel, "current foreground worker should signal the active turn");
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelRequested),
+            "current foreground worker should signal the active turn"
+        );
         assert!(
             output.contains("Requested cancellation for provider worker w#1"),
             "{output}"
@@ -15872,6 +15944,114 @@ mod p3_directional_switch_tests {
         assert_eq!(
             provider_turn_workers.worker(task_id).unwrap().state,
             crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_cancel_command_targets_detached_worker_without_cancelling_peer() {
+        let msg = input_msg("/workers cancel w#2");
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        let second = scheduler.enqueue("second detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(first).expect("first task starts");
+        scheduler.start_task(second).expect("second task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(first).expect("first task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(second).expect("second task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+
+        let (output, signal_cancel) =
+            active_turn_workers_cancel_output(&msg, &mut scheduler, &mut provider_turn_workers, Some(first))
+                .expect("workers cancel output");
+
+        assert!(
+            output.contains("Requested cancellation for provider worker w#2"),
+            "{output}"
+        );
+        assert!(output.contains("kind=detached"), "{output}");
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelProviderTurn { task_id: second }),
+            "detached worker cancellation must target the requested task id"
+        );
+        assert_eq!(
+            scheduler.task(first).expect("first task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "peer detached task must stay running"
+        );
+        assert_eq!(
+            scheduler.task(second).expect("second task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling,
+            "requested detached task should enter cancelling"
+        );
+        assert_eq!(
+            provider_turn_workers.worker(first).expect("first worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running,
+            "peer detached worker must stay running"
+        );
+        assert_eq!(
+            provider_turn_workers.worker(second).expect("second worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling,
+            "requested detached worker should enter cancelling"
+        );
+    }
+
+    #[test]
+    fn workers_cancel_command_targets_detached_worker_from_outer_loop() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        let second = scheduler.enqueue("second detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(first).expect("first task starts");
+        scheduler.start_task(second).expect("second task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(first).expect("first task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(second).expect("second task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+
+        let (output, signal_cancel) = provider_workers_cancel_output_for_input(
+            "/workers cancel w#2",
+            &mut scheduler,
+            &mut provider_turn_workers,
+            None,
+        )
+        .expect("workers cancel output");
+
+        assert!(
+            output.contains("Requested cancellation for provider worker w#2"),
+            "{output}"
+        );
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelProviderTurn { task_id: second }),
+            "outer-loop worker cancel must target the requested detached task"
+        );
+        assert_eq!(
+            scheduler.task(first).expect("first task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "peer detached task must stay running"
+        );
+        assert_eq!(
+            scheduler.task(second).expect("second task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling,
+            "requested detached task should enter cancelling"
         );
     }
 
@@ -15933,7 +16113,7 @@ mod p3_directional_switch_tests {
             outputs[0]
         );
         assert!(
-            outputs[1].contains("Main input queue: 0 queued, 0 priority."),
+            outputs[1].contains("Main queue: 0 queued (0 priority), 0 running."),
             "{}",
             outputs[1]
         );
@@ -16790,6 +16970,53 @@ mod p3_directional_switch_tests {
             "blocked visible input must not be marked dispatched"
         );
         assert_eq!(scheduler.status().main_queue_status().queued, 1);
+    }
+
+    #[test]
+    fn visible_input_pop_prefers_priority_when_detached_slot_is_available() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let active = scheduler.enqueue("active", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(active).expect("active task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(active).expect("active task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("active worker starts");
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal queued first"), 7);
+        enqueue_input_message_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            input_msg("/priority urgent queued second"),
+            7,
+        );
+
+        let popped = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            2,
+        )
+        .expect("second detached slot should be available");
+
+        assert_eq!(
+            popped.msg.content, "urgent queued second",
+            "priority input must dispatch before older normal input when a visible slot opens"
+        );
+        let popped_task = popped.turn_task_id.expect("popped task id");
+        assert_eq!(
+            scheduler.task(popped_task).expect("priority task").priority,
+            crate::chat::turn_scheduler::TurnPriority::Priority
+        );
+        assert_eq!(
+            backlog.front().map(|queued| queued.msg.content.as_str()),
+            Some("normal queued first"),
+            "normal input remains queued after priority dispatch"
+        );
     }
 
     #[test]
@@ -17909,6 +18136,7 @@ mod p3_directional_switch_tests {
     async fn active_turn_sessions_command_is_handled_without_enqueue() {
         let mut backlog = std::collections::VecDeque::new();
         enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
         let msg = input_msg("/sessions");
         let chat_session = session::ChatSession::new("p", "m");
         let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
@@ -17922,6 +18150,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,
@@ -17941,6 +18170,7 @@ mod p3_directional_switch_tests {
     async fn active_turn_logs_command_is_handled_without_enqueue() {
         let mut backlog = std::collections::VecDeque::new();
         enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
         let msg = input_msg("/logs #99");
         let chat_session = session::ChatSession::new("p", "m");
         let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
@@ -17954,6 +18184,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,
@@ -17973,6 +18204,7 @@ mod p3_directional_switch_tests {
     async fn active_turn_kill_command_is_handled_without_enqueue() {
         let mut backlog = std::collections::VecDeque::new();
         enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
         let msg = input_msg("/kill #99");
         let chat_session = session::ChatSession::new("p", "m");
         let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
@@ -17986,6 +18218,7 @@ mod p3_directional_switch_tests {
         let output = active_turn_local_command_output(
             &msg,
             &backlog,
+            &scheduler,
             &chat_session,
             &provider_turn_workers,
             &mut chat_sessions,

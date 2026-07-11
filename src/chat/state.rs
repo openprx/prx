@@ -1164,6 +1164,7 @@ impl ChatState {
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
+            Action::CancelProviderTurn { task_id } => self.reduce_cancel_provider_turn(task_id),
             Action::ShutdownRequested => self.reduce_shutdown_requested(),
             Action::ForceQuit => vec![Effect::Quit],
         }
@@ -2365,6 +2366,23 @@ impl ChatState {
             .map(|turn| (ToolTaskKey::from_task_id(turn.task_id), turn.draft.draft_id.clone()))
     }
 
+    fn reduce_cancel_provider_turn(&mut self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> Vec<Effect> {
+        let Some(draft_id) = self
+            .stream
+            .visible_drafts
+            .iter()
+            .find(|turn| turn.task_id == Some(task_id))
+            .map(|turn| turn.draft.draft_id.clone())
+        else {
+            return vec![];
+        };
+        self.cancel_task(
+            ToolTaskKey::Task(task_id),
+            draft_id,
+            "turn cancelled by provider worker cancel request",
+        )
+    }
+
     fn clear_target_pending_approval(
         &mut self,
         tool_key: ToolTaskKey,
@@ -3375,8 +3393,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
 
-        // 退出：CancelRequested / ShutdownRequested 可能清空 stream.draft → dirty.
-        Action::CancelRequested | Action::ShutdownRequested => true,
+        // 退出：CancelRequested / targeted provider cancel / ShutdownRequested
+        // may clear visible drafts.
+        Action::CancelRequested | Action::CancelProviderTurn { .. } | Action::ShutdownRequested => true,
         // ForceQuit 仅发 Quit Effect，UI 立刻被 unmount，dirty 无意义.
         Action::ForceQuit => false,
     }
@@ -4422,6 +4441,8 @@ mod tests {
     fn test_reduce_does_not_panic_for_all_actions() {
         use crate::chat::action::HistoryDir;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("cancel target", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
 
         let actions: Vec<Action> = vec![
             Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -4434,6 +4455,7 @@ mod tests {
             Action::ToolCardFoldToggled,
             Action::ReasoningFoldToggled,
             Action::RedrawRequested,
+            Action::CancelProviderTurn { task_id },
             Action::ForceQuit,
         ];
 
@@ -9369,6 +9391,54 @@ mod tests {
             assert!(state.control.turn_cancels.is_empty());
             assert!(!state.control.generating);
             assert!(state.stream.visible_drafts.is_empty());
+        }
+
+        #[test]
+        fn p4c_cancel_provider_turn_targets_requested_task_token_only() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let tokens = cancel_tokens(state.reduce(Action::CancelProviderTurn { task_id: task_b }));
+
+            assert_eq!(
+                tokens.len(),
+                1,
+                "targeted cancel should emit only the requested task token"
+            );
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(!token_a.is_cancelled(), "peer task token must remain live");
+            assert!(token_b.is_cancelled(), "requested task token must be cancelled");
+            assert!(
+                state.control.turn_cancels.contains_key(&task_a),
+                "peer task cancel token remains retained"
+            );
+            assert!(
+                !state.control.turn_cancels.contains_key(&task_b),
+                "requested task cancel token is consumed"
+            );
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .any(|draft| draft.task_id == Some(task_a)),
+                "peer draft remains visible"
+            );
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .all(|draft| draft.task_id != Some(task_b)),
+                "requested draft is removed"
+            );
+            assert!(state.control.generating, "peer task keeps generation active");
         }
 
         #[test]
