@@ -436,6 +436,17 @@ impl McpTool {
         (!is_error, output)
     }
 
+    fn call_tool_params(
+        tool_name: &str,
+        arguments: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> CallToolRequestParams {
+        let mut params = CallToolRequestParams::new(tool_name.to_string());
+        if let Some(arguments) = arguments {
+            params = params.with_arguments(arguments);
+        }
+        params
+    }
+
     async fn discover_server_tools_stdio(
         server_name: &str,
         server: &McpServerConfig,
@@ -563,12 +574,7 @@ impl McpTool {
 
         let result = tokio::time::timeout(
             request_timeout,
-            client.call_tool(CallToolRequestParams {
-                meta: None,
-                name: tool_name.to_string().into(),
-                arguments,
-                task: None,
-            }),
+            client.call_tool(Self::call_tool_params(tool_name, arguments)),
         )
         .await
         .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))?;
@@ -629,12 +635,7 @@ impl McpTool {
 
         let result = tokio::time::timeout(
             request_timeout,
-            client.call_tool(CallToolRequestParams {
-                meta: None,
-                name: tool_name.to_string().into(),
-                arguments,
-                task: None,
-            }),
+            client.call_tool(Self::call_tool_params(tool_name, arguments)),
         )
         .await
         .map_err(|_| anyhow::anyhow!("MCP call timed out after {} ms", server.request_timeout_ms))??;
