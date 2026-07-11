@@ -14,14 +14,15 @@ pub use schema::{
     IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig, MatrixConfig, McpConfig, McpServerConfig,
     McpServerRuntimeConfig, McpTransport, MediaConfig, MemoryConfig, MemoryEventsConfig, MemorySemanticConfig,
     MemoryWebhookConfig, ModelRouteConfig, ModulesConfig, MultimodalConfig, NextcloudTalkConfig, NodeServerConfig,
-    NodesConfig, ObservabilityConfig, OsPagingConfig, ProxyConfig, ProxyScope, QueryClassificationConfig,
-    ReliabilityConfig, RemoteNodeConfig, ResourceLimitsConfig, RetrievalInjectionRole, RouterConfig, RouterModelConfig,
-    RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig, ScopeRule, SecretsConfig,
-    SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig, SmartGroupConfig, StorageConfig,
-    StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig,
-    TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig, WacliConfig, WebSearchConfig,
-    WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder, build_runtime_proxy_client,
-    build_runtime_proxy_client_with_timeouts, runtime_proxy_config, set_runtime_proxy_config,
+    NodesConfig, ObservabilityConfig, OllamaProviderConfig, OsPagingConfig, ProvidersConfig, ProxyConfig, ProxyScope,
+    QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig, ResourceLimitsConfig, RetrievalInjectionRole,
+    RouterConfig, RouterModelConfig, RuntimeConfig, SandboxBackend, SandboxConfig, SchedulerConfig, ScopeConfig,
+    ScopeRule, SecretsConfig, SecurityConfig, SelfSystemConfig, SessionsSpawnConfig, SkillsConfig, SlackConfig,
+    SmartGroupConfig, StorageConfig, StorageProviderConfig, StorageProviderSection, StreamMode, TaskRoutingConfig,
+    TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig, ToolTieringConfig, TunnelConfig, UserPolicyConfig,
+    WacliConfig, WebSearchConfig, WebhookConfig, WhatsAppConfig, apply_runtime_proxy_to_builder,
+    build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts, runtime_proxy_config,
+    set_runtime_proxy_config,
 };
 
 #[cfg(test)]

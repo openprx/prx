@@ -146,6 +146,10 @@ pub struct TokenUsage {
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
     #[serde(default)]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default)]
     pub source: TokenUsageSource,
 }
 
@@ -158,6 +162,10 @@ pub struct MeteredTokenUsageRecord {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u64,
+    #[serde(default)]
+    pub cache_read_input_tokens: u64,
     pub source: TokenUsageSource,
     /// Display cost computed from `[cost].prices`. `None` means the model is
     /// intentionally unknown-priced for this UI pass, not zero cost.
@@ -191,6 +199,8 @@ impl MeteredTokenUsageRecord {
 
         let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
         let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
+        let cache_creation_input_tokens = usage.cache_creation_input_tokens.map_or(0, u64::from);
+        let cache_read_input_tokens = usage.cache_read_input_tokens.map_or(0, u64::from);
         let total_tokens = usage
             .total_tokens
             .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
@@ -198,7 +208,15 @@ impl MeteredTokenUsageRecord {
             return None;
         }
 
-        let cost_usd = usage_cost_usd(provider, model, prompt_tokens, completion_tokens, cost_config);
+        let cost_usd = usage_cost_usd(
+            provider,
+            model,
+            prompt_tokens,
+            completion_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
+            cost_config,
+        );
 
         Some(Self {
             provider: provider.to_string(),
@@ -206,6 +224,8 @@ impl MeteredTokenUsageRecord {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             source: usage.source,
             cost_usd,
         })
@@ -217,6 +237,8 @@ fn usage_cost_usd(
     model: &str,
     prompt_tokens: u64,
     completion_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     cost_config: &crate::config::schema::CostConfig,
 ) -> Option<f64> {
     if provider.eq_ignore_ascii_case("ollama") {
@@ -228,14 +250,17 @@ fn usage_cost_usd(
         format!("{provider}/{model}")
     };
     let pricing = cost_config.prices.get(&pricing_key)?;
-    let usage = crate::cost::types::TokenUsage::new(
-        pricing_key,
-        prompt_tokens,
-        completion_tokens,
-        pricing.input,
-        pricing.output,
-    );
-    Some(usage.cost())
+    let ordinary_prompt_tokens = prompt_tokens
+        .saturating_sub(cache_creation_input_tokens)
+        .saturating_sub(cache_read_input_tokens);
+    let cost = (cache_read_input_tokens as f64).mul_add(
+        pricing.cache_read,
+        (cache_creation_input_tokens as f64).mul_add(
+            pricing.cache_write,
+            (completion_tokens as f64).mul_add(pricing.output, ordinary_prompt_tokens as f64 * pricing.input),
+        ),
+    ) / 1_000_000.0;
+    Some(cost)
 }
 
 impl TokenUsage {
@@ -249,6 +274,26 @@ impl TokenUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
+            source: TokenUsageSource::Reported,
+        }
+    }
+
+    #[must_use]
+    pub const fn reported_with_cache(
+        prompt_tokens: Option<u32>,
+        completion_tokens: Option<u32>,
+        total_tokens: Option<u32>,
+        cache_creation_input_tokens: Option<u32>,
+        cache_read_input_tokens: Option<u32>,
+    ) -> Self {
+        Self {
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cache_creation_input_tokens,
+            cache_read_input_tokens,
             source: TokenUsageSource::Reported,
         }
     }
@@ -263,13 +308,19 @@ impl TokenUsage {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_creation_input_tokens: None,
+            cache_read_input_tokens: None,
             source: TokenUsageSource::Estimated,
         }
     }
 
     #[must_use]
     pub const fn has_any_tokens(&self) -> bool {
-        self.prompt_tokens.is_some() || self.completion_tokens.is_some() || self.total_tokens.is_some()
+        self.prompt_tokens.is_some()
+            || self.completion_tokens.is_some()
+            || self.total_tokens.is_some()
+            || self.cache_creation_input_tokens.is_some()
+            || self.cache_read_input_tokens.is_some()
     }
 
     #[must_use]
@@ -346,9 +397,13 @@ struct TokenUsageSums {
     prompt_tokens: u64,
     completion_tokens: u64,
     total_tokens: u64,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     has_prompt_tokens: bool,
     has_completion_tokens: bool,
     has_total_tokens: bool,
+    has_cache_creation_input_tokens: bool,
+    has_cache_read_input_tokens: bool,
 }
 
 impl TokenUsageSums {
@@ -357,14 +412,22 @@ impl TokenUsageSums {
             prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             has_prompt_tokens: false,
             has_completion_tokens: false,
             has_total_tokens: false,
+            has_cache_creation_input_tokens: false,
+            has_cache_read_input_tokens: false,
         }
     }
 
     const fn has_any(&self) -> bool {
-        self.has_prompt_tokens || self.has_completion_tokens || self.has_total_tokens
+        self.has_prompt_tokens
+            || self.has_completion_tokens
+            || self.has_total_tokens
+            || self.has_cache_creation_input_tokens
+            || self.has_cache_read_input_tokens
     }
 
     fn add(&mut self, usage: &TokenUsage) {
@@ -379,6 +442,14 @@ impl TokenUsageSums {
         if let Some(tokens) = usage.total_tokens {
             self.total_tokens = self.total_tokens.saturating_add(u64::from(tokens));
             self.has_total_tokens = true;
+        }
+        if let Some(tokens) = usage.cache_creation_input_tokens {
+            self.cache_creation_input_tokens = self.cache_creation_input_tokens.saturating_add(u64::from(tokens));
+            self.has_cache_creation_input_tokens = true;
+        }
+        if let Some(tokens) = usage.cache_read_input_tokens {
+            self.cache_read_input_tokens = self.cache_read_input_tokens.saturating_add(u64::from(tokens));
+            self.has_cache_read_input_tokens = true;
         }
     }
 
@@ -400,6 +471,12 @@ impl TokenUsageSums {
             prompt_tokens,
             completion_tokens,
             total_tokens,
+            cache_creation_input_tokens: self
+                .has_cache_creation_input_tokens
+                .then(|| clamp_u64_to_u32(self.cache_creation_input_tokens)),
+            cache_read_input_tokens: self
+                .has_cache_read_input_tokens
+                .then(|| clamp_u64_to_u32(self.cache_read_input_tokens)),
             source,
         }
     }
@@ -1198,6 +1275,74 @@ mod tests {
 
         assert_eq!(decoded, usage);
         assert_eq!(decoded.source, TokenUsageSource::Reported);
+    }
+
+    #[test]
+    fn token_usage_deserializes_legacy_json_without_cache_fields() {
+        let decoded: TokenUsage = serde_json::from_str(
+            r#"{
+                "prompt_tokens": 10,
+                "completion_tokens": 5,
+                "total_tokens": 15,
+                "source": "reported"
+            }"#,
+        )
+        .expect("legacy token usage should deserialize");
+
+        assert_eq!(decoded.prompt_tokens, Some(10));
+        assert_eq!(decoded.completion_tokens, Some(5));
+        assert_eq!(decoded.total_tokens, Some(15));
+        assert_eq!(decoded.cache_creation_input_tokens, None);
+        assert_eq!(decoded.cache_read_input_tokens, None);
+        assert_eq!(decoded.source, TokenUsageSource::Reported);
+    }
+
+    #[test]
+    fn metered_usage_record_deserializes_legacy_json_without_cache_fields() {
+        let decoded: MeteredTokenUsageRecord = serde_json::from_str(
+            r#"{
+                "provider": "anthropic",
+                "model": "claude-sonnet",
+                "prompt_tokens": 100,
+                "completion_tokens": 20,
+                "total_tokens": 120,
+                "source": "reported",
+                "cost_usd": 0.001
+            }"#,
+        )
+        .expect("legacy metered usage record should deserialize");
+
+        assert_eq!(decoded.provider, "anthropic");
+        assert_eq!(decoded.model, "claude-sonnet");
+        assert_eq!(decoded.prompt_tokens, 100);
+        assert_eq!(decoded.completion_tokens, 20);
+        assert_eq!(decoded.total_tokens, 120);
+        assert_eq!(decoded.cache_creation_input_tokens, 0);
+        assert_eq!(decoded.cache_read_input_tokens, 0);
+        assert_eq!(decoded.source, TokenUsageSource::Reported);
+        assert_eq!(decoded.cost_usd, Some(0.001));
+    }
+
+    #[test]
+    fn metered_usage_cost_prices_anthropic_cache_tokens_separately() {
+        let usage = TokenUsage::reported_with_cache(Some(1_500), Some(200), Some(1_700), Some(300), Some(700));
+        let record = MeteredTokenUsageRecord::from_parts(
+            "anthropic",
+            "claude-sonnet-4-20250514",
+            &usage,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .expect("cache usage should produce a record");
+
+        assert_eq!(record.prompt_tokens, 1_500);
+        assert_eq!(record.cache_creation_input_tokens, 300);
+        assert_eq!(record.cache_read_input_tokens, 700);
+        let cost = record.cost_usd.expect("default anthropic price should compute cost");
+        let expected = 5_835.0 / 1_000_000.0;
+        assert!(
+            (cost - expected).abs() < 0.000_000_1,
+            "cache read/write cost should be priced separately: {cost}"
+        );
     }
 
     #[test]

@@ -56,11 +56,17 @@ pub mod commands;
 pub mod diff_apply;
 pub mod dispatcher;
 pub mod error;
+pub mod history_commit;
+pub mod managed_session;
 pub mod sanitize;
+pub mod scheduled_input;
 pub mod session;
 pub mod sessions;
+pub mod slash_types;
 pub mod state;
 pub mod terminal_proto;
+pub mod turn_scheduler;
+pub mod turn_worker;
 
 #[cfg(feature = "terminal-tui")]
 pub mod renderer;
@@ -69,9 +75,9 @@ pub mod tui;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolCallNotification, ToolConcurrencyGovernanceConfig,
+    apply_compaction_patch_exact, build_configurable_compaction_patch_with_source_history,
     build_context_with_shared_events_and_scope, build_runtime_system_prompt, increment_recalled_useful_counts,
-    is_tool_loop_cancelled, measure_history_tokens, plan_context_budget, run_tool_call_loop_traced,
-    select_prompt_skills,
+    is_tool_loop_cancelled, measure_history_tokens, run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
@@ -125,6 +131,138 @@ const COMPACT_TOTAL_CHARS: usize = 2400;
 /// Capacity for the user-input mpsc channel.
 const INPUT_CHANNEL_CAPACITY: usize = 16;
 const CHAT_CONTROL_CHANNEL_CAPACITY: usize = 8;
+const SYNTHETIC_UI_COMMAND_SENDER: &str = "prx-ui";
+const SESSION_LOGS_MAX_LINES: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum InputQueuePriority {
+    Normal,
+    Priority,
+    Control,
+}
+
+struct QueuedInputMessage {
+    priority: InputQueuePriority,
+    turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    msg: crate::channels::traits::ChannelMessage,
+}
+
+struct DequeuedInputMessage {
+    priority: InputQueuePriority,
+    turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    msg: crate::channels::traits::ChannelMessage,
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTurnCompletionEvent {
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    outcome: Option<dispatcher::TurnOutcomeKind>,
+    usage: crate::llm::route_decision::TokenUsage,
+}
+
+#[derive(Debug)]
+enum ProviderTurnCompletionRoute {
+    Current(ProviderTurnCompletionEvent),
+    Pending,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderTurnCompletionContext {
+    history_len_before_assistant: usize,
+}
+
+#[cfg(feature = "terminal-tui")]
+struct PerTurnContext {
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: String,
+    delta_tx: Option<mpsc::Sender<String>>,
+    tool_event_tx: Option<mpsc::Sender<ToolCallNotification>>,
+    draft_updater: Option<tokio::task::JoinHandle<()>>,
+    tool_event_forwarder: Option<tokio::task::JoinHandle<()>>,
+    user_input: String,
+    turn_run_id: String,
+    route_scope: MessageEventScope,
+    route_decision: RouteDecision,
+    provider_started_at: chrono::DateTime<chrono::Utc>,
+    provider_name: String,
+    model_name: String,
+    history_len_before_user_turn: usize,
+    history_user_message: ChatMessage,
+}
+
+#[cfg(feature = "terminal-tui")]
+struct PendingOrderedProviderTurnCommit {
+    context: PerTurnContext,
+    terminal_plan: ProviderTurnTerminalPlan,
+}
+
+#[derive(Debug)]
+struct ResolvedProviderTurnCompletion {
+    outcome: Option<dispatcher::TurnOutcomeKind>,
+    usage: crate::llm::route_decision::TokenUsage,
+}
+
+#[derive(Debug, Clone)]
+enum ProviderTurnTerminalPlan {
+    Completed {
+        final_text: String,
+        reasoning: String,
+        recorded_response: String,
+        empty_response: bool,
+        usage: crate::llm::route_decision::TokenUsage,
+        history_commit_len: usize,
+        final_text_chars: usize,
+        recorded_response_chars: usize,
+        summary: &'static str,
+    },
+    Failed {
+        err: String,
+        history_commit_len: usize,
+        summary: String,
+    },
+    Cancelled {
+        summary: &'static str,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ProviderTurnFinalizerEvent {
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    plan: ProviderTurnTerminalPlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProviderTurnFinalizerResult {
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    terminal_status: &'static str,
+    finalized: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ProviderTurnVisibleAdmission {
+    active_workers: usize,
+    foreground_active: usize,
+    detached_active: usize,
+    effective_max_visible_turns: usize,
+    can_start_visible: bool,
+}
+
+enum ProviderTurnTerminalGate<'a> {
+    Completed {
+        history_commit_len: usize,
+        final_text_chars: usize,
+        recorded_response_chars: usize,
+        usage: &'a crate::llm::route_decision::TokenUsage,
+        summary: &'static str,
+    },
+    Failed {
+        history_commit_len: usize,
+        summary: String,
+    },
+    Cancelled {
+        summary: &'static str,
+    },
+}
 
 /// Capacity for the streaming delta (partial response) mpsc channel.
 const DELTA_CHANNEL_CAPACITY: usize = 64;
@@ -344,6 +482,77 @@ fn truncate_utf8_to_byte_cap(input: &str, max_bytes: usize) -> (String, bool) {
     (input[..end].to_string(), true)
 }
 
+const COPY_OSC52_MAX_BYTES: usize = 74 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CopySelection {
+    content: String,
+    ordinal: usize,
+    truncated: bool,
+}
+
+fn is_copy_command(input: &str) -> bool {
+    input == "/copy" || input.starts_with("/copy ")
+}
+
+fn select_copy_content(session: &session::ChatSession, input: &str) -> Result<CopySelection, String> {
+    let raw = input.strip_prefix("/copy").unwrap_or_default().trim();
+    let ordinal = if raw.is_empty() || raw.eq_ignore_ascii_case("latest") {
+        1
+    } else {
+        raw.parse::<usize>()
+            .ok()
+            .filter(|value| *value > 0)
+            .ok_or_else(|| "Usage: /copy [latest|N]".to_string())?
+    };
+    let Some(turn) = session
+        .turns
+        .iter()
+        .rev()
+        .filter(|turn| turn.role == "assistant")
+        .nth(ordinal - 1)
+    else {
+        return Err("No assistant response to copy.".to_string());
+    };
+    let (content, truncated) = truncate_utf8_to_byte_cap(&turn.content, COPY_OSC52_MAX_BYTES);
+    Ok(CopySelection {
+        content,
+        ordinal,
+        truncated,
+    })
+}
+
+fn copy_success_message(selection: &CopySelection) -> String {
+    let suffix = if selection.truncated {
+        " (truncated to 74 KiB for OSC 52)"
+    } else {
+        ""
+    };
+    if selection.ordinal == 1 {
+        format!("Copied latest assistant response to clipboard{suffix}.")
+    } else {
+        format!(
+            "Copied assistant response #{} from the end to clipboard{suffix}.",
+            selection.ordinal
+        )
+    }
+}
+
+fn mouse_capture_disabled_by_env(value: Option<&str>) -> bool {
+    value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
+fn mouse_capture_enabled_by_env(enable_value: Option<&str>, disable_value: Option<&str>) -> bool {
+    if mouse_capture_disabled_by_env(disable_value) {
+        return false;
+    }
+    enable_value
+        .map(str::trim)
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 /// Compact conversation history in-place to fit within context window limits.
 ///
 /// Preserves the system prompt (index 0), keeps the last [`COMPACT_KEEP_MESSAGES`]
@@ -424,26 +633,176 @@ fn format_compact_feedback(
     }
 }
 
-fn context_budget_warning_for_tui(
+fn manual_compact_below_trigger_threshold(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> bool {
+    !crate::agent::loop_::plan_context_budget(
+        history,
+        compaction_config,
+        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+    )
+    .over_hard_limit
+}
+
+fn format_nothing_to_compact_feedback(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> String {
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    let turns = history.len().saturating_sub(system_count);
+    let tokens = estimate_chat_history_tokens(history);
+    let window = format_compact_token_count(compaction_config.max_context_tokens);
+    format!("Nothing to compact: {turns} turns / ~{tokens} tokens / {window} window.")
+}
+
+fn format_compact_feedback_after_history(
+    turns_before: usize,
+    tokens_before: usize,
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+) -> String {
+    let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+    format_compact_feedback(
+        turns_before,
+        history.len().saturating_sub(system_count),
+        tokens_before,
+        estimate_chat_history_tokens(history),
+        compaction_config.max_context_tokens,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TuiContextBudgetStatus {
+    used_context_tokens: usize,
+    max_context_tokens: usize,
+}
+
+fn context_budget_status_for_tui(
     history: &[ChatMessage],
     compaction_config: &crate::config::AgentCompactionConfig,
     terminal_tui_enabled: bool,
-) -> Option<String> {
+) -> Option<TuiContextBudgetStatus> {
     if !terminal_tui_enabled {
         return None;
     }
-    let budget = plan_context_budget(
+    let budget = crate::agent::loop_::plan_context_budget(
         history,
         compaction_config,
         crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
     );
-    if !budget.over_warning {
-        return None;
+    Some(TuiContextBudgetStatus {
+        used_context_tokens: budget.used_tokens,
+        max_context_tokens: budget.max_context_tokens,
+    })
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_context_budget_for_tui(
+    history: &[ChatMessage],
+    compaction_config: &crate::config::AgentCompactionConfig,
+    terminal_tui_enabled: bool,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) {
+    let Some(context_budget) = context_budget_status_for_tui(history, compaction_config, terminal_tui_enabled) else {
+        return;
+    };
+    let context_used_tokens = Some(context_budget.used_context_tokens);
+    let context_window_tokens = Some(context_budget.max_context_tokens);
+    {
+        let mut mirror = chat_mirror.lock();
+        mirror.context_used_tokens = context_used_tokens;
+        mirror.context_window_tokens = context_window_tokens;
     }
-    Some(format!(
-        "Context budget warning: ~{} / {} tokens used (window {}, reserve {}).",
-        budget.used_tokens, budget.available_input_tokens, budget.max_context_tokens, budget.reserve_tokens
-    ))
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ContextWindowUpdated {
+            used_context_tokens: context_used_tokens,
+            max_context_tokens: context_window_tokens,
+        },
+        "chat.context_window_updated",
+    );
+}
+
+async fn build_chat_compaction_patch_with_timeout(
+    budget_history: &[ChatMessage],
+    source_history: &[ChatMessage],
+    provider: &dyn Provider,
+    model: &str,
+    config: &crate::config::AgentCompactionConfig,
+    audit: Option<&DocumentIngestRuntime>,
+    trigger: &str,
+    timeout_duration: Duration,
+) -> Option<crate::agent::loop_::CompactionPatch> {
+    match tokio::time::timeout(
+        timeout_duration,
+        build_configurable_compaction_patch_with_source_history(
+            budget_history,
+            source_history,
+            provider,
+            model,
+            config,
+            audit,
+            trigger,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(patch)) => patch,
+        Ok(Err(error)) => {
+            tracing::warn!(%error, trigger, "chat summary compaction failed; falling back to deterministic trim");
+            None
+        }
+        Err(_) => {
+            tracing::warn!(
+                ?timeout_duration,
+                trigger,
+                "chat summary compaction timed out; falling back to deterministic trim"
+            );
+            None
+        }
+    }
+}
+
+fn apply_chat_compaction_patch_and_sync(
+    history: &mut Vec<ChatMessage>,
+    patch_source_history: Option<&[ChatMessage]>,
+    patch: crate::agent::loop_::CompactionPatch,
+    config: &crate::config::AgentCompactionConfig,
+    reason: crate::chat::action::CompactReason,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+) {
+    let replacement_len = patch.replacement.len();
+    if let Some(source_history) = patch_source_history {
+        let mut source_history = source_history.to_vec();
+        apply_compaction_patch_exact(&mut source_history, &patch);
+        *history = source_history;
+    } else {
+        apply_compaction_patch_exact(history, &patch);
+    }
+    let budget =
+        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    if budget.over_hard_limit {
+        let trimmed = crate::agent::loop_::trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+            history,
+            config,
+            replacement_len,
+        );
+        tracing::warn!(
+            used_tokens = budget.used_tokens,
+            hard_limit = budget.available_input_tokens,
+            trimmed,
+            "chat summary compaction applied preserving trim"
+        );
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::HistoryCompactionPatchApplied {
+            reason,
+            patch,
+            compaction_config: config.clone(),
+        },
+        "chat.history_compaction_patch_applied",
+    );
 }
 
 fn bounded_legacy_chat_compaction_audit_source(history: &[ChatMessage]) -> Vec<ChatMessage> {
@@ -695,6 +1054,190 @@ fn format_managed_sessions_list(views: &[crate::chat::sessions::model::ManagedSe
     out.trim_end().to_string()
 }
 
+async fn handle_local_session_command(
+    action: &crate::chat::sessions::SessionCommand,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    session_rings: &std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reaped_log_archive: &mut ReapedSessionLogArchive,
+    reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
+    tools_registry: &[Box<dyn Tool>],
+) -> Option<String> {
+    use crate::chat::sessions::SessionCommand;
+
+    match action {
+        SessionCommand::Sessions => {
+            let views = chat_sessions.snapshot().await;
+            Some(format_managed_sessions_list(&views))
+        }
+        SessionCommand::Logs { seq } => {
+            Some(format_local_session_logs(*seq, chat_sessions, session_rings, reaped_log_archive, reap_policy).await)
+        }
+        SessionCommand::Kill { seq } => Some(kill_local_session(*seq, chat_sessions, tools_registry).await),
+        _ => None,
+    }
+}
+
+async fn format_local_session_logs(
+    seq: u64,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    session_rings: &std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reaped_log_archive: &mut ReapedSessionLogArchive,
+    reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
+) -> String {
+    match chat_sessions.resolve_run_id(seq).await {
+        Ok(run_id) => {
+            let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
+            session_rings.get(&sid).map_or_else(
+                || format!("Session #{seq} has no buffered output yet."),
+                |ring| {
+                    // Replay the retained window without disturbing live-follow cursors.
+                    let lines = ring.recent_lines(SESSION_LOGS_MAX_LINES);
+                    if lines.is_empty() {
+                        format!("Session #{seq} has no buffered output yet.")
+                    } else {
+                        format_session_logs(seq, &lines, ring.is_truncated())
+                    }
+                },
+            )
+        }
+        Err(e) => {
+            let now = chrono::Utc::now();
+            reaped_log_archive
+                .logs_message(seq, reap_policy, now)
+                .unwrap_or_else(|| {
+                    chat_sessions.reaped_session(seq).map_or_else(
+                        || format!("Logs failed: {e}"),
+                        |reaped| format_reaped_session_notice(seq, Some(&reaped.summary)),
+                    )
+                })
+        }
+    }
+}
+
+async fn kill_local_session(
+    seq: u64,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    tools_registry: &[Box<dyn Tool>],
+) -> String {
+    match chat_sessions.kind_for_seq(seq).await {
+        Ok(crate::chat::sessions::model::ManagedKind::Shell) => {
+            return match chat_sessions.kill_shell(seq).await {
+                Ok(()) => format!("Killed background shell #{seq} (process group terminated)."),
+                Err(e) => format!("Kill failed: {e}"),
+            };
+        }
+        Ok(crate::chat::sessions::model::ManagedKind::Pty) => {
+            #[cfg(feature = "terminal-tui")]
+            {
+                return match chat_sessions.kill_pty(seq).await {
+                    Ok(()) => format!("Killed interactive PTY session #{seq} (process group terminated)."),
+                    Err(e) => format!("Kill failed: {e}"),
+                };
+            }
+            #[cfg(not(feature = "terminal-tui"))]
+            {
+                return "Interactive PTY sessions are only available in the terminal TUI.".to_string();
+            }
+        }
+        Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
+        Ok(crate::chat::sessions::model::ManagedKind::Transcript) => {
+            return "Transcript is a read-only viewer, not a killable child session.".to_string();
+        }
+        Ok(crate::chat::sessions::model::ManagedKind::Approval) => {
+            return "Tool approval is a foreground prompt, not a killable child session.".to_string();
+        }
+        Ok(crate::chat::sessions::model::ManagedKind::Diff) => {
+            return "Diff is a read-only viewer, not a killable child session.".to_string();
+        }
+        Ok(crate::chat::sessions::model::ManagedKind::Worker) => {
+            return "Provider worker detail is a read-only viewer, not a killable child session.".to_string();
+        }
+        Err(e) => return format!("Kill failed: {e}"),
+    }
+
+    // Agent path: resolve `#N` -> run UUID and delegate to sessions_spawn `kill`
+    // so side-effect grants, terminal-state checks, steer cleanup, and task
+    // events remain identical to the normal `/kill` path.
+    let run_id = match chat_sessions.resolve_run_id(seq).await {
+        Ok(id) => id,
+        Err(e) => return format!("Kill failed: {e}"),
+    };
+    let Some(tool) = tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) else {
+        return "Background sessions are not available in this session.".to_string();
+    };
+
+    let operation_name = format!("sessions_spawn:kill:{run_id}");
+    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
+        "sessions_spawn",
+        &operation_name,
+        "chat-operator",
+        None,
+    );
+    let mut args = serde_json::json!({
+        "action": "kill",
+        "run_id": run_id,
+    });
+    match serde_json::to_value(&grant) {
+        Ok(grant_value) => {
+            if let Some(obj) = args.as_object_mut() {
+                obj.insert(
+                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
+                    grant_value,
+                );
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to serialize kill approval grant; proceeding without it"
+            );
+        }
+    }
+    match tool.execute_named("sessions_spawn", args).await {
+        Ok(result) => {
+            if result.output.is_empty() {
+                result
+                    .error
+                    .filter(|e| !e.is_empty())
+                    .unwrap_or_else(|| "(no output)".to_string())
+            } else {
+                result.output
+            }
+        }
+        Err(e) => format!("Kill failed: {e}"),
+    }
+}
+
+fn format_observed_session_announcement(view: &crate::chat::sessions::model::ManagedSessionView) -> String {
+    let elapsed = crate::chat::sessions::model::session_elapsed_label(view);
+    let title = clamp_chars(&view.title, CHILD_STARTED_TITLE_MAX_CHARS);
+    let verb = if matches!(
+        view.status,
+        crate::chat::sessions::model::ManagedStatus::Running | crate::chat::sessions::model::ManagedStatus::NeedsInput
+    ) {
+        "started"
+    } else {
+        "observed"
+    };
+    if title.is_empty() {
+        format!(
+            "[{} #{} {} {} {elapsed}] {verb}",
+            view.kind.as_str(),
+            view.seq,
+            view.origin.as_str(),
+            view.status.as_str(),
+        )
+    } else {
+        format!(
+            "[{} #{} {} {} {elapsed}] {verb}: {title}",
+            view.kind.as_str(),
+            view.seq,
+            view.origin.as_str(),
+            view.status.as_str(),
+        )
+    }
+}
+
 fn format_finished_session_announcement(fin: &crate::chat::sessions::runtime::FinishedSession) -> String {
     let kind = fin.kind.as_str();
     let marker = match fin.status {
@@ -723,12 +1266,28 @@ fn format_finished_session_announcement(fin: &crate::chat::sessions::runtime::Fi
 }
 
 const CHILD_COMPLETION_SUMMARY_MAX_CHARS: usize = 120;
+const CHILD_STARTED_TITLE_MAX_CHARS: usize = 96;
 
 fn compact_child_completion_summary(text: &str) -> String {
     let Some(line) = text.lines().map(str::trim).find(|line| is_useful_completion_line(line)) else {
         return String::new();
     };
     clamp_chars(line, CHILD_COMPLETION_SUMMARY_MAX_CHARS)
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_sessions_cache_and_clear_stale_strip_selection(
+    mirror: &mut tui::TuiState,
+    entries: Vec<crate::chat::sessions::SwitcherEntry>,
+) -> bool {
+    let stale_strip_selection = mirror
+        .strip_selection
+        .is_some_and(|selected| !entries.iter().any(|entry| entry.seq == selected));
+    mirror.sessions_cache = entries;
+    if stale_strip_selection {
+        mirror.strip_selection = None;
+    }
+    stale_strip_selection
 }
 
 fn is_useful_completion_line(line: &str) -> bool {
@@ -1052,6 +1611,55 @@ fn surface_session_message(dispatcher: &dispatcher::ChatDispatcher, redraw_tx: O
 }
 
 #[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
+fn surface_active_turn_message(
+    dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    text: &str,
+) {
+    surface_session_message(dispatcher, redraw_tx, text);
+}
+
+#[cfg(feature = "terminal-tui")]
+fn defer_resume_saved_session_if_provider_turn_pending(
+    pending_turns: usize,
+    deferred: &mut std::collections::VecDeque<String>,
+    id: String,
+) -> bool {
+    if pending_turns == 0 {
+        return false;
+    }
+    deferred.push_back(id);
+    true
+}
+
+#[cfg(feature = "terminal-tui")]
+const fn should_continue_event_pump_after_input_closed(pending_turns: usize) -> bool {
+    pending_turns > 0
+}
+
+#[cfg(feature = "terminal-tui")]
+fn should_drain_deferred_resume_after_visible_inputs(
+    pending_turns: usize,
+    backlog: &std::collections::VecDeque<QueuedInputMessage>,
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) -> bool {
+    pending_turns == 0
+        && backlog.is_empty()
+        && provider_turn_visible_admission(
+            workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            1,
+        )
+        .can_start_visible
+}
+
+const fn consume_deferred_visible_input_pop(defer_visible_input_pop_once: &mut bool) -> bool {
+    let should_defer = *defer_visible_input_pop_once;
+    *defer_visible_input_pop_once = false;
+    should_defer
+}
+
+#[cfg_attr(not(feature = "terminal-tui"), allow(dead_code))]
 fn format_turn_elapsed_message(
     status: &str,
     started_at: chrono::DateTime<chrono::Utc>,
@@ -1064,6 +1672,17 @@ fn format_turn_elapsed_message(
 }
 
 #[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
+fn turn_elapsed_message_for_surface(
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    status: &str,
+    started_at: chrono::DateTime<chrono::Utc>,
+    finished_at: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    redraw_tx?;
+    Some(format_turn_elapsed_message(status, started_at, finished_at))
+}
+
+#[cfg_attr(not(feature = "terminal-tui"), allow(unused_variables))]
 fn surface_turn_elapsed_message(
     dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
@@ -1073,11 +1692,10 @@ fn surface_turn_elapsed_message(
 ) {
     #[cfg(feature = "terminal-tui")]
     {
-        surface_session_message(
-            dispatcher,
-            redraw_tx,
-            &format_turn_elapsed_message(status, started_at, finished_at),
-        );
+        let Some(text) = turn_elapsed_message_for_surface(redraw_tx, status, started_at, finished_at) else {
+            return;
+        };
+        surface_session_message(dispatcher, redraw_tx, &text);
     }
 }
 
@@ -1139,9 +1757,58 @@ mod runtime_display_tests {
             prompt_tokens: 8_000,
             completion_tokens: 4_300,
             total_tokens: 12_300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source,
             cost_usd: Some(0.0042),
         }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn switcher_entry(seq: u64) -> crate::chat::sessions::SwitcherEntry {
+        crate::chat::sessions::SwitcherEntry {
+            seq,
+            kind: ManagedKind::Agent.as_str(),
+            origin: SessionOrigin::User.as_str(),
+            status: ManagedStatus::Running.as_str(),
+            title: format!("session {seq}"),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_tick_helper_clears_reaped_strip_selection() {
+        let mut mirror = tui::TuiState::new("provider", "model");
+        mirror.strip_selection = Some(9);
+
+        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, vec![switcher_entry(1)]);
+
+        assert!(
+            stale,
+            "missing selected seq should request StripSelectionChanged dispatch"
+        );
+        assert_eq!(mirror.strip_selection, None);
+        assert_eq!(mirror.sessions_cache.len(), 1);
+        assert_eq!(mirror.sessions_cache.first().map(|entry| entry.seq), Some(1));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn sessions_tick_helper_keeps_live_strip_selection() {
+        let mut mirror = tui::TuiState::new("provider", "model");
+        mirror.strip_selection = Some(2);
+
+        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(
+            &mut mirror,
+            vec![switcher_entry(1), switcher_entry(2)],
+        );
+
+        assert!(!stale);
+        assert_eq!(mirror.strip_selection, Some(2));
     }
 
     #[test]
@@ -1161,6 +1828,46 @@ mod runtime_display_tests {
         let out = format_managed_sessions_list(&[view]);
 
         assert!(out.contains("#9 agent model running 3s index workspace"), "{out}");
+    }
+
+    #[test]
+    fn started_session_announcement_promotes_model_agent_to_child_session() {
+        let view = ManagedSessionView {
+            id: SessionId::from_run_id("run-started"),
+            seq: 2,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::Model,
+            title: "audit queued input".to_string(),
+            status: ManagedStatus::Running,
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:03Z"),
+            token_usage_records: Vec::new(),
+        };
+
+        assert_eq!(
+            format_observed_session_announcement(&view),
+            "[agent #2 model running 3s] started: audit queued input"
+        );
+    }
+
+    #[test]
+    fn observed_session_announcement_covers_fast_completed_model_agent() {
+        let view = ManagedSessionView {
+            id: SessionId::from_run_id("run-fast"),
+            seq: 3,
+            kind: ManagedKind::Agent,
+            origin: SessionOrigin::Model,
+            title: "fast reply".to_string(),
+            status: ManagedStatus::Completed,
+            created_at: ts("2026-07-04T12:00:00Z"),
+            updated_at: ts("2026-07-04T12:00:01Z"),
+            token_usage_records: Vec::new(),
+        };
+
+        assert_eq!(
+            format_observed_session_announcement(&view),
+            "[agent #3 model completed 1s] observed: fast reply"
+        );
     }
 
     #[test]
@@ -1208,6 +1915,65 @@ mod runtime_display_tests {
             out.contains("#10 agent user completed 3s ~12.3k tok | cost unknown summarize"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn copy_command_selects_latest_and_numbered_assistant_turns() {
+        let mut session = session::ChatSession::new("provider", "model");
+        session.add_user_turn("question");
+        session.add_assistant_turn("first **markdown**", Vec::new());
+        session.add_user_turn("again");
+        session.add_assistant_turn("second `raw`", Vec::new());
+
+        let latest = select_copy_content(&session, "/copy").expect("latest copy");
+        assert_eq!(latest.content, "second `raw`");
+        assert_eq!(latest.ordinal, 1);
+        assert!(!latest.truncated);
+
+        let latest_named = select_copy_content(&session, "/copy latest").expect("named latest copy");
+        assert_eq!(latest_named.content, "second `raw`");
+        assert_eq!(latest_named.ordinal, 1);
+
+        let previous = select_copy_content(&session, "/copy 2").expect("previous copy");
+        assert_eq!(previous.content, "first **markdown**");
+        assert_eq!(previous.ordinal, 2);
+    }
+
+    #[test]
+    fn copy_command_validates_args_and_truncates_for_osc52() {
+        let mut session = session::ChatSession::new("provider", "model");
+        assert_eq!(
+            select_copy_content(&session, "/copy").expect_err("no assistant"),
+            "No assistant response to copy."
+        );
+        assert_eq!(
+            select_copy_content(&session, "/copy nope").expect_err("usage"),
+            "Usage: /copy [latest|N]"
+        );
+
+        let oversized = format!("{}界", "x".repeat(COPY_OSC52_MAX_BYTES));
+        session.add_assistant_turn(&oversized, Vec::new());
+        let selected = select_copy_content(&session, "/copy").expect("copy oversized");
+        assert!(selected.truncated);
+        assert!(selected.content.len() <= COPY_OSC52_MAX_BYTES);
+        assert!(selected.content.is_char_boundary(selected.content.len()));
+        assert!(
+            !selected.content.ends_with('界'),
+            "truncate at UTF-8 boundary before wide char"
+        );
+    }
+
+    #[test]
+    fn mouse_capture_disable_env_parser_is_explicit() {
+        for enabled in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(mouse_capture_disabled_by_env(Some(enabled)), "{enabled:?}");
+        }
+        for disabled in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("no")] {
+            assert!(!mouse_capture_disabled_by_env(disabled), "{disabled:?}");
+        }
+        assert!(!mouse_capture_enabled_by_env(None, None));
+        assert!(mouse_capture_enabled_by_env(Some("1"), None));
+        assert!(!mouse_capture_enabled_by_env(Some("1"), Some("true")));
     }
 
     #[test]
@@ -1352,6 +2118,95 @@ mod runtime_display_tests {
             "turn completed 3s"
         );
     }
+
+    #[test]
+    fn plain_mode_suppresses_turn_elapsed_chrome() {
+        assert_eq!(
+            turn_elapsed_message_for_surface(
+                None,
+                "completed",
+                ts("2026-07-04T12:00:00Z"),
+                ts("2026-07-04T12:00:03Z")
+            ),
+            None,
+            "plain/fallback path must not surface turn completed chrome"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn surface_turn_elapsed_message_dispatches_system_message_and_redraw() {
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
+
+        surface_turn_elapsed_message(
+            &dispatcher,
+            Some(&redraw_tx),
+            "completed",
+            ts("2026-07-04T12:00:00Z"),
+            ts("2026-07-04T12:00:03Z"),
+        );
+
+        assert!(redraw_rx.try_recv().is_ok(), "surface path should request redraw");
+        let action = action_rx
+            .try_recv()
+            .expect("surface path should dispatch system message");
+        assert!(
+            matches!(
+                action,
+                crate::chat::action::Action::SystemMessageAdded { ref text } if text == "turn completed 3s"
+            ),
+            "unexpected action: {action:?}"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_active_turn_message_uses_reducer_redraw_path() {
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
+
+        surface_active_turn_message(&dispatcher, Some(&redraw_tx), "Main input queue: 0 queued, 0 priority.");
+
+        assert!(
+            redraw_rx.try_recv().is_ok(),
+            "active-turn local output should request redraw"
+        );
+        let action = action_rx
+            .try_recv()
+            .expect("active-turn local output should dispatch through reducer");
+        assert!(
+            matches!(
+                action,
+                crate::chat::action::Action::SystemMessageAdded { ref text }
+                    if text == "Main input queue: 0 queued, 0 priority."
+            ),
+            "unexpected action: {action:?}"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_resume_saved_session_is_deferred_while_provider_turn_pending() {
+        let mut deferred = std::collections::VecDeque::new();
+
+        assert!(defer_resume_saved_session_if_provider_turn_pending(
+            1,
+            &mut deferred,
+            "session-a".to_string()
+        ));
+        assert_eq!(deferred.pop_front().as_deref(), Some("session-a"));
+
+        assert!(!defer_resume_saved_session_if_provider_turn_pending(
+            0,
+            &mut deferred,
+            "session-b".to_string()
+        ));
+        assert!(
+            deferred.is_empty(),
+            "no pending turn means resume should be handled immediately"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1410,6 +2265,226 @@ mod compact_command_tests {
         assert!(
             text.contains("reclaimed ~6000 tokens (60%)"),
             "reclaim delta missing: {text}"
+        );
+    }
+
+    #[test]
+    fn compact_command_below_trigger_threshold_reports_noop() {
+        let config = crate::config::AgentCompactionConfig {
+            reserve_tokens: 10,
+            max_context_tokens: 10_000,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![ChatMessage::system("sys"), ChatMessage::user("short prompt")];
+
+        assert!(
+            manual_compact_below_trigger_threshold(&history, &config),
+            "short history should not fall through to deterministic /compact trimming"
+        );
+        let feedback = format_nothing_to_compact_feedback(&history, &config);
+        assert!(feedback.contains("Nothing to compact"), "{feedback}");
+        assert!(feedback.contains("1 turns"), "{feedback}");
+    }
+
+    #[test]
+    fn legacy_preflight_compaction_feedback_emits_system_message() {
+        let config = crate::config::AgentCompactionConfig {
+            reserve_tokens: 10,
+            max_context_tokens: 10_000,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let mut history = vec![ChatMessage::system("sys")];
+        for i in 0..(COMPACT_KEEP_MESSAGES + 4) {
+            history.push(long_user(i));
+        }
+        let system_count = usize::from(history.first().is_some_and(|message| message.role == "system"));
+        let turns_before = history.len().saturating_sub(system_count);
+        let tokens_before = estimate_chat_history_tokens(&history);
+        compact_chat_history(&mut history);
+        let text = format_compact_feedback_after_history(turns_before, tokens_before, &history, &config);
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+
+        surface_session_message(&dispatcher, None, &text);
+
+        let action = action_rx
+            .try_recv()
+            .expect("legacy preflight feedback should dispatch a system message");
+        assert!(
+            matches!(action, crate::chat::action::Action::SystemMessageAdded { text: ref actual } if actual == &text),
+            "unexpected feedback action: {action:?}"
+        );
+    }
+
+    struct SlowSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for SlowSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Ok("## Decisions\nslow summary".to_string())
+        }
+    }
+
+    struct ImmediateSummaryProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for ImmediateSummaryProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            Ok(
+                "## Decisions\n- PERSISTED_GUARD_SUMMARY\n## Open TODOs\n- continue\n## Critical Context\n- persisted source"
+                    .to_string(),
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn configurable_summary_compaction_timeout_returns_none_for_fallback() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 0,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 16,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user("older ".repeat(400)),
+            ChatMessage::assistant("middle ".repeat(400)),
+            ChatMessage::user("recent ".repeat(40)),
+        ];
+
+        let patch = build_chat_compaction_patch_with_timeout(
+            &history,
+            &history,
+            &SlowSummaryProvider,
+            "slow-model",
+            &config,
+            None,
+            "test_timeout",
+            Duration::from_millis(1),
+        )
+        .await;
+
+        assert!(
+            patch.is_none(),
+            "timeout must let caller fall back to deterministic trim"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_with_tool_message_uses_persisted_guard_for_reducer() {
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Safeguard,
+            reserve_tokens: 0,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 400,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let system_message = ChatMessage::system("sys");
+        let old_user_message = ChatMessage::user(format!("old persisted user {}", "u ".repeat(220)));
+        let old_assistant_message = ChatMessage::assistant(format!("old persisted assistant {}", "a ".repeat(220)));
+        let latest_user_message = ChatMessage::user("latest visible question");
+        let persisted_history = vec![
+            system_message.clone(),
+            old_user_message.clone(),
+            old_assistant_message.clone(),
+            latest_user_message,
+        ];
+        let enriched_history = vec![
+            system_message,
+            old_user_message,
+            old_assistant_message,
+            ChatMessage::assistant(format!("[tool:shell]\n{}", "tool output ".repeat(320))),
+            ChatMessage::user("[Memory context]\nlatest visible question"),
+        ];
+
+        let patch = build_chat_compaction_patch_with_timeout(
+            &enriched_history,
+            &persisted_history,
+            &ImmediateSummaryProvider,
+            "summary-model",
+            &config,
+            None,
+            "test_persisted_guard",
+            Duration::from_secs(1),
+        )
+        .await
+        .expect("budget-overflowing enriched history should produce a persisted-source patch");
+
+        assert!(
+            crate::agent::loop_::compaction_patch_guard_matches(&persisted_history, &patch.guard),
+            "patch guard must match the persisted reducer mirror"
+        );
+        assert!(
+            !crate::agent::loop_::compaction_patch_guard_matches(&enriched_history, &patch.guard),
+            "pre-fix enriched guard source would miss once tool/internal messages exist"
+        );
+
+        let mut legacy_history = enriched_history;
+        let (dispatcher, mut action_rx) = dispatcher::ChatDispatcher::new();
+        apply_chat_compaction_patch_and_sync(
+            &mut legacy_history,
+            Some(&persisted_history),
+            patch,
+            &config,
+            crate::chat::action::CompactReason::ContextOverflow,
+            &dispatcher,
+        );
+        let action = action_rx
+            .try_recv()
+            .expect("compaction helper should dispatch reducer patch");
+
+        let mut reducer_state = crate::chat::state::ChatState::new(
+            std::sync::Arc::from("provider"),
+            std::sync::Arc::from("model"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        reducer_state.session.history = persisted_history;
+        let _ = reducer_state.reduce(action);
+
+        let legacy_pairs: Vec<_> = legacy_history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        let reducer_pairs: Vec<_> = reducer_state
+            .session
+            .history
+            .iter()
+            .map(|message| (message.role.as_str(), message.content.as_str()))
+            .collect();
+        assert_eq!(
+            legacy_pairs, reducer_pairs,
+            "legacy driver and reducer mirror must converge on the persisted-source compaction patch"
+        );
+        assert!(
+            legacy_history
+                .iter()
+                .any(|message| message.content.contains("PERSISTED_GUARD_SUMMARY")),
+            "provider summary should survive the reducer guard"
+        );
+        assert!(
+            legacy_history
+                .iter()
+                .all(|message| !message.content.contains("[tool:shell]")),
+            "persisted-source compaction must not keep enriched-only tool/internal messages"
         );
     }
 }
@@ -1527,6 +2602,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
         tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
         tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
+        tui::KeyDispatch::OpenProviderWorkerView { .. } => "OpenProviderWorkerView",
+        tui::KeyDispatch::CloseProviderWorkerView => "CloseProviderWorkerView",
         tui::KeyDispatch::CloseDiffViewer => "CloseDiffViewer",
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
         tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
@@ -1549,6 +2626,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
             Effect::DisplayMedia { .. } => "DisplayMedia",
             Effect::AutoTitleSession(_) => "AutoTitleSession",
             Effect::RequestApproval { .. } => "RequestApproval",
+            Effect::ResolveApproval { .. } => "ResolveApproval",
         })
         .collect();
 
@@ -1585,6 +2663,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SwitchSession { .. }
         | tui::KeyDispatch::OpenTranscriptViewer
         | tui::KeyDispatch::CloseTranscriptViewer
+        | tui::KeyDispatch::OpenProviderWorkerView { .. }
+        | tui::KeyDispatch::CloseProviderWorkerView
         | tui::KeyDispatch::CloseDiffViewer
         | tui::KeyDispatch::ExternalEditorRequested
         | tui::KeyDispatch::ToolApprovalDecision { .. }
@@ -1754,6 +2834,7 @@ fn select_chat_tui(plain_mode: bool, stdin_is_terminal: bool, prx_tui_env: Optio
 struct TerminalGuardState {
     raw_mode_active: bool,
     bracketed_paste_active: bool,
+    keyboard_enhancement_active: bool,
     mouse_capture_active: bool,
     alternate_screen_active: bool,
 }
@@ -1763,6 +2844,7 @@ impl TerminalGuardState {
         Self {
             raw_mode_active: false,
             bracketed_paste_active: false,
+            keyboard_enhancement_active: false,
             mouse_capture_active: false,
             alternate_screen_active: false,
         }
@@ -1772,6 +2854,9 @@ impl TerminalGuardState {
 trait TerminalModeOps {
     fn enable_raw_mode(&mut self) -> std::io::Result<()>;
     fn disable_raw_mode(&mut self) -> std::io::Result<()>;
+    fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool>;
+    fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
+    fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn disable_bracketed_paste(&mut self) -> std::io::Result<()>;
     fn enable_mouse_capture(&mut self) -> std::io::Result<()>;
@@ -1790,6 +2875,22 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 
     fn disable_raw_mode(&mut self) -> std::io::Result<()> {
         crossterm::terminal::disable_raw_mode()
+    }
+
+    fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool> {
+        crossterm::terminal::supports_keyboard_enhancement()
+    }
+
+    fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+        let flags = crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+            | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES;
+        crossterm::execute!(std::io::stdout(), crossterm::event::PushKeyboardEnhancementFlags(flags)).map(|_| ())
+    }
+
+    fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+        crossterm::execute!(std::io::stdout(), crossterm::event::PopKeyboardEnhancementFlags).map(|_| ())
     }
 
     fn enable_bracketed_paste(&mut self) -> std::io::Result<()> {
@@ -1822,8 +2923,21 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 }
 
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHAT_KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHAT_MOUSE_CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
+    let mouse_enabled = mouse_capture_enabled_by_env(
+        std::env::var("PRX_TUI_ENABLE_MOUSE").ok().as_deref(),
+        std::env::var("PRX_TUI_DISABLE_MOUSE").ok().as_deref(),
+    );
+    enter_terminal_state_with_ops_inner(ops, mouse_enabled)
+}
+
+fn enter_terminal_state_with_ops_inner(
+    ops: &mut impl TerminalModeOps,
+    mouse_enabled: bool,
+) -> std::io::Result<TerminalGuardState> {
     let mut state = TerminalGuardState::inactive();
 
     ops.enable_raw_mode()?;
@@ -1837,19 +2951,50 @@ fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Res
     }
     state.alternate_screen_active = true;
 
-    if let Err(e) = ops.enable_mouse_capture() {
-        if state.alternate_screen_active {
-            let _ = ops.leave_alternate_screen();
-            CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    if mouse_enabled {
+        if let Err(e) = ops.enable_mouse_capture() {
+            if state.alternate_screen_active {
+                let _ = ops.leave_alternate_screen();
+                CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            }
+            let _ = ops.disable_raw_mode();
+            return Err(e);
         }
-        let _ = ops.disable_raw_mode();
-        return Err(e);
+        state.mouse_capture_active = true;
+        CHAT_MOUSE_CAPTURE_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
     }
-    state.mouse_capture_active = true;
+
+    match ops.supports_keyboard_enhancement() {
+        Ok(true) => {
+            if let Err(e) = ops.push_keyboard_enhancement_flags() {
+                if state.mouse_capture_active {
+                    let _ = ops.disable_mouse_capture();
+                    CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+                }
+                if state.alternate_screen_active {
+                    let _ = ops.leave_alternate_screen();
+                    CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+                }
+                let _ = ops.disable_raw_mode();
+                return Err(e);
+            }
+            state.keyboard_enhancement_active = true;
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(error = %e, "terminal keyboard enhancement probe failed; skipping");
+        }
+    }
 
     if let Err(e) = ops.enable_bracketed_paste() {
+        if state.keyboard_enhancement_active {
+            let _ = ops.pop_keyboard_enhancement_flags();
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+        }
         if state.mouse_capture_active {
             let _ = ops.disable_mouse_capture();
+            CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         }
         if state.alternate_screen_active {
             let _ = ops.leave_alternate_screen();
@@ -1868,8 +3013,13 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
         let _ = ops.disable_bracketed_paste();
         let _ = ops.show_cursor();
     }
+    if state.keyboard_enhancement_active {
+        let _ = ops.pop_keyboard_enhancement_flags();
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+    }
     if state.mouse_capture_active {
         let _ = ops.disable_mouse_capture();
+        CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
     if state.alternate_screen_active {
         let _ = ops.leave_alternate_screen();
@@ -1884,7 +3034,8 @@ fn restore_terminal_state_with_ops(ops: &mut impl TerminalModeOps, leave_alterna
     let state = TerminalGuardState {
         raw_mode_active: true,
         bracketed_paste_active: true,
-        mouse_capture_active: true,
+        keyboard_enhancement_active: CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.swap(false, std::sync::atomic::Ordering::AcqRel),
+        mouse_capture_active: CHAT_MOUSE_CAPTURE_ACTIVE.swap(false, std::sync::atomic::Ordering::AcqRel),
         alternate_screen_active: leave_alternate_screen,
     };
     leave_terminal_state_with_ops(ops, state);
@@ -1909,6 +3060,7 @@ fn restore_terminal_state() {
 pub struct TerminalGuard {
     raw_mode_active: std::sync::atomic::AtomicBool,
     bracketed_paste_active: std::sync::atomic::AtomicBool,
+    keyboard_enhancement_active: std::sync::atomic::AtomicBool,
     mouse_capture_active: std::sync::atomic::AtomicBool,
     alternate_screen_active: std::sync::atomic::AtomicBool,
 }
@@ -1921,6 +3073,7 @@ impl TerminalGuard {
         Ok(Self {
             raw_mode_active: std::sync::atomic::AtomicBool::new(state.raw_mode_active),
             bracketed_paste_active: std::sync::atomic::AtomicBool::new(state.bracketed_paste_active),
+            keyboard_enhancement_active: std::sync::atomic::AtomicBool::new(state.keyboard_enhancement_active),
             mouse_capture_active: std::sync::atomic::AtomicBool::new(state.mouse_capture_active),
             alternate_screen_active: std::sync::atomic::AtomicBool::new(state.alternate_screen_active),
         })
@@ -1942,6 +3095,15 @@ impl TerminalGuard {
                 .is_ok(),
             mouse_capture_active: self
                 .mouse_capture_active
+                .compare_exchange(
+                    true,
+                    false,
+                    std::sync::atomic::Ordering::AcqRel,
+                    std::sync::atomic::Ordering::Acquire,
+                )
+                .is_ok(),
+            keyboard_enhancement_active: self
+                .keyboard_enhancement_active
                 .compare_exchange(
                     true,
                     false,
@@ -2215,16 +3377,7 @@ pub async fn run(
         .unwrap_or("anthropic/claude-sonnet-4");
     providers::validate_provider_model(provider_name, model_name)?;
 
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let provider: Arc<dyn Provider> = Arc::from(providers::create_routed_provider_with_options(
         provider_name,
@@ -2265,6 +3418,10 @@ pub async fn run(
         ("memory_store", "Save to memory."),
         ("memory_recall", "Search memory."),
         ("memory_forget", "Delete a memory entry."),
+        (
+            "chat_schedule",
+            "Schedule a future message back into the current chat main session for dispatcher self-wake observation.",
+        ),
     ];
     let native_tools = provider.supports_native_tools();
 
@@ -2298,6 +3455,12 @@ pub async fn run(
     // so live `/attach` and `/logs` work uniformly across both kinds. The other
     // clone is consumed by the spawn tool's `into_spawn_sink` below.
     let shell_event_sink = session_event_sink.clone();
+    // Chat-side handle over the same single-source registries for `/sessions`,
+    // `/kill`, and model-callable managed sessions. Build it before freezing the
+    // tool registry so the LLM receives a handle to the same shell registry that
+    // the TUI and slash commands render.
+    let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(Arc::clone(&active_runs));
+    let managed_shell_registry = chat_sessions.shell_registry();
     // NeedsInput (chat `/bg` only): shared pending-approval registry + per-run
     // resolver factory. When a background sub-agent hits the supervised approval
     // gate it suspends (NeedsInput) awaiting an operator `/approve` / `/deny`
@@ -2337,6 +3500,7 @@ pub async fn run(
     .with_event_sink(session_event_sink.into_spawn_sink())
     .with_approval_resolver_factory(approval_resolver_factory);
     let spawn_tools_handle = spawn_tool.tools_handle();
+    let scheduled_input_handle = crate::chat::scheduled_input::ScheduledInputHandle::default();
 
     // Sibling tools share the same single-source registry (only the v1a four;
     // `subagents`/`sessions_history` are intentionally not registered in chat —
@@ -2360,6 +3524,14 @@ pub async fn run(
         .with_shared_memory(Arc::clone(&mem), sessions_workspace_id),
     ));
     base_tools_vec.push(Box::new(spawn_tool));
+    base_tools_vec.push(Box::new(crate::chat::managed_session::ManagedSessionTool::new(
+        security.clone(),
+        managed_shell_registry,
+        shell_event_sink.clone(),
+    )));
+    base_tools_vec.push(Box::new(crate::chat::scheduled_input::ScheduledInputTool::new(
+        scheduled_input_handle.clone(),
+    )));
 
     // Wrap the now-complete registry in `Arc`, then inject it back into
     // sessions_spawn's tools OnceLock so spawned sub-agents can use the full tool
@@ -2375,10 +3547,6 @@ pub async fn run(
             "sessions_spawn tools registry was already initialized; spawned sub-agents may have an incomplete tool set"
         );
     }
-
-    // Chat-side handle over the same single-source registry for `/sessions` and
-    // `/kill` (side-channel — same Arc, no type erasure / downcast).
-    let mut chat_sessions = crate::chat::sessions::ChatSessionsHandle::new(Arc::clone(&active_runs));
 
     // v3a: coordination handle for interactive PTY terminal handoff. Shared with
     // the unified TUI render loop (which parks while a PTY is attached) and the
@@ -2479,23 +3647,31 @@ pub async fn run(
     // per-turn `tui_mirror`) collapses all observable mutations into a
     // single state machine so the renderer sees a consistent view.
     #[cfg(feature = "terminal-tui")]
+    let initial_saved_session_entries = match saved_chat_sessions(mem.as_ref()).await {
+        Ok(sessions) => sessions
+            .iter()
+            .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load saved chat sessions for TUI slash-menu cache");
+            Vec::new()
+        }
+    };
+
+    #[cfg(feature = "terminal-tui")]
     let chat_mirror: Arc<parking_lot::Mutex<tui::TuiState>> = {
         let mut state = tui::TuiState::new(provider_name, model_name);
         state.chat_mode = chat_session.mode;
         state.autonomy_level = config.autonomy.level;
         state.token_usage_summary = chat_session.token_usage_summary();
         state.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
-        if let Ok(sessions) = saved_chat_sessions(mem.as_ref()).await {
-            state.saved_sessions_cache = sessions
-                .iter()
-                .map(|session| crate::chat::session::SavedSessionPickerEntry::from_session(session, &chat_session.id))
-                .collect();
-        }
+        state.saved_sessions_cache = initial_saved_session_entries.clone();
         Arc::new(parking_lot::Mutex::new(state))
     };
 
     // ── Input channel ────────────────────────────────────────────
     let (input_tx, mut input_rx) = mpsc::channel(INPUT_CHANNEL_CAPACITY);
+    scheduled_input_handle.set_input_sender(input_tx.clone());
     let (control_tx, mut control_rx) = mpsc::channel(CHAT_CONTROL_CHANNEL_CAPACITY);
     #[cfg(not(feature = "terminal-tui"))]
     let _ = &control_tx;
@@ -2530,6 +3706,8 @@ pub async fn run(
     {
         dispatcher_shadow_state.ui.chat_mode = chat_session.mode;
         dispatcher_shadow_state.ui.autonomy_level = config.autonomy.level;
+        dispatcher_shadow_state.ui.provider_model_catalog = tui::slash_provider_model_catalog_from_config(&config);
+        dispatcher_shadow_state.ui.saved_sessions_cache = initial_saved_session_entries.clone();
     }
 
     // 共享 dual-write guard（在 Both/Redux 模式下被 EffectExecutor 置位；旧路径
@@ -2542,6 +3720,19 @@ pub async fn run(
     // S4-B: Pure 是唯一支持的运行路径；非 Pure 值 warning 后强制升级
     #[cfg(feature = "terminal-tui")]
     let top_redux_mode = { ReduxMode::from_env() };
+    #[cfg(feature = "terminal-tui")]
+    let max_concurrent_visible_turns = config.chat.max_concurrent_visible_turns.max(1);
+    #[cfg(not(feature = "terminal-tui"))]
+    let max_concurrent_visible_turns = 1usize;
+    #[cfg(feature = "terminal-tui")]
+    let visible_input_admission_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::Detached;
+    #[cfg(not(feature = "terminal-tui"))]
+    let visible_input_admission_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
+
+    let (provider_turn_lifecycle_tx, mut provider_turn_lifecycle_rx) =
+        mpsc::unbounded_channel::<dispatcher::ProviderTurnLifecycleEvent>();
+    #[cfg(not(feature = "terminal-tui"))]
+    let _ = &provider_turn_lifecycle_tx;
 
     // 根据 redux mode 选择 EffectExecutor 模式（TUI feature only）
     #[cfg(feature = "terminal-tui")]
@@ -2554,6 +3745,7 @@ pub async fn run(
             hooks: Arc::clone(&hooks),
             observer: Arc::clone(&observer),
             action_tx: chat_dispatcher.sender(),
+            provider_turn_lifecycle_tx: Some(provider_turn_lifecycle_tx.clone()),
             dual_write_guard: dual_write_guard.clone(),
             redraw_tx: None,
             tui_mirror: Some(Arc::clone(&chat_mirror)),
@@ -2604,9 +3796,10 @@ pub async fn run(
     // Off / legacy 路径不读 signal，构造成本极低（Arc<Notify>）。
     let turn_signal = dispatcher::TurnCompletionSignal::new();
 
-    // S4-A Commit 3: Pure 模式构造 watch::channel<Arc<UiSnapshot>>，dispatcher
-    // 在 ui_dirty=true 时推送新 snapshot；其他模式（Off/Both/Redux）传 None
-    // 维持 chat_mirror 单源路径。
+    // S4-A Commit 3: 构造 watch::channel<Arc<UiSnapshot>>，dispatcher
+    // 在 ui_dirty=true 时推送新 snapshot；TUI render and child views consume
+    // this reducer-owned snapshot as the primary UI source, with chat_mirror kept
+    // only for synchronous key-thread compatibility and fallback.
     //
     // rx 在 Commit 4 接入 run_tui_unified_loop；本 commit 仅 trace 观察推送频率，
     // rx 保留为 `Option` 留给 spawn_tui_unified_loop 使用。
@@ -2723,9 +3916,9 @@ pub async fn run(
                     // into `chat_mirror`.
                     let redraw_tx_main = redraw_tx.clone();
                     let redraw_tx_loop = redraw_tx.clone();
-                    // S4-A Commit 4: Pure 模式把 snapshot_rx 传给 unified loop，
-                    // 让其从 watch::Receiver borrow snapshot 替代 chat_mirror.lock()。
-                    // Off/Both/Redux 模式 snapshot_rx_for_tui=None，loop 走 mirror.
+                    // S4-A Commit 4: 把 snapshot_rx 传给 unified loop，让其从
+                    // watch::Receiver borrow reducer-owned snapshot 替代
+                    // chat_mirror.lock() on the render path.
                     spawn_tui_unified_loop(
                         input_tx,
                         control_tx.clone(),
@@ -2737,6 +3930,8 @@ pub async fn run(
                         chat_dispatcher.clone(),
                         snapshot_rx_for_tui.clone(),
                         Arc::clone(&pty_handoff),
+                        config.workspace_dir.clone(),
+                        Arc::clone(&security),
                     );
                     (Some(guard), Some(redraw_tx_main))
                 }
@@ -2800,6 +3995,10 @@ pub async fn run(
         let cancel_ref = Arc::clone(&active_cancel);
         let shutdown_signal = shutdown.clone();
         let dispatcher_for_signal = chat_dispatcher.clone();
+        #[cfg(feature = "terminal-tui")]
+        let mirror_for_signal = Arc::clone(&chat_mirror);
+        #[cfg(feature = "terminal-tui")]
+        let redraw_for_signal = redraw_tx_for_main.clone();
         tokio::spawn(async move {
             loop {
                 tokio::select! {
@@ -2828,6 +4027,12 @@ pub async fn run(
 
                 // Single Ctrl+C → cancel active generation if any
                 // Step 5b shadow: 同步投递 CancelRequested 给 reducer 观察。
+                #[cfg(feature = "terminal-tui")]
+                if mirror_for_signal.lock().clear_pending_tool_approval()
+                    && let Some(tx) = redraw_for_signal.as_ref()
+                {
+                    let _ = tx.try_send(());
+                }
                 let _ = dispatcher_for_signal
                     .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_single_ctrlc");
                 #[cfg(not(feature = "terminal-tui"))]
@@ -2892,10 +4097,13 @@ pub async fn run(
     // Owned by the main loop (single-threaded), per the iron law that runtime
     // state is only written here — the detached spawn tasks only mutate the
     // shared registry, never this. `reported_sessions` dedups the one-shot
-    // summary reflow; `last_sessions_summary` dedups the persistent status-line
+    // summary reflow; `announced_started_sessions` dedups the started notices
+    // that promote sessions_spawn agents into the same visible child-session
+    // mode as shells; `last_sessions_summary` dedups the persistent status-line
     // action so we only dispatch on change. The 1s timer is a read-only poll of
     // the registry (no event bus until v1.1).
     let mut reported_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut announced_started_sessions: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut last_sessions_summary: String = String::new();
     let mut last_sessions_entries: Vec<crate::chat::sessions::SwitcherEntry> = Vec::new();
     let mut sessions_tick = tokio::time::interval(Duration::from_secs(1));
@@ -2914,6 +4122,35 @@ pub async fn run(
     let mut reaped_log_archive = ReapedSessionLogArchive::default();
     let mut ignored_session_events: std::collections::HashSet<crate::chat::sessions::id::SessionId> =
         std::collections::HashSet::new();
+    let mut input_backlog: std::collections::VecDeque<QueuedInputMessage> = std::collections::VecDeque::new();
+    let mut defer_visible_input_pop_once = false;
+    let mut turn_scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+    let mut history_commit_coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+    let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+    let mut provider_turn_lifecycle_events_open = true;
+    let (provider_completion_tx, mut provider_completion_rx) = mpsc::channel::<ProviderTurnCompletionEvent>(64);
+    #[cfg(not(feature = "terminal-tui"))]
+    let _ = &provider_completion_tx;
+    let mut provider_turn_finalizer_events: std::collections::VecDeque<ProviderTurnFinalizerEvent> =
+        std::collections::VecDeque::new();
+    let mut pending_provider_completion_events: std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionEvent,
+    > = std::collections::HashMap::new();
+    let mut provider_turn_completion_contexts: std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionContext,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "terminal-tui")]
+    let mut per_turn_contexts: std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext> =
+        std::collections::HashMap::new();
+    #[cfg(feature = "terminal-tui")]
+    let mut pending_ordered_provider_turn_commits: std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    > = std::collections::HashMap::new();
+    #[cfg(feature = "terminal-tui")]
+    let mut deferred_resume_saved_session_ids: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut attached_follow: Option<crate::chat::sessions::id::SessionId> = None;
     // Display sequence `#N` of the currently-followed session, kept in lock-step
     // with `attached_follow`. Used purely to reconstruct the *previous* focus
@@ -2935,6 +4172,10 @@ pub async fn run(
     let sessions_redraw_handle: Option<mpsc::Sender<()>> = None;
     let mut pending_chat_rewind: Option<PendingChatRewind> = None;
     let mut pending_diff_apply: Option<PendingDiffApply> = None;
+    #[cfg(feature = "terminal-tui")]
+    let mut input_events_open = true;
+    #[cfg(not(feature = "terminal-tui"))]
+    let input_events_open = true;
 
     // ── Reload notice: historical child sessions (v4) ────────
     // If this chat session was resumed and carried persisted background-session
@@ -2955,10 +4196,298 @@ pub async fn run(
     // outer loop: it only `break`s with a real input message (or `None` on
     // shutdown). On a tick we poll the registry and surface results via the
     // dispatcher (single source, reaches both render paths), then keep waiting.
-    while let Some(msg) = loop {
+    while let Some(input) = loop {
+        macro_rules! handle_resume_saved_session_control {
+            ($id:expr) => {{
+                let provider_name = current_provider_owned.as_str();
+                let model_name = current_model_owned.as_str();
+                match resume_saved_session_by_id(
+                    mem.as_ref(),
+                    &$id,
+                    ChatSwitchCtx {
+                        chat_session: &mut chat_session,
+                        chat_session_key: &mut chat_session_key,
+                        fabric_turn_seq: &mut fabric_turn_seq,
+                        history: &mut history,
+                        approval_router: approval_router.as_ref(),
+                        pending_chat_rewind: &mut pending_chat_rewind,
+                        pending_diff_apply: &mut pending_diff_apply,
+                        chat_sessions: &mut chat_sessions,
+                        ignored_session_events: &mut ignored_session_events,
+                        session_rings: &mut session_rings,
+                        reported_sessions: &mut reported_sessions,
+                        announced_started_sessions: &mut announced_started_sessions,
+                        last_sessions_summary: &mut last_sessions_summary,
+                        last_sessions_entries: &mut last_sessions_entries,
+                        attached_follow: &mut attached_follow,
+                        attached_follow_seq: &mut attached_follow_seq,
+                        chat_dispatcher: &chat_dispatcher,
+                        redraw_handle: sessions_redraw_handle.as_ref(),
+                        config: &config,
+                        provider_name,
+                        model_name,
+                        tool_descs: &tool_descs,
+                        skills: &skills,
+                        native_tools,
+                        tools_registry: &tools_registry,
+                        #[cfg(feature = "terminal-tui")]
+                        chat_mirror: &chat_mirror,
+                    },
+                )
+                .await
+                {
+                    Ok(message) => surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &message),
+                    Err(e) => {
+                        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &e.to_string())
+                    }
+                }
+            }};
+        }
+        #[cfg(feature = "terminal-tui")]
+        if finalize_ready_per_turn_contexts(
+            &mut per_turn_contexts,
+            &mut pending_ordered_provider_turn_commits,
+            &mut pending_provider_completion_events,
+            &turn_signal,
+            &mut provider_turn_completion_contexts,
+            &mut history,
+            &tools_registry,
+            &mut provider_turn_finalizer_events,
+            &mut turn_scheduler,
+            &mut history_commit_coordinator,
+            &mut provider_turn_workers,
+            &chat_mirror,
+            &chat_dispatcher,
+            &terminal,
+            &memory_fabric,
+            &chat_session_key,
+            &mut chat_session,
+            &config,
+            sessions_redraw_handle.as_ref(),
+            redraw_tx_for_main.as_ref(),
+            plain_mode,
+            &mut plain_mode_turn_failed,
+        )
+        .await
+        {
+            continue;
+        }
+        if !input_events_open && input_backlog.is_empty() {
+            #[cfg(feature = "terminal-tui")]
+            if should_continue_event_pump_after_input_closed(per_turn_contexts.len()) {
+                // Keep lifecycle/completion arms alive until the detached Redux turn
+                // resolves; this mirrors the old inner wait, which ignored closed
+                // input while the active turn was still running.
+            } else {
+                break None;
+            }
+            #[cfg(not(feature = "terminal-tui"))]
+            break None;
+        }
+        if !provider_turn_finalizer_events.is_empty() {
+            let results = drain_provider_turn_finalizer_events_and_publish(
+                &mut turn_scheduler,
+                &mut history_commit_coordinator,
+                &mut provider_turn_workers,
+                &mut provider_turn_finalizer_events,
+                &chat_dispatcher,
+            );
+            #[cfg(feature = "terminal-tui")]
+            let applied_ordered_commits = apply_ready_ordered_provider_turn_commits(
+                results,
+                &mut pending_ordered_provider_turn_commits,
+                &mut history,
+                &mut turn_scheduler,
+                &provider_turn_workers,
+                &chat_mirror,
+                &chat_dispatcher,
+                &terminal,
+                &memory_fabric,
+                &chat_session_key,
+                &mut chat_session,
+                &config,
+                sessions_redraw_handle.as_ref(),
+                redraw_tx_for_main.as_ref(),
+            )
+            .await;
+            #[cfg(not(feature = "terminal-tui"))]
+            let applied_ordered_commits = !results.is_empty();
+            if applied_ordered_commits {
+                continue;
+            }
+        }
+        if consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once) {
+            // A post-route admission failure just requeued the same input at the
+            // front. Skip one immediate visible pop so the event pump can consume
+            // in-flight completion/lifecycle events that may free stricter Legacy
+            // admission.
+        } else if let Some(input) = pop_next_visible_input_task_with_scheduler(
+            &mut input_backlog,
+            &mut turn_scheduler,
+            &provider_turn_workers,
+            visible_input_admission_kind,
+            max_concurrent_visible_turns,
+        ) {
+            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+            break Some(input);
+        }
+        #[cfg(feature = "terminal-tui")]
+        if should_drain_deferred_resume_after_visible_inputs(
+            per_turn_contexts.len(),
+            &input_backlog,
+            &provider_turn_workers,
+        ) && let Some(id) = deferred_resume_saved_session_ids.pop_front()
+        {
+            handle_resume_saved_session_control!(id);
+            continue;
+        }
         tokio::select! {
-            msg = input_rx.recv() => break msg,
-            _ = shutdown.cancelled() => break None,
+            msg = input_rx.recv(), if input_events_open => {
+                let Some(msg) = msg else {
+                    #[cfg(feature = "terminal-tui")]
+                    {
+                        if !per_turn_contexts.is_empty() {
+                            input_events_open = false;
+                            continue;
+                        }
+                    }
+                    break None;
+                };
+                #[cfg(feature = "terminal-tui")]
+                if let Some(active_task_id) = per_turn_contexts.keys().next().copied() {
+                    let mut emit_active_turn_output =
+                        |text: &str| surface_active_turn_message(&chat_dispatcher, redraw_tx_for_main.as_ref(), text);
+                    process_active_turn_input_batch(
+                        msg,
+                        &mut emit_active_turn_output,
+                        &mut input_rx,
+                        &mut input_backlog,
+                        &mut turn_scheduler,
+                        &mut provider_turn_workers,
+                        Some(active_task_id),
+                        &chat_dispatcher,
+                        &chat_session,
+                        &mut chat_sessions,
+                        &session_rings,
+                        &mut reaped_log_archive,
+                        &reap_policy,
+                        &tools_registry,
+                    )
+                    .await;
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                    continue;
+                }
+                enqueue_input_message_with_scheduler(
+                    &mut input_backlog,
+                    &mut turn_scheduler,
+                    msg,
+                    chat_session.turns.len(),
+                );
+                drain_available_input_messages(
+                    &mut input_rx,
+                    &mut input_backlog,
+                    Some(&mut turn_scheduler),
+                    chat_session.turns.len(),
+                );
+                publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                if let Some(next) = pop_next_visible_input_task_with_scheduler(
+                    &mut input_backlog,
+                    &mut turn_scheduler,
+                    &provider_turn_workers,
+                    visible_input_admission_kind,
+                    max_concurrent_visible_turns,
+                ) {
+                    break Some(next);
+                }
+                continue;
+            },
+            lifecycle = provider_turn_lifecycle_rx.recv(), if provider_turn_lifecycle_events_open => {
+                let Some(lifecycle) = lifecycle else {
+                    provider_turn_lifecycle_events_open = false;
+                    continue;
+                };
+                record_provider_turn_lifecycle_event(
+                    &mut provider_turn_workers,
+                    lifecycle,
+                );
+                publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                continue;
+            },
+            completion = provider_completion_rx.recv() => {
+                let Some(completion) = completion else {
+                    continue;
+                };
+                let _ = route_provider_completion_event_and_publish(
+                    &mut provider_turn_lifecycle_rx,
+                    &mut provider_turn_lifecycle_events_open,
+                    &mut provider_turn_workers,
+                    &mut pending_provider_completion_events,
+                    None,
+                    completion,
+                    &chat_dispatcher,
+                );
+                #[cfg(feature = "terminal-tui")]
+                {
+                    let _ = finalize_ready_per_turn_contexts(
+                        &mut per_turn_contexts,
+                        &mut pending_ordered_provider_turn_commits,
+                        &mut pending_provider_completion_events,
+                        &turn_signal,
+                        &mut provider_turn_completion_contexts,
+                        &mut history,
+                        &tools_registry,
+                        &mut provider_turn_finalizer_events,
+                        &mut turn_scheduler,
+                        &mut history_commit_coordinator,
+                        &mut provider_turn_workers,
+                        &chat_mirror,
+                        &chat_dispatcher,
+                        &terminal,
+                        &memory_fabric,
+                        &chat_session_key,
+                        &mut chat_session,
+                        &config,
+                        sessions_redraw_handle.as_ref(),
+                        redraw_tx_for_main.as_ref(),
+                        plain_mode,
+                        &mut plain_mode_turn_failed,
+                    )
+                    .await;
+                }
+                continue;
+            },
+            _ = shutdown.cancelled() => {
+                #[cfg(feature = "terminal-tui")]
+                {
+                    if !per_turn_contexts.is_empty() {
+                        finalize_all_per_turn_contexts_as_cancelled(
+                            &mut per_turn_contexts,
+                            &mut pending_ordered_provider_turn_commits,
+                            &turn_signal,
+                            &mut provider_turn_completion_contexts,
+                            &mut history,
+                            &tools_registry,
+                            &mut provider_turn_finalizer_events,
+                            &mut turn_scheduler,
+                            &mut history_commit_coordinator,
+                            &mut provider_turn_workers,
+                            &chat_mirror,
+                            &chat_dispatcher,
+                            &terminal,
+                            &memory_fabric,
+                            &chat_session_key,
+                            &mut chat_session,
+                            &config,
+                            sessions_redraw_handle.as_ref(),
+                            redraw_tx_for_main.as_ref(),
+                            plain_mode,
+                            &mut plain_mode_turn_failed,
+                        )
+                        .await;
+                    }
+                }
+                break None
+            },
             maybe_control = control_rx.recv(), if control_events_open => {
                 let Some(control) = maybe_control else {
                     control_events_open = false;
@@ -2966,53 +4495,18 @@ pub async fn run(
                 };
                 match control {
                     ChatControlEvent::ResumeSavedSession { id } => {
-                        let provider_name = current_provider_owned.as_str();
-                        let model_name = current_model_owned.as_str();
-                        match resume_saved_session_by_id(
-                            mem.as_ref(),
-                            &id,
-                            ChatSwitchCtx {
-                                chat_session: &mut chat_session,
-                                chat_session_key: &mut chat_session_key,
-                                fabric_turn_seq: &mut fabric_turn_seq,
-                                history: &mut history,
-                                approval_router: approval_router.as_ref(),
-                                pending_chat_rewind: &mut pending_chat_rewind,
-                                pending_diff_apply: &mut pending_diff_apply,
-                                chat_sessions: &mut chat_sessions,
-                                ignored_session_events: &mut ignored_session_events,
-                                session_rings: &mut session_rings,
-                                reported_sessions: &mut reported_sessions,
-                                last_sessions_summary: &mut last_sessions_summary,
-                                last_sessions_entries: &mut last_sessions_entries,
-                                attached_follow: &mut attached_follow,
-                                attached_follow_seq: &mut attached_follow_seq,
-                                chat_dispatcher: &chat_dispatcher,
-                                redraw_handle: sessions_redraw_handle.as_ref(),
-                                config: &config,
-                                provider_name,
-                                model_name,
-                                tool_descs: &tool_descs,
-                                skills: &skills,
-                                native_tools,
-                                tools_registry: &tools_registry,
-                                #[cfg(feature = "terminal-tui")]
-                                chat_mirror: &chat_mirror,
-                            },
-                        )
-                        .await
-                        {
-                            Ok(message) => surface_session_message(
-                                &chat_dispatcher,
-                                sessions_redraw_handle.as_ref(),
-                                &message,
-                            ),
-                            Err(e) => surface_session_message(
-                                &chat_dispatcher,
-                                sessions_redraw_handle.as_ref(),
-                                &e.to_string(),
-                            ),
+                        #[cfg(feature = "terminal-tui")]
+                        if defer_resume_saved_session_if_provider_turn_pending(
+                            per_turn_contexts.len(),
+                            &mut deferred_resume_saved_session_ids,
+                            id.clone(),
+                        ) {
+                            // Old Redux N=1 behavior waited inside the turn and did not
+                            // poll control_rx, so session switching could not mutate
+                            // chat_session/history until the active turn was finalized.
+                            continue;
                         }
+                        handle_resume_saved_session_control!(id);
                     }
                 }
                 continue;
@@ -3055,6 +4549,7 @@ pub async fn run(
                             ignored_session_events: &mut ignored_session_events,
                             session_rings: &mut session_rings,
                             reported_sessions: &mut reported_sessions,
+                            announced_started_sessions: &mut announced_started_sessions,
                             last_sessions_summary: &mut last_sessions_summary,
                             last_sessions_entries: &mut last_sessions_entries,
                             attached_follow: &mut attached_follow,
@@ -3231,17 +4726,37 @@ pub async fn run(
                     }
                 }
                 let views = chat_sessions.snapshot().await;
+                for view in &views {
+                    if view.kind != crate::chat::sessions::model::ManagedKind::Agent {
+                        continue;
+                    }
+                    if announced_started_sessions.insert(view.id.as_str().to_string()) {
+                        let line = format_observed_session_announcement(view);
+                        surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &line);
+                    }
+                }
                 // v1.1b: refresh the switcher cache the key thread reads on Ctrl+G
                 // (it cannot run async registry queries itself). Display staleness
                 // is harmless: switcher Enter re-resolves the seq via /attach.
                 #[cfg(feature = "terminal-tui")]
                 {
-                    let idle_warnings = chat_sessions.idle_warning_seqs(&reap_policy, chrono::Utc::now()).await;
+                    let idle_warnings = chat_sessions
+                        .idle_warning_seqs(&reap_policy, chrono::Utc::now(), &session_rings)
+                        .await;
                     let mut entries = crate::chat::sessions::focus::switcher_entries(&views);
                     for entry in &mut entries {
                         entry.idle_warning = idle_warnings.contains(&entry.seq);
                     }
-                    chat_mirror.lock().sessions_cache = entries.clone();
+                    let stale_strip_selection = {
+                        let mut mirror = chat_mirror.lock();
+                        refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, entries.clone())
+                    };
+                    if stale_strip_selection {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::StripSelectionChanged { selected: None },
+                            "chat.strip_selection_reaped",
+                        );
+                    }
                     if entries != last_sessions_entries {
                         last_sessions_entries = entries.clone();
                         let _ = chat_dispatcher.dispatch_or_log(
@@ -3355,7 +4870,11 @@ pub async fn run(
             }
         }
     } {
+        let provider_queue_task_id = input.turn_task_id;
+        let input_priority = input.priority;
+        let msg = input.msg;
         let user_input = msg.content.clone();
+        let synthetic_ui_command = is_synthetic_ui_command(&msg);
 
         // Bug #3: 本轮生效的 provider 名（借自可变 owned 值）。`/provider <name>`
         // 拦截会改写 `current_provider_owned` + `provider` Arc，下一轮迭代此 shadow
@@ -3367,10 +4886,12 @@ pub async fn run(
         // InputSubmitted 仅记 UI/LogTrace；RecordUserTurn 真写 history + session.turns，
         // 必须在 mem_context 注入后才 dispatch（用 `enriched` 与 legacy `history.push`
         // 字节级对齐 — 见 S2-B Step 4 risk notes）.
-        let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::InputSubmitted(user_input.clone()),
-            "chat.input_submitted",
-        );
+        if !synthetic_ui_command {
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::InputSubmitted(user_input.clone()),
+                "chat.input_submitted",
+            );
+        }
 
         // Echo the user's input into the TUI conversation pane.
         //
@@ -3386,10 +4907,12 @@ pub async fn run(
         #[cfg(feature = "terminal-tui")]
         {
             // S4-B: 删除 legacy mirror push，reducer 单源 UserMessageEchoed
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::UserMessageEchoed(user_input.clone()),
-                "chat.user_message_echoed",
-            );
+            if !synthetic_ui_command {
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::UserMessageEchoed(user_input.clone()),
+                    "chat.user_message_echoed",
+                );
+            }
             if let Some(tx) = redraw_tx_for_main.as_ref() {
                 let _ = tx.try_send(());
             }
@@ -3405,25 +4928,61 @@ pub async fn run(
         // ratatui mirror on the TUI path (so it survives raw-mode `\n`
         // mangling), plain stdout otherwise. Returns immediately for plain
         // mode so the legacy `--plain` / piped path is unchanged.
-        let emit_chat_output = |text: &str| {
-            #[cfg(feature = "terminal-tui")]
-            {
-                // S4-B: 删除 mirror 旁路写，reducer 单源 SystemMessageAdded
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
-                    "chat.system_message_slash",
-                );
-                if let Some(tx) = redraw_tx_for_main.as_ref() {
-                    let _ = tx.try_send(());
-                } else {
-                    print_fallback_chat_output(text);
-                }
-            }
-            #[cfg(not(feature = "terminal-tui"))]
-            {
+        #[cfg(feature = "terminal-tui")]
+        let mut emit_chat_output = |text: &str| {
+            // S4-B: 删除 mirror 旁路写，reducer 单源 SystemMessageAdded
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::SystemMessageAdded { text: text.to_string() },
+                "chat.system_message_slash",
+            );
+            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                let _ = tx.try_send(());
+            } else {
                 print_fallback_chat_output(text);
             }
         };
+        #[cfg(not(feature = "terminal-tui"))]
+        let emit_chat_output = |text: &str| {
+            print_fallback_chat_output(text);
+        };
+
+        if is_copy_command(&user_input) {
+            match select_copy_content(&chat_session, &user_input) {
+                Ok(selection) if plain_mode => {
+                    println!("{}", selection.content);
+                    let _ = std::io::stdout().flush();
+                }
+                Ok(selection) => match terminal_proto::copy_to_clipboard(&selection.content) {
+                    Ok(()) => emit_chat_output(&copy_success_message(&selection)),
+                    Err(error) => emit_chat_output(&format!("Copy failed: {error}")),
+                },
+                Err(message) => emit_chat_output(&message),
+            }
+            continue;
+        }
+
+        if is_queue_command(&user_input) {
+            emit_chat_output(&format_input_backlog_report(&input_backlog, &turn_scheduler, 8));
+            continue;
+        }
+
+        if is_workers_command(&user_input) {
+            if let Some((output, signal_cancel)) = provider_workers_cancel_output_for_input(
+                &user_input,
+                &mut turn_scheduler,
+                &mut provider_turn_workers,
+                None,
+            ) {
+                emit_chat_output(&output);
+                publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                dispatch_provider_worker_cancel_signal(&chat_dispatcher, signal_cancel);
+            } else {
+                emit_chat_output(&format_provider_worker_report(&provider_worker_status(
+                    &provider_turn_workers,
+                )));
+            }
+            continue;
+        }
 
         // BUG-07: `/model <name>` 在线切换 model（同 provider 换 model）。
         //
@@ -3683,14 +5242,9 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
-        // Bug #1: `/compact` — manually compact the live LLM context history.
-        //
-        // Intercepted here (like `/clear` / `/model`) because it must mutate the
-        // real `history` Vec that feeds `run_tool_call_loop`; `commands::dispatch`
-        // only carries immutable borrows. Reuses the same `compact_chat_history`
-        // routine the context-overflow safeguard runs automatically, so manual and
-        // automatic compaction stay byte-for-byte identical. Reports the turn /
-        // token delta so the user can see the effect on the context window.
+        // `/compact` mutates the real LLM context history before the next turn.
+        // Prefer the provider-backed summary patch used by the Redux driver; if
+        // the summary call fails or times out, fall back to deterministic trim.
         if matches!(user_input.as_str(), "/compact") {
             let compact_context = crate::router::resolve_effective_compaction_config(
                 &config.agent.compaction,
@@ -3699,28 +5253,64 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 &config.router,
                 &config.model_routes,
             );
+            if manual_compact_below_trigger_threshold(&history, &compact_context.config) {
+                emit_chat_output(&format_nothing_to_compact_feedback(&history, &compact_context.config));
+                continue;
+            }
+            emit_chat_output("Compacting conversation...");
+            let mut compact_source_history = Vec::with_capacity(
+                chat_session
+                    .turns
+                    .len()
+                    .saturating_add(usize::from(!history.is_empty())),
+            );
+            if let Some(system) = history.first().filter(|message| message.role == "system") {
+                compact_source_history.push(system.clone());
+            }
+            compact_source_history.extend(session_turns_to_history(&chat_session));
             let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
             let turns_before = history.len().saturating_sub(system_count);
             let tokens_before = estimate_chat_history_tokens(&history);
-            compact_chat_history(&mut history);
-            let turns_after = history.len().saturating_sub(system_count);
-            let tokens_after = estimate_chat_history_tokens(&history);
-
-            // Keep the Redux UI mirror in sync (manual trigger reason).
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::HistoryCompacted {
-                    reason: crate::chat::action::CompactReason::Manual,
-                },
-                "chat.history_compacted_manual",
+            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                &history,
+                &compact_source_history,
+                provider.as_ref(),
+                model_name,
+                &compact_context.config,
+                None,
+                "chat_manual_compact",
+                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+            )
+            .await
+            {
+                apply_chat_compaction_patch_and_sync(
+                    &mut history,
+                    Some(&compact_source_history),
+                    patch,
+                    &compact_context.config,
+                    crate::chat::action::CompactReason::Manual,
+                    &chat_dispatcher,
+                );
+            } else {
+                compact_chat_history(&mut history);
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::Manual,
+                    },
+                    "chat.history_compacted_manual",
+                );
+            }
+            #[cfg(feature = "terminal-tui")]
+            refresh_context_budget_for_tui(
+                &history,
+                &compact_context.config,
+                redraw_tx_for_main.is_some(),
+                &chat_mirror,
+                &chat_dispatcher,
             );
 
-            let msg = format_compact_feedback(
-                turns_before,
-                turns_after,
-                tokens_before,
-                tokens_after,
-                compact_context.config.max_context_tokens,
-            );
+            let msg =
+                format_compact_feedback_after_history(turns_before, tokens_before, &history, &compact_context.config);
             emit_chat_output(&msg);
             continue;
         }
@@ -3791,6 +5381,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         crate::chat::action::Action::SavedSessionPickerOpened { entries },
                                         "chat.saved_session_picker_opened_resume",
                                     );
+                                    let sources = {
+                                        let mirror = chat_mirror.lock();
+                                        crate::chat::action::Action::SlashMenuSourcesUpdated {
+                                            saved_sessions: mirror.saved_sessions_cache.clone(),
+                                            provider_model_catalog: mirror.provider_model_catalog.clone(),
+                                        }
+                                    };
+                                    let _ = chat_dispatcher.dispatch_or_log(sources, "chat.slash_menu_sources_resume");
                                     if let Some(tx) = sessions_redraw_handle.as_ref() {
                                         let _ = tx.try_send(());
                                     }
@@ -3818,6 +5416,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
                                     reported_sessions: &mut reported_sessions,
+                                    announced_started_sessions: &mut announced_started_sessions,
                                     last_sessions_summary: &mut last_sessions_summary,
                                     last_sessions_entries: &mut last_sessions_entries,
                                     attached_follow: &mut attached_follow,
@@ -3900,6 +5499,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
                                     reported_sessions: &mut reported_sessions,
+                                    announced_started_sessions: &mut announced_started_sessions,
                                     last_sessions_summary: &mut last_sessions_summary,
                                     last_sessions_entries: &mut last_sessions_entries,
                                     attached_follow: &mut attached_follow,
@@ -3986,6 +5586,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     ignored_session_events: &mut ignored_session_events,
                                     session_rings: &mut session_rings,
                                     reported_sessions: &mut reported_sessions,
+                                    announced_started_sessions: &mut announced_started_sessions,
                                     last_sessions_summary: &mut last_sessions_summary,
                                     last_sessions_entries: &mut last_sessions_entries,
                                     attached_follow: &mut attached_follow,
@@ -4065,6 +5666,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 .to_string();
                                 let dispatch_result = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::ToolApprovalRequested {
+                                        task_id: None,
                                         tool_id: tool_id.clone(),
                                         name: "rewind_chat_session".to_string(),
                                         args,
@@ -4202,8 +5804,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             continue;
                         }
                         SessionCommand::Sessions => {
-                            let views = chat_sessions.snapshot().await;
-                            emit_chat_output(&format_managed_sessions_list(&views));
+                            if let Some(output) = handle_local_session_command(
+                                &action,
+                                &mut chat_sessions,
+                                &session_rings,
+                                &mut reaped_log_archive,
+                                &reap_policy,
+                                &tools_registry,
+                            )
+                            .await
+                            {
+                                emit_chat_output(&output);
+                            }
                             continue;
                         }
                         SessionCommand::Transcript => {
@@ -4211,7 +5823,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             attached_follow_seq = None;
                             #[cfg(feature = "terminal-tui")]
                             {
-                                open_transcript_view(&chat_mirror, &chat_dispatcher, sessions_redraw_handle.as_ref());
+                                open_transcript_view(
+                                    &chat_mirror,
+                                    &chat_dispatcher,
+                                    sessions_redraw_handle.as_ref(),
+                                    snapshot_rx_for_tui.as_ref(),
+                                );
                             }
                             #[cfg(not(feature = "terminal-tui"))]
                             emit_chat_output("Transcript viewer is only available in the terminal TUI.");
@@ -4238,120 +5855,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             emit_chat_output(&source.to_plain_text());
                             continue;
                         }
-                        SessionCommand::Kill { seq } => {
-                            // Unified kill: shells terminate their process group via
-                            // the shell registry; agents delegate to the
-                            // sessions_spawn tool's `kill` action (shared semantics).
-                            match chat_sessions.kind_for_seq(seq).await {
-                                Ok(crate::chat::sessions::model::ManagedKind::Shell) => {
-                                    match chat_sessions.kill_shell(seq).await {
-                                        Ok(()) => emit_chat_output(&format!(
-                                            "Killed background shell #{seq} (process group terminated)."
-                                        )),
-                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
-                                    }
-                                    continue;
-                                }
-                                Ok(crate::chat::sessions::model::ManagedKind::Pty) => {
-                                    #[cfg(feature = "terminal-tui")]
-                                    {
-                                        match chat_sessions.kill_pty(seq).await {
-                                            Ok(()) => emit_chat_output(&format!(
-                                                "Killed interactive PTY session #{seq} (process group terminated)."
-                                            )),
-                                            Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
-                                        }
-                                    }
-                                    continue;
-                                }
-                                Ok(crate::chat::sessions::model::ManagedKind::Agent) => {}
-                                Ok(crate::chat::sessions::model::ManagedKind::Transcript) => {
-                                    emit_chat_output("Transcript is a read-only viewer, not a killable child session.");
-                                    continue;
-                                }
-                                Ok(crate::chat::sessions::model::ManagedKind::Approval) => {
-                                    emit_chat_output(
-                                        "Tool approval is a foreground prompt, not a killable child session.",
-                                    );
-                                    continue;
-                                }
-                                Ok(crate::chat::sessions::model::ManagedKind::Diff) => {
-                                    emit_chat_output("Diff is a read-only viewer, not a killable child session.");
-                                    continue;
-                                }
-                                Err(e) => {
-                                    emit_chat_output(&format!("Kill failed: {e}"));
-                                    continue;
-                                }
-                            }
-                            // Agent path: resolve `#N` -> run UUID (refreshing the
-                            // seq map so a just-`/bg`-ed run is addressable), then
-                            // delegate the actual kill to the `sessions_spawn` tool's
-                            // `kill` action. Routing through the tool — instead of
-                            // mutating the registry here — keeps the shared kill
-                            // semantics: side-effect gate authorization,
-                            // completed/failed status check (no overwriting a
-                            // finished run), `task.killed` event, `steer_tx`
-                            // cleanup, and the channel announcement.
-                            let run_id = match chat_sessions.resolve_run_id(seq).await {
-                                Ok(id) => id,
-                                Err(e) => {
-                                    emit_chat_output(&format!("Kill failed: {e}"));
-                                    continue;
-                                }
-                            };
-                            match tools_registry.iter().find(|t| t.supports_name("sessions_spawn")) {
-                                Some(tool) => {
-                                    // The kill operation is Medium-risk; under
-                                    // supervised autonomy the gate requires a grant
-                                    // bound to `sessions_spawn:kill:<run_id>`. The
-                                    // operator typed `/kill`, so issue the matching
-                                    // grant here (same op name the gate authorizes),
-                                    // mirroring how the agent loop grants after
-                                    // operator approval.
-                                    let operation_name = format!("sessions_spawn:kill:{run_id}");
-                                    let grant = crate::security::policy::ApprovalGrant::for_resource_operation(
-                                        "sessions_spawn",
-                                        &operation_name,
-                                        "chat-operator",
-                                        None,
-                                    );
-                                    let mut args = serde_json::json!({
-                                        "action": "kill",
-                                        "run_id": run_id,
-                                    });
-                                    match serde_json::to_value(&grant) {
-                                        Ok(grant_value) => {
-                                            if let Some(obj) = args.as_object_mut() {
-                                                obj.insert(
-                                                    crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG.to_string(),
-                                                    grant_value,
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(
-                                                error = %e,
-                                                "Failed to serialize kill approval grant; proceeding without it"
-                                            );
-                                        }
-                                    }
-                                    match tool.execute_named("sessions_spawn", args).await {
-                                        Ok(result) => {
-                                            let out = if result.output.is_empty() {
-                                                result
-                                                    .error
-                                                    .filter(|e| !e.is_empty())
-                                                    .unwrap_or_else(|| "(no output)".to_string())
-                                            } else {
-                                                result.output
-                                            };
-                                            emit_chat_output(&out);
-                                        }
-                                        Err(e) => emit_chat_output(&format!("Kill failed: {e}")),
-                                    }
-                                }
-                                None => emit_chat_output("Background sessions are not available in this session."),
+                        SessionCommand::Kill { seq: _ } => {
+                            if let Some(output) = handle_local_session_command(
+                                &action,
+                                &mut chat_sessions,
+                                &session_rings,
+                                &mut reaped_log_archive,
+                                &reap_policy,
+                                &tools_registry,
+                            )
+                            .await
+                            {
+                                emit_chat_output(&output);
                             }
                             continue;
                         }
@@ -4489,10 +6004,15 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
                                     "chat.session_focus_attach_pty_done",
                                 );
+                                let _ = chat_dispatcher.dispatch_or_log(
+                                    crate::chat::action::Action::StripSelectionChanged { selected: None },
+                                    "chat.strip_selection_attach_pty_done",
+                                );
                                 {
                                     let mut mirror = chat_mirror.lock();
                                     mirror.focus = prev_focus;
                                     mirror.active_session_view = None;
+                                    mirror.strip_selection = None;
                                 }
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
@@ -4560,12 +6080,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         crate::chat::action::Action::SessionFocusChanged { focus },
                                         "chat.session_focus_attach",
                                     );
+                                    let _ = chat_dispatcher.dispatch_or_log(
+                                        crate::chat::action::Action::StripSelectionChanged { selected: None },
+                                        "chat.strip_selection_attach",
+                                    );
                                     #[cfg(feature = "terminal-tui")]
                                     {
                                         {
                                             let mut mirror = chat_mirror.lock();
                                             mirror.focus = focus;
                                             mirror.active_session_view = Some(active_projection.view.clone());
+                                            mirror.strip_selection = None;
                                         }
                                         let _ = chat_dispatcher.dispatch_or_log(
                                             crate::chat::action::Action::ActiveSessionViewUpdated {
@@ -4673,45 +6198,18 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             }
                             continue;
                         }
-                        SessionCommand::Logs { seq } => {
-                            // v2: dump a session's accumulated output buffer (the
-                            // per-session ring) — applies to both agents and
-                            // shells. Resolving the seq first refreshes the map so a
-                            // just-spawned session is addressable.
-                            const LOGS_MAX_LINES: usize = 200;
-                            match chat_sessions.resolve_run_id(seq).await {
-                                Ok(run_id) => {
-                                    let sid = crate::chat::sessions::id::SessionId::from_run_id(&run_id);
-                                    match session_rings.get(&sid) {
-                                        Some(ring) => {
-                                            // Replay the full retained window without
-                                            // disturbing the live-follow drained
-                                            // cursor: snapshot via a temporary rewind.
-                                            let lines = ring.recent_lines(LOGS_MAX_LINES);
-                                            if lines.is_empty() {
-                                                emit_chat_output(&format!(
-                                                    "Session #{seq} has no buffered output yet."
-                                                ));
-                                            } else {
-                                                let out = format_session_logs(seq, &lines, ring.is_truncated());
-                                                emit_chat_output(&out);
-                                            }
-                                        }
-                                        None => {
-                                            emit_chat_output(&format!("Session #{seq} has no buffered output yet."))
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    let now = chrono::Utc::now();
-                                    if let Some(message) = reaped_log_archive.logs_message(seq, &reap_policy, now) {
-                                        emit_chat_output(&message);
-                                    } else if let Some(reaped) = chat_sessions.reaped_session(seq) {
-                                        emit_chat_output(&format_reaped_session_notice(seq, Some(&reaped.summary)));
-                                    } else {
-                                        emit_chat_output(&format!("Logs failed: {e}"));
-                                    }
-                                }
+                        SessionCommand::Logs { seq: _ } => {
+                            if let Some(output) = handle_local_session_command(
+                                &action,
+                                &mut chat_sessions,
+                                &session_rings,
+                                &mut reaped_log_archive,
+                                &reap_policy,
+                                &tools_registry,
+                            )
+                            .await
+                            {
+                                emit_chat_output(&output);
                             }
                             continue;
                         }
@@ -4940,18 +6438,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
             },
             "chat.system_prompt_per_turn",
         );
-        history.push(ChatMessage::user(&enriched));
-
-        // Persist the user-visible turn, not the memory-enriched prompt that
-        // is sent to the provider. Otherwise session titles/resume history
-        // leak the synthetic "[Memory context]" preamble.
-        let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordUserTurn(user_input.clone()),
-            "chat.record_user_turn",
-        );
+        let history_len_before_user_turn = history.len();
+        let history_user_message = ChatMessage::user(&enriched);
+        let mut history_for_provider = history.clone();
+        history_for_provider.push(history_user_message.clone());
 
         // ── Set active recipient/channel on tools (for proactive messaging) ──
         for tool in tools_registry.iter() {
+            if tool.name() == "message_send" {
+                continue;
+            }
             tool.set_active_recipient("user").await;
             tool.set_active_channel(Arc::clone(&terminal) as Arc<dyn Channel>).await;
         }
@@ -5160,24 +6656,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
         );
         crate::router::context::trace_effective_compaction_resolution(&effective_compaction);
         #[cfg(feature = "terminal-tui")]
-        if redraw_tx_for_main.is_some() {
-            let context_window_tokens = Some(effective_compaction.config.max_context_tokens);
-            chat_mirror.lock().context_window_tokens = context_window_tokens;
-            let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::ContextWindowUpdated {
-                    max_context_tokens: context_window_tokens,
-                },
-                "chat.context_window_updated",
-            );
-            if let Some(warning) =
-                context_budget_warning_for_tui(&history, &effective_compaction.config, redraw_tx_for_main.is_some())
-            {
-                let _ = chat_dispatcher.dispatch_or_log(
-                    crate::chat::action::Action::SystemMessageAdded { text: warning },
-                    "chat.context_budget_warning",
-                );
-            }
-        }
+        refresh_context_budget_for_tui(
+            &history_for_provider,
+            &effective_compaction.config,
+            redraw_tx_for_main.is_some(),
+            &chat_mirror,
+            &chat_dispatcher,
+        );
 
         let route_decision = RouteDecision::from_model_routes_for_context(
             provider_name,
@@ -5253,10 +6738,89 @@ Retry with a compatible model: /provider {new_provider} <model>"
         };
         #[cfg(feature = "terminal-tui")]
         let reducer_driver_turn_active = matches!(turn_route, TurnRoute::ReduxDriver) && draft_id.is_some();
+        #[cfg(feature = "terminal-tui")]
+        let provider_worker_kind = if reducer_driver_turn_active {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached
+        } else {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
+        };
         // 非 TUI feature 下 turn_route 不参与控制流（driver 分支被 cfg 屏蔽），
         // 仅作变量保留以让两条 feature 配置下 chat::run 共享同一路由契约。
         #[cfg(not(feature = "terminal-tui"))]
         let _ = TurnRoute::LegacyToolLoop;
+        #[cfg(not(feature = "terminal-tui"))]
+        let provider_worker_kind = crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited;
+        let provider_admission_max = match provider_worker_kind {
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => 1,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => max_concurrent_visible_turns,
+        };
+        let provider_admission =
+            provider_turn_visible_admission(&provider_turn_workers, provider_worker_kind, provider_admission_max);
+        if !provider_admission.can_start_visible {
+            tracing::warn!(
+                active_workers = provider_admission.active_workers,
+                foreground_active = provider_admission.foreground_active,
+                detached_active = provider_admission.detached_active,
+                effective_max_visible_turns = provider_admission.effective_max_visible_turns,
+                target_kind = ?provider_worker_kind,
+                "visible provider turn admission rejected after route decision; requeueing input"
+            );
+            requeue_post_route_admission_rejected_input(
+                &mut input_backlog,
+                &mut defer_visible_input_pop_once,
+                DequeuedInputMessage {
+                    priority: input_priority,
+                    turn_task_id: provider_queue_task_id,
+                    msg,
+                },
+            );
+            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+            continue;
+        }
+        let provider_history_len_before_assistant;
+        #[cfg(feature = "terminal-tui")]
+        {
+            if reducer_driver_turn_active {
+                provider_history_len_before_assistant = history_for_provider.len();
+            } else {
+                history.push(history_user_message.clone());
+                provider_history_len_before_assistant = history.len();
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::RecordUserTurn(user_input.clone()),
+                    "chat.record_user_turn",
+                );
+            }
+        }
+        #[cfg(not(feature = "terminal-tui"))]
+        {
+            history.push(history_user_message.clone());
+            provider_history_len_before_assistant = history.len();
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::RecordUserTurn(user_input.clone()),
+                "chat.record_user_turn",
+            );
+        }
+
+        let provider_turn_task_id = start_provider_turn_task(
+            &mut turn_scheduler,
+            provider_queue_task_id,
+            &user_input,
+            history_len_before_user_turn,
+        );
+        register_provider_history_commit_task(&mut history_commit_coordinator, &turn_scheduler, provider_turn_task_id);
+        record_provider_turn_completion_context(
+            &mut provider_turn_completion_contexts,
+            provider_turn_task_id,
+            provider_history_len_before_assistant,
+        );
+        register_provider_turn_worker(
+            &mut provider_turn_workers,
+            &turn_scheduler,
+            provider_turn_task_id,
+            provider_worker_kind,
+        );
+        publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+        publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
 
         // ── Redux Driver 切闸路径（Step 5a-4） ─────────────────────
         //
@@ -5273,9 +6837,27 @@ Retry with a compatible model: /provider {new_provider} <model>"
         //
         #[cfg(feature = "terminal-tui")]
         if reducer_driver_turn_active && let Some(d_id) = draft_id.clone() {
-            // 协议：先获取 notified() future，再 dispatch，再 await。
+            // Protocol: register the keyed turn before dispatch, then obtain the
+            // waiter. The legacy single-slot signal remains as fallback while
+            // P6J migrates toward detached provider workers.
+            if let Some(id) = provider_turn_task_id {
+                turn_signal.register_turn(id, d_id.clone());
+                let _ = turn_signal.consume_turn_outcome(id);
+                let _ = turn_signal.consume_turn_usage(id);
+            }
+            if let Some(id) = provider_turn_task_id {
+                spawn_provider_turn_completion_waiter(
+                    turn_signal.clone(),
+                    id,
+                    provider_completion_tx.clone(),
+                    shutdown.clone(),
+                );
+            }
+            let mut notify_fut: Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>> =
+                provider_turn_task_id
+                    .is_none()
+                    .then(|| Box::pin(turn_signal.notified()) as _);
             // 在 dispatch 前消费旧 outcome 残留以确保读到的是本轮的。
-            let notify_fut = turn_signal.notified();
             let _ = turn_signal.consume_outcome();
 
             // S2.5 P1-A: 显式分支处理 dispatch_result（StartLLMTurn 失败必须 fall-through
@@ -5293,13 +6875,22 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 turn_run_id.clone(),
                 chat_session_key.clone(),
             );
+            let redux_turn_message_send_ctx = crate::tools::message_send::MessageSendExecutionContext::new(
+                Some("user".to_string()),
+                Arc::clone(&terminal) as Arc<dyn Channel>,
+            );
+            let provider_turn_sequence =
+                provider_turn_task_id.and_then(|id| turn_scheduler.task(id).map(|task| task.sequence));
             let dispatch_result = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StartLLMTurn {
+                    provider_turn_task_id,
+                    provider_turn_sequence,
                     draft_id: d_id.clone(),
-                    history: history.clone(),
+                    history: history_for_provider.clone(),
                     compaction_config: Some(effective_compaction.config.clone()),
                     cancel: cancellation.clone(),
                     turn_spawn_ctx: Some(redux_turn_spawn_ctx),
+                    turn_message_send_ctx: Some(redux_turn_message_send_ctx),
                 },
                 "chat.start_llm_turn",
             );
@@ -5332,20 +6923,164 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 if let Some(ref id) = draft_id {
                     let _ = terminal.cancel_draft("user", id).await;
                 }
+                enqueue_provider_turn_finalizer_event(
+                    &mut provider_turn_finalizer_events,
+                    provider_turn_task_id,
+                    ProviderTurnTerminalPlan::Failed {
+                        err: "redux driver dispatch failed".to_string(),
+                        history_commit_len: take_provider_turn_completion_history_len(
+                            &mut provider_turn_completion_contexts,
+                            provider_turn_task_id,
+                            history.len(),
+                        ),
+                        summary: "redux driver dispatch failed".to_string(),
+                    },
+                );
                 eprintln!("\nError: redux driver dispatch failed\n");
                 continue;
             }
 
+            if let Some(task_id) = provider_turn_task_id {
+                if per_turn_contexts
+                    .insert(
+                        task_id,
+                        PerTurnContext {
+                            task_id,
+                            draft_id: d_id.clone(),
+                            delta_tx: Some(delta_tx),
+                            tool_event_tx: Some(tool_event_tx),
+                            draft_updater,
+                            tool_event_forwarder: Some(tool_event_forwarder),
+                            user_input: user_input.clone(),
+                            turn_run_id: turn_run_id.clone(),
+                            route_scope: route_scope.clone(),
+                            route_decision: route_decision.clone(),
+                            provider_started_at,
+                            provider_name: provider_name.to_string(),
+                            model_name: model_name.to_string(),
+                            history_len_before_user_turn,
+                            history_user_message: history_user_message.clone(),
+                        },
+                    )
+                    .is_some()
+                {
+                    tracing::warn!(
+                        task_id = task_id.get(),
+                        "replaced pending Redux turn context before completion"
+                    );
+                }
+                continue;
+            }
+
             // shutdown 抢占保护防 round 2 hang。
-            tokio::select! {
-                () = notify_fut => {}
-                () = shutdown.cancelled() => {
-                    tracing::debug!("Redux driver: shutdown.cancelled before turn complete");
+            let mut turn_input_open = true;
+            let mut provider_completion_event: Option<ProviderTurnCompletionEvent> =
+                provider_turn_task_id.and_then(|id| pending_provider_completion_events.remove(&id));
+            if provider_completion_event.is_none() {
+                loop {
+                    tokio::select! {
+                        () = async {
+                            if let Some(fut) = notify_fut.as_mut() {
+                                fut.await;
+                            } else {
+                                std::future::pending::<()>().await;
+                            }
+                        } => break,
+                        completion = provider_completion_rx.recv(), if provider_turn_task_id.is_some() => {
+                            let Some(completion) = completion else {
+                                break;
+                            };
+                            match route_provider_completion_event_and_publish(
+                                &mut provider_turn_lifecycle_rx,
+                                &mut provider_turn_lifecycle_events_open,
+                                &mut provider_turn_workers,
+                                &mut pending_provider_completion_events,
+                                provider_turn_task_id,
+                                completion,
+                                &chat_dispatcher,
+                            ) {
+                                ProviderTurnCompletionRoute::Current(completion) => {
+                                    provider_completion_event = Some(completion);
+                                    break;
+                                }
+                                ProviderTurnCompletionRoute::Pending => {}
+                            }
+                        }
+                        lifecycle = provider_turn_lifecycle_rx.recv(), if provider_turn_lifecycle_events_open => {
+                            let Some(lifecycle) = lifecycle else {
+                                provider_turn_lifecycle_events_open = false;
+                                continue;
+                            };
+                            record_provider_turn_lifecycle_event(
+                                &mut provider_turn_workers,
+                                lifecycle,
+                            );
+                            publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                        }
+                        () = shutdown.cancelled() => {
+                            tracing::debug!("Redux driver: shutdown.cancelled before turn complete");
+                            break;
+                        }
+                        msg = input_rx.recv(), if turn_input_open => {
+                            let Some(msg) = msg else {
+                                turn_input_open = false;
+                                continue;
+                            };
+                            process_active_turn_input_batch(
+                                msg,
+                                &mut emit_chat_output,
+                                &mut input_rx,
+                                &mut input_backlog,
+                                &mut turn_scheduler,
+                                &mut provider_turn_workers,
+                                provider_turn_task_id,
+                                &chat_dispatcher,
+                                &chat_session,
+                                &mut chat_sessions,
+                                &session_rings,
+                                &mut reaped_log_archive,
+                                &reap_policy,
+                                &tools_registry,
+                            )
+                            .await;
+                            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                        }
+                    }
                 }
             }
 
-            let outcome = turn_signal.consume_outcome();
-            let mut redux_tokens_used = turn_signal.consume_usage();
+            let resolved_completion =
+                resolve_provider_turn_completion(&turn_signal, provider_turn_task_id, provider_completion_event);
+            let completion_history_len = take_provider_turn_completion_history_len(
+                &mut provider_turn_completion_contexts,
+                provider_turn_task_id,
+                history.len(),
+            );
+            let terminal_plan = provider_turn_terminal_plan_from_completion(
+                resolved_completion,
+                completion_history_len,
+                &tools_registry,
+            );
+            enqueue_provider_turn_finalizer_event(
+                &mut provider_turn_finalizer_events,
+                provider_turn_task_id,
+                terminal_plan.clone(),
+            );
+            let finalizer_result = drain_provider_turn_finalizer_events_and_publish(
+                &mut turn_scheduler,
+                &mut history_commit_coordinator,
+                &mut provider_turn_workers,
+                &mut provider_turn_finalizer_events,
+                &chat_dispatcher,
+            )
+            .into_iter()
+            .rev()
+            .find(|result| result.task_id == provider_turn_task_id)
+            .unwrap_or(ProviderTurnFinalizerResult {
+                task_id: provider_turn_task_id,
+                terminal_status: "unknown",
+                finalized: false,
+            });
 
             // Finalize streaming（与 legacy 收尾对齐）：drop senders 让后台任务收口.
             //
@@ -5362,11 +7097,82 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
             let _ = tool_event_forwarder.await;
 
-            match outcome {
-                Some(dispatcher::TurnOutcomeKind::Completed { final_text }) => {
-                    if !redux_tokens_used.has_any_tokens() {
-                        let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
-                        redux_tokens_used = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
+            match terminal_plan {
+                ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    recorded_response,
+                    empty_response,
+                    usage: redux_tokens_used,
+                    ..
+                } => {
+                    if empty_response {
+                        let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+                            &route_decision,
+                            provider_started_at,
+                            redux_tokens_used.clone(),
+                        );
+                        if !finalizer_result.finalized {
+                            if let Err(e) = terminal.cancel_draft("user", &d_id).await {
+                                tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+                            }
+                            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                            publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                            continue;
+                        }
+                        if let Err(e) = terminal.cancel_draft("user", &d_id).await {
+                            tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+                        }
+                        if let Err(e) =
+                            record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
+                        {
+                            tracing::warn!(
+                                error = %e,
+                                "Failed to append provider.final_outcome message event for empty Redux driver turn"
+                            );
+                        }
+                        chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
+                        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                            record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
+                            #[cfg(feature = "terminal-tui")]
+                            {
+                                chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+                            }
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::ProviderUsageRecorded {
+                                    task_id: provider_turn_task_id,
+                                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                                    record,
+                                },
+                                "chat.provider_usage_recorded_empty_response",
+                            );
+                            #[cfg(feature = "terminal-tui")]
+                            if let Some(tx) = redraw_tx_for_main.as_ref() {
+                                let _ = tx.try_send(());
+                            }
+                        }
+                        surface_turn_elapsed_message(
+                            &chat_dispatcher,
+                            sessions_redraw_handle.as_ref(),
+                            "completed",
+                            provider_outcome.started_at,
+                            provider_outcome.finished_at,
+                        );
+                        publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                        publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                        continue;
+                    }
+                    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+                        &route_decision,
+                        provider_started_at,
+                        redux_tokens_used.clone(),
+                    );
+                    if !finalizer_result.finalized {
+                        if let Err(e) = terminal.cancel_draft("user", &d_id).await {
+                            tracing::debug!(error = %e, "Redux driver: cancel commit-gated draft failed");
+                        }
+                        publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                        publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                        continue;
                     }
                     // 1) 把 driver 流式累计的最终文本写回 LLM history（与 legacy 行尾
                     //    `history.push(ChatMessage::assistant(...))` 对齐）。
@@ -5376,7 +7182,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
                         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
                     }
-                    let recorded_response = sanitize_channel_response(&final_text, &tools_registry);
                     if let Err(e) = record_chat_assistant_message_event(
                         &memory_fabric,
                         &chat_session_key,
@@ -5389,11 +7194,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     {
                         tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
                     }
-                    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
-                        &route_decision,
-                        provider_started_at,
-                        redux_tokens_used.clone(),
-                    );
                     if let Err(e) =
                         record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
                     {
@@ -5427,12 +7227,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     chat_session
                         .add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
                     if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                        record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                         #[cfg(feature = "terminal-tui")]
                         {
                             chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
                         }
                         let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::ProviderUsageRecorded { record },
+                            crate::chat::action::Action::ProviderUsageRecorded {
+                                task_id: provider_turn_task_id,
+                                usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                                record,
+                            },
                             "chat.provider_usage_recorded",
                         );
                         #[cfg(feature = "terminal-tui")]
@@ -5447,9 +7252,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         provider_outcome.started_at,
                         provider_outcome.finished_at,
                     );
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                    publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                     let _ = final_text;
                 }
-                Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => {
+                ProviderTurnTerminalPlan::Failed { err, .. } => {
                     // reducer NotifyHook(Error) 已发；这里不再 hooks.emit 避免双发.
                     #[cfg(feature = "terminal-tui")]
                     let interactive_tui_active = redraw_tx_for_main.is_some();
@@ -5472,15 +7279,80 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         provider_started_at,
                         chrono::Utc::now(),
                     );
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                    publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                 }
-                Some(dispatcher::TurnOutcomeKind::Cancelled) | None => {
+                ProviderTurnTerminalPlan::Cancelled { .. } => {
                     if let Some(ref id) = draft_id {
                         let _ = terminal.cancel_draft("user", id).await;
                     }
+                    rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                    publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                    publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                 }
             }
 
             continue;
+        }
+
+        let preflight_budget = crate::agent::loop_::plan_context_budget(
+            &history,
+            &effective_compaction.config,
+            crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+        );
+        if preflight_budget.over_hard_limit {
+            let system_count = usize::from(history.first().is_some_and(|m| m.role == "system"));
+            let turns_before = history.len().saturating_sub(system_count);
+            let tokens_before = estimate_chat_history_tokens(&history);
+            if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                &history,
+                &persisted_history_for_turn,
+                provider.as_ref(),
+                model_name,
+                &effective_compaction.config,
+                document_ingest.as_ref(),
+                "chat_preflight",
+                Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+            )
+            .await
+            {
+                apply_chat_compaction_patch_and_sync(
+                    &mut history,
+                    Some(&persisted_history_for_turn),
+                    patch,
+                    &effective_compaction.config,
+                    crate::chat::action::CompactReason::ContextOverflow,
+                    &chat_dispatcher,
+                );
+            } else {
+                compact_chat_history(&mut history);
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::HistoryCompacted {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                    },
+                    "chat.history_compacted_preflight",
+                );
+            }
+            #[cfg(feature = "terminal-tui")]
+            refresh_context_budget_for_tui(
+                &history,
+                &effective_compaction.config,
+                redraw_tx_for_main.is_some(),
+                &chat_mirror,
+                &chat_dispatcher,
+            );
+            let compact_msg = format_compact_feedback_after_history(
+                turns_before,
+                tokens_before,
+                &history,
+                &effective_compaction.config,
+            );
+            surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
+            tracing::warn!(
+                before_used_tokens = preflight_budget.used_tokens,
+                hard_limit = preflight_budget.available_input_tokens,
+                "legacy chat context budget preflight compacted before provider call"
+            );
         }
 
         // D8-4: seed a turn-root spawn execution context so a sub-agent spawned
@@ -5492,51 +7364,60 @@ Retry with a compatible model: /provider {new_provider} <model>"
             turn_run_id.clone(),
             chat_session_key.clone(),
         );
+        let turn_message_send_ctx = crate::tools::message_send::MessageSendExecutionContext::new(
+            Some("user".to_string()),
+            Arc::clone(&terminal) as Arc<dyn Channel>,
+        );
 
         let turn_outcome = loop {
             history_len_before_tools = history.len();
 
             let result = tokio::time::timeout(
                 timeout_budget,
-                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
-                    turn_spawn_ctx.clone(),
-                    run_tool_call_loop_traced(
-                        provider.as_ref(),
-                        &mut history,
-                        &tools_registry,
-                        observer.as_ref(),
-                        &hooks,
-                        provider_name,
-                        model_name,
-                        temperature,
-                        false,
-                        Some(&approval_manager),
-                        "terminal",
-                        &config.multimodal,
-                        config.agent.max_tool_iterations,
-                        config.agent.parallel_tools,
-                        config.agent.read_only_tool_concurrency_window,
-                        config.agent.read_only_tool_timeout_secs,
-                        config.agent.priority_scheduling_enabled,
-                        config.agent.low_priority_tools.clone(),
-                        ToolConcurrencyGovernanceConfig {
-                            kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
-                            rollout_stage: config.agent.concurrency_rollout_stage.clone(),
-                            rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
-                            rollout_channels: config.agent.concurrency_rollout_channels.clone(),
-                            auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
-                            rollback_timeout_rate_threshold: config.agent.concurrency_rollback_timeout_rate_threshold,
-                            rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
-                            rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
-                        },
-                        Some(&effective_compaction.config),
-                        Some(cancellation.clone()),
-                        Some(delta_tx.clone()),
-                        Some(&scope_ctx),
-                        Some(tool_event_tx.clone()),
-                        Some(&config.tool_tiering),
-                        document_ingest.clone(),
-                        chat_session.mode,
+                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT.scope(
+                    turn_message_send_ctx.clone(),
+                    crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
+                        turn_spawn_ctx.clone(),
+                        run_tool_call_loop_traced(
+                            provider.as_ref(),
+                            &mut history,
+                            &tools_registry,
+                            observer.as_ref(),
+                            &hooks,
+                            provider_name,
+                            model_name,
+                            temperature,
+                            false,
+                            Some(&approval_manager),
+                            "terminal",
+                            &config.multimodal,
+                            config.agent.max_tool_iterations,
+                            config.agent.parallel_tools,
+                            config.agent.read_only_tool_concurrency_window,
+                            config.agent.read_only_tool_timeout_secs,
+                            config.agent.priority_scheduling_enabled,
+                            config.agent.low_priority_tools.clone(),
+                            ToolConcurrencyGovernanceConfig {
+                                kill_switch_force_serial: config.agent.concurrency_kill_switch_force_serial,
+                                rollout_stage: config.agent.concurrency_rollout_stage.clone(),
+                                rollout_sample_percent: config.agent.concurrency_rollout_sample_percent,
+                                rollout_channels: config.agent.concurrency_rollout_channels.clone(),
+                                auto_rollback_enabled: config.agent.concurrency_auto_rollback_enabled,
+                                rollback_timeout_rate_threshold: config
+                                    .agent
+                                    .concurrency_rollback_timeout_rate_threshold,
+                                rollback_cancel_rate_threshold: config.agent.concurrency_rollback_cancel_rate_threshold,
+                                rollback_error_rate_threshold: config.agent.concurrency_rollback_error_rate_threshold,
+                            },
+                            Some(&effective_compaction.config),
+                            Some(cancellation.clone()),
+                            Some(delta_tx.clone()),
+                            Some(&scope_ctx),
+                            Some(tool_event_tx.clone()),
+                            Some(&config.tool_tiering),
+                            document_ingest.clone(),
+                            chat_session.mode,
+                        ),
                     ),
                 ),
             )
@@ -5588,25 +7469,43 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 }
                 // ── Context window overflow → compact + retry ─────
                 Ok(Err(ref e)) if is_context_window_overflow_error(e) => {
-                    // S2-B Step 4: dispatch `HistoryCompacted` 让 reducer 对
-                    // `state.session.history` 应用同样的 compaction 算法（两侧共享
-                    // COMPACT_KEEP_MESSAGES/COMPACT_CONTENT_CHARS/COMPACT_TOTAL_CHARS
-                    // 三个常量，state.rs 与 mod.rs 同源 → 字节级一致）。
-                    // legacy `compact_chat_history(&mut history)` 仍 unconditional 跑，
-                    // 因为 `history` 是真实喂给 `run_tool_call_loop` 的 LLM 上下文 Vec —
-                    // S2-C 删除 legacy 路径前不能跳过它，否则 Redux 模式下 overflow
-                    // 重试会拿同一份未压缩的 history 二次失败。
                     let audit_source_history =
                         original_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
                     let summary_projection = bounded_legacy_chat_compaction_audit_source(&persisted_history_for_turn);
                     let token_metadata = legacy_compaction_token_metadata(&history, &persisted_history_for_turn);
-                    let _ = chat_dispatcher.dispatch_or_log(
-                        crate::chat::action::Action::HistoryCompacted {
-                            reason: crate::chat::action::CompactReason::ContextOverflow,
-                        },
-                        "chat.history_compacted_overflow",
-                    );
-                    compact_chat_history(&mut history);
+                    let turns_before = history
+                        .len()
+                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
+                    let tokens_before = estimate_chat_history_tokens(&history);
+                    if let Some(patch) = build_chat_compaction_patch_with_timeout(
+                        &history,
+                        &persisted_history_for_turn,
+                        provider.as_ref(),
+                        model_name,
+                        &effective_compaction.config,
+                        document_ingest.as_ref(),
+                        "chat_context_overflow",
+                        Duration::from_secs(crate::agent::loop_::COMPACTION_TIMEOUT_SECS),
+                    )
+                    .await
+                    {
+                        apply_chat_compaction_patch_and_sync(
+                            &mut history,
+                            Some(&persisted_history_for_turn),
+                            patch,
+                            &effective_compaction.config,
+                            crate::chat::action::CompactReason::ContextOverflow,
+                            &chat_dispatcher,
+                        );
+                    } else {
+                        let _ = chat_dispatcher.dispatch_or_log(
+                            crate::chat::action::Action::HistoryCompacted {
+                                reason: crate::chat::action::CompactReason::ContextOverflow,
+                            },
+                            "chat.history_compacted_overflow",
+                        );
+                        compact_chat_history(&mut history);
+                    }
                     persist_legacy_chat_compaction_audit(
                         mem.as_ref(),
                         &runtime_envelope,
@@ -5616,6 +7515,26 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         "chat_context_overflow",
                     )
                     .await;
+                    let turns_after = history
+                        .len()
+                        .saturating_sub(usize::from(history.first().is_some_and(|m| m.role == "system")));
+                    let tokens_after = estimate_chat_history_tokens(&history);
+                    #[cfg(feature = "terminal-tui")]
+                    refresh_context_budget_for_tui(
+                        &history,
+                        &effective_compaction.config,
+                        redraw_tx_for_main.is_some(),
+                        &chat_mirror,
+                        &chat_dispatcher,
+                    );
+                    let compact_msg = format_compact_feedback(
+                        turns_before,
+                        turns_after,
+                        tokens_before,
+                        tokens_after,
+                        effective_compaction.config.max_context_tokens,
+                    );
+                    surface_session_message(&chat_dispatcher, sessions_redraw_handle.as_ref(), &compact_msg);
                     let compacted_chars: usize = history.iter().map(|m| m.content.chars().count()).sum();
                     tracing::warn!(
                         retries = context_overflow_retries,
@@ -5774,7 +7693,32 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // If the turn failed or was cancelled, skip response processing
         let (response, turn_trace) = match turn_outcome {
             TurnOutcome::Success(resp, trace) => (resp, trace),
-            TurnOutcome::Cancelled | TurnOutcome::FailedWithError { .. } => continue,
+            TurnOutcome::Cancelled => {
+                rollback_cancelled_turn_history(&mut history, history_len_before_user_turn);
+                gate_cancelled_provider_turn_finalization(
+                    &mut turn_scheduler,
+                    &mut history_commit_coordinator,
+                    &mut provider_turn_workers,
+                    provider_turn_task_id,
+                    "legacy tool loop cancelled",
+                );
+                publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                continue;
+            }
+            TurnOutcome::FailedWithError { err, .. } => {
+                gate_failed_provider_turn_finalization(
+                    &mut turn_scheduler,
+                    &mut history_commit_coordinator,
+                    &mut provider_turn_workers,
+                    provider_turn_task_id,
+                    history.len(),
+                    format!("legacy tool loop failed: {err}"),
+                );
+                publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+                publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+                continue;
+            }
         };
         // FIX-P0-30/31: build the provider outcome from the loop's real
         // attribution trace. When the trace carries the actual serving
@@ -5871,6 +7815,77 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // ── Sanitize response: strip tool-call XML/JSON artifacts ──
         let response = sanitize_channel_response(&response, &tools_registry);
 
+        if crate::agent::loop_::is_empty_assistant_response(&response, false) {
+            if let Some(ref d_id) = draft_id {
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::StreamCompleted {
+                        draft_id: d_id.clone(),
+                        final_text: String::new(),
+                        reasoning: String::new(),
+                    },
+                    "chat.stream_completed_empty_response",
+                );
+                if let Err(e) = terminal.cancel_draft("user", d_id).await {
+                    tracing::debug!(error = %e, "cancel empty-response draft failed");
+                }
+            }
+            surface_session_message(
+                &chat_dispatcher,
+                sessions_redraw_handle.as_ref(),
+                crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+            );
+
+            let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
+            chat_session.add_user_turn(&sanitized_input);
+            if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
+                #[cfg(feature = "terminal-tui")]
+                {
+                    chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+                }
+                let _ = chat_dispatcher.dispatch_or_log(
+                    crate::chat::action::Action::ProviderUsageRecorded {
+                        task_id: provider_turn_task_id,
+                        usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                        record,
+                    },
+                    "chat.provider_usage_recorded_empty_response",
+                );
+                #[cfg(feature = "terminal-tui")]
+                if let Some(tx) = redraw_tx_for_main.as_ref() {
+                    let _ = tx.try_send(());
+                }
+            }
+            if !dual_write_guard.is_active() {
+                if let Err(e) = save_session(mem.as_ref(), &chat_session).await {
+                    tracing::warn!("Failed to persist session after empty assistant response: {e}");
+                }
+                observer.record_event(&ObserverEvent::TurnComplete);
+                hooks
+                    .emit(
+                        HookEvent::TurnComplete,
+                        serde_json::json!({
+                            "mode": "chat",
+                            "response_chars": 0,
+                        }),
+                    )
+                    .await;
+            } else {
+                observer.record_event(&ObserverEvent::TurnComplete);
+            }
+            mark_provider_turn_completed(
+                &mut turn_scheduler,
+                &mut history_commit_coordinator,
+                &mut provider_turn_workers,
+                provider_turn_task_id,
+                history.len(),
+                "legacy tool loop completed with empty response",
+            );
+            publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+            publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
+            continue;
+        }
+
         if let Err(e) = record_chat_assistant_message_event(
             &memory_fabric,
             &chat_session_key,
@@ -5901,7 +7916,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
         // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
         let _ = chat_dispatcher.dispatch_or_log(
-            crate::chat::action::Action::RecordAssistantTurn(history_response.clone()),
+            crate::chat::action::Action::RecordAssistantTurn {
+                task_id: provider_turn_task_id,
+                content: history_response.clone(),
+            },
             "chat.record_assistant_turn",
         );
 
@@ -5998,12 +8016,17 @@ Retry with a compatible model: /provider {new_provider} <model>"
         chat_session.add_user_turn(&sanitized_input);
         chat_session.add_assistant_turn(&sanitized_response, Vec::new());
         if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+            record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
             #[cfg(feature = "terminal-tui")]
             {
                 chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
             }
             let _ = chat_dispatcher.dispatch_or_log(
-                crate::chat::action::Action::ProviderUsageRecorded { record },
+                crate::chat::action::Action::ProviderUsageRecorded {
+                    task_id: provider_turn_task_id,
+                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                    record,
+                },
                 "chat.provider_usage_recorded",
             );
             #[cfg(feature = "terminal-tui")]
@@ -6043,6 +8066,16 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // observer.record_event 仍然调用（observer 只是本地计数，无外部副作用）
             observer.record_event(&ObserverEvent::TurnComplete);
         }
+        mark_provider_turn_completed(
+            &mut turn_scheduler,
+            &mut history_commit_coordinator,
+            &mut provider_turn_workers,
+            provider_turn_task_id,
+            history.len(),
+            "legacy tool loop completed",
+        );
+        publish_main_queue_status(&chat_dispatcher, &turn_scheduler);
+        publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
     }
 
     // ── Child-session shutdown on exit (Phase C) ─────────────────
@@ -6243,6 +8276,43 @@ impl RenderSource {
 }
 
 #[cfg(feature = "terminal-tui")]
+fn sync_key_mirror_observation_state(render_source: &RenderSource, mirror: &Arc<parking_lot::Mutex<tui::TuiState>>) {
+    let RenderSource::Snapshot(rx) = render_source else {
+        return;
+    };
+    let snapshot = rx.borrow();
+    let status = snapshot.provider_worker_status.clone();
+    let conversation_lines = snapshot.conversation_lines.as_ref().clone();
+    let streaming = snapshot.streaming.clone();
+    let visible_streaming_drafts = Arc::clone(&snapshot.visible_streaming_drafts);
+    drop(snapshot);
+    let mut guard = mirror.lock();
+    guard.provider_worker_status = status.clone();
+    guard.conversation_lines = conversation_lines;
+    guard.streaming = streaming;
+    guard.visible_streaming_drafts = visible_streaming_drafts;
+    if let crate::chat::sessions::FocusTarget::Worker { sequence } = guard.focus {
+        let previous_view = guard
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = tui::provider_worker_io_lines_for_streaming_draft(
+            &guard.conversation_lines,
+            guard.streaming_draft_for_worker(sequence),
+            12,
+        );
+        guard.active_session_view = Some(
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &status,
+                sequence,
+                previous_view,
+                io_lines,
+            ),
+        );
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
 type ChatTerminal = ratatui::Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>;
 
 #[cfg(feature = "terminal-tui")]
@@ -6306,6 +8376,8 @@ fn spawn_tui_unified_loop(
     chat_dispatcher: dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
     handoff: Arc<crate::chat::sessions::pty::HandoffControl>,
+    workspace_dir: std::path::PathBuf,
+    security: Arc<crate::security::SecurityPolicy>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = run_tui_unified_loop(
@@ -6319,11 +8391,119 @@ fn spawn_tui_unified_loop(
             &chat_dispatcher,
             snapshot_rx,
             &handoff,
+            workspace_dir,
+            security,
         );
         if let Err(e) = result {
             tracing::error!("TUI unified loop error: {e}");
         }
     });
+}
+
+#[cfg(feature = "terminal-tui")]
+fn refresh_at_path_candidates_for_tui(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+    workspace_dir: &std::path::Path,
+    security: &crate::security::SecurityPolicy,
+) {
+    let candidates = {
+        let guard = mirror.lock();
+        collect_at_path_candidates(&guard.input, workspace_dir, security)
+    };
+    {
+        let mut guard = mirror.lock();
+        guard.update_at_path_candidates(candidates.clone());
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::AtPathCandidatesUpdated { candidates },
+        "chat.at_path_candidates_updated",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
+#[cfg(feature = "terminal-tui")]
+fn collect_at_path_candidates(
+    input: &tui::TuiInput,
+    workspace_dir: &std::path::Path,
+    security: &crate::security::SecurityPolicy,
+) -> Vec<tui::AtPathCandidate> {
+    const MAX_AT_PATH_CANDIDATES: usize = 50;
+
+    let Some(filter) = input.at_path_filter_at_cursor() else {
+        return Vec::new();
+    };
+    if filter.starts_with('/') || filter.starts_with('~') || !security.is_path_allowed(&filter) {
+        return Vec::new();
+    }
+    let normalized = filter.trim_start_matches("./");
+    let (base_rel, needle) = if normalized.ends_with('/') {
+        (normalized.trim_end_matches('/'), "")
+    } else if let Some((base, leaf)) = normalized.rsplit_once('/') {
+        (base, leaf)
+    } else {
+        ("", normalized)
+    };
+    let base_for_policy = if base_rel.is_empty() { "." } else { base_rel };
+    if !security.is_path_allowed(base_for_policy) {
+        return Vec::new();
+    }
+    let base_abs = if base_rel.is_empty() {
+        workspace_dir.to_path_buf()
+    } else {
+        workspace_dir.join(base_rel)
+    };
+    let Ok(base_resolved) = base_abs.canonicalize() else {
+        return Vec::new();
+    };
+    if !security.is_resolved_path_allowed(&base_resolved) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(&base_resolved) else {
+        return Vec::new();
+    };
+    let needle = needle.to_ascii_lowercase();
+    let mut candidates = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(file_name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if file_name == "." || file_name == ".." {
+            continue;
+        }
+        let rel = if base_rel.is_empty() {
+            file_name.clone()
+        } else {
+            format!("{base_rel}/{file_name}")
+        };
+        let file_name_lower = file_name.to_ascii_lowercase();
+        let rel_lower = rel.to_ascii_lowercase();
+        if !needle.is_empty()
+            && !file_name_lower.contains(&needle)
+            && !rel_lower.contains(&needle)
+            && !tui::fuzzy_path_match(&rel_lower, &needle)
+        {
+            continue;
+        }
+        if !security.is_path_allowed(&rel) {
+            continue;
+        }
+        let Ok(resolved) = entry.path().canonicalize() else {
+            continue;
+        };
+        if !security.is_resolved_path_allowed(&resolved) {
+            continue;
+        }
+        let is_dir = entry.file_type().is_ok_and(|kind| kind.is_dir());
+        candidates.push(tui::AtPathCandidate {
+            path: if is_dir { format!("{rel}/") } else { rel },
+            is_dir,
+        });
+    }
+    candidates.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.path.cmp(&b.path)));
+    candidates.truncate(MAX_AT_PATH_CANDIDATES);
+    candidates
 }
 
 /// Send a synthetic slash command from the TUI key thread to the async main
@@ -6344,18 +8524,2161 @@ fn send_synthetic_command(
         .as_secs();
     let msg = crate::channels::traits::ChannelMessage {
         id: uuid::Uuid::new_v4().to_string(),
-        sender: "user".to_string(),
+        sender: SYNTHETIC_UI_COMMAND_SENDER.to_string(),
         reply_target: "user".to_string(),
         content: command.to_string(),
         channel: "terminal".to_string(),
         timestamp,
         thread_ts: None,
+        chat_kind: crate::channels::traits::ChatKind::Dm,
+        chat_title: None,
+        sender_display: None,
         mentioned_uuids: vec![],
         mentioned: false,
         is_group_hint: false,
         sender_is_bot: false,
     };
     input_tx.blocking_send(msg).map_err(|_| ())
+}
+
+fn is_synthetic_ui_command(msg: &crate::channels::traits::ChannelMessage) -> bool {
+    msg.sender == SYNTHETIC_UI_COMMAND_SENDER && msg.channel == "terminal"
+}
+
+fn classify_input_priority(msg: &crate::channels::traits::ChannelMessage) -> (InputQueuePriority, String) {
+    if is_synthetic_ui_command(msg) {
+        return (InputQueuePriority::Control, msg.content.clone());
+    }
+    input_priority_from_text(&msg.content)
+}
+
+fn input_priority_from_text(input: &str) -> (InputQueuePriority, String) {
+    let trimmed = input.trim();
+    for prefix in ["/now ", "/priority ", "!! "] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            let rest = rest.trim();
+            if !rest.is_empty() {
+                return (InputQueuePriority::Priority, rest.to_string());
+            }
+        }
+    }
+    (InputQueuePriority::Normal, input.to_string())
+}
+
+fn enqueue_input_message_and_return_priority(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    mut msg: crate::channels::traits::ChannelMessage,
+) -> InputQueuePriority {
+    let (priority, content) = classify_input_priority(&msg);
+    msg.content = content;
+    backlog.push_back(QueuedInputMessage {
+        priority,
+        turn_task_id: None,
+        msg,
+    });
+    priority
+}
+
+const fn turn_priority_from_input(priority: InputQueuePriority) -> crate::chat::turn_scheduler::TurnPriority {
+    match priority {
+        InputQueuePriority::Normal => crate::chat::turn_scheduler::TurnPriority::Normal,
+        InputQueuePriority::Priority => crate::chat::turn_scheduler::TurnPriority::Priority,
+        InputQueuePriority::Control => crate::chat::turn_scheduler::TurnPriority::Control,
+    }
+}
+
+fn enqueue_input_message_and_return_priority_with_scheduler(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    mut msg: crate::channels::traits::ChannelMessage,
+    history_base_len: usize,
+) -> InputQueuePriority {
+    let (priority, content) = classify_input_priority(&msg);
+    msg.content = content;
+    let turn_task_id = scheduler.enqueue(
+        msg.content.clone(),
+        turn_priority_from_input(priority),
+        history_base_len,
+    );
+    backlog.push_back(QueuedInputMessage {
+        priority,
+        turn_task_id: Some(turn_task_id),
+        msg,
+    });
+    priority
+}
+
+fn enqueue_input_message_with_scheduler(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    msg: crate::channels::traits::ChannelMessage,
+    history_base_len: usize,
+) {
+    let _ = enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, msg, history_base_len);
+}
+
+fn enqueue_input_message(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    msg: crate::channels::traits::ChannelMessage,
+) {
+    let _ = enqueue_input_message_and_return_priority(backlog, msg);
+}
+
+fn pop_next_input_message(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+) -> Option<crate::channels::traits::ChannelMessage> {
+    pop_next_queued_input_message(backlog).map(|queued| queued.msg)
+}
+
+fn pop_next_queued_input_message(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+) -> Option<QueuedInputMessage> {
+    let mut best_idx = None;
+    let mut best_priority = InputQueuePriority::Normal;
+    for (idx, queued) in backlog.iter().enumerate() {
+        if best_idx.is_none() || queued.priority > best_priority {
+            best_idx = Some(idx);
+            best_priority = queued.priority;
+        }
+    }
+    let best_idx = best_idx?;
+    backlog.remove(best_idx)
+}
+
+fn pop_next_input_message_with_scheduler(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+) -> Option<crate::channels::traits::ChannelMessage> {
+    let queued = pop_next_queued_input_message(backlog)?;
+    if let Some(id) = queued.turn_task_id
+        && let Err(error) = scheduler.mark_legacy_dispatched(id)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "TurnScheduler legacy dispatch mirror failed"
+        );
+    }
+    Some(queued.msg)
+}
+
+fn pop_next_input_task_with_scheduler(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+) -> Option<DequeuedInputMessage> {
+    let queued = pop_next_queued_input_message(backlog)?;
+    if let Some(id) = queued.turn_task_id
+        && let Err(error) = scheduler.mark_dispatched_to_chat_loop(id)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "TurnScheduler chat-loop dequeue mirror failed"
+        );
+    }
+    Some(DequeuedInputMessage {
+        priority: queued.priority,
+        turn_task_id: queued.turn_task_id,
+        msg: queued.msg,
+    })
+}
+
+fn pop_next_visible_input_task_with_scheduler(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    target_kind: crate::chat::turn_worker::ProviderTurnWorkerKind,
+    max_concurrent_visible_turns: usize,
+) -> Option<DequeuedInputMessage> {
+    if !provider_turn_visible_admission(workers, target_kind, max_concurrent_visible_turns).can_start_visible {
+        return None;
+    }
+    pop_next_input_task_with_scheduler(backlog, scheduler)
+}
+
+fn requeue_post_route_admission_rejected_input(
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    defer_visible_input_pop_once: &mut bool,
+    input: DequeuedInputMessage,
+) {
+    backlog.push_front(QueuedInputMessage {
+        priority: input.priority,
+        turn_task_id: input.turn_task_id,
+        msg: input.msg,
+    });
+    *defer_visible_input_pop_once = true;
+}
+
+fn input_backlog_status(
+    backlog: &std::collections::VecDeque<QueuedInputMessage>,
+) -> crate::chat::action::MainQueueStatus {
+    crate::chat::action::MainQueueStatus {
+        queued: backlog.len(),
+        priority: backlog
+            .iter()
+            .filter(|queued| queued.priority == InputQueuePriority::Priority)
+            .count(),
+    }
+}
+
+fn publish_main_queue_status(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+) {
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::MainQueueStatusUpdated {
+            status: scheduler.status().main_queue_status(),
+        },
+        "chat.main_queue_status_updated",
+    );
+}
+
+fn provider_worker_status(
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) -> crate::chat::action::ProviderWorkerStatus {
+    use crate::chat::action::{ProviderWorkerRowKind, ProviderWorkerRowState, ProviderWorkerStatusRow};
+
+    let mut status = crate::chat::action::ProviderWorkerStatus::default();
+    for worker in workers.snapshot() {
+        if worker.finalized_payload_ready {
+            status.finalized_payloads = status.finalized_payloads.saturating_add(1);
+            status.finalized_total_tokens = status
+                .finalized_total_tokens
+                .saturating_add(worker.finalized_total_tokens.unwrap_or_default());
+        }
+        let row_state = match worker.state {
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running => ProviderWorkerRowState::Running,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling => ProviderWorkerRowState::Cancelling,
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_) => {
+                ProviderWorkerRowState::AwaitingCommit
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed => ProviderWorkerRowState::Committed,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled => ProviderWorkerRowState::Cancelled,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Failed => ProviderWorkerRowState::Failed,
+        };
+        if !worker.state.is_terminal() || worker.finalized_payload_ready {
+            let row_kind = match worker.kind {
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => {
+                    ProviderWorkerRowKind::ForegroundAwaited
+                }
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => ProviderWorkerRowKind::Detached,
+            };
+            status.rows.push(ProviderWorkerStatusRow {
+                task_id: worker.task_id.get(),
+                sequence: worker.sequence,
+                kind: row_kind,
+                state: row_state,
+                started_at_ms: worker.started_at_ms,
+                finalized_total_tokens: worker.finalized_total_tokens,
+                completion_ready: worker.completion_ready,
+            });
+        }
+        match worker.state {
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running => {
+                status.running = status.running.saturating_add(1);
+                status.oldest_started_at_ms = Some(
+                    status
+                        .oldest_started_at_ms
+                        .map_or(worker.started_at_ms, |current| current.min(worker.started_at_ms)),
+                );
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling => {
+                status.cancelling = status.cancelling.saturating_add(1);
+                status.oldest_started_at_ms = Some(
+                    status
+                        .oldest_started_at_ms
+                        .map_or(worker.started_at_ms, |current| current.min(worker.started_at_ms)),
+                );
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_) => {
+                status.awaiting_commit = status.awaiting_commit.saturating_add(1);
+            }
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+            | crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled
+            | crate::chat::turn_worker::ProviderTurnWorkerState::Failed => {}
+        }
+    }
+    status
+}
+
+fn publish_provider_worker_status(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) {
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ProviderWorkerStatusUpdated {
+            status: provider_worker_status(workers),
+        },
+        "chat.provider_worker_status_updated",
+    );
+}
+
+fn provider_turn_visible_admission(
+    workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    target_kind: crate::chat::turn_worker::ProviderTurnWorkerKind,
+    max_concurrent_visible_turns: usize,
+) -> ProviderTurnVisibleAdmission {
+    let effective_max_visible_turns = max_concurrent_visible_turns.max(1);
+    let active_rows: Vec<_> = workers
+        .snapshot()
+        .into_iter()
+        .filter(|worker| {
+            matches!(
+                worker.state,
+                crate::chat::turn_worker::ProviderTurnWorkerState::Running
+                    | crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling
+                    | crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_)
+            )
+        })
+        .collect();
+    let active_workers = active_rows.len();
+    let foreground_active = active_rows
+        .iter()
+        .filter(|worker| worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited)
+        .count();
+    let detached_active = active_rows
+        .iter()
+        .filter(|worker| worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::Detached)
+        .count();
+    let can_start_visible = match target_kind {
+        crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => active_workers == 0,
+        crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => {
+            foreground_active == 0 && detached_active < effective_max_visible_turns
+        }
+    };
+    ProviderTurnVisibleAdmission {
+        active_workers,
+        foreground_active,
+        detached_active,
+        effective_max_visible_turns,
+        can_start_visible,
+    }
+}
+
+fn drain_provider_turn_lifecycle_events(
+    rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+) -> bool {
+    if !*events_open {
+        return false;
+    }
+
+    let mut drained = false;
+    loop {
+        match rx.try_recv() {
+            Ok(event) => {
+                drained = true;
+                record_provider_turn_lifecycle_event(workers, event);
+            }
+            Err(mpsc::error::TryRecvError::Empty) => return drained,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *events_open = false;
+                return drained;
+            }
+        }
+    }
+}
+
+fn record_provider_turn_lifecycle_event(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    event: dispatcher::ProviderTurnLifecycleEvent,
+) {
+    let (task_id, lease_id, kind, result) = match event {
+        dispatcher::ProviderTurnLifecycleEvent::HandleAttached {
+            task_id,
+            lease_id,
+            abort_handle,
+        } => {
+            let result = workers.attach_execution_handle(task_id, lease_id, abort_handle);
+            (task_id, lease_id, "handle_attached", result)
+        }
+        dispatcher::ProviderTurnLifecycleEvent::Started { task_id, lease_id } => {
+            let result = workers.record_execution_started(task_id, lease_id);
+            (task_id, lease_id, "started", result)
+        }
+        dispatcher::ProviderTurnLifecycleEvent::Exited { task_id, lease_id } => {
+            let result = workers.record_execution_exited(task_id, lease_id);
+            (task_id, lease_id, "exited", result)
+        }
+    };
+    if let Err(error) = result {
+        tracing::warn!(
+            task_id = task_id.get(),
+            lease_id,
+            kind,
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider execution lifecycle record failed"
+        );
+    }
+}
+
+fn record_provider_turn_completion_ready(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+) {
+    if let Err(error) = workers.record_completion_ready(task_id) {
+        tracing::warn!(
+            task_id = task_id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider completion-ready gate failed"
+        );
+    }
+}
+
+fn route_provider_completion_event(
+    lifecycle_rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
+    current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion: ProviderTurnCompletionEvent,
+) -> ProviderTurnCompletionRoute {
+    if drain_provider_turn_lifecycle_events(lifecycle_rx, lifecycle_events_open, workers) {
+        tracing::trace!(
+            task_id = completion.task_id.get(),
+            "drained provider lifecycle events before routing completion"
+        );
+    }
+    let task_id = completion.task_id;
+    record_provider_turn_completion_ready(workers, task_id);
+    if Some(task_id) == current_task_id {
+        return ProviderTurnCompletionRoute::Current(completion);
+    }
+    if pending.insert(task_id, completion).is_some() {
+        tracing::warn!(
+            task_id = task_id.get(),
+            "replaced duplicate pending provider completion event"
+        );
+    }
+    ProviderTurnCompletionRoute::Pending
+}
+
+fn route_provider_completion_event_and_publish(
+    lifecycle_rx: &mut mpsc::UnboundedReceiver<dispatcher::ProviderTurnLifecycleEvent>,
+    lifecycle_events_open: &mut bool,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    pending: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionEvent>,
+    current_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion: ProviderTurnCompletionEvent,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+) -> ProviderTurnCompletionRoute {
+    let route = route_provider_completion_event(
+        lifecycle_rx,
+        lifecycle_events_open,
+        workers,
+        pending,
+        current_task_id,
+        completion,
+    );
+    publish_provider_worker_status(chat_dispatcher, workers);
+    route
+}
+
+fn record_provider_turn_completion_context(
+    contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionContext>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_len_before_assistant: usize,
+) {
+    if let Some(task_id) = task_id
+        && contexts
+            .insert(
+                task_id,
+                ProviderTurnCompletionContext {
+                    history_len_before_assistant,
+                },
+            )
+            .is_some()
+    {
+        tracing::warn!(
+            task_id = task_id.get(),
+            "replaced duplicate provider turn completion context"
+        );
+    }
+}
+
+fn take_provider_turn_completion_history_len(
+    contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, ProviderTurnCompletionContext>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    fallback_history_len: usize,
+) -> usize {
+    task_id
+        .and_then(|task_id| contexts.remove(&task_id))
+        .map_or(fallback_history_len, |context| context.history_len_before_assistant)
+}
+
+fn provider_turn_finalized_payload_from_usage(
+    history_commit_len: usize,
+    final_text_chars: usize,
+    recorded_response_chars: usize,
+    usage: &crate::llm::route_decision::TokenUsage,
+) -> crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+    let prompt_tokens = usage.prompt_tokens.map_or(0, u64::from);
+    let completion_tokens = usage.completion_tokens.map_or(0, u64::from);
+    let total_tokens = usage
+        .total_tokens
+        .map_or_else(|| prompt_tokens.saturating_add(completion_tokens), u64::from);
+    crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+        history_commit_len,
+        final_text_chars,
+        recorded_response_chars,
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+    }
+}
+
+fn record_provider_turn_finalized_payload(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    payload: crate::chat::turn_worker::ProviderTurnFinalizedPayload,
+) -> bool {
+    let Some(id) = id else {
+        tracing::warn!("ProviderTurnWorkerRegistry missing provider task for finalized payload");
+        return false;
+    };
+    if let Err(error) = workers.record_finalized_payload(id, payload) {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider finalized payload record failed"
+        );
+        return false;
+    }
+    true
+}
+
+fn gate_completed_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    final_text_chars: usize,
+    recorded_response_chars: usize,
+    usage: &crate::llm::route_decision::TokenUsage,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    let finalized_payload = provider_turn_finalized_payload_from_usage(
+        history_commit_len,
+        final_text_chars,
+        recorded_response_chars,
+        usage,
+    );
+    if !record_provider_turn_finalized_payload(workers, id, finalized_payload) {
+        return Vec::new();
+    }
+    mark_provider_turn_completed(scheduler, coordinator, workers, id, history_commit_len, summary)
+}
+
+fn gate_failed_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    summary: impl Into<String>,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    mark_provider_turn_failed(scheduler, coordinator, workers, id, history_commit_len, summary)
+}
+
+fn gate_cancelled_provider_turn_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    mark_provider_turn_cancelled(scheduler, coordinator, workers, id, summary)
+}
+
+#[allow(clippy::option_if_let_else)]
+fn resolve_provider_turn_completion(
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    completion_event: Option<ProviderTurnCompletionEvent>,
+) -> ResolvedProviderTurnCompletion {
+    let outcome = if let Some(completion) = completion_event.as_ref() {
+        completion.outcome.clone().or_else(|| turn_signal.consume_outcome())
+    } else if let Some(id) = task_id {
+        turn_signal
+            .consume_turn_outcome(id)
+            .or_else(|| turn_signal.consume_outcome())
+    } else {
+        turn_signal.consume_outcome()
+    };
+    let usage = if let Some(completion) = completion_event {
+        if completion.usage.has_any_tokens() {
+            completion.usage
+        } else {
+            turn_signal.consume_usage()
+        }
+    } else if let Some(id) = task_id {
+        let keyed_usage = turn_signal.consume_turn_usage(id);
+        if keyed_usage.has_any_tokens() {
+            keyed_usage
+        } else {
+            turn_signal.consume_usage()
+        }
+    } else {
+        turn_signal.consume_usage()
+    };
+    if let Some(id) = task_id {
+        turn_signal.unregister_turn(id);
+    }
+    ResolvedProviderTurnCompletion { outcome, usage }
+}
+
+fn provider_turn_terminal_plan_from_completion(
+    resolved: ResolvedProviderTurnCompletion,
+    history_len: usize,
+    tools_registry: &[Box<dyn Tool>],
+) -> ProviderTurnTerminalPlan {
+    match resolved.outcome {
+        Some(dispatcher::TurnOutcomeKind::Completed { final_text, reasoning }) => {
+            let mut usage = resolved.usage;
+            if !usage.has_any_tokens() {
+                let accumulator = crate::llm::route_decision::ProviderUsageAccumulator::new();
+                usage = accumulator.finish_or_estimate_completion_chars(final_text.chars().count());
+            }
+            if crate::agent::loop_::is_empty_assistant_response(&final_text, false) {
+                ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning: String::new(),
+                    recorded_response: String::new(),
+                    empty_response: true,
+                    usage,
+                    history_commit_len: history_len,
+                    final_text_chars: 0,
+                    recorded_response_chars: 0,
+                    summary: "redux driver completed with empty response",
+                }
+            } else {
+                let recorded_response = sanitize_channel_response(&final_text, tools_registry);
+                let final_text_chars = final_text.chars().count();
+                let recorded_response_chars = recorded_response.chars().count();
+                ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning,
+                    final_text_chars,
+                    recorded_response_chars,
+                    recorded_response,
+                    empty_response: false,
+                    usage,
+                    history_commit_len: history_len.saturating_add(1),
+                    summary: "redux driver completed",
+                }
+            }
+        }
+        Some(dispatcher::TurnOutcomeKind::Failed { err, retryable: _ }) => ProviderTurnTerminalPlan::Failed {
+            summary: format!("redux driver failed: {err}"),
+            err,
+            history_commit_len: history_len,
+        },
+        Some(dispatcher::TurnOutcomeKind::Cancelled) | None => ProviderTurnTerminalPlan::Cancelled {
+            summary: "redux driver cancelled",
+        },
+    }
+}
+
+fn gate_provider_turn_terminal_finalization(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    gate: ProviderTurnTerminalGate<'_>,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    match gate {
+        ProviderTurnTerminalGate::Completed {
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            usage,
+            summary,
+        } => gate_completed_provider_turn_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            id,
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            usage,
+            summary,
+        ),
+        ProviderTurnTerminalGate::Failed {
+            history_commit_len,
+            summary,
+        } => gate_failed_provider_turn_finalization(scheduler, coordinator, workers, id, history_commit_len, summary),
+        ProviderTurnTerminalGate::Cancelled { summary } => {
+            gate_cancelled_provider_turn_finalization(scheduler, coordinator, workers, id, summary)
+        }
+    }
+}
+
+fn finalize_provider_turn_from_event(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    event: ProviderTurnFinalizerEvent,
+) -> Vec<ProviderTurnFinalizerResult> {
+    let task_id = event.task_id;
+    let decisions = match event.plan {
+        ProviderTurnTerminalPlan::Completed {
+            usage,
+            history_commit_len,
+            final_text_chars,
+            recorded_response_chars,
+            summary,
+            ..
+        } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Completed {
+                history_commit_len,
+                final_text_chars,
+                recorded_response_chars,
+                usage: &usage,
+                summary,
+            },
+        ),
+        ProviderTurnTerminalPlan::Failed {
+            history_commit_len,
+            summary,
+            ..
+        } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Failed {
+                history_commit_len,
+                summary,
+            },
+        ),
+        ProviderTurnTerminalPlan::Cancelled { summary } => gate_provider_turn_terminal_finalization(
+            scheduler,
+            coordinator,
+            workers,
+            task_id,
+            ProviderTurnTerminalGate::Cancelled { summary },
+        ),
+    };
+    if decisions.is_empty() {
+        return vec![ProviderTurnFinalizerResult {
+            task_id,
+            terminal_status: "unknown",
+            finalized: false,
+        }];
+    }
+    decisions
+        .iter()
+        .map(provider_turn_finalizer_result_from_commit_decision)
+        .collect()
+}
+
+const fn provider_turn_finalizer_result_from_commit_decision(
+    decision: &crate::chat::history_commit::HistoryCommitDecision,
+) -> ProviderTurnFinalizerResult {
+    match decision {
+        crate::chat::history_commit::HistoryCommitDecision::Commit { task_id, .. } => ProviderTurnFinalizerResult {
+            task_id: Some(*task_id),
+            terminal_status: "completed",
+            finalized: true,
+        },
+        crate::chat::history_commit::HistoryCommitDecision::Skip { task_id, status, .. } => {
+            ProviderTurnFinalizerResult {
+                task_id: Some(*task_id),
+                terminal_status: match status {
+                    crate::chat::history_commit::HistoryCommitStatus::Completed => "completed",
+                    crate::chat::history_commit::HistoryCommitStatus::Cancelled => "cancelled",
+                    crate::chat::history_commit::HistoryCommitStatus::Failed => "failed",
+                },
+                finalized: true,
+            }
+        }
+    }
+}
+
+fn enqueue_provider_turn_finalizer_event(
+    queue: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    plan: ProviderTurnTerminalPlan,
+) {
+    queue.push_back(ProviderTurnFinalizerEvent { task_id, plan });
+}
+
+#[cfg(feature = "terminal-tui")]
+fn dispatch_ordered_provider_turn_commit(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: &str,
+    user_input: &str,
+    final_text: &str,
+    reasoning: &str,
+    empty_response: bool,
+) {
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::RecordUserTurn(user_input.to_string()),
+        "chat.ordered_record_user_turn",
+    );
+    if !empty_response {
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::RecordAssistantTurn {
+                task_id: Some(task_id),
+                content: final_text.to_string(),
+            },
+            "chat.ordered_record_assistant_turn",
+        );
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::StreamCompleted {
+            draft_id: draft_id.to_string(),
+            final_text: final_text.to_string(),
+            reasoning: reasoning.to_string(),
+        },
+        "chat.ordered_stream_completed",
+    );
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn commit_completed_provider_turn(
+    pending_commit: PendingOrderedProviderTurnCommit,
+    history: &mut Vec<ChatMessage>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_session: &mut session::ChatSession,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+) {
+    let pending = pending_commit.context;
+    let ProviderTurnTerminalPlan::Completed {
+        final_text,
+        reasoning,
+        recorded_response,
+        empty_response,
+        usage: redux_tokens_used,
+        ..
+    } = pending_commit.terminal_plan
+    else {
+        tracing::warn!(
+            task_id = pending.task_id.get(),
+            "ordered provider turn commit received non-completed terminal plan"
+        );
+        return;
+    };
+
+    let provider_turn_task_id = Some(pending.task_id);
+    let provider_outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+        &pending.route_decision,
+        pending.provider_started_at,
+        redux_tokens_used.clone(),
+    );
+    history.push(pending.history_user_message.clone());
+    if empty_response {
+        if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
+            tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
+        }
+        dispatch_ordered_provider_turn_commit(
+            chat_dispatcher,
+            pending.task_id,
+            &pending.draft_id,
+            &pending.user_input,
+            &final_text,
+            &reasoning,
+            empty_response,
+        );
+        if let Err(e) =
+            record_provider_outcome_events(memory_fabric, pending.route_scope.clone(), &provider_outcome).await
+        {
+            tracing::warn!(
+                error = %e,
+                "Failed to append provider.final_outcome message event for empty Redux driver turn"
+            );
+        }
+        chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&pending.user_input));
+        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+            record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
+            chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+            let _ = chat_dispatcher.dispatch_or_log(
+                crate::chat::action::Action::ProviderUsageRecorded {
+                    task_id: provider_turn_task_id,
+                    usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                    record,
+                },
+                "chat.provider_usage_recorded_empty_response",
+            );
+            if let Some(tx) = redraw_tx_for_main {
+                let _ = tx.try_send(());
+            }
+        }
+        surface_turn_elapsed_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            "completed",
+            provider_outcome.started_at,
+            provider_outcome.finished_at,
+        );
+        publish_main_queue_status(chat_dispatcher, turn_scheduler);
+        publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        return;
+    }
+
+    history.push(ChatMessage::assistant(final_text.clone()));
+    if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
+        tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
+    }
+    dispatch_ordered_provider_turn_commit(
+        chat_dispatcher,
+        pending.task_id,
+        &pending.draft_id,
+        &pending.user_input,
+        &final_text,
+        &reasoning,
+        empty_response,
+    );
+    if let Err(e) = record_chat_assistant_message_event(
+        memory_fabric,
+        chat_session_key,
+        &pending.turn_run_id,
+        &pending.provider_name,
+        &pending.model_name,
+        &recorded_response,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
+    }
+    if let Err(e) = record_provider_outcome_events(memory_fabric, pending.route_scope.clone(), &provider_outcome).await
+    {
+        tracing::warn!(
+            error = %e,
+            "Failed to append provider.final_outcome message event for Redux driver turn"
+        );
+    }
+    let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
+    crate::runtime::control_ladder::append_provider_outcome_trace(
+        std::path::Path::new(&config.workspace_dir),
+        &provider_outcome.decision_id,
+        &provider_outcome.final_provider,
+        &provider_outcome.final_model,
+        attempts_count,
+        "success",
+    );
+    chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&pending.user_input));
+    chat_session.add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
+    if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+        record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
+        chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
+        let _ = chat_dispatcher.dispatch_or_log(
+            crate::chat::action::Action::ProviderUsageRecorded {
+                task_id: provider_turn_task_id,
+                usage_kind: crate::chat::action::ProviderUsageRecordKind::FinalAggregate,
+                record,
+            },
+            "chat.provider_usage_recorded",
+        );
+        if let Some(tx) = redraw_tx_for_main {
+            let _ = tx.try_send(());
+        }
+    }
+    surface_turn_elapsed_message(
+        chat_dispatcher,
+        sessions_redraw_handle,
+        "completed",
+        provider_outcome.started_at,
+        provider_outcome.finished_at,
+    );
+    publish_main_queue_status(chat_dispatcher, turn_scheduler);
+    publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn apply_ready_ordered_provider_turn_commits(
+    results: Vec<ProviderTurnFinalizerResult>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    history: &mut Vec<ChatMessage>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_session: &mut session::ChatSession,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+) -> bool {
+    let mut applied = false;
+    for result in results {
+        if !result.finalized || result.terminal_status != "completed" {
+            continue;
+        }
+        let Some(task_id) = result.task_id else {
+            continue;
+        };
+        let Some(pending_commit) = pending_ordered_provider_turn_commits.remove(&task_id) else {
+            tracing::debug!(
+                task_id = task_id.get(),
+                "ordered provider turn commit ready before local payload was registered"
+            );
+            continue;
+        };
+        commit_completed_provider_turn(
+            pending_commit,
+            history,
+            turn_scheduler,
+            provider_turn_workers,
+            chat_mirror,
+            chat_dispatcher,
+            terminal,
+            memory_fabric,
+            chat_session_key,
+            chat_session,
+            config,
+            sessions_redraw_handle,
+            redraw_tx_for_main,
+        )
+        .await;
+        applied = true;
+    }
+    applied
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_per_turn_context(
+    mut pending: PerTurnContext,
+    completion_event: Option<ProviderTurnCompletionEvent>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    provider_turn_completion_contexts: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionContext,
+    >,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    provider_turn_finalizer_events: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    history_commit_coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_session: &mut session::ChatSession,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
+) {
+    let provider_turn_task_id = Some(pending.task_id);
+    let resolved_completion = resolve_provider_turn_completion(turn_signal, provider_turn_task_id, completion_event);
+    let completion_history_len = take_provider_turn_completion_history_len(
+        provider_turn_completion_contexts,
+        provider_turn_task_id,
+        history.len(),
+    );
+    let terminal_plan =
+        provider_turn_terminal_plan_from_completion(resolved_completion, completion_history_len, tools_registry);
+    tracing::debug!(
+        task_id = pending.task_id.get(),
+        draft_id = %pending.draft_id,
+        turn_run_id = %pending.turn_run_id,
+        provider_name = %pending.provider_name,
+        model_name = %pending.model_name,
+        history_len_before_user_turn = pending.history_len_before_user_turn,
+        "finalizing provider turn context"
+    );
+    enqueue_provider_turn_finalizer_event(
+        provider_turn_finalizer_events,
+        provider_turn_task_id,
+        terminal_plan.clone(),
+    );
+    let finalizer_results = drain_provider_turn_finalizer_events_and_publish(
+        turn_scheduler,
+        history_commit_coordinator,
+        provider_turn_workers,
+        provider_turn_finalizer_events,
+        chat_dispatcher,
+    );
+
+    drop(pending.delta_tx.take());
+    drop(pending.tool_event_tx.take());
+    if let Some(handle) = pending.draft_updater.take() {
+        let _ = handle.await;
+    }
+    if let Some(handle) = pending.tool_event_forwarder.take() {
+        let _ = handle.await;
+    }
+
+    match terminal_plan {
+        plan @ ProviderTurnTerminalPlan::Completed { .. } => {
+            let task_id = pending.task_id;
+            if pending_ordered_provider_turn_commits
+                .insert(
+                    task_id,
+                    PendingOrderedProviderTurnCommit {
+                        context: pending,
+                        terminal_plan: plan,
+                    },
+                )
+                .is_some()
+            {
+                tracing::warn!(
+                    task_id = task_id.get(),
+                    "replaced pending ordered provider turn commit payload"
+                );
+            }
+        }
+        ProviderTurnTerminalPlan::Failed { err, .. } => {
+            let interactive_tui_active = redraw_tx_for_main.is_some();
+            if !interactive_tui_active {
+                let _ = terminal.cancel_draft("user", &pending.draft_id).await;
+                eprintln!("\nError: {err}\n");
+            }
+            if plain_mode {
+                *plain_mode_turn_failed = true;
+            }
+            surface_turn_elapsed_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                "failed",
+                pending.provider_started_at,
+                chrono::Utc::now(),
+            );
+            publish_main_queue_status(chat_dispatcher, turn_scheduler);
+            publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        }
+        ProviderTurnTerminalPlan::Cancelled { .. } => {
+            let _ = terminal.cancel_draft("user", &pending.draft_id).await;
+            rollback_cancelled_turn_history(history, pending.history_len_before_user_turn);
+            publish_main_queue_status(chat_dispatcher, turn_scheduler);
+            publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        }
+    }
+    let _ = apply_ready_ordered_provider_turn_commits(
+        finalizer_results,
+        pending_ordered_provider_turn_commits,
+        history,
+        turn_scheduler,
+        provider_turn_workers,
+        chat_mirror,
+        chat_dispatcher,
+        terminal,
+        memory_fabric,
+        chat_session_key,
+        chat_session,
+        config,
+        sessions_redraw_handle,
+        redraw_tx_for_main,
+    )
+    .await;
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_ready_per_turn_contexts(
+    per_turn_contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    pending_provider_completion_events: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionEvent,
+    >,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    provider_turn_completion_contexts: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionContext,
+    >,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    provider_turn_finalizer_events: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    history_commit_coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_session: &mut session::ChatSession,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
+) -> bool {
+    let ready_task_ids: Vec<_> = per_turn_contexts
+        .keys()
+        .copied()
+        .filter(|task_id| pending_provider_completion_events.contains_key(task_id))
+        .collect();
+    if ready_task_ids.is_empty() {
+        return false;
+    }
+    for task_id in ready_task_ids {
+        let Some(pending) = per_turn_contexts.remove(&task_id) else {
+            continue;
+        };
+        let completion = pending_provider_completion_events.remove(&task_id);
+        finalize_per_turn_context(
+            pending,
+            completion,
+            pending_ordered_provider_turn_commits,
+            turn_signal,
+            provider_turn_completion_contexts,
+            history,
+            tools_registry,
+            provider_turn_finalizer_events,
+            turn_scheduler,
+            history_commit_coordinator,
+            provider_turn_workers,
+            chat_mirror,
+            chat_dispatcher,
+            terminal,
+            memory_fabric,
+            chat_session_key,
+            chat_session,
+            config,
+            sessions_redraw_handle,
+            redraw_tx_for_main,
+            plain_mode,
+            plain_mode_turn_failed,
+        )
+        .await;
+    }
+    true
+}
+
+#[cfg(feature = "terminal-tui")]
+#[allow(clippy::too_many_arguments)]
+async fn finalize_all_per_turn_contexts_as_cancelled(
+    per_turn_contexts: &mut std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, PerTurnContext>,
+    pending_ordered_provider_turn_commits: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        PendingOrderedProviderTurnCommit,
+    >,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    provider_turn_completion_contexts: &mut std::collections::HashMap<
+        crate::chat::turn_scheduler::TurnTaskId,
+        ProviderTurnCompletionContext,
+    >,
+    history: &mut Vec<ChatMessage>,
+    tools_registry: &[Box<dyn Tool>],
+    provider_turn_finalizer_events: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    turn_scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    history_commit_coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    terminal: &Arc<TerminalChannel>,
+    memory_fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_session: &mut session::ChatSession,
+    config: &Config,
+    sessions_redraw_handle: Option<&mpsc::Sender<()>>,
+    redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
+) {
+    let pending_turns: Vec<_> = per_turn_contexts.drain().map(|(_, pending)| pending).collect();
+    for pending in pending_turns {
+        finalize_per_turn_context(
+            pending,
+            None,
+            pending_ordered_provider_turn_commits,
+            turn_signal,
+            provider_turn_completion_contexts,
+            history,
+            tools_registry,
+            provider_turn_finalizer_events,
+            turn_scheduler,
+            history_commit_coordinator,
+            provider_turn_workers,
+            chat_mirror,
+            chat_dispatcher,
+            terminal,
+            memory_fabric,
+            chat_session_key,
+            chat_session,
+            config,
+            sessions_redraw_handle,
+            redraw_tx_for_main,
+            plain_mode,
+            plain_mode_turn_failed,
+        )
+        .await;
+    }
+}
+
+fn drain_provider_turn_finalizer_events(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    queue: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+) -> Vec<ProviderTurnFinalizerResult> {
+    let mut results = Vec::new();
+    while let Some(event) = queue.pop_front() {
+        results.extend(finalize_provider_turn_from_event(
+            scheduler,
+            coordinator,
+            workers,
+            event,
+        ));
+    }
+    results
+}
+
+fn drain_provider_turn_finalizer_events_and_publish(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    queue: &mut std::collections::VecDeque<ProviderTurnFinalizerEvent>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+) -> Vec<ProviderTurnFinalizerResult> {
+    let results = drain_provider_turn_finalizer_events(scheduler, coordinator, workers, queue);
+    if !results.is_empty() {
+        publish_main_queue_status(chat_dispatcher, scheduler);
+        publish_provider_worker_status(chat_dispatcher, workers);
+    }
+    results
+}
+
+fn start_provider_turn_task(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    existing_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    input: &str,
+    history_base_len: usize,
+) -> Option<crate::chat::turn_scheduler::TurnTaskId> {
+    let id = existing_task_id.unwrap_or_else(|| {
+        scheduler.enqueue(
+            input.to_string(),
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            history_base_len,
+        )
+    });
+    if let Err(error) = scheduler.start_task(id) {
+        tracing::warn!(
+            task_id = id.get(),
+            reused_queued_task = existing_task_id.is_some(),
+            error = ?error,
+            "TurnScheduler provider task start failed"
+        );
+        return None;
+    }
+    Some(id)
+}
+
+fn register_provider_history_commit_task(
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+) {
+    if let Some(id) = id
+        && let Some(task) = scheduler.task(id)
+        && let Err(error) = coordinator.register_task(task)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            sequence = task.sequence,
+            error = ?error,
+            "HistoryCommitCoordinator provider task registration failed"
+        );
+    }
+}
+
+fn register_provider_turn_worker(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    kind: crate::chat::turn_worker::ProviderTurnWorkerKind,
+) {
+    if let Some(id) = id
+        && let Some(task) = scheduler.task(id)
+        && let Err(error) = workers.start_from_task(task, kind)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            sequence = task.sequence,
+            kind = ?kind,
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider worker registration failed"
+        );
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn spawn_provider_turn_completion_waiter(
+    turn_signal: dispatcher::TurnCompletionSignal,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    tx: mpsc::Sender<ProviderTurnCompletionEvent>,
+    shutdown: CancellationToken,
+) {
+    tokio::spawn(async move {
+        let notified = turn_signal.notified_for(task_id);
+        match notified {
+            Some(notified) => {
+                tokio::select! {
+                    () = notified => {}
+                    () = shutdown.cancelled() => {}
+                }
+            }
+            None => {
+                tokio::select! {
+                    () = turn_signal.notified() => {}
+                    () = shutdown.cancelled() => {}
+                }
+            }
+        }
+        let event = ProviderTurnCompletionEvent {
+            task_id,
+            outcome: turn_signal.consume_turn_outcome(task_id),
+            usage: turn_signal.consume_turn_usage(task_id),
+        };
+        if tx.send(event).await.is_err() {
+            tracing::debug!(
+                task_id = task_id.get(),
+                "provider turn completion waiter could not deliver event"
+            );
+        }
+    });
+}
+
+fn request_provider_turn_cancel(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    reason: &'static str,
+) {
+    if let Some(id) = id {
+        if let Err(error) = scheduler.request_cancel(id) {
+            tracing::warn!(
+                task_id = id.get(),
+                reason,
+                error = ?error,
+                "TurnScheduler provider task cancel request failed"
+            );
+        }
+        if let Err(error) = workers.request_cancel(id) {
+            tracing::warn!(
+                task_id = id.get(),
+                reason,
+                error = ?error,
+                "ProviderTurnWorkerRegistry provider worker cancel request failed"
+            );
+        }
+    }
+}
+
+fn record_provider_turn_usage(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    record: &crate::chat::session::MainSessionTokenUsageRecord,
+) {
+    if let Some(id) = id
+        && let Err(error) = scheduler.record_usage(id, record)
+    {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "TurnScheduler provider usage ledger record failed"
+        );
+    }
+}
+
+fn mark_provider_turn_completed(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    if let Some(id) = id {
+        match scheduler.mark_completed(id, history_commit_len, summary) {
+            Ok(()) => {
+                if record_provider_worker_completed(workers, id) {
+                    return record_provider_history_commit_outcome(coordinator, workers, scheduler, id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = id.get(),
+                    error = ?error,
+                    "TurnScheduler provider task completion failed"
+                );
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn mark_provider_turn_failed(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    history_commit_len: usize,
+    summary: impl Into<String>,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    if let Some(id) = id {
+        match scheduler.mark_failed(id, history_commit_len, summary) {
+            Ok(()) => {
+                if record_provider_worker_failed(workers, id) {
+                    return record_provider_history_commit_outcome(coordinator, workers, scheduler, id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = id.get(),
+                    error = ?error,
+                    "TurnScheduler provider task failure failed"
+                );
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn mark_provider_turn_cancelled(
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    summary: &'static str,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    if let Some(id) = id {
+        match scheduler.mark_cancelled(id, summary) {
+            Ok(()) => {
+                if record_provider_worker_cancelled(workers, id) {
+                    return record_provider_history_commit_outcome(coordinator, workers, scheduler, id);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    task_id = id.get(),
+                    error = ?error,
+                    "TurnScheduler provider task cancellation failed"
+                );
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn record_provider_worker_completed(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: crate::chat::turn_scheduler::TurnTaskId,
+) -> bool {
+    if let Err(error) = workers.record_completed(id) {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider worker completion failed"
+        );
+        return false;
+    }
+    true
+}
+
+fn record_provider_worker_failed(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: crate::chat::turn_scheduler::TurnTaskId,
+) -> bool {
+    if let Err(error) = workers.record_failed(id) {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider worker failure failed"
+        );
+        return false;
+    }
+    true
+}
+
+fn record_provider_worker_cancelled(
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    id: crate::chat::turn_scheduler::TurnTaskId,
+) -> bool {
+    if let Err(error) = workers.record_cancelled(id) {
+        tracing::warn!(
+            task_id = id.get(),
+            error = ?error,
+            "ProviderTurnWorkerRegistry provider worker cancellation failed"
+        );
+        return false;
+    }
+    true
+}
+
+fn record_provider_history_commit_outcome(
+    coordinator: &mut crate::chat::history_commit::HistoryCommitCoordinator,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    id: crate::chat::turn_scheduler::TurnTaskId,
+) -> Vec<crate::chat::history_commit::HistoryCommitDecision> {
+    let Some(task) = scheduler.task(id) else {
+        tracing::warn!(
+            task_id = id.get(),
+            "HistoryCommitCoordinator missing scheduler task for provider outcome"
+        );
+        return Vec::new();
+    };
+    let Some(outcome) = crate::chat::history_commit::HistoryCommitOutcome::from_terminal_task(task) else {
+        tracing::warn!(
+            task_id = id.get(),
+            state = ?task.state,
+            "HistoryCommitCoordinator ignored non-terminal provider outcome"
+        );
+        return Vec::new();
+    };
+    if let Err(error) = coordinator.record_outcome(outcome) {
+        tracing::warn!(
+            task_id = id.get(),
+            sequence = task.sequence,
+            error = ?error,
+            "HistoryCommitCoordinator provider outcome record failed"
+        );
+        return Vec::new();
+    }
+    let mut decisions = Vec::new();
+    for decision in coordinator.drain_ready() {
+        if let Err(error) = workers.apply_commit_decision(&decision) {
+            tracing::warn!(
+                task_id = id.get(),
+                decision = ?decision,
+                error = ?error,
+                "ProviderTurnWorkerRegistry provider worker commit decision failed"
+            );
+        }
+        tracing::trace!(
+            task_id = id.get(),
+            decision = ?decision,
+            pending_tasks = coordinator.pending_tasks(),
+            pending_outcomes = coordinator.pending_outcomes(),
+            "HistoryCommitCoordinator provider outcome became ready"
+        );
+        decisions.push(decision);
+    }
+    decisions
+}
+
+fn is_queue_command(input: &str) -> bool {
+    matches!(input.trim(), "/queue" | "/queue status")
+}
+
+fn is_cost_command(input: &str) -> bool {
+    input.trim() == "/cost"
+}
+
+fn is_workers_command(input: &str) -> bool {
+    matches!(input.trim(), "/workers" | "/workers status")
+        || !matches!(
+            parse_workers_cancel_command(input),
+            ProviderWorkerCancelCommand::NotCancel
+        )
+}
+
+fn is_active_turn_local_command(input: &str) -> bool {
+    let (_priority, content) = input_priority_from_text(input);
+    is_queue_command(&content)
+        || is_cost_command(&content)
+        || is_workers_command(&content)
+        || local_session_command(&content).is_some()
+}
+
+fn format_active_turn_local_notice(input: &str) -> String {
+    let (_priority, content) = input_priority_from_text(input);
+    let collapsed = content.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview = truncate_chars_for_queued_notice(&collapsed, 160);
+    format!("local > {preview}")
+}
+
+async fn active_turn_local_command_output(
+    msg: &crate::channels::traits::ChannelMessage,
+    backlog: &std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    chat_session: &session::ChatSession,
+    provider_turn_workers: &crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    session_rings: &std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reaped_log_archive: &mut ReapedSessionLogArchive,
+    reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
+    tools_registry: &[Box<dyn Tool>],
+) -> Option<String> {
+    let (_priority, content) = classify_input_priority(msg);
+    if is_queue_command(&content) {
+        return Some(format_input_backlog_report(backlog, scheduler, 8));
+    }
+    if is_cost_command(&content) {
+        return Some(commands::format_cost_feedback(chat_session));
+    }
+    if is_workers_command(&content) {
+        return Some(format_provider_worker_report(&provider_worker_status(
+            provider_turn_workers,
+        )));
+    }
+    if let Some(action) = local_session_command(&content) {
+        return handle_local_session_command(
+            &action,
+            chat_sessions,
+            session_rings,
+            reaped_log_archive,
+            reap_policy,
+            tools_registry,
+        )
+        .await;
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_active_turn_input_message(
+    msg: crate::channels::traits::ChannelMessage,
+    emit_chat_output: &mut impl FnMut(&str),
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    chat_session: &session::ChatSession,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    session_rings: &std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reaped_log_archive: &mut ReapedSessionLogArchive,
+    reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    if let Some((output, signal_cancel)) =
+        active_turn_workers_cancel_output(&msg, scheduler, provider_turn_workers, provider_turn_task_id)
+    {
+        emit_chat_output(&output);
+        publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+        dispatch_provider_worker_cancel_signal(chat_dispatcher, signal_cancel);
+        return;
+    }
+    if let Some(output) = active_turn_local_command_output(
+        &msg,
+        backlog,
+        scheduler,
+        chat_session,
+        provider_turn_workers,
+        chat_sessions,
+        session_rings,
+        reaped_log_archive,
+        reap_policy,
+        tools_registry,
+    )
+    .await
+    {
+        emit_chat_output(&output);
+        return;
+    }
+    let _priority =
+        enqueue_input_message_and_return_priority_with_scheduler(backlog, scheduler, msg, chat_session.turns.len());
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_active_turn_input_batch(
+    msg: crate::channels::traits::ChannelMessage,
+    emit_chat_output: &mut impl FnMut(&str),
+    input_rx: &mut mpsc::Receiver<crate::channels::traits::ChannelMessage>,
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    provider_turn_workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    chat_session: &session::ChatSession,
+    chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
+    session_rings: &std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
+    reaped_log_archive: &mut ReapedSessionLogArchive,
+    reap_policy: &crate::chat::sessions::runtime::ReapPolicy,
+    tools_registry: &[Box<dyn Tool>],
+) {
+    process_active_turn_input_message(
+        msg,
+        emit_chat_output,
+        backlog,
+        scheduler,
+        provider_turn_workers,
+        provider_turn_task_id,
+        chat_dispatcher,
+        chat_session,
+        chat_sessions,
+        session_rings,
+        reaped_log_archive,
+        reap_policy,
+        tools_registry,
+    )
+    .await;
+    while let Ok(msg) = input_rx.try_recv() {
+        process_active_turn_input_message(
+            msg,
+            emit_chat_output,
+            backlog,
+            scheduler,
+            provider_turn_workers,
+            provider_turn_task_id,
+            chat_dispatcher,
+            chat_session,
+            chat_sessions,
+            session_rings,
+            reaped_log_archive,
+            reap_policy,
+            tools_registry,
+        )
+        .await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderWorkerCancelCommand {
+    NotCancel,
+    Invalid(String),
+    Cancel { sequence: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProviderWorkerCancelSignal {
+    CancelRequested,
+    CancelProviderTurn {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+    },
+}
+
+fn parse_workers_cancel_command(input: &str) -> ProviderWorkerCancelCommand {
+    let mut parts = input.split_whitespace();
+    if parts.next() != Some("/workers") {
+        return ProviderWorkerCancelCommand::NotCancel;
+    }
+    let Some(verb) = parts.next() else {
+        return ProviderWorkerCancelCommand::NotCancel;
+    };
+    if !matches!(verb, "cancel" | "stop") {
+        return ProviderWorkerCancelCommand::NotCancel;
+    }
+    let Some(target) = parts.next() else {
+        return ProviderWorkerCancelCommand::Invalid("missing worker id".to_string());
+    };
+    if parts.next().is_some() {
+        return ProviderWorkerCancelCommand::Invalid("expected exactly one worker id".to_string());
+    }
+    match parse_provider_worker_sequence(target) {
+        Ok(sequence) => ProviderWorkerCancelCommand::Cancel { sequence },
+        Err(error) => ProviderWorkerCancelCommand::Invalid(error),
+    }
+}
+
+fn parse_provider_worker_sequence(target: &str) -> Result<u64, String> {
+    let raw = target
+        .strip_prefix("w#")
+        .or_else(|| target.strip_prefix("W#"))
+        .or_else(|| target.strip_prefix('#'))
+        .unwrap_or(target);
+    if raw.is_empty() {
+        return Err("empty worker id".to_string());
+    }
+    let sequence = raw
+        .parse::<u64>()
+        .map_err(|_| format!("invalid worker id {target:?}"))?;
+    if sequence == 0 {
+        return Err("worker id must be greater than zero".to_string());
+    }
+    Ok(sequence)
+}
+
+fn active_turn_workers_cancel_output(
+    msg: &crate::channels::traits::ChannelMessage,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+) -> Option<(String, Option<ProviderWorkerCancelSignal>)> {
+    let (_priority, content) = classify_input_priority(msg);
+    provider_workers_cancel_output_for_input(&content, scheduler, workers, provider_turn_task_id)
+}
+
+fn provider_workers_cancel_output_for_input(
+    input: &str,
+    scheduler: &mut crate::chat::turn_scheduler::TurnScheduler,
+    workers: &mut crate::chat::turn_worker::ProviderTurnWorkerRegistry,
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+) -> Option<(String, Option<ProviderWorkerCancelSignal>)> {
+    match parse_workers_cancel_command(input) {
+        ProviderWorkerCancelCommand::NotCancel => None,
+        ProviderWorkerCancelCommand::Invalid(error) => Some((
+            format!("Workers cancel failed: {error}.\nUsage: /workers cancel w#N"),
+            None,
+        )),
+        ProviderWorkerCancelCommand::Cancel { sequence } => {
+            let Some(worker) = workers
+                .snapshot()
+                .into_iter()
+                .find(|worker| worker.sequence == sequence)
+            else {
+                return Some((
+                    format!("Workers cancel failed: provider worker w#{sequence} is not retained."),
+                    None,
+                ));
+            };
+            if !matches!(
+                worker.state,
+                crate::chat::turn_worker::ProviderTurnWorkerState::Running
+                    | crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling
+            ) {
+                return Some((
+                    format!(
+                        "Workers cancel ignored: provider worker w#{sequence} is already {}.",
+                        provider_turn_worker_state_label(worker.state)
+                    ),
+                    None,
+                ));
+            }
+            request_provider_turn_cancel(
+                scheduler,
+                workers,
+                Some(worker.task_id),
+                "workers cancel command during active turn",
+            );
+            let state = workers
+                .worker(worker.task_id)
+                .map(|worker| provider_turn_worker_state_label(worker.state))
+                .unwrap_or("unknown");
+            Some((
+                format!(
+                    "Requested cancellation for provider worker w#{sequence} task={} kind={} state={state}.",
+                    worker.task_id.get(),
+                    provider_turn_worker_kind_label(worker.kind),
+                ),
+                Some(
+                    if provider_turn_task_id == Some(worker.task_id)
+                        && worker.kind == crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited
+                    {
+                        ProviderWorkerCancelSignal::CancelRequested
+                    } else {
+                        ProviderWorkerCancelSignal::CancelProviderTurn {
+                            task_id: worker.task_id,
+                        }
+                    },
+                ),
+            ))
+        }
+    }
+}
+
+fn dispatch_provider_worker_cancel_signal(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    signal_cancel: Option<ProviderWorkerCancelSignal>,
+) {
+    let Some(signal) = signal_cancel else {
+        return;
+    };
+    let action = match signal {
+        ProviderWorkerCancelSignal::CancelRequested => crate::chat::action::Action::CancelRequested,
+        ProviderWorkerCancelSignal::CancelProviderTurn { task_id } => {
+            crate::chat::action::Action::CancelProviderTurn { task_id }
+        }
+    };
+    let _ = chat_dispatcher.dispatch_or_log(action, "chat.workers_cancel_provider_turn");
+}
+
+const fn provider_turn_worker_kind_label(kind: crate::chat::turn_worker::ProviderTurnWorkerKind) -> &'static str {
+    match kind {
+        crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited => "foreground_awaited",
+        crate::chat::turn_worker::ProviderTurnWorkerKind::Detached => "detached",
+    }
+}
+
+const fn provider_turn_worker_state_label(state: crate::chat::turn_worker::ProviderTurnWorkerState) -> &'static str {
+    match state {
+        crate::chat::turn_worker::ProviderTurnWorkerState::Running => "running",
+        crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling => "cancelling",
+        crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_) => "awaiting_commit",
+        crate::chat::turn_worker::ProviderTurnWorkerState::Committed => "committed",
+        crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled => "cancelled",
+        crate::chat::turn_worker::ProviderTurnWorkerState::Failed => "failed",
+    }
+}
+
+fn format_provider_worker_report(status: &crate::chat::action::ProviderWorkerStatus) -> String {
+    if status.running == 0
+        && status.cancelling == 0
+        && status.awaiting_commit == 0
+        && status.finalized_payloads == 0
+        && status.rows.is_empty()
+    {
+        return "No main provider workers are active.".to_string();
+    }
+
+    let mut lines = vec![format!(
+        "Main provider workers: {} running, {} cancelling, {} awaiting commit, {} finalized payloads, {} finalized tokens.",
+        status.running,
+        status.cancelling,
+        status.awaiting_commit,
+        status.finalized_payloads,
+        format_worker_tokens_compact(status.finalized_total_tokens),
+    )];
+    let active_rows: Vec<_> = status.rows.iter().filter(|row| row.is_active()).collect();
+    if active_rows.is_empty() {
+        lines.push("No active worker rows are currently retained.".to_string());
+        return lines.join("\n");
+    }
+    for row in active_rows {
+        lines.push(format_provider_worker_report_row(row));
+    }
+    lines.join("\n")
+}
+
+fn format_provider_worker_report_row(row: &crate::chat::action::ProviderWorkerStatusRow) -> String {
+    use crate::chat::action::ProviderWorkerRowState;
+
+    let state = match row.state {
+        ProviderWorkerRowState::Running => "running",
+        ProviderWorkerRowState::Cancelling => "cancelling",
+        ProviderWorkerRowState::AwaitingCommit => "awaiting_commit",
+        ProviderWorkerRowState::Committed => "committed",
+        ProviderWorkerRowState::Cancelled => "cancelled",
+        ProviderWorkerRowState::Failed => "failed",
+    };
+    let elapsed = format_provider_worker_elapsed(row.started_at_ms);
+    let mut line = format!(
+        "- w#{} task={} kind={} state={} completion={} elapsed={elapsed}",
+        row.sequence,
+        row.task_id,
+        crate::chat::action::provider_worker_row_kind_label(row.kind),
+        state,
+        if row.completion_ready { "ready" } else { "pending" },
+    );
+    if let Some(tokens) = row.finalized_total_tokens.filter(|tokens| *tokens > 0) {
+        line.push_str(" tokens=");
+        line.push_str(&format_worker_tokens_compact(tokens));
+    }
+    line
+}
+
+fn format_provider_worker_elapsed(started_at_ms: i64) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+    let elapsed_secs = u64::try_from(elapsed_ms / 1000).unwrap_or_default();
+    crate::chat::sessions::model::format_elapsed_compact(elapsed_secs)
+}
+
+fn format_worker_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        let whole = tokens / 1_000;
+        let decimal = (tokens % 1_000) / 100;
+        if decimal == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{decimal}k")
+        }
+    } else {
+        tokens.to_string()
+    }
+}
+
+fn local_session_command(input: &str) -> Option<crate::chat::sessions::SessionCommand> {
+    let action = crate::chat::sessions::parse_session_command(input)?;
+    match action {
+        crate::chat::sessions::SessionCommand::Sessions
+        | crate::chat::sessions::SessionCommand::Logs { .. }
+        | crate::chat::sessions::SessionCommand::Kill { .. } => Some(action),
+        _ => None,
+    }
+}
+
+fn format_input_backlog_report(
+    backlog: &std::collections::VecDeque<QueuedInputMessage>,
+    scheduler: &crate::chat::turn_scheduler::TurnScheduler,
+    max_preview: usize,
+) -> String {
+    let status = scheduler.status();
+    let mut lines = vec![format!(
+        "Main queue: {} queued ({} priority), {} running.",
+        status.queued, status.priority_queued, status.running
+    )];
+    if backlog.is_empty() {
+        lines.push("Queue is empty.".to_string());
+        return lines.join("\n");
+    }
+    for (idx, queued) in backlog.iter().take(max_preview).enumerate() {
+        let label = match queued.priority {
+            InputQueuePriority::Normal => "normal",
+            InputQueuePriority::Priority => "priority",
+            InputQueuePriority::Control => "control",
+        };
+        let preview = truncate_chars_for_queued_notice(
+            &queued.msg.content.split_whitespace().collect::<Vec<_>>().join(" "),
+            120,
+        );
+        lines.push(format!("{}. [{}] {}", idx + 1, label, preview));
+    }
+    let hidden = backlog.len().saturating_sub(max_preview);
+    if hidden > 0 {
+        lines.push(format!("... {hidden} more queued."));
+    }
+    lines.join("\n")
+}
+
+fn drain_available_input_messages(
+    input_rx: &mut mpsc::Receiver<crate::channels::traits::ChannelMessage>,
+    backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
+    mut scheduler: Option<&mut crate::chat::turn_scheduler::TurnScheduler>,
+    history_base_len: usize,
+) {
+    while let Ok(msg) = input_rx.try_recv() {
+        if let Some(scheduler) = scheduler.as_deref_mut() {
+            enqueue_input_message_with_scheduler(backlog, scheduler, msg, history_base_len);
+        } else {
+            enqueue_input_message(backlog, msg);
+        }
+    }
+}
+
+fn format_queued_input_notice(input: &str, priority: InputQueuePriority) -> String {
+    let (_, text) = input_priority_from_text(input);
+    let label = match priority {
+        InputQueuePriority::Normal => "queued",
+        InputQueuePriority::Priority => "priority queued",
+        InputQueuePriority::Control => "control queued",
+    };
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let preview = truncate_chars_for_queued_notice(&collapsed, 160);
+    format!("{label} > {preview}")
+}
+
+fn truncate_chars_for_queued_notice(input: &str, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input.to_string();
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = input.chars().take(keep).collect();
+    out.push('…');
+    out
+}
+
+fn rollback_cancelled_turn_history(history: &mut Vec<ChatMessage>, len_before_user_turn: usize) {
+    history.truncate(len_before_user_turn);
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -6369,12 +10692,18 @@ struct CrosstermExternalEditorTerminalMode;
 
 #[cfg(feature = "terminal-tui")]
 fn write_external_editor_suspend_sequences(out: &mut dyn std::io::Write) {
-    crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(out);
+    crate::chat::sessions::pty::write_chat_alt_screen_leave_for_handoff(
+        out,
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+    );
 }
 
 #[cfg(feature = "terminal-tui")]
 fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write) {
-    crate::chat::sessions::pty::write_handoff_terminal_restore(out);
+    crate::chat::sessions::pty::write_handoff_terminal_restore(
+        out,
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+    );
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -6837,7 +11166,19 @@ fn open_transcript_view(
     mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: Option<&mpsc::Sender<()>>,
+    snapshot_rx: Option<&tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
 ) {
+    let snapshot_source = snapshot_rx.and_then(|rx| {
+        let snapshot = rx.borrow();
+        if snapshot.conversation_lines.is_empty() {
+            None
+        } else {
+            Some((
+                snapshot.session_title.to_string(),
+                snapshot.conversation_lines.as_ref().clone(),
+            ))
+        }
+    });
     let (view, focus) = {
         let mut guard = mirror.lock();
         let previous_offset = guard
@@ -6845,7 +11186,11 @@ fn open_transcript_view(
             .as_ref()
             .filter(|view| view.kind == crate::chat::sessions::model::ManagedKind::Transcript.as_str())
             .map_or(0, |view| view.scroll_offset);
-        let view = tui::build_transcript_view(&guard.session_title, &guard.conversation_lines, previous_offset);
+        let view = if let Some((session_title, conversation_lines)) = snapshot_source {
+            tui::build_transcript_view(&session_title, &conversation_lines, previous_offset)
+        } else {
+            tui::build_transcript_view(&guard.session_title, &guard.conversation_lines, previous_offset)
+        };
         let focus = crate::chat::sessions::FocusTarget::Transcript;
         guard.focus = focus;
         guard.active_session_view = Some(view.clone());
@@ -6957,6 +11302,86 @@ fn close_diff_view(
     let _ = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
         "chat.diff_view_close",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
+#[cfg(feature = "terminal-tui")]
+fn open_provider_worker_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: Option<&mpsc::Sender<()>>,
+    sequence: u64,
+) {
+    let (view, focus) = {
+        let mut guard = mirror.lock();
+        let previous_view = guard
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = tui::provider_worker_io_lines_for_streaming_draft(
+            &guard.conversation_lines,
+            guard.streaming_draft_for_worker(sequence),
+            12,
+        );
+        let view = crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+            &guard.provider_worker_status,
+            sequence,
+            previous_view,
+            io_lines,
+        );
+        let focus = crate::chat::sessions::FocusTarget::Worker { sequence };
+        guard.focus = focus;
+        guard.strip_selection = None;
+        guard.active_session_view = Some(view.clone());
+        (view, focus)
+    };
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SwitcherClosed,
+        "chat.switcher_closed_worker_view",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged { focus },
+        "chat.provider_worker_focus_open",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: Some(view) },
+        "chat.provider_worker_view_open",
+    );
+    if let Some(tx) = redraw_tx {
+        let _ = tx.try_send(());
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn close_provider_worker_view(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+) {
+    {
+        let mut guard = mirror.lock();
+        if !matches!(guard.focus, crate::chat::sessions::FocusTarget::Worker { .. })
+            && guard
+                .active_session_view
+                .as_ref()
+                .is_none_or(|view| view.kind != crate::chat::action::PROVIDER_WORKER_VIEW_KIND)
+        {
+            return;
+        }
+        guard.focus = crate::chat::sessions::FocusTarget::Main;
+        guard.strip_selection = None;
+        guard.active_session_view = None;
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::SessionFocusChanged {
+            focus: crate::chat::sessions::FocusTarget::Main,
+        },
+        "chat.provider_worker_focus_close",
+    );
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
+        "chat.provider_worker_view_close",
     );
     let _ = redraw_tx.try_send(());
 }
@@ -7074,7 +11499,11 @@ async fn reattach_pty(
         // the ack times out we do NOT proceed (running while the render loop might
         // still touch the terminal would corrupt the screen). `acquire` un-pauses
         // the render loop itself on timeout, so we just report the abort.
-        let Some(_guard) = PtyHandoffGuard::acquire(handoff, redraw_nudge) else {
+        let Some(_guard) = PtyHandoffGuard::acquire(
+            handoff,
+            redraw_nudge,
+            CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+        ) else {
             return PtyOutcome::AttachAborted;
         };
         PtyOutcome::Exited(run_pty_attach(&session_for_passthrough))
@@ -7385,6 +11814,8 @@ fn run_tui_unified_loop(
     chat_dispatcher: &dispatcher::ChatDispatcher,
     snapshot_rx: Option<tokio::sync::watch::Receiver<Arc<crate::chat::state::UiSnapshot>>>,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
+    workspace_dir: std::path::PathBuf,
+    security: Arc<crate::security::SecurityPolicy>,
 ) -> Result<()> {
     use crate::channels::traits::ChannelMessage;
     use crate::chat::action::Action;
@@ -7528,6 +11959,13 @@ fn run_tui_unified_loop(
                         let _ =
                             chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_key_burst");
                         mirror.lock().input.paste(&text);
+                        refresh_at_path_candidates_for_tui(
+                            &mirror,
+                            chat_dispatcher,
+                            &redraw_tx,
+                            &workspace_dir,
+                            &security,
+                        );
                         skip_next_draw = true;
                         continue;
                     }
@@ -7568,7 +12006,14 @@ fn run_tui_unified_loop(
                 }
                 let _ = chat_dispatcher.dispatch_or_log(Action::KeyPressed(key), "chat.tui_key_pressed");
 
+                sync_key_mirror_observation_state(&render_source, &mirror);
+                let switcher_open_before_dispatch = mirror.lock().switcher.is_some();
                 let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                if !(key.code == crossterm::event::KeyCode::Esc
+                    && key.modifiers == crossterm::event::KeyModifiers::NONE)
+                {
+                    refresh_at_path_candidates_for_tui(&mirror, chat_dispatcher, &redraw_tx, &workspace_dir, &security);
+                }
                 // C1 fix: any consumed keystroke may have mutated visible
                 // state — typing in the input box, Tab folding a card,
                 // Ctrl+R reverse-searching history, Esc clearing the buffer,
@@ -7585,9 +12030,31 @@ fn run_tui_unified_loop(
                 }
                 match dispatch {
                     tui::KeyDispatch::Submitted(text) => {
+                        if switcher_open_before_dispatch {
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SwitcherClosed,
+                                "chat.switcher_closed_submit",
+                            );
+                        }
                         let trimmed = text.trim().to_string();
                         if trimmed.is_empty() {
                             continue;
+                        }
+                        let (input_priority, _) = input_priority_from_text(&trimmed);
+                        let activity_active = render_source
+                            .with_view(|view| tui::execution_activity_active_for_view(view))
+                            || mirror.lock().execution_activity_active();
+                        if activity_active {
+                            let notice = if is_active_turn_local_command(&trimmed) {
+                                format_active_turn_local_notice(&trimmed)
+                            } else {
+                                format_queued_input_notice(&trimmed, input_priority)
+                            };
+                            let _ = chat_dispatcher.dispatch_or_log(
+                                crate::chat::action::Action::SystemMessageAdded { text: notice },
+                                "chat.input_queued_during_activity",
+                            );
+                            let _ = redraw_tx.try_send(());
                         }
                         let timestamp = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
@@ -7601,6 +12068,9 @@ fn run_tui_unified_loop(
                             channel: "terminal".to_string(),
                             timestamp,
                             thread_ts: None,
+                            chat_kind: crate::channels::traits::ChatKind::Dm,
+                            chat_title: None,
+                            sender_display: None,
                             mentioned_uuids: vec![],
                             mentioned: false,
                             is_group_hint: false,
@@ -7645,6 +12115,9 @@ fn run_tui_unified_loop(
                         }
                         // Single Ctrl+C is handled by the reducer path
                         // (Action::CancelRequested -> Effect::CancelToken).
+                        if mirror.lock().clear_pending_tool_approval() {
+                            let _ = redraw_tx.try_send(());
+                        }
                         let _ = chat_dispatcher.dispatch_or_log(
                             crate::chat::action::Action::CancelRequested,
                             "chat.cancel_tui_single_ctrlc",
@@ -7757,6 +12230,12 @@ fn run_tui_unified_loop(
                     tui::KeyDispatch::CloseTranscriptViewer => {
                         close_transcript_view(&mirror, chat_dispatcher, &redraw_tx);
                     }
+                    tui::KeyDispatch::OpenProviderWorkerView { sequence } => {
+                        open_provider_worker_view(&mirror, chat_dispatcher, Some(&redraw_tx), sequence);
+                    }
+                    tui::KeyDispatch::CloseProviderWorkerView => {
+                        close_provider_worker_view(&mirror, chat_dispatcher, &redraw_tx);
+                    }
                     tui::KeyDispatch::CloseDiffViewer => {
                         close_diff_view(&mirror, chat_dispatcher, &redraw_tx);
                     }
@@ -7776,6 +12255,13 @@ fn run_tui_unified_loop(
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::InputReplaced(text),
                                     "chat.external_editor_input_replaced",
+                                );
+                                refresh_at_path_candidates_for_tui(
+                                    &mirror,
+                                    chat_dispatcher,
+                                    &redraw_tx,
+                                    &workspace_dir,
+                                    &security,
                                 );
                                 let _ = redraw_tx.try_send(());
                             }
@@ -7843,7 +12329,11 @@ fn run_tui_unified_loop(
                             false,
                         );
                     }
-                    tui::KeyDispatch::Cancelled | tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
+                    tui::KeyDispatch::Cancelled => {
+                        let _ = chat_dispatcher
+                            .dispatch_or_log(crate::chat::action::Action::CancelRequested, "chat.cancel_tui_esc");
+                    }
+                    tui::KeyDispatch::Consumed | tui::KeyDispatch::Ignored => {}
                 }
             }
             Event::Paste(text) => {
@@ -7864,6 +12354,7 @@ fn run_tui_unified_loop(
                 }
                 let _ = chat_dispatcher.dispatch_or_log(Action::PasteReceived(text.clone()), "chat.tui_paste");
                 mirror.lock().input.paste(&text);
+                refresh_at_path_candidates_for_tui(&mirror, chat_dispatcher, &redraw_tx, &workspace_dir, &security);
                 // Paste mutates `input.lines` directly so the chrome must
                 // repaint; without this kick the next redraw is gated on
                 // the 50 ms poll.
@@ -7879,6 +12370,26 @@ fn run_tui_unified_loop(
             Event::Mouse(mouse) => {
                 if apply_fullscreen_mouse_scroll(mouse.kind, &mut fullscreen_scroll) {
                     let _ = redraw_tx.try_send(());
+                } else if matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                ) {
+                    if let Ok(size) = terminal.size() {
+                        let toggled = {
+                            let mut guard = mirror.lock();
+                            tui::toggle_reasoning_at_fullscreen_point(
+                                &mut guard,
+                                &fullscreen_scroll,
+                                size.width,
+                                size.height,
+                                mouse.column,
+                                mouse.row,
+                            )
+                        };
+                        if toggled {
+                            let _ = redraw_tx.try_send(());
+                        }
+                    }
                 }
             }
             _ => {
@@ -8183,6 +12694,7 @@ struct ChatSwitchCtx<'a> {
     session_rings:
         &'a mut std::collections::HashMap<crate::chat::sessions::id::SessionId, crate::chat::sessions::SessionRing>,
     reported_sessions: &'a mut std::collections::HashSet<String>,
+    announced_started_sessions: &'a mut std::collections::HashSet<String>,
     last_sessions_summary: &'a mut String,
     last_sessions_entries: &'a mut Vec<crate::chat::sessions::SwitcherEntry>,
     attached_follow: &'a mut Option<crate::chat::sessions::id::SessionId>,
@@ -8311,6 +12823,7 @@ fn request_diff_apply_approval(
     let args = plan.approval_args_json();
     let dispatch_result = chat_dispatcher.dispatch_or_log(
         crate::chat::action::Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: tool_id.clone(),
             name: "apply_fenced_diff".to_string(),
             args,
@@ -8389,6 +12902,7 @@ async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_sessio
     ctx.ignored_session_events.extend(ignored_ids);
     ctx.session_rings.clear();
     ctx.reported_sessions.clear();
+    ctx.announced_started_sessions.clear();
     ctx.last_sessions_summary.clear();
     ctx.last_sessions_entries.clear();
     *ctx.attached_follow = None;
@@ -8457,6 +12971,7 @@ async fn apply_chat_session_switch(mut ctx: ChatSwitchCtx<'_>, mut loaded_sessio
         mirror.sessions_cache.clear();
         mirror.active_session_view = None;
         mirror.pending_tool_approval = None;
+        mirror.context_used_tokens = None;
         mirror.context_window_tokens = None;
         mirror.token_usage_summary = ctx.chat_session.token_usage_summary();
         mirror.external_editor_prefix_armed = false;
@@ -9358,6 +13873,52 @@ mod file_mention_tests {
         assert!(enriched.prompt.starts_with("inspect @dir"));
     }
 
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn at_path_candidates_are_relative_sorted_and_security_filtered() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(temp.path().join("src")).expect("create src");
+        std::fs::write(temp.path().join("src").join("main.rs"), "fn main() {}\n").expect("write main");
+        std::fs::write(temp.path().join("setup.rs"), "// setup\n").expect("write setup");
+
+        #[cfg(unix)]
+        let outside = tempfile::tempdir().expect("outside");
+        #[cfg(unix)]
+        {
+            std::fs::write(outside.path().join("secret.rs"), "secret\n").expect("write outside");
+            std::os::unix::fs::symlink(outside.path().join("secret.rs"), temp.path().join("secret.rs"))
+                .expect("symlink");
+        }
+
+        let policy = SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            workspace_dir: temp.path().to_path_buf(),
+            forbidden_paths: Vec::new(),
+            ..SecurityPolicy::default()
+        };
+        let mut input = tui::TuiInput::new();
+        input.set_text("@s");
+
+        let candidates = collect_at_path_candidates(&input, temp.path(), &policy);
+
+        let paths = candidates
+            .iter()
+            .map(|candidate| candidate.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths.first().copied(), Some("src/"), "directories sort first");
+        assert!(paths.contains(&"setup.rs"));
+        assert!(
+            !paths.contains(&"secret.rs"),
+            "symlink escaping workspace must be filtered by resolved-path policy"
+        );
+
+        input.set_text("@../");
+        assert!(
+            collect_at_path_candidates(&input, temp.path(), &policy).is_empty(),
+            "traversal filter is blocked before directory enumeration"
+        );
+    }
+
     #[tokio::test]
     async fn file_mention_caps_file_count_and_bytes() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -9683,6 +14244,8 @@ mod terminal_guard_tests {
         calls: Vec<&'static str>,
         fail_enable_bracketed_paste: bool,
         fail_enable_mouse_capture: bool,
+        keyboard_enhancement_supported: bool,
+        fail_push_keyboard_enhancement: bool,
     }
 
     impl TerminalModeOps for FakeTerminalModeOps {
@@ -9693,6 +14256,25 @@ mod terminal_guard_tests {
 
         fn disable_raw_mode(&mut self) -> std::io::Result<()> {
             self.calls.push("disable_raw_mode");
+            Ok(())
+        }
+
+        fn supports_keyboard_enhancement(&mut self) -> std::io::Result<bool> {
+            self.calls.push("supports_keyboard_enhancement");
+            Ok(self.keyboard_enhancement_supported)
+        }
+
+        fn push_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+            self.calls.push("push_keyboard_enhancement_flags");
+            if self.fail_push_keyboard_enhancement {
+                Err(std::io::Error::other("push keyboard enhancement failed"))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn pop_keyboard_enhancement_flags(&mut self) -> std::io::Result<()> {
+            self.calls.push("pop_keyboard_enhancement_flags");
             Ok(())
         }
 
@@ -9746,6 +14328,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(false),
             bracketed_paste_active: AtomicBool::new(false),
+            keyboard_enhancement_active: AtomicBool::new(false),
             mouse_capture_active: AtomicBool::new(false),
             alternate_screen_active: AtomicBool::new(false),
         }
@@ -9760,6 +14343,7 @@ mod terminal_guard_tests {
         TerminalGuard {
             raw_mode_active: AtomicBool::new(true),
             bracketed_paste_active: AtomicBool::new(true),
+            keyboard_enhancement_active: AtomicBool::new(true),
             mouse_capture_active: AtomicBool::new(true),
             alternate_screen_active: AtomicBool::new(true),
         }
@@ -9774,6 +14358,7 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
     }
@@ -9788,11 +14373,13 @@ mod terminal_guard_tests {
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
         // Second leave is a no-op (CAS fails, no crossterm calls).
         guard.leave();
         assert!(!guard.raw_mode_active.load(Ordering::Acquire));
+        assert!(!guard.keyboard_enhancement_active.load(Ordering::Acquire));
         assert!(!guard.bracketed_paste_active.load(Ordering::Acquire));
         assert!(!guard.mouse_capture_active.load(Ordering::Acquire));
         assert!(!guard.alternate_screen_active.load(Ordering::Acquire));
@@ -9823,6 +14410,32 @@ mod terminal_guard_tests {
     fn fullscreen_terminal_lifecycle_enters_and_leaves_alternate_screen_in_order() {
         let mut ops = FakeTerminalModeOps::default();
         let state = enter_terminal_state_with_ops(&mut ops).unwrap();
+        assert!(
+            !state.mouse_capture_active,
+            "mouse capture is opt-in so native terminal selection works"
+        );
+        leave_terminal_state_with_ops(&mut ops, state);
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "supports_keyboard_enhancement",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_terminal_lifecycle_can_opt_into_mouse_capture() {
+        let mut ops = FakeTerminalModeOps::default();
+        let state = enter_terminal_state_with_ops_inner(&mut ops, true).unwrap();
+        assert!(state.mouse_capture_active);
         leave_terminal_state_with_ops(&mut ops, state);
 
         assert_eq!(
@@ -9831,6 +14444,7 @@ mod terminal_guard_tests {
                 "enable_raw_mode",
                 "enter_alternate_screen",
                 "enable_mouse_capture",
+                "supports_keyboard_enhancement",
                 "enable_bracketed_paste",
                 "disable_bracketed_paste",
                 "show_cursor",
@@ -9848,7 +14462,7 @@ mod terminal_guard_tests {
             ..FakeTerminalModeOps::default()
         };
 
-        let err = enter_terminal_state_with_ops(&mut ops).unwrap_err();
+        let err = enter_terminal_state_with_ops_inner(&mut ops, true).unwrap_err();
 
         assert_eq!(err.kind(), std::io::ErrorKind::Other);
         assert_eq!(
@@ -9878,9 +14492,65 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
-                "enable_mouse_capture",
+                "supports_keyboard_enhancement",
                 "enable_bracketed_paste",
-                "disable_mouse_capture",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_enter_rolls_back_when_keyboard_enhancement_push_fails() {
+        let mut ops = FakeTerminalModeOps {
+            keyboard_enhancement_supported: true,
+            fail_push_keyboard_enhancement: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let err = enter_terminal_state_with_ops(&mut ops).unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::Other);
+        assert!(!CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(Ordering::Acquire));
+        assert!(
+            !CHAT_FULLSCREEN_ACTIVE.load(Ordering::Acquire),
+            "failed keyboard-enhancement push must roll back fullscreen active flag"
+        );
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "supports_keyboard_enhancement",
+                "push_keyboard_enhancement_flags",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
+    }
+
+    #[test]
+    fn fullscreen_terminal_lifecycle_pushes_and_pops_keyboard_enhancement_when_supported() {
+        let mut ops = FakeTerminalModeOps {
+            keyboard_enhancement_supported: true,
+            ..FakeTerminalModeOps::default()
+        };
+
+        let state = enter_terminal_state_with_ops(&mut ops).unwrap();
+        assert!(state.keyboard_enhancement_active);
+        leave_terminal_state_with_ops(&mut ops, state);
+
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "supports_keyboard_enhancement",
+                "push_keyboard_enhancement_flags",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "pop_keyboard_enhancement_flags",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -9893,12 +14563,7 @@ mod terminal_guard_tests {
         restore_terminal_state_with_ops(&mut inline_ops, false);
         assert_eq!(
             inline_ops.calls,
-            vec![
-                "disable_bracketed_paste",
-                "show_cursor",
-                "disable_mouse_capture",
-                "disable_raw_mode"
-            ]
+            vec!["disable_bracketed_paste", "show_cursor", "disable_raw_mode"]
         );
 
         let mut fullscreen_ops = FakeTerminalModeOps::default();
@@ -9908,7 +14573,6 @@ mod terminal_guard_tests {
             vec![
                 "disable_bracketed_paste",
                 "show_cursor",
-                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -9941,7 +14605,7 @@ mod terminal_guard_tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn plain_mode_suppresses_context_budget_warning_chrome() {
+    fn plain_mode_does_not_emit_context_budget_chrome() {
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Aggressive,
             reserve_tokens: 5,
@@ -9955,19 +14619,17 @@ mod terminal_guard_tests {
             ChatMessage::system("sys"),
             ChatMessage::user("context pressure ".repeat(400)),
         ];
-        let budget = plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
-        assert!(budget.over_warning, "fixture must cross the warning threshold");
+        let budget =
+            crate::agent::loop_::plan_context_budget(&history, &config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+        assert!(budget.used_tokens > 0, "fixture must produce context usage");
         let terminal_tui_enabled = should_enable_terminal_tui(true, true, Some("1"));
         assert!(
-            context_budget_warning_for_tui(&history, &config, terminal_tui_enabled).is_none(),
-            "--plain must not emit context warning chrome"
+            context_budget_status_for_tui(&history, &config, terminal_tui_enabled).is_none(),
+            "--plain must not emit context budget chrome"
         );
-        assert!(
-            context_budget_warning_for_tui(&history, &config, true)
-                .unwrap_or_default()
-                .contains("Context budget warning:"),
-            "non-plain TUI path should still produce the warning"
-        );
+        let status = context_budget_status_for_tui(&history, &config, true).expect("TUI context budget status");
+        assert_eq!(status.used_context_tokens, budget.used_tokens);
+        assert_eq!(status.max_context_tokens, budget.max_context_tokens);
     }
 
     #[test]
@@ -10228,6 +14890,154 @@ mod s4_a_4 {
             assert_eq!(view.provider(), "ps");
             assert_eq!(view.model(), "ms");
         });
+    }
+
+    #[test]
+    fn snapshot_render_source_syncs_provider_worker_status_into_key_mirror() {
+        let mirror = Arc::new(parking_lot::Mutex::new(TuiState::new("p", "m")));
+        let mut state = ChatState::new(Arc::from("ps"), Arc::from("ms"), CancellationToken::new());
+        state.ui.provider_worker_status = crate::chat::action::ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            rows: vec![crate::chat::action::ProviderWorkerStatusRow {
+                task_id: 42,
+                sequence: 7,
+                kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                state: crate::chat::action::ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        };
+        let snap = Arc::new(state.build_ui_snapshot(1));
+        let (_tx, rx) = watch::channel(snap);
+        let src = RenderSource::Snapshot(rx);
+
+        sync_key_mirror_observation_state(&src, &mirror);
+
+        let status = mirror.lock().provider_worker_status.clone();
+        assert_eq!(status.running, 1);
+        assert_eq!(status.rows.first().map(|row| row.sequence), Some(7));
+    }
+
+    #[test]
+    fn phase2_snapshot_mirror_sync_uses_focused_worker_draft_not_primary() {
+        let mirror = Arc::new(parking_lot::Mutex::new(TuiState::new("p", "m")));
+        {
+            let mut guard = mirror.lock();
+            guard.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 20 };
+        }
+        let mut state = ChatState::new(Arc::from("ps"), Arc::from("ms"), CancellationToken::new());
+        state.ui.provider_worker_status = crate::chat::action::ProviderWorkerStatus {
+            running: 2,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 10,
+                    sequence: 10,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: crate::chat::action::ProviderWorkerRowState::Running,
+                    started_at_ms: 0,
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 20,
+                    sequence: 20,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: crate::chat::action::ProviderWorkerRowState::Running,
+                    started_at_ms: 0,
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+            ],
+        };
+        let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
+            provider_turn_task_id: None,
+            provider_turn_sequence: Some(10),
+            draft_id: "draft-a".to_string(),
+            history: vec![crate::providers::ChatMessage::user("first")],
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StartLLMTurn {
+            provider_turn_task_id: None,
+            provider_turn_sequence: Some(20),
+            draft_id: "draft-b".to_string(),
+            history: vec![crate::providers::ChatMessage::user("second")],
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
+            draft_id: "draft-a".to_string(),
+            delta: "A primary live".to_string(),
+            version: 1,
+        });
+        let _ = state.reduce(crate::chat::action::Action::StreamChunkReceived {
+            draft_id: "draft-b".to_string(),
+            delta: "B focused live".to_string(),
+            version: 1,
+        });
+        let snap = Arc::new(state.build_ui_snapshot(1));
+        assert_eq!(
+            snap.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+            Some("draft-a")
+        );
+        assert_eq!(
+            snap.streaming_draft_for_worker(20)
+                .map(|draft| draft.accumulated.as_str()),
+            Some("B focused live")
+        );
+        let (_tx, rx) = watch::channel(snap);
+        let src = RenderSource::Snapshot(rx);
+
+        sync_key_mirror_observation_state(&src, &mirror);
+
+        let guard = mirror.lock();
+        assert_eq!(
+            guard
+                .streaming_draft_for_worker(20)
+                .map(|draft| draft.accumulated.as_str()),
+            Some("B focused live")
+        );
+        let view = guard.active_session_view.as_ref().expect("focused worker view");
+        let text = view.lines.join("\n");
+        assert!(text.contains("assistant streaming: B focused live"), "{text}");
+        assert!(!text.contains("A primary live"), "{text}");
+        drop(guard);
+
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+        open_provider_worker_view(&mirror, &dispatcher, None, 20);
+        match action_rx.try_recv().expect("switcher close action") {
+            crate::chat::action::Action::SwitcherClosed => {}
+            other => panic!("expected SwitcherClosed, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Worker { sequence: 20 });
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active worker view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                let text = view.expect("worker view").lines.join("\n");
+                assert!(text.contains("assistant streaming: B focused live"), "{text}");
+                assert!(!text.contains("A primary live"), "{text}");
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -10706,6 +15516,7 @@ mod p6b2_external_editor_tests {
 
     #[test]
     fn external_editor_fullscreen_suspend_leaves_alt_and_restore_reenters() {
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, Ordering::SeqCst);
         let mut suspend = Vec::new();
         write_external_editor_suspend_sequences(&mut suspend);
         let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
@@ -10732,10 +15543,34 @@ mod p6b2_external_editor_tests {
             "fullscreen editor restore must re-enable chat mouse capture after chat alt-screen: {restore:?}"
         );
     }
+
+    #[test]
+    fn external_editor_handoff_pops_and_repushes_keyboard_flags_when_active() {
+        let previous = CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.swap(true, Ordering::SeqCst);
+
+        let mut suspend = Vec::new();
+        write_external_editor_suspend_sequences(&mut suspend);
+        let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
+        assert!(
+            suspend.starts_with("\x1b[<1u"),
+            "active keyboard enhancement must be popped before editor handoff: {suspend:?}"
+        );
+
+        let mut restore = Vec::new();
+        write_external_editor_restore_sequences(&mut restore);
+        let restore = String::from_utf8(restore).expect("test: restore escape bytes are utf-8");
+        assert!(
+            restore.ends_with("\x1b[>15u"),
+            "active keyboard enhancement must be re-pushed after editor handoff: {restore:?}"
+        );
+
+        CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(previous, Ordering::SeqCst);
+    }
 }
 
 #[cfg(test)]
 #[cfg(feature = "terminal-tui")]
+#[allow(clippy::indexing_slicing)]
 mod p3_directional_switch_tests {
     use super::*;
     use crate::chat::sessions::id::SessionId;
@@ -10763,6 +15598,2986 @@ mod p3_directional_switch_tests {
 
         assert_eq!(focus, crate::chat::sessions::FocusTarget::Session { seq });
         assert_eq!(attach_command_for_seq(seq), "/attach 42");
+    }
+
+    #[test]
+    fn synthetic_ui_command_is_identified_for_hidden_echo_path() {
+        let mut msg = crate::channels::traits::ChannelMessage {
+            id: "synthetic".to_string(),
+            sender: SYNTHETIC_UI_COMMAND_SENDER.to_string(),
+            reply_target: "user".to_string(),
+            content: "/attach 42".to_string(),
+            channel: "terminal".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        };
+
+        assert!(is_synthetic_ui_command(&msg));
+
+        msg.sender = "user".to_string();
+        assert!(!is_synthetic_ui_command(&msg));
+    }
+
+    fn input_msg(content: &str) -> crate::channels::traits::ChannelMessage {
+        crate::channels::traits::ChannelMessage {
+            id: uuid::Uuid::new_v4().to_string(),
+            sender: "user".to_string(),
+            reply_target: "user".to_string(),
+            content: content.to_string(),
+            channel: "terminal".to_string(),
+            timestamp: 0,
+            thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: false,
+            sender_is_bot: false,
+        }
+    }
+
+    #[test]
+    fn priority_input_prefix_is_stripped_for_execution() {
+        let (priority, content) = input_priority_from_text("  /now   inspect queue  ");
+        assert_eq!(priority, InputQueuePriority::Priority);
+        assert_eq!(content, "inspect queue");
+
+        let (priority, content) = input_priority_from_text("!! urgent");
+        assert_eq!(priority, InputQueuePriority::Priority);
+        assert_eq!(content, "urgent");
+    }
+
+    #[test]
+    fn active_turn_enqueue_reports_priority_and_strips_prefix() {
+        let mut backlog = std::collections::VecDeque::new();
+
+        let priority = enqueue_input_message_and_return_priority(&mut backlog, input_msg("/now inspect status"));
+
+        assert_eq!(priority, InputQueuePriority::Priority);
+        let msg = pop_next_input_message(&mut backlog).expect("queued priority message");
+        assert_eq!(msg.content, "inspect status");
+    }
+
+    #[test]
+    fn input_backlog_status_counts_priority_messages() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        enqueue_input_message(&mut backlog, input_msg("/priority urgent two"));
+        enqueue_input_message(&mut backlog, input_msg("normal three"));
+
+        let status = input_backlog_status(&backlog);
+
+        assert_eq!(status.queued, 3);
+        assert_eq!(status.priority, 1);
+    }
+
+    #[test]
+    fn scheduler_mirror_projects_same_queue_status_as_backlog() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 5);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 5);
+
+        assert_eq!(input_backlog_status(&backlog), scheduler.status().main_queue_status());
+        assert_eq!(scheduler.status().main_queue_status().queued, 2);
+        assert_eq!(scheduler.status().main_queue_status().priority, 1);
+    }
+
+    #[test]
+    fn scheduler_mirror_does_not_change_priority_pop_order() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 7);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 7);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal three"), 7);
+
+        let first = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("priority first");
+        let second = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("normal one second");
+        let third = pop_next_input_message_with_scheduler(&mut backlog, &mut scheduler).expect("normal three third");
+
+        assert_eq!(first.content, "urgent two");
+        assert_eq!(second.content, "normal one");
+        assert_eq!(third.content, "normal three");
+        assert_eq!(
+            scheduler.status().main_queue_status(),
+            crate::chat::action::MainQueueStatus::default()
+        );
+    }
+
+    #[test]
+    fn dequeued_input_task_id_is_reused_for_provider_start() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal provider turn"), 7);
+        let expected_id = backlog
+            .front()
+            .and_then(|queued| queued.turn_task_id)
+            .expect("queued task id");
+
+        let dequeued = pop_next_input_task_with_scheduler(&mut backlog, &mut scheduler).expect("dequeued input");
+
+        assert_eq!(dequeued.turn_task_id, Some(expected_id));
+        assert_eq!(
+            scheduler.task(expected_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Dispatched
+        );
+        assert_eq!(
+            scheduler.status().main_queue_status(),
+            crate::chat::action::MainQueueStatus::default()
+        );
+
+        let provider_id = start_provider_turn_task(&mut scheduler, dequeued.turn_task_id, &dequeued.msg.content, 7)
+            .expect("provider task id");
+
+        assert_eq!(provider_id, expected_id);
+        assert_eq!(
+            scheduler.task(provider_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Running
+        );
+    }
+
+    #[test]
+    fn queue_report_summarizes_backlog_with_preview() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 3);
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("/priority urgent two"), 3);
+        let running = scheduler.enqueue("running turn", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(running).expect("running turn starts");
+
+        let report = format_input_backlog_report(&backlog, &scheduler, 8);
+
+        assert!(
+            report.contains("Main queue: 2 queued (1 priority), 1 running."),
+            "{report}"
+        );
+        assert!(report.contains("1. [normal] normal one"), "{report}");
+        assert!(report.contains("2. [priority] urgent two"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn active_turn_queue_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal one"), 3);
+        let running = scheduler.enqueue("active turn", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(running).expect("active turn starts");
+        let msg = input_msg("/now /queue");
+        let chat_session = session::ChatSession::new("p", "m");
+        let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("queue command output");
+
+        assert!(
+            output.contains("Main queue: 1 queued (0 priority), 1 running."),
+            "{output}"
+        );
+        assert_eq!(backlog.len(), 1, "read-only queue command must not mutate backlog");
+    }
+
+    #[tokio::test]
+    async fn active_turn_cost_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let msg = input_msg("/now /cost");
+        let chat_session = session::ChatSession::new("p", "m");
+        let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("cost command output");
+
+        assert!(output.contains("Session cost:"), "{output}");
+        assert!(output.contains("Turns:"), "{output}");
+        assert_eq!(backlog.len(), 1, "read-only cost command must not mutate backlog");
+    }
+
+    #[tokio::test]
+    async fn active_turn_workers_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let msg = input_msg("/now /workers");
+        let chat_session = session::ChatSession::new("p", "m");
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("long worker", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("worker starts");
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("workers command output");
+
+        assert!(output.contains("Main provider workers: 1 running"), "{output}");
+        assert!(output.contains("w#1 task="), "{output}");
+        assert!(output.contains("kind=foreground_awaited"), "{output}");
+        assert!(output.contains("state=running"), "{output}");
+        assert_eq!(backlog.len(), 1, "read-only workers command must not mutate backlog");
+    }
+
+    #[test]
+    fn workers_cancel_command_parser_accepts_worker_sequence_forms() {
+        assert_eq!(
+            parse_workers_cancel_command("/workers cancel w#7"),
+            ProviderWorkerCancelCommand::Cancel { sequence: 7 }
+        );
+        assert_eq!(
+            parse_workers_cancel_command("/workers stop #8"),
+            ProviderWorkerCancelCommand::Cancel { sequence: 8 }
+        );
+        assert_eq!(
+            parse_workers_cancel_command("/workers cancel 9"),
+            ProviderWorkerCancelCommand::Cancel { sequence: 9 }
+        );
+        assert!(matches!(
+            parse_workers_cancel_command("/workers cancel nope"),
+            ProviderWorkerCancelCommand::Invalid(_)
+        ));
+        assert!(matches!(
+            parse_workers_cancel_command("/workers status"),
+            ProviderWorkerCancelCommand::NotCancel
+        ));
+    }
+
+    #[tokio::test]
+    async fn active_turn_workers_cancel_command_marks_current_worker_cancelling_without_enqueue() {
+        let msg = input_msg("/now /workers cancel w#1");
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("long worker", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("worker starts");
+
+        let (output, signal_cancel) =
+            active_turn_workers_cancel_output(&msg, &mut scheduler, &mut provider_turn_workers, Some(task_id))
+                .expect("workers cancel output");
+
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelRequested),
+            "current foreground worker should signal the active turn"
+        );
+        assert!(
+            output.contains("Requested cancellation for provider worker w#1"),
+            "{output}"
+        );
+        assert!(output.contains("state=cancelling"), "{output}");
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling
+        );
+        assert_eq!(
+            provider_turn_workers.worker(task_id).unwrap().state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling
+        );
+    }
+
+    #[tokio::test]
+    async fn workers_cancel_command_targets_detached_worker_without_cancelling_peer() {
+        let msg = input_msg("/workers cancel w#2");
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        let second = scheduler.enqueue("second detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(first).expect("first task starts");
+        scheduler.start_task(second).expect("second task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(first).expect("first task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(second).expect("second task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+
+        let (output, signal_cancel) =
+            active_turn_workers_cancel_output(&msg, &mut scheduler, &mut provider_turn_workers, Some(first))
+                .expect("workers cancel output");
+
+        assert!(
+            output.contains("Requested cancellation for provider worker w#2"),
+            "{output}"
+        );
+        assert!(output.contains("kind=detached"), "{output}");
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelProviderTurn { task_id: second }),
+            "detached worker cancellation must target the requested task id"
+        );
+        assert_eq!(
+            scheduler.task(first).expect("first task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "peer detached task must stay running"
+        );
+        assert_eq!(
+            scheduler.task(second).expect("second task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling,
+            "requested detached task should enter cancelling"
+        );
+        assert_eq!(
+            provider_turn_workers.worker(first).expect("first worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Running,
+            "peer detached worker must stay running"
+        );
+        assert_eq!(
+            provider_turn_workers.worker(second).expect("second worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelling,
+            "requested detached worker should enter cancelling"
+        );
+    }
+
+    #[test]
+    fn workers_cancel_command_targets_detached_worker_from_outer_loop() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        let second = scheduler.enqueue("second detached", crate::chat::turn_scheduler::TurnPriority::Normal, 3);
+        scheduler.start_task(first).expect("first task starts");
+        scheduler.start_task(second).expect("second task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(first).expect("first task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(second).expect("second task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+
+        let (output, signal_cancel) = provider_workers_cancel_output_for_input(
+            "/workers cancel w#2",
+            &mut scheduler,
+            &mut provider_turn_workers,
+            None,
+        )
+        .expect("workers cancel output");
+
+        assert!(
+            output.contains("Requested cancellation for provider worker w#2"),
+            "{output}"
+        );
+        assert_eq!(
+            signal_cancel,
+            Some(ProviderWorkerCancelSignal::CancelProviderTurn { task_id: second }),
+            "outer-loop worker cancel must target the requested detached task"
+        );
+        assert_eq!(
+            scheduler.task(first).expect("first task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "peer detached task must stay running"
+        );
+        assert_eq!(
+            scheduler.task(second).expect("second task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling,
+            "requested detached task should enter cancelling"
+        );
+    }
+
+    #[tokio::test]
+    async fn p4a_active_turn_event_pump_preserves_cancel_local_and_enqueue_order() {
+        let first_msg = input_msg("/workers cancel w#1");
+        let (tx, mut input_rx) = mpsc::channel(4);
+        tx.send(input_msg("/queue")).await.expect("send queue command");
+        tx.send(input_msg("follow up turn")).await.expect("send follow-up turn");
+        drop(tx);
+        let mut outputs = Vec::<String>::new();
+        let mut emit = |text: &str| outputs.push(text.to_string());
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "active provider turn",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            3,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("worker starts");
+        let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+        let chat_session = session::ChatSession::new("p", "m");
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        process_active_turn_input_batch(
+            first_msg,
+            &mut emit,
+            &mut input_rx,
+            &mut backlog,
+            &mut scheduler,
+            &mut provider_turn_workers,
+            Some(task_id),
+            &chat_dispatcher,
+            &chat_session,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await;
+
+        assert_eq!(outputs.len(), 2, "cancel and /queue should emit local output");
+        assert!(
+            outputs[0].contains("Requested cancellation for provider worker w#1"),
+            "{}",
+            outputs[0]
+        );
+        assert!(
+            outputs[1].contains("Main queue: 0 queued (0 priority), 0 running."),
+            "{}",
+            outputs[1]
+        );
+        assert_eq!(backlog.len(), 1, "ordinary input after local commands remains queued");
+        assert_eq!(backlog.front().expect("queued follow-up").msg.content, "follow up turn");
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelling
+        );
+        assert_eq!(scheduler.status().main_queue_status().queued, 1);
+    }
+
+    #[tokio::test]
+    async fn p4a_active_turn_quit_is_queued_for_delayed_exit() {
+        let mut outputs = Vec::<String>::new();
+        let mut emit = |text: &str| outputs.push(text.to_string());
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "active provider turn",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            3,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        provider_turn_workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("worker starts");
+        let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+        let chat_session = session::ChatSession::new("p", "m");
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        process_active_turn_input_message(
+            input_msg("/exit"),
+            &mut emit,
+            &mut backlog,
+            &mut scheduler,
+            &mut provider_turn_workers,
+            Some(task_id),
+            &chat_dispatcher,
+            &chat_session,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await;
+
+        assert!(outputs.is_empty(), "/exit during an active turn is not a local command");
+        assert_eq!(backlog.len(), 1, "/exit should wait behind the active turn");
+        assert_eq!(backlog.front().expect("queued exit").msg.content, "/exit");
+        assert_eq!(scheduler.status().main_queue_status().queued, 1);
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Running,
+            "delayed exit must not cancel or complete the active provider turn"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_input_close_keeps_event_pump_alive_until_pending_turn_finishes() {
+        assert!(
+            should_continue_event_pump_after_input_closed(1),
+            "closed input should not terminate the event pump while a detached Redux turn is pending"
+        );
+        assert!(
+            !should_continue_event_pump_after_input_closed(0),
+            "with no pending Redux turn, closed input can end the outer loop"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_deferred_resume_waits_for_queued_visible_input_from_current_session() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut deferred_resume = std::collections::VecDeque::from(["session-b".to_string()]);
+        let session_a_history_len = 4;
+
+        enqueue_input_message_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            input_msg("queued for session A"),
+            session_a_history_len,
+        );
+
+        assert!(
+            !should_drain_deferred_resume_after_visible_inputs(0, &backlog, &workers),
+            "deferred resume must not run before queued visible input is dequeued"
+        );
+        assert_eq!(
+            deferred_resume.front().map(String::as_str),
+            Some("session-b"),
+            "resume request remains deferred while session-A input is pending"
+        );
+
+        let next = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            1,
+        )
+        .expect("queued input");
+        assert_eq!(next.msg.content, "queued for session A");
+        let task_id = next.turn_task_id.expect("scheduler task id");
+        let task = scheduler.task(task_id).expect("queued task snapshot");
+        assert_eq!(
+            task.history_base_len, session_a_history_len,
+            "queued input keeps the pre-resume session-A history boundary"
+        );
+        assert_eq!(
+            task.state,
+            crate::chat::turn_scheduler::TurnTaskState::Dispatched,
+            "queued input is dispatched before deferred resume can drain"
+        );
+
+        assert!(should_drain_deferred_resume_after_visible_inputs(0, &backlog, &workers));
+        assert_eq!(deferred_resume.pop_front().as_deref(), Some("session-b"));
+    }
+
+    #[test]
+    fn workers_report_lists_only_active_worker_rows() {
+        let status = crate::chat::action::ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 1,
+            finalized_total_tokens: 1_250,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis().saturating_sub(1_000)),
+            rows: vec![
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 1,
+                    sequence: 1,
+                    kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                    state: crate::chat::action::ProviderWorkerRowState::Running,
+                    started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(1_000),
+                    finalized_total_tokens: None,
+                    completion_ready: false,
+                },
+                crate::chat::action::ProviderWorkerStatusRow {
+                    task_id: 2,
+                    sequence: 2,
+                    kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                    state: crate::chat::action::ProviderWorkerRowState::Committed,
+                    started_at_ms: chrono::Utc::now().timestamp_millis().saturating_sub(9_000),
+                    finalized_total_tokens: Some(1_250),
+                    completion_ready: true,
+                },
+            ],
+        };
+
+        let report = format_provider_worker_report(&status);
+
+        assert!(
+            report.contains("1 finalized payloads, 1.2k finalized tokens"),
+            "report should retain finalized aggregate: {report}"
+        );
+        assert!(report.contains("- w#1 task=1"), "active row should be listed: {report}");
+        assert!(
+            report.contains("completion=pending"),
+            "active row should expose completion readiness: {report}"
+        );
+        assert!(
+            !report.contains("- w#2 task=2"),
+            "completed row should not stay in the active worker list: {report}"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn non_current_provider_completion_is_retained_and_marks_ready() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        let second = scheduler.enqueue("second", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(first).expect("first starts");
+        scheduler.start_task(second).expect("second starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(first).expect("first task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        workers
+            .start_from_task(
+                scheduler.task(second).expect("second task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+        workers
+            .record_execution_started(second, 42)
+            .expect("second worker execution starts");
+
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle_open = true;
+        let mut pending = std::collections::HashMap::new();
+        let completion = ProviderTurnCompletionEvent {
+            task_id: second,
+            outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                final_text: "second done".to_string(),
+                reasoning: String::new(),
+            }),
+            usage: crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(42),
+                ..Default::default()
+            },
+        };
+
+        let route = route_provider_completion_event(
+            &mut lifecycle_rx,
+            &mut lifecycle_open,
+            &mut workers,
+            &mut pending,
+            Some(first),
+            completion,
+        );
+
+        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+        assert!(
+            pending.contains_key(&second),
+            "non-current completion should be retained"
+        );
+        let rows = workers.snapshot();
+        let second_row = rows
+            .iter()
+            .find(|row| row.task_id == second)
+            .expect("second worker snapshot");
+        assert!(
+            second_row.completion_ready,
+            "retained completion should still mark the worker completion-ready"
+        );
+        assert!(
+            !rows
+                .iter()
+                .find(|row| row.task_id == first)
+                .expect("first worker snapshot")
+                .completion_ready,
+            "uncompleted worker should remain pending"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn current_provider_completion_is_routed_without_retaining_pending() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("current", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(task_id).expect("task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers
+            .record_execution_started(task_id, 43)
+            .expect("worker execution starts");
+
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle_open = true;
+        let mut pending = std::collections::HashMap::new();
+        let completion = ProviderTurnCompletionEvent {
+            task_id,
+            outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                final_text: "current done".to_string(),
+                reasoning: String::new(),
+            }),
+            usage: crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(43),
+                ..Default::default()
+            },
+        };
+
+        let route = route_provider_completion_event(
+            &mut lifecycle_rx,
+            &mut lifecycle_open,
+            &mut workers,
+            &mut pending,
+            Some(task_id),
+            completion,
+        );
+
+        match route {
+            ProviderTurnCompletionRoute::Current(completion) => {
+                assert_eq!(completion.task_id, task_id);
+                assert_eq!(completion.usage.total_tokens, Some(43));
+            }
+            ProviderTurnCompletionRoute::Pending => panic!("current completion must not be retained as pending"),
+        }
+        assert!(pending.is_empty(), "current completion should bypass pending map");
+        assert!(
+            workers
+                .snapshot()
+                .into_iter()
+                .find(|row| row.task_id == task_id)
+                .expect("worker snapshot")
+                .completion_ready,
+            "current completion should still mark the worker completion-ready"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_outer_completion_route_retains_event_for_pending_redux_finalizer() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("redux pending", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers
+            .record_execution_started(task_id, 60)
+            .expect("worker execution starts");
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle_open = true;
+        let mut pending = std::collections::HashMap::new();
+        let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+        let completion = ProviderTurnCompletionEvent {
+            task_id,
+            outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                final_text: "done".to_string(),
+                reasoning: String::new(),
+            }),
+            usage: crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(9),
+                ..Default::default()
+            },
+        };
+
+        let route = route_provider_completion_event_and_publish(
+            &mut lifecycle_rx,
+            &mut lifecycle_open,
+            &mut workers,
+            &mut pending,
+            None,
+            completion,
+            &chat_dispatcher,
+        );
+
+        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+        let retained = pending.get(&task_id).expect("outer completion retained by task id");
+        assert_eq!(retained.usage.total_tokens, Some(9));
+        assert!(
+            workers
+                .snapshot()
+                .into_iter()
+                .find(|row| row.task_id == task_id)
+                .expect("worker snapshot")
+                .completion_ready,
+            "outer route still marks worker completion-ready before finalizer"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4a_completion_event_and_finalizer_chain_commits_ready_turn() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "redux pending finalizer",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            1,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers
+            .record_execution_started(task_id, 64)
+            .expect("worker execution starts");
+        let (_tx, mut lifecycle_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut lifecycle_open = true;
+        let mut pending = std::collections::HashMap::new();
+        let (chat_dispatcher, _action_rx) = dispatcher::ChatDispatcher::new();
+
+        let route = route_provider_completion_event_and_publish(
+            &mut lifecycle_rx,
+            &mut lifecycle_open,
+            &mut workers,
+            &mut pending,
+            None,
+            ProviderTurnCompletionEvent {
+                task_id,
+                outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                    final_text: "ready finalizer".to_string(),
+                    reasoning: String::new(),
+                }),
+                usage: crate::llm::route_decision::TokenUsage {
+                    total_tokens: Some(64),
+                    ..Default::default()
+                },
+            },
+            &chat_dispatcher,
+        );
+        assert!(matches!(route, ProviderTurnCompletionRoute::Pending));
+
+        let completion = pending
+            .remove(&task_id)
+            .expect("ready completion retained for finalizer");
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let plan = provider_turn_terminal_plan_from_completion(
+            ResolvedProviderTurnCompletion {
+                outcome: completion.outcome,
+                usage: completion.usage,
+            },
+            1,
+            &tools,
+        );
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_provider_turn_finalizer_event(&mut queue, Some(task_id), plan);
+
+        let results = drain_provider_turn_finalizer_events_and_publish(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            &mut queue,
+            &chat_dispatcher,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].terminal_status, "completed");
+        assert!(results[0].finalized);
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Completed
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert_eq!(row.finalized_total_tokens, Some(64));
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4b1_ready_signal_is_noop_until_ordered_commit_dispatches_save() {
+        use crate::chat::action::Action;
+        use crate::chat::state::{ChatState, Effect};
+        use std::sync::Arc;
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("ordered commit", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(task_id).expect("task starts");
+        let sequence = scheduler.task(task_id).expect("task snapshot").sequence;
+        let mut state = ChatState::new(Arc::from("provider"), Arc::from("model"), CancellationToken::new());
+        let _ = state.reduce(Action::StartLLMTurn {
+            provider_turn_task_id: Some(task_id),
+            provider_turn_sequence: Some(sequence),
+            draft_id: "draft-p4b1".to_string(),
+            history: Vec::new(),
+            compaction_config: None,
+            cancel: CancellationToken::new(),
+            turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
+        });
+
+        let ready_effects = state.reduce(Action::ProviderTurnReadyForCommit {
+            draft_id: "draft-p4b1".to_string(),
+            final_text: "answer".to_string(),
+            reasoning: "reason".to_string(),
+        });
+        assert!(ready_effects.is_empty(), "ready signal must not emit SaveSession");
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "ready signal must leave reducer draft open until ordered commit"
+        );
+
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+        dispatch_ordered_provider_turn_commit(
+            &dispatcher,
+            task_id,
+            "draft-p4b1",
+            "question",
+            "answer",
+            "reason",
+            false,
+        );
+
+        let user = rx.try_recv().expect("ordered RecordUserTurn action");
+        match user {
+            Action::RecordUserTurn(content) => {
+                assert_eq!(content, "question");
+                let effects = state.reduce(Action::RecordUserTurn(content));
+                assert!(
+                    !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+                    "RecordUserTurn alone must not save before terminal commit"
+                );
+            }
+            other => panic!("expected ordered RecordUserTurn, got {other:?}"),
+        }
+
+        let record = rx.try_recv().expect("ordered RecordAssistantTurn action");
+        match record {
+            Action::RecordAssistantTurn { task_id: seen, content } => {
+                assert_eq!(seen, Some(task_id));
+                assert_eq!(content, "answer");
+                let effects = state.reduce(Action::RecordAssistantTurn { task_id: seen, content });
+                assert!(
+                    !effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+                    "RecordAssistantTurn alone must not save before terminal commit"
+                );
+            }
+            other => panic!("expected ordered RecordAssistantTurn, got {other:?}"),
+        }
+
+        let terminal = rx.try_recv().expect("ordered StreamCompleted action");
+        match terminal {
+            Action::StreamCompleted {
+                draft_id,
+                final_text,
+                reasoning,
+            } => {
+                assert_eq!(draft_id, "draft-p4b1");
+                assert_eq!(final_text, "answer");
+                assert_eq!(reasoning, "reason");
+                let effects = state.reduce(Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                });
+                assert!(
+                    effects.iter().any(|effect| matches!(effect, Effect::SaveSession(_))),
+                    "SaveSession must be emitted only by ordered StreamCompleted"
+                );
+            }
+            other => panic!("expected ordered StreamCompleted, got {other:?}"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "ordered commit helper should emit exactly record + terminal actions"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn p4b1_failed_and_cancelled_skip_do_not_emit_persistence_actions() {
+        use crate::chat::action::Action;
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let failed = scheduler.enqueue("failed", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let cancelled = scheduler.enqueue("cancelled", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(failed).expect("failed task starts");
+        scheduler.start_task(cancelled).expect("cancelled task starts");
+        scheduler.request_cancel(cancelled).expect("cancel request accepted");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(failed).expect("failed task snapshot"))
+            .expect("failed task registers");
+        coordinator
+            .register_task(scheduler.task(cancelled).expect("cancelled task snapshot"))
+            .expect("cancelled task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for task_id in [failed, cancelled] {
+            workers
+                .start_from_task(
+                    scheduler.task(task_id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers
+                .record_execution_started(task_id, 70)
+                .expect("worker execution starts");
+            workers
+                .record_completion_ready(task_id)
+                .expect("worker completion ready");
+        }
+        workers
+            .request_cancel(cancelled)
+            .expect("worker cancellation requested");
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(failed),
+            ProviderTurnTerminalPlan::Failed {
+                err: "failed".to_string(),
+                history_commit_len: 0,
+                summary: "test failed skip".to_string(),
+            },
+        );
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(cancelled),
+            ProviderTurnTerminalPlan::Cancelled {
+                summary: "test cancelled skip",
+            },
+        );
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+
+        let results = drain_provider_turn_finalizer_events_and_publish(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            &mut queue,
+            &dispatcher,
+        );
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].terminal_status, "failed");
+        assert_eq!(results[1].terminal_status, "cancelled");
+        assert!(results.iter().all(|result| result.finalized));
+        while let Ok(action) = rx.try_recv() {
+            assert!(
+                !matches!(
+                    action,
+                    Action::RecordAssistantTurn { .. } | Action::StreamCompleted { .. }
+                ),
+                "skip decisions must not emit assistant/session persistence actions: {action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_turn_visible_admission_blocks_while_provider_worker_active() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let running = scheduler.enqueue("running", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let committed = scheduler.enqueue("committed", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(running).expect("running starts");
+        scheduler.start_task(committed).expect("committed starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        assert!(
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 1,)
+                .can_start_visible
+        );
+
+        workers
+            .start_from_task(
+                scheduler.task(running).expect("running task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("running worker starts");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 1);
+        assert_eq!(admission.active_workers, 1);
+        assert!(!admission.can_start_visible);
+
+        workers
+            .record_execution_started(running, 44)
+            .expect("running execution starts");
+        workers
+            .record_completion_ready(running)
+            .expect("running completion ready");
+        workers
+            .record_finalized_payload(
+                running,
+                crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+                    history_commit_len: 1,
+                    final_text_chars: 1,
+                    recorded_response_chars: 1,
+                    total_tokens: 1,
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                },
+            )
+            .expect("running payload finalized");
+        workers.record_completed(running).expect("running worker completed");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 1);
+        assert_eq!(admission.active_workers, 1);
+        assert!(
+            !admission.can_start_visible,
+            "awaiting commit still owns the visible draft boundary"
+        );
+
+        workers
+            .start_from_task(
+                scheduler.task(committed).expect("committed task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("committed worker starts");
+        workers
+            .record_execution_started(committed, 45)
+            .expect("committed execution starts");
+        workers
+            .record_completion_ready(committed)
+            .expect("committed completion ready");
+        workers
+            .record_finalized_payload(
+                committed,
+                crate::chat::turn_worker::ProviderTurnFinalizedPayload {
+                    history_commit_len: 1,
+                    final_text_chars: 1,
+                    recorded_response_chars: 1,
+                    total_tokens: 1,
+                    prompt_tokens: 0,
+                    completion_tokens: 1,
+                },
+            )
+            .expect("committed payload finalized");
+        workers.record_completed(committed).expect("committed worker completed");
+        let decision = crate::chat::history_commit::HistoryCommitDecision::Commit {
+            task_id: running,
+            sequence: scheduler.task(running).expect("running task").sequence,
+            history_commit_len: 1,
+            summary: "running committed".to_string(),
+        };
+        workers
+            .apply_commit_decision(&decision)
+            .expect("running commit applies");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 1);
+        assert_eq!(admission.active_workers, 1);
+        assert!(
+            !admission.can_start_visible,
+            "second awaiting commit worker still blocks"
+        );
+
+        let decision = crate::chat::history_commit::HistoryCommitDecision::Commit {
+            task_id: committed,
+            sequence: scheduler.task(committed).expect("committed task").sequence,
+            history_commit_len: 1,
+            summary: "committed committed".to_string(),
+        };
+        workers
+            .apply_commit_decision(&decision)
+            .expect("committed commit applies");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 1);
+        assert_eq!(admission.active_workers, 0);
+        assert!(admission.can_start_visible);
+    }
+
+    #[test]
+    fn provider_turn_visible_admission_allows_detached_until_configured_limit() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let second = scheduler.enqueue("second", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(first).expect("first starts");
+        scheduler.start_task(second).expect("second starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(first).expect("first task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2);
+        assert_eq!(admission.detached_active, 1);
+        assert!(admission.can_start_visible, "one detached turn leaves one N=2 slot");
+
+        workers
+            .start_from_task(
+                scheduler.task(second).expect("second task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+        let admission =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2);
+        assert_eq!(admission.detached_active, 2);
+        assert!(
+            !admission.can_start_visible,
+            "two detached turns exhaust configured N=2 admission"
+        );
+    }
+
+    #[test]
+    fn provider_turn_visible_admission_legacy_foreground_is_exclusive() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let legacy = scheduler.enqueue("legacy", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(legacy).expect("legacy starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(legacy).expect("legacy task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            )
+            .expect("legacy worker starts");
+
+        let detached =
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2);
+        assert_eq!(detached.foreground_active, 1);
+        assert!(!detached.can_start_visible, "legacy active blocks detached turns");
+
+        let foreground = provider_turn_visible_admission(
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+            2,
+        );
+        assert!(
+            !foreground.can_start_visible,
+            "legacy active blocks another legacy turn"
+        );
+    }
+
+    #[test]
+    fn visible_input_pop_preserves_queue_while_provider_worker_active() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let active = scheduler.enqueue("active", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(active).expect("active task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(active).expect("active task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("active worker starts");
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("queued while active"), 7);
+        let queued_task = backlog
+            .front()
+            .and_then(|queued| queued.turn_task_id)
+            .expect("queued task id");
+
+        let popped = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            1,
+        );
+
+        assert!(
+            popped.is_none(),
+            "active provider worker must hold visible input admission"
+        );
+        assert_eq!(backlog.len(), 1, "queued input must remain queued");
+        assert_eq!(
+            scheduler.task(queued_task).expect("queued task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Queued,
+            "blocked visible input must not be marked dispatched"
+        );
+        assert_eq!(scheduler.status().main_queue_status().queued, 1);
+    }
+
+    #[test]
+    fn visible_input_pop_prefers_priority_when_detached_slot_is_available() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let active = scheduler.enqueue("active", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(active).expect("active task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(active).expect("active task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("active worker starts");
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("normal queued first"), 7);
+        enqueue_input_message_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            input_msg("/priority urgent queued second"),
+            7,
+        );
+
+        let popped = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            2,
+        )
+        .expect("second detached slot should be available");
+
+        assert_eq!(
+            popped.msg.content, "urgent queued second",
+            "priority input must dispatch before older normal input when a visible slot opens"
+        );
+        let popped_task = popped.turn_task_id.expect("popped task id");
+        assert_eq!(
+            scheduler.task(popped_task).expect("priority task").priority,
+            crate::chat::turn_scheduler::TurnPriority::Priority
+        );
+        assert_eq!(
+            backlog.front().map(|queued| queued.msg.content.as_str()),
+            Some("normal queued first"),
+            "normal input remains queued after priority dispatch"
+        );
+    }
+
+    #[test]
+    fn post_route_requeue_defers_next_visible_pop_once_under_detached_capacity() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let active = scheduler.enqueue("active detached", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(active).expect("active task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(active).expect("active task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("active worker starts");
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("legacy fallback"), 7);
+        let queued_task = backlog
+            .front()
+            .and_then(|queued| queued.turn_task_id)
+            .expect("queued task id");
+
+        assert!(
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2,)
+                .can_start_visible,
+            "ordinary detached pop admission would otherwise immediately re-pop"
+        );
+        let mut defer_visible_input_pop_once = true;
+
+        assert!(
+            consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once),
+            "post-route requeue should force one event-pump wait"
+        );
+        assert_eq!(backlog.len(), 1, "deferred pop leaves requeued input in place");
+        assert_eq!(
+            scheduler.task(queued_task).expect("queued task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Queued,
+            "deferred pop must not repeatedly mark the requeued task dispatched"
+        );
+        assert!(
+            !consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once),
+            "defer gate is one-shot"
+        );
+
+        let popped = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            2,
+        )
+        .expect("input can pop after one event-pump wait");
+        assert_eq!(popped.turn_task_id, Some(queued_task));
+        assert_eq!(
+            scheduler.task(queued_task).expect("queued task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Dispatched
+        );
+    }
+
+    #[test]
+    fn post_route_admission_rejection_requeues_input_and_defers_next_pop() {
+        let mut backlog = std::collections::VecDeque::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let active = scheduler.enqueue("active detached", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(active).expect("active task starts");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(active).expect("active task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("active worker starts");
+        enqueue_input_message_with_scheduler(&mut backlog, &mut scheduler, input_msg("legacy after draft failure"), 7);
+
+        let popped = pop_next_visible_input_task_with_scheduler(
+            &mut backlog,
+            &mut scheduler,
+            &workers,
+            crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            2,
+        )
+        .expect("detached admission allows second visible turn before route is known");
+        let task_id = popped.turn_task_id.expect("popped task id");
+        assert_eq!(
+            scheduler.task(task_id).expect("popped task").state,
+            crate::chat::turn_scheduler::TurnTaskState::Dispatched,
+            "chat-loop pop marks the task dispatched before post-route admission runs"
+        );
+        assert!(
+            !provider_turn_visible_admission(
+                &workers,
+                crate::chat::turn_worker::ProviderTurnWorkerKind::ForegroundAwaited,
+                1
+            )
+            .can_start_visible,
+            "legacy-routed turn is rejected while another detached worker is active"
+        );
+
+        let mut defer_visible_input_pop_once = false;
+        requeue_post_route_admission_rejected_input(&mut backlog, &mut defer_visible_input_pop_once, popped);
+
+        assert_eq!(backlog.len(), 1, "post-route rejection must requeue the popped input");
+        assert_eq!(
+            backlog.front().and_then(|queued| queued.turn_task_id),
+            Some(task_id),
+            "requeued input keeps the original scheduler task id"
+        );
+        assert!(
+            provider_turn_visible_admission(&workers, crate::chat::turn_worker::ProviderTurnWorkerKind::Detached, 2)
+                .can_start_visible,
+            "without the defer gate, the next pump pass would immediately re-pop under detached capacity"
+        );
+        assert!(
+            consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once),
+            "post-route rejection must force one event-pump wait before the same input can pop again"
+        );
+        assert_eq!(
+            backlog.len(),
+            1,
+            "deferred pump pass leaves the requeued input in place"
+        );
+        assert!(
+            !consume_deferred_visible_input_pop(&mut defer_visible_input_pop_once),
+            "defer gate is one-shot after the event-pump wait"
+        );
+    }
+
+    #[test]
+    fn provider_turn_completion_context_supplies_stable_history_boundary_once() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("context", crate::chat::turn_scheduler::TurnPriority::Normal, 9);
+        let mut contexts = std::collections::HashMap::new();
+
+        record_provider_turn_completion_context(&mut contexts, Some(task_id), 12);
+
+        assert_eq!(
+            take_provider_turn_completion_history_len(&mut contexts, Some(task_id), 99),
+            12
+        );
+        assert_eq!(
+            take_provider_turn_completion_history_len(&mut contexts, Some(task_id), 99),
+            99,
+            "completion context is single-use"
+        );
+        assert_eq!(
+            take_provider_turn_completion_history_len(&mut contexts, None, 7),
+            7,
+            "legacy turns without task id use the local fallback"
+        );
+    }
+
+    #[test]
+    fn provider_terminal_plan_uses_completion_context_history_boundary() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("context plan", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        let mut contexts = std::collections::HashMap::new();
+        record_provider_turn_completion_context(&mut contexts, Some(task_id), 4);
+        let history_len = take_provider_turn_completion_history_len(&mut contexts, Some(task_id), 99);
+
+        let plan = provider_turn_terminal_plan_from_completion(
+            ResolvedProviderTurnCompletion {
+                outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                    final_text: "context done".to_string(),
+                    reasoning: String::new(),
+                }),
+                usage: crate::llm::route_decision::TokenUsage::default(),
+            },
+            history_len,
+            &tools,
+        );
+
+        match plan {
+            ProviderTurnTerminalPlan::Completed { history_commit_len, .. } => assert_eq!(history_commit_len, 5),
+            other => panic!("unexpected terminal plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completed_provider_turn_finalization_gate_records_payload_and_commit() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("complete me", crate::chat::turn_scheduler::TurnPriority::Normal, 2);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 7).expect("execution starts");
+        workers.record_completion_ready(task_id).expect("completion ready");
+        let usage = crate::llm::route_decision::TokenUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            ..Default::default()
+        };
+
+        let decisions = gate_completed_provider_turn_finalization(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            Some(task_id),
+            3,
+            12,
+            10,
+            &usage,
+            "test completed",
+        );
+
+        assert_eq!(decisions.len(), 1, "completion gate should release one ready decision");
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Completed
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert_eq!(row.finalized_total_tokens, Some(15));
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[test]
+    fn failed_provider_turn_finalization_gate_records_skip_decision() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("fail me", crate::chat::turn_scheduler::TurnPriority::Normal, 2);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 8).expect("execution starts");
+        workers.record_completion_ready(task_id).expect("completion ready");
+
+        let decisions = gate_failed_provider_turn_finalization(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            Some(task_id),
+            2,
+            "test failed",
+        );
+
+        assert_eq!(decisions.len(), 1, "failure gate should release one skip decision");
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Failed
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Failed
+        ));
+    }
+
+    #[test]
+    fn cancelled_provider_turn_finalization_gate_records_skip_decision() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("cancel me", crate::chat::turn_scheduler::TurnPriority::Normal, 2);
+        scheduler.start_task(task_id).expect("task starts");
+        scheduler.request_cancel(task_id).expect("task cancellation requested");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 9).expect("execution starts");
+        workers.request_cancel(task_id).expect("worker cancellation requested");
+        workers.record_completion_ready(task_id).expect("completion ready");
+
+        let decisions = gate_cancelled_provider_turn_finalization(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            Some(task_id),
+            "test cancelled",
+        );
+
+        assert_eq!(decisions.len(), 1, "cancellation gate should release one skip decision");
+        assert_eq!(
+            scheduler.task(task_id).unwrap().state,
+            crate::chat::turn_scheduler::TurnTaskState::Cancelled
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled
+        ));
+    }
+
+    #[test]
+    fn provider_completion_resolution_prefers_completion_event() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("event", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let signal = dispatcher::TurnCompletionSignal::new();
+        signal.register_turn(task_id, "draft-event");
+        signal.record_and_notify(dispatcher::TurnOutcomeKind::Cancelled);
+        signal.record_usage(crate::llm::route_decision::TokenUsage {
+            total_tokens: Some(99),
+            ..Default::default()
+        });
+        let event = ProviderTurnCompletionEvent {
+            task_id,
+            outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                final_text: "event wins".to_string(),
+                reasoning: String::new(),
+            }),
+            usage: crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(12),
+                ..Default::default()
+            },
+        };
+
+        let resolved = resolve_provider_turn_completion(&signal, Some(task_id), Some(event));
+
+        match resolved.outcome {
+            Some(dispatcher::TurnOutcomeKind::Completed { final_text, .. }) => {
+                assert_eq!(final_text, "event wins");
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(resolved.usage.total_tokens, Some(12));
+        assert!(signal.notified_for(task_id).is_none(), "task should unregister");
+    }
+
+    #[test]
+    fn provider_completion_resolution_uses_legacy_usage_when_event_usage_empty() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "event empty usage",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            0,
+        );
+        let signal = dispatcher::TurnCompletionSignal::new();
+        signal.record_usage(crate::llm::route_decision::TokenUsage {
+            total_tokens: Some(21),
+            ..Default::default()
+        });
+        let event = ProviderTurnCompletionEvent {
+            task_id,
+            outcome: Some(dispatcher::TurnOutcomeKind::Cancelled),
+            usage: crate::llm::route_decision::TokenUsage::default(),
+        };
+
+        let resolved = resolve_provider_turn_completion(&signal, Some(task_id), Some(event));
+
+        assert!(matches!(resolved.outcome, Some(dispatcher::TurnOutcomeKind::Cancelled)));
+        assert_eq!(resolved.usage.total_tokens, Some(21));
+    }
+
+    #[test]
+    fn provider_completion_resolution_uses_keyed_signal_without_event() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("keyed", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let signal = dispatcher::TurnCompletionSignal::new();
+        signal.register_turn(task_id, "draft-keyed");
+        assert!(signal.record_usage_for_draft(
+            "draft-keyed",
+            crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(34),
+                ..Default::default()
+            }
+        ));
+        assert!(signal.record_and_notify_for_draft(
+            "draft-keyed",
+            dispatcher::TurnOutcomeKind::Failed {
+                err: "keyed failed".to_string(),
+                retryable: false,
+            },
+        ));
+
+        let resolved = resolve_provider_turn_completion(&signal, Some(task_id), None);
+
+        match resolved.outcome {
+            Some(dispatcher::TurnOutcomeKind::Failed { err, retryable }) => {
+                assert_eq!(err, "keyed failed");
+                assert!(!retryable);
+            }
+            other => panic!("unexpected outcome: {other:?}"),
+        }
+        assert_eq!(resolved.usage.total_tokens, Some(34));
+        assert!(signal.notified_for(task_id).is_none(), "task should unregister");
+    }
+
+    #[test]
+    fn provider_turn_terminal_gate_dispatches_completed_finalization() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("unified gate", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 55).expect("execution starts");
+        workers.record_completion_ready(task_id).expect("completion ready");
+        let usage = crate::llm::route_decision::TokenUsage {
+            total_tokens: Some(55),
+            ..Default::default()
+        };
+
+        let decisions = gate_provider_turn_terminal_finalization(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            Some(task_id),
+            ProviderTurnTerminalGate::Completed {
+                history_commit_len: 2,
+                final_text_chars: 11,
+                recorded_response_chars: 10,
+                usage: &usage,
+                summary: "test unified completed",
+            },
+        );
+
+        assert_eq!(
+            decisions.len(),
+            1,
+            "unified terminal gate should finalize completed turn"
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert_eq!(row.finalized_total_tokens, Some(55));
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[test]
+    fn provider_turn_finalizer_event_commits_completed_plan() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "finalizer completed",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            1,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 56).expect("execution starts");
+        workers.record_completion_ready(task_id).expect("completion ready");
+
+        let result = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(task_id),
+                plan: ProviderTurnTerminalPlan::Completed {
+                    final_text: "done".to_string(),
+                    reasoning: String::new(),
+                    recorded_response: "done".to_string(),
+                    empty_response: false,
+                    usage: crate::llm::route_decision::TokenUsage {
+                        total_tokens: Some(56),
+                        ..Default::default()
+                    },
+                    history_commit_len: 2,
+                    final_text_chars: 4,
+                    recorded_response_chars: 4,
+                    summary: "test finalizer completed",
+                },
+            },
+        );
+
+        assert_eq!(
+            result,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(task_id),
+                terminal_status: "completed",
+                finalized: true,
+            }]
+        );
+        let row = workers
+            .snapshot()
+            .into_iter()
+            .find(|row| row.task_id == task_id)
+            .expect("worker snapshot retained");
+        assert_eq!(row.finalized_total_tokens, Some(56));
+        assert!(matches!(
+            row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[test]
+    fn provider_turn_finalizer_event_closes_failed_and_cancelled_plans() {
+        let mut failed_scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let failed_id =
+            failed_scheduler.enqueue("finalizer failed", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        failed_scheduler.start_task(failed_id).expect("failed task starts");
+        let mut failed_coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        failed_coordinator
+            .register_task(failed_scheduler.task(failed_id).expect("failed task snapshot"))
+            .expect("failed history task registers");
+        let mut failed_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        failed_workers
+            .start_from_task(
+                failed_scheduler.task(failed_id).expect("failed task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("failed worker starts");
+        failed_workers
+            .record_execution_started(failed_id, 57)
+            .expect("failed execution starts");
+        failed_workers
+            .record_completion_ready(failed_id)
+            .expect("failed completion ready");
+
+        let failed_result = finalize_provider_turn_from_event(
+            &mut failed_scheduler,
+            &mut failed_coordinator,
+            &mut failed_workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(failed_id),
+                plan: ProviderTurnTerminalPlan::Failed {
+                    err: "failed".to_string(),
+                    history_commit_len: 1,
+                    summary: "test finalizer failed".to_string(),
+                },
+            },
+        );
+
+        assert_eq!(failed_result.len(), 1);
+        assert_eq!(failed_result[0].terminal_status, "failed");
+        assert!(failed_result[0].finalized);
+        assert!(matches!(
+            failed_workers
+                .snapshot()
+                .into_iter()
+                .find(|row| row.task_id == failed_id)
+                .expect("failed worker snapshot")
+                .state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Failed
+        ));
+
+        let mut cancelled_scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let cancelled_id = cancelled_scheduler.enqueue(
+            "finalizer cancelled",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            1,
+        );
+        cancelled_scheduler
+            .start_task(cancelled_id)
+            .expect("cancelled task starts");
+        cancelled_scheduler
+            .request_cancel(cancelled_id)
+            .expect("cancelled task requested");
+        let mut cancelled_coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        cancelled_coordinator
+            .register_task(cancelled_scheduler.task(cancelled_id).expect("cancelled task snapshot"))
+            .expect("cancelled history task registers");
+        let mut cancelled_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        cancelled_workers
+            .start_from_task(
+                cancelled_scheduler.task(cancelled_id).expect("cancelled task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("cancelled worker starts");
+        cancelled_workers
+            .record_execution_started(cancelled_id, 58)
+            .expect("cancelled execution starts");
+        cancelled_workers
+            .request_cancel(cancelled_id)
+            .expect("cancelled worker requested");
+        cancelled_workers
+            .record_completion_ready(cancelled_id)
+            .expect("cancelled completion ready");
+
+        let cancelled_result = finalize_provider_turn_from_event(
+            &mut cancelled_scheduler,
+            &mut cancelled_coordinator,
+            &mut cancelled_workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(cancelled_id),
+                plan: ProviderTurnTerminalPlan::Cancelled {
+                    summary: "test finalizer cancelled",
+                },
+            },
+        );
+
+        assert_eq!(cancelled_result.len(), 1);
+        assert_eq!(cancelled_result[0].terminal_status, "cancelled");
+        assert!(cancelled_result[0].finalized);
+        assert!(matches!(
+            cancelled_workers
+                .snapshot()
+                .into_iter()
+                .find(|row| row.task_id == cancelled_id)
+                .expect("cancelled worker snapshot")
+                .state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled
+        ));
+    }
+
+    #[test]
+    fn provider_turn_finalizer_queue_drains_fifo_and_unlocks_commit_order() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first failed", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        let second = scheduler.enqueue("second completed", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(first).expect("first starts");
+        scheduler.start_task(second).expect("second starts");
+
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(first).expect("first task"))
+            .expect("first history task registers");
+        coordinator
+            .register_task(scheduler.task(second).expect("second task"))
+            .expect("second history task registers");
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for (id, lease) in [(first, 61), (second, 62)] {
+            workers
+                .start_from_task(
+                    scheduler.task(id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers.record_execution_started(id, lease).expect("execution starts");
+            workers.record_completion_ready(id).expect("completion ready");
+        }
+
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(first),
+            ProviderTurnTerminalPlan::Failed {
+                err: "first failed".to_string(),
+                history_commit_len: 1,
+                summary: "test first failed".to_string(),
+            },
+        );
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(second),
+            ProviderTurnTerminalPlan::Completed {
+                final_text: "second done".to_string(),
+                reasoning: String::new(),
+                recorded_response: "second done".to_string(),
+                empty_response: false,
+                usage: crate::llm::route_decision::TokenUsage {
+                    total_tokens: Some(62),
+                    ..Default::default()
+                },
+                history_commit_len: 2,
+                final_text_chars: 11,
+                recorded_response_chars: 11,
+                summary: "test second completed",
+            },
+        );
+
+        let results = drain_provider_turn_finalizer_events(&mut scheduler, &mut coordinator, &mut workers, &mut queue);
+
+        assert!(queue.is_empty());
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].task_id, Some(first));
+        assert_eq!(results[0].terminal_status, "failed");
+        assert!(results[0].finalized);
+        assert_eq!(results[1].task_id, Some(second));
+        assert_eq!(results[1].terminal_status, "completed");
+        assert!(results[1].finalized);
+        let rows = workers.snapshot();
+        assert!(matches!(
+            rows.iter().find(|row| row.task_id == first).expect("first row").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Failed
+        ));
+        let second_row = rows.iter().find(|row| row.task_id == second).expect("second row");
+        assert_eq!(second_row.finalized_total_tokens, Some(62));
+        assert!(matches!(
+            second_row.state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[test]
+    fn provider_turn_finalizer_delays_later_completed_turn_until_earlier_ready() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first slow", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        let second = scheduler.enqueue("second fast", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(first).expect("first starts");
+        scheduler.start_task(second).expect("second starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(first).expect("first task"))
+            .expect("first history task registers");
+        coordinator
+            .register_task(scheduler.task(second).expect("second task"))
+            .expect("second history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for (id, lease) in [(first, 81), (second, 82)] {
+            workers
+                .start_from_task(
+                    scheduler.task(id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers.record_execution_started(id, lease).expect("execution starts");
+            workers.record_completion_ready(id).expect("completion ready");
+        }
+
+        let second_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(second),
+                plan: ProviderTurnTerminalPlan::Completed {
+                    final_text: "second answer".to_string(),
+                    reasoning: String::new(),
+                    recorded_response: "second answer".to_string(),
+                    empty_response: false,
+                    usage: crate::llm::route_decision::TokenUsage {
+                        total_tokens: Some(82),
+                        ..Default::default()
+                    },
+                    history_commit_len: 3,
+                    final_text_chars: 13,
+                    recorded_response_chars: 13,
+                    summary: "test second completed",
+                },
+            },
+        );
+        assert_eq!(
+            second_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(second),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "later completion must wait for the earlier sequence"
+        );
+        assert!(matches!(
+            workers.worker(second).expect("second worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_)
+        ));
+
+        let first_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(first),
+                plan: ProviderTurnTerminalPlan::Completed {
+                    final_text: "first answer".to_string(),
+                    reasoning: String::new(),
+                    recorded_response: "first answer".to_string(),
+                    empty_response: false,
+                    usage: crate::llm::route_decision::TokenUsage {
+                        total_tokens: Some(81),
+                        ..Default::default()
+                    },
+                    history_commit_len: 3,
+                    final_text_chars: 12,
+                    recorded_response_chars: 12,
+                    summary: "test first completed",
+                },
+            },
+        );
+
+        assert_eq!(
+            first_results.iter().map(|result| result.task_id).collect::<Vec<_>>(),
+            vec![Some(first), Some(second)],
+            "earlier completion should release both ready decisions in sequence"
+        );
+        assert!(first_results.iter().all(|result| result.finalized));
+        assert!(matches!(
+            workers.worker(first).expect("first worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+        assert!(matches!(
+            workers.worker(second).expect("second worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[test]
+    fn provider_turn_finalizer_releases_later_completed_turn_when_earlier_cancelled() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("first cancelled", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        let second = scheduler.enqueue("second held", crate::chat::turn_scheduler::TurnPriority::Normal, 1);
+        scheduler.start_task(first).expect("first starts");
+        scheduler.request_cancel(first).expect("first cancellation requested");
+        scheduler.start_task(second).expect("second starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(first).expect("first task"))
+            .expect("first history task registers");
+        coordinator
+            .register_task(scheduler.task(second).expect("second task"))
+            .expect("second history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(first).expect("first task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("first worker starts");
+        workers
+            .record_execution_started(first, 91)
+            .expect("first execution starts");
+        workers
+            .request_cancel(first)
+            .expect("first worker cancellation requested");
+        workers.record_completion_ready(first).expect("first completion ready");
+        workers
+            .start_from_task(
+                scheduler.task(second).expect("second task"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("second worker starts");
+        workers
+            .record_execution_started(second, 92)
+            .expect("second execution starts");
+        workers
+            .record_completion_ready(second)
+            .expect("second completion ready");
+
+        let second_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(second),
+                plan: ProviderTurnTerminalPlan::Completed {
+                    final_text: "second after cancel".to_string(),
+                    reasoning: String::new(),
+                    recorded_response: "second after cancel".to_string(),
+                    empty_response: false,
+                    usage: crate::llm::route_decision::TokenUsage {
+                        total_tokens: Some(92),
+                        ..Default::default()
+                    },
+                    history_commit_len: 3,
+                    final_text_chars: 19,
+                    recorded_response_chars: 19,
+                    summary: "test second completed after cancel",
+                },
+            },
+        );
+        assert_eq!(
+            second_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(second),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "later completion must remain held until earlier cancellation is ordered"
+        );
+
+        let first_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(first),
+                plan: ProviderTurnTerminalPlan::Cancelled {
+                    summary: "test first cancelled",
+                },
+            },
+        );
+
+        assert_eq!(
+            first_results
+                .iter()
+                .map(|result| (result.task_id, result.terminal_status))
+                .collect::<Vec<_>>(),
+            vec![(Some(first), "cancelled"), (Some(second), "completed")],
+            "earlier cancellation should skip first and then release held later commit"
+        );
+        assert!(first_results.iter().all(|result| result.finalized));
+        assert!(matches!(
+            workers.worker(first).expect("first worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Cancelled
+        ));
+        assert!(matches!(
+            workers.worker(second).expect("second worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+        ));
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_turn_finalizer_n3_out_of_order_releases_ordered_persistence_actions() {
+        use crate::chat::action::Action;
+
+        fn completed_plan(final_text: &str, total_tokens: u32, history_commit_len: usize) -> ProviderTurnTerminalPlan {
+            ProviderTurnTerminalPlan::Completed {
+                final_text: final_text.to_string(),
+                reasoning: String::new(),
+                recorded_response: final_text.to_string(),
+                empty_response: false,
+                usage: crate::llm::route_decision::TokenUsage {
+                    total_tokens: Some(total_tokens),
+                    ..Default::default()
+                },
+                history_commit_len,
+                final_text_chars: final_text.chars().count(),
+                recorded_response_chars: final_text.chars().count(),
+                summary: "test n3 completed",
+            }
+        }
+
+        fn pending_commit_for(
+            task_id: crate::chat::turn_scheduler::TurnTaskId,
+            draft_id: &str,
+            user_input: &str,
+            plan: ProviderTurnTerminalPlan,
+        ) -> PendingOrderedProviderTurnCommit {
+            PendingOrderedProviderTurnCommit {
+                context: PerTurnContext {
+                    task_id,
+                    draft_id: draft_id.to_string(),
+                    delta_tx: None,
+                    tool_event_tx: None,
+                    draft_updater: None,
+                    tool_event_forwarder: None,
+                    user_input: user_input.to_string(),
+                    turn_run_id: format!("test-run-{}", task_id.get()),
+                    route_scope: crate::memory::MessageEventScope::new(
+                        "chat",
+                        crate::memory::MemoryVisibility::Workspace,
+                    ),
+                    route_decision: RouteDecision::single_candidate("mock", "mock"),
+                    provider_started_at: chrono::Utc::now(),
+                    provider_name: "mock".to_string(),
+                    model_name: "mock".to_string(),
+                    history_len_before_user_turn: 0,
+                    history_user_message: ChatMessage::user(user_input.to_string()),
+                },
+                terminal_plan: plan,
+            }
+        }
+
+        fn dispatch_ready_for_test(
+            results: Vec<ProviderTurnFinalizerResult>,
+            pending: &mut std::collections::HashMap<
+                crate::chat::turn_scheduler::TurnTaskId,
+                PendingOrderedProviderTurnCommit,
+            >,
+            dispatcher: &dispatcher::ChatDispatcher,
+        ) {
+            for result in results {
+                if !result.finalized || result.terminal_status != "completed" {
+                    continue;
+                }
+                let task_id = result.task_id.expect("finalized result has task id");
+                let pending_commit = pending.remove(&task_id).expect("pending commit payload");
+                let ProviderTurnTerminalPlan::Completed {
+                    final_text,
+                    reasoning,
+                    empty_response,
+                    ..
+                } = pending_commit.terminal_plan
+                else {
+                    panic!("expected completed terminal plan");
+                };
+                dispatch_ordered_provider_turn_commit(
+                    dispatcher,
+                    task_id,
+                    &pending_commit.context.draft_id,
+                    &pending_commit.context.user_input,
+                    &final_text,
+                    &reasoning,
+                    empty_response,
+                );
+            }
+        }
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let first = scheduler.enqueue("alpha prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let second = scheduler.enqueue("bravo prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let third = scheduler.enqueue("charlie prompt", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        for task_id in [first, second, third] {
+            scheduler.start_task(task_id).expect("task starts");
+        }
+
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        for task_id in [first, second, third] {
+            coordinator
+                .register_task(scheduler.task(task_id).expect("task snapshot"))
+                .expect("history task registers");
+        }
+
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        for (task_id, lease) in [(first, 101), (second, 102), (third, 103)] {
+            workers
+                .start_from_task(
+                    scheduler.task(task_id).expect("task snapshot"),
+                    crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+                )
+                .expect("worker starts");
+            workers
+                .record_execution_started(task_id, lease)
+                .expect("execution starts");
+            workers.record_completion_ready(task_id).expect("completion ready");
+        }
+
+        let first_plan = completed_plan("alpha answer", 11, 2);
+        let second_plan = completed_plan("bravo answer", 12, 4);
+        let third_plan = completed_plan("charlie answer", 13, 6);
+        let mut pending_ordered_provider_turn_commits = std::collections::HashMap::from([
+            (
+                first,
+                pending_commit_for(first, "draft-alpha", "alpha prompt", first_plan.clone()),
+            ),
+            (
+                second,
+                pending_commit_for(second, "draft-bravo", "bravo prompt", second_plan.clone()),
+            ),
+            (
+                third,
+                pending_commit_for(third, "draft-charlie", "charlie prompt", third_plan.clone()),
+            ),
+        ]);
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+
+        let third_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(third),
+                plan: third_plan,
+            },
+        );
+        assert_eq!(
+            third_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(third),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "third completion must stay held until first and second are terminal"
+        );
+        dispatch_ready_for_test(third_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+        assert!(
+            rx.try_recv().is_err(),
+            "held third turn must emit no persistence actions"
+        );
+        assert!(matches!(
+            workers.worker(third).expect("third worker").state,
+            crate::chat::turn_worker::ProviderTurnWorkerState::AwaitingCommit(_)
+        ));
+
+        let second_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(second),
+                plan: second_plan,
+            },
+        );
+        assert_eq!(
+            second_results,
+            vec![ProviderTurnFinalizerResult {
+                task_id: Some(second),
+                terminal_status: "unknown",
+                finalized: false,
+            }],
+            "second completion must stay held until first is terminal"
+        );
+        dispatch_ready_for_test(second_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+        assert!(
+            rx.try_recv().is_err(),
+            "held second turn must emit no persistence actions"
+        );
+
+        let first_results = finalize_provider_turn_from_event(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            ProviderTurnFinalizerEvent {
+                task_id: Some(first),
+                plan: first_plan,
+            },
+        );
+        assert_eq!(
+            first_results
+                .iter()
+                .map(|result| (result.task_id, result.terminal_status, result.finalized))
+                .collect::<Vec<_>>(),
+            vec![
+                (Some(first), "completed", true),
+                (Some(second), "completed", true),
+                (Some(third), "completed", true),
+            ],
+            "first completion must release all held completed turns in dispatch order"
+        );
+        dispatch_ready_for_test(first_results, &mut pending_ordered_provider_turn_commits, &dispatcher);
+
+        for (expected_user, expected_assistant, expected_draft, expected_task) in [
+            ("alpha prompt", "alpha answer", "draft-alpha", first),
+            ("bravo prompt", "bravo answer", "draft-bravo", second),
+            ("charlie prompt", "charlie answer", "draft-charlie", third),
+        ] {
+            match rx.try_recv().expect("ordered user action") {
+                Action::RecordUserTurn(content) => assert_eq!(content, expected_user),
+                other => panic!("expected RecordUserTurn, got {other:?}"),
+            }
+            match rx.try_recv().expect("ordered assistant action") {
+                Action::RecordAssistantTurn { task_id, content } => {
+                    assert_eq!(task_id, Some(expected_task));
+                    assert_eq!(content, expected_assistant);
+                }
+                other => panic!("expected RecordAssistantTurn, got {other:?}"),
+            }
+            match rx.try_recv().expect("ordered stream completed action") {
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                } => {
+                    assert_eq!(draft_id, expected_draft);
+                    assert_eq!(final_text, expected_assistant);
+                    assert!(reasoning.is_empty());
+                }
+                other => panic!("expected StreamCompleted, got {other:?}"),
+            }
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "ordered dispatch should emit exactly three action triplets"
+        );
+        assert!(pending_ordered_provider_turn_commits.is_empty());
+        assert_eq!(coordinator.pending_tasks(), 0);
+        assert_eq!(coordinator.pending_outcomes(), 0);
+        for task_id in [first, second, third] {
+            assert!(matches!(
+                workers.worker(task_id).expect("worker").state,
+                crate::chat::turn_worker::ProviderTurnWorkerState::Committed
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_turn_finalizer_drain_helper_publishes_queue_and_worker_status() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue(
+            "publish finalizer",
+            crate::chat::turn_scheduler::TurnPriority::Normal,
+            1,
+        );
+        scheduler.start_task(task_id).expect("task starts");
+        let mut coordinator = crate::chat::history_commit::HistoryCommitCoordinator::new();
+        coordinator
+            .register_task(scheduler.task(task_id).expect("task snapshot"))
+            .expect("history task registers");
+        let mut workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        workers
+            .start_from_task(
+                scheduler.task(task_id).expect("task snapshot"),
+                crate::chat::turn_worker::ProviderTurnWorkerKind::Detached,
+            )
+            .expect("worker starts");
+        workers.record_execution_started(task_id, 63).expect("execution starts");
+        workers.record_completion_ready(task_id).expect("completion ready");
+        let mut queue = std::collections::VecDeque::new();
+        enqueue_provider_turn_finalizer_event(
+            &mut queue,
+            Some(task_id),
+            ProviderTurnTerminalPlan::Completed {
+                final_text: "published".to_string(),
+                reasoning: String::new(),
+                recorded_response: "published".to_string(),
+                empty_response: false,
+                usage: crate::llm::route_decision::TokenUsage {
+                    total_tokens: Some(63),
+                    ..Default::default()
+                },
+                history_commit_len: 2,
+                final_text_chars: 9,
+                recorded_response_chars: 9,
+                summary: "test finalizer published",
+            },
+        );
+        let (dispatcher, mut rx) = dispatcher::ChatDispatcher::new();
+
+        let results = drain_provider_turn_finalizer_events_and_publish(
+            &mut scheduler,
+            &mut coordinator,
+            &mut workers,
+            &mut queue,
+            &dispatcher,
+        );
+
+        assert_eq!(results.len(), 1);
+        assert!(results[0].finalized);
+        assert!(queue.is_empty());
+        let first = rx.recv().await.expect("main queue status action");
+        let second = rx.recv().await.expect("provider worker status action");
+        assert!(matches!(
+            first,
+            crate::chat::action::Action::MainQueueStatusUpdated { .. }
+        ));
+        match second {
+            crate::chat::action::Action::ProviderWorkerStatusUpdated { status } => {
+                assert_eq!(status.finalized_payloads, 1);
+                assert_eq!(status.finalized_total_tokens, 63);
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_terminal_plan_completed_non_empty_builds_gate_fields() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let resolved = ResolvedProviderTurnCompletion {
+            outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                final_text: "P7J terminal plan".to_string(),
+                reasoning: "kept reasoning".to_string(),
+            }),
+            usage: crate::llm::route_decision::TokenUsage {
+                total_tokens: Some(77),
+                ..Default::default()
+            },
+        };
+
+        let plan = provider_turn_terminal_plan_from_completion(resolved, 4, &tools);
+
+        match plan {
+            ProviderTurnTerminalPlan::Completed {
+                final_text,
+                recorded_response,
+                reasoning,
+                empty_response,
+                usage,
+                history_commit_len,
+                final_text_chars,
+                recorded_response_chars,
+                summary,
+            } => {
+                assert_eq!(final_text, "P7J terminal plan");
+                assert_eq!(recorded_response, "P7J terminal plan");
+                assert_eq!(reasoning, "kept reasoning");
+                assert!(!empty_response);
+                assert_eq!(usage.total_tokens, Some(77));
+                assert_eq!(history_commit_len, 5);
+                assert_eq!(final_text_chars, "P7J terminal plan".chars().count());
+                assert_eq!(recorded_response_chars, "P7J terminal plan".chars().count());
+                assert_eq!(summary, "redux driver completed");
+            }
+            other => panic!("unexpected terminal plan: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_terminal_plan_empty_failed_and_cancelled_keep_boundaries() {
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let empty = provider_turn_terminal_plan_from_completion(
+            ResolvedProviderTurnCompletion {
+                outcome: Some(dispatcher::TurnOutcomeKind::Completed {
+                    final_text: "   ".to_string(),
+                    reasoning: "hidden reasoning".to_string(),
+                }),
+                usage: crate::llm::route_decision::TokenUsage::default(),
+            },
+            6,
+            &tools,
+        );
+        match empty {
+            ProviderTurnTerminalPlan::Completed {
+                empty_response,
+                history_commit_len,
+                final_text_chars,
+                recorded_response_chars,
+                summary,
+                ..
+            } => {
+                assert!(empty_response);
+                assert_eq!(history_commit_len, 6);
+                assert_eq!(final_text_chars, 0);
+                assert_eq!(recorded_response_chars, 0);
+                assert_eq!(summary, "redux driver completed with empty response");
+            }
+            other => panic!("unexpected empty terminal plan: {other:?}"),
+        }
+
+        let failed = provider_turn_terminal_plan_from_completion(
+            ResolvedProviderTurnCompletion {
+                outcome: Some(dispatcher::TurnOutcomeKind::Failed {
+                    err: "provider failed".to_string(),
+                    retryable: false,
+                }),
+                usage: crate::llm::route_decision::TokenUsage::default(),
+            },
+            7,
+            &tools,
+        );
+        match failed {
+            ProviderTurnTerminalPlan::Failed {
+                err,
+                history_commit_len,
+                summary,
+            } => {
+                assert_eq!(err, "provider failed");
+                assert_eq!(history_commit_len, 7);
+                assert_eq!(summary, "redux driver failed: provider failed");
+            }
+            other => panic!("unexpected failed terminal plan: {other:?}"),
+        }
+
+        let cancelled = provider_turn_terminal_plan_from_completion(
+            ResolvedProviderTurnCompletion {
+                outcome: None,
+                usage: crate::llm::route_decision::TokenUsage::default(),
+            },
+            8,
+            &tools,
+        );
+        match cancelled {
+            ProviderTurnTerminalPlan::Cancelled { summary } => {
+                assert_eq!(summary, "redux driver cancelled");
+            }
+            other => panic!("unexpected cancelled terminal plan: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn active_turn_sessions_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let msg = input_msg("/sessions");
+        let chat_session = session::ChatSession::new("p", "m");
+        let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("sessions command output");
+
+        assert_eq!(output, "No child TUI sessions.");
+        assert_eq!(backlog.len(), 1, "read-only sessions command must not mutate backlog");
+    }
+
+    #[tokio::test]
+    async fn active_turn_logs_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let msg = input_msg("/logs #99");
+        let chat_session = session::ChatSession::new("p", "m");
+        let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("logs command output");
+
+        assert!(output.contains("Logs failed: no session #99"), "{output}");
+        assert_eq!(backlog.len(), 1, "read-only logs command must not mutate backlog");
+    }
+
+    #[tokio::test]
+    async fn active_turn_kill_command_is_handled_without_enqueue() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        let scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let msg = input_msg("/kill #99");
+        let chat_session = session::ChatSession::new("p", "m");
+        let provider_turn_workers = crate::chat::turn_worker::ProviderTurnWorkerRegistry::new();
+        let mut chat_sessions =
+            crate::chat::sessions::ChatSessionsHandle::new(std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())));
+        let session_rings = std::collections::HashMap::new();
+        let mut reaped_log_archive = ReapedSessionLogArchive::default();
+        let reap_policy = crate::chat::sessions::runtime::ReapPolicy::default();
+        let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+
+        let output = active_turn_local_command_output(
+            &msg,
+            &backlog,
+            &scheduler,
+            &chat_session,
+            &provider_turn_workers,
+            &mut chat_sessions,
+            &session_rings,
+            &mut reaped_log_archive,
+            &reap_policy,
+            &tools_registry,
+        )
+        .await
+        .expect("kill command output");
+
+        assert!(output.contains("Kill failed: no session #99"), "{output}");
+        assert_eq!(backlog.len(), 1, "explicit kill command must not mutate backlog");
+    }
+
+    #[test]
+    fn queued_input_scheduler_prefers_priority_over_older_normal() {
+        let mut backlog = std::collections::VecDeque::new();
+        enqueue_input_message(&mut backlog, input_msg("normal one"));
+        enqueue_input_message(&mut backlog, input_msg("/priority urgent two"));
+        enqueue_input_message(&mut backlog, input_msg("normal three"));
+
+        let first = pop_next_input_message(&mut backlog).expect("priority first");
+        let second = pop_next_input_message(&mut backlog).expect("normal one second");
+        let third = pop_next_input_message(&mut backlog).expect("normal three third");
+
+        assert_eq!(first.content, "urgent two");
+        assert_eq!(second.content, "normal one");
+        assert_eq!(third.content, "normal three");
+    }
+
+    #[test]
+    fn cancelled_turn_rolls_back_legacy_history_user_message() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("previous question"),
+            ChatMessage::assistant("previous answer"),
+        ];
+        let len_before = history.len();
+        history.push(ChatMessage::user("cancelled long task"));
+
+        rollback_cancelled_turn_history(&mut history, len_before);
+
+        assert_eq!(history.len(), len_before);
+        assert!(
+            history.iter().all(|message| message.content != "cancelled long task"),
+            "cancelled turn must not leak into the next queued prompt"
+        );
+    }
+
+    #[test]
+    fn p4a_shutdown_cancelled_pending_turn_rolls_back_to_user_boundary() {
+        let mut history = vec![
+            ChatMessage::system("system"),
+            ChatMessage::user("previous question"),
+            ChatMessage::assistant("previous answer"),
+        ];
+        let len_before_user_turn = history.len();
+        history.push(ChatMessage::user("pending provider turn"));
+        history.push(ChatMessage::assistant("partial assistant text"));
+
+        rollback_cancelled_turn_history(&mut history, len_before_user_turn);
+
+        assert_eq!(history.len(), len_before_user_turn);
+        assert!(
+            history.iter().all(
+                |message| message.content != "pending provider turn" && message.content != "partial assistant text"
+            ),
+            "shutdown cancellation must remove both the queued user turn and partial assistant output"
+        );
+    }
+
+    #[test]
+    fn queued_input_notice_is_single_line_and_bounded() {
+        let notice = format_queued_input_notice("  first line\nsecond\tline  ", InputQueuePriority::Normal);
+        assert_eq!(notice, "queued > first line second line");
+
+        let long = format_queued_input_notice(&"x".repeat(220), InputQueuePriority::Normal);
+        assert!(long.starts_with("queued > "));
+        assert!(long.ends_with('…'));
+        assert!(long.chars().count() <= "queued > ".chars().count() + 160);
+
+        let priority = format_queued_input_notice("/now urgent", InputQueuePriority::Priority);
+        assert_eq!(priority, "priority queued > urgent");
+    }
+
+    #[test]
+    fn active_turn_local_notice_strips_priority_prefix() {
+        assert!(is_active_turn_local_command("/now /cost"));
+        assert!(is_active_turn_local_command("/workers"));
+        assert!(is_active_turn_local_command("/workers cancel w#1"));
+        assert!(is_active_turn_local_command("/sessions"));
+        assert!(is_active_turn_local_command("/now /logs #1"));
+        assert!(is_active_turn_local_command("/priority /kill 2"));
+        assert!(!is_active_turn_local_command("/bg create child"));
+        assert_eq!(format_active_turn_local_notice("/now /cost"), "local > /cost");
+        assert_eq!(
+            format_active_turn_local_notice("/priority /queue status"),
+            "local > /queue status"
+        );
+        assert_eq!(
+            format_active_turn_local_notice("/priority /workers cancel #2"),
+            "local > /workers cancel #2"
+        );
     }
 
     #[test]
@@ -11024,6 +18839,7 @@ mod regfix_approval_switch_tests {
         let mut ignored_session_events = std::collections::HashSet::new();
         let mut session_rings = std::collections::HashMap::new();
         let mut reported_sessions = std::collections::HashSet::new();
+        let mut announced_started_sessions = std::collections::HashSet::from(["stale-started".to_string()]);
         let mut last_sessions_summary = "stale summary".to_string();
         let mut last_sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
             seq: 1,
@@ -11046,10 +18862,12 @@ mod regfix_approval_switch_tests {
         {
             let mut mirror = chat_mirror.lock();
             mirror.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+                task_id: None,
                 tool_id: "tool-live".to_string(),
                 name: "shell".to_string(),
                 args: "{}".to_string(),
             });
+            mirror.context_used_tokens = Some(2_500);
             mirror.context_window_tokens = Some(10_000_000);
             mirror.external_editor_prefix_armed = true;
             mirror.input.set_text("draft");
@@ -11070,6 +18888,7 @@ mod regfix_approval_switch_tests {
                 ignored_session_events: &mut ignored_session_events,
                 session_rings: &mut session_rings,
                 reported_sessions: &mut reported_sessions,
+                announced_started_sessions: &mut announced_started_sessions,
                 last_sessions_summary: &mut last_sessions_summary,
                 last_sessions_entries: &mut last_sessions_entries,
                 attached_follow: &mut attached_follow,
@@ -11096,6 +18915,7 @@ mod regfix_approval_switch_tests {
         assert_eq!(chat_session.id, "loaded-session");
         assert_eq!(chat_session_key, "chat:loaded-session");
         assert_eq!(fabric_turn_seq, 1);
+        assert!(announced_started_sessions.is_empty());
         assert!(last_sessions_summary.is_empty());
         assert!(last_sessions_entries.is_empty());
         assert!(attached_follow.is_none());
@@ -11103,6 +18923,7 @@ mod regfix_approval_switch_tests {
         {
             let mirror = chat_mirror.lock();
             assert!(mirror.pending_tool_approval.is_none());
+            assert_eq!(mirror.context_used_tokens, None);
             assert_eq!(mirror.context_window_tokens, None);
             assert!(!mirror.external_editor_prefix_armed);
             assert!(!mirror.input.is_reverse_search_active());
@@ -11160,7 +18981,7 @@ mod p6b1_transcript_tests {
         let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
         let (redraw_tx, mut redraw_rx) = mpsc::channel(1);
 
-        open_transcript_view(&mirror, &dispatcher, Some(&redraw_tx));
+        open_transcript_view(&mirror, &dispatcher, Some(&redraw_tx), None);
 
         {
             let guard = mirror.lock();
@@ -11195,6 +19016,82 @@ mod p6b1_transcript_tests {
             other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
         }
         assert!(redraw_rx.try_recv().is_ok(), "open should request redraw");
+    }
+
+    #[test]
+    fn open_transcript_view_prefers_redux_snapshot_over_empty_mirror() {
+        let mirror = Arc::new(parking_lot::Mutex::new(tui::TuiState::new("p", "m")));
+        {
+            let guard = mirror.lock();
+            assert!(
+                guard.conversation_lines.is_empty(),
+                "test must model the real Redux-only shape: mirror transcript is empty"
+            );
+        }
+
+        let mut state = crate::chat::state::ChatState::new(
+            Arc::from("p"),
+            Arc::from("m"),
+            tokio_util::sync::CancellationToken::new(),
+        );
+        state.session.title = "redux chat".to_string();
+        state.ui.conversation_lines.push(tui::ConversationLine::User {
+            content: "redux-only user".to_string(),
+        });
+        state.ui.conversation_lines.push(tui::ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "echo ok".to_string(),
+            args_full: "echo ok".to_string(),
+            status: tui::ToolStatus::Done,
+            elapsed_ms: Some(12),
+            result: Some("ok".to_string()),
+            folded: false,
+        });
+        let snapshot = Arc::new(state.build_ui_snapshot(1));
+        let (_snapshot_tx, snapshot_rx) = tokio::sync::watch::channel(snapshot);
+
+        let (dispatcher, mut action_rx) = crate::chat::dispatcher::ChatDispatcher::new();
+
+        open_transcript_view(&mirror, &dispatcher, None, Some(&snapshot_rx));
+
+        let view = {
+            let guard = mirror.lock();
+            guard.active_session_view.clone().expect("transcript view")
+        };
+        assert_eq!(view.title, "redux chat");
+        assert!(
+            view.lines.iter().any(|line| line.contains("redux-only user")),
+            "transcript must render Redux-only user line: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().any(|line| line.contains("tool shell")),
+            "transcript must render Redux-only tool output line: {:?}",
+            view.lines
+        );
+        assert!(
+            view.lines.iter().all(|line| !line.contains("(transcript is empty)")),
+            "snapshot-backed transcript must not fall back to empty mirror: {:?}",
+            view.lines
+        );
+
+        match action_rx.try_recv().expect("focus action") {
+            crate::chat::action::Action::SessionFocusChanged { focus } => {
+                assert_eq!(focus, crate::chat::sessions::FocusTarget::Transcript);
+            }
+            other => panic!("expected SessionFocusChanged, got {other:?}"),
+        }
+        match action_rx.try_recv().expect("active view action") {
+            crate::chat::action::Action::ActiveSessionViewUpdated { view } => {
+                let view = view.expect("transcript view action");
+                assert!(
+                    view.lines.iter().any(|line| line.contains("redux-only user")),
+                    "dispatched view must carry Redux-only transcript: {:?}",
+                    view.lines
+                );
+            }
+            other => panic!("expected ActiveSessionViewUpdated, got {other:?}"),
+        }
     }
 
     #[test]
@@ -11258,6 +19155,8 @@ mod v4_reload_recap_tests {
             prompt_tokens: 100,
             completion_tokens: 50,
             total_tokens: 150,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source: TokenUsageSource::Reported,
             cost_usd: Some(0.0004),
         }

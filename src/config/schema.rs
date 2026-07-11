@@ -221,6 +221,10 @@ pub struct Config {
     /// Default model temperature (0.0–2.0). Default: `0.7`.
     pub default_temperature: f64,
 
+    /// Provider-specific runtime options (`[providers.<name>]`).
+    #[serde(default)]
+    pub providers: ProvidersConfig,
+
     /// Observability backend configuration (`[observability]`).
     #[serde(default)]
     pub observability: ObservabilityConfig,
@@ -425,6 +429,7 @@ impl std::fmt::Debug for Config {
             .field("default_provider", &self.default_provider)
             .field("default_model", &self.default_model)
             .field("default_temperature", &self.default_temperature)
+            .field("providers", &self.providers)
             .field("observability", &self.observability)
             .field("autonomy", &self.autonomy)
             .field("runtime", &self.runtime)
@@ -715,6 +720,22 @@ pub struct RouterModelConfig {
     /// Initial Elo rating.
     #[serde(default = "default_router_elo")]
     pub elo_rating: f32,
+}
+
+/// Provider-specific runtime configuration (`[providers]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct ProvidersConfig {
+    /// Ollama-specific request options (`[providers.ollama]`).
+    #[serde(default)]
+    pub ollama: OllamaProviderConfig,
+}
+
+/// Ollama-specific request options (`[providers.ollama]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct OllamaProviderConfig {
+    /// Explicit context window sent as Ollama `options.num_ctx`.
+    #[serde(default)]
+    pub num_ctx: Option<usize>,
 }
 
 /// Remote node proxy configuration for core-side RPC calls and node daemon defaults.
@@ -1573,6 +1594,14 @@ pub struct ModelPricing {
     /// Output price per 1M tokens
     #[serde(default)]
     pub output: f64,
+
+    /// Cache write/creation input price per 1M tokens.
+    #[serde(default)]
+    pub cache_write: f64,
+
+    /// Cache read input price per 1M tokens.
+    #[serde(default)]
+    pub cache_read: f64,
 }
 
 const fn default_daily_limit() -> f64 {
@@ -1610,6 +1639,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 3.0,
             output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
         },
     );
     prices.insert(
@@ -1617,6 +1648,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 15.0,
             output: 75.0,
+            cache_write: 18.75,
+            cache_read: 1.50,
         },
     );
     prices.insert(
@@ -1624,6 +1657,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 3.0,
             output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
         },
     );
     prices.insert(
@@ -1631,6 +1666,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.25,
             output: 1.25,
+            cache_write: 0.3125,
+            cache_read: 0.03,
         },
     );
 
@@ -1640,6 +1677,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 5.0,
             output: 15.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1647,6 +1686,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.15,
             output: 0.60,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1654,6 +1695,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 15.0,
             output: 60.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
 
@@ -1663,6 +1706,8 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 0.10,
             output: 0.40,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
     prices.insert(
@@ -1670,8 +1715,31 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
         ModelPricing {
             input: 1.25,
             output: 5.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
         },
     );
+
+    // Kimi API Platform models. Kimi publishes a cache-hit input price, but no
+    // separate cache-write tier; treat cache writes as ordinary cache-miss input.
+    let mut insert_kimi = |provider: &str, model: &str, input: f64, output: f64, cache_read: f64| {
+        prices.insert(
+            format!("{provider}/{model}"),
+            ModelPricing {
+                input,
+                output,
+                cache_write: input,
+                cache_read,
+            },
+        );
+    };
+    insert_kimi("kimi-code", "kimi-k2.7-code", 0.95, 4.0, 0.19);
+    insert_kimi("kimi-code", "kimi-k2.7-code-highspeed", 1.90, 8.0, 0.38);
+    insert_kimi("kimi-code", "kimi2.6", 0.95, 4.0, 0.16);
+    insert_kimi("kimi-code", "kimi-k2.6", 0.95, 4.0, 0.16);
+    insert_kimi("kimi-code", "kimi-k2.5", 0.60, 3.0, 0.10);
+    insert_kimi("moonshot", "kimi-k2.6", 0.95, 4.0, 0.16);
+    insert_kimi("moonshot", "kimi-k2.5", 0.60, 3.0, 0.10);
 
     prices
 }
@@ -5118,12 +5186,22 @@ pub struct QQConfig {
 
 /// Interactive chat configuration (`[chat]`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ChatConfig {}
+pub struct ChatConfig {
+    /// Maximum concurrent visible provider turns in the TUI Redux driver.
+    #[serde(default = "default_chat_max_concurrent_visible_turns")]
+    pub max_concurrent_visible_turns: usize,
+}
 
 impl Default for ChatConfig {
     fn default() -> Self {
-        Self {}
+        Self {
+            max_concurrent_visible_turns: default_chat_max_concurrent_visible_turns(),
+        }
     }
+}
+
+const fn default_chat_max_concurrent_visible_turns() -> usize {
+    2
 }
 
 // ── Config impl ──────────────────────────────────────────────────
@@ -5141,6 +5219,7 @@ impl Default for Config {
             default_provider: Some("openrouter".to_string()),
             default_model: Some("anthropic/claude-sonnet-4.6".to_string()),
             default_temperature: 0.7,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),
@@ -6196,12 +6275,14 @@ min_chars = 12
     async fn chat_config_defaults_to_empty_fullscreen_config() {
         let config = ChatConfig::default();
 
-        assert_eq!(config, ChatConfig {});
+        assert_eq!(config.max_concurrent_visible_turns, 2);
     }
 
     #[test]
     async fn chat_config_roundtrips_without_renderer_mode() {
-        let config = ChatConfig {};
+        let config = ChatConfig {
+            max_concurrent_visible_turns: 3,
+        };
 
         let encoded = toml::to_string(&config).unwrap();
         assert!(
@@ -6209,10 +6290,10 @@ min_chars = 12
             "renderer selection is no longer a persisted config field: {encoded}"
         );
         let decoded: ChatConfig = toml::from_str(&encoded).unwrap();
-        assert_eq!(decoded, ChatConfig {});
+        assert_eq!(decoded.max_concurrent_visible_turns, 3);
 
         let defaulted: ChatConfig = toml::from_str("").unwrap();
-        assert_eq!(defaulted, ChatConfig {});
+        assert_eq!(defaulted.max_concurrent_visible_turns, 2);
     }
 
     // ── Serde round-trip ─────────────────────────────────────
@@ -6227,6 +6308,7 @@ min_chars = 12
             default_provider: Some("openrouter".into()),
             default_model: Some("gpt-4o".into()),
             default_temperature: 0.5,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig {
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
@@ -6430,6 +6512,19 @@ connect_timeout_secs = 12
     }
 
     #[test]
+    async fn ollama_provider_num_ctx_deserializes() {
+        let raw = r#"
+default_temperature = 0.7
+
+[providers.ollama]
+num_ctx = 32768
+"#;
+
+        let parsed: Config = toml::from_str(raw).unwrap();
+        assert_eq!(parsed.providers.ollama.num_ctx, Some(32_768));
+    }
+
+    #[test]
     async fn runtime_reasoning_enabled_deserializes() {
         let raw = r#"
 default_temperature = 0.7
@@ -6615,6 +6710,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             default_provider: Some("openrouter".into()),
             default_model: Some("test-model".into()),
             default_temperature: 0.9,
+            providers: ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
             runtime: RuntimeConfig::default(),

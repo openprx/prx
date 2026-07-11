@@ -48,8 +48,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent::loop_::ChatMode;
 use crate::channels::traits::SendMessage;
-use crate::chat::action::{Action, CompactReason, HistoryDir};
+use crate::chat::action::{
+    Action, CompactReason, HistoryDir, MainQueueStatus, ProviderUsageRecordKind, ProviderWorkerStatus,
+};
 use crate::chat::session::{ChatSession, ChatTurn, MainSessionTokenUsageRecord, MainSessionTokenUsageSummary};
+use crate::chat::slash_types::AtPathCandidate;
 use crate::hooks::HookEvent;
 use crate::memory::MemoryCategory;
 use crate::providers::ChatMessage;
@@ -131,6 +134,8 @@ pub enum Effect {
     /// Step 5a-2 起 `EffectExecutor` 在 deps 模式下真调 `provider.stream_chat_with_history`，
     /// 流式 chunk 通过 `EffectDeps::action_tx` 回投到 reducer。
     StartTurn {
+        /// Main turn scheduler identity for the real provider execution task.
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         draft_id: String,
         history: Vec<ChatMessage>,
         /// Optional persisted/original-history source used for compaction patch
@@ -154,6 +159,9 @@ pub enum Effect {
         /// `run_tool_call_loop_traced` wrapper in `chat::run`. `None` → no scope
         /// (sub-agents fall back to user origin, correct for non-turn callers).
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        /// Per-turn default route for `message_send` tool calls. `None` keeps
+        /// non-turn/test callers on the tool's legacy fallback slot.
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     },
     /// 持久化当前会话快照
     SaveSession(ChatSession),
@@ -203,10 +211,16 @@ pub enum Effect {
     /// 数据流为单向 fire-and-forget（driver 通过 `approval_response_tx` mpsc 反向
     /// 接收响应）。Effect 不要求响应。
     RequestApproval {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         tool_id: String,
         name: String,
         args: String,
     },
+    /// Resolve a pending foreground approval without going through a separate
+    /// `ToolApprovalReceived` Action. Used by pure key handling paths where the
+    /// reducer owns the key event and must return the approval decision to the
+    /// dispatcher/executor as an effect.
+    ResolveApproval { tool_id: String, approved: bool },
     /// 优雅退出主循环
     Quit,
 }
@@ -229,6 +243,7 @@ impl Effect {
             Self::AutoTitleSession(_) => "AutoTitleSession",
             Self::LogTrace { .. } => "LogTrace",
             Self::RequestApproval { .. } => "RequestApproval",
+            Self::ResolveApproval { .. } => "ResolveApproval",
             Self::Quit => "Quit",
         }
     }
@@ -297,14 +312,24 @@ pub struct UiState {
     /// P1 sessions strip entries. This is the same child TUI registry snapshot
     /// used by the Ctrl+G switcher, kept structured for rendering.
     pub sessions_entries: Vec<crate::chat::sessions::SwitcherEntry>,
+    /// Main-session input backlog status for orchestration observation.
+    pub main_queue_status: MainQueueStatus,
+    /// Main-session provider worker status for orchestration observation.
+    pub provider_worker_status: ProviderWorkerStatus,
+    /// Saved chat-session candidates for `/resume` slash-menu arguments.
+    pub saved_sessions_cache: Vec<crate::chat::session::SavedSessionPickerEntry>,
+    /// Provider/model candidates for `/provider` and `/model` slash-menu args.
+    pub provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
     /// P2 active line-session viewport snapshot. `None` when the main chat or a
     /// PTY handoff owns the visible surface.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
     /// P6c1 foreground tool approval prompt. Display-only; the dispatcher
     /// ApprovalRouter remains the single execution gate.
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
-    /// Effective context window used by status bar budget display. This is a
-    /// UI hint denominator only; P5 owns hard tokenizer budgeting.
+    /// Current context-budget numerator used by status bar budget display.
+    /// Derived from the planned prompt context, not cumulative session usage.
+    pub context_used_tokens: Option<usize>,
+    /// Effective context window used by status bar budget display.
     pub context_window_tokens: Option<usize>,
     /// Main-session cumulative token/cost summary for the status bar.
     pub token_usage_summary: MainSessionTokenUsageSummary,
@@ -321,6 +346,8 @@ pub struct UiState {
     pub strip_selection: Option<u64>,
     /// Slash-command menu overlay. Derived from the current input command token.
     pub slash_menu: Option<SlashMenuState>,
+    /// Security-filtered `@path` completion source, delivered via Action.
+    pub at_path_candidates: Vec<AtPathCandidate>,
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
@@ -362,16 +389,24 @@ pub struct UiSnapshot {
     pub conversation_generation: u64,
     /// 当前 in-flight streaming draft（None 表示空闲）.
     pub streaming: Option<StreamingDraft>,
+    /// In-flight visible streaming drafts keyed by provider worker sequence.
+    pub visible_streaming_drafts: Arc<Vec<VisibleStreamingDraftView>>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
     /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
     pub sessions_status: Arc<str>,
     /// P1 sessions strip entries, cloned from reducer-owned UI state.
     pub sessions_entries: Arc<Vec<crate::chat::sessions::SwitcherEntry>>,
+    /// Main-session input backlog status.
+    pub main_queue_status: MainQueueStatus,
+    /// Main-session provider worker status.
+    pub provider_worker_status: ProviderWorkerStatus,
     /// P2 active line-session viewport snapshot.
     pub active_session_view: Option<crate::chat::sessions::ActiveSessionView>,
     /// P6c1 foreground tool approval prompt.
     pub pending_tool_approval: Option<crate::chat::sessions::PendingToolApprovalView>,
+    /// Current context-budget numerator for UI-only status budget display.
+    pub context_used_tokens: Option<usize>,
     /// Effective context window for UI-only status budget display.
     pub context_window_tokens: Option<usize>,
     /// Main-session cumulative token/cost summary for the status bar.
@@ -406,11 +441,15 @@ impl UiSnapshot {
             conversation_lines: Arc::new(Vec::new()),
             conversation_generation: 0,
             streaming: None,
+            visible_streaming_drafts: Arc::new(Vec::new()),
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
+            main_queue_status: MainQueueStatus::default(),
+            provider_worker_status: ProviderWorkerStatus::default(),
             active_session_view: None,
             pending_tool_approval: None,
+            context_used_tokens: None,
             context_window_tokens: None,
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             focus: crate::chat::sessions::FocusTarget::Main,
@@ -422,13 +461,158 @@ impl UiSnapshot {
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+impl UiSnapshot {
+    #[must_use]
+    pub fn streaming_draft_for_worker(&self, sequence: u64) -> Option<&StreamingDraft> {
+        self.visible_streaming_drafts
+            .iter()
+            .find(|draft| draft.sequence == sequence)
+            .map(|draft| &draft.draft)
+    }
+}
+
+/// One keyed visible streaming turn draft.
+///
+/// Phase 1 is structural only: the live chat loop still keeps visible provider
+/// turns safe-serial via admission guard, but the reducer can now represent
+/// multiple drafts without a single global draft slot.
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamingTurnDraft {
+    pub task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    /// Scheduler sequence; lower sequence renders as the primary/earlier draft.
+    pub sequence: u64,
+    pub prompt_preview: String,
+    pub draft: StreamingDraft,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VisibleStreamingDraftView {
+    pub sequence: u64,
+    pub draft: StreamingDraft,
+}
+
 /// 流式推理中间态（每轮重置）.
 #[allow(dead_code)]
 pub struct StreamState {
-    /// 当前 in-flight streaming draft（Step 3 起由 reducer 接管版本号防护）
-    pub draft: Option<StreamingDraft>,
-    /// 当前回合中处于 Running 状态的工具卡片索引列表
+    /// Keyed in-flight visible streaming drafts.
+    ///
+    /// This is the single source of truth for streaming draft state. The legacy
+    /// single-draft snapshot is computed from [`Self::primary_draft`].
+    pub visible_drafts: Vec<StreamingTurnDraft>,
+}
+
+impl StreamState {
+    #[must_use]
+    pub fn primary_draft(&self) -> Option<&StreamingTurnDraft> {
+        self.visible_drafts.first()
+    }
+
+    #[must_use]
+    pub fn primary_streaming_draft(&self) -> Option<&StreamingDraft> {
+        self.primary_draft().map(|turn| &turn.draft)
+    }
+
+    #[must_use]
+    pub fn streaming_draft_for_worker(&self, sequence: u64) -> Option<&StreamingDraft> {
+        self.visible_drafts
+            .iter()
+            .find(|turn| turn.sequence == sequence)
+            .map(|turn| &turn.draft)
+    }
+
+    #[must_use]
+    fn visible_streaming_draft_views(&self) -> Vec<VisibleStreamingDraftView> {
+        self.visible_drafts
+            .iter()
+            .map(|turn| VisibleStreamingDraftView {
+                sequence: turn.sequence,
+                draft: turn.draft.clone(),
+            })
+            .collect()
+    }
+
+    fn insert_visible_draft(&mut self, draft: StreamingTurnDraft) {
+        self.visible_drafts
+            .retain(|existing| existing.draft.draft_id != draft.draft.draft_id);
+        let insert_at = self
+            .visible_drafts
+            .iter()
+            .position(|existing| existing.sequence > draft.sequence)
+            .unwrap_or(self.visible_drafts.len());
+        self.visible_drafts.insert(insert_at, draft);
+    }
+
+    fn visible_draft_mut(&mut self, draft_id: &str) -> Option<&mut StreamingTurnDraft> {
+        self.visible_drafts
+            .iter_mut()
+            .find(|turn| turn.draft.draft_id == draft_id)
+    }
+
+    fn remove_visible_draft(&mut self, draft_id: &str) -> Option<StreamingTurnDraft> {
+        let idx = self
+            .visible_drafts
+            .iter()
+            .position(|turn| turn.draft.draft_id == draft_id)?;
+        Some(self.visible_drafts.remove(idx))
+    }
+
+    fn clear_visible_drafts(&mut self) {
+        self.visible_drafts.clear();
+    }
+
+    #[must_use]
+    const fn has_visible_drafts(&self) -> bool {
+        !self.visible_drafts.is_empty()
+    }
+
+    #[must_use]
+    fn versions_fingerprint(&self) -> Vec<(String, u64)> {
+        self.visible_drafts
+            .iter()
+            .map(|turn| (turn.draft.draft_id.clone(), turn.draft.version))
+            .collect()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ToolTaskKey {
+    Task(crate::chat::turn_scheduler::TurnTaskId),
+    Primary,
+}
+
+impl ToolTaskKey {
+    #[must_use]
+    pub const fn from_task_id(task_id: Option<crate::chat::turn_scheduler::TurnTaskId>) -> Self {
+        match task_id {
+            Some(id) => Self::Task(id),
+            None => Self::Primary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ToolInvocationKey {
+    pub tool_call_id: Option<String>,
+    pub name: String,
+}
+
+impl ToolInvocationKey {
+    #[must_use]
+    fn new(tool_call_id: Option<String>, name: &str) -> Self {
+        Self {
+            tool_call_id,
+            name: name.to_string(),
+        }
+    }
+}
+
+#[derive(Default, Debug)]
+pub struct TaskToolBuffer {
     pub pending_tool_cards: Vec<usize>,
+    pub tool_calls: Vec<crate::chat::session::ToolCallSummary>,
+    pub tool_args: std::collections::HashMap<ToolInvocationKey, String>,
 }
 
 /// 取消/关停控制状态.
@@ -440,12 +624,114 @@ pub struct ControlState {
     pub shutdown: CancellationToken,
     /// 是否正在生成（用于 CancelRequested 分支判断）
     pub generating: bool,
-    /// S2.5 P1-B: 本轮累积的 tool_calls — ToolStarted/Finished 期间累积，
-    /// RecordAssistantTurn 用 mem::take 回填到 session.turns.last_mut().tool_calls.
-    pub current_turn_tool_calls: Vec<crate::chat::session::ToolCallSummary>,
-    /// S2.5 P1-B: ToolStarted 的 args_preview 暂存 — ToolFinished 时 remove 并 push
-    /// 到 current_turn_tool_calls（key 用 tool name，回避 ToolStarted 缺 id 的局限）.
-    pub current_turn_tool_args: std::collections::HashMap<String, String>,
+    /// P3a: tool state is keyed by turn task so concurrent visible workers do
+    /// not share running card indices, argument previews, or persisted summaries.
+    pub tool_buffers: std::collections::HashMap<ToolTaskKey, TaskToolBuffer>,
+    /// P3b: graceful provider cancellation tokens keyed by turn task. Legacy
+    /// Primary callers keep using `active_cancel` until the runtime fully
+    /// migrates away from the pre-scheduler path.
+    pub turn_cancels: std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, CancellationToken>,
+    /// P3c: final aggregate usage records are idempotent per provider task.
+    /// Incremental usage records are intentionally never tracked here.
+    pub final_usage_tasks_recorded: std::collections::HashSet<crate::chat::turn_scheduler::TurnTaskId>,
+}
+
+impl ControlState {
+    fn register_turn_cancel(&mut self, key: ToolTaskKey, cancel: CancellationToken) {
+        match key {
+            ToolTaskKey::Task(task_id) => {
+                self.turn_cancels.insert(task_id, cancel);
+            }
+            ToolTaskKey::Primary => {
+                self.active_cancel = Some(cancel);
+            }
+        }
+    }
+
+    fn take_turn_cancel(&mut self, key: ToolTaskKey) -> Option<CancellationToken> {
+        match key {
+            ToolTaskKey::Task(task_id) => self.turn_cancels.remove(&task_id),
+            ToolTaskKey::Primary => self.active_cancel.take(),
+        }
+    }
+
+    fn remove_turn_cancel(&mut self, key: ToolTaskKey) {
+        match key {
+            ToolTaskKey::Task(task_id) => {
+                self.turn_cancels.remove(&task_id);
+            }
+            ToolTaskKey::Primary => {
+                self.active_cancel = None;
+            }
+        }
+    }
+
+    fn has_task_turn_cancels(&self) -> bool {
+        !self.turn_cancels.is_empty()
+    }
+
+    fn drain_turn_cancels(&mut self) -> Vec<CancellationToken> {
+        let mut tokens = Vec::new();
+        if let Some(token) = self.active_cancel.take() {
+            tokens.push(token);
+        }
+        tokens.extend(self.turn_cancels.drain().map(|(_, token)| token));
+        tokens
+    }
+
+    fn should_record_provider_usage(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        usage_kind: ProviderUsageRecordKind,
+    ) -> bool {
+        match (task_id, usage_kind) {
+            (Some(task_id), ProviderUsageRecordKind::FinalAggregate) => self.final_usage_tasks_recorded.insert(task_id),
+            _ => true,
+        }
+    }
+
+    fn tool_buffer_mut(&mut self, key: ToolTaskKey) -> &mut TaskToolBuffer {
+        self.tool_buffers.entry(key).or_default()
+    }
+
+    fn take_tool_calls(&mut self, key: ToolTaskKey) -> Vec<crate::chat::session::ToolCallSummary> {
+        let Some(buffer) = self.tool_buffers.get_mut(&key) else {
+            return Vec::new();
+        };
+        let calls = std::mem::take(&mut buffer.tool_calls);
+        buffer.tool_args.clear();
+        let remove_buffer =
+            buffer.pending_tool_cards.is_empty() && buffer.tool_calls.is_empty() && buffer.tool_args.is_empty();
+        if remove_buffer {
+            self.tool_buffers.remove(&key);
+        }
+        calls
+    }
+
+    fn clear_tool_buffer(&mut self, key: ToolTaskKey) {
+        self.tool_buffers.remove(&key);
+    }
+
+    fn clear_all_tool_buffers(&mut self) {
+        self.tool_buffers.clear();
+    }
+
+    #[cfg(test)]
+    fn pending_tool_card_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers
+            .get(&key)
+            .map_or(0, |buffer| buffer.pending_tool_cards.len())
+    }
+
+    #[cfg(test)]
+    fn tool_call_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers.get(&key).map_or(0, |buffer| buffer.tool_calls.len())
+    }
+
+    #[cfg(test)]
+    fn tool_arg_count(&self, key: ToolTaskKey) -> usize {
+        self.tool_buffers.get(&key).map_or(0, |buffer| buffer.tool_args.len())
+    }
 }
 
 // ─── ChatState ────────────────────────────────────────────────────────────────
@@ -470,13 +756,13 @@ pub struct ChatState {
 }
 
 #[cfg(feature = "terminal-tui")]
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 struct SnapshotDirtyFields {
     conversation_len: usize,
     conversation_generation: u64,
-    has_stream_draft: bool,
-    draft_version: u64,
+    draft_versions: Vec<(String, u64)>,
     input_lines: usize,
+    context_used_tokens: Option<usize>,
     context_window_tokens: Option<usize>,
     slash_menu_open: bool,
     slash_menu_selected: Option<usize>,
@@ -485,6 +771,7 @@ struct SnapshotDirtyFields {
     approval_visible: bool,
     focus: crate::chat::sessions::FocusTarget,
     token_usage_summary: MainSessionTokenUsageSummary,
+    main_queue_status: MainQueueStatus,
 }
 
 impl ChatState {
@@ -518,26 +805,32 @@ impl ChatState {
                 last_submitted: None,
                 sessions_status: String::new(),
                 sessions_entries: Vec::new(),
+                main_queue_status: MainQueueStatus::default(),
+                provider_worker_status: ProviderWorkerStatus::default(),
+                saved_sessions_cache: Vec::new(),
+                provider_model_catalog: Vec::new(),
                 active_session_view: None,
                 pending_tool_approval: None,
+                context_used_tokens: None,
                 context_window_tokens: None,
                 token_usage_summary: MainSessionTokenUsageSummary::default(),
                 focus: crate::chat::sessions::FocusTarget::Main,
                 switcher: None,
                 strip_selection: None,
                 slash_menu: None,
+                at_path_candidates: Vec::new(),
                 saved_session_picker: None,
             },
             stream: StreamState {
-                draft: None,
-                pending_tool_cards: Vec::new(),
+                visible_drafts: Vec::new(),
             },
             control: ControlState {
                 active_cancel: None,
                 shutdown,
                 generating: false,
-                current_turn_tool_calls: Vec::new(),
-                current_turn_tool_args: std::collections::HashMap::new(),
+                tool_buffers: std::collections::HashMap::new(),
+                turn_cancels: std::collections::HashMap::new(),
+                final_usage_tasks_recorded: std::collections::HashSet::new(),
             },
             #[cfg(feature = "terminal-tui")]
             cached_lines_arc: None,
@@ -555,6 +848,23 @@ impl ChatState {
     #[allow(clippy::missing_const_for_fn)]
     fn new_input() -> TuiInput {
         Vec::new()
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    const fn slash_menu_sources_from<'a>(
+        live_sessions: &'a [crate::chat::sessions::SwitcherEntry],
+        saved_sessions: &'a [crate::chat::session::SavedSessionPickerEntry],
+        provider_model_catalog: &'a [crate::chat::tui::SlashProviderModelCatalog],
+        at_path_candidates: &'a [crate::chat::slash_types::AtPathCandidate],
+        current_provider: &'a str,
+    ) -> crate::chat::tui::SlashMenuSources<'a> {
+        crate::chat::tui::SlashMenuSources {
+            live_sessions,
+            saved_sessions,
+            provider_model_catalog,
+            at_path_candidates,
+            current_provider,
+        }
     }
 
     /// 构造当前状态对应的 [`UiSnapshot`].
@@ -586,12 +896,16 @@ impl ChatState {
             ascii_fallback: self.ui.ascii_fallback,
             conversation_lines: lines,
             conversation_generation: self.ui.conversation_generation,
-            streaming: self.stream.draft.clone(),
+            streaming: self.stream.primary_streaming_draft().cloned(),
+            visible_streaming_drafts: Arc::new(self.stream.visible_streaming_draft_views()),
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
+            main_queue_status: self.ui.main_queue_status,
+            provider_worker_status: self.ui.provider_worker_status.clone(),
             active_session_view: self.ui.active_session_view.clone(),
             pending_tool_approval: self.ui.pending_tool_approval.clone(),
+            context_used_tokens: self.ui.context_used_tokens,
             context_window_tokens: self.ui.context_window_tokens,
             token_usage_summary: self.ui.token_usage_summary,
             focus: self.ui.focus,
@@ -642,13 +956,12 @@ impl ChatState {
     /// 静态 whitelist `ui_dirty_for` 兜住（StreamChunkReceived → true）.
     #[cfg(feature = "terminal-tui")]
     fn snapshot_dirty_fields(&self) -> SnapshotDirtyFields {
-        let draft_ver = self.stream.draft.as_ref().map_or(0, |d| d.version);
         SnapshotDirtyFields {
             conversation_len: self.ui.conversation_lines.len(),
             conversation_generation: self.ui.conversation_generation,
-            has_stream_draft: self.stream.draft.is_some(),
-            draft_version: draft_ver,
+            draft_versions: self.stream.versions_fingerprint(),
             input_lines: self.ui.input.lines.len(),
+            context_used_tokens: self.ui.context_used_tokens,
             context_window_tokens: self.ui.context_window_tokens,
             slash_menu_open: self.ui.slash_menu.is_some(),
             slash_menu_selected: self.ui.slash_menu.as_ref().map(|menu| menu.selected),
@@ -657,6 +970,7 @@ impl ChatState {
             approval_visible: self.ui.pending_tool_approval.is_some(),
             focus: self.ui.focus,
             token_usage_summary: self.ui.token_usage_summary,
+            main_queue_status: self.ui.main_queue_status,
         }
     }
 
@@ -737,12 +1051,24 @@ impl ChatState {
             // ── LLM 流式 (Step 3) ─────────────────────────────────
             Action::TurnStarted { draft_id, cancel } => self.reduce_turn_started(draft_id, cancel),
             Action::StartLLMTurn {
+                provider_turn_task_id,
+                provider_turn_sequence,
                 draft_id,
                 history,
                 compaction_config,
                 cancel,
                 turn_spawn_ctx,
-            } => self.reduce_start_llm_turn(draft_id, history, compaction_config, cancel, turn_spawn_ctx),
+                turn_message_send_ctx,
+            } => self.reduce_start_llm_turn(
+                provider_turn_task_id,
+                provider_turn_sequence,
+                draft_id,
+                history,
+                compaction_config,
+                cancel,
+                turn_spawn_ctx,
+                turn_message_send_ctx,
+            ),
             Action::StreamChunkReceived {
                 draft_id,
                 delta,
@@ -754,6 +1080,7 @@ impl ChatState {
                 final_text,
                 reasoning,
             } => self.reduce_stream_completed(&draft_id, final_text, reasoning),
+            Action::ProviderTurnReadyForCommit { .. } => vec![],
             Action::StreamFailed {
                 draft_id,
                 err,
@@ -762,17 +1089,29 @@ impl ChatState {
             Action::StreamCancelled { draft_id } => self.reduce_stream_cancelled(&draft_id),
 
             // ── 工具事件 (Step 3) ─────────────────────────────────
-            Action::ToolStarted { name, args } => self.reduce_tool_started(name, args),
+            Action::ToolStarted {
+                task_id,
+                sequence,
+                tool_call_id,
+                name,
+                args,
+            } => self.reduce_tool_started(task_id, sequence, tool_call_id, name, args),
             Action::ToolFinished {
+                task_id,
+                sequence,
+                tool_call_id,
                 name,
                 success,
                 duration_ms,
                 result,
-            } => self.reduce_tool_finished(name, success, duration_ms, result),
+            } => self.reduce_tool_finished(task_id, sequence, tool_call_id, name, success, duration_ms, result),
             Action::ToolProgress { iteration, max } => self.reduce_tool_progress(iteration, max),
-            Action::ToolApprovalRequested { tool_id, name, args } => {
-                self.reduce_tool_approval_requested(tool_id, name, args)
-            }
+            Action::ToolApprovalRequested {
+                task_id,
+                tool_id,
+                name,
+                args,
+            } => self.reduce_tool_approval_requested(task_id, tool_id, name, args),
             Action::ToolApprovalReceived { tool_id, approved } => {
                 self.reduce_tool_approval_received(&tool_id, approved)
             }
@@ -784,7 +1123,7 @@ impl ChatState {
             Action::SessionSaved { id } => self.reduce_session_saved(id),
             Action::SessionSwitched { id } => self.reduce_session_switched(id),
             Action::RecordUserTurn(content) => self.reduce_record_user_turn(content),
-            Action::RecordAssistantTurn(content) => self.reduce_record_assistant_turn(content),
+            Action::RecordAssistantTurn { task_id, content } => self.reduce_record_assistant_turn(task_id, content),
             Action::RecordSystemMessage { content } => self.reduce_record_system_message(content),
             Action::SetLeadingSystemPrompt { content } => self.reduce_set_leading_system_prompt(content),
 
@@ -796,11 +1135,23 @@ impl ChatState {
             Action::UserMessageEchoed(text) => self.reduce_user_message_echoed(text),
             Action::SessionsStatusUpdated { summary } => self.reduce_sessions_status_updated(summary),
             Action::SessionsEntriesUpdated { entries } => self.reduce_sessions_entries_updated(entries),
+            Action::MainQueueStatusUpdated { status } => self.reduce_main_queue_status_updated(status),
+            Action::ProviderWorkerStatusUpdated { status } => self.reduce_provider_worker_status_updated(status),
+            Action::SlashMenuSourcesUpdated {
+                saved_sessions,
+                provider_model_catalog,
+            } => self.reduce_slash_menu_sources_updated(saved_sessions, provider_model_catalog),
+            Action::AtPathCandidatesUpdated { candidates } => self.reduce_at_path_candidates_updated(candidates),
             Action::ActiveSessionViewUpdated { view } => self.reduce_active_session_view_updated(view),
-            Action::ContextWindowUpdated { max_context_tokens } => {
-                self.reduce_context_window_updated(max_context_tokens)
-            }
-            Action::ProviderUsageRecorded { record } => self.reduce_provider_usage_recorded(record),
+            Action::ContextWindowUpdated {
+                used_context_tokens,
+                max_context_tokens,
+            } => self.reduce_context_window_updated(used_context_tokens, max_context_tokens),
+            Action::ProviderUsageRecorded {
+                task_id,
+                usage_kind,
+                record,
+            } => self.reduce_provider_usage_recorded(task_id, usage_kind, record),
             Action::BackgroundSessionRecorded { summary } => self.reduce_background_session_recorded(summary),
             Action::SessionFocusChanged { focus } => self.reduce_session_focus_changed(focus),
             Action::SwitcherOpened { entries } => self.reduce_switcher_opened(entries),
@@ -813,6 +1164,7 @@ impl ChatState {
 
             // ── 退出 ──────────────────────────────────────────────
             Action::CancelRequested => self.reduce_cancel_requested(),
+            Action::CancelProviderTurn { task_id } => self.reduce_cancel_provider_turn(task_id),
             Action::ShutdownRequested => self.reduce_shutdown_requested(),
             Action::ForceQuit => vec![Effect::Quit],
         }
@@ -829,19 +1181,45 @@ impl ChatState {
     fn reduce_key_pressed(&mut self, key: crossterm::event::KeyEvent, now_ms: u64) -> Vec<Effect> {
         use crossterm::event::{KeyCode, KeyModifiers};
 
+        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
+            let prev = self.ui.last_ctrlc_ms;
+            self.ui.last_ctrlc_ms = now_ms;
+            if prev != 0 && now_ms.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
+                return vec![Effect::Quit];
+            }
+            return self.reduce_cancel_requested();
+        }
+        if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
+            return vec![Effect::Quit];
+        }
+        if self.ui.saved_session_picker.is_some() {
+            return self.reduce_saved_session_picker_key_pressed(key);
+        }
+        if self.ui.switcher.is_some() {
+            if key.code == KeyCode::Esc
+                || (key.code == KeyCode::Char('g') && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                return self.reduce_switcher_closed();
+            }
+            return vec![Effect::RequestRedraw];
+        }
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.ui.strip_selection.take().is_some() {
+            return vec![Effect::RequestRedraw];
+        }
         if self.ui.pending_tool_approval.is_some()
             || matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval)
         {
-            return vec![Effect::RequestRedraw];
+            return self.reduce_approval_key_pressed(key);
         }
 
         if self.ui.slash_menu.is_some() {
-            let sources = crate::chat::tui::SlashMenuSources {
-                live_sessions: &self.ui.sessions_entries,
-                saved_sessions: &[],
-                provider_model_catalog: &[],
-                current_provider: self.session.provider.as_ref(),
-            };
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
+                self.session.provider.as_ref(),
+            );
             let dispatch = crate::chat::tui::dispatch_slash_menu_key_with_sources(
                 &mut self.ui.input,
                 &mut self.ui.slash_menu,
@@ -854,6 +1232,47 @@ impl ChatState {
                 crate::chat::tui::KeyDispatch::Ignored => Vec::new(),
                 _ => vec![Effect::RequestRedraw],
             };
+        }
+
+        if key.modifiers == KeyModifiers::ALT {
+            let direction = match key.code {
+                KeyCode::Left | KeyCode::Up => Some(crate::chat::sessions::SessionDirection::Previous),
+                KeyCode::Right | KeyCode::Down => Some(crate::chat::sessions::SessionDirection::Next),
+                _ => None,
+            };
+            if let Some(direction) = direction {
+                self.ui.strip_selection = crate::chat::tui::move_strip_selection(
+                    &self.ui.sessions_entries,
+                    self.ui.strip_selection,
+                    self.ui.focus,
+                    direction,
+                );
+                return vec![Effect::RequestRedraw];
+            }
+            if key.code == KeyCode::Enter
+                && let Some(selected) = self.ui.strip_selection
+            {
+                if crate::chat::tui::selected_strip_entry(&self.ui.sessions_entries, Some(selected)).is_some() {
+                    return vec![
+                        Effect::LogTrace {
+                            level: tracing::Level::DEBUG,
+                            msg: format!("strip_alt_enter_attach seq={selected}"),
+                        },
+                        Effect::RequestRedraw,
+                    ];
+                }
+                self.ui.strip_selection = None;
+                self.ui
+                    .conversation_lines
+                    .push(crate::chat::tui::ConversationLine::System {
+                        content: "session gone".to_string(),
+                    });
+                return vec![Effect::RequestRedraw];
+            }
+        }
+
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE && self.control.generating {
+            return self.reduce_cancel_requested();
         }
 
         // Tab → 折叠/展开最近的可折叠卡片（Reasoning 或 ToolResult，取更靠后的）。
@@ -873,31 +1292,18 @@ impl ChatState {
         if key.code == KeyCode::Char('l') && key.modifiers == KeyModifiers::CONTROL {
             return vec![Effect::RequestRedraw];
         }
-        // Ctrl+C → 单击取消 / 双击退出（500ms 窗口）
-        if key.code == KeyCode::Char('c') && key.modifiers == KeyModifiers::CONTROL {
-            let prev = self.ui.last_ctrlc_ms;
-            self.ui.last_ctrlc_ms = now_ms;
-            if prev != 0 && now_ms.saturating_sub(prev) < DOUBLE_CTRLC_WINDOW_MS {
-                // 双击 → 优雅退出。Effect::Quit 由外壳触发 shutdown_token.cancel()
-                return vec![Effect::Quit];
-            }
-            // 单击 → 仅记录窗口；实际 cancel 由外壳读取 active_cancel
-            return vec![];
-        }
         // Ctrl+D → 空 buffer 退出 / 非空 forward-delete（委托 handle_key）
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL {
-            if self.ui.input.is_empty() {
-                return vec![Effect::Quit];
-            }
             // 非空 buffer 转发为 Delete
             let synthetic = crossterm::event::KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE);
             let _ = self.ui.input.handle_key(synthetic);
-            let sources = crate::chat::tui::SlashMenuSources {
-                live_sessions: &self.ui.sessions_entries,
-                saved_sessions: &[],
-                provider_model_catalog: &[],
-                current_provider: self.session.provider.as_ref(),
-            };
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
+                self.session.provider.as_ref(),
+            );
             crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
             return vec![Effect::RequestRedraw];
         }
@@ -913,17 +1319,54 @@ impl ChatState {
                 self.reduce_input_cancelled()
             }
             crate::chat::tui::InputOutcome::Consumed | crate::chat::tui::InputOutcome::Unhandled => {
-                let sources = crate::chat::tui::SlashMenuSources {
-                    live_sessions: &self.ui.sessions_entries,
-                    saved_sessions: &[],
-                    provider_model_catalog: &[],
-                    current_provider: self.session.provider.as_ref(),
-                };
+                let sources = Self::slash_menu_sources_from(
+                    &self.ui.sessions_entries,
+                    &self.ui.saved_sessions_cache,
+                    &self.ui.provider_model_catalog,
+                    &self.ui.at_path_candidates,
+                    self.session.provider.as_ref(),
+                );
                 crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
                 vec![Effect::RequestRedraw]
             }
             crate::chat::tui::InputOutcome::Ignored => Vec::new(),
         }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_approval_key_pressed(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let Some(pending) = self.ui.pending_tool_approval.clone() else {
+            if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+                if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+                    self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+                }
+                return vec![Effect::RequestRedraw];
+            }
+            return vec![Effect::RequestRedraw];
+        };
+        if key.modifiers != KeyModifiers::NONE {
+            return vec![Effect::RequestRedraw];
+        }
+        let approved = match key.code {
+            KeyCode::Char('y' | 'Y') => Some(true),
+            KeyCode::Char('n' | 'N') | KeyCode::Esc => Some(false),
+            _ => None,
+        };
+        let Some(approved) = approved else {
+            return vec![Effect::RequestRedraw];
+        };
+        self.ui.pending_tool_approval = None;
+        if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+            self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+        vec![
+            Effect::ResolveApproval {
+                tool_id: pending.tool_id,
+                approved,
+            },
+            Effect::RequestRedraw,
+        ]
     }
 
     /// 非 terminal-tui feature 下的占位（KeyEvent 仅在 crossterm 可用时存在）
@@ -943,12 +1386,13 @@ impl ChatState {
             return vec![Effect::RequestRedraw];
         }
         self.ui.input.paste(text);
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -968,10 +1412,10 @@ impl ChatState {
         self.ui.turn_count = self.ui.turn_count.saturating_add(1);
         let log_msg = format!("input_submitted len={}", text.chars().count());
         self.ui.last_submitted = Some(text);
-        // S2.5 P1-B: 兜底清理本轮 tool_calls 缓冲（幂等：新一轮 turn 入口前清空，
-        // 防御上一轮 stream 异常终止时未走 Completed/Cancelled/Failed 清理路径）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        self.ui.input.clear();
+        // Legacy main-turn entry only clears the Primary tool bucket; keyed
+        // worker buckets must survive until their own terminal event.
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -985,12 +1429,13 @@ impl ChatState {
     fn reduce_input_replaced(&mut self, text: &str) -> Vec<Effect> {
         self.ui.input.set_text(text);
         self.ui.input.clear_navigation_state();
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -1010,12 +1455,13 @@ impl ChatState {
             HistoryDir::Down => KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
         };
         let _ = self.ui.input.handle_key(key);
-        let sources = crate::chat::tui::SlashMenuSources {
-            live_sessions: &self.ui.sessions_entries,
-            saved_sessions: &[],
-            provider_model_catalog: &[],
-            current_provider: self.session.provider.as_ref(),
-        };
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
+            self.session.provider.as_ref(),
+        );
         crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
         vec![Effect::RequestRedraw]
     }
@@ -1135,15 +1581,57 @@ impl ChatState {
     // FIFO，counter 足够保证 monotonic）。Reducer 接管后版本号机制只在一处，
     // 杜绝双写期竞争。
 
+    fn visible_draft_sequence(task_id: Option<crate::chat::turn_scheduler::TurnTaskId>, sequence: Option<u64>) -> u64 {
+        sequence
+            .or_else(|| task_id.map(crate::chat::turn_scheduler::TurnTaskId::get))
+            .unwrap_or(0)
+    }
+
+    fn prompt_preview_from_history(history: &[ChatMessage]) -> String {
+        history
+            .iter()
+            .rev()
+            .find(|message| message.role == "user")
+            .map_or_else(String::new, |message| truncate_with_ellipsis(&message.content, 96))
+    }
+
+    fn insert_visible_streaming_draft(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        draft_id: String,
+        prompt_preview: String,
+    ) {
+        self.stream.insert_visible_draft(StreamingTurnDraft {
+            task_id,
+            sequence: Self::visible_draft_sequence(task_id, sequence),
+            prompt_preview,
+            draft: StreamingDraft {
+                draft_id,
+                accumulated: String::new(),
+                version: 0,
+            },
+        });
+    }
+
+    #[must_use]
+    fn sequence_for_tool_key(&self, key: ToolTaskKey) -> Option<u64> {
+        let ToolTaskKey::Task(task_id) = key else {
+            return None;
+        };
+        self.stream
+            .visible_drafts
+            .iter()
+            .find(|draft| draft.task_id == Some(task_id))
+            .map(|draft| draft.sequence)
+    }
+
     /// `Action::TurnStarted` — 初始化 streaming draft + 注册取消令牌.
     #[cfg(feature = "terminal-tui")]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
-        self.control.active_cancel = Some(cancel);
+        self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
+        self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
         vec![
             Effect::LogTrace {
@@ -1156,12 +1644,9 @@ impl ChatState {
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
-        self.control.active_cancel = Some(cancel);
+        self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
+        self.control.clear_tool_buffer(ToolTaskKey::Primary);
+        self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
         vec![
             Effect::LogTrace {
@@ -1185,18 +1670,25 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_start_llm_turn(
         &mut self,
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
-        self.control.active_cancel = Some(cancel.clone());
+        self.insert_visible_streaming_draft(
+            provider_turn_task_id,
+            provider_turn_sequence,
+            draft_id.clone(),
+            Self::prompt_preview_from_history(&history),
+        );
+        self.control
+            .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
+        self.control
+            .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
@@ -1207,6 +1699,7 @@ impl ChatState {
                 msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
             },
             Effect::StartTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_guard_history: Some(self.session.history.clone()),
@@ -1214,6 +1707,7 @@ impl ChatState {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -1222,18 +1716,25 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_start_llm_turn(
         &mut self,
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         compaction_config: Option<crate::config::AgentCompactionConfig>,
         cancel: CancellationToken,
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     ) -> Vec<Effect> {
-        self.stream.draft = Some(StreamingDraft {
-            draft_id: draft_id.clone(),
-            accumulated: String::new(),
-            version: 0,
-        });
-        self.control.active_cancel = Some(cancel.clone());
+        self.insert_visible_streaming_draft(
+            provider_turn_task_id,
+            provider_turn_sequence,
+            draft_id.clone(),
+            Self::prompt_preview_from_history(&history),
+        );
+        self.control
+            .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
+        self.control
+            .register_turn_cancel(ToolTaskKey::from_task_id(provider_turn_task_id), cancel.clone());
         self.control.generating = true;
         // BUG-09: capture the current chat mode so the driver can enforce plan
         // mode's read-only contract on write/shell/git tools.
@@ -1244,6 +1745,7 @@ impl ChatState {
                 msg: format!("start_llm_turn draft_id={draft_id} history_len={}", history.len()),
             },
             Effect::StartTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_guard_history: Some(self.session.history.clone()),
@@ -1251,6 +1753,7 @@ impl ChatState {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             },
             Effect::RequestRedraw,
         ]
@@ -1263,31 +1766,27 @@ impl ChatState {
     /// - 丢弃时 → `[]`（静默；调用方可通过比较 draft.version 前后是否变化判断）
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
-        let Some(draft) = self.stream.draft.as_mut() else {
+        let Some(turn) = self.stream.visible_draft_mut(draft_id) else {
             // 已 finalize — chunk 视为 stale，丢弃
             return vec![];
         };
-        if draft.draft_id != draft_id {
-            // 跨 turn stale
-            return vec![];
-        }
+        let draft = &mut turn.draft;
         if version <= draft.version {
             // 严格单调：等于或更小都视为乱序/重复，丢弃
             return vec![];
         }
         draft.accumulated.push_str(delta);
         draft.version = version;
+        self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_chunk_received(&mut self, draft_id: &str, delta: &str, version: u64) -> Vec<Effect> {
-        let Some(draft) = self.stream.draft.as_mut() else {
+        let Some(turn) = self.stream.visible_draft_mut(draft_id) else {
             return vec![];
         };
-        if draft.draft_id != draft_id {
-            return vec![];
-        }
+        let draft = &mut turn.draft;
         if version <= draft.version {
             return vec![];
         }
@@ -1314,14 +1813,17 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
         use crate::chat::tui::ConversationLine;
-        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
-        if !matches {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.remove_pending_tool_cards(tool_key);
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
+            self.control.active_cancel = None;
+            self.control.generating = false;
         }
-        self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
-        self.control.active_cancel = None;
-        self.control.generating = false;
         if !final_text.is_empty() {
             self.ui.conversation_lines.push(ConversationLine::Assistant {
                 content: final_text.clone(),
@@ -1335,6 +1837,7 @@ impl ChatState {
                 folded: true,
             });
         }
+        self.refresh_provider_worker_view_if_focused();
         let chars = final_text.chars().count();
         let effects = vec![
             Effect::NotifyHook {
@@ -1347,23 +1850,25 @@ impl ChatState {
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ];
-        // S2.5 P1-B: 兜底清理本轮 tool 缓冲（RecordAssistantTurn 正常已 mem::take 清空，
-        // 此处防御 driver 漏发 RecordAssistantTurn 的边缘情况）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        // Fallback for drivers that miss RecordAssistantTurn: only the completed
+        // task's buffer is discarded.
+        self.control.clear_tool_buffer(tool_key);
         effects
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_stream_completed(&mut self, draft_id: &str, final_text: String, reasoning: String) -> Vec<Effect> {
-        let matches = self.stream.draft.as_ref().is_some_and(|d| d.draft_id == draft_id);
-        if !matches {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.remove_pending_tool_cards(tool_key);
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
+            self.control.active_cancel = None;
+            self.control.generating = false;
         }
-        self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
-        self.control.active_cancel = None;
-        self.control.generating = false;
         if !final_text.is_empty() {
             self.ui.conversation_lines.push(final_text.clone());
         }
@@ -1382,9 +1887,7 @@ impl ChatState {
             Effect::SaveSession(self.build_session_snapshot()),
             Effect::RequestRedraw,
         ];
-        // S2.5 P1-B: 同 terminal-tui 分支兜底清理.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        self.control.clear_tool_buffer(tool_key);
         effects
     }
 
@@ -1395,19 +1898,23 @@ impl ChatState {
     /// retryable 字段由 EffectExecutor 上层（chat::run 主循环重试逻辑）观察决定是否重发；
     /// hook 一律触发，因为对外可见的"本轮失败"是确定事件。
     fn reduce_stream_failed(&mut self, draft_id: &str, err: String, retryable: bool) -> Vec<Effect> {
-        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
-        if !matches {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        let orphan_user_removed = if no_visible_drafts {
+            self.rollback_trailing_answerless_user_turn()
+        } else {
+            false
+        };
+        self.finalize_pending_tool_cards(tool_key, false, Some("turn failed before tool finish event"));
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
+            self.control.active_cancel = None;
+            self.control.generating = false;
         }
-        let orphan_user_removed = self.rollback_trailing_answerless_user_turn();
-        self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
-        self.control.active_cancel = None;
-        self.control.generating = false;
-        // S2.5 P1-B: stream 失败丢弃本轮 tool 缓冲（无 RecordAssistantTurn 可回填，
-        // 失败后本轮 tool_calls 不可信，下轮入口由 reduce_input_submitted 兜底再清一次）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        self.control.clear_tool_buffer(tool_key);
         #[cfg(feature = "terminal-tui")]
         self.ui
             .conversation_lines
@@ -1436,18 +1943,21 @@ impl ChatState {
 
     /// `Action::StreamCancelled` — 用户主动取消，仅清除 draft.
     fn reduce_stream_cancelled(&mut self, draft_id: &str) -> Vec<Effect> {
-        let matches = Self::stream_draft_id_matches(self.stream.draft.as_ref(), draft_id);
-        if !matches {
+        let Some(removed_draft) = self.stream.remove_visible_draft(draft_id) else {
             return vec![];
+        };
+        let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
+        self.control.remove_turn_cancel(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        self.finalize_pending_tool_cards(tool_key, false, Some("turn cancelled before tool finish event"));
+        if no_visible_drafts {
+            self.rollback_trailing_answerless_user_turn();
         }
-        self.rollback_trailing_answerless_user_turn();
-        self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
-        self.control.active_cancel = None;
-        self.control.generating = false;
-        // S2.5 P1-B: cancel 丢弃本轮 tool 缓冲（同 failed 路径语义）.
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
+        if no_visible_drafts && !self.control.has_task_turn_cancels() {
+            self.control.active_cancel = None;
+            self.control.generating = false;
+        }
+        self.control.clear_tool_buffer(tool_key);
         vec![Effect::RequestRedraw]
     }
 
@@ -1475,20 +1985,102 @@ impl ChatState {
         true
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn remove_pending_tool_cards(&mut self, key: ToolTaskKey) {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut indices = self
+            .control
+            .tool_buffers
+            .get_mut(&key)
+            .map(|buffer| buffer.pending_tool_cards.drain(..).collect::<Vec<_>>())
+            .unwrap_or_default();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        indices.dedup();
+        for idx in indices {
+            if matches!(
+                self.ui.conversation_lines.get(idx),
+                Some(ConversationLine::ToolResult {
+                    status: ToolStatus::Running,
+                    ..
+                })
+            ) {
+                self.ui.conversation_lines.remove(idx);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn remove_pending_tool_cards(&mut self, key: ToolTaskKey) {
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&key) {
+            buffer.pending_tool_cards.clear();
+        }
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn finalize_pending_tool_cards(&mut self, key: ToolTaskKey, success: bool, fallback_result: Option<&'static str>) {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let Some(buffer) = self.control.tool_buffers.get_mut(&key) else {
+            return;
+        };
+        for idx in buffer.pending_tool_cards.drain(..) {
+            let Some(ConversationLine::ToolResult {
+                status,
+                result,
+                elapsed_ms,
+                ..
+            }) = self.ui.conversation_lines.get_mut(idx)
+            else {
+                continue;
+            };
+            if *status != ToolStatus::Running {
+                continue;
+            }
+            *status = if success { ToolStatus::Done } else { ToolStatus::Error };
+            if result.is_none()
+                && let Some(fallback_result) = fallback_result
+            {
+                *result = Some(fallback_result.to_string());
+            }
+            if elapsed_ms.is_none() {
+                *elapsed_ms = Some(0);
+            }
+        }
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn finalize_pending_tool_cards(
+        &mut self,
+        key: ToolTaskKey,
+        _success: bool,
+        _fallback_result: Option<&'static str>,
+    ) {
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&key) {
+            buffer.pending_tool_cards.clear();
+        }
+    }
+
     /// `Action::ToolStarted` — 追加 Running 状态的 ToolResult 卡片 + 记录索引.
     #[cfg(feature = "terminal-tui")]
-    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
-        use crate::chat::tui::{ConversationLine, ToolStatus};
-        let args_preview = if args.chars().count() > 80 {
-            let prefix: String = args.chars().take(80).collect();
-            format!("{prefix}…")
-        } else {
-            args.clone()
+    fn reduce_tool_started(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        _sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
+        use crate::chat::tui::{
+            ARGS_PREVIEW_ELLIPSIS, ARGS_PREVIEW_MAX_CHARS, ConversationLine, ToolStatus, build_tool_args_preview,
         };
-        // S2.5 P1-B: 暂存 args_preview，ToolFinished 时取出 push 到 current_turn_tool_calls.
+        let args_preview = build_tool_args_preview(&name, &args, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
         self.control
-            .current_turn_tool_args
-            .insert(name.clone(), args_preview.clone());
+            .tool_buffer_mut(tool_key)
+            .tool_args
+            .insert(invocation_key, args_preview.clone());
         self.ui.conversation_lines.push(ConversationLine::ToolResult {
             tool_name: name,
             args_preview,
@@ -1499,23 +2091,35 @@ impl ChatState {
             folded: true,
         });
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
-        self.stream.pending_tool_cards.push(idx);
+        self.control.tool_buffer_mut(tool_key).pending_tool_cards.push(idx);
+        self.refresh_provider_worker_view_if_focused();
         vec![Effect::RequestRedraw]
     }
 
     #[cfg(not(feature = "terminal-tui"))]
-    fn reduce_tool_started(&mut self, name: String, args: String) -> Vec<Effect> {
-        // S2.5 P1-B: 占位 feature 下也累积 args_preview，便于 parity 测试在两种 feature 走通.
+    fn reduce_tool_started(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        _sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
         let args_preview = if args.chars().count() > 80 {
             let prefix: String = args.chars().take(80).collect();
             format!("{prefix}…")
         } else {
             args.clone()
         };
-        self.control.current_turn_tool_args.insert(name.clone(), args_preview);
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        self.control
+            .tool_buffer_mut(tool_key)
+            .tool_args
+            .insert(invocation_key, args_preview);
         self.ui.conversation_lines.push(format!("tool_started:{name}:{args}"));
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
-        self.stream.pending_tool_cards.push(idx);
+        self.control.tool_buffer_mut(tool_key).pending_tool_cards.push(idx);
         vec![Effect::RequestRedraw]
     }
 
@@ -1523,6 +2127,9 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_tool_finished(
         &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
@@ -1530,30 +2137,35 @@ impl ChatState {
     ) -> Vec<Effect> {
         use crate::chat::session::ToolCallSummary;
         use crate::chat::tui::{ConversationLine, ToolStatus};
-        // S2.5 P1-B: 取出 ToolStarted 暂存的 args_preview（没有则空串，例如 driver
-        // 在 supervised 模式下漏发 ToolStarted 的边缘情况），push 到本轮累积列表.
-        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
-        self.control.current_turn_tool_calls.push(ToolCallSummary {
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let sequence = sequence.or_else(|| self.sequence_for_tool_key(tool_key));
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        let buffer = self.control.tool_buffer_mut(tool_key);
+        let args_preview = buffer.tool_args.remove(&invocation_key).unwrap_or_default();
+        buffer.tool_calls.push(ToolCallSummary {
             name: name.clone(),
             args_preview,
             success,
+            task_id: task_id.map(crate::chat::turn_scheduler::TurnTaskId::get),
+            sequence,
         });
         // 第 1 步：从 pending_tool_cards 反向查找最近一个 name 匹配 + Running 的卡片
         // （只借用 conversation_lines，不持 mut 引用，避免 result 跨循环 move 冲突）
-        let target_pos = self
-            .stream
-            .pending_tool_cards
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(pos, &idx)| match self.ui.conversation_lines.get(idx) {
-                Some(ConversationLine::ToolResult { tool_name, status, .. })
-                    if tool_name == &name && *status == ToolStatus::Running =>
-                {
-                    Some((pos, idx))
-                }
-                _ => None,
-            });
+        let target_pos = self.control.tool_buffers.get(&tool_key).and_then(|buffer| {
+            buffer
+                .pending_tool_cards
+                .iter()
+                .enumerate()
+                .rev()
+                .find_map(|(pos, &idx)| match self.ui.conversation_lines.get(idx) {
+                    Some(ConversationLine::ToolResult { tool_name, status, .. })
+                        if tool_name == &name && *status == ToolStatus::Running =>
+                    {
+                        Some((pos, idx))
+                    }
+                    _ => None,
+                })
+        });
         // 第 2 步：找到目标后再做 mut 更新 + 从 pending 移除
         if let Some((pending_pos, line_idx)) = target_pos {
             if let Some(ConversationLine::ToolResult {
@@ -1567,8 +2179,11 @@ impl ChatState {
                 *elapsed_ms = Some(duration_ms);
                 *result_slot = result;
             }
-            self.stream.pending_tool_cards.remove(pending_pos);
+            if let Some(buffer) = self.control.tool_buffers.get_mut(&tool_key) {
+                buffer.pending_tool_cards.remove(pending_pos);
+            }
         }
+        self.refresh_provider_worker_view_if_focused();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -1581,22 +2196,32 @@ impl ChatState {
     #[cfg(not(feature = "terminal-tui"))]
     fn reduce_tool_finished(
         &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
         _result: Option<String>,
     ) -> Vec<Effect> {
         use crate::chat::session::ToolCallSummary;
-        // S2.5 P1-B: 同 terminal-tui 分支，回填本轮累积列表.
-        let args_preview = self.control.current_turn_tool_args.remove(&name).unwrap_or_default();
-        self.control.current_turn_tool_calls.push(ToolCallSummary {
+        let tool_key = ToolTaskKey::from_task_id(task_id);
+        let sequence = sequence.or_else(|| self.sequence_for_tool_key(tool_key));
+        let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
+        let buffer = self.control.tool_buffer_mut(tool_key);
+        let args_preview = buffer.tool_args.remove(&invocation_key).unwrap_or_default();
+        buffer.tool_calls.push(ToolCallSummary {
             name: name.clone(),
             args_preview,
             success,
+            task_id: task_id.map(crate::chat::turn_scheduler::TurnTaskId::get),
+            sequence,
         });
         // 占位 feature 下仅记录 + 弹出最后一个 pending 索引
-        if !self.stream.pending_tool_cards.is_empty() {
-            self.stream.pending_tool_cards.pop();
+        if let Some(buffer) = self.control.tool_buffers.get_mut(&tool_key)
+            && !buffer.pending_tool_cards.is_empty()
+        {
+            buffer.pending_tool_cards.pop();
         }
         vec![
             Effect::RequestRedraw,
@@ -1612,8 +2237,8 @@ impl ChatState {
     /// 当前 UI 未单独显示 progress 字段；保留 Action 是为了未来扩展 + 钩子触发.
     /// 不 mutate UI 状态（签名仍接受 `&self` 但 reducer 入口统一传 `&mut`，
     /// 此处用 `&self` 让 clippy::needless-pass-by-ref-mut 静音）.
-    fn reduce_tool_progress(&self, iteration: usize, max: usize) -> Vec<Effect> {
-        let _ = &self.ui; // 强制依赖 self 防止变 const fn
+    fn reduce_tool_progress(&mut self, iteration: usize, max: usize) -> Vec<Effect> {
+        self.ui.conversation_generation = self.ui.conversation_generation.saturating_add(1);
         vec![
             Effect::LogTrace {
                 level: tracing::Level::DEBUG,
@@ -1631,8 +2256,15 @@ impl ChatState {
     /// 等响应（dispatcher 把 `ToolApprovalReceived` 转写到 driver 的接收 channel）。
     /// reducer only owns display state. The driver/router remains the single
     /// approval owner and execution gate.
-    fn reduce_tool_approval_requested(&mut self, tool_id: String, name: String, args: String) -> Vec<Effect> {
+    fn reduce_tool_approval_requested(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        tool_id: String,
+        name: String,
+        args: String,
+    ) -> Vec<Effect> {
         self.ui.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+            task_id,
             tool_id: tool_id.clone(),
             name: name.clone(),
             args: args.clone(),
@@ -1644,7 +2276,12 @@ impl ChatState {
                 level: tracing::Level::DEBUG,
                 msg: format!("tool_approval_requested tool_id={tool_id} name={name}"),
             },
-            Effect::RequestApproval { tool_id, name, args },
+            Effect::RequestApproval {
+                task_id,
+                tool_id,
+                name,
+                args,
+            },
         ]
     }
 
@@ -1700,17 +2337,6 @@ impl ChatState {
         ]
     }
 
-    /// Helper：判断当前 draft 的 id 是否匹配传入值（处理 terminal-tui 和占位两种 StreamingDraft 类型）.
-    #[cfg(feature = "terminal-tui")]
-    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
-        draft.is_some_and(|d| d.draft_id == draft_id)
-    }
-
-    #[cfg(not(feature = "terminal-tui"))]
-    fn stream_draft_id_matches(draft: Option<&StreamingDraft>, draft_id: &str) -> bool {
-        draft.is_some_and(|d| d.draft_id == draft_id)
-    }
-
     // ── Step 4 子函数（退出 + 会话） ─────────────────────────────────────────────
 
     /// `Action::CancelRequested` — 单击 Ctrl+C，取消当前流式回合（如有）.
@@ -1728,21 +2354,86 @@ impl ChatState {
             // 空闲时取消无意义 — no-op
             return vec![];
         }
-        // 取出 draft id（如有）+ cancel token（如有）用于 Effect
-        let draft_id_opt = Self::take_draft_id(&self.stream);
-        let cancel_opt = self.control.active_cancel.take();
-        // 清除流式状态
-        self.stream.draft = None;
-        self.control.generating = false;
+        let Some((tool_key, draft_id)) = self.primary_cancel_target() else {
+            return vec![];
+        };
+        self.cancel_task(tool_key, draft_id, "turn cancelled by cancel request")
+    }
+
+    fn primary_cancel_target(&self) -> Option<(ToolTaskKey, String)> {
+        self.stream
+            .primary_draft()
+            .map(|turn| (ToolTaskKey::from_task_id(turn.task_id), turn.draft.draft_id.clone()))
+    }
+
+    fn reduce_cancel_provider_turn(&mut self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> Vec<Effect> {
+        let Some(draft_id) = self
+            .stream
+            .visible_drafts
+            .iter()
+            .find(|turn| turn.task_id == Some(task_id))
+            .map(|turn| turn.draft.draft_id.clone())
+        else {
+            return vec![];
+        };
+        self.cancel_task(
+            ToolTaskKey::Task(task_id),
+            draft_id,
+            "turn cancelled by provider worker cancel request",
+        )
+    }
+
+    fn clear_target_pending_approval(
+        &mut self,
+        tool_key: ToolTaskKey,
+    ) -> Option<crate::chat::sessions::PendingToolApprovalView> {
+        let should_clear = self
+            .ui
+            .pending_tool_approval
+            .as_ref()
+            .is_some_and(|pending| ToolTaskKey::from_task_id(pending.task_id) == tool_key);
+        if !should_clear {
+            return None;
+        }
+        let pending = self.ui.pending_tool_approval.take();
+        if matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+            self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+        }
+        pending
+    }
+
+    fn cancel_task(&mut self, tool_key: ToolTaskKey, draft_id: String, reason: &'static str) -> Vec<Effect> {
+        let cancel_opt = self.control.take_turn_cancel(tool_key);
+        let _ = self.stream.remove_visible_draft(&draft_id);
+        self.finalize_pending_tool_cards(tool_key, false, Some(reason));
+        self.control.clear_tool_buffer(tool_key);
+        let target_pending_approval = self.clear_target_pending_approval(tool_key);
+        let no_visible_drafts = !self.stream.has_visible_drafts();
+        let no_task_cancels = !self.control.has_task_turn_cancels();
+        let global_pending_approval = if no_visible_drafts && no_task_cancels {
+            self.control.active_cancel = None;
+            self.control.generating = false;
+            let pending = self.ui.pending_tool_approval.take();
+            if pending.is_some() && matches!(self.ui.focus, crate::chat::sessions::FocusTarget::Approval) {
+                self.ui.focus = crate::chat::sessions::FocusTarget::Main;
+            }
+            pending
+        } else {
+            None
+        };
 
         let mut effects = Vec::new();
         // 优先发 CancelToken 真触发底层取消；再发 CancelDraft 同步 channel UI。
         if let Some(token) = cancel_opt {
             effects.push(Effect::CancelToken(token));
         }
-        if let Some(draft_id) = draft_id_opt {
-            effects.push(Effect::CancelDraft(draft_id));
+        for pending in target_pending_approval.into_iter().chain(global_pending_approval) {
+            effects.push(Effect::ResolveApproval {
+                tool_id: pending.tool_id,
+                approved: false,
+            });
         }
+        effects.push(Effect::CancelDraft(draft_id));
         effects.push(Effect::LogTrace {
             level: tracing::Level::INFO,
             msg: "Turn cancelled by CancelRequested".to_string(),
@@ -1761,18 +2452,18 @@ impl ChatState {
     /// 必须发 `Effect::CancelToken` 让 EffectExecutor 真调 token.cancel()，否则
     /// 底层 LLM 流不会立刻收到 cancel 信号。
     fn reduce_shutdown_requested(&mut self) -> Vec<Effect> {
-        let (draft_id_opt, cancel_opt) = if self.control.generating {
+        let (draft_id_opt, cancel_tokens) = if self.control.generating {
             let id = Self::take_draft_id(&self.stream);
-            let tok = self.control.active_cancel.take();
-            self.stream.draft = None;
+            let tokens = self.control.drain_turn_cancels();
+            self.stream.clear_visible_drafts();
             self.control.generating = false;
-            (id, tok)
+            (id, tokens)
         } else {
-            (None, None)
+            (None, Vec::new())
         };
 
         let mut effects = Vec::new();
-        if let Some(token) = cancel_opt {
+        for token in cancel_tokens {
             effects.push(Effect::CancelToken(token));
         }
         if let Some(draft_id) = draft_id_opt {
@@ -1830,6 +2521,7 @@ impl ChatState {
         self.ui.turn_count = self.session.turns.len();
         self.ui.active_session_view = None;
         self.ui.pending_tool_approval = None;
+        self.ui.context_used_tokens = None;
         self.ui.context_window_tokens = None;
         self.ui.focus = crate::chat::sessions::FocusTarget::Main;
         self.ui.sessions_status.clear();
@@ -1837,12 +2529,12 @@ impl ChatState {
         self.ui.switcher = None;
         self.ui.slash_menu = None;
         self.ui.saved_session_picker = None;
-        self.stream.draft = None;
-        self.stream.pending_tool_cards.clear();
+        self.stream.clear_visible_drafts();
+        self.control.clear_all_tool_buffers();
+        self.control.turn_cancels.clear();
+        self.control.final_usage_tasks_recorded.clear();
         self.control.generating = false;
         self.control.active_cancel = None;
-        self.control.current_turn_tool_calls.clear();
-        self.control.current_turn_tool_args.clear();
         vec![
             Effect::RequestRedraw,
             Effect::LogTrace {
@@ -1941,15 +2633,18 @@ impl ChatState {
         }]
     }
 
-    /// `Action::RecordAssistantTurn(text)` — 请求 reducer 持久化助手回合到 session 记录和 LLM history.
+    /// `Action::RecordAssistantTurn` — 请求 reducer 持久化助手回合到 session 记录和 LLM history.
     ///
     /// 对齐 `session.add_assistant_turn` 语义：
     /// - `updated_at` 由 effect executor 在构建 `SaveSession` 快照时设置（SessionState 不含时间戳）
-    /// - S2.5 P1-B: tool_calls 由 reducer 内 ControlState.current_turn_tool_calls
-    ///   缓冲 mem::take 回填（关闭原 FIXME(S2.5)，方案 C reducer 回填，不改 Action 签名）.
-    fn reduce_record_assistant_turn(&mut self, content: String) -> Vec<Effect> {
-        let tool_calls = std::mem::take(&mut self.control.current_turn_tool_calls);
-        self.control.current_turn_tool_args.clear();
+    /// - P3a: tool_calls come from the matching task bucket. Legacy callers use
+    ///   the Primary bucket, so main transcript behavior stays unchanged.
+    fn reduce_record_assistant_turn(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        content: String,
+    ) -> Vec<Effect> {
+        let tool_calls = self.control.take_tool_calls(ToolTaskKey::from_task_id(task_id));
         self.session.turns.push(crate::chat::session::ChatTurn {
             role: "assistant".to_string(),
             content: content.clone(),
@@ -2072,6 +2767,129 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    fn reduce_main_queue_status_updated(&mut self, status: MainQueueStatus) -> Vec<Effect> {
+        if self.ui.main_queue_status == status {
+            return Vec::new();
+        }
+        self.ui.main_queue_status = status;
+        vec![Effect::RequestRedraw]
+    }
+
+    fn reduce_provider_worker_status_updated(&mut self, status: ProviderWorkerStatus) -> Vec<Effect> {
+        if self.ui.provider_worker_status == status {
+            return Vec::new();
+        }
+        let worker_view = self.ui.focus.worker_sequence().map(|sequence| {
+            let previous_view = self
+                .ui
+                .active_session_view
+                .as_ref()
+                .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+            #[cfg(feature = "terminal-tui")]
+            let io_lines = crate::chat::tui::provider_worker_io_lines_for_streaming_draft(
+                &self.ui.conversation_lines,
+                self.stream.streaming_draft_for_worker(sequence),
+                12,
+            );
+            #[cfg(not(feature = "terminal-tui"))]
+            let io_lines = Vec::new();
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &status,
+                sequence,
+                previous_view,
+                io_lines,
+            )
+        });
+        self.ui.provider_worker_status = status;
+        if let Some(view) = worker_view {
+            self.ui.active_session_view = Some(view);
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn refresh_provider_worker_view_if_focused(&mut self) {
+        let Some(sequence) = self.ui.focus.worker_sequence() else {
+            return;
+        };
+        let previous_view = self
+            .ui
+            .active_session_view
+            .as_ref()
+            .filter(|view| view.kind == crate::chat::action::PROVIDER_WORKER_VIEW_KIND && view.seq == sequence);
+        let io_lines = crate::chat::tui::provider_worker_io_lines_for_streaming_draft(
+            &self.ui.conversation_lines,
+            self.stream.streaming_draft_for_worker(sequence),
+            12,
+        );
+        self.ui.active_session_view = Some(
+            crate::chat::action::build_provider_worker_active_view_with_io_preserving_scroll(
+                &self.ui.provider_worker_status,
+                sequence,
+                previous_view,
+                io_lines,
+            ),
+        );
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn refresh_provider_worker_view_if_focused(&mut self) {}
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_slash_menu_sources_updated(
+        &mut self,
+        saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
+    ) -> Vec<Effect> {
+        if self.ui.saved_sessions_cache == saved_sessions && self.ui.provider_model_catalog == provider_model_catalog {
+            return Vec::new();
+        }
+        self.ui.saved_sessions_cache = saved_sessions;
+        self.ui.provider_model_catalog = provider_model_catalog;
+        if self.ui.slash_menu.is_some() {
+            let sources = Self::slash_menu_sources_from(
+                &self.ui.sessions_entries,
+                &self.ui.saved_sessions_cache,
+                &self.ui.provider_model_catalog,
+                &self.ui.at_path_candidates,
+                self.session.provider.as_ref(),
+            );
+            crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
+        }
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_at_path_candidates_updated(&mut self, candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
+        if self.ui.at_path_candidates == candidates {
+            return Vec::new();
+        }
+        self.ui.at_path_candidates = candidates;
+        let sources = Self::slash_menu_sources_from(
+            &self.ui.sessions_entries,
+            &self.ui.saved_sessions_cache,
+            &self.ui.provider_model_catalog,
+            &self.ui.at_path_candidates,
+            self.session.provider.as_ref(),
+        );
+        crate::chat::tui::sync_slash_menu_for_sources(&self.ui.input, &mut self.ui.slash_menu, sources);
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_at_path_candidates_updated(&mut self, _candidates: Vec<AtPathCandidate>) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
+    #[cfg(not(feature = "terminal-tui"))]
+    fn reduce_slash_menu_sources_updated(
+        &mut self,
+        _saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        _provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
+    ) -> Vec<Effect> {
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::ActiveSessionViewUpdated` — replace/clear the focused child
     /// viewport render snapshot.
     fn reduce_active_session_view_updated(
@@ -2085,15 +2903,28 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    fn reduce_context_window_updated(&mut self, max_context_tokens: Option<usize>) -> Vec<Effect> {
-        if self.ui.context_window_tokens == max_context_tokens {
+    fn reduce_context_window_updated(
+        &mut self,
+        used_context_tokens: Option<usize>,
+        max_context_tokens: Option<usize>,
+    ) -> Vec<Effect> {
+        if self.ui.context_used_tokens == used_context_tokens && self.ui.context_window_tokens == max_context_tokens {
             return Vec::new();
         }
+        self.ui.context_used_tokens = used_context_tokens;
         self.ui.context_window_tokens = max_context_tokens;
         vec![Effect::RequestRedraw]
     }
 
-    fn reduce_provider_usage_recorded(&mut self, record: MainSessionTokenUsageRecord) -> Vec<Effect> {
+    fn reduce_provider_usage_recorded(
+        &mut self,
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        usage_kind: ProviderUsageRecordKind,
+        record: MainSessionTokenUsageRecord,
+    ) -> Vec<Effect> {
+        if !self.control.should_record_provider_usage(task_id, usage_kind) {
+            return Vec::new();
+        }
         self.session.token_usage_records.push(record);
         self.ui.token_usage_summary = MainSessionTokenUsageSummary::from_records(&self.session.token_usage_records);
         vec![
@@ -2239,6 +3070,34 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    #[cfg(feature = "terminal-tui")]
+    fn reduce_saved_session_picker_key_pressed(&mut self, key: crossterm::event::KeyEvent) -> Vec<Effect> {
+        use crossterm::event::{KeyCode, KeyModifiers};
+
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let up = key.code == KeyCode::Up || (ctrl && key.code == KeyCode::Char('p'));
+        let down = key.code == KeyCode::Down || (ctrl && key.code == KeyCode::Char('n'));
+        if up || down {
+            let Some(picker) = self.ui.saved_session_picker.as_mut() else {
+                return Vec::new();
+            };
+            if up {
+                picker.select_prev();
+            } else {
+                picker.select_next();
+            }
+            picker.clamp_selected();
+            return vec![Effect::RequestRedraw];
+        }
+        if key.code == KeyCode::Enter && key.modifiers == KeyModifiers::NONE {
+            return self.reduce_saved_session_picker_closed();
+        }
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            return self.reduce_saved_session_picker_closed();
+        }
+        Vec::new()
+    }
+
     /// `Action::HistoryCleared` — 清除 LLM context history（保留 system prompt）+ 清 UI.
     ///
     /// session.turns 不清除（持久化记录不可逆）；只重置 LLM context（下次请求
@@ -2365,12 +3224,12 @@ impl ChatState {
     /// 辅助：从 StreamState 中取出当前 draft 的 id（不同 feature 下结构不同）.
     #[cfg(feature = "terminal-tui")]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.draft.as_ref().map(|d| d.draft_id.clone())
+        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
     }
 
     #[cfg(not(feature = "terminal-tui"))]
     fn take_draft_id(stream: &StreamState) -> Option<String> {
-        stream.draft.as_ref().map(|d| d.draft_id.clone())
+        stream.primary_streaming_draft().map(|d| d.draft_id.clone())
     }
 }
 
@@ -2477,7 +3336,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         | Action::ToolStarted { .. }
         | Action::ToolFinished { .. } => true,
         // 仅 LogTrace，不变 UI
-        Action::ToolProgress { .. } | Action::StreamRetryAttempt { .. } | Action::StreamUsageMetered { .. } => false,
+        Action::StreamRetryAttempt { .. }
+        | Action::StreamUsageMetered { .. }
+        | Action::ProviderTurnReadyForCommit { .. } => false,
+        Action::ToolProgress { .. } => true,
         // Foreground approval writes pending view + focus.
         Action::ToolApprovalRequested { .. } | Action::ToolApprovalReceived { .. } | Action::ToolApprovalCleared => {
             true
@@ -2486,10 +3348,11 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // 会话：SessionLoaded 重建 history + 可能要求 UI 重置；SessionSaved/Switched 不影响 UI
         Action::SessionLoaded(_) => true,
         Action::SessionSaved { .. } | Action::SessionSwitched { .. } => false,
-        // Record* 写 session.turns / history，不直接进 conversation_lines（那是
-        // ToolStarted/StreamCompleted 等单独处理），UI 不变.
+        // Record*/compaction writes session.turns/history only. User-visible
+        // compaction feedback is `SystemMessageAdded`; budget UI refresh is
+        // `ContextWindowUpdated`, so the history patch itself is not snapshot-dirty.
         Action::RecordUserTurn(_)
-        | Action::RecordAssistantTurn(_)
+        | Action::RecordAssistantTurn { .. }
         | Action::RecordSystemMessage { .. }
         | Action::SetLeadingSystemPrompt { .. }
         | Action::HistoryCompacted { .. }
@@ -2508,6 +3371,10 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // identical writes, so this never churns frames.
         Action::SessionsStatusUpdated { .. }
         | Action::SessionsEntriesUpdated { .. }
+        | Action::MainQueueStatusUpdated { .. }
+        | Action::ProviderWorkerStatusUpdated { .. }
+        | Action::SlashMenuSourcesUpdated { .. }
+        | Action::AtPathCandidatesUpdated { .. }
         | Action::ActiveSessionViewUpdated { .. }
         | Action::ContextWindowUpdated { .. }
         | Action::ProviderUsageRecorded { .. } => true,
@@ -2526,8 +3393,9 @@ const fn ui_dirty_for(action: &Action) -> bool {
         // 但语义上需要触发 redraw — 标 dirty 走 watch 路径.
         Action::RedrawRequested => true,
 
-        // 退出：CancelRequested / ShutdownRequested 可能清空 stream.draft → dirty.
-        Action::CancelRequested | Action::ShutdownRequested => true,
+        // 退出：CancelRequested / targeted provider cancel / ShutdownRequested
+        // may clear visible drafts.
+        Action::CancelRequested | Action::CancelProviderTurn { .. } | Action::ShutdownRequested => true,
         // ForceQuit 仅发 Quit Effect，UI 立刻被 unmount，dirty 无意义.
         Action::ForceQuit => false,
     }
@@ -2583,8 +3451,8 @@ mod tests {
     #[test]
     fn test_chatstate_new_default_stream() {
         let state = make_state();
-        assert!(state.stream.draft.is_none());
-        assert!(state.stream.pending_tool_cards.is_empty());
+        assert!(state.stream.primary_streaming_draft().is_none());
+        assert!(state.control.tool_buffers.is_empty());
     }
 
     /// v1b: SessionsStatusUpdated 写入 ui.sessions_status 并经快照反映；相同内容 no-op.
@@ -2612,6 +3480,191 @@ mod tests {
         let effects = state.reduce(Action::SessionsStatusUpdated { summary: String::new() });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
         assert!(state.ui.sessions_status.is_empty());
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn main_queue_status_updated_writes_snapshot_and_dedups() {
+        let mut state = make_state();
+        let status = MainQueueStatus { queued: 3, priority: 1 };
+
+        let effects = state.reduce(Action::MainQueueStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.main_queue_status, status);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.main_queue_status, status);
+
+        let effects = state.reduce(Action::MainQueueStatusUpdated { status });
+        assert!(effects.is_empty(), "identical queue status must not emit an effect");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_updated_writes_snapshot_and_dedups() {
+        let mut state = make_state();
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 1,
+            awaiting_commit: 2,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: None,
+            rows: Vec::new(),
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status: status.clone() });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.provider_worker_status, status);
+        let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.provider_worker_status, status);
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+        assert!(
+            effects.is_empty(),
+            "identical provider worker status must not emit an effect"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn provider_worker_status_update_refreshes_open_worker_view_with_io() {
+        use crate::chat::tui::{ConversationLine, ToolStatus};
+
+        let mut state = make_state();
+        state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 2 };
+        state.ui.conversation_lines.push(ConversationLine::ToolResult {
+            tool_name: "shell".to_string(),
+            args_preview: "echo P6Z".to_string(),
+            args_full: "{\"command\":\"echo P6Z\"}".to_string(),
+            result: Some("P6Z\n".to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(12),
+            folded: true,
+        });
+        let status = ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(chrono::Utc::now().timestamp_millis()),
+            rows: vec![crate::chat::action::ProviderWorkerStatusRow {
+                task_id: 7,
+                sequence: 2,
+                kind: crate::chat::action::ProviderWorkerRowKind::ForegroundAwaited,
+                state: crate::chat::action::ProviderWorkerRowState::Running,
+                started_at_ms: chrono::Utc::now().timestamp_millis(),
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        };
+
+        let effects = state.reduce(Action::ProviderWorkerStatusUpdated { status });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let view = state.ui.active_session_view.as_ref().expect("worker view refreshed");
+        assert_eq!(view.kind, crate::chat::action::PROVIDER_WORKER_VIEW_KIND);
+        assert!(view.lines.iter().any(|line| line == "task: 7"));
+        assert!(
+            !view.lines.iter().any(|line| line == "io: recent provider turn"),
+            "non-streaming worker views must not replay transcript history: {:?}",
+            view.lines
+        );
+        assert!(
+            !view.lines.iter().any(|line| line.starts_with("run shell done:")),
+            "completed tool cards without a matching streaming draft stay out of worker IO: {:?}",
+            view.lines
+        );
+        assert!(
+            !view.lines.iter().any(|line| line == "output: P6Z"),
+            "completed tool output without a matching streaming draft stays out of worker IO: {:?}",
+            view.lines
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn slash_menu_sources_match_legacy_and_redux_for_same_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let catalog = vec![crate::chat::tui::SlashProviderModelCatalog {
+            provider: "test-provider".to_string(),
+            models: vec![crate::chat::tui::SlashModelCandidate {
+                name: "gpt-parity".to_string(),
+                description: "Parity model".to_string(),
+            }],
+        }];
+        let mut legacy = crate::chat::tui::TuiState::new("test-provider", "test-model");
+        legacy.provider_model_catalog = catalog.clone();
+        let mut redux = make_state();
+        let _ = redux.reduce(Action::SlashMenuSourcesUpdated {
+            saved_sessions: Vec::new(),
+            provider_model_catalog: catalog,
+        });
+
+        for ch in "/model ".chars() {
+            let key = KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE);
+            let _ = crate::chat::tui::dispatch_global_key(key, &mut legacy);
+            let _ = redux.reduce_with_now(Action::KeyPressed(key), 1_000);
+        }
+
+        let legacy_labels = legacy
+            .slash_menu
+            .as_ref()
+            .expect("legacy model menu")
+            .entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+        let redux_labels = redux
+            .ui
+            .slash_menu
+            .as_ref()
+            .expect("redux model menu")
+            .entries
+            .iter()
+            .map(|entry| entry.label.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(legacy_labels, redux_labels);
+        assert_eq!(redux_labels, vec!["gpt-parity"]);
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn at_path_candidates_action_opens_redux_menu_and_tab_inserts() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        let _ = state.reduce(Action::InputReplaced("inspect @ca".to_string()));
+        assert!(
+            state.ui.slash_menu.is_none(),
+            "input alone has no candidates and must not render a stale menu"
+        );
+
+        let effects = state.reduce(Action::AtPathCandidatesUpdated {
+            candidates: vec![AtPathCandidate {
+                path: "Cargo.toml".to_string(),
+                is_dir: false,
+            }],
+        });
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(
+            state
+                .ui
+                .slash_menu
+                .as_ref()
+                .expect("@path menu")
+                .entries
+                .first()
+                .map(|entry| entry.label.as_str()),
+            Some("Cargo.toml")
+        );
+        let _ = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
+        assert_eq!(state.ui.input.text(), "inspect @Cargo.toml ");
     }
 
     /// P1: SessionsEntriesUpdated writes structured strip entries and dedups
@@ -2688,25 +3741,32 @@ mod tests {
     #[test]
     fn context_window_updated_writes_snapshot_and_dedups() {
         let mut state = make_state();
+        assert_eq!(state.ui.context_used_tokens, None);
         assert_eq!(state.ui.context_window_tokens, None);
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: Some(2_500),
             max_context_tokens: Some(10_000_000),
         });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_used_tokens, Some(2_500));
         assert_eq!(state.ui.context_window_tokens, Some(10_000_000));
         let snap = state.build_ui_snapshot(1);
+        assert_eq!(snap.context_used_tokens, Some(2_500));
         assert_eq!(snap.context_window_tokens, Some(10_000_000));
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: Some(2_500),
             max_context_tokens: Some(10_000_000),
         });
-        assert!(effects.is_empty(), "identical context window must not redraw");
+        assert!(effects.is_empty(), "identical context budget must not redraw");
 
         let effects = state.reduce(Action::ContextWindowUpdated {
+            used_context_tokens: None,
             max_context_tokens: None,
         });
         assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.context_used_tokens, None);
         assert_eq!(state.ui.context_window_tokens, None);
     }
 
@@ -2822,6 +3882,193 @@ mod tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
+    fn alt_enter_stale_strip_selection_clears_and_surfaces_session_gone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 1,
+            kind: "agent",
+            origin: "user",
+            status: "running",
+            title: "task".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }];
+        state.ui.strip_selection = Some(2);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.strip_selection, None);
+        assert_eq!(
+            state.ui.input.text(),
+            "draft",
+            "stale Alt+Enter must not insert a newline"
+        );
+        assert!(
+            matches!(
+                state.ui.conversation_lines.last(),
+                Some(crate::chat::tui::ConversationLine::System { content }) if content == "session gone"
+            ),
+            "reducer should surface session gone"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn alt_enter_matching_strip_selection_uses_attach_branch_without_newline() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![crate::chat::sessions::SwitcherEntry {
+            seq: 2,
+            kind: "shell",
+            origin: "user",
+            status: "running",
+            title: "task".into(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            token_usage_records: Vec::new(),
+            idle_warning: false,
+        }];
+        state.ui.strip_selection = Some(2);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::LogTrace { msg, .. }, Effect::RequestRedraw] if msg.contains("strip_alt_enter_attach seq=2")
+            ),
+            "matching Alt+Enter should take attach branch: {effects:?}"
+        );
+        assert_eq!(state.ui.strip_selection, Some(2));
+        assert_eq!(
+            state.ui.input.text(),
+            "draft",
+            "matching Alt+Enter must not insert a newline"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn alt_enter_without_strip_selection_falls_through_to_newline_insert() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.input.set_text("a");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(matches!(effects.as_slice(), [Effect::RequestRedraw]));
+        assert_eq!(state.ui.input.text(), "a\nb");
+        assert!(
+            state.ui.conversation_lines.is_empty(),
+            "no strip selection means Alt+Enter falls through to input, not session gone"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn slash_menu_captures_alt_arrows_before_strip_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.sessions_entries = vec![
+            crate::chat::sessions::SwitcherEntry {
+                seq: 1,
+                kind: "agent",
+                origin: "user",
+                status: "running",
+                title: "one".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
+                idle_warning: false,
+            },
+            crate::chat::sessions::SwitcherEntry {
+                seq: 2,
+                kind: "agent",
+                origin: "user",
+                status: "running",
+                title: "two".into(),
+                created_at: chrono::Utc::now(),
+                updated_at: chrono::Utc::now(),
+                token_usage_records: Vec::new(),
+                idle_warning: false,
+            },
+        ];
+        state.ui.input.set_text("/mo");
+        state.ui.slash_menu = Some(SlashMenuState::new("mo"));
+        state.ui.strip_selection = Some(2);
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Up, KeyModifiers::ALT)));
+
+        assert!(
+            effects.iter().all(|effect| matches!(effect, Effect::RequestRedraw)),
+            "slash menu may redraw, but must not leak Alt+Up into strip navigation: {effects:?}"
+        );
+        assert_eq!(
+            state.ui.strip_selection,
+            Some(2),
+            "Alt+Up must not move the session strip while slash menu is open"
+        );
+        assert!(state.ui.slash_menu.is_some(), "slash menu remains open");
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn saved_session_picker_captures_alt_enter_before_stale_strip_selection() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let mut state = make_state();
+        state.ui.saved_session_picker = Some(crate::chat::session::SavedSessionPickerState::new(vec![
+            crate::chat::session::SavedSessionPickerEntry {
+                id: "saved-a".to_string(),
+                title: "saved a".to_string(),
+                turn_count: 1,
+                updated_at: chrono::Utc::now(),
+                provider: "p".to_string(),
+                model: "m".to_string(),
+                is_current: false,
+            },
+        ]));
+        state.ui.strip_selection = Some(99);
+        state.ui.input.set_text("draft");
+
+        let effects = state.reduce(Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT)));
+
+        assert!(
+            effects.is_empty(),
+            "saved picker consumes Alt+Enter without reducer side effects"
+        );
+        assert!(
+            state.ui.saved_session_picker.is_some(),
+            "Alt+Enter is consumed, not treated as picker Enter"
+        );
+        assert_eq!(state.ui.strip_selection, Some(99));
+        assert_eq!(state.ui.input.text(), "draft");
+        assert!(
+            !matches!(
+                state.ui.conversation_lines.last(),
+                Some(crate::chat::tui::ConversationLine::System { content }) if content == "session gone"
+            ),
+            "stale strip selection must not receive Alt+Enter while picker is open"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
     fn saved_session_picker_open_move_close_lifecycle() {
         let mut state = make_state();
         state.ui.switcher = Some(crate::chat::sessions::SwitcherState::new(vec![
@@ -2895,6 +4142,7 @@ mod tests {
     fn tool_approval_requested_opens_approval_child_view() {
         let mut state = make_state();
         let effects = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-approve".to_string(),
             name: "shell".to_string(),
             args: r#"{"cmd":"printf secure"}"#.to_string(),
@@ -2922,6 +4170,7 @@ mod tests {
     fn tool_approval_received_closes_approval_child_view() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-deny".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -2937,9 +4186,117 @@ mod tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
+    fn redux_esc_approval_generating_denies_without_cancelling_turn() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-approval".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
+            tool_id: "call-esc-deny".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(
+            state.control.generating,
+            "Esc in approval must not cancel the active turn"
+        );
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "streaming draft stays active"
+        );
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-esc-deny"
+            )
+        }));
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelToken(_) | Effect::CancelDraft(_))),
+            "approval Esc must not emit turn-cancel effects"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn redux_esc_generating_slash_menu_closes_menu_without_cancelling_turn() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-slash".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        state.ui.input.set_text("/mo");
+        state.ui.slash_menu = Some(SlashMenuState::new("mo"));
+
+        let effects = state.reduce(Action::KeyPressed(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(state.control.generating, "slash Esc must not cancel the active turn");
+        assert!(
+            state.stream.primary_streaming_draft().is_some(),
+            "streaming draft stays active"
+        );
+        assert!(state.ui.slash_menu.is_none(), "Esc closes only the slash menu");
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelToken(_) | Effect::CancelDraft(_))),
+            "slash Esc must not emit turn-cancel effects"
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
+    fn cancel_requested_clears_pending_approval_and_resolves_false() {
+        let mut state = make_state();
+        let _ = state.reduce(Action::TurnStarted {
+            draft_id: "draft-cancel".to_string(),
+            cancel: CancellationToken::new(),
+        });
+        let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
+            tool_id: "call-cancel-deny".to_string(),
+            name: "shell".to_string(),
+            args: "{}".to_string(),
+        });
+
+        let effects = state.reduce(Action::CancelRequested);
+
+        assert!(state.ui.pending_tool_approval.is_none());
+        assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
+        assert!(effects.iter().any(|effect| matches!(effect, Effect::CancelToken(_))));
+        assert!(effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::ResolveApproval { tool_id, approved: false } if tool_id == "call-cancel-deny"
+            )
+        }));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CancelDraft(draft_id) if draft_id == "draft-cancel"))
+        );
+    }
+
+    #[cfg(feature = "terminal-tui")]
+    #[test]
     fn tool_approval_focus_paste_does_not_edit_input() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-paste".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -2955,6 +4312,7 @@ mod tests {
     fn session_loaded_resets_transient_holder_set() {
         let mut state = make_state();
         let _ = state.reduce(Action::ToolApprovalRequested {
+            task_id: None,
             tool_id: "call-stale".to_string(),
             name: "shell".to_string(),
             args: "{}".to_string(),
@@ -2964,6 +4322,7 @@ mod tests {
             cancel: CancellationToken::new(),
         });
         state.ui.context_window_tokens = Some(10_000_000);
+        state.ui.context_used_tokens = Some(2_500);
         state.ui.input.set_text("draft text");
         assert!(state.ui.input.begin_or_cycle_reverse_search());
         state.control.generating = false;
@@ -2977,9 +4336,10 @@ mod tests {
         assert!(state.ui.pending_tool_approval.is_none());
         assert_eq!(state.ui.focus, crate::chat::sessions::FocusTarget::Main);
         assert_eq!(state.ui.context_window_tokens, None);
+        assert_eq!(state.ui.context_used_tokens, None);
         assert!(!state.ui.input.is_reverse_search_active());
         assert_eq!(state.ui.turn_count, 2);
-        assert!(state.stream.draft.is_none());
+        assert!(state.stream.primary_streaming_draft().is_none());
         assert!(!state.control.generating);
         assert!(state.control.active_cancel.is_none());
         assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
@@ -2996,7 +4356,7 @@ mod tests {
             cancel: cancel.clone(),
         });
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
         assert!(state.control.active_cancel.is_some());
 
         let mut loaded = ChatSession::new("prov-new", "model-new");
@@ -3006,7 +4366,7 @@ mod tests {
 
         assert_eq!(state.session.id, "sess-old");
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
         assert!(state.control.active_cancel.is_some());
         assert!(!cancel.is_cancelled());
         assert!(!effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
@@ -3081,6 +4441,8 @@ mod tests {
     fn test_reduce_does_not_panic_for_all_actions() {
         use crate::chat::action::HistoryDir;
         use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("cancel target", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
 
         let actions: Vec<Action> = vec![
             Action::KeyPressed(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
@@ -3093,6 +4455,7 @@ mod tests {
             Action::ToolCardFoldToggled,
             Action::ReasoningFoldToggled,
             Action::RedrawRequested,
+            Action::CancelProviderTurn { task_id },
             Action::ForceQuit,
         ];
 
@@ -3292,6 +4655,7 @@ mod tests {
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
             assert_eq!(state.ui.last_submitted.as_deref(), Some(bounded.as_str()));
+            assert!(state.ui.input.is_empty());
         }
 
         /// 9. TerminalResized → RequestRedraw
@@ -3310,6 +4674,7 @@ mod tests {
             let effects = state.reduce(Action::InputSubmitted("hello world".to_string()));
             assert_eq!(state.ui.turn_count, 1);
             assert_eq!(state.ui.last_submitted.as_deref(), Some("hello world"));
+            assert!(state.ui.input.is_empty());
             assert!(has_log_trace(&effects));
             assert!(has_request_redraw(&effects));
         }
@@ -3629,19 +4994,19 @@ mod tests {
         #[test]
         fn test_redux_turn_started_sets_stream_state() {
             let mut state = s();
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(state.control.active_cancel.is_none());
             assert!(!state.control.generating);
             let effects = state.reduce(Action::TurnStarted {
                 draft_id: "d1".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert!(state.stream.draft.is_some());
+            assert!(state.stream.primary_streaming_draft().is_some());
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.draft_id.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.draft_id.clone()),
                 Some("d1".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(0));
             assert!(state.control.active_cancel.is_some());
             assert!(state.control.generating);
             assert!(has_request_redraw(&effects));
@@ -3663,10 +5028,10 @@ mod tests {
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("hello".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(1));
 
             // 第二个有效 chunk → 累积
             let effects = state.reduce(Action::StreamChunkReceived {
@@ -3676,10 +5041,10 @@ mod tests {
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("hello world".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
         }
 
         /// Step3-3: stale version（version=1 在 version=2 之后到达）→ 丢弃
@@ -3697,10 +5062,10 @@ mod tests {
                 version: 2,
             });
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
             // 后来才到 version=1 → 丢弃
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -3709,11 +5074,11 @@ mod tests {
             });
             assert!(effects.is_empty(), "stale version 应返回空 effects");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string()),
                 "accumulated 应保持不变"
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(2));
 
             // 重复 version=2 → 也丢弃（strict-monotonic）
             let effects = state.reduce(Action::StreamChunkReceived {
@@ -3723,7 +5088,7 @@ mod tests {
             });
             assert!(effects.is_empty(), "重复 version 应丢弃");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("AB".to_string())
             );
         }
@@ -3749,10 +5114,10 @@ mod tests {
             });
             assert!(effects.is_empty(), "draft_id 不匹配应返回空");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("ok".to_string())
             );
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(1));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(1));
         }
 
         /// Step3-5: finalize 后再到达的 chunk → 丢弃
@@ -3773,7 +5138,10 @@ mod tests {
                 final_text: "complete".to_string(),
                 reasoning: String::new(),
             });
-            assert!(state.stream.draft.is_none(), "finalize 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "finalize 后 draft 应清空"
+            );
             // 此后 chunk 视为 stale
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -3781,7 +5149,7 @@ mod tests {
                 version: 2,
             });
             assert!(effects.is_empty(), "finalize 后 chunk 应丢弃");
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
         }
 
         /// Step3-6: StreamCompleted 清除 draft + push assistant + NotifyHook
@@ -3799,7 +5167,7 @@ mod tests {
                 final_text: "final answer".to_string(),
                 reasoning: String::new(),
             });
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             assert!(state.control.active_cancel.is_none());
             assert!(!state.control.generating);
             assert_eq!(
@@ -3863,7 +5231,7 @@ mod tests {
                 err: "network".to_string(),
                 retryable: true,
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(!state.control.generating);
             assert!(has_request_redraw(&effects));
             assert!(
@@ -3891,7 +5259,7 @@ mod tests {
             let effects = state.reduce(Action::StreamCancelled {
                 draft_id: "d1".to_string(),
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
             assert!(has_request_redraw(&effects));
@@ -3899,6 +5267,118 @@ mod tests {
                 state.ui.conversation_lines.len(),
                 lines_before,
                 "cancel 不应 push 任何 conversation line"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn stream_cancelled_finalizes_pending_running_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-cancel".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::StreamCancelled {
+                draft_id: "d-tool-cancel".to_string(),
+            });
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "cancelled turn must not leave a running tool card driving the status bar"
+            );
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Error,
+                        ..
+                    } if tool_name == "shell"
+                )),
+                "pending shell tool card should be finalized as an error/cancelled card"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn cancel_requested_finalizes_pending_running_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-cancel-request".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "cancel request must not leave a running tool card driving the status bar"
+            );
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Error,
+                        result: Some(result),
+                        ..
+                    } if tool_name == "shell" && result.contains("cancel request")
+                )),
+                "cancel request should finalize the shell tool card"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn stream_completed_removes_unfinished_pending_tool_cards() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "d-tool-complete".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                args: r#"{"command":"sleep 10"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "d-tool-complete".to_string(),
+                final_text: "done".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 0);
+            assert!(
+                !state
+                    .ui
+                    .conversation_lines
+                    .iter()
+                    .any(|line| matches!(line, crate::chat::tui::ConversationLine::ToolResult { .. })),
+                "completed turn should remove unfinished placeholder tool cards"
+            );
+            assert!(
+                !crate::chat::tui::execution_activity_active_for_view(&state.build_ui_snapshot(1)),
+                "completed turn must not leave placeholder tool cards driving the status bar"
             );
         }
 
@@ -4001,7 +5481,10 @@ mod tests {
                 draft_id: "d-ok".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("real answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "real answer".to_string(),
+            });
             let completion_effects = state.reduce(Action::StreamCompleted {
                 draft_id: "d-ok".to_string(),
                 final_text: "real answer".to_string(),
@@ -4052,7 +5535,7 @@ mod tests {
                 reasoning: String::new(),
             });
             assert!(e1.is_empty() && e2.is_empty() && e3.is_empty());
-            assert!(state.stream.draft.is_some(), "原 draft 应保留");
+            assert!(state.stream.primary_streaming_draft().is_some(), "原 draft 应保留");
             assert!(state.control.generating, "generating 标志应保留");
         }
 
@@ -4062,12 +5545,15 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let effects = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             assert!(has_request_redraw(&effects));
             assert_eq!(state.ui.conversation_lines.len(), 1);
-            assert_eq!(state.stream.pending_tool_cards.len(), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Primary), 1);
             if let Some(ConversationLine::ToolResult { tool_name, status, .. }) = state.ui.conversation_lines.last() {
                 assert_eq!(tool_name, "shell");
                 assert_eq!(*status, ToolStatus::Running);
@@ -4082,17 +5568,27 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             let effects = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: true,
                 duration_ms: 42,
                 result: Some("ok".to_string()),
             });
             assert!(has_request_redraw(&effects));
-            assert!(state.stream.pending_tool_cards.is_empty(), "pending 应被清空");
+            assert_eq!(
+                state.control.pending_tool_card_count(ToolTaskKey::Primary),
+                0,
+                "pending 应被清空"
+            );
             if let Some(ConversationLine::ToolResult {
                 status,
                 elapsed_ms,
@@ -4114,10 +5610,16 @@ mod tests {
             use crate::chat::tui::{ConversationLine, ToolStatus};
             let mut state = s();
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: false,
                 duration_ms: 10,
@@ -4130,15 +5632,16 @@ mod tests {
             }
         }
 
-        /// Step3-11: ToolProgress 仅返回 RequestRedraw + LogTrace
+        /// Step3-11: ToolProgress returns redraw/log and bumps UI generation.
         #[test]
-        fn test_redux_tool_progress_returns_log_and_redraw() {
+        fn test_redux_tool_progress_returns_log_redraw_and_visible_generation() {
             let mut state = s();
+            let before = state.ui.conversation_generation;
             let effects = state.reduce(Action::ToolProgress { iteration: 3, max: 10 });
             assert!(has_request_redraw(&effects));
             assert!(has_log_trace(&effects));
-            // 不 mutate conversation_lines
             assert!(state.ui.conversation_lines.is_empty());
+            assert_eq!(state.ui.conversation_generation, before + 1);
         }
 
         /// Step3-12: finalize 路径的幂等性 — 即便 StreamCompleted 被错误地重复
@@ -4188,13 +5691,13 @@ mod tests {
                 err: "boom".to_string(),
                 retryable: true,
             });
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
             // 重试：开一个新 turn (相同 draft_id 也 OK，draft.version 从 0 起)
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d1".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert_eq!(state.stream.draft.as_ref().map(|d| d.version), Some(0));
+            assert_eq!(state.stream.primary_streaming_draft().map(|d| d.version), Some(0));
             // version=1 应被接受（不被前一轮的 5 影响 — 因为 draft 已重建）
             let effects = state.reduce(Action::StreamChunkReceived {
                 draft_id: "d1".to_string(),
@@ -4203,9 +5706,34 @@ mod tests {
             });
             assert!(has_request_redraw(&effects), "新 turn 的 v=1 应被接受");
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.accumulated.clone()),
+                state.stream.primary_streaming_draft().map(|d| d.accumulated.clone()),
                 Some("retry".to_string())
             );
+        }
+
+        #[test]
+        fn esc_key_during_generation_cancels_active_turn() {
+            use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "draft-esc".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            state.ui.input.set_text("local draft");
+
+            let effects = state.reduce_with_now(
+                Action::KeyPressed(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+                1_000,
+            );
+
+            assert!(
+                effects
+                    .iter()
+                    .any(|effect| matches!(effect, Effect::CancelDraft(id) if id == "draft-esc")),
+                "Esc while generating must cancel the active draft: {effects:?}"
+            );
+            assert!(!state.control.generating);
+            assert_eq!(state.ui.input.text(), "local draft");
         }
 
         /// P1-2: Both 模式下连续 10 个正常 Action — 无语义差异（diff_count 基线验证）.
@@ -4263,13 +5791,13 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             assert!(state.control.generating);
-            assert!(state.stream.draft.is_some());
+            assert!(state.stream.primary_streaming_draft().is_some());
 
             let effects = state.reduce(Action::CancelRequested);
 
             // 状态应已清除
             assert!(!state.control.generating, "generating 应清为 false");
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             assert!(state.control.active_cancel.is_none(), "active_cancel 应清空");
             // effects 应含 CancelDraft + LogTrace + RequestRedraw
             assert!(
@@ -4308,7 +5836,7 @@ mod tests {
             let effects = state.reduce(Action::ShutdownRequested);
 
             assert!(!state.control.generating, "generating 应清除");
-            assert!(state.stream.draft.is_none(), "draft 应清空");
+            assert!(state.stream.primary_streaming_draft().is_none(), "draft 应清空");
             // S2-B Step 2: effect 顺序变为 [CancelToken, CancelDraft, Quit].
             // CancelToken 在前（真取消底层 turn），CancelDraft 紧随（同步 channel UI），
             // Quit 在最后（外壳调 shutdown.cancel()）。
@@ -4645,7 +6173,10 @@ mod tests {
         fn test_redux_record_assistant_turn_grows_history() {
             let mut state = s();
             let _ = state.reduce(Action::RecordUserTurn("hello".to_string()));
-            let effects = state.reduce(Action::RecordAssistantTurn("Rust is fast.".to_string()));
+            let effects = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "Rust is fast.".to_string(),
+            });
             assert_eq!(state.session.turns.len(), 2, "turns 增长至 2");
             assert_eq!(state.session.history.len(), 2, "history 增长至 2");
             assert_eq!(
@@ -5014,7 +6545,10 @@ mod tests {
                 patch,
                 compaction_config: config,
             });
-            let _ = state.reduce(Action::RecordAssistantTurn(assistant_reply.to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: assistant_reply.to_string(),
+            });
 
             assert_eq!(
                 state.session.turns.len(),
@@ -5175,15 +6709,21 @@ mod tests {
             let history = vec![ChatMessage::system("you are helpful"), ChatMessage::user("hi")];
 
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "draft-1".to_string(),
                 history,
                 compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
 
             // 状态变更：draft + active_cancel + generating
-            assert!(state.stream.draft.is_some(), "stream.draft 必须被设置");
+            assert!(
+                state.stream.primary_streaming_draft().is_some(),
+                "stream.draft 必须被设置"
+            );
             assert!(state.control.active_cancel.is_some(), "active_cancel 必须被注册");
             assert!(state.control.generating, "generating 必须置 true");
 
@@ -5211,11 +6751,14 @@ mod tests {
             let mut state = s();
             let cancel = CancellationToken::new();
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d2".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
             // 通过取消原 token，验证 Effect 内的 token 一并取消（共享 cancellation）
             cancel.cancel();
@@ -5239,15 +6782,19 @@ mod tests {
             };
 
             let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d-budget".to_string(),
                 history: vec![ChatMessage::user("x")],
                 compaction_config: Some(compaction_config),
                 cancel: CancellationToken::new(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
 
             let carried = effects.iter().find_map(|effect| match effect {
                 Effect::StartTurn {
+                    provider_turn_task_id: None,
                     compaction_config: Some(config),
                     ..
                 } => Some(config),
@@ -5258,6 +6805,36 @@ mod tests {
             assert_eq!(config.reserve_tokens, 10);
         }
 
+        #[test]
+        fn start_llm_turn_carries_provider_turn_task_id_to_effect() {
+            let mut state = s();
+            let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+            let task_id = scheduler.enqueue(
+                "provider identity",
+                crate::chat::turn_scheduler::TurnPriority::Normal,
+                0,
+            );
+
+            let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: None,
+                draft_id: "d-worker".to_string(),
+                history: vec![ChatMessage::user("x")],
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+
+            let carried = effects.iter().find_map(|effect| match effect {
+                Effect::StartTurn {
+                    provider_turn_task_id, ..
+                } => Some(*provider_turn_task_id),
+                _ => None,
+            });
+            assert_eq!(carried, Some(Some(task_id)));
+        }
+
         /// Phase A-3: TurnStarted（旧 Action）保持原行为 — 不发射 Effect::StartTurn
         #[test]
         fn test_phase_a_legacy_turn_started_no_start_turn_effect() {
@@ -5266,7 +6843,10 @@ mod tests {
                 draft_id: "legacy".to_string(),
                 cancel: CancellationToken::new(),
             });
-            assert!(state.stream.draft.is_some(), "TurnStarted 同样初始化 draft");
+            assert!(
+                state.stream.primary_streaming_draft().is_some(),
+                "TurnStarted 同样初始化 draft"
+            );
             assert!(
                 !has_start_turn(&effects),
                 "TurnStarted 不应发 Effect::StartTurn（旧路径仍由 chat::run 主导）"
@@ -5340,11 +6920,14 @@ mod tests {
             let mut state = s();
             let cancel = CancellationToken::new();
             let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "d5".to_string(),
                 history: vec![ChatMessage::user("hi")],
                 compaction_config: None,
                 cancel,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             });
             assert!(state.control.generating);
 
@@ -5355,7 +6938,359 @@ mod tests {
                 "CancelRequested(generating=true) 应发 CancelDraft"
             );
             assert!(!state.control.generating, "cancel 后 generating 必须复位");
-            assert!(state.stream.draft.is_none(), "cancel 后 draft 必须清理");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "cancel 后 draft 必须清理"
+            );
+        }
+
+        fn start_phase1_draft(state: &mut ChatState, draft_id: &str, sequence: u64, prompt: &str) {
+            let effects = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: vec![ChatMessage::user(prompt)],
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+            assert!(has_start_turn(&effects), "phase1 draft start must still emit StartTurn");
+        }
+
+        fn visible_draft_ids(state: &ChatState) -> Vec<&str> {
+            state
+                .stream
+                .visible_drafts
+                .iter()
+                .map(|turn| turn.draft.draft_id.as_str())
+                .collect()
+        }
+
+        fn draft_text(state: &ChatState, draft_id: &str) -> Option<String> {
+            state
+                .stream
+                .visible_drafts
+                .iter()
+                .find(|turn| turn.draft.draft_id == draft_id)
+                .map(|turn| turn.draft.accumulated.clone())
+        }
+
+        fn provider_worker_status(sequences: &[u64]) -> ProviderWorkerStatus {
+            ProviderWorkerStatus {
+                running: sequences.len(),
+                cancelling: 0,
+                awaiting_commit: 0,
+                finalized_payloads: 0,
+                finalized_total_tokens: 0,
+                oldest_started_at_ms: Some(0),
+                rows: sequences
+                    .iter()
+                    .map(|sequence| crate::chat::action::ProviderWorkerStatusRow {
+                        task_id: *sequence,
+                        sequence: *sequence,
+                        kind: crate::chat::action::ProviderWorkerRowKind::Detached,
+                        state: crate::chat::action::ProviderWorkerRowState::Running,
+                        started_at_ms: 0,
+                        finalized_total_tokens: None,
+                        completion_ready: false,
+                    })
+                    .collect(),
+            }
+        }
+
+        fn active_worker_view_text(state: &ChatState) -> String {
+            state
+                .ui
+                .active_session_view
+                .as_ref()
+                .map(|view| view.lines.join("\n"))
+                .unwrap_or_default()
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_snapshot_exposes_worker_drafts_and_keeps_primary_streaming() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A live".to_string(),
+                version: 1,
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B live".to_string(),
+                version: 1,
+            });
+
+            let snapshot = state.build_ui_snapshot(42);
+
+            assert_eq!(
+                snapshot.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
+            assert_eq!(
+                snapshot
+                    .streaming_draft_for_worker(20)
+                    .map(|draft| draft.accumulated.as_str()),
+                Some("B live")
+            );
+            assert!(snapshot.streaming_draft_for_worker(30).is_none());
+            assert_eq!(
+                snapshot
+                    .visible_streaming_drafts
+                    .iter()
+                    .map(|draft| draft.sequence)
+                    .collect::<Vec<_>>(),
+                vec![10, 20]
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_worker_pane_focus_uses_matching_draft_not_primary() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A live".to_string(),
+                version: 1,
+            });
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B live".to_string(),
+                version: 1,
+            });
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 10 };
+            let _ = state.reduce(Action::ProviderWorkerStatusUpdated {
+                status: provider_worker_status(&[10, 20]),
+            });
+            let view_a = active_worker_view_text(&state);
+            assert!(view_a.contains("assistant streaming: A live"), "{view_a}");
+            assert!(!view_a.contains("B live"), "{view_a}");
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 20 };
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: " B2".to_string(),
+                version: 2,
+            });
+            let view_b = active_worker_view_text(&state);
+            assert!(view_b.contains("assistant streaming: B live B2"), "{view_b}");
+            assert!(!view_b.contains("A live"), "{view_b}");
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_worker_pane_missing_draft_uses_empty_io_not_history_or_primary() {
+            let mut state = s();
+            state.ui.conversation_lines.push(ConversationLine::User {
+                content: "history user".to_string(),
+            });
+            state.ui.conversation_lines.push(ConversationLine::Assistant {
+                content: "history assistant must not leak".to_string(),
+            });
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            let _ = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "primary live must not leak".to_string(),
+                version: 1,
+            });
+
+            state.ui.focus = crate::chat::sessions::FocusTarget::Worker { sequence: 30 };
+            let _ = state.reduce(Action::ProviderWorkerStatusUpdated {
+                status: provider_worker_status(&[30]),
+            });
+            let view = active_worker_view_text(&state);
+
+            assert!(!view.contains("io: recent provider turn"), "{view}");
+            assert!(!view.contains("history assistant must not leak"), "{view}");
+            assert!(!view.contains("primary live must not leak"), "{view}");
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase2_main_transcript_primary_streaming_path_is_unchanged() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            let snapshot = state.build_ui_snapshot(1);
+
+            assert_eq!(
+                snapshot.streaming.as_ref().map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-a")
+            );
+        }
+
+        #[test]
+        fn phase1_two_visible_drafts_start_without_overwriting() {
+            let mut state = s();
+
+            start_phase1_draft(&mut state, "draft-b", 20, "second prompt");
+            start_phase1_draft(&mut state, "draft-a", 10, "first prompt");
+
+            assert_eq!(visible_draft_ids(&state), vec!["draft-a", "draft-b"]);
+            assert_eq!(
+                state
+                    .stream
+                    .primary_draft()
+                    .map(|turn| (turn.sequence, turn.prompt_preview.as_str())),
+                Some((10, "first prompt"))
+            );
+            assert!(state.control.generating);
+        }
+
+        #[test]
+        fn phase1_stream_chunks_route_by_draft_id() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let b_effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B1".to_string(),
+                version: 1,
+            });
+            let a_effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "A1".to_string(),
+                version: 1,
+            });
+
+            assert!(has_request_redraw(&b_effects));
+            assert!(has_request_redraw(&a_effects));
+            assert_eq!(draft_text(&state, "draft-a"), Some("A1".to_string()));
+            assert_eq!(draft_text(&state, "draft-b"), Some("B1".to_string()));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-a", "draft-b"]);
+        }
+
+        #[test]
+        fn phase1_stream_completed_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "answer a".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert!(has_save_session(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "remaining draft keeps structural generating state"
+            );
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-b")
+            );
+        }
+
+        #[test]
+        fn phase1_stale_chunk_for_completed_draft_is_ignored() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "answer a".to_string(),
+                reasoning: String::new(),
+            });
+
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-a".to_string(),
+                delta: "late".to_string(),
+                version: 1,
+            });
+
+            assert!(effects.is_empty(), "completed draft must reject late chunks");
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert_eq!(draft_text(&state, "draft-b"), Some(String::new()));
+        }
+
+        #[test]
+        fn phase1_stream_cancelled_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamCancelled {
+                draft_id: "draft-a".to_string(),
+            });
+
+            assert!(has_request_redraw(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "cancelling one structural draft must not stop the other"
+            );
+        }
+
+        #[test]
+        fn phase1_stream_failed_removes_only_matching_draft() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+
+            let effects = state.reduce(Action::StreamFailed {
+                draft_id: "draft-a".to_string(),
+                err: "failed a".to_string(),
+                retryable: false,
+            });
+
+            assert!(has_notify_hook(&effects));
+            assert_eq!(visible_draft_ids(&state), vec!["draft-b"]);
+            assert!(
+                state.control.generating,
+                "failing one structural draft must not stop the other"
+            );
+        }
+
+        #[cfg(feature = "terminal-tui")]
+        #[test]
+        fn phase1_snapshot_dirty_changes_when_non_primary_draft_version_changes() {
+            let mut state = s();
+            start_phase1_draft(&mut state, "draft-a", 10, "first");
+            start_phase1_draft(&mut state, "draft-b", 20, "second");
+            let before = state.snapshot_dirty_fields();
+
+            let effects = state.reduce(Action::StreamChunkReceived {
+                draft_id: "draft-b".to_string(),
+                delta: "B1".to_string(),
+                version: 1,
+            });
+            let after = state.snapshot_dirty_fields();
+
+            assert!(has_request_redraw(&effects));
+            assert_ne!(
+                before, after,
+                "non-primary draft version must affect snapshot dirty fingerprint"
+            );
+            assert_eq!(draft_text(&state, "draft-b"), Some("B1".to_string()));
+            assert_eq!(
+                state
+                    .stream
+                    .primary_streaming_draft()
+                    .map(|draft| draft.draft_id.as_str()),
+                Some("draft-a"),
+                "non-primary chunk must not change primary selection"
+            );
         }
 
         // ─── S2-A: chat::run stream-path → Redux dispatch wiring tests ─────
@@ -5405,8 +7340,7 @@ mod tests {
             // 核心验收点：旧路径 accumulated == reducer 内部 accumulated
             let redux_accumulated = state
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: stream.draft must exist after StreamChunkReceived");
             assert_eq!(
@@ -5414,7 +7348,7 @@ mod tests {
                 "S2-A M2 验收：reducer accumulated 必须等于旧路径 update_draft 传入的累计串"
             );
             assert_eq!(
-                state.stream.draft.as_ref().map(|d| d.version),
+                state.stream.primary_streaming_draft().map(|d| d.version),
                 Some(version),
                 "reducer version 必须等于 draft_updater 内 counter 终值"
             );
@@ -5445,7 +7379,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "completed 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "completed 后 draft 应清空"
+            );
             assert!(!state.control.generating, "completed 后 generating=false");
             assert!(state.control.active_cancel.is_none(), "active_cancel 复位");
 
@@ -5476,7 +7413,10 @@ mod tests {
                 draft_id: "draft-T3-3c".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "answer".to_string(),
+            });
             let effects = state.reduce(Action::StreamCompleted {
                 draft_id: "draft-T3-3c".to_string(),
                 final_text: "answer".to_string(),
@@ -5566,7 +7506,10 @@ mod tests {
                 draft_id: "d-fwd".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state_a.reduce(Action::RecordAssistantTurn("a-fwd".to_string()));
+            let _ = state_a.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a-fwd".to_string(),
+            });
             let fwd_effects = state_a.reduce(Action::StreamCompleted {
                 draft_id: "d-fwd".to_string(),
                 final_text: "a-fwd".to_string(),
@@ -5596,7 +7539,10 @@ mod tests {
                 final_text: "a-rev".to_string(),
                 reasoning: String::new(),
             });
-            let _ = state_b.reduce(Action::RecordAssistantTurn("a-rev".to_string()));
+            let _ = state_b.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a-rev".to_string(),
+            });
             let rev_snap = rev_effects
                 .iter()
                 .find_map(|e| match e {
@@ -5681,7 +7627,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "failed 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "failed 后 draft 应清空"
+            );
             assert!(!state.control.generating);
 
             // Effect 序列断言（按 reduce_stream_failed 的发射顺序）
@@ -5741,7 +7690,10 @@ mod tests {
             });
 
             // 终态清理
-            assert!(state.stream.draft.is_none(), "cancelled 后 draft 应清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "cancelled 后 draft 应清空"
+            );
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
 
@@ -5792,10 +7744,16 @@ mod tests {
                 version: 1,
             });
             let _ = state_a.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: "{\"q\":\"openprx\"}".to_string(),
             });
             let _ = state_a.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 42,
@@ -5824,10 +7782,16 @@ mod tests {
                 version: 2,
             });
             let _ = state_b.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: "{\"q\":\"openprx\"}".to_string(),
             });
             let _ = state_b.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 42,
@@ -5837,14 +7801,12 @@ mod tests {
             // 核心不变量：draft.accumulated 完全相同（tool 事件不污染流式文本）
             let acc_a = state_a
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: scenario A draft must exist");
             let acc_b = state_b
                 .stream
-                .draft
-                .as_ref()
+                .primary_streaming_draft()
                 .map(|d| d.accumulated.clone())
                 .expect("test: scenario B draft must exist");
             assert_eq!(
@@ -5858,20 +7820,20 @@ mod tests {
 
             // version 也必须相等（tool 事件不动 version）
             assert_eq!(
-                state_a.stream.draft.as_ref().map(|d| d.version),
-                state_b.stream.draft.as_ref().map(|d| d.version),
+                state_a.stream.primary_streaming_draft().map(|d| d.version),
+                state_b.stream.primary_streaming_draft().map(|d| d.version),
                 "tool 事件不应推进 stream.version"
             );
-            assert_eq!(state_a.stream.draft.as_ref().map(|d| d.version), Some(2));
+            assert_eq!(state_a.stream.primary_streaming_draft().map(|d| d.version), Some(2));
 
             // tool 卡片在两边都已落地，且 ToolFinished 后已从 pending 移除
             assert_eq!(
-                state_a.stream.pending_tool_cards.len(),
-                state_b.stream.pending_tool_cards.len(),
+                state_a.control.pending_tool_card_count(ToolTaskKey::Primary),
+                state_b.control.pending_tool_card_count(ToolTaskKey::Primary),
                 "两个序列 pending_tool_cards 数量必须一致"
             );
             assert!(
-                state_a.stream.pending_tool_cards.is_empty(),
+                state_a.control.pending_tool_card_count(ToolTaskKey::Primary) == 0,
                 "ToolFinished 后 pending_tool_cards 应清空"
             );
 
@@ -5924,7 +7886,10 @@ mod tests {
 
             // control 状态必须清干净
             assert!(!state.control.generating, "CancelRequested 后 generating=false");
-            assert!(state.stream.draft.is_none(), "CancelRequested 后 draft 清空");
+            assert!(
+                state.stream.primary_streaming_draft().is_none(),
+                "CancelRequested 后 draft 清空"
+            );
             assert!(
                 state.control.active_cancel.is_none(),
                 "CancelRequested 后 active_cancel 清空（token 已交给 Effect::CancelToken）"
@@ -6123,7 +8088,10 @@ mod tests {
                     legacy.add_user_turn(text);
                 } else {
                     // 测试输入闭包所有 role 都是 "user" / "assistant"，else 分支即 assistant
-                    let _ = state.reduce(Action::RecordAssistantTurn(text.to_string()));
+                    let _ = state.reduce(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: text.to_string(),
+                    });
                     legacy.add_assistant_turn(text, Vec::new());
                 }
             }
@@ -6183,7 +8151,10 @@ mod tests {
             }
 
             // 4) RecordAssistantTurn → append assistant
-            let _ = state.reduce(Action::RecordAssistantTurn("a1".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a1".to_string(),
+            });
             legacy.push(ChatMessage::assistant("a1"));
 
             // 5) RecordSystemMessage → append system 到末尾（/clear 后场景）
@@ -6222,7 +8193,10 @@ mod tests {
             assert_eq!(state.session.turns.len(), 1);
             assert_eq!(state.session.history.len(), 1, "history 也应同步增长（reducer 单写）");
 
-            let _ = state.reduce(Action::RecordAssistantTurn("hi back".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "hi back".to_string(),
+            });
             assert_eq!(state.session.turns.len(), 2, "user + assistant 两条，无重复");
             assert_eq!(state.session.history.len(), 2, "history 也应是 user+assistant 两条");
 
@@ -6325,7 +8299,7 @@ mod tests {
             );
             // control 已清
             assert!(!state.control.generating);
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
 
             // 2. chat::run 主循环检测到 cancellation → 投递 StreamCancelled 终态
             let terminal_effects = state.reduce(Action::StreamCancelled {
@@ -6419,7 +8393,7 @@ mod tests {
             // 终态：generating=false, active_cancel=None, draft=None — 不留残留
             assert!(!state.control.generating);
             assert!(state.control.active_cancel.is_none());
-            assert!(state.stream.draft.is_none());
+            assert!(state.stream.primary_streaming_draft().is_none());
 
             // 反向 race 验证：构造另一份 state，先 Shutdown 再 Cancel —
             // 同样只能发 1 个 CancelToken（首发 take 走 token，后续 Cancel 在
@@ -6573,7 +8547,10 @@ mod tests {
             assert_eq!(state.session.turns.len(), 1, "session.turns 也应增长（user）");
 
             // RecordAssistantTurn → append assistant
-            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r1".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "assistant-r1".to_string(),
+            });
             assert_eq!(state.session.history.len(), 3);
             let h2 = state.session.history.get(2).expect("test: history[2] = assistant");
             assert_eq!(h2.role, "assistant");
@@ -6582,7 +8559,10 @@ mod tests {
 
             // 再来一轮 — 顺序应仍稳定 system, user, assistant, user, assistant
             let _ = state.reduce(Action::RecordUserTurn("user-q2".to_string()));
-            let _ = state.reduce(Action::RecordAssistantTurn("assistant-r2".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "assistant-r2".to_string(),
+            });
             assert_eq!(state.session.history.len(), 5);
             let roles: Vec<&str> = state.session.history.iter().map(|m| m.role.as_str()).collect();
             assert_eq!(
@@ -6782,16 +8762,25 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 args: r#"{"cmd":"ls"}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "shell".to_string(),
                 success: true,
                 duration_ms: 12,
                 result: Some("ok".to_string()),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("answer".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "answer".to_string(),
+            });
 
             let last = state.session.turns.last().expect("test: assistant turn");
             assert_eq!(last.role, "assistant");
@@ -6799,11 +8788,10 @@ mod tests {
             let call: &ToolCallSummary = last.tool_calls.first().expect("test: tool_calls[0]");
             assert_eq!(call.name, "shell");
             assert!(call.success);
-            assert_eq!(call.args_preview, r#"{"cmd":"ls"}"#);
+            assert_eq!(call.args_preview, r#"command="ls""#);
 
             // 回填后 ControlState 缓冲必须清空（mem::take + clear）.
-            assert!(state.control.current_turn_tool_calls.is_empty());
-            assert!(state.control.current_turn_tool_args.is_empty());
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
         }
 
         /// S2.5 P1-B: 多个 tool 在同一 turn 内按顺序聚合.
@@ -6817,17 +8805,26 @@ mod tests {
             for (i, ok) in [(1u8, true), (2, false), (3, true)] {
                 let name = format!("tool{i}");
                 let _ = state.reduce(Action::ToolStarted {
+                    task_id: None,
+                    sequence: None,
+                    tool_call_id: None,
                     name: name.clone(),
                     args: format!("args-{i}"),
                 });
                 let _ = state.reduce(Action::ToolFinished {
+                    task_id: None,
+                    sequence: None,
+                    tool_call_id: None,
                     name,
                     success: ok,
                     duration_ms: 10,
                     result: None,
                 });
             }
-            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a".to_string(),
+            });
 
             let last = state.session.turns.last().expect("test: assistant turn");
             assert_eq!(last.tool_calls.len(), 3);
@@ -6853,31 +8850,46 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "leftover".to_string(),
                 args: "x".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "leftover".to_string(),
                 success: true,
                 duration_ms: 1,
                 result: None,
             });
-            assert_eq!(state.control.current_turn_tool_calls.len(), 1);
+            assert_eq!(
+                state
+                    .control
+                    .tool_buffers
+                    .get(&ToolTaskKey::Primary)
+                    .map_or(0, |buffer| buffer.tool_calls.len()),
+                1
+            );
             let _ = state.reduce(Action::StreamCompleted {
                 draft_id: "d-p1b-3a".to_string(),
                 final_text: "x".to_string(),
                 reasoning: String::new(),
             });
             // StreamCompleted 兜底 clear 后缓冲为空.
-            assert!(state.control.current_turn_tool_calls.is_empty());
-            assert!(state.control.current_turn_tool_args.is_empty());
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
 
             // Turn 2：RecordAssistantTurn 应得到空 tool_calls（未被 Turn 1 残留污染）.
             let _ = state.reduce(Action::TurnStarted {
                 draft_id: "d-p1b-3b".to_string(),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("clean".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "clean".to_string(),
+            });
             let last = state.session.turns.last().expect("test: turn 2 assistant");
             assert_eq!(last.tool_calls.len(), 0, "Turn 2 不能继承 Turn 1 残留 tool_calls");
         }
@@ -6891,22 +8903,28 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "partial".to_string(),
                 args: "...".to_string(),
             });
             // 此时 args 暂存有内容
-            assert_eq!(state.control.current_turn_tool_args.len(), 1);
+            assert_eq!(
+                state
+                    .control
+                    .tool_buffers
+                    .get(&ToolTaskKey::Primary)
+                    .map_or(0, |buffer| buffer.tool_args.len()),
+                1
+            );
 
             let _ = state.reduce(Action::StreamCancelled {
                 draft_id: "d-p1b-4".to_string(),
             });
             assert!(
-                state.control.current_turn_tool_calls.is_empty(),
+                !state.control.tool_buffers.contains_key(&ToolTaskKey::Primary),
                 "cancel 后缓冲必须清空"
-            );
-            assert!(
-                state.control.current_turn_tool_args.is_empty(),
-                "cancel 后 args 暂存必须清空"
             );
 
             // 同理验证 StreamFailed.
@@ -6916,6 +8934,9 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state2.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "partial2".to_string(),
                 args: "...".to_string(),
             });
@@ -6924,8 +8945,7 @@ mod tests {
                 err: "timeout".to_string(),
                 retryable: true,
             });
-            assert!(state2.control.current_turn_tool_calls.is_empty());
-            assert!(state2.control.current_turn_tool_args.is_empty());
+            assert!(!state2.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
         }
 
         /// S2.5 P1-B: 扩展 fixB C1 parity 模式 — RecordAssistantTurn 后
@@ -6942,26 +8962,41 @@ mod tests {
                 cancel: CancellationToken::new(),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 args: r#"{"q":"x"}"#.to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "search".to_string(),
                 success: true,
                 duration_ms: 5,
                 result: Some("hit".to_string()),
             });
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "fetch".to_string(),
                 args: "url".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "fetch".to_string(),
                 success: false,
                 duration_ms: 30,
                 result: Some("404".to_string()),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("done".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "done".to_string(),
+            });
             let _ = state.reduce(Action::StreamCompleted {
                 draft_id: "d-parity".to_string(),
                 final_text: "done".to_string(),
@@ -6997,6 +9032,547 @@ mod tests {
                 2,
                 "build_session_snapshot 落盘的 turns 必须携带 tool_calls"
             );
+        }
+    }
+
+    #[cfg(test)]
+    mod p3a_task_aware_tool_buffers {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskId};
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn task_pair() -> ((TurnTaskId, u64), (TurnTaskId, u64)) {
+            let mut scheduler = TurnScheduler::new();
+            let a = scheduler.enqueue("a", TurnPriority::Normal, 0);
+            let b = scheduler.enqueue("b", TurnPriority::Normal, 0);
+            let a_seq = scheduler.task(a).expect("test: task a").sequence;
+            let b_seq = scheduler.task(b).expect("test: task b").sequence;
+            ((a, a_seq), (b, b_seq))
+        }
+
+        fn start_task(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, draft_id: &str) {
+            let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: Vec::new(),
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+        }
+
+        fn start_tool(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, name: &str, args: &str) {
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: Some(task_id),
+                sequence: Some(sequence),
+                tool_call_id: None,
+                name: name.to_string(),
+                args: args.to_string(),
+            });
+        }
+
+        fn finish_tool(state: &mut ChatState, task_id: TurnTaskId, sequence: u64, name: &str, success: bool) {
+            let _ = state.reduce(Action::ToolFinished {
+                task_id: Some(task_id),
+                sequence: Some(sequence),
+                tool_call_id: None,
+                name: name.to_string(),
+                success,
+                duration_ms: 7,
+                result: Some(format!("{name}-result")),
+            });
+        }
+
+        #[test]
+        fn p3a_cancelled_task_finalizes_only_its_tool_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "shell", r#"{"cmd":"sleep 1"}"#);
+            start_tool(&mut state, task_b, seq_b, "grep", r#"{"q":"needle"}"#);
+
+            let _ = state.reduce(Action::StreamCancelled {
+                draft_id: "draft-a".to_string(),
+            });
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_a)), 0);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+            assert!(
+                state.ui.conversation_lines.iter().any(|line| matches!(
+                    line,
+                    crate::chat::tui::ConversationLine::ToolResult {
+                        tool_name,
+                        status: crate::chat::tui::ToolStatus::Running,
+                        ..
+                    } if tool_name == "grep"
+                )),
+                "task B running tool card must survive task A cancellation"
+            );
+        }
+
+        #[test]
+        fn p3a_completed_task_clears_only_matching_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "search", r#"{"q":"a"}"#);
+            finish_tool(&mut state, task_a, seq_a, "search", true);
+            start_tool(&mut state, task_b, seq_b, "fetch", r#"{"url":"b"}"#);
+
+            let _ = state.reduce(Action::StreamCompleted {
+                draft_id: "draft-a".to_string(),
+                final_text: "a done".to_string(),
+                reasoning: String::new(),
+            });
+
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_a)), 0);
+            assert_eq!(state.control.tool_arg_count(ToolTaskKey::Task(task_b)), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+        }
+
+        #[test]
+        fn p3a_record_assistant_turn_drains_only_requested_task_calls() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "search", r#"{"q":"a"}"#);
+            finish_tool(&mut state, task_a, seq_a, "search", true);
+            start_tool(&mut state, task_b, seq_b, "fetch", r#"{"url":"b"}"#);
+            finish_tool(&mut state, task_b, seq_b, "fetch", false);
+
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: Some(task_b),
+                content: "b answer".to_string(),
+            });
+
+            let last = state.session.turns.last().expect("test: assistant turn");
+            assert_eq!(last.tool_calls.len(), 1);
+            let call = last.tool_calls.first().expect("test: tool call");
+            assert_eq!(call.name, "fetch");
+            assert!(!call.success);
+            assert_eq!(call.task_id, Some(task_b.get()));
+            assert_eq!(call.sequence, Some(seq_b));
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_a)), 1);
+            assert_eq!(state.control.tool_call_count(ToolTaskKey::Task(task_b)), 0);
+        }
+
+        #[test]
+        fn p3a_same_tool_name_args_are_isolated_by_task() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a");
+            start_task(&mut state, task_b, seq_b, "draft-b");
+            start_tool(&mut state, task_a, seq_a, "shell", r#"{"cmd":"echo a"}"#);
+            start_tool(&mut state, task_b, seq_b, "shell", r#"{"cmd":"echo b"}"#);
+
+            finish_tool(&mut state, task_b, seq_b, "shell", true);
+
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_a)), 1);
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 0);
+            let b_call = state
+                .control
+                .tool_buffers
+                .get(&ToolTaskKey::Task(task_b))
+                .and_then(|buffer| buffer.tool_calls.first())
+                .expect("test: task b call");
+            assert!(b_call.args_preview.contains("echo b"));
+            assert_eq!(state.control.tool_arg_count(ToolTaskKey::Task(task_a)), 1);
+
+            finish_tool(&mut state, task_a, seq_a, "shell", true);
+            let a_call = state
+                .control
+                .tool_buffers
+                .get(&ToolTaskKey::Task(task_a))
+                .and_then(|buffer| buffer.tool_calls.first())
+                .expect("test: task a call");
+            assert!(a_call.args_preview.contains("echo a"));
+        }
+
+        #[test]
+        fn p3a_legacy_primary_tool_buffer_path_still_records_tool_calls() {
+            let mut state = s();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "primary-draft".to_string(),
+                cancel: CancellationToken::new(),
+            });
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                args: r#"{"cmd":"ls"}"#.to_string(),
+            });
+            let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
+                name: "shell".to_string(),
+                success: true,
+                duration_ms: 3,
+                result: Some("ok".to_string()),
+            });
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "primary answer".to_string(),
+            });
+
+            let last = state.session.turns.last().expect("test: primary assistant turn");
+            assert_eq!(last.tool_calls.len(), 1);
+            let call = last.tool_calls.first().expect("test: primary tool call");
+            assert_eq!(call.name, "shell");
+            assert!(call.success);
+            assert_eq!(call.task_id, None);
+            assert_eq!(call.sequence, None);
+            assert!(!state.control.tool_buffers.contains_key(&ToolTaskKey::Primary));
+        }
+    }
+
+    #[cfg(test)]
+    mod p3b_task_aware_cancel_tokens {
+        use super::super::*;
+        use crate::chat::action::Action;
+        use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskId};
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn task_pair() -> ((TurnTaskId, u64), (TurnTaskId, u64)) {
+            let mut scheduler = TurnScheduler::new();
+            let a = scheduler.enqueue("a", TurnPriority::Normal, 0);
+            let b = scheduler.enqueue("b", TurnPriority::Normal, 0);
+            let a_seq = scheduler.task(a).expect("test: task a").sequence;
+            let b_seq = scheduler.task(b).expect("test: task b").sequence;
+            ((a, a_seq), (b, b_seq))
+        }
+
+        fn start_task(
+            state: &mut ChatState,
+            task_id: TurnTaskId,
+            sequence: u64,
+            draft_id: &str,
+            cancel: CancellationToken,
+        ) {
+            let _ = state.reduce(Action::StartLLMTurn {
+                provider_turn_task_id: Some(task_id),
+                provider_turn_sequence: Some(sequence),
+                draft_id: draft_id.to_string(),
+                history: Vec::new(),
+                compaction_config: None,
+                cancel,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            });
+        }
+
+        fn cancel_tokens(effects: Vec<Effect>) -> Vec<CancellationToken> {
+            effects
+                .into_iter()
+                .filter_map(|effect| match effect {
+                    Effect::CancelToken(token) => Some(token),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[test]
+        fn p3b_two_task_tokens_are_independent() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let tokens = cancel_tokens(state.reduce(Action::CancelRequested));
+
+            assert_eq!(tokens.len(), 1);
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token_a.is_cancelled(), "primary task A token must be emitted");
+            assert!(!token_b.is_cancelled(), "task B token must remain untouched");
+            assert!(!state.control.turn_cancels.contains_key(&task_a));
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+        }
+
+        #[test]
+        fn p3b_cancel_primary_does_not_clear_other_task_tool_buffer() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a", CancellationToken::new());
+            start_task(&mut state, task_b, seq_b, "draft-b", CancellationToken::new());
+            let _ = state.reduce(Action::ToolStarted {
+                task_id: Some(task_b),
+                sequence: Some(seq_b),
+                tool_call_id: None,
+                name: "grep".to_string(),
+                args: r#"{"q":"needle"}"#.to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(state.control.generating, "task B still keeps generation active");
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .any(|draft| draft.task_id == Some(task_b))
+            );
+            assert_eq!(state.control.pending_tool_card_count(ToolTaskKey::Task(task_b)), 1);
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+        }
+
+        #[test]
+        fn p3b_global_state_clears_only_after_all_visible_tasks_are_cancelled() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            start_task(&mut state, task_a, seq_a, "draft-a", CancellationToken::new());
+            start_task(&mut state, task_b, seq_b, "draft-b", CancellationToken::new());
+            let _ = state.reduce(Action::ToolApprovalRequested {
+                task_id: Some(task_b),
+                tool_id: "tool-b".to_string(),
+                name: "shell".to_string(),
+                args: "{}".to_string(),
+            });
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(state.control.generating, "B remains visible after cancelling A");
+            assert!(
+                state.control.active_cancel.is_none(),
+                "task turns do not use legacy active_cancel"
+            );
+            assert!(
+                state.ui.pending_tool_approval.is_some(),
+                "B approval must not be globally cleared"
+            );
+            assert!(state.control.turn_cancels.contains_key(&task_b));
+
+            let _ = state.reduce(Action::CancelRequested);
+
+            assert!(!state.control.generating);
+            assert!(state.control.active_cancel.is_none());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(state.stream.visible_drafts.is_empty());
+            assert!(state.ui.pending_tool_approval.is_none());
+        }
+
+        #[test]
+        fn p3b_shutdown_cancels_all_task_tokens() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let effects = state.reduce(Action::ShutdownRequested);
+            let tokens = cancel_tokens(effects);
+
+            assert_eq!(tokens.len(), 2, "shutdown must emit both task cancel tokens");
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token_a.is_cancelled());
+            assert!(token_b.is_cancelled());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(!state.control.generating);
+            assert!(state.stream.visible_drafts.is_empty());
+        }
+
+        #[test]
+        fn p4c_cancel_provider_turn_targets_requested_task_token_only() {
+            let mut state = s();
+            let ((task_a, seq_a), (task_b, seq_b)) = task_pair();
+            let token_a = CancellationToken::new();
+            let token_b = CancellationToken::new();
+            start_task(&mut state, task_a, seq_a, "draft-a", token_a.clone());
+            start_task(&mut state, task_b, seq_b, "draft-b", token_b.clone());
+
+            let tokens = cancel_tokens(state.reduce(Action::CancelProviderTurn { task_id: task_b }));
+
+            assert_eq!(
+                tokens.len(),
+                1,
+                "targeted cancel should emit only the requested task token"
+            );
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(!token_a.is_cancelled(), "peer task token must remain live");
+            assert!(token_b.is_cancelled(), "requested task token must be cancelled");
+            assert!(
+                state.control.turn_cancels.contains_key(&task_a),
+                "peer task cancel token remains retained"
+            );
+            assert!(
+                !state.control.turn_cancels.contains_key(&task_b),
+                "requested task cancel token is consumed"
+            );
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .any(|draft| draft.task_id == Some(task_a)),
+                "peer draft remains visible"
+            );
+            assert!(
+                state
+                    .stream
+                    .visible_drafts
+                    .iter()
+                    .all(|draft| draft.task_id != Some(task_b)),
+                "requested draft is removed"
+            );
+            assert!(state.control.generating, "peer task keeps generation active");
+        }
+
+        #[test]
+        fn p3b_single_legacy_turn_ctrl_c_still_uses_primary_active_cancel() {
+            let mut state = s();
+            let token = CancellationToken::new();
+            let _ = state.reduce(Action::TurnStarted {
+                draft_id: "primary-draft".to_string(),
+                cancel: token.clone(),
+            });
+
+            let effects = state.reduce(Action::CancelRequested);
+            let tokens = cancel_tokens(effects);
+
+            assert_eq!(tokens.len(), 1);
+            for token in tokens {
+                token.cancel();
+            }
+            assert!(token.is_cancelled());
+            assert!(state.control.active_cancel.is_none());
+            assert!(state.control.turn_cancels.is_empty());
+            assert!(!state.control.generating);
+            assert!(state.stream.primary_streaming_draft().is_none());
+        }
+    }
+
+    #[cfg(test)]
+    mod p3c_task_aware_usage {
+        use super::super::*;
+        use crate::chat::action::{Action, ProviderUsageRecordKind};
+        use crate::chat::turn_scheduler::{TurnPriority, TurnScheduler, TurnTaskId};
+        use crate::llm::route_decision::TokenUsageSource;
+        use tokio_util::sync::CancellationToken;
+
+        fn s() -> ChatState {
+            ChatState::new(Arc::from("openai"), Arc::from("gpt-4o-mini"), CancellationToken::new())
+        }
+
+        fn task_pair() -> (TurnTaskId, TurnTaskId) {
+            let mut scheduler = TurnScheduler::new();
+            let a = scheduler.enqueue("usage-a", TurnPriority::Normal, 0);
+            let b = scheduler.enqueue("usage-b", TurnPriority::Normal, 0);
+            (a, b)
+        }
+
+        fn record(total_tokens: u64) -> MainSessionTokenUsageRecord {
+            MainSessionTokenUsageRecord {
+                provider: "openai".to_string(),
+                model: "gpt-4o-mini".to_string(),
+                prompt_tokens: total_tokens / 2,
+                completion_tokens: total_tokens - (total_tokens / 2),
+                total_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+                source: TokenUsageSource::Reported,
+                cost_usd: None,
+            }
+        }
+
+        fn provider_usage(
+            state: &mut ChatState,
+            task_id: Option<TurnTaskId>,
+            usage_kind: ProviderUsageRecordKind,
+            total_tokens: u64,
+        ) -> Vec<Effect> {
+            state.reduce(Action::ProviderUsageRecorded {
+                task_id,
+                usage_kind,
+                record: record(total_tokens),
+            })
+        }
+
+        #[test]
+        fn p3c_same_task_final_aggregate_is_deduped_once() {
+            let mut state = s();
+            let (task_id, _) = task_pair();
+
+            let first = provider_usage(&mut state, Some(task_id), ProviderUsageRecordKind::FinalAggregate, 10);
+            let second = provider_usage(&mut state, Some(task_id), ProviderUsageRecordKind::FinalAggregate, 20);
+
+            assert_eq!(first.len(), 2);
+            assert!(second.is_empty(), "duplicate final aggregate should be a reducer no-op");
+            assert_eq!(state.session.token_usage_records.len(), 1);
+            assert_eq!(state.ui.token_usage_summary.total_tokens, 10);
+        }
+
+        #[test]
+        fn p3c_out_of_order_final_usage_stays_on_own_task() {
+            let mut state = s();
+            let (task_a, task_b) = task_pair();
+
+            let _ = provider_usage(&mut state, Some(task_b), ProviderUsageRecordKind::FinalAggregate, 40);
+            let _ = provider_usage(&mut state, Some(task_a), ProviderUsageRecordKind::FinalAggregate, 15);
+            let duplicate_b = provider_usage(&mut state, Some(task_b), ProviderUsageRecordKind::FinalAggregate, 99);
+
+            assert!(duplicate_b.is_empty());
+            assert_eq!(state.session.token_usage_records.len(), 2);
+            let totals = state
+                .session
+                .token_usage_records
+                .iter()
+                .map(|record| record.total_tokens)
+                .collect::<Vec<_>>();
+            assert_eq!(totals, vec![40, 15]);
+            assert_eq!(state.ui.token_usage_summary.total_tokens, 55);
+            assert!(state.control.final_usage_tasks_recorded.contains(&task_a));
+            assert!(state.control.final_usage_tasks_recorded.contains(&task_b));
+        }
+
+        #[test]
+        fn p3c_incremental_usage_for_same_task_is_not_deduped() {
+            let mut state = s();
+            let (task_id, _) = task_pair();
+
+            let _ = provider_usage(&mut state, Some(task_id), ProviderUsageRecordKind::Incremental, 7);
+            let _ = provider_usage(&mut state, Some(task_id), ProviderUsageRecordKind::Incremental, 11);
+
+            assert_eq!(state.session.token_usage_records.len(), 2);
+            assert_eq!(state.ui.token_usage_summary.request_count, 2);
+            assert_eq!(state.ui.token_usage_summary.total_tokens, 18);
+            assert!(state.control.final_usage_tasks_recorded.is_empty());
+        }
+
+        #[test]
+        fn p3c_legacy_usage_without_task_id_is_not_deduped() {
+            let mut state = s();
+
+            let _ = provider_usage(&mut state, None, ProviderUsageRecordKind::FinalAggregate, 12);
+            let _ = provider_usage(&mut state, None, ProviderUsageRecordKind::FinalAggregate, 13);
+
+            assert_eq!(state.session.token_usage_records.len(), 2);
+            assert_eq!(state.ui.token_usage_summary.request_count, 2);
+            assert_eq!(state.ui.token_usage_summary.total_tokens, 25);
+            assert!(state.control.final_usage_tasks_recorded.is_empty());
         }
     }
 
@@ -7072,10 +9648,10 @@ mod tests {
         }
 
         #[test]
-        fn s4_a_1_ui_dirty_false_on_log_trace_only_actions() {
+        fn s4_a_1_tool_progress_dirty_but_retry_trace_only_is_clean() {
             let mut state = make_state();
             let (_e, d) = state.reduce_tracked(Action::ToolProgress { iteration: 1, max: 3 });
-            assert!(!d, "ToolProgress 仅 LogTrace, 不应 dirty");
+            assert!(d, "ToolProgress must dirty Pure snapshots so progress is visible");
             let (_e, d2) = state.reduce_tracked(Action::StreamRetryAttempt {
                 attempt: 1,
                 reason: "x".into(),
@@ -7149,10 +9725,16 @@ mod tests {
             });
             let _ = state.reduce(Action::UserMessageEchoed("hello".to_string()));
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 args: "{\"cmd\":\"ls\"}".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 success: true,
                 duration_ms: 50,
@@ -7300,10 +9882,16 @@ mod tests {
             });
             let _ = state.reduce(Action::UserMessageEchoed("hi".to_string()));
             let _ = state.reduce(Action::ToolStarted {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 args: "{}".to_string(),
             });
             let _ = state.reduce(Action::ToolFinished {
+                task_id: None,
+                sequence: None,
+                tool_call_id: None,
                 name: "Bash".to_string(),
                 success: true,
                 duration_ms: 10,
@@ -7395,7 +9983,10 @@ mod tests {
                         draft_id: "d1".to_string(),
                         cancel: CancellationToken::new(),
                     },
-                    Action::RecordAssistantTurn("ok".to_string()),
+                    Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: "ok".to_string(),
+                    },
                     Action::StreamCompleted {
                         draft_id: "d1".to_string(),
                         final_text: "ok".to_string(),

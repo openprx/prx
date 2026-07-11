@@ -490,15 +490,41 @@ impl ChatSessionsHandle {
 
     /// Display sequences for detached shell/PTY sessions that should carry an
     /// idle warning in the strip. This is warning-only: it never kills sessions.
-    pub async fn idle_warning_seqs(&mut self, policy: &ReapPolicy, now: DateTime<Utc>) -> HashSet<u64> {
+    pub async fn idle_warning_seqs(
+        &mut self,
+        policy: &ReapPolicy,
+        now: DateTime<Utc>,
+        session_rings: &HashMap<SessionId, super::event::SessionRing>,
+    ) -> HashSet<u64> {
         let _ = self.refresh_seqs().await;
         let mut warned = HashSet::new();
+        let runs = self.runs.read().await.clone();
+        for run in &runs {
+            if !matches!(
+                &run.status,
+                SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
+            ) {
+                continue;
+            }
+            let id = SessionId::from_run_id(&run.id);
+            let last_activity = session_rings
+                .get(&id)
+                .and_then(super::event::SessionRing::last_pushed_at)
+                .unwrap_or(run.started_at);
+            if now.signed_duration_since(last_activity) >= policy.idle_warn_after {
+                warned.insert(self.seq_for(&id));
+            }
+        }
         let shells = self.shells.lock().clone();
         for shell in &shells {
             if shell.is_terminal() {
                 continue;
             }
-            if now.signed_duration_since(shell.started_at) >= policy.idle_warn_after {
+            let last_activity = session_rings
+                .get(&shell.id)
+                .and_then(super::event::SessionRing::last_pushed_at)
+                .unwrap_or(shell.started_at);
+            if now.signed_duration_since(last_activity) >= policy.idle_warn_after {
                 warned.insert(self.seq_for(&shell.id));
             }
         }
@@ -509,7 +535,8 @@ impl ChatSessionsHandle {
                 if pty.has_exited() {
                     continue;
                 }
-                if now.signed_duration_since(pty.started_at) >= policy.idle_warn_after {
+                let last_activity = pty.last_output_at().unwrap_or(pty.started_at);
+                if now.signed_duration_since(last_activity) >= policy.idle_warn_after {
                     warned.insert(self.seq_for(&pty.id));
                 }
             }
@@ -699,8 +726,10 @@ impl ChatSessionsHandle {
                 seq,
                 run_id: key,
                 kind: ManagedKind::Shell,
-                // Shells are always operator-initiated (`/shell`).
-                origin: super::model::SessionOrigin::User,
+                origin: match shell.origin {
+                    super::shell::ShellOrigin::User => super::model::SessionOrigin::User,
+                    super::shell::ShellOrigin::Model => super::model::SessionOrigin::Model,
+                },
                 status,
                 summary,
                 created_at: shell.started_at,
@@ -963,6 +992,8 @@ mod tests {
             prompt_tokens: 8_000,
             completion_tokens: 4_300,
             total_tokens: 12_300,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             source,
             cost_usd: Some(0.0042),
         }
@@ -1063,7 +1094,11 @@ mod tests {
         let seq = handle.add_shell(shell.clone());
 
         let warnings = handle
-            .idle_warning_seqs(&ReapPolicy::default(), shell.started_at + chrono::Duration::minutes(11))
+            .idle_warning_seqs(
+                &ReapPolicy::default(),
+                shell.started_at + chrono::Duration::minutes(11),
+                &HashMap::new(),
+            )
             .await;
 
         assert!(warnings.contains(&seq), "long-running detached shell is warning-marked");
@@ -1072,6 +1107,39 @@ mod tests {
             "idle warning must not auto-kill during active chat"
         );
         shell.kill().await.expect("test: cleanup shell");
+    }
+
+    #[tokio::test]
+    async fn idle_warning_uses_ring_last_activity_for_running_agent() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-06T12:00:00Z")
+            .expect("test timestamp")
+            .with_timezone(&Utc);
+        let mut run = make_run("agent-active", "long task", SubAgentStatus::Running);
+        run.started_at = now - chrono::Duration::minutes(20);
+        let id = SessionId::from_run_id(&run.id);
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let seq = handle.seq_for(&id);
+        let mut rings = HashMap::new();
+        let mut ring = super::super::event::SessionRing::with_capacity(16);
+        ring.push_at("still working".to_string(), now - chrono::Duration::minutes(1));
+        rings.insert(id.clone(), ring);
+
+        let warnings = handle.idle_warning_seqs(&ReapPolicy::default(), now, &rings).await;
+        assert!(
+            !warnings.contains(&seq),
+            "recent output should prevent idle warning even when started_at is old"
+        );
+
+        rings
+            .get_mut(&id)
+            .expect("ring")
+            .push_at("old output".to_string(), now - chrono::Duration::minutes(10));
+        let warnings = handle.idle_warning_seqs(&ReapPolicy::default(), now, &rings).await;
+        assert!(
+            warnings.contains(&seq),
+            "no output for idle_warn_after should mark the session idle"
+        );
     }
 
     #[cfg(all(unix, feature = "terminal-tui"))]

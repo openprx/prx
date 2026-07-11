@@ -13,6 +13,203 @@ use crate::agent::loop_::ChatMode;
 use crate::chat::session::{ChatSession, MainSessionTokenUsageRecord};
 use crate::llm::route_decision::TokenUsage;
 
+/// Main-session input backlog status for human-visible orchestration.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MainQueueStatus {
+    pub queued: usize,
+    pub priority: usize,
+}
+
+/// Main-session provider worker lifecycle status for human-visible orchestration.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderWorkerStatus {
+    pub running: usize,
+    pub cancelling: usize,
+    pub awaiting_commit: usize,
+    pub finalized_payloads: usize,
+    pub finalized_total_tokens: u64,
+    pub oldest_started_at_ms: Option<i64>,
+    pub rows: Vec<ProviderWorkerStatusRow>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderWorkerStatusRow {
+    pub task_id: u64,
+    pub sequence: u64,
+    pub kind: ProviderWorkerRowKind,
+    pub state: ProviderWorkerRowState,
+    pub started_at_ms: i64,
+    pub finalized_total_tokens: Option<u64>,
+    pub completion_ready: bool,
+}
+
+impl ProviderWorkerStatusRow {
+    #[must_use]
+    pub const fn is_active(self) -> bool {
+        matches!(
+            self.state,
+            ProviderWorkerRowState::Running
+                | ProviderWorkerRowState::Cancelling
+                | ProviderWorkerRowState::AwaitingCommit
+        )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWorkerRowKind {
+    ForegroundAwaited,
+    Detached,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderWorkerRowState {
+    Running,
+    Cancelling,
+    AwaitingCommit,
+    Committed,
+    Cancelled,
+    Failed,
+}
+
+pub const PROVIDER_WORKER_VIEW_KIND: &str = "worker";
+const PROVIDER_WORKER_VIEW_DESIRED_ROWS: usize = 24;
+
+pub fn build_provider_worker_active_view(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    scroll_offset: usize,
+) -> crate::chat::sessions::ActiveSessionView {
+    build_provider_worker_active_view_with_io(status, sequence, scroll_offset, Vec::new())
+}
+
+pub fn build_provider_worker_active_view_with_io(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    scroll_offset: usize,
+    io_lines: Vec<String>,
+) -> crate::chat::sessions::ActiveSessionView {
+    let row = status.rows.iter().find(|row| row.sequence == sequence).copied();
+    let title = format!("main provider w#{sequence}");
+    let mut lines = Vec::new();
+    if let Some(row) = row {
+        lines.push(format!("worker: w#{}", row.sequence));
+        lines.push(format!("task: {}", row.task_id));
+        lines.push(format!("kind: {}", provider_worker_row_kind_label(row.kind)));
+        lines.push(format!("state: {}", provider_worker_row_state_label(row.state)));
+        lines.push(format!(
+            "completion: {}",
+            if row.completion_ready { "ready" } else { "pending" }
+        ));
+        lines.push(format!("elapsed: {}", provider_worker_elapsed_label(row.started_at_ms)));
+        lines.push(match row.finalized_total_tokens {
+            Some(tokens) if tokens > 0 => format!("tokens: {}", format_provider_worker_tokens_compact(tokens)),
+            _ => "tokens: pending".to_string(),
+        });
+        lines.push(format!(
+            "summary: {} running, {} cancelling, {} awaiting commit",
+            status.running, status.cancelling, status.awaiting_commit
+        ));
+        lines.push(format!(
+            "finalized: {} payloads, {} tokens",
+            status.finalized_payloads,
+            format_provider_worker_tokens_compact(status.finalized_total_tokens)
+        ));
+    } else {
+        lines.push(format!("worker: w#{sequence}"));
+        lines.push("state: no longer retained".to_string());
+        lines.push("detail: use /workers for the current retained provider worker report".to_string());
+    }
+    if !io_lines.is_empty() {
+        lines.push("io: recent provider turn".to_string());
+        lines.extend(io_lines);
+    }
+    lines.push("view: read-only provider worker detail".to_string());
+    lines.push("keys: PageUp/PageDown scroll, Esc returns to main".to_string());
+    crate::chat::sessions::ActiveSessionView {
+        seq: sequence,
+        kind: PROVIDER_WORKER_VIEW_KIND.to_string(),
+        title,
+        lines,
+        truncated: false,
+        scroll_offset,
+    }
+    .clamped_for_height(PROVIDER_WORKER_VIEW_DESIRED_ROWS)
+}
+
+#[must_use]
+pub fn build_provider_worker_active_view_with_io_preserving_scroll(
+    status: &ProviderWorkerStatus,
+    sequence: u64,
+    previous: Option<&crate::chat::sessions::ActiveSessionView>,
+    io_lines: Vec<String>,
+) -> crate::chat::sessions::ActiveSessionView {
+    let mut view = build_provider_worker_active_view_with_io(status, sequence, 0, io_lines);
+    view.scroll_offset = provider_worker_refresh_scroll_offset(previous, &view);
+    view.clamped_for_height(PROVIDER_WORKER_VIEW_DESIRED_ROWS)
+}
+
+fn provider_worker_refresh_scroll_offset(
+    previous: Option<&crate::chat::sessions::ActiveSessionView>,
+    refreshed: &crate::chat::sessions::ActiveSessionView,
+) -> usize {
+    let Some(previous) = previous
+        .filter(|view| view.kind == PROVIDER_WORKER_VIEW_KIND && view.seq == refreshed.seq && view.scroll_offset > 0)
+    else {
+        return 0;
+    };
+    let appended = refreshed.lines.len().saturating_sub(previous.lines.len());
+    previous
+        .scroll_offset
+        .saturating_add(appended)
+        .min(refreshed.max_scroll_offset(PROVIDER_WORKER_VIEW_DESIRED_ROWS))
+}
+
+pub const fn provider_worker_row_state_label(state: ProviderWorkerRowState) -> &'static str {
+    match state {
+        ProviderWorkerRowState::Running => "running",
+        ProviderWorkerRowState::Cancelling => "cancelling",
+        ProviderWorkerRowState::AwaitingCommit => "awaiting_commit",
+        ProviderWorkerRowState::Committed => "committed",
+        ProviderWorkerRowState::Cancelled => "cancelled",
+        ProviderWorkerRowState::Failed => "failed",
+    }
+}
+
+pub const fn provider_worker_row_kind_label(kind: ProviderWorkerRowKind) -> &'static str {
+    match kind {
+        ProviderWorkerRowKind::ForegroundAwaited => "foreground_awaited",
+        ProviderWorkerRowKind::Detached => "detached",
+    }
+}
+
+pub const fn provider_worker_row_kind_compact(kind: ProviderWorkerRowKind) -> &'static str {
+    match kind {
+        ProviderWorkerRowKind::ForegroundAwaited => "fg",
+        ProviderWorkerRowKind::Detached => "detached",
+    }
+}
+
+fn provider_worker_elapsed_label(started_at_ms: i64) -> String {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let elapsed_ms = now_ms.saturating_sub(started_at_ms).max(0);
+    let elapsed_secs = u64::try_from(elapsed_ms / 1000).unwrap_or_default();
+    crate::chat::sessions::model::format_elapsed_compact(elapsed_secs)
+}
+
+pub fn format_provider_worker_tokens_compact(tokens: u64) -> String {
+    if tokens >= 1_000 {
+        let whole = tokens / 1_000;
+        let decimal = (tokens % 1_000) / 100;
+        if decimal == 0 {
+            format!("{whole}k")
+        } else {
+            format!("{whole}.{decimal}k")
+        }
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// 历史导航方向。
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
@@ -35,6 +232,18 @@ pub enum CompactReason {
     ContextOverflow,
     /// 用户手动触发（如 /compact 命令，预留给后续 step）.
     Manual,
+}
+
+/// Identity for main-session provider usage records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderUsageRecordKind {
+    /// A final per-turn aggregate produced when provider completion is consumed.
+    FinalAggregate,
+    /// A non-final metering segment. These are intentionally not deduped by task
+    /// id. No production path emits this yet; it is reserved for future
+    /// incremental metering and its "not deduped" contract is locked by tests so
+    /// the dedup rule stays scoped to `FinalAggregate` only.
+    Incremental,
 }
 
 /// 单一事件代数，所有状态变更必须通过 reduce 应用.
@@ -103,6 +312,14 @@ pub enum Action {
     /// Phase A 阶段两者并存，主循环仍由旧路径主导；Phase B 之后旧路径删除，
     /// `TurnStarted` 由 `StartLLMTurn` 完全取代。
     StartLLMTurn {
+        /// Main turn scheduler identity for this provider execution. `None`
+        /// preserves non-chat/test callers, but live chat should pass the
+        /// `TurnTaskId` that owns this provider worker.
+        provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        /// Scheduler sequence for visible ordering. `None` preserves tests and
+        /// non-chat callers; live chat should pass the sequence from
+        /// `TurnScheduler`.
+        provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
         /// P5 proactive budgeting: resolved context budget for this turn.
@@ -120,6 +337,11 @@ pub enum Action {
         /// not originate a chat turn) — sub-agents then fall back to user origin,
         /// which is correct for non-turn paths such as the `/bg` slash command.
         turn_spawn_ctx: Option<crate::tools::sessions_spawn::SpawnExecutionContext>,
+        /// Per-turn default route for `message_send` tool calls. This mirrors
+        /// `turn_spawn_ctx`: the real Redux driver runs in a spawned task, so
+        /// the routing default must be carried through the reducer/effect
+        /// boundary and scoped at the actual tool execution site.
+        turn_message_send_ctx: Option<crate::tools::message_send::MessageSendExecutionContext>,
     },
     /// 收到一个 streaming 增量块
     StreamChunkReceived {
@@ -127,10 +349,18 @@ pub enum Action {
         delta: String,
         version: u64,
     },
-    /// Provider-reported or estimated usage for the active streaming turn.
-    StreamUsageMetered { usage: TokenUsage },
+    /// Provider-reported or estimated usage for a streaming turn.
+    StreamUsageMetered { draft_id: String, usage: TokenUsage },
     /// streaming 完成，携带最终文本和 reasoning 摘要
     StreamCompleted {
+        draft_id: String,
+        final_text: String,
+        reasoning: String,
+    },
+    /// Provider turn completed, but assistant/session persistence must wait for
+    /// the ordered commit gate. The dispatcher records this as a turn
+    /// completion signal and the reducer intentionally performs no state change.
+    ProviderTurnReadyForCommit {
         draft_id: String,
         final_text: String,
         reasoning: String,
@@ -146,9 +376,18 @@ pub enum Action {
 
     // ── 工具事件 ────────────────────────────────────────────────
     /// 工具调用开始
-    ToolStarted { name: String, args: String },
+    ToolStarted {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
+        name: String,
+        args: String,
+    },
     /// 工具调用结束
     ToolFinished {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        sequence: Option<u64>,
+        tool_call_id: Option<String>,
         name: String,
         success: bool,
         duration_ms: u64,
@@ -162,6 +401,7 @@ pub enum Action {
     /// `tool_id` 即 LLM 给出的 `tool_call_id`，用于将响应 [`Self::ToolApprovalReceived`]
     /// 关联到具体 pending oneshot。
     ToolApprovalRequested {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
         tool_id: String,
         name: String,
         args: String,
@@ -193,7 +433,10 @@ pub enum Action {
     /// 请求 reducer 持久化用户回合（写入 session.turns + LLM history）
     RecordUserTurn(String),
     /// 请求 reducer 持久化助手回合（写入 session.turns + LLM history）
-    RecordAssistantTurn(String),
+    RecordAssistantTurn {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        content: String,
+    },
     /// 请求 reducer append 一条 system 消息到 `session.history`（用于 `/clear` 后
     /// 重建 system prompt 等场景）.
     ///
@@ -251,16 +494,43 @@ pub enum Action {
     SessionsEntriesUpdated {
         entries: Vec<crate::chat::sessions::SwitcherEntry>,
     },
+    /// Main-session input backlog status. Updated by the chat main loop when
+    /// active-turn input is drained or queued input is popped.
+    MainQueueStatusUpdated { status: MainQueueStatus },
+    /// Main-session provider worker status. Updated by the chat main loop from
+    /// `ProviderTurnWorkerRegistry` so the TUI can show foreground/detached
+    /// provider lifecycle progress without parsing logs.
+    ProviderWorkerStatusUpdated { status: ProviderWorkerStatus },
+    /// Slash-menu argument candidate sources that are not derivable from the
+    /// structured live-session strip.
+    SlashMenuSourcesUpdated {
+        saved_sessions: Vec<crate::chat::session::SavedSessionPickerEntry>,
+        provider_model_catalog: Vec<crate::chat::slash_types::SlashProviderModelCatalog>,
+    },
+    /// `@path` completion candidates sourced by the TUI loop after applying
+    /// the file-read security policy. Kept as an Action so the reducer path
+    /// never renders with an empty source while the legacy mirror has entries.
+    AtPathCandidatesUpdated {
+        candidates: Vec<crate::chat::slash_types::AtPathCandidate>,
+    },
     /// P2 active line-oriented child session viewport snapshot. `None` clears
     /// the child viewport when focus returns to main or PTY handoff resumes.
     ActiveSessionViewUpdated {
         view: Option<crate::chat::sessions::ActiveSessionView>,
     },
-    /// Effective context window for UI-only status budget display. `None`
-    /// preserves the old `~used tok` status fallback.
-    ContextWindowUpdated { max_context_tokens: Option<usize> },
+    /// Current context-budget usage for UI-only status display. `used_context_tokens`
+    /// is the planned prompt context size for this turn, not cumulative session
+    /// token usage.
+    ContextWindowUpdated {
+        used_context_tokens: Option<usize>,
+        max_context_tokens: Option<usize>,
+    },
     /// Main-session provider usage has been recorded for a successful turn.
-    ProviderUsageRecorded { record: MainSessionTokenUsageRecord },
+    ProviderUsageRecorded {
+        task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+        usage_kind: ProviderUsageRecordKind,
+        record: MainSessionTokenUsageRecord,
+    },
     /// 记录一个进入终态（或退出时被中断）的后台会话摘要（v4）。由 chat 主循环
     /// 在 `poll_finished` surface 每个 finished session 时、以及退出时为仍 running
     /// 的 session 各 dispatch 一次。reducer 把摘要 upsert（去重 by id）进
@@ -299,6 +569,10 @@ pub enum Action {
     // ── 退出 ────────────────────────────────────────────────────
     /// 单击 Ctrl+C — 取消当前生成
     CancelRequested,
+    /// Cancel a specific visible provider turn by scheduler task id.
+    CancelProviderTurn {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+    },
     /// 双击 Ctrl+C / Ctrl+D / SIGTERM — 优雅退出
     ShutdownRequested,
     /// 兜底强制退出
@@ -330,6 +604,7 @@ impl Action {
             Self::StreamChunkReceived { .. } => "StreamChunkReceived",
             Self::StreamUsageMetered { .. } => "StreamUsageMetered",
             Self::StreamCompleted { .. } => "StreamCompleted",
+            Self::ProviderTurnReadyForCommit { .. } => "ProviderTurnReadyForCommit",
             Self::StreamFailed { .. } => "StreamFailed",
             Self::StreamCancelled { .. } => "StreamCancelled",
             Self::ToolStarted { .. } => "ToolStarted",
@@ -343,7 +618,7 @@ impl Action {
             Self::SessionSaved { .. } => "SessionSaved",
             Self::SessionSwitched { .. } => "SessionSwitched",
             Self::RecordUserTurn(_) => "RecordUserTurn",
-            Self::RecordAssistantTurn(_) => "RecordAssistantTurn",
+            Self::RecordAssistantTurn { .. } => "RecordAssistantTurn",
             Self::RecordSystemMessage { .. } => "RecordSystemMessage",
             Self::SetLeadingSystemPrompt { .. } => "SetLeadingSystemPrompt",
             Self::HistoryCompacted { .. } => "HistoryCompacted",
@@ -355,6 +630,10 @@ impl Action {
             Self::UserMessageEchoed(_) => "UserMessageEchoed",
             Self::SessionsStatusUpdated { .. } => "SessionsStatusUpdated",
             Self::SessionsEntriesUpdated { .. } => "SessionsEntriesUpdated",
+            Self::MainQueueStatusUpdated { .. } => "MainQueueStatusUpdated",
+            Self::ProviderWorkerStatusUpdated { .. } => "ProviderWorkerStatusUpdated",
+            Self::SlashMenuSourcesUpdated { .. } => "SlashMenuSourcesUpdated",
+            Self::AtPathCandidatesUpdated { .. } => "AtPathCandidatesUpdated",
             Self::ActiveSessionViewUpdated { .. } => "ActiveSessionViewUpdated",
             Self::ContextWindowUpdated { .. } => "ContextWindowUpdated",
             Self::ProviderUsageRecorded { .. } => "ProviderUsageRecorded",
@@ -368,8 +647,60 @@ impl Action {
             Self::SavedSessionPickerMoved { .. } => "SavedSessionPickerMoved",
             Self::SavedSessionPickerClosed => "SavedSessionPickerClosed",
             Self::CancelRequested => "CancelRequested",
+            Self::CancelProviderTurn { .. } => "CancelProviderTurn",
             Self::ShutdownRequested => "ShutdownRequested",
             Self::ForceQuit => "ForceQuit",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn worker_status(sequence: u64) -> ProviderWorkerStatus {
+        ProviderWorkerStatus {
+            running: 1,
+            cancelling: 0,
+            awaiting_commit: 0,
+            finalized_payloads: 0,
+            finalized_total_tokens: 0,
+            oldest_started_at_ms: Some(0),
+            rows: vec![ProviderWorkerStatusRow {
+                task_id: sequence,
+                sequence,
+                kind: ProviderWorkerRowKind::Detached,
+                state: ProviderWorkerRowState::Running,
+                started_at_ms: 0,
+                finalized_total_tokens: None,
+                completion_ready: false,
+            }],
+        }
+    }
+
+    #[test]
+    fn phase2_provider_worker_scroll_preserves_top_on_append_and_follows_tail_at_bottom() {
+        let status = worker_status(7);
+        let old_io: Vec<String> = (0..30).map(|idx| format!("old io {idx}")).collect();
+        let old_view = build_provider_worker_active_view_with_io(&status, 7, 3, old_io);
+        assert_eq!(old_view.scroll_offset, 3);
+
+        let new_io: Vec<String> = (0..32).map(|idx| format!("new io {idx}")).collect();
+        let refreshed =
+            build_provider_worker_active_view_with_io_preserving_scroll(&status, 7, Some(&old_view), new_io);
+        assert_eq!(
+            refreshed.scroll_offset, 5,
+            "two appended lines should compensate tail-relative offset"
+        );
+
+        let tail_view =
+            build_provider_worker_active_view_with_io(&status, 7, 0, (0..30).map(|idx| idx.to_string()).collect());
+        let tail_refreshed = build_provider_worker_active_view_with_io_preserving_scroll(
+            &status,
+            7,
+            Some(&tail_view),
+            (0..32).map(|idx| idx.to_string()).collect(),
+        );
+        assert_eq!(tail_refreshed.scroll_offset, 0, "tail-follow offset must remain pinned");
     }
 }

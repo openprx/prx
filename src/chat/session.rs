@@ -34,6 +34,10 @@ pub struct ToolCallSummary {
     pub name: String,
     pub args_preview: String,
     pub success: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequence: Option<u64>,
 }
 
 /// Per-provider-call token usage recorded for a chat session or child agent
@@ -49,6 +53,8 @@ pub struct MainSessionTokenUsageSummary {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
     pub reported_tokens: u64,
     pub estimated_tokens: u64,
     pub request_count: u64,
@@ -83,6 +89,12 @@ impl MainSessionTokenUsageSummary {
             summary.prompt_tokens = summary.prompt_tokens.saturating_add(record.prompt_tokens);
             summary.completion_tokens = summary.completion_tokens.saturating_add(record.completion_tokens);
             summary.total_tokens = summary.total_tokens.saturating_add(record.total_tokens);
+            summary.cache_creation_input_tokens = summary
+                .cache_creation_input_tokens
+                .saturating_add(record.cache_creation_input_tokens);
+            summary.cache_read_input_tokens = summary
+                .cache_read_input_tokens
+                .saturating_add(record.cache_read_input_tokens);
             match record.source {
                 crate::llm::route_decision::TokenUsageSource::Reported => {
                     summary.reported_tokens = summary.reported_tokens.saturating_add(record.total_tokens);
@@ -461,6 +473,8 @@ mod tests {
                 name: "shell".to_string(),
                 args_preview: "ls -la".to_string(),
                 success: true,
+                task_id: None,
+                sequence: None,
             }],
         );
 
@@ -575,6 +589,32 @@ mod tests {
         assert!(
             (cost - 0.000_45).abs() < 0.000_000_1,
             "cost should be computed independently of cost.enabled: {cost}"
+        );
+    }
+
+    #[test]
+    fn provider_usage_record_computes_kimi_code_cost() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("kimi-code", "kimi-k2.7-code");
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            Utc::now(),
+            crate::llm::route_decision::TokenUsage::reported(Some(1_000), Some(500), Some(1_500)),
+        );
+
+        let record =
+            MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &crate::config::schema::CostConfig::default())
+                .expect("reported usage should produce a record");
+
+        assert_eq!(record.prompt_tokens, 1_000);
+        assert_eq!(record.completion_tokens, 500);
+        assert_eq!(record.total_tokens, 1_500);
+        assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Reported);
+        let cost = record
+            .cost_usd
+            .expect("default kimi-code/kimi-k2.7-code price should compute cost");
+        assert!(
+            (cost - 0.002_95).abs() < 0.000_000_1,
+            "kimi-code cost should use default pricing: {cost}"
         );
     }
 

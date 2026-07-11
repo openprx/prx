@@ -8,6 +8,7 @@ use base64::Engine;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::io::{self, Write};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 // ── Draft version protocol (P1-6) ───────────────────────────────────────────
@@ -292,12 +293,40 @@ fn display_image_iterm2(data: &[u8], name: &str) -> io::Result<()> {
 ///
 /// Works in terminals that support OSC 52 (xterm, kitty, iTerm2, WezTerm, etc.).
 pub fn copy_to_clipboard(text: &str) -> io::Result<()> {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    if let Err(error) = copy_to_tmux_buffer(text) {
+        tracing::debug!(%error, "tmux clipboard handoff failed; falling back to OSC 52");
+    }
     let mut stdout = io::stdout().lock();
-    // OSC 52: set clipboard content
-    // 'c' = clipboard selection
-    write!(stdout, "\x1b]52;c;{b64}\x07")?;
+    write!(stdout, "{}", osc52_clipboard_sequence(text))?;
     stdout.flush()
+}
+
+fn osc52_clipboard_sequence(text: &str) -> String {
+    let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    // OSC 52: set clipboard content; "c" means CLIPBOARD selection.
+    format!("\x1b]52;c;{b64}\x07")
+}
+
+fn copy_to_tmux_buffer(text: &str) -> io::Result<()> {
+    if std::env::var_os("TMUX").is_none() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("tmux")
+        .args(["load-buffer", "-w", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(text.as_bytes())?;
+    }
+    let status = child.wait()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(io::Error::other("tmux load-buffer -w failed"))
+    }
 }
 
 /// Chat theme configuration.
@@ -386,10 +415,10 @@ mod tests {
 
     #[test]
     fn osc52_clipboard_format() {
-        // Just verify encoding format
-        let text = "hello world";
-        let b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-        assert!(!b64.is_empty());
+        assert_eq!(
+            osc52_clipboard_sequence("hello world"),
+            "\x1b]52;c;aGVsbG8gd29ybGQ=\x07"
+        );
     }
 
     #[test]

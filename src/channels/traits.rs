@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::sync::LazyLock;
 
 #[allow(clippy::expect_used)]
@@ -6,6 +7,31 @@ static RE_OUTGOING_MEDIA: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(r"\[(IMAGE|DOCUMENT|AUDIO|VOICE|VIDEO):([^\]]+)\]")
         .expect("BUG: invalid hardcoded outgoing media tag regex")
 });
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatKind {
+    #[default]
+    Dm,
+    Group,
+    Thread,
+}
+
+impl ChatKind {
+    #[must_use]
+    pub const fn scope_chat_type(self) -> &'static str {
+        match self {
+            Self::Dm => "direct",
+            Self::Group => "group",
+            Self::Thread => "thread",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_group_like(self) -> bool {
+        matches!(self, Self::Group | Self::Thread)
+    }
+}
 
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
@@ -16,6 +42,9 @@ pub struct ChannelMessage {
     pub content: String,
     pub channel: String,
     pub timestamp: u64,
+    pub chat_kind: ChatKind,
+    pub chat_title: Option<String>,
+    pub sender_display: Option<String>,
     /// Platform thread identifier (e.g. Slack `ts`, Discord thread ID).
     /// When set, replies should be posted as threaded responses.
     pub thread_ts: Option<String>,
@@ -57,6 +86,9 @@ impl Default for ChannelMessage {
             content: String::new(),
             channel: String::new(),
             timestamp: 0,
+            chat_kind: ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             thread_ts: None,
             mentioned_uuids: Vec::new(),
             mentioned: false,
@@ -117,6 +149,11 @@ impl SendMessage {
 pub trait Channel: Send + Sync {
     /// Human-readable channel name
     fn name(&self) -> &str;
+
+    /// Bot account/name on this platform when known.
+    fn bot_identity(&self) -> Option<String> {
+        None
+    }
 
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
@@ -307,6 +344,9 @@ mod tests {
                 channel: "dummy".into(),
                 timestamp: 123,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -327,6 +367,9 @@ mod tests {
             channel: "dummy".into(),
             timestamp: 999,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,

@@ -278,8 +278,10 @@ impl ChatDispatcher {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub enum TurnOutcomeKind {
-    /// LLM 流式成功完成；`final_text` 为最终累计可见文本.
-    Completed { final_text: String },
+    /// LLM 流式成功完成；`final_text` 为最终累计可见文本，`reasoning`
+    /// carries the final reasoning card payload that must be replayed when an
+    /// ordered commit gate releases the reducer terminal action.
+    Completed { final_text: String, reasoning: String },
     /// LLM 流式失败；`err` 为 [`Action::StreamFailed`] 携带的错误描述，
     /// `retryable` 反映 [`stream_error_is_retryable`] 判定结果。
     Failed { err: String, retryable: bool },
@@ -309,6 +311,20 @@ pub struct TurnCompletionSignal {
     inner: Arc<tokio::sync::Notify>,
     outcome: Arc<ParkingMutex<Option<TurnOutcomeKind>>>,
     usage: Arc<ParkingMutex<ProviderUsageAccumulator>>,
+    keyed: Arc<ParkingMutex<KeyedTurnCompletionState>>,
+}
+
+#[derive(Default)]
+struct KeyedTurnCompletionState {
+    task_by_draft: std::collections::HashMap<String, crate::chat::turn_scheduler::TurnTaskId>,
+    slots: std::collections::HashMap<crate::chat::turn_scheduler::TurnTaskId, KeyedTurnCompletionSlot>,
+}
+
+struct KeyedTurnCompletionSlot {
+    draft_id: String,
+    notify: Arc<tokio::sync::Notify>,
+    outcome: Option<TurnOutcomeKind>,
+    usage: ProviderUsageAccumulator,
 }
 
 impl TurnCompletionSignal {
@@ -319,11 +335,103 @@ impl TurnCompletionSignal {
             inner: Arc::new(tokio::sync::Notify::new()),
             outcome: Arc::new(parking_lot::Mutex::new(None)),
             usage: Arc::new(ParkingMutex::new(ProviderUsageAccumulator::new())),
+            keyed: Arc::new(ParkingMutex::new(KeyedTurnCompletionState::default())),
         }
     }
 
     pub fn record_usage(&self, usage: TokenUsage) {
         self.usage.lock().record(usage);
+    }
+
+    pub fn register_turn(&self, task_id: crate::chat::turn_scheduler::TurnTaskId, draft_id: impl Into<String>) {
+        let draft_id = draft_id.into();
+        let mut keyed = self.keyed.lock();
+        if let Some(previous) = keyed.task_by_draft.insert(draft_id.clone(), task_id)
+            && previous != task_id
+            && let Some(slot) = keyed.slots.get_mut(&previous)
+        {
+            slot.draft_id.clear();
+        }
+        keyed.slots.insert(
+            task_id,
+            KeyedTurnCompletionSlot {
+                draft_id,
+                notify: Arc::new(tokio::sync::Notify::new()),
+                outcome: None,
+                usage: ProviderUsageAccumulator::new(),
+            },
+        );
+    }
+
+    pub fn unregister_turn(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) {
+        let mut keyed = self.keyed.lock();
+        if let Some(slot) = keyed.slots.remove(&task_id)
+            && !slot.draft_id.is_empty()
+        {
+            keyed.task_by_draft.remove(&slot.draft_id);
+        }
+    }
+
+    #[must_use]
+    pub fn notified_for(
+        &self,
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+    ) -> Option<tokio::sync::futures::OwnedNotified> {
+        self.keyed
+            .lock()
+            .slots
+            .get(&task_id)
+            .map(|slot| slot.notify.clone().notified_owned())
+    }
+
+    pub fn record_usage_for_draft(&self, draft_id: &str, usage: TokenUsage) -> bool {
+        let mut keyed = self.keyed.lock();
+        let Some(task_id) = keyed.task_by_draft.get(draft_id).copied() else {
+            return false;
+        };
+        let Some(slot) = keyed.slots.get_mut(&task_id) else {
+            return false;
+        };
+        slot.usage.record(usage);
+        true
+    }
+
+    pub fn record_and_notify_for_draft(&self, draft_id: &str, outcome: TurnOutcomeKind) -> bool {
+        let notify = {
+            let mut keyed = self.keyed.lock();
+            let Some(task_id) = keyed.task_by_draft.get(draft_id).copied() else {
+                return false;
+            };
+            let Some(slot) = keyed.slots.get_mut(&task_id) else {
+                return false;
+            };
+            slot.outcome = Some(outcome);
+            slot.notify.clone()
+        };
+        notify.notify_waiters();
+        true
+    }
+
+    #[must_use]
+    pub fn consume_turn_outcome(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> Option<TurnOutcomeKind> {
+        self.keyed
+            .lock()
+            .slots
+            .get_mut(&task_id)
+            .and_then(|slot| slot.outcome.take())
+    }
+
+    /// Consume the task-scoped final aggregate collected for one provider turn.
+    /// Session-level dedup happens when this aggregate is recorded as
+    /// `ProviderUsageRecordKind::FinalAggregate`.
+    pub fn consume_turn_usage(&self, task_id: crate::chat::turn_scheduler::TurnTaskId) -> TokenUsage {
+        let mut keyed = self.keyed.lock();
+        let Some(slot) = keyed.slots.get_mut(&task_id) else {
+            return ProviderUsageAccumulator::new().finish();
+        };
+        let usage = slot.usage.finish();
+        slot.usage = ProviderUsageAccumulator::new();
+        usage
     }
 
     /// dispatcher task 调用：写入 outcome + 唤醒等待方。
@@ -336,6 +444,16 @@ impl TurnCompletionSignal {
     /// 等待方读取到 `None` 应视为 cancelled。
     pub fn notify(&self) {
         self.inner.notify_waiters();
+        let notifiers: Vec<_> = self
+            .keyed
+            .lock()
+            .slots
+            .values()
+            .map(|slot| slot.notify.clone())
+            .collect();
+        for notify in notifiers {
+            notify.notify_waiters();
+        }
     }
 
     /// 返回 `Notified` future。chat::run 协议：dispatch 前调用，await 在 dispatch 之后。
@@ -374,8 +492,14 @@ impl std::fmt::Debug for TurnCompletionSignal {
 #[allow(dead_code)]
 pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
     match action {
-        Action::StreamCompleted { final_text, .. } => Some(TurnOutcomeKind::Completed {
+        Action::StreamCompleted {
+            final_text, reasoning, ..
+        }
+        | Action::ProviderTurnReadyForCommit {
+            final_text, reasoning, ..
+        } => Some(TurnOutcomeKind::Completed {
             final_text: final_text.clone(),
+            reasoning: reasoning.clone(),
         }),
         Action::StreamFailed { err, retryable, .. } => Some(TurnOutcomeKind::Failed {
             err: err.clone(),
@@ -389,8 +513,40 @@ pub fn extract_turn_outcome(action: &Action) -> Option<TurnOutcomeKind> {
 #[must_use]
 pub fn extract_stream_usage(action: &Action) -> Option<TokenUsage> {
     match action {
-        Action::StreamUsageMetered { usage } => Some(usage.clone()),
+        Action::StreamUsageMetered { usage, .. } => Some(usage.clone()),
         _ => None,
+    }
+}
+
+#[must_use]
+pub fn extract_turn_draft_id(action: &Action) -> Option<&str> {
+    match action {
+        Action::StreamUsageMetered { draft_id, .. }
+        | Action::StreamCompleted { draft_id, .. }
+        | Action::ProviderTurnReadyForCommit { draft_id, .. }
+        | Action::StreamFailed { draft_id, .. }
+        | Action::StreamCancelled { draft_id } => Some(draft_id),
+        _ => None,
+    }
+}
+
+fn record_turn_signal_action(
+    sig: &TurnCompletionSignal,
+    draft_id: Option<&str>,
+    usage: Option<TokenUsage>,
+    outcome: Option<TurnOutcomeKind>,
+) {
+    if let Some(usage) = usage {
+        sig.record_usage(usage.clone());
+        if let Some(draft_id) = draft_id {
+            let _ = sig.record_usage_for_draft(draft_id, usage);
+        }
+    }
+    if let Some(outcome) = outcome {
+        sig.record_and_notify(outcome.clone());
+        if let Some(draft_id) = draft_id {
+            let _ = sig.record_and_notify_for_draft(draft_id, outcome);
+        }
     }
 }
 
@@ -400,7 +556,10 @@ pub fn extract_stream_usage(action: &Action) -> Option<TokenUsage> {
 pub const fn is_turn_terminal_action(action: &Action) -> bool {
     matches!(
         action,
-        Action::StreamCompleted { .. } | Action::StreamFailed { .. } | Action::StreamCancelled { .. }
+        Action::StreamCompleted { .. }
+            | Action::ProviderTurnReadyForCommit { .. }
+            | Action::StreamFailed { .. }
+            | Action::StreamCancelled { .. }
     )
 }
 
@@ -572,6 +731,29 @@ impl ProviderSlot {
     }
 }
 
+#[derive(Debug)]
+pub enum ProviderTurnLifecycleEvent {
+    HandleAttached {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        lease_id: u64,
+        abort_handle: tokio::task::AbortHandle,
+    },
+    Started {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        lease_id: u64,
+    },
+    Exited {
+        task_id: crate::chat::turn_scheduler::TurnTaskId,
+        lease_id: u64,
+    },
+}
+
+static PROVIDER_TURN_EXECUTION_LEASE_IDS: AtomicU64 = AtomicU64::new(1);
+
+fn next_provider_turn_execution_lease_id() -> u64 {
+    PROVIDER_TURN_EXECUTION_LEASE_IDS.fetch_add(1, Ordering::Relaxed)
+}
+
 // ─── EffectDeps ────────────────────────────────────────────────────────────────
 
 /// EffectExecutor 真业务执行所需依赖.
@@ -592,6 +774,9 @@ pub struct EffectDeps {
     pub observer: Arc<dyn Observer>,
     /// Action 回投 channel sender（StartTurn 子任务的流式回调）
     pub action_tx: mpsc::Sender<Action>,
+    /// Provider task lifecycle event bridge back to chat::run. This is separate
+    /// from action_tx because it is orchestration metadata, not reducer state.
+    pub provider_turn_lifecycle_tx: Option<mpsc::UnboundedSender<ProviderTurnLifecycleEvent>>,
     /// 双写抑制 guard（Both/Redux 模式下持久化 effect 前置位）
     pub dual_write_guard: RuntimeDualWriteGuard,
     /// 渲染重绘 channel（RequestRedraw 唤醒主循环）
@@ -786,6 +971,7 @@ impl EffectExecutor {
                 }
             }
             Effect::StartTurn {
+                provider_turn_task_id,
                 draft_id,
                 history,
                 compaction_guard_history,
@@ -793,6 +979,7 @@ impl EffectExecutor {
                 cancel,
                 chat_mode,
                 turn_spawn_ctx,
+                turn_message_send_ctx,
             } => {
                 // Step 5a-2 — 长耗时：spawn 子任务真调 provider.stream_chat_with_history，
                 // 通过 deps.action_tx 把 chunk / 完成 / 失败 / 取消事件回投给 reducer，
@@ -831,7 +1018,25 @@ impl EffectExecutor {
                 // S3 T3-1: approval 桥接 — router + manager 句柄一起透传给 driver.
                 let approval_router = Some(Arc::clone(&deps.approval_router));
                 let approval_manager = deps.approval_manager.as_ref().map(Arc::clone);
-                tokio::spawn(async move {
+                let provider_turn_task_id_for_trace = provider_turn_task_id.map(|id| id.get());
+                let provider_turn_lifecycle_tx = deps.provider_turn_lifecycle_tx.clone();
+                let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
+                let provider_turn_execution_lease_id =
+                    provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
+                let provider_task_handle = tokio::spawn(async move {
+                    if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                        provider_turn_task_id,
+                        provider_turn_execution_lease_id,
+                        provider_turn_lifecycle_tx.as_ref(),
+                    ) {
+                        let _ = tx.send(ProviderTurnLifecycleEvent::Started { task_id, lease_id });
+                    }
+                    tracing::debug!(
+                        provider_turn_task_id = provider_turn_task_id_for_trace,
+                        provider_turn_execution_lease_id,
+                        draft_id = %draft_id,
+                        "provider turn worker task started"
+                    );
                     // RAII scope：子任务退出（含 panic）时自动复位 dual_write_guard。
                     let _scope = guard_scope;
                     if cancel.is_cancelled() {
@@ -839,10 +1044,18 @@ impl EffectExecutor {
                         if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id }).await {
                             tracing::debug!(error = %e, "StartTurn: action_tx closed on pre-cancel");
                         }
+                        if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                            provider_turn_task_id,
+                            provider_turn_execution_lease_id,
+                            provider_turn_lifecycle_tx.as_ref(),
+                        ) {
+                            let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id });
+                        }
                         return;
                     }
                     let compaction_guard_history = compaction_guard_history.unwrap_or_else(|| history.clone());
                     let driver = drive_start_turn_stream(
+                        provider_turn_task_id,
                         provider,
                         history,
                         compaction_guard_history,
@@ -871,7 +1084,7 @@ impl EffectExecutor {
                     // dispatches `StartLLMTurn`), the driver runs unscoped and
                     // spawned sub-agents fall back to user origin — the correct
                     // behavior for those paths.
-                    let scoped_driver = async move {
+                    let scoped_spawn_driver = async move {
                         match turn_spawn_ctx {
                             Some(ctx) => {
                                 crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
@@ -879,6 +1092,16 @@ impl EffectExecutor {
                                     .await;
                             }
                             None => driver.await,
+                        }
+                    };
+                    let scoped_driver = async move {
+                        match turn_message_send_ctx {
+                            Some(ctx) => {
+                                crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                                    .scope(ctx, scoped_spawn_driver)
+                                    .await;
+                            }
+                            None => scoped_spawn_driver.await,
                         }
                     };
                     if let Some(timeout_budget) = turn_timeout_budget {
@@ -899,7 +1122,30 @@ impl EffectExecutor {
                     } else {
                         scoped_driver.await;
                     }
+                    tracing::debug!(
+                        provider_turn_task_id = provider_turn_task_id_for_trace,
+                        provider_turn_execution_lease_id,
+                        "provider turn worker task exited"
+                    );
+                    if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                        provider_turn_task_id,
+                        provider_turn_execution_lease_id,
+                        provider_turn_lifecycle_tx.as_ref(),
+                    ) {
+                        let _ = tx.send(ProviderTurnLifecycleEvent::Exited { task_id, lease_id });
+                    }
                 });
+                if let (Some(task_id), Some(lease_id), Some(tx)) = (
+                    provider_turn_task_id,
+                    provider_turn_execution_lease_id,
+                    provider_turn_handle_tx.as_ref(),
+                ) {
+                    let _ = tx.send(ProviderTurnLifecycleEvent::HandleAttached {
+                        task_id,
+                        lease_id,
+                        abort_handle: provider_task_handle.abort_handle(),
+                    });
+                }
             }
             Effect::SaveSession(session) => {
                 // T3-3-fixB D1：inline await 替代 tokio::spawn，让主循环
@@ -1009,7 +1255,14 @@ impl EffectExecutor {
             Effect::AutoTitleSession(title) => {
                 tracing::debug!(title = %title, "AutoTitleSession effect");
             }
-            Effect::RequestApproval { tool_id, name, args } => {
+            Effect::RequestApproval {
+                task_id,
+                tool_id,
+                name,
+                args,
+            } => {
+                #[cfg(not(feature = "terminal-tui"))]
+                let _ = task_id;
                 #[cfg(feature = "terminal-tui")]
                 {
                     let interactive_tui = self.redraw_slot.lock().is_some() || deps.redraw_tx.is_some();
@@ -1017,8 +1270,12 @@ impl EffectExecutor {
                         if let Some(mirror) = deps.tui_mirror.as_ref() {
                             {
                                 let mut state = mirror.lock();
-                                state.pending_tool_approval =
-                                    Some(crate::chat::sessions::PendingToolApprovalView { tool_id, name, args });
+                                state.pending_tool_approval = Some(crate::chat::sessions::PendingToolApprovalView {
+                                    task_id,
+                                    tool_id,
+                                    name,
+                                    args,
+                                });
                                 state.focus = crate::chat::sessions::FocusTarget::Approval;
                                 state.switcher = None;
                             }
@@ -1079,6 +1336,9 @@ impl EffectExecutor {
                         tracing::debug!(error = %e, "RequestApproval stub: action_tx closed");
                     }
                 });
+            }
+            Effect::ResolveApproval { tool_id, approved } => {
+                deps.approval_router.resolve(&tool_id, approved);
             }
             Effect::Quit => {
                 // 关停信号：真 cancel + drop 等隐式协议由 chat::run 收尾处理
@@ -1468,6 +1728,62 @@ async fn apply_redux_summary_compaction(
     Ok(Some(replacement_len))
 }
 
+fn chat_history_turn_count(history: &[crate::providers::traits::ChatMessage]) -> usize {
+    history
+        .len()
+        .saturating_sub(usize::from(history.first().is_some_and(|msg| msg.role == "system")))
+}
+
+async fn send_redux_compaction_feedback(
+    action_tx: &mpsc::Sender<Action>,
+    turns_before: usize,
+    tokens_before: usize,
+    history: &[crate::providers::traits::ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    context: &'static str,
+    last_feedback: &mut Option<String>,
+) -> Result<bool, ()> {
+    let turns_after = chat_history_turn_count(history);
+    let tokens_after = super::estimate_chat_history_tokens(history);
+    let text = super::format_compact_feedback(
+        turns_before,
+        turns_after,
+        tokens_before,
+        tokens_after,
+        config.max_context_tokens,
+    );
+    if last_feedback.as_deref() == Some(text.as_str()) {
+        return Ok(false);
+    }
+    if let Err(error) = action_tx.send(Action::SystemMessageAdded { text: text.clone() }).await {
+        tracing::debug!(%error, context, "StartTurn: action_tx closed on compaction feedback");
+        return Err(());
+    }
+    *last_feedback = Some(text);
+    Ok(true)
+}
+
+async fn send_redux_context_window_update(
+    action_tx: &mpsc::Sender<Action>,
+    history: &[crate::providers::traits::ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+    context: &'static str,
+) -> Result<(), ()> {
+    let budget =
+        crate::agent::loop_::plan_context_budget(history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+    if let Err(error) = action_tx
+        .send(Action::ContextWindowUpdated {
+            used_context_tokens: Some(budget.used_tokens),
+            max_context_tokens: Some(budget.max_context_tokens),
+        })
+        .await
+    {
+        tracing::debug!(%error, context, "StartTurn: action_tx closed on context-window update");
+        return Err(());
+    }
+    Ok(())
+}
+
 fn trim_redux_driver_context_budget_after_summary(
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_guard_history: &mut Vec<crate::providers::traits::ChatMessage>,
@@ -1503,6 +1819,7 @@ fn trim_redux_driver_context_budget_after_summary(
     )
 )]
 async fn drive_start_turn_stream(
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
     mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
@@ -1526,6 +1843,7 @@ async fn drive_start_turn_stream(
     let mut usage_accumulator = ProviderUsageAccumulator::new();
     let mut iteration: usize = 0;
     let mut overflow_retries: u8 = 0;
+    let mut last_compaction_feedback: Option<String> = None;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
     let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // BUG-03: count how many times each unrecoverable tool-failure signature has
@@ -1556,6 +1874,8 @@ async fn drive_start_turn_stream(
                 crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
             );
             if budget.over_hard_limit {
+                let turns_before = chat_history_turn_count(&history);
+                let tokens_before = super::estimate_chat_history_tokens(&history);
                 let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
                 let summary_replacement_len = if compaction_off {
                     None
@@ -1597,6 +1917,31 @@ async fn drive_start_turn_stream(
                         trimmed,
                         "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
+                }
+                if send_redux_context_window_update(
+                    &action_tx,
+                    &history,
+                    config,
+                    "redux_preflight_context_window_updated",
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                if send_redux_compaction_feedback(
+                    &action_tx,
+                    turns_before,
+                    tokens_before,
+                    &history,
+                    config,
+                    "redux_preflight_compaction_feedback",
+                    &mut last_compaction_feedback,
+                )
+                .await
+                .is_err()
+                {
+                    return;
                 }
             } else if budget.over_warning {
                 tracing::info!(
@@ -1642,6 +1987,13 @@ async fn drive_start_turn_stream(
                     return;
                 }
                 overflow_retries = overflow_retries.saturating_add(1);
+                let compaction_feedback_before = compaction_config.as_ref().map(|config| {
+                    (
+                        chat_history_turn_count(&history),
+                        super::estimate_chat_history_tokens(&history),
+                        config.clone(),
+                    )
+                });
                 match compaction_config.as_ref() {
                     Some(config) if matches!(config.mode, crate::config::AgentCompactionMode::Off) => {
                         let trimmed = crate::agent::loop_::trim_history_to_context_budget(&mut history, config);
@@ -1690,6 +2042,33 @@ async fn drive_start_turn_stream(
                             tracing::debug!(error = %e, "StartTurn: action_tx closed on compact-dispatch");
                             return;
                         }
+                    }
+                }
+                if let Some((turns_before, tokens_before, config)) = compaction_feedback_before {
+                    if send_redux_context_window_update(
+                        &action_tx,
+                        &history,
+                        &config,
+                        "redux_overflow_context_window_updated",
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                    if send_redux_compaction_feedback(
+                        &action_tx,
+                        turns_before,
+                        tokens_before,
+                        &history,
+                        &config,
+                        "redux_overflow_compaction_feedback",
+                        &mut last_compaction_feedback,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
                     }
                 }
                 // 同一次 outer iteration 不消耗配额 — decrement 让重试不计入 max_iterations.
@@ -1777,6 +2156,7 @@ async fn drive_start_turn_stream(
                     }
                     let call_name = call.name.clone();
                     let outcome = execute_single_tool_call(
+                        provider_turn_task_id,
                         registry,
                         &call,
                         &cancel,
@@ -1849,13 +2229,17 @@ async fn drive_start_turn_stream(
         }
     }
 
-    // T3-3-fixB B5：先 RecordAssistantTurn 再 StreamCompleted，让 reducer
-    // reduce_stream_completed emit Effect::SaveSession 时 session.turns 已
-    // 含本轮 assistant。与 fixA P0-1 legacy 路径修同款时序契约。
+    // P4b-1: task-scoped visible provider turns are persisted only after the
+    // ordered commit gate in chat::run. The dispatcher still emits usage and
+    // empty-response notices immediately, but its successful terminal action is
+    // a reducer no-op that only wakes TurnCompletionSignal. Non task-scoped
+    // tests/legacy paths keep the original RecordAssistantTurn -> StreamCompleted
+    // contract.
     let tokens_used = usage_accumulator.finish();
     if tokens_used.is_reported()
         && let Err(e) = action_tx
             .send(Action::StreamUsageMetered {
+                draft_id: draft_id.clone(),
                 usage: tokens_used.clone(),
             })
             .await
@@ -1863,15 +2247,44 @@ async fn drive_start_turn_stream(
         tracing::debug!(error = %e, "StartTurn: action_tx closed before StreamUsageMetered");
         return;
     }
-    let record = Action::RecordAssistantTurn(accumulated.clone());
-    if let Err(e) = action_tx.send(record).await {
-        tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
-        return;
+    let empty_assistant_response = crate::agent::loop_::is_empty_assistant_response(&accumulated, false);
+    if empty_assistant_response {
+        if let Err(e) = action_tx
+            .send(Action::SystemMessageAdded {
+                text: crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed before empty-response system message");
+            return;
+        }
+    } else if provider_turn_task_id.is_none() {
+        let record = Action::RecordAssistantTurn {
+            task_id: provider_turn_task_id,
+            content: accumulated.clone(),
+        };
+        if let Err(e) = action_tx.send(record).await {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed before RecordAssistantTurn");
+            return;
+        }
     }
-    let action = Action::StreamCompleted {
-        draft_id,
-        final_text: accumulated,
-        reasoning: reasoning_buf,
+    let reasoning = if empty_assistant_response {
+        String::new()
+    } else {
+        reasoning_buf
+    };
+    let action = if provider_turn_task_id.is_some() {
+        Action::ProviderTurnReadyForCommit {
+            draft_id,
+            final_text: accumulated,
+            reasoning,
+        }
+    } else {
+        Action::StreamCompleted {
+            draft_id,
+            final_text: accumulated,
+            reasoning,
+        }
     };
     if let Err(e) = action_tx.send(action).await {
         tracing::debug!(error = %e, "StartTurn: action_tx closed on completion");
@@ -1992,6 +2405,7 @@ fn plan_preview_args(raw_args: &str) -> String {
 /// 拆出后逻辑/borrow 都更清晰。返回值告诉调用方下一步行为（继续 / 取消 / 退出）。
 #[allow(clippy::too_many_arguments)]
 async fn execute_single_tool_call(
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
     call: &ResolvedToolCall,
     cancel: &CancellationToken,
@@ -2020,6 +2434,9 @@ async fn execute_single_tool_call(
         history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
         if let Err(e) = action_tx
             .send(Action::ToolFinished {
+                task_id: provider_turn_task_id,
+                sequence: None,
+                tool_call_id: Some(call.id.clone()),
                 name: call.name.clone(),
                 success: true,
                 duration_ms: 0,
@@ -2044,6 +2461,7 @@ async fn execute_single_tool_call(
             if registered {
                 if let Err(e) = action_tx
                     .send(Action::ToolApprovalRequested {
+                        task_id: provider_turn_task_id,
                         tool_id: call.id.clone(),
                         name: call.name.clone(),
                         args: call.args.clone(),
@@ -2081,6 +2499,9 @@ async fn execute_single_tool_call(
                 history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
                 if let Err(e) = action_tx
                     .send(Action::ToolFinished {
+                        task_id: provider_turn_task_id,
+                        sequence: None,
+                        tool_call_id: Some(call.id.clone()),
                         name: call.name.clone(),
                         success: false,
                         duration_ms: 0,
@@ -2111,6 +2532,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             if let Err(e) = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2131,6 +2555,9 @@ async fn execute_single_tool_call(
     // 2) 发 ToolStarted（reducer/UI 感知）.
     if let Err(e) = action_tx
         .send(Action::ToolStarted {
+            task_id: provider_turn_task_id,
+            sequence: None,
+            tool_call_id: Some(call.id.clone()),
             name: call.name.clone(),
             args: call.args.clone(),
         })
@@ -2153,6 +2580,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             let _ = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2178,6 +2608,9 @@ async fn execute_single_tool_call(
             history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
             let _ = action_tx
                 .send(Action::ToolFinished {
+                    task_id: provider_turn_task_id,
+                    sequence: None,
+                    tool_call_id: Some(call.id.clone()),
                     name: call.name.clone(),
                     success: false,
                     duration_ms: 0,
@@ -2191,7 +2624,9 @@ async fn execute_single_tool_call(
         }
     };
 
-    // 5) 执行 tool, 与 cancel 竞速.
+    // 5) 执行 tool, 与 cancel 竞速. Tools that own subprocesses can observe the
+    // same token and terminate their OS work before returning the cancelled
+    // sentinel result.
     let start = std::time::Instant::now();
     let exec_result = tokio::select! {
         biased;
@@ -2201,9 +2636,24 @@ async fn execute_single_tool_call(
             }
             return ToolExecOutcome::Cancelled;
         }
-        res = tool.execute_named(&call.name, args_value) => res,
+        res = tool.execute_named_with_cancellation(&call.name, args_value, Some(cancel.clone())) => res,
     };
     let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
+
+    if exec_result
+        .as_ref()
+        .is_ok_and(crate::tools::traits::is_tool_cancelled_result)
+    {
+        if let Err(e) = action_tx
+            .send(Action::StreamCancelled {
+                draft_id: draft_id.to_string(),
+            })
+            .await
+        {
+            tracing::debug!(error = %e, "StartTurn: action_tx closed on cancellable tool result");
+        }
+        return ToolExecOutcome::Cancelled;
+    }
 
     let (tool_payload, ok_flag, summary) = match exec_result {
         Ok(tool_result) => {
@@ -2258,6 +2708,9 @@ async fn execute_single_tool_call(
     };
     let _ = action_tx
         .send(Action::ToolFinished {
+            task_id: provider_turn_task_id,
+            sequence: None,
+            tool_call_id: Some(call.id.clone()),
             name: call.name.clone(),
             success: ok_flag,
             duration_ms,
@@ -2609,6 +3062,7 @@ pub fn spawn_dispatcher_task_full(
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
                         let usage = extract_stream_usage(&action);
+                        let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                         let approval_response = extract_approval_response(&action);
                         let (effects, ui_dirty) = state.reduce_tracked(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2626,12 +3080,7 @@ pub fn spawn_dispatcher_task_full(
                         // 回归）。terminal action 携带 outcome — main.rs:888
                         // shutdown_timeout 兜底保证主进程最终退出。
                         if let Some(ref sig) = turn_signal {
-                            if let Some(usage) = usage {
-                                sig.record_usage(usage);
-                            }
-                            if let Some(out) = outcome {
-                                sig.record_and_notify(out);
-                            }
+                            record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
                         }
                     }
                     // 兜底：shutdown 期间 chat::run 仍可能在 await turn_signal.notified()，
@@ -2653,6 +3102,7 @@ pub fn spawn_dispatcher_task_full(
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
                             let usage = extract_stream_usage(&action);
+                            let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                             let approval_response = extract_approval_response(&action);
                             let (effects, ui_dirty) = state.reduce_tracked(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2668,12 +3118,7 @@ pub fn spawn_dispatcher_task_full(
                                 router.resolve(&tool_id, approved);
                             }
                             if let Some(ref sig) = turn_signal {
-                                if let Some(usage) = usage {
-                                    sig.record_usage(usage);
-                                }
-                                if let Some(out) = outcome {
-                                    sig.record_and_notify(out);
-                                }
+                                record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
                             }
                         }
                         None => {
@@ -2721,6 +3166,7 @@ pub fn spawn_dispatcher_task_full(
                         stats.actions_seen = stats.actions_seen.saturating_add(1);
                         let outcome = extract_turn_outcome(&action);
                         let usage = extract_stream_usage(&action);
+                        let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                         let approval_response = extract_approval_response(&action);
                         let effects = state.reduce(action);
                         stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2733,12 +3179,7 @@ pub fn spawn_dispatcher_task_full(
                             router.resolve(&tool_id, approved);
                         }
                         if let Some(ref sig) = turn_signal {
-                            if let Some(usage) = usage {
-                                sig.record_usage(usage);
-                            }
-                            if let Some(out) = outcome {
-                                sig.record_and_notify(out);
-                            }
+                            record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
                         }
                     }
                     if let Some(ref sig) = turn_signal {
@@ -2752,6 +3193,7 @@ pub fn spawn_dispatcher_task_full(
                             stats.actions_seen = stats.actions_seen.saturating_add(1);
                             let outcome = extract_turn_outcome(&action);
                             let usage = extract_stream_usage(&action);
+                            let draft_id = extract_turn_draft_id(&action).map(str::to_string);
                             let approval_response = extract_approval_response(&action);
                             let effects = state.reduce(action);
                             stats.effects_seen = stats.effects_seen.saturating_add(effects.len() as u64);
@@ -2764,12 +3206,7 @@ pub fn spawn_dispatcher_task_full(
                                 router.resolve(&tool_id, approved);
                             }
                             if let Some(ref sig) = turn_signal {
-                                if let Some(usage) = usage {
-                                    sig.record_usage(usage);
-                                }
-                                if let Some(out) = outcome {
-                                    sig.record_and_notify(out);
-                                }
+                                record_turn_signal_action(sig, draft_id.as_deref(), usage, outcome);
                             }
                         }
                         None => {
@@ -3243,6 +3680,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn redux_compaction_feedback_dedupes_same_state_until_changed() {
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let config = crate::config::AgentCompactionConfig {
+            max_context_tokens: 1_000,
+            reserve_tokens: 10,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let history = vec![
+            crate::providers::traits::ChatMessage::system("sys"),
+            crate::providers::traits::ChatMessage::user("same state"),
+        ];
+        let changed_history = vec![
+            crate::providers::traits::ChatMessage::system("sys"),
+            crate::providers::traits::ChatMessage::user("changed state"),
+            crate::providers::traits::ChatMessage::assistant("summary"),
+        ];
+        let mut last_feedback = None;
+
+        assert!(
+            send_redux_compaction_feedback(&action_tx, 1, 20, &history, &config, "test", &mut last_feedback)
+                .await
+                .expect("first feedback send"),
+            "first feedback should be emitted"
+        );
+        assert!(
+            !send_redux_compaction_feedback(&action_tx, 1, 20, &history, &config, "test", &mut last_feedback)
+                .await
+                .expect("duplicate feedback send"),
+            "identical feedback should be suppressed"
+        );
+        assert!(
+            send_redux_compaction_feedback(&action_tx, 2, 40, &changed_history, &config, "test", &mut last_feedback,)
+                .await
+                .expect("changed feedback send"),
+            "changed state should emit another feedback"
+        );
+
+        let sent = action_rx.try_recv().expect("first feedback action should be queued");
+        assert!(matches!(sent, Action::SystemMessageAdded { .. }));
+        let sent = action_rx.try_recv().expect("changed feedback action should be queued");
+        assert!(matches!(sent, Action::SystemMessageAdded { .. }));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "duplicate feedback must not queue an action"
+        );
+    }
+
+    #[tokio::test]
     async fn effect_executor_shadow_log_trace_runs() {
         let executor = EffectExecutor::new_shadow();
         // LogTrace 真执行（shadow 也跑）；这里只验证不 panic / 不 await 外部
@@ -3441,7 +3927,10 @@ mod integration_tests {
             DispatchResult::Sent
         );
         assert_eq!(
-            dispatcher.try_dispatch(Action::RecordAssistantTurn("hello user, response complete".to_string())),
+            dispatcher.try_dispatch(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "hello user, response complete".to_string(),
+            }),
             DispatchResult::Sent
         );
 
@@ -3646,6 +4135,7 @@ mod integration_tests {
                 text: "final".to_string(),
             },
             Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "shadow-d".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -3653,8 +4143,13 @@ mod integration_tests {
                 cancel: token.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             },
             Effect::CancelToken(token),
+            Effect::ResolveApproval {
+                tool_id: "call-shadow".to_string(),
+                approved: false,
+            },
         ];
 
         for effect in effects {
@@ -3696,7 +4191,10 @@ mod integration_tests {
         for i in 0..50u64 {
             let _ = dispatcher.try_dispatch(Action::InputSubmitted(format!("msg{i}")));
             let _ = dispatcher.try_dispatch(Action::RecordUserTurn(format!("user{i}")));
-            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn(format!("assist{i}")));
+            let _ = dispatcher.try_dispatch(Action::RecordAssistantTurn {
+                task_id: None,
+                content: format!("assist{i}"),
+            });
         }
 
         shutdown.cancel();
@@ -3827,6 +4325,7 @@ mod real_mode_tests {
             hooks: Arc::clone(&hooks),
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard,
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
@@ -3963,7 +4462,10 @@ mod real_mode_tests {
                 draft_id: format!("d-{tag}"),
                 cancel: CancellationToken::new(),
             });
-            let _ = state.reduce(Action::RecordAssistantTurn("a".to_string()));
+            let _ = state.reduce(Action::RecordAssistantTurn {
+                task_id: None,
+                content: "a".to_string(),
+            });
             let effects = state.reduce(Action::StreamCompleted {
                 draft_id: format!("d-{tag}"),
                 final_text: "a".to_string(),
@@ -4073,6 +4575,7 @@ mod real_mode_tests {
         // ── 启动 driver ──
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-fixB-B5".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4080,6 +4583,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4105,10 +4609,13 @@ mod real_mode_tests {
                 .expect("driver action within 1.5s")
                 .expect("action received");
             match action {
-                Action::RecordAssistantTurn(text) => {
+                Action::RecordAssistantTurn { content: text, .. } => {
                     assert!(!saw_record, "RecordAssistantTurn 应只发一次");
                     saw_record = true;
-                    let _ = state.reduce(Action::RecordAssistantTurn(text));
+                    let _ = state.reduce(Action::RecordAssistantTurn {
+                        task_id: None,
+                        content: text,
+                    });
                 }
                 Action::StreamCompleted {
                     draft_id,
@@ -4221,6 +4728,7 @@ mod real_mode_tests {
                 hooks,
                 observer,
                 action_tx,
+                provider_turn_lifecycle_tx: None,
                 dual_write_guard: RuntimeDualWriteGuard::new(),
                 redraw_tx: Some(redraw_tx),
                 #[cfg(feature = "terminal-tui")]
@@ -4290,6 +4798,7 @@ mod real_mode_tests {
             hooks,
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
@@ -4326,6 +4835,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::RequestApproval {
+                task_id: None,
                 tool_id: "call-tui".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"echo secure"}"#.to_string(),
@@ -4385,6 +4895,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::RequestApproval {
+                task_id: None,
                 tool_id: "call-tui-override".to_string(),
                 name: "shell".to_string(),
                 args: r#"{"cmd":"echo secure"}"#.to_string(),
@@ -4422,6 +4933,7 @@ mod real_mode_tests {
         let start = std::time::Instant::now();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-real".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4429,6 +4941,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
         // execute() 立即返回（不阻塞）；spawn 子任务在后台真调 provider + 回投 Action.
@@ -4457,7 +4970,7 @@ mod real_mode_tests {
             .expect("RecordAssistantTurn within 1s")
             .expect("RecordAssistantTurn received");
         match action {
-            Action::RecordAssistantTurn(_) => {}
+            Action::RecordAssistantTurn { .. } => {}
             other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
         }
 
@@ -4487,6 +5000,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-cancelled".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4494,6 +5008,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4576,6 +5091,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-stream".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4583,6 +5099,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4624,7 +5141,7 @@ mod real_mode_tests {
             .expect("RecordAssistantTurn within 1.5s")
             .expect("RecordAssistantTurn received");
         match a_record {
-            Action::RecordAssistantTurn(text) => {
+            Action::RecordAssistantTurn { content: text, .. } => {
                 assert_eq!(text, "hello world", "RecordAssistantTurn 内容应与 final_text 一致");
             }
             other => panic!("expected RecordAssistantTurn (fixB B5 前置), got {other:?}"),
@@ -4647,6 +5164,223 @@ mod real_mode_tests {
             }
             other => panic!("expected StreamCompleted, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn task_scoped_start_turn_emits_ready_for_ordered_commit() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct FakeTaskScopedStreamProvider;
+
+        #[async_trait]
+        impl Provider for FakeTaskScopedStreamProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                let chunks: Vec<StreamResult<StreamChunk>> = vec![
+                    Ok(StreamChunk::delta("ordered ")),
+                    Ok(StreamChunk::reasoning_delta("gate")),
+                    Ok(StreamChunk::delta("commit")),
+                    Ok(StreamChunk::final_chunk()),
+                ];
+                stream::iter(chunks).boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("task scoped", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        scheduler.start_task(task_id).expect("task starts");
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(FakeTaskScopedStreamProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: Some(task_id),
+                draft_id: "draft-task-scoped".to_string(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            })
+            .await;
+
+        for expected_delta in ["ordered ", "commit"] {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("stream action within 1.5s")
+                .expect("stream action received");
+            match action {
+                Action::StreamChunkReceived { delta, .. } => assert_eq!(delta, expected_delta),
+                other => panic!("expected StreamChunkReceived, got {other:?}"),
+            }
+        }
+
+        let terminal = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+            .await
+            .expect("ready signal within 1.5s")
+            .expect("ready signal received");
+        match terminal {
+            Action::ProviderTurnReadyForCommit {
+                draft_id,
+                final_text,
+                reasoning,
+            } => {
+                assert_eq!(draft_id, "draft-task-scoped");
+                assert_eq!(final_text, "ordered commit");
+                assert_eq!(reasoning, "gate");
+            }
+            other => panic!("task-scoped completion must wait for ordered commit gate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn real_mode_empty_stream_surfaces_system_message_without_assistant_record() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct ReasoningOnlyProvider;
+
+        #[async_trait]
+        impl Provider for ReasoningOnlyProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+            async fn chat_with_system(
+                &self,
+                _sys: Option<&str>,
+                _msg: &str,
+                _model: &str,
+                _temp: f64,
+            ) -> anyhow::Result<String> {
+                Ok(String::new())
+            }
+            async fn chat(&self, _r: ChatRequest<'_>, _model: &str, _temp: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: None,
+                    tool_calls: Vec::new(),
+                    reasoning_content: Some("thinking only".to_string()),
+                })
+            }
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+            fn stream_chat_with_history(
+                &self,
+                _messages: &[PMsg],
+                _model: &str,
+                _temperature: f64,
+                _options: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![
+                    Ok(StreamChunk::reasoning_delta("thinking only")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
+        let shutdown = CancellationToken::new();
+        let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
+        deps.provider = Arc::new(ReasoningOnlyProvider);
+        let executor = EffectExecutor::new_with_deps(deps);
+
+        executor
+            .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
+                draft_id: "draft-empty".to_string(),
+                history: Vec::new(),
+                compaction_guard_history: None,
+                compaction_config: None,
+                cancel: CancellationToken::new(),
+                chat_mode: crate::agent::loop_::ChatMode::Edit,
+                turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
+            })
+            .await;
+
+        let mut saw_system_message = false;
+        let mut saw_completion = false;
+        for _ in 0..5 {
+            let action = tokio::time::timeout(Duration::from_millis(1500), action_rx.recv())
+                .await
+                .expect("driver action within 1.5s")
+                .expect("driver action received");
+            match action {
+                Action::SystemMessageAdded { text } => {
+                    assert_eq!(text, crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE);
+                    saw_system_message = true;
+                }
+                Action::RecordAssistantTurn { content: text, .. } => {
+                    panic!("empty response must not record assistant turn: {text:?}");
+                }
+                Action::StreamCompleted {
+                    draft_id,
+                    final_text,
+                    reasoning,
+                } => {
+                    assert_eq!(draft_id, "draft-empty");
+                    assert!(final_text.is_empty(), "empty response completion stays empty");
+                    assert!(
+                        reasoning.is_empty(),
+                        "reasoning-only empty response must not render a reasoning card"
+                    );
+                    saw_completion = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_system_message, "empty response must surface a system message");
+        assert!(saw_completion, "empty response must still complete and clear the draft");
     }
 
     /// Step 5a-2 — provider stream 产生 Err 时发 StreamFailed（含 retryable 判定）.
@@ -4709,6 +5443,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-fail".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4716,6 +5451,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -4804,6 +5540,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-mid-cancel".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -4811,6 +5548,7 @@ mod real_mode_tests {
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5030,6 +5768,7 @@ mod real_mode_tests {
             hooks,
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
@@ -5180,6 +5919,7 @@ mod real_mode_tests {
             hooks: Arc::clone(&hooks),
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
@@ -5334,6 +6074,7 @@ mod real_mode_tests {
             hooks,
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: None, // 模拟构造时 redraw_tx 尚不存在
             #[cfg(feature = "terminal-tui")]
@@ -5535,6 +6276,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-params".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -5542,6 +6284,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5593,6 +6336,53 @@ mod real_mode_tests {
         }
         // 第二次 consume 应为 None（消费式 API）.
         assert!(signal.consume_outcome().is_none(), "consume_outcome must drain slot");
+    }
+
+    #[tokio::test]
+    async fn turn_signal_records_keyed_outcome_and_usage_by_draft_id() {
+        let mut scheduler = crate::chat::turn_scheduler::TurnScheduler::new();
+        let task_id = scheduler.enqueue("keyed turn", crate::chat::turn_scheduler::TurnPriority::Normal, 0);
+        let signal = TurnCompletionSignal::new();
+        signal.register_turn(task_id, "draft-keyed");
+        let notified = signal.notified_for(task_id).expect("registered keyed waiter");
+
+        let usage = TokenUsage {
+            prompt_tokens: Some(10),
+            completion_tokens: Some(5),
+            total_tokens: Some(15),
+            source: crate::llm::route_decision::TokenUsageSource::Reported,
+            ..TokenUsage::default()
+        };
+        assert!(signal.record_usage_for_draft("draft-keyed", usage));
+        assert!(signal.record_and_notify_for_draft(
+            "draft-keyed",
+            TurnOutcomeKind::Completed {
+                final_text: "done".to_string(),
+                reasoning: "because".to_string(),
+            },
+        ));
+        tokio::time::timeout(std::time::Duration::from_secs(1), notified)
+            .await
+            .expect("keyed turn should notify");
+
+        let keyed_usage = signal.consume_turn_usage(task_id);
+        assert_eq!(keyed_usage.total_tokens, Some(15));
+        match signal.consume_turn_outcome(task_id) {
+            Some(TurnOutcomeKind::Completed { final_text, reasoning }) => {
+                assert_eq!(final_text, "done");
+                assert_eq!(reasoning, "because");
+            }
+            other => panic!("expected keyed completed outcome, got {other:?}"),
+        }
+        assert!(
+            signal.consume_turn_outcome(task_id).is_none(),
+            "keyed outcome is consume-once"
+        );
+        signal.unregister_turn(task_id);
+        assert!(
+            signal.notified_for(task_id).is_none(),
+            "unregister removes keyed waiter"
+        );
     }
 
     /// **5a-6 negative case**：driver 收到 tool_calls chunk 但 `tools_registry == None`，
@@ -5664,6 +6454,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-no-registry".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -5671,6 +6462,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -5819,6 +6611,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-tool-happy".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -5826,6 +6619,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6022,6 +6816,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-ctx-probe".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -6029,6 +6824,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: Some(seed),
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6138,6 +6934,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-max-iter".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -6145,6 +6942,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6282,6 +7080,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-unrecoverable".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -6289,6 +7088,7 @@ mod real_mode_tests {
                 cancel,
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6393,6 +7193,7 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-cancel-mid".to_string(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -6400,6 +7201,7 @@ mod real_mode_tests {
                 cancel: cancel.clone(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -6490,17 +7292,20 @@ mod real_mode_tests {
         let cancel = CancellationToken::new();
         let start_effect = state
             .reduce(Action::StartLLMTurn {
+                provider_turn_task_id: None,
+                provider_turn_sequence: None,
                 draft_id: "draft-timeout".to_string(),
                 history: Vec::new(),
                 compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .into_iter()
             .find(|effect| matches!(effect, Effect::StartTurn { .. }))
             .expect("StartLLMTurn must emit StartTurn");
         assert!(state.control.generating);
-        assert!(state.stream.draft.is_some());
+        assert!(state.stream.primary_streaming_draft().is_some());
 
         executor.execute(start_effect).await;
         let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
@@ -6524,7 +7329,7 @@ mod real_mode_tests {
         let _ = state.reduce(action);
         assert!(!state.control.generating, "StreamFailed must clear generating");
         assert!(state.control.active_cancel.is_none());
-        assert!(state.stream.draft.is_none());
+        assert!(state.stream.primary_streaming_draft().is_none());
     }
 
     /// P0-1 简化版: try_dispatch ChannelClosed 时返回 ChannelClosed
@@ -6534,11 +7339,14 @@ mod real_mode_tests {
         let (dispatcher, rx) = ChatDispatcher::new();
         drop(rx);
         let result = dispatcher.try_dispatch(Action::StartLLMTurn {
+            provider_turn_task_id: None,
+            provider_turn_sequence: None,
             draft_id: "d1".to_string(),
             history: Vec::new(),
             compaction_config: None,
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
+            turn_message_send_ctx: None,
         });
         assert!(
             matches!(result, DispatchResult::ChannelClosed),
@@ -6878,6 +7686,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-t31-streaming".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -6885,6 +7694,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7018,6 +7828,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-reasoning-tool-history".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -7025,6 +7836,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7133,6 +7945,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-overflow".into(),
                 history: vec![crate::providers::traits::ChatMessage {
                     role: "user".into(),
@@ -7143,6 +7956,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7270,6 +8084,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-budget-preflight".into(),
                 history,
                 compaction_guard_history: None,
@@ -7277,10 +8092,13 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
         let mut saw_summary_patch = false;
+        let mut saw_feedback = false;
+        let mut saw_context_update = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
                 .await
@@ -7300,6 +8118,24 @@ mod real_mode_tests {
                 Action::HistoryCompacted { .. } => {
                     panic!("preflight summary path must not dispatch lossy HistoryCompacted");
                 }
+                Action::ContextWindowUpdated {
+                    used_context_tokens: Some(used),
+                    max_context_tokens: Some(max),
+                } => {
+                    saw_context_update = true;
+                    assert_eq!(max, 160);
+                    assert!(
+                        used <= 150,
+                        "context window update must reflect compacted budget: {used}"
+                    );
+                }
+                Action::SystemMessageAdded { text } => {
+                    saw_feedback = true;
+                    assert!(
+                        text.contains("Compacted context") || text.contains("Context already compact"),
+                        "preflight feedback should describe compaction result: {text}"
+                    );
+                }
                 Action::StreamCompleted { final_text, .. } => {
                     assert!(final_text.contains("budget-ok"));
                     break;
@@ -7309,6 +8145,11 @@ mod real_mode_tests {
             }
         }
         assert!(saw_summary_patch, "preflight must dispatch exact summary patch");
+        assert!(saw_feedback, "preflight must dispatch user-visible compact feedback");
+        assert!(
+            saw_context_update,
+            "preflight must update context-window UI metadata after compaction"
+        );
         assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
         let captured = first_history.lock().clone().expect("first stream history");
         assert!(
@@ -7486,6 +8327,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-resume-compacted".to_string(),
                 history: resumed.session.history.clone(),
                 compaction_guard_history: None,
@@ -7493,6 +8335,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -7626,6 +8469,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-iss-037-redux".to_string(),
                 history,
                 compaction_guard_history: None,
@@ -7633,6 +8477,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8414,6 +9259,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-budget-off-preflight".into(),
                 history,
                 compaction_guard_history: None,
@@ -8421,6 +9267,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8555,6 +9402,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-summary-failure".into(),
                 history,
                 compaction_guard_history: None,
@@ -8562,6 +9410,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8702,6 +9551,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-overflow-summary".into(),
                 history,
                 compaction_guard_history: None,
@@ -8709,10 +9559,13 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
         let mut saw_summary_patch = false;
+        let mut saw_feedback = false;
+        let mut saw_context_update = false;
         for _ in 0..16 {
             let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
                 .await
@@ -8732,6 +9585,24 @@ mod real_mode_tests {
                 Action::HistoryCompacted { .. } => {
                     panic!("overflow retry with config must not use lossy HistoryCompacted");
                 }
+                Action::ContextWindowUpdated {
+                    used_context_tokens: Some(used),
+                    max_context_tokens: Some(max),
+                } => {
+                    saw_context_update = true;
+                    assert_eq!(max, 400);
+                    assert!(
+                        used <= 390,
+                        "overflow context window update should use compacted history: {used}"
+                    );
+                }
+                Action::SystemMessageAdded { text } => {
+                    saw_feedback = true;
+                    assert!(
+                        text.contains("Compacted context") || text.contains("Context already compact"),
+                        "overflow feedback should describe compaction result: {text}"
+                    );
+                }
                 Action::StreamCompleted { final_text, .. } => {
                     assert!(final_text.contains("summary-retry-ok"));
                     break;
@@ -8742,6 +9613,14 @@ mod real_mode_tests {
         }
 
         assert!(saw_summary_patch, "overflow retry must dispatch exact summary patch");
+        assert!(
+            saw_feedback,
+            "overflow retry must dispatch user-visible compact feedback"
+        );
+        assert!(
+            saw_context_update,
+            "overflow retry must update context-window UI metadata after mid-turn compaction"
+        );
         assert_eq!(summary_calls.load(AtomicOrdering::SeqCst), 1);
         assert_eq!(
             stream_calls.load(AtomicOrdering::SeqCst),
@@ -8810,6 +9689,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-overflow-fail".into(),
                 history: vec![crate::providers::traits::ChatMessage {
                     role: "user".into(),
@@ -8820,6 +9700,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -8985,6 +9866,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-approval".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -8992,6 +9874,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9158,7 +10041,13 @@ mod real_mode_tests {
                     maybe = action_rx.recv() => {
                         match maybe {
                             Some(action) => {
-                                if let Action::ToolApprovalRequested { tool_id, name, args } = &action {
+                                if let Action::ToolApprovalRequested {
+                                    task_id,
+                                    tool_id,
+                                    name,
+                                    args,
+                                } = &action
+                                {
                                     #[cfg(not(feature = "terminal-tui"))]
                                     let _ = (name, args);
                                     #[cfg(feature = "terminal-tui")]
@@ -9167,6 +10056,7 @@ mod real_mode_tests {
                                         tui.focus = crate::chat::sessions::FocusTarget::Approval;
                                         tui.pending_tool_approval =
                                             Some(crate::chat::sessions::PendingToolApprovalView {
+                                                task_id: *task_id,
                                                 tool_id: tool_id.clone(),
                                                 name: name.clone(),
                                                 args: args.clone(),
@@ -9208,6 +10098,7 @@ mod real_mode_tests {
 
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-reject".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -9215,6 +10106,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9303,6 +10195,7 @@ mod real_mode_tests {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -9438,6 +10331,7 @@ mod real_mode_tests {
         });
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -9570,6 +10464,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-flaky".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -9577,6 +10472,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9667,6 +10563,7 @@ mod real_mode_tests {
         let executor = EffectExecutor::new_with_deps(deps);
         executor
             .execute(Effect::StartTurn {
+                provider_turn_task_id: None,
                 draft_id: "draft-net-fail".into(),
                 history: Vec::new(),
                 compaction_guard_history: None,
@@ -9674,6 +10571,7 @@ mod real_mode_tests {
                 cancel: CancellationToken::new(),
                 chat_mode: crate::agent::loop_::ChatMode::Edit,
                 turn_spawn_ctx: None,
+                turn_message_send_ctx: None,
             })
             .await;
 
@@ -9767,6 +10665,7 @@ mod real_mode_tests {
             hooks: Arc::clone(&hooks),
             observer,
             action_tx,
+            provider_turn_lifecycle_tx: None,
             dual_write_guard: RuntimeDualWriteGuard::new(),
             redraw_tx: Some(redraw_tx),
             #[cfg(feature = "terminal-tui")]
@@ -9968,7 +10867,7 @@ mod s4_a_3 {
 
     #[tokio::test]
     async fn s4_a_3_dispatcher_skips_unrelated_action() {
-        // ToolProgress 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
+        // StreamRetryAttempt 静态判定 dirty=false 且不写 ui 字段 → 不应推 snapshot.
         let state = make_state();
         let initial = Arc::new(UiSnapshot::initial(
             Arc::clone(&state.session.provider),
@@ -9987,12 +10886,17 @@ mod s4_a_3 {
             Some(snap_tx),
         );
 
-        let _ = dispatcher.dispatch(Action::ToolProgress { iteration: 1, max: 3 }).await;
+        let _ = dispatcher
+            .dispatch(Action::StreamRetryAttempt {
+                attempt: 1,
+                reason: "transient".to_string(),
+            })
+            .await;
         // 应在 200ms 内不出现 changed 信号.
         let result = tokio::time::timeout(Duration::from_millis(200), snap_rx.changed()).await;
         assert!(
             result.is_err(),
-            "ToolProgress 不应触发 snapshot 推送 (changed 返回={:?})",
+            "StreamRetryAttempt 不应触发 snapshot 推送 (changed 返回={:?})",
             result.map(|r| r.is_ok())
         );
         assert_eq!(snap_rx.borrow().revision, initial_rev, "revision 应保持不变");
@@ -10148,6 +11052,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10234,6 +11139,7 @@ mod s4_a_3 {
         ];
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10305,6 +11211,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),
@@ -10373,6 +11280,7 @@ mod s4_a_3 {
         let mut history = Vec::new();
 
         let outcome = execute_single_tool_call(
+            None,
             &registry,
             &call,
             &CancellationToken::new(),

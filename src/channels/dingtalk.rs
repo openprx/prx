@@ -273,6 +273,9 @@ impl Channel for DingTalkChannel {
                             .unwrap_or_default()
                             .as_secs(),
                         thread_ts: None,
+                        chat_kind: crate::channels::traits::ChatKind::Dm,
+                        chat_title: None,
+                        sender_display: None,
                         mentioned_uuids: vec![],
                         mentioned: false,
                         is_group_hint: false,

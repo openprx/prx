@@ -76,6 +76,12 @@ impl ChatMode {
     }
 }
 
+pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "model returned empty response";
+
+pub(crate) fn is_empty_assistant_response(text: &str, has_tool_calls: bool) -> bool {
+    text.trim().is_empty() && !has_tool_calls
+}
+
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
 #[derive(Debug, Clone)]
 pub enum ToolCallNotification {
@@ -1351,19 +1357,6 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
     audit: Option<&DocumentIngestRuntime>,
     trigger: &str,
 ) -> Result<Option<CompactionPatch>> {
-    if budget_history.len() != source_history.len()
-        || budget_history
-            .iter()
-            .zip(source_history.iter())
-            .any(|(budget, source)| budget.role != source.role)
-    {
-        anyhow::bail!(
-            "compaction budget/source histories have different shapes: budget_len={} source_len={}",
-            budget_history.len(),
-            source_history.len()
-        );
-    }
-
     let Some(limit) = compaction_trigger_limit(config) else {
         return Ok(None);
     };
@@ -3893,7 +3886,7 @@ async fn execute_one_tool(
     });
     let start = Instant::now();
 
-    let tool_future = tool.execute(call_arguments);
+    let tool_future = tool.execute_with_cancellation(call_arguments, cancellation_token.cloned());
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
             () = token.cancelled() => return Err(ToolLoopCancelled.into()),
@@ -3905,6 +3898,9 @@ async fn execute_one_tool(
 
     match tool_result {
         Ok(r) => {
+            if crate::tools::traits::is_tool_cancelled_result(&r) {
+                return Err(ToolLoopCancelled.into());
+            }
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 duration: start.elapsed(),
@@ -5285,6 +5281,17 @@ pub(crate) async fn run_tool_call_loop_outcome(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
+            if is_empty_assistant_response(&response_text, false) {
+                tracing::warn!(
+                    provider = provider_name,
+                    model,
+                    user_message = EMPTY_ASSISTANT_RESPONSE_MESSAGE,
+                    "model returned empty assistant response; suppressing assistant history turn"
+                );
+                last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
+                last_turn_trace.tokens_used = usage_accumulator.finish();
+                return Ok((ToolLoopOutcome::Text(String::new()), last_turn_trace));
+            }
             // If a streaming sender is provided, relay the text in small chunks
             // so the channel can progressively update the draft message.
             if let Some(ref tx) = on_delta {
@@ -5799,16 +5806,7 @@ pub async fn run(
         .or(config.default_model.as_deref())
         .unwrap_or("anthropic/claude-sonnet-4");
 
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
 
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
@@ -6532,16 +6530,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         .default_model
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4-20250514".into());
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Box<dyn Provider> = providers::create_routed_provider_with_options(
         provider_name,
         config.api_key.as_deref(),
@@ -11728,6 +11717,64 @@ Let me check the result."#;
     mod stay_silent_outcome {
         use super::*;
         use crate::tools::StaySilentTool;
+
+        #[tokio::test]
+        async fn empty_assistant_response_writes_no_assistant_history() {
+            let provider = ScriptedProvider {
+                responses: Arc::new(Mutex::new(
+                    vec![ChatResponse {
+                        text: Some("   \n".to_string()),
+                        tool_calls: Vec::new(),
+                        reasoning_content: Some("thinking without content".to_string()),
+                    }]
+                    .into(),
+                )),
+            };
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
+            let tmp = TempDir::new().unwrap();
+
+            let (outcome, _trace) = run_tool_call_loop_outcome(
+                &provider,
+                &mut history,
+                &tools_registry,
+                &NoopObserver,
+                &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
+                "mock-provider",
+                "mock-model",
+                0.0,
+                true,
+                None,
+                "terminal",
+                &crate::config::MultimodalConfig::default(),
+                4,
+                false,
+                2,
+                30,
+                false,
+                Vec::new(),
+                ToolConcurrencyGovernanceConfig::default(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                ChatMode::default(),
+                None,
+                false,
+            )
+            .await
+            .expect("empty response turn should complete");
+
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text.is_empty()));
+            assert_eq!(history.len(), 2, "empty assistant turn must not be appended");
+            assert!(
+                history.iter().all(|message| message.role != "assistant"),
+                "history must not contain an assistant turn after empty response: {history:?}"
+            );
+        }
 
         async fn run_with_response(response: &str, expose: bool) -> (ToolLoopOutcome, Vec<ChatMessage>) {
             let provider = ScriptedProvider::from_text_responses(vec![response]);

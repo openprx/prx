@@ -1,5 +1,5 @@
 use crate::channels::traits::{
-    Channel, ChannelMessage, SendMessage, extract_outgoing_media, guess_audio_mime, guess_mime_from_path,
+    Channel, ChannelMessage, ChatKind, SendMessage, extract_outgoing_media, guess_audio_mime, guess_mime_from_path,
 };
 use async_trait::async_trait;
 use base64::Engine as _;
@@ -1509,6 +1509,13 @@ impl SignalChannel {
         }
         content_with_meta.push_str(&signal_meta);
 
+        let chat_kind = if is_group_message {
+            ChatKind::Group
+        } else {
+            ChatKind::Dm
+        };
+        let chat_title = group_label.map(str::to_string);
+
         Some(ChannelMessage {
             id: format!("sig_{timestamp}"),
             sender,
@@ -1517,6 +1524,9 @@ impl SignalChannel {
             channel: "signal".to_string(),
             timestamp: timestamp / 1000, // millis → secs
             thread_ts: None,
+            chat_kind,
+            chat_title,
+            sender_display: None,
             mentioned_uuids: data_msg
                 .and_then(|dm| dm.mentions.as_ref())
                 .map(|ms| {

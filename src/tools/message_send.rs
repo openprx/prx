@@ -14,6 +14,7 @@ use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
+use std::fmt;
 use std::sync::Arc;
 
 /// Auto-generate a voice file from text using edge-tts + ffmpeg.
@@ -81,6 +82,44 @@ pub(crate) async fn auto_generate_voice(text: &str, voice: &str) -> anyhow::Resu
     let _ = tokio::fs::remove_file(&mp3_path).await;
 
     Ok(m4a_path)
+}
+
+/// Per-turn routing defaults for `message_send`.
+///
+/// Channel/gateway/chat turns may run concurrently in the same process. The
+/// legacy `active_channel` / `default_recipient` slots below remain as a
+/// non-turn fallback, but in-turn tool calls must read this task-local context
+/// so one inbound message cannot overwrite another turn's implicit reply target.
+#[derive(Clone)]
+pub(crate) struct MessageSendExecutionContext {
+    pub(crate) default_recipient: Option<String>,
+    pub(crate) active_channel: Arc<dyn Channel>,
+}
+
+impl MessageSendExecutionContext {
+    pub(crate) fn new(default_recipient: Option<String>, active_channel: Arc<dyn Channel>) -> Self {
+        Self {
+            default_recipient,
+            active_channel,
+        }
+    }
+}
+
+impl fmt::Debug for MessageSendExecutionContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MessageSendExecutionContext")
+            .field("default_recipient", &self.default_recipient)
+            .field("active_channel", &self.active_channel.name())
+            .finish()
+    }
+}
+
+tokio::task_local! {
+    pub(crate) static MESSAGE_SEND_EXECUTION_CONTEXT: MessageSendExecutionContext;
+}
+
+fn current_message_send_execution_context() -> Option<MessageSendExecutionContext> {
+    MESSAGE_SEND_EXECUTION_CONTEXT.try_with(Clone::clone).ok()
 }
 
 pub struct MessageSendTool {
@@ -229,12 +268,21 @@ impl Tool for MessageSendTool {
 
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("send");
 
-        // Resolve the active channel (updated per-message via set_active_channel so that
-        // replies are routed on the same channel the incoming message arrived on).
-        let channel = self.active_channel.read().await.clone();
+        let turn_context = current_message_send_execution_context();
 
-        // Resolve recipient: explicit arg takes priority, then default_recipient
-        let default = self.default_recipient.read().await.clone();
+        // Resolve the active channel. In-turn calls use task-local routing;
+        // outside a turn, fall back to the construction/update-time slot.
+        let channel = match turn_context.as_ref() {
+            Some(context) => Arc::clone(&context.active_channel),
+            None => self.active_channel.read().await.clone(),
+        };
+
+        // Resolve recipient: explicit arg takes priority, then the task-local
+        // turn default. Only non-turn calls fall back to the legacy slot.
+        let default = match turn_context {
+            Some(context) => context.default_recipient,
+            None => self.default_recipient.read().await.clone(),
+        };
         let target = args
             .get("target")
             .and_then(|v| v.as_str())
@@ -549,24 +597,47 @@ mod tests {
     use async_trait::async_trait;
 
     struct DummyChannel {
+        pub name: &'static str,
         pub sent: Arc<tokio::sync::Mutex<Vec<String>>>,
+        pub recipients: Arc<tokio::sync::Mutex<Vec<String>>>,
     }
 
     impl DummyChannel {
         fn new() -> (Arc<Self>, Arc<tokio::sync::Mutex<Vec<String>>>) {
+            let (channel, sent, _recipients) = Self::new_named("dummy");
+            (channel, sent)
+        }
+
+        fn new_named(
+            name: &'static str,
+        ) -> (
+            Arc<Self>,
+            Arc<tokio::sync::Mutex<Vec<String>>>,
+            Arc<tokio::sync::Mutex<Vec<String>>>,
+        ) {
             let sent = Arc::new(tokio::sync::Mutex::new(Vec::new()));
-            (Arc::new(Self { sent: sent.clone() }), sent)
+            let recipients = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+            (
+                Arc::new(Self {
+                    name,
+                    sent: sent.clone(),
+                    recipients: recipients.clone(),
+                }),
+                sent,
+                recipients,
+            )
         }
     }
 
     #[async_trait]
     impl Channel for DummyChannel {
         fn name(&self) -> &str {
-            "dummy"
+            self.name
         }
 
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.sent.lock().await.push(message.content.clone());
+            self.recipients.lock().await.push(message.recipient.clone());
             Ok(())
         }
 
@@ -639,6 +710,66 @@ mod tests {
         assert!(result.success, "Expected success, got: {:?}", result.error);
         let msgs = sent.lock().await;
         assert_eq!(msgs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn task_local_context_beats_mutated_fallback_defaults() {
+        let (channel_a, sent_a, recipients_a) = DummyChannel::new_named("channel-a");
+        let (channel_b, sent_b, recipients_b) = DummyChannel::new_named("channel-b");
+        let tool = MessageSendTool::new(channel_a.clone(), test_security(AutonomyLevel::Full));
+
+        let turn_a_context = MessageSendExecutionContext::new(
+            Some("recipient-a".to_string()),
+            channel_a as Arc<dyn crate::channels::traits::Channel>,
+        );
+
+        let result = MESSAGE_SEND_EXECUTION_CONTEXT
+            .scope(turn_a_context, async {
+                // Simulate another inbound turn updating the legacy fallback while
+                // turn A is still in progress. The send below omits `target`; it
+                // must still route to A's task-local recipient/channel.
+                tool.set_default_recipient(Some("recipient-b".to_string())).await;
+                tool.set_active_channel(channel_b as Arc<dyn crate::channels::traits::Channel>)
+                    .await;
+                tool.execute(json!({
+                    "action": "send",
+                    "message": "reply from A"
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert_eq!(&*sent_a.lock().await, &["reply from A".to_string()]);
+        assert_eq!(&*recipients_a.lock().await, &["recipient-a".to_string()]);
+        assert!(
+            sent_b.lock().await.is_empty(),
+            "fallback channel must not receive turn A send"
+        );
+        assert!(
+            recipients_b.lock().await.is_empty(),
+            "fallback recipient must not receive turn A send"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_default_still_works_without_turn_context() {
+        let (ch, sent, recipients) = DummyChannel::new_named("fallback");
+        let tool = MessageSendTool::new(ch, test_security(AutonomyLevel::Full));
+        tool.set_default_recipient(Some("fallback-recipient".to_string())).await;
+
+        let result = tool
+            .execute(json!({
+                "action": "send",
+                "message": "fallback send"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "Expected success, got: {:?}", result.error);
+        assert_eq!(&*sent.lock().await, &["fallback send".to_string()]);
+        assert_eq!(&*recipients.lock().await, &["fallback-recipient".to_string()]);
     }
 
     #[tokio::test]

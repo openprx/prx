@@ -8,6 +8,8 @@
 //! - `history` action: view the conversation log of any sub-agent run
 //! - `steer` action: inject a message into a running sub-agent's context
 
+use super::sessions_list::format_run_usage;
+use super::sessions_read_model;
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, SpawnEventSink, ToolConcurrencyGovernanceConfig};
 use crate::channels::build_identity_prompt;
@@ -44,6 +46,8 @@ Focus only on the assigned task; do not ask clarifying questions.";
 const PROCESS_MEMORY_STRATEGY_SHARED: &str = "shared_fabric";
 const PROCESS_MEMORY_STRATEGY_ISOLATED: &str = "isolated_private";
 const PROCESS_MEMORY_STRATEGY_HYBRID: &str = "hybrid";
+const DEFAULT_HISTORY_LAST_N: usize = 20;
+const DEFAULT_HISTORY_ENTRY_MAX_CHARS: usize = 800;
 
 /// Status of a spawned sub-agent run.
 #[derive(Debug, Clone)]
@@ -833,6 +837,18 @@ impl Tool for SessionsSpawnTool {
                     "type": "string",
                     "description": "Optional recipient for result announcement (phone number, group ID, etc.). \
                                     Defaults to the current conversation sender."
+                },
+                "last_n": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 200,
+                    "description": "For action='history', return only the last N entries. Defaults to the last 20 entries so final proof markers stay visible."
+                },
+                "max_chars_per_entry": {
+                    "type": "integer",
+                    "minimum": 80,
+                    "maximum": 4000,
+                    "description": "For action='history', maximum characters per returned history entry. Defaults to 800."
                 }
             },
             "required": []
@@ -874,7 +890,16 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for history action"))?;
-                return self.execute_history(run_id).await;
+                let last_n = args
+                    .get("last_n")
+                    .and_then(|v| v.as_u64())
+                    .map(|value| value.clamp(1, 200) as usize);
+                let max_chars_per_entry = args
+                    .get("max_chars_per_entry")
+                    .and_then(|v| v.as_u64())
+                    .map(|value| value.clamp(80, 4000) as usize)
+                    .unwrap_or(DEFAULT_HISTORY_ENTRY_MAX_CHARS);
+                return self.execute_history(run_id, last_n, max_chars_per_entry).await;
             }
             "steer" => {
                 let run_id = args
@@ -1717,8 +1742,9 @@ impl SessionsSpawnTool {
                 };
                 let age = (Utc::now() - r.started_at).num_seconds();
                 let parent = r.parent_run_id.as_deref().unwrap_or("root");
+                let usage = format_run_usage(&r.token_usage_records);
                 format!(
-                    "• `{}` [{age}s ago] {status}\n  task: {}\n  depth: {} | parent: {}",
+                    "• `{}` [source=runtime, manageable=true, usage={usage}, {age}s ago] {status}\n  task: {}\n  depth: {} | parent: {}",
                     r.id, r.task, r.spawn_depth, parent
                 )
             })
@@ -1733,63 +1759,66 @@ impl SessionsSpawnTool {
 
     /// Kill a running sub-agent by its run ID.
     async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
-        let (recipient_opt, channel_name_opt, rid, killed_run) = {
+        let kill_target = {
             let mut runs = self.active_runs.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                match &run.status {
-                    // A live run (executing) or one suspended awaiting approval
-                    // (NeedsInput) is killable: aborting the task tears down the
-                    // suspended approval resolver's pending await along with it.
-                    SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
-                        let operation_name = format!("sessions_spawn:kill:{run_id}");
-                        if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
-                            self.name(),
-                            &operation_name,
-                            ResourceRiskLevel::Medium,
-                            approval_grant,
-                        ) {
+            match runs.iter_mut().find(|r| r.id == run_id) {
+                Some(run) => {
+                    match &run.status {
+                        // A live run (executing) or one suspended awaiting approval
+                        // (NeedsInput) is killable: aborting the task tears down the
+                        // suspended approval resolver's pending await along with it.
+                        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
+                            let operation_name = format!("sessions_spawn:kill:{run_id}");
+                            if let Err(error) = SideEffectGate::new(self.security.as_ref())
+                                .authorize_resource_operation(
+                                    self.name(),
+                                    &operation_name,
+                                    ResourceRiskLevel::Medium,
+                                    approval_grant,
+                                )
+                            {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(error),
+                                });
+                            }
+                            if let Some(ah) = run.abort_handle.as_ref() {
+                                ah.abort();
+                            }
+                            let recipient = run.recipient.clone();
+                            // Per-turn channel bound at spawn time — kill-notify routes
+                            // to the same channel + recipient as the launching message,
+                            // not the shared active channel (avoids cross-channel leak).
+                            let channel_name = run.channel_name.clone();
+                            let rid = run.id.clone();
+                            run.finished_at = Some(Utc::now());
+                            run.status = SubAgentStatus::Failed("killed by user".into());
+                            run.steer_tx = None;
+                            Some((recipient, channel_name, rid, run.clone()))
+                        }
+                        SubAgentStatus::Completed(_) => {
                             return Ok(ToolResult {
                                 success: false,
                                 output: String::new(),
-                                error: Some(error),
+                                error: Some(format!("Run `{run_id}` already completed.")),
                             });
                         }
-                        if let Some(ah) = run.abort_handle.as_ref() {
-                            ah.abort();
+                        SubAgentStatus::Failed(e) => {
+                            return Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!("Run `{run_id}` already failed: {e}")),
+                            });
                         }
-                        let recipient = run.recipient.clone();
-                        // Per-turn channel bound at spawn time — kill-notify routes
-                        // to the same channel + recipient as the launching message,
-                        // not the shared active channel (avoids cross-channel leak).
-                        let channel_name = run.channel_name.clone();
-                        let rid = run.id.clone();
-                        run.finished_at = Some(Utc::now());
-                        run.status = SubAgentStatus::Failed("killed by user".into());
-                        run.steer_tx = None;
-                        (recipient, channel_name, rid, run.clone())
-                    }
-                    SubAgentStatus::Completed(_) => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Run `{run_id}` already completed.")),
-                        });
-                    }
-                    SubAgentStatus::Failed(e) => {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(format!("Run `{run_id}` already failed: {e}")),
-                        });
                     }
                 }
-            } else {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("No run found with ID `{run_id}`.")),
-                });
+                None => None,
             }
+        };
+
+        let Some((recipient_opt, channel_name_opt, rid, killed_run)) = kill_target else {
+            return Ok(self.no_runtime_run_result(run_id).await);
         };
 
         self.record_active_run_task_event(&killed_run, "task.killed", json!({"reason": "killed by user"}))
@@ -1817,17 +1846,19 @@ impl SessionsSpawnTool {
     }
 
     /// Return the conversation history of a sub-agent run.
-    async fn execute_history(&self, run_id: &str) -> anyhow::Result<ToolResult> {
+    async fn execute_history(
+        &self,
+        run_id: &str,
+        last_n: Option<usize>,
+        max_chars_per_entry: usize,
+    ) -> anyhow::Result<ToolResult> {
         let runs = self.active_runs.read().await;
         let Some(run) = runs.iter().find(|r| r.id == run_id) else {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("No run found with ID `{run_id}`.")),
-            });
+            return Ok(self.no_runtime_run_result(run_id).await);
         };
 
         let entries = run.history.read().await;
+        let usage = format_run_usage(&run.token_usage_records);
         if entries.is_empty() {
             let status = match &run.status {
                 SubAgentStatus::Running => "still running, no history captured yet",
@@ -1837,30 +1868,69 @@ impl SessionsSpawnTool {
             };
             return Ok(ToolResult {
                 success: true,
-                output: format!("No history entries for run `{run_id}` ({status})."),
+                output: format!(
+                    "No history entries for run `{run_id}` ({status}).\nmetadata: source=runtime, manageable=true, usage={usage}"
+                ),
                 error: None,
             });
         }
 
+        let retained = last_n.unwrap_or(DEFAULT_HISTORY_LAST_N).min(entries.len());
+        let skipped = entries.len().saturating_sub(retained);
         let lines: Vec<String> = entries
             .iter()
+            .skip(skipped)
             .map(|e| {
                 let ts = e.timestamp.format("%H:%M:%S").to_string();
-                let preview: String = e.content.chars().take(200).collect();
-                let ellipsis = if e.content.len() > 200 { "…" } else { "" };
+                let preview: String = e.content.chars().take(max_chars_per_entry).collect();
+                let ellipsis = if e.content.chars().count() > max_chars_per_entry {
+                    "\n[entry truncated]"
+                } else {
+                    ""
+                };
                 format!("[{ts}] **{}**: {}{}", e.role, preview, ellipsis)
             })
             .collect();
+        let omitted = if skipped > 0 {
+            format!("\n\n[history omitted: {skipped} older entries; use last_n/max_chars_per_entry to adjust]")
+        } else {
+            String::new()
+        };
 
         Ok(ToolResult {
             success: true,
             output: format!(
-                "Conversation history for sub-agent `{run_id}` ({} entries):\n\n{}",
+                "Conversation history for sub-agent `{run_id}` ({} entries, showing last {retained}):\nmetadata: source=runtime, manageable=true, usage={usage}\n\n{}{}",
                 entries.len(),
-                lines.join("\n\n")
+                lines.join("\n\n"),
+                omitted
             ),
             error: None,
         })
+    }
+
+    async fn no_runtime_run_result(&self, run_id: &str) -> ToolResult {
+        if self.recovered_run_exists(run_id).await {
+            return ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Run `{run_id}` exists only as a memory-backed projected session (source=memory, manageable=false). It is not present in the current runtime registry, so sessions_spawn cannot kill, steer, or read live history for it. Use sessions_list to inspect it; treat it as stale/interrupted unless a new runtime process reattaches it."
+                )),
+            };
+        }
+        ToolResult {
+            success: false,
+            output: String::new(),
+            error: Some(format!("No runtime run found with ID `{run_id}`.")),
+        }
+    }
+
+    async fn recovered_run_exists(&self, run_id: &str) -> bool {
+        let args = json!({"status": "all", "limit": 100});
+        sessions_read_model::recover_task_runs(self.memory.as_ref(), &self.workspace_dir.to_string_lossy(), &args, 100)
+            .await
+            .is_ok_and(|runs| runs.iter().any(|run| run.run_id == run_id))
     }
 
     /// Inject a steering message into a running sub-agent.
@@ -2994,7 +3064,7 @@ mod tests {
     )]
     use super::*;
     use crate::channels::traits::{Channel, ChannelMessage, SendMessage};
-    use crate::memory::{Memory, MemoryPrincipal, SqliteMemory};
+    use crate::memory::{Memory, MemoryEventInput, MemoryPrincipal, MemoryVisibility, SqliteMemory};
     use crate::security::SecurityPolicy;
     use anyhow::anyhow;
     use std::collections::HashMap;
@@ -4533,7 +4603,42 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("No run found"));
+        assert!(result.error.unwrap().contains("No runtime run found"));
+    }
+
+    #[tokio::test]
+    async fn kill_memory_backed_run_reports_not_manageable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        memory
+            .append_memory_event(MemoryEventInput {
+                event_id: None,
+                workspace_id: "/tmp".to_string(),
+                event_type: "task.spawned".to_string(),
+                subject_table: "tasks".to_string(),
+                subject_id: "memory-only-run".to_string(),
+                session_key: Some("test-session".to_string()),
+                run_id: None,
+                parent_run_id: None,
+                agent_id: None,
+                persona_id: None,
+                visibility: MemoryVisibility::Workspace,
+                payload_json: Some(json!({"task": "stale task"}).to_string()),
+            })
+            .await
+            .unwrap();
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() })).with_shared_memory(memory);
+
+        let result = tool
+            .execute(json!({"action": "kill", "run_id": "memory-only-run"}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap_or_default();
+        assert!(error.contains("source=memory, manageable=false"), "{error}");
+        assert!(error.contains("not present in the current runtime registry"), "{error}");
     }
 
     #[tokio::test]
@@ -4668,6 +4773,78 @@ mod tests {
         assert!(hist_result.success);
         assert!(hist_result.output.contains("user"));
         assert!(hist_result.output.contains("assistant"));
+    }
+
+    #[tokio::test]
+    async fn history_action_returns_tail_usage_and_truncation_controls() {
+        let (ch, _) = RecordingChannel::new();
+        let tool = make_tool(Arc::new(ch), Arc::new(EchoProvider { response: "ok".into() }));
+        let history = Arc::new(RwLock::new(Vec::new()));
+        {
+            let mut entries = history.write().await;
+            for idx in 0..25 {
+                entries.push(HistoryEntry {
+                    role: "assistant".to_string(),
+                    content: format!("entry-{idx} {}", "x".repeat(120)),
+                    timestamp: Utc::now(),
+                });
+            }
+        }
+        {
+            let mut runs = tool.active_runs.write().await;
+            runs.push(SubAgentRun {
+                id: "run-history-tail".to_string(),
+                task: "task".to_string(),
+                owner_id: None,
+                topic_id: None,
+                source_message_event_id: None,
+                started_at: Utc::now(),
+                finished_at: Some(Utc::now()),
+                status: SubAgentStatus::Completed("done".to_string()),
+                recipient: None,
+                channel_name: None,
+                abort_handle: None,
+                history,
+                steer_tx: None,
+                parent_run_id: Some("parent".to_string()),
+                session_scope_key: "test-session".to_string(),
+                spawn_depth: 0,
+                token_usage_records: vec![crate::llm::route_decision::MeteredTokenUsageRecord {
+                    provider: "test-provider".to_string(),
+                    model: "test-model".to_string(),
+                    prompt_tokens: 1000,
+                    completion_tokens: 500,
+                    total_tokens: 1500,
+                    cache_creation_input_tokens: 0,
+                    cache_read_input_tokens: 0,
+                    source: crate::llm::route_decision::TokenUsageSource::Reported,
+                    cost_usd: Some(0.0042),
+                }],
+            });
+        }
+
+        let result = tool
+            .execute(json!({
+                "action": "history",
+                "run_id": "run-history-tail",
+                "last_n": 3,
+                "max_chars_per_entry": 80
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("showing last 3"), "{}", result.output);
+        assert!(result.output.contains("usage=1.5k tok | $0.0042"), "{}", result.output);
+        assert!(result.output.contains("entry-22"), "{}", result.output);
+        assert!(result.output.contains("entry-24"), "{}", result.output);
+        assert!(!result.output.contains("entry-0"), "{}", result.output);
+        assert!(result.output.contains("[entry truncated]"), "{}", result.output);
+        assert!(
+            result.output.contains("[history omitted: 22 older entries"),
+            "{}",
+            result.output
+        );
     }
 
     #[tokio::test]

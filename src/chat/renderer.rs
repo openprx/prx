@@ -431,32 +431,90 @@ fn emit_highlighted_block(result: &mut String, state: &mut AnsiState, code: &str
 
 /// Apply basic inline markdown formatting (bold, italic, code).
 ///
-/// Returns `Cow::Borrowed(line)` when no inline code is found, avoiding an
-/// allocation for plain-prose lines. When backtick pairs are found the string
-/// is rebuilt with `\x1b[33m…\x1b[0m` wrapping (always reset-terminated so
-/// the shared [`AnsiState`] in the caller can track the trailing reset via
-/// `recompute_from_tail`).
+/// Returns `Cow::Borrowed(line)` when no inline markers are found, avoiding an
+/// allocation for plain-prose lines. Styled spans are reset-terminated so the
+/// shared [`AnsiState`] in the caller can track the trailing reset via
+/// `recompute_from_tail`.
 fn render_inline_markdown(line: &str) -> Cow<'_, str> {
-    // Fast path: no backtick ⇒ borrow the original slice, zero allocation.
-    if !line.contains('`') {
+    // Fast path: no inline markers ⇒ borrow the original slice, zero allocation.
+    if !line.contains('`') && !line.contains('*') && !line.contains('_') {
         return Cow::Borrowed(line);
     }
 
-    let mut result = line.to_owned();
-
-    // Inline code: `code` → \x1b[33mcode\x1b[0m (yellow)
-    while let Some(start) = result.find('`') {
-        if let Some(rel_end) = result[start + 1..].find('`') {
-            let end = start + 1 + rel_end;
-            let code = result[start + 1..end].to_owned();
-            let replacement = format!("\x1b[33m{code}\x1b[0m");
-            result = format!("{}{}{}", &result[..start], replacement, &result[end + 1..]);
-        } else {
-            break;
+    let mut result = String::with_capacity(line.len());
+    let mut idx = 0usize;
+    while idx < line.len() {
+        let rest = &line[idx..];
+        if let Some(after) = rest.strip_prefix('`') {
+            if let Some(rel_end) = after.find('`') {
+                let body = &after[..rel_end];
+                result.push_str("\x1b[33m");
+                result.push_str(body);
+                result.push_str("\x1b[0m");
+                idx = idx.saturating_add(1).saturating_add(rel_end).saturating_add(1);
+                continue;
+            }
+        } else if let Some(after) = rest.strip_prefix("**") {
+            if let Some(rel_end) = after.find("**") {
+                let body = &after[..rel_end];
+                if !body.is_empty() {
+                    result.push_str("\x1b[1m");
+                    result.push_str(body);
+                    result.push_str("\x1b[0m");
+                    idx = idx.saturating_add(2).saturating_add(rel_end).saturating_add(2);
+                    continue;
+                }
+            }
+        } else if let Some(after) = rest.strip_prefix('*') {
+            if let Some(rel_end) = after.find('*') {
+                let body = &after[..rel_end];
+                if emphasis_body_has_valid_flanks(body) {
+                    result.push_str("\x1b[3m");
+                    result.push_str(body);
+                    result.push_str("\x1b[0m");
+                    idx = idx.saturating_add(1).saturating_add(rel_end).saturating_add(1);
+                    continue;
+                }
+            }
+        } else if let Some(after) = rest.strip_prefix('_')
+            && let Some(rel_end) = after.find('_')
+        {
+            let body = &after[..rel_end];
+            let closing_idx = idx.saturating_add(1).saturating_add(rel_end);
+            if emphasis_body_has_valid_flanks(body)
+                && underscore_emphasis_has_word_boundaries(line, idx, closing_idx.saturating_add(1))
+            {
+                result.push_str("\x1b[3m");
+                result.push_str(body);
+                result.push_str("\x1b[0m");
+                idx = idx.saturating_add(1).saturating_add(rel_end).saturating_add(1);
+                continue;
+            }
         }
+
+        let Some(ch) = rest.chars().next() else {
+            break;
+        };
+        result.push(ch);
+        idx = idx.saturating_add(ch.len_utf8());
     }
 
     Cow::Owned(result)
+}
+
+fn emphasis_body_has_valid_flanks(body: &str) -> bool {
+    body.chars().next().is_some_and(|ch| !ch.is_whitespace())
+        && body.chars().next_back().is_some_and(|ch| !ch.is_whitespace())
+}
+
+fn is_inline_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn underscore_emphasis_has_word_boundaries(line: &str, opening_idx: usize, after_closing_idx: usize) -> bool {
+    let before = line[..opening_idx].chars().next_back();
+    let after = line[after_closing_idx..].chars().next();
+    !before.is_some_and(is_inline_word_char) && !after.is_some_and(is_inline_word_char)
 }
 
 /// Calculate the display width of a string, accounting for CJK characters.
@@ -544,6 +602,42 @@ mod tests {
         let result = render_inline_markdown(line);
         assert!(result.contains("\x1b[33m"));
         assert!(result.contains("cargo build"));
+    }
+
+    #[test]
+    fn inline_bold_and_italic_formatting() {
+        let line = "Use **bold** and *italic* plus _emphasis_ with `code`";
+        let result = render_inline_markdown(line);
+        assert!(result.contains("\x1b[1mbold\x1b[0m"), "bold missing: {result:?}");
+        assert!(
+            result.contains("\x1b[3mitalic\x1b[0m"),
+            "star italic missing: {result:?}"
+        );
+        assert!(
+            result.contains("\x1b[3memphasis\x1b[0m"),
+            "underscore italic missing: {result:?}"
+        );
+        assert!(result.contains("\x1b[33mcode\x1b[0m"), "code missing: {result:?}");
+    }
+
+    #[test]
+    fn inline_italic_requires_non_whitespace_flanks() {
+        for line in ["width * height * depth", "* item", "multiply by * factor * here"] {
+            let result = render_inline_markdown(line);
+            assert!(
+                !result.contains("\x1b[3m"),
+                "line must not render accidental italic emphasis: {line:?} -> {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inline_underscore_italic_requires_word_boundaries() {
+        let result = render_inline_markdown("snake_case_name");
+        assert!(
+            !result.contains("\x1b[3m"),
+            "snake_case_name must not render accidental underscore emphasis: {result:?}"
+        );
     }
 
     #[test]

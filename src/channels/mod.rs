@@ -61,7 +61,7 @@ pub use signal_native::SignalNativeChannel;
 pub use slack::SlackChannel;
 pub use telegram::TelegramChannel;
 pub use terminal::TerminalChannel;
-pub use traits::{Channel, SendMessage};
+pub use traits::{Channel, ChatKind, SendMessage};
 pub use wacli::WacliChannel;
 pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
@@ -75,7 +75,8 @@ use crate::config::Config;
 use crate::hooks::HookManager;
 use crate::identity;
 use crate::memory::{
-    self, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility, MemoryWriteContext,
+    self, ChatProfile, Memory, MemoryEventRecording, MemoryFabric, MemoryPrincipal, MemoryVisibility,
+    MemoryWriteContext,
 };
 use crate::observability::{self, Observer};
 use crate::providers::{self, ChatMessage, ChatRequest, Provider};
@@ -371,12 +372,24 @@ fn normalize_allowlist(values: &[String]) -> HashSet<String> {
         .collect()
 }
 
-fn infer_chat_type_from_message(msg: &traits::ChannelMessage) -> &'static str {
+fn legacy_chat_kind_from_message(msg: &traits::ChannelMessage) -> ChatKind {
     if msg.reply_target.starts_with("group:") || msg.reply_target.ends_with("@g.us") || msg.sender.ends_with("@g.us") {
-        "group"
+        ChatKind::Group
     } else {
-        "direct"
+        ChatKind::Dm
     }
+}
+
+fn chat_kind_from_message(msg: &traits::ChannelMessage) -> ChatKind {
+    if msg.chat_kind == ChatKind::Dm {
+        legacy_chat_kind_from_message(msg)
+    } else {
+        msg.chat_kind
+    }
+}
+
+fn infer_chat_type_from_message(msg: &traits::ChannelMessage) -> &'static str {
+    chat_kind_from_message(msg).scope_chat_type()
 }
 
 fn extract_group_identifier(msg: &traits::ChannelMessage) -> Option<String> {
@@ -788,7 +801,7 @@ impl ConversationKey {
 }
 
 fn channel_message_visibility(msg: &traits::ChannelMessage) -> MemoryVisibility {
-    if infer_chat_type_from_message(msg) == "group" {
+    if chat_kind_from_message(msg).is_group_like() {
         MemoryVisibility::Session
     } else {
         MemoryVisibility::Workspace
@@ -820,6 +833,21 @@ fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
         ),
         _ => None,
     }
+}
+
+fn channel_runtime_instructions(channel_name: &str) -> String {
+    let mut instructions = String::from(
+        "## Channel Capabilities\n\n\
+         - You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n\
+         - You do NOT need to ask permission to respond; just respond directly.\n\
+         - NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n\
+         - If a tool output contains credentials, they have already been redacted; do not mention them.\n",
+    );
+    if let Some(delivery) = channel_delivery_instructions(channel_name) {
+        instructions.push('\n');
+        instructions.push_str(delivery);
+    }
+    instructions
 }
 
 /// System-prompt addendum for smart group-reply turns. Overrides the default
@@ -866,17 +894,99 @@ fn stay_silent_tool_instructions() -> String {
     block
 }
 
-fn build_channel_system_prompt(base_prompt: &str, channel_name: &str) -> String {
-    channel_delivery_instructions(channel_name).map_or_else(
-        || base_prompt.to_string(),
-        |instructions| {
-            if base_prompt.is_empty() {
-                instructions.to_string()
-            } else {
-                format!("{base_prompt}\n\n{instructions}")
-            }
-        },
-    )
+fn prompt_trim(value: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    let mut truncated = false;
+    for (idx, ch) in value.trim().chars().enumerate() {
+        if idx >= max_chars {
+            truncated = true;
+            break;
+        }
+        out.push(ch);
+    }
+    if truncated {
+        out.push_str("...");
+    }
+    out
+}
+
+const fn display_chat_kind(kind: ChatKind) -> &'static str {
+    match kind {
+        ChatKind::Dm => "dm",
+        ChatKind::Group => "group",
+        ChatKind::Thread => "thread",
+    }
+}
+
+fn build_current_conversation_prompt(
+    msg: &traits::ChannelMessage,
+    profile: Option<&ChatProfile>,
+    bot_identity: Option<&str>,
+) -> String {
+    let kind = profile
+        .map(|profile| profile.chat_kind.as_str())
+        .map(|value| match value {
+            "group" => "group",
+            "thread" => "thread",
+            _ => "dm",
+        })
+        .unwrap_or_else(|| display_chat_kind(chat_kind_from_message(msg)));
+    let title = msg
+        .chat_title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| profile.and_then(|profile| profile.title.as_deref()))
+        .unwrap_or("untitled");
+    let you = bot_identity.unwrap_or(msg.channel.as_str());
+    let mut block = format!(
+        "## Current Conversation\n- Platform: {} | You: {}\n- Type: {} | Chat: \"{}\" ({})",
+        msg.channel,
+        prompt_trim(you, 48),
+        kind,
+        prompt_trim(title, 80),
+        prompt_trim(&msg.reply_target, 96)
+    );
+    if let Some(profile) = profile {
+        if let Some(purpose) = profile.purpose.as_deref().filter(|value| !value.trim().is_empty()) {
+            let _ = write!(block, "\n- Purpose (self-maintained): {}", prompt_trim(purpose, 180));
+        }
+        let notes = profile.notes.as_deref().filter(|value| !value.trim().is_empty());
+        let tags = if profile.tags.is_empty() {
+            None
+        } else {
+            Some(profile.tags.join(", "))
+        };
+        if notes.is_some() || tags.is_some() {
+            let _ = write!(
+                block,
+                "\n- Notes: {} | Tags: {}",
+                notes
+                    .map(|value| prompt_trim(value, 240))
+                    .unwrap_or_else(|| "none".to_string()),
+                tags.as_deref()
+                    .map(|value| prompt_trim(value, 120))
+                    .unwrap_or_else(|| "none".to_string())
+            );
+        }
+    }
+    block.push_str("\n- When you learn what this chat is for, use the chat_profile_update tool (not memory_store).");
+    block
+}
+
+fn build_channel_system_prompt(
+    base_prompt: &str,
+    msg: &traits::ChannelMessage,
+    profile: Option<&ChatProfile>,
+    bot_identity: Option<&str>,
+) -> String {
+    let instructions = channel_runtime_instructions(&msg.channel);
+    let current_conversation = build_current_conversation_prompt(msg, profile, bot_identity);
+    let instructions = format!("{instructions}\n\n{current_conversation}");
+    if base_prompt.is_empty() {
+        instructions
+    } else {
+        format!("{base_prompt}\n\n{instructions}")
+    }
 }
 
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
@@ -2612,20 +2722,19 @@ async fn process_channel_message(
             return;
         }
     };
-    let inferred_chat_type = if msg.reply_target.starts_with("group:")
-        || msg.reply_target.ends_with("@g.us")
-        || msg.sender.ends_with("@g.us")
-    {
-        "group"
-    } else {
-        "dm"
-    };
+    let chat_kind = chat_kind_from_message(&msg);
+    let inferred_chat_type = chat_kind.scope_chat_type();
+    let is_direct_chat = chat_kind == ChatKind::Dm;
+    let is_group = chat_kind.is_group_like();
     println!("  ⏳ Processing message...");
 
     // Set active recipient on tools that support proactive messaging (message_send, sessions_spawn).
     // Also update the active channel so channel-aware tools route replies back on the correct channel
     // (e.g., wacli for WhatsApp messages, not always Signal).
     for tool in ctx.tools_registry.iter() {
+        if tool.name() == "message_send" {
+            continue;
+        }
         tool.set_active_recipient(&msg.reply_target).await;
         if let Some(ref ch) = target_channel {
             tool.set_active_channel(Arc::clone(ch)).await;
@@ -2665,6 +2774,23 @@ async fn process_channel_message(
     // share a single run_id (per-turn provenance, not per-session).
     let turn_run_id = uuid::Uuid::new_v4().to_string();
 
+    if let Err(error) = ctx
+        .memory
+        .upsert_chat_profile_metadata(
+            &msg.channel,
+            &msg.reply_target,
+            inferred_chat_type,
+            msg.chat_title.as_deref(),
+        )
+        .await
+    {
+        tracing::warn!(
+            channel = %msg.channel,
+            chat_id = %msg.reply_target,
+            "failed to upsert chat profile metadata: {error}"
+        );
+    }
+
     // Preserve user turn before the LLM call so interrupted requests keep context.
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
     let inbound_event = append_sender_turn(
@@ -2698,11 +2824,7 @@ async fn process_channel_message(
         .is_ok();
 
     // Only auto-save DM messages; group messages are noise unless explicitly stored by the agent.
-    if autosave_allowed
-        && ctx.auto_save_memory
-        && inferred_chat_type == "dm"
-        && memory::should_autosave_content(&msg.content)
-    {
+    if autosave_allowed && ctx.auto_save_memory && is_direct_chat && memory::should_autosave_content(&msg.content) {
         let autosave_key = conversation_memory_key(&msg);
         let write_ctx = MemoryWriteContext {
             channel: Some(msg.channel.clone()),
@@ -2733,18 +2855,13 @@ async fn process_channel_message(
             .await;
     }
 
-    // Skip LLM call for group messages when mention_only is enabled and bot is not mentioned.
-    let is_group = msg.reply_target.starts_with("group:")
-        || msg.reply_target.ends_with("@g.us")
-        || msg.reply_target.contains("@g.us");
-
     // ── Smart group-reply decision context ──────────────────────────────────
     // Effective mode for this channel. Smart-capable channels (Telegram/Discord)
     // tag group-ness via `msg.is_group_hint` since their `reply_target` is a bare
     // chat/channel id; other channels rely on `is_group` above.
     let group_reply_mode = group_reply_mode_for(ctx.as_ref(), &msg.channel);
-    // A message is "in a group" for smart purposes if either the central
-    // reply_target encoding says so OR the channel layer flagged it.
+    // A message is "in a group" for smart purposes if the structured chat kind
+    // says so OR the channel layer flagged it.
     let in_group_for_smart = is_group || msg.is_group_hint;
     // 🔴 Invariant #1 (DM never silent): smart suppression is gated on a real
     // group message. DMs (`!in_group_for_smart`) can never be smart, so
@@ -2912,6 +3029,17 @@ async fn process_channel_message(
     )
     .await
     .preamble;
+    let chat_profile = match ctx.memory.get_chat_profile(&msg.channel, &msg.reply_target).await {
+        Ok(profile) => profile,
+        Err(error) => {
+            tracing::warn!(
+                channel = %msg.channel,
+                chat_id = %msg.reply_target,
+                "failed to load chat profile for prompt: {error}"
+            );
+            None
+        }
+    };
 
     // When Skill RAG is enabled, select relevant skills per-message and rebuild
     // the system prompt (same as chat/mod.rs per-turn skill selection).
@@ -2955,7 +3083,13 @@ async fn process_channel_message(
         }
         prompt
     };
-    let mut system_prompt = build_channel_system_prompt(&base_system_prompt, &msg.channel);
+    let bot_identity = target_channel.as_ref().and_then(|channel| channel.bot_identity());
+    let mut system_prompt = build_channel_system_prompt(
+        &base_system_prompt,
+        &msg,
+        chat_profile.as_ref(),
+        bot_identity.as_deref(),
+    );
     // Smart group-reply: override the default "respond directly / response is
     // automatically sent" guidance so the model knows it is one participant in a
     // group and may decline to speak via `stay_silent`. Only appended for smart
@@ -3140,8 +3274,6 @@ async fn process_channel_message(
 
     let timeout_budget_secs = channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
 
-    // Derive chat_type from reply_target: "group" if the reply target is a group, else "direct".
-    let chat_type = infer_chat_type_from_message(&msg);
     let scope_owner_id = runtime_envelope.resolved_owner_id();
     // D2-2: borrow the per-message security generation for the whole tool-call
     // loop. ScopeContext takes `security_gen.security` from the SAME generation,
@@ -3154,7 +3286,7 @@ async fn process_channel_message(
         policy: security_gen.security.as_ref(),
         sender: &msg.sender,
         channel: &msg.channel,
-        chat_type,
+        chat_type: inferred_chat_type,
         chat_id: &msg.reply_target,
         owner_id: Some(&scope_owner_id),
         topic_id: runtime_envelope.topic_id.as_deref(),
@@ -3173,6 +3305,12 @@ async fn process_channel_message(
         turn_run_id.clone(),
         turn_spawn_session_scope_key,
     );
+    let turn_message_send_ctx = target_channel.as_ref().map(|channel| {
+        crate::tools::message_send::MessageSendExecutionContext::new(
+            Some(msg.reply_target.clone()),
+            Arc::clone(channel),
+        )
+    });
 
     let mut context_overflow_retries = 0usize;
     let mut timeout_retries = 0usize;
@@ -3183,9 +3321,10 @@ async fn process_channel_message(
             () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
             result = tokio::time::timeout(
                 Duration::from_secs(timeout_budget_secs),
-                crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
-                turn_spawn_ctx.clone(),
-                crate::agent::loop_::run_tool_call_loop_outcome(
+                async {
+                    let scoped_tool_loop = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.scope(
+                        turn_spawn_ctx.clone(),
+                        crate::agent::loop_::run_tool_call_loop_outcome(
                     active_provider.as_ref(),
                     &mut history,
                     ctx.tools_registry.as_ref(),
@@ -3217,8 +3356,17 @@ async fn process_channel_message(
                     // expose_stay_silent: ONLY on smart group turns. DMs / non-smart
                     // never see the tool, so they can never short-circuit to Silent.
                     smart_group,
-                ),
-                ),
+                        ),
+                    );
+                    match turn_message_send_ctx.clone() {
+                        Some(message_ctx) => {
+                            crate::tools::message_send::MESSAGE_SEND_EXECUTION_CONTEXT
+                                .scope(message_ctx, scoped_tool_loop)
+                                .await
+                        }
+                        None => scoped_tool_loop.await,
+                    }
+                },
             ) => LlmExecutionResult::Completed(Box::new(result)),
         };
 
@@ -3997,17 +4145,6 @@ pub fn build_system_prompt_with_mode(
         std::env::consts::OS,
     );
 
-    // ── 8. Channel Capabilities ─────────────────────────────────────
-    prompt.push_str("## Channel Capabilities\n\n");
-    prompt.push_str(
-        "- You are running as a messaging bot. Your response is automatically sent back to the user's channel.\n",
-    );
-    prompt.push_str("- You do NOT need to ask permission to respond — just respond directly.\n");
-    prompt.push_str("- NEVER repeat, describe, or echo credentials, tokens, API keys, or secrets in your responses.\n");
-    prompt.push_str(
-        "- If a tool output contains credentials, they have already been redacted — do not mention them.\n\n",
-    );
-
     if prompt.is_empty() {
         "You are OpenPRX, a fast and efficient AI assistant built in Rust. Be helpful, concise, and direct.".to_string()
     } else {
@@ -4541,16 +4678,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 #[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Result<()> {
     let provider_name = resolved_default_provider(&config);
-    let provider_runtime_options = providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(std::path::PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
         &provider_name,
         config.api_key.as_deref(),
@@ -6478,6 +6606,9 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -6502,12 +6633,38 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
             sender_is_bot: false,
         };
         assert!(evaluate_inbound_policy(&policy, &msg));
+    }
+
+    #[test]
+    fn structured_chat_kind_drives_group_scope_for_bare_telegram_targets() {
+        let msg = traits::ChannelMessage {
+            id: "tg-group".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-100200300".to_string(),
+            content: "[Telegram Group] Alice: group update".to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Build Room".to_string()),
+            sender_display: Some("Alice".to_string()),
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: true,
+            sender_is_bot: false,
+        };
+
+        assert_eq!(infer_chat_type_from_message(&msg), "group");
+        assert_eq!(channel_message_visibility(&msg), MemoryVisibility::Session);
     }
 
     #[test]
@@ -6526,6 +6683,9 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -6550,6 +6710,9 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -6592,6 +6755,9 @@ mod tests {
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -7153,6 +7319,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7236,6 +7405,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7319,6 +7491,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7404,6 +7579,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "signal".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7488,6 +7666,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "signal".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7578,6 +7759,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7696,6 +7880,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7787,6 +7974,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 3,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -7895,6 +8085,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 4,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -8027,6 +8220,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -8111,6 +8307,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -8377,6 +8576,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -8440,9 +8642,32 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
+            sender_is_bot: false,
+        }
+    }
+
+    fn gate_test_telegram_group_message() -> traits::ChannelMessage {
+        traits::ChannelMessage {
+            id: "gate-msg-telegram-group".to_string(),
+            sender: "alice".to_string(),
+            reply_target: "-100200300".to_string(),
+            content: "[Telegram Group] Alice: this is a sufficiently long group message that must not autosave"
+                .to_string(),
+            channel: "telegram".to_string(),
+            timestamp: 1,
+            thread_ts: None,
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Build Room".to_string()),
+            sender_display: Some("Alice".to_string()),
+            mentioned_uuids: vec![],
+            mentioned: false,
+            is_group_hint: true,
             sender_is_bot: false,
         }
     }
@@ -8520,6 +8745,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "signal".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -8640,6 +8868,28 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(
             memory.store_calls.load(Ordering::SeqCst) >= 1,
             "autosave allow must perform the autosave memory write"
+        );
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_telegram_group_does_not_autosave() {
+        let memory = Arc::new(CountingMemory::default());
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+        let mut opts = GateTestOpts::new(crate::security::AutonomyLevel::Supervised);
+        opts.auto_save_memory = true;
+        let ctx = gate_test_ctx_with(opts, Arc::clone(&memory), channel);
+
+        process_channel_message(ctx, gate_test_telegram_group_message(), CancellationToken::new()).await;
+
+        assert!(
+            memory.append_calls.load(Ordering::SeqCst) >= 1,
+            "group message inbound turn should still persist"
+        );
+        assert_eq!(
+            memory.store_calls.load(Ordering::SeqCst),
+            0,
+            "Telegram group messages must not take the DM autosave path"
         );
     }
 
@@ -9246,6 +9496,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9261,6 +9514,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "test-channel".to_string(),
             timestamp: 2,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9355,6 +9611,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -9371,6 +9630,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -9476,6 +9738,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -9492,6 +9757,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -9580,6 +9848,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -9885,9 +10156,27 @@ BTC is currently around $65,000 based on latest tool output."#
     }
 
     #[test]
-    fn prompt_contains_channel_capabilities() {
+    fn runtime_prompt_excludes_channel_delivery_context() {
         let ws = make_workspace();
         let prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+
+        assert!(!prompt.contains("## Channel Capabilities"));
+        assert!(!prompt.contains("running as a messaging bot"));
+        assert!(!prompt.contains("automatically sent back"));
+    }
+
+    #[test]
+    fn channel_prompt_includes_channel_delivery_context() {
+        let ws = make_workspace();
+        let base_prompt = build_system_prompt(ws.path(), "model", &[], &[], None, None);
+        let msg = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "chat-1".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Ops".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_channel_system_prompt(&base_prompt, &msg, None, Some("@bot"));
 
         assert!(
             prompt.contains("## Channel Capabilities"),
@@ -9896,8 +10185,115 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(prompt.contains("running as a messaging bot"), "missing channel context");
         assert!(
             prompt.contains("NEVER repeat, describe, or echo credentials"),
-            "missing security instruction"
+            "missing channel safety instruction"
         );
+        assert!(
+            prompt.contains("When responding on Telegram"),
+            "missing Telegram delivery guidance"
+        );
+        assert!(
+            prompt.contains("## Current Conversation")
+                && prompt.contains("- Platform: telegram | You: @bot")
+                && prompt.contains("- Type: group | Chat: \"Ops\" (chat-1)"),
+            "missing current conversation context"
+        );
+        assert!(
+            prompt.contains("use the chat_profile_update tool (not memory_store)"),
+            "missing chat_profile_update preference hint"
+        );
+    }
+
+    fn test_chat_profile(channel: &str, chat_id: &str, chat_kind: &str, purpose: &str) -> ChatProfile {
+        ChatProfile {
+            id: format!("{channel}-{chat_id}"),
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            chat_kind: chat_kind.to_string(),
+            title: Some(format!("title-{chat_id}")),
+            purpose: Some(purpose.to_string()),
+            notes: Some("shared operating notes".to_string()),
+            tags: vec!["ops".to_string(), "handoff".to_string()],
+            updated_by: "agent".to_string(),
+            created_at: "2026-07-06T00:00:00Z".to_string(),
+            updated_at: "2026-07-06T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn current_conversation_prompt_cross_chat_isolation() {
+        let group_a = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "group-a".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Group A".to_string()),
+            ..Default::default()
+        };
+        let group_b = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "group-b".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Group B".to_string()),
+            ..Default::default()
+        };
+        let dm = traits::ChannelMessage {
+            channel: "telegram".to_string(),
+            reply_target: "dm-1".to_string(),
+            chat_kind: ChatKind::Dm,
+            chat_title: Some("Direct".to_string()),
+            ..Default::default()
+        };
+        let profile_a = test_chat_profile("telegram", "group-a", "group", "A-only release room");
+
+        let prompt_a = build_current_conversation_prompt(&group_a, Some(&profile_a), Some("@bot"));
+        let prompt_b = build_current_conversation_prompt(&group_b, None, Some("@bot"));
+        let prompt_dm = build_current_conversation_prompt(&dm, None, Some("@bot"));
+
+        assert!(prompt_a.contains("A-only release room"));
+        assert!(!prompt_b.contains("A-only release room"));
+        assert!(!prompt_dm.contains("A-only release room"));
+        assert!(prompt_b.contains("- Type: group | Chat: \"Group B\" (group-b)"));
+        assert!(prompt_dm.contains("- Type: dm | Chat: \"Direct\" (dm-1)"));
+    }
+
+    #[test]
+    fn current_conversation_prompt_snapshots_no_profile_with_profile_and_long_truncation() {
+        let msg = traits::ChannelMessage {
+            channel: "wacli".to_string(),
+            reply_target: "12345@g.us".to_string(),
+            chat_kind: ChatKind::Group,
+            chat_title: Some("Release War Room".to_string()),
+            ..Default::default()
+        };
+        let no_profile = build_current_conversation_prompt(&msg, None, Some("99550001@s.whatsapp.net"));
+        assert!(no_profile.contains("- Platform: wacli | You: 99550001@s.whatsapp.net"));
+        assert!(no_profile.contains("- Type: group | Chat: \"Release War Room\" (12345@g.us)"));
+        assert!(!no_profile.contains("Purpose (self-maintained):"));
+
+        let mut profile = test_chat_profile("wacli", "12345@g.us", "group", "Coordinate release approvals");
+        let with_profile = build_current_conversation_prompt(&msg, Some(&profile), Some("99550001@s.whatsapp.net"));
+        assert!(with_profile.contains("- Purpose (self-maintained): Coordinate release approvals"));
+        assert!(with_profile.contains("- Notes: shared operating notes | Tags: ops, handoff"));
+
+        profile.purpose = Some("p".repeat(400));
+        profile.notes = Some("n".repeat(900));
+        let long = build_current_conversation_prompt(&msg, Some(&profile), Some("99550001@s.whatsapp.net"));
+        assert!(long.contains(&format!("{}...", "p".repeat(180))));
+        assert!(!long.contains(&"p".repeat(300)));
+        assert!(long.contains(&format!("{}...", "n".repeat(240))));
+        assert!(!long.contains(&"n".repeat(400)));
+    }
+
+    #[test]
+    fn current_conversation_prompt_renders_thread_self_consistently() {
+        let msg = traits::ChannelMessage {
+            channel: "slack".to_string(),
+            reply_target: "thread-1".to_string(),
+            chat_kind: ChatKind::Thread,
+            chat_title: Some("Thread".to_string()),
+            ..Default::default()
+        };
+        let prompt = build_current_conversation_prompt(&msg, None, Some("prx"));
+        assert!(prompt.contains("- Type: thread | Chat: \"Thread\" (thread-1)"));
     }
 
     #[test]
@@ -9918,6 +10314,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9937,6 +10336,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9950,6 +10352,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9972,6 +10377,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 1,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -9985,6 +10393,9 @@ BTC is currently around $65,000 based on latest tool output."#
             channel: "slack".into(),
             timestamp: 2,
             thread_ts: None,
+            chat_kind: crate::channels::traits::ChatKind::Dm,
+            chat_title: None,
+            sender_display: None,
             mentioned_uuids: vec![],
             mentioned: false,
             is_group_hint: false,
@@ -10095,6 +10506,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -10114,6 +10528,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 2,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -10205,6 +10622,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "test-channel".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,
@@ -10308,6 +10728,9 @@ BTC is currently around $65,000 based on latest tool output."#
                 channel: "telegram".to_string(),
                 timestamp: 1,
                 thread_ts: None,
+                chat_kind: crate::channels::traits::ChatKind::Dm,
+                chat_title: None,
+                sender_display: None,
                 mentioned_uuids: vec![],
                 mentioned: false,
                 is_group_hint: false,

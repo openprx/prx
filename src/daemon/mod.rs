@@ -627,16 +627,7 @@ fn build_evolution_judge_model(config: &Config) -> Arc<dyn crate::self_system::e
         .default_provider
         .clone()
         .unwrap_or_else(|| "openrouter".to_string());
-    let provider_runtime_options = crate::providers::ProviderRuntimeOptions {
-        auth_profile_override: None,
-        openprx_dir: config.config_path.parent().map(PathBuf::from),
-        secrets_encrypt: config.secrets.encrypt,
-        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
-        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
-        reasoning_enabled: config.runtime.reasoning_enabled,
-        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
-        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
-    };
+    let provider_runtime_options = crate::providers::provider_runtime_options_from_config(config);
 
     match crate::providers::create_resilient_provider_with_options(
         &provider_name,

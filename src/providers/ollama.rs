@@ -10,10 +10,15 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+const DEFAULT_NUM_CTX: usize = 8192;
+const MAX_NUM_CTX: usize = 65_536;
+
 pub struct OllamaProvider {
     base_url: String,
     api_key: Option<String>,
     reasoning_enabled: Option<bool>,
+    num_ctx: Option<usize>,
+    model_num_ctx: HashMap<String, usize>,
 }
 
 // ─── Request Structures ───────────────────────────────────────────────────────
@@ -59,6 +64,7 @@ struct OutgoingFunction {
 #[derive(Debug, Serialize)]
 struct Options {
     temperature: f64,
+    num_ctx: usize,
 }
 
 // ─── Response Structures ──────────────────────────────────────────────────────
@@ -116,10 +122,24 @@ impl OllamaProvider {
     }
 
     pub fn new_with_reasoning(base_url: Option<&str>, api_key: Option<&str>, reasoning_enabled: Option<bool>) -> Self {
+        Self::new_with_runtime_options(base_url, api_key, reasoning_enabled, None, Vec::new())
+    }
+
+    pub fn new_with_runtime_options(
+        base_url: Option<&str>,
+        api_key: Option<&str>,
+        reasoning_enabled: Option<bool>,
+        num_ctx: Option<usize>,
+        model_num_ctx: Vec<(String, usize)>,
+    ) -> Self {
         let api_key = api_key.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
         });
+        let model_num_ctx = model_num_ctx
+            .into_iter()
+            .filter(|(model, num_ctx)| !model.trim().is_empty() && *num_ctx > 0 && *num_ctx < 1_000_000)
+            .collect();
 
         Self {
             base_url: base_url
@@ -128,6 +148,8 @@ impl OllamaProvider {
                 .to_string(),
             api_key,
             reasoning_enabled,
+            num_ctx,
+            model_num_ctx,
         }
     }
 
@@ -174,6 +196,28 @@ impl OllamaProvider {
         serde_json::from_str(arguments).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    fn resolve_num_ctx(&self, model: &str) -> usize {
+        let requested = self
+            .num_ctx
+            .filter(|value| *value > 0)
+            .or_else(|| self.model_num_ctx.get(model).copied())
+            .or_else(|| {
+                model
+                    .rsplit_once('/')
+                    .and_then(|(_, bare_model)| self.model_num_ctx.get(bare_model).copied())
+            })
+            .unwrap_or(DEFAULT_NUM_CTX);
+        let resolved = requested.min(MAX_NUM_CTX);
+        tracing::debug!(
+            model = model,
+            requested_num_ctx = requested,
+            num_ctx = resolved,
+            cap = MAX_NUM_CTX,
+            "applying Ollama num_ctx"
+        );
+        resolved
+    }
+
     fn build_chat_request(
         &self,
         messages: Vec<Message>,
@@ -186,7 +230,10 @@ impl OllamaProvider {
             model: model.to_string(),
             messages,
             stream,
-            options: Options { temperature },
+            options: Options {
+                temperature,
+                num_ctx: self.resolve_num_ctx(model),
+            },
             think: self.reasoning_enabled,
             tools: tools.map(|t| t.to_vec()),
         }
@@ -1147,6 +1194,77 @@ mod tests {
 
         let json = serde_json::to_value(request).unwrap();
         assert_eq!(json.get("think"), Some(&serde_json::json!(false)));
+    }
+
+    fn user_message(content: &str) -> Message {
+        Message {
+            role: "user".to_string(),
+            content: Some(content.to_string()),
+            images: None,
+            tool_calls: None,
+            tool_name: None,
+        }
+    }
+
+    fn request_num_ctx(provider: &OllamaProvider, model: &str) -> usize {
+        let request = provider.build_chat_request(vec![user_message("hello")], model, 0.7, false, None);
+        let json = serde_json::to_value(request).unwrap();
+        json.pointer("/options/num_ctx")
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .expect("request serializes options.num_ctx")
+    }
+
+    #[test]
+    fn request_num_ctx_defaults_to_8192() {
+        let provider = OllamaProvider::new(None, None);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 8192);
+    }
+
+    #[test]
+    fn request_num_ctx_uses_router_model_context() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("llama3".to_string(), 32_768)]);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 32_768);
+        assert_eq!(request_num_ctx(&provider, "ollama/llama3"), 32_768);
+    }
+
+    #[test]
+    fn request_num_ctx_ignores_router_default_sentinel() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("llama3".to_string(), 1_000_000)]);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 8192);
+    }
+
+    #[test]
+    fn request_num_ctx_clamps_large_router_context_to_safe_cap() {
+        let provider =
+            OllamaProvider::new_with_runtime_options(None, None, None, None, vec![("llama3".to_string(), 128_000)]);
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
+    }
+
+    #[test]
+    fn request_num_ctx_explicit_config_overrides_router_model_context() {
+        let provider = OllamaProvider::new_with_runtime_options(
+            None,
+            None,
+            None,
+            Some(65_536),
+            vec![("llama3".to_string(), 32_768)],
+        );
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
+    }
+
+    #[test]
+    fn request_num_ctx_clamps_large_explicit_config_to_safe_cap() {
+        let provider = OllamaProvider::new_with_runtime_options(None, None, None, Some(128_000), Vec::new());
+
+        assert_eq!(request_num_ctx(&provider, "llama3"), 65_536);
     }
 
     #[test]

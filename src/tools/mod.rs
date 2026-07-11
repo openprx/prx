@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod agents_list;
+pub mod chat_profile_update;
 pub mod composio;
 pub mod config_reload;
 pub mod cron;
@@ -59,6 +60,7 @@ pub mod web_search_tool;
 pub mod xin;
 
 pub use agents_list::AgentsListTool;
+pub use chat_profile_update::ChatProfileUpdateTool;
 pub use composio::ComposioTool;
 pub use config_reload::ConfigReloadTool;
 pub use cron::CronTool;
@@ -159,6 +161,29 @@ impl Tool for ArcDelegatingTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         self.inner.execute(args).await
+    }
+
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner.execute_with_cancellation(args, cancellation).await
+    }
+
+    async fn execute_named(&self, name: &str, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.inner.execute_named(name, args).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<tokio_util::sync::CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        self.inner
+            .execute_named_with_cancellation(name, args, cancellation)
+            .await
     }
 
     fn tier(&self) -> ToolTier {
@@ -347,6 +372,7 @@ pub fn all_tools_with_runtime_ext(
 
     // ── Memory module gates memory tools ──
     if modules.memory {
+        tool_arcs.push(Arc::new(ChatProfileUpdateTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemorySearchTool::new(
@@ -502,16 +528,7 @@ pub fn all_tools_with_runtime_ext(
             delegate_agents,
             delegate_fallback_credential,
             security.clone(),
-            crate::providers::ProviderRuntimeOptions {
-                auth_profile_override: None,
-                openprx_dir: root_config.config_path.parent().map(std::path::PathBuf::from),
-                secrets_encrypt: root_config.secrets.encrypt,
-                codex_auth_json_path: Some(root_config.auth.codex_auth_json_path.clone()),
-                codex_auth_json_auto_import: root_config.auth.codex_auth_json_auto_import,
-                reasoning_enabled: root_config.runtime.reasoning_enabled,
-                codex_stream_idle_timeout_secs: root_config.runtime.codex_stream_idle_timeout_secs,
-                codex_reasoning_effort: root_config.runtime.codex_reasoning_effort.clone(),
-            },
+            crate::providers::provider_runtime_options_from_config(root_config),
         )
         .with_parent_tools(parent_tools)
         .with_multimodal_config(root_config.multimodal.clone())

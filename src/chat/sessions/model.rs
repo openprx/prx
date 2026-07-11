@@ -14,7 +14,7 @@
 //!   **never** produced here (there is no underlying signal for it yet).
 
 use super::id::SessionId;
-use super::shell::{ShellSession, ShellStatus};
+use super::shell::{ShellOrigin, ShellSession, ShellStatus};
 use crate::chat::session::SessionTokenUsageRecord;
 use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 use chrono::{DateTime, Utc};
@@ -38,6 +38,8 @@ pub enum ManagedKind {
     Approval,
     /// Read-only workspace diff viewer (`/diff`).
     Diff,
+    /// Read-only main provider worker detail viewer.
+    Worker,
 }
 
 impl ManagedKind {
@@ -51,6 +53,7 @@ impl ManagedKind {
             Self::Transcript => "transcript",
             Self::Approval => "approval",
             Self::Diff => "diff",
+            Self::Worker => "worker",
         }
     }
 }
@@ -345,9 +348,10 @@ pub fn project_shell(session: &ShellSession, seq: u64) -> ManagedSessionView {
         id: session.id.clone(),
         seq,
         kind: ManagedKind::Shell,
-        // Shells are always operator-initiated (`/shell`); the model has no
-        // shell-spawn path.
-        origin: SessionOrigin::User,
+        origin: match session.origin {
+            ShellOrigin::User => SessionOrigin::User,
+            ShellOrigin::Model => SessionOrigin::Model,
+        },
         title,
         status,
         created_at: session.started_at,

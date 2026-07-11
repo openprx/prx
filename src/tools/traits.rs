@@ -2,6 +2,9 @@ use anyhow::bail;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
+
+pub const TOOL_EXECUTION_CANCELLED: &str = "Tool execution cancelled";
 
 /// Result of a tool execution
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -9,6 +12,11 @@ pub struct ToolResult {
     pub success: bool,
     pub output: String,
     pub error: Option<String>,
+}
+
+#[must_use]
+pub fn is_tool_cancelled_result(result: &ToolResult) -> bool {
+    !result.success && result.error.as_deref() == Some(TOOL_EXECUTION_CANCELLED)
 }
 
 /// Description of a tool for the LLM
@@ -65,6 +73,31 @@ pub trait Tool: Send + Sync {
     /// Execute the tool with given arguments
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult>;
 
+    /// Execute the tool with an optional cancellation token.
+    ///
+    /// The default implementation races the existing `execute` future against
+    /// the token. Tools that own subprocesses should override this method so
+    /// cancellation terminates the underlying OS work instead of merely dropping
+    /// the Rust future.
+    async fn execute_with_cancellation(
+        &self,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let Some(cancellation) = cancellation else {
+            return self.execute(args).await;
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
+            }),
+            result = self.execute(args) => result,
+        }
+    }
+
     /// Optional pre-turn refresh hook for tools with dynamic capabilities.
     async fn refresh(&self) -> anyhow::Result<()> {
         Ok(())
@@ -118,6 +151,18 @@ pub trait Tool: Send + Sync {
             bail!("Tool '{}' does not handle name '{}'", self.name(), name);
         }
         self.execute(args).await
+    }
+
+    async fn execute_named_with_cancellation(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        if !self.supports_name(name) {
+            bail!("Tool '{}' does not handle name '{}'", self.name(), name);
+        }
+        self.execute_with_cancellation(args, cancellation).await
     }
 }
 

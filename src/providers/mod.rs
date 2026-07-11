@@ -1057,6 +1057,8 @@ pub struct ProviderRuntimeOptions {
     pub reasoning_enabled: Option<bool>,
     pub codex_stream_idle_timeout_secs: Option<u64>,
     pub codex_reasoning_effort: Option<String>,
+    pub ollama_num_ctx: Option<usize>,
+    pub ollama_model_num_ctx: Vec<(String, usize)>,
 }
 
 impl Default for ProviderRuntimeOptions {
@@ -1070,8 +1072,40 @@ impl Default for ProviderRuntimeOptions {
             reasoning_enabled: None,
             codex_stream_idle_timeout_secs: None,
             codex_reasoning_effort: None,
+            ollama_num_ctx: None,
+            ollama_model_num_ctx: Vec::new(),
         }
     }
+}
+
+#[must_use]
+pub fn provider_runtime_options_from_config(config: &crate::config::Config) -> ProviderRuntimeOptions {
+    ProviderRuntimeOptions {
+        auth_profile_override: None,
+        openprx_dir: config.config_path.parent().map(PathBuf::from),
+        secrets_encrypt: config.secrets.encrypt,
+        codex_auth_json_path: Some(config.auth.codex_auth_json_path.clone()),
+        codex_auth_json_auto_import: config.auth.codex_auth_json_auto_import,
+        reasoning_enabled: config.runtime.reasoning_enabled,
+        codex_stream_idle_timeout_secs: config.runtime.codex_stream_idle_timeout_secs,
+        codex_reasoning_effort: config.runtime.codex_reasoning_effort.clone(),
+        ollama_num_ctx: config.providers.ollama.num_ctx,
+        ollama_model_num_ctx: ollama_model_num_ctx_from_router(&config.router),
+    }
+}
+
+fn ollama_model_num_ctx_from_router(router: &crate::config::RouterConfig) -> Vec<(String, usize)> {
+    const ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL: usize = 1_000_000;
+    router
+        .models
+        .iter()
+        .filter(|model| {
+            model.provider.eq_ignore_ascii_case("ollama")
+                && model.max_context > 0
+                && model.max_context < ROUTER_DEFAULT_MAX_CONTEXT_SENTINEL
+        })
+        .map(|model| (model.model_id.clone(), model.max_context))
+        .collect()
 }
 
 const fn is_secret_char(c: char) -> bool {
@@ -1401,10 +1435,12 @@ fn create_provider_with_url_and_options(
         }
         "openai" => Ok(Box::new(openai::OpenAiProvider::with_base_url(api_url, key))),
         // Ollama uses api_url for custom base URL (e.g. remote Ollama instance)
-        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_reasoning(
+        "ollama" => Ok(Box::new(ollama::OllamaProvider::new_with_runtime_options(
             api_url,
             key,
             options.reasoning_enabled,
+            options.ollama_num_ctx,
+            options.ollama_model_num_ctx.clone(),
         ))),
         "gemini" | "google" | "google-gemini" => Ok(Box::new(gemini::GeminiProvider::new(key))),
 
