@@ -109,6 +109,8 @@ use std::io::{IsTerminal as _, Write as _};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+#[cfg(feature = "terminal-tui")]
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -1276,18 +1278,8 @@ fn compact_child_completion_summary(text: &str) -> String {
 }
 
 #[cfg(feature = "terminal-tui")]
-fn refresh_sessions_cache_and_clear_stale_strip_selection(
-    mirror: &mut tui::TuiState,
-    entries: Vec<crate::chat::sessions::SwitcherEntry>,
-) -> bool {
-    let stale_strip_selection = mirror
-        .strip_selection
-        .is_some_and(|selected| !entries.iter().any(|entry| entry.seq == selected));
+fn refresh_sessions_cache(mirror: &mut tui::TuiState, entries: Vec<crate::chat::sessions::SwitcherEntry>) {
     mirror.sessions_cache = entries;
-    if stale_strip_selection {
-        mirror.strip_selection = None;
-    }
-    stale_strip_selection
 }
 
 fn is_useful_completion_line(line: &str) -> bool {
@@ -1566,6 +1558,42 @@ mod session_cleanup_tests {
 const MOUSE_WHEEL_TRANSCRIPT_ROWS: usize = 3;
 
 #[cfg(feature = "terminal-tui")]
+const DIRECTIONAL_SWITCH_DEBOUNCE: Duration = Duration::from_millis(100);
+
+#[cfg(feature = "terminal-tui")]
+fn debounce_directional_switch_dispatch(
+    key: crossterm::event::KeyEvent,
+    dispatch: tui::KeyDispatch,
+    last_directional_switch_at: &mut Option<Instant>,
+    now: Instant,
+) -> tui::KeyDispatch {
+    if key.modifiers == crossterm::event::KeyModifiers::NONE
+        && matches!(
+            key.code,
+            crossterm::event::KeyCode::Left | crossterm::event::KeyCode::Right
+        )
+        && matches!(
+            &dispatch,
+            tui::KeyDispatch::AttachSession { .. }
+                | tui::KeyDispatch::SwitchSession { .. }
+                | tui::KeyDispatch::OpenProviderWorkerView { .. }
+                | tui::KeyDispatch::CloseProviderWorkerView
+                | tui::KeyDispatch::RequestDetach
+        )
+    {
+        if last_directional_switch_at.is_some_and(|previous| now.duration_since(previous) < DIRECTIONAL_SWITCH_DEBOUNCE)
+        {
+            tui::KeyDispatch::Consumed
+        } else {
+            *last_directional_switch_at = Some(now);
+            dispatch
+        }
+    } else {
+        dispatch
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
 fn apply_fullscreen_mouse_scroll(
     kind: crossterm::event::MouseEventKind,
     fullscreen_scroll: &mut tui::FullscreenTranscriptScroll,
@@ -1781,34 +1809,14 @@ mod runtime_display_tests {
 
     #[cfg(feature = "terminal-tui")]
     #[test]
-    fn sessions_tick_helper_clears_reaped_strip_selection() {
+    fn sessions_tick_helper_refreshes_session_cache() {
         let mut mirror = tui::TuiState::new("provider", "model");
-        mirror.strip_selection = Some(9);
 
-        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, vec![switcher_entry(1)]);
+        refresh_sessions_cache(&mut mirror, vec![switcher_entry(1), switcher_entry(2)]);
 
-        assert!(
-            stale,
-            "missing selected seq should request StripSelectionChanged dispatch"
-        );
-        assert_eq!(mirror.strip_selection, None);
-        assert_eq!(mirror.sessions_cache.len(), 1);
+        assert_eq!(mirror.sessions_cache.len(), 2);
         assert_eq!(mirror.sessions_cache.first().map(|entry| entry.seq), Some(1));
-    }
-
-    #[cfg(feature = "terminal-tui")]
-    #[test]
-    fn sessions_tick_helper_keeps_live_strip_selection() {
-        let mut mirror = tui::TuiState::new("provider", "model");
-        mirror.strip_selection = Some(2);
-
-        let stale = refresh_sessions_cache_and_clear_stale_strip_selection(
-            &mut mirror,
-            vec![switcher_entry(1), switcher_entry(2)],
-        );
-
-        assert!(!stale);
-        assert_eq!(mirror.strip_selection, Some(2));
+        assert_eq!(mirror.sessions_cache.get(1).map(|entry| entry.seq), Some(2));
     }
 
     #[test]
@@ -2593,12 +2601,19 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::SavedSessionPickerClosed => "SavedSessionPickerClosed",
         tui::KeyDispatch::ResumeSavedSession { .. } => "ResumeSavedSession",
         tui::KeyDispatch::AttachSession { .. } => "AttachSession",
-        tui::KeyDispatch::StripSelectionChanged { .. } => "StripSelectionChanged",
         tui::KeyDispatch::RequestDetach => "RequestDetach",
+        tui::KeyDispatch::ScrollTranscriptUp => "ScrollTranscriptUp",
+        tui::KeyDispatch::ScrollTranscriptDown => "ScrollTranscriptDown",
+        tui::KeyDispatch::PageTranscriptUp => "PageTranscriptUp",
+        tui::KeyDispatch::PageTranscriptDown => "PageTranscriptDown",
+        tui::KeyDispatch::TranscriptHome => "TranscriptHome",
+        tui::KeyDispatch::TranscriptEnd => "TranscriptEnd",
         tui::KeyDispatch::ScrollSessionUp => "ScrollSessionUp",
         tui::KeyDispatch::ScrollSessionDown => "ScrollSessionDown",
         tui::KeyDispatch::PageSessionUp => "PageSessionUp",
         tui::KeyDispatch::PageSessionDown => "PageSessionDown",
+        tui::KeyDispatch::SessionHome => "SessionHome",
+        tui::KeyDispatch::SessionEnd => "SessionEnd",
         tui::KeyDispatch::SwitchSession { .. } => "SwitchSession",
         tui::KeyDispatch::OpenTranscriptViewer => "OpenTranscriptViewer",
         tui::KeyDispatch::CloseTranscriptViewer => "CloseTranscriptViewer",
@@ -2654,12 +2669,19 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::SavedSessionPickerClosed
         | tui::KeyDispatch::ResumeSavedSession { .. }
         | tui::KeyDispatch::AttachSession { .. }
-        | tui::KeyDispatch::StripSelectionChanged { .. }
         | tui::KeyDispatch::RequestDetach
+        | tui::KeyDispatch::ScrollTranscriptUp
+        | tui::KeyDispatch::ScrollTranscriptDown
+        | tui::KeyDispatch::PageTranscriptUp
+        | tui::KeyDispatch::PageTranscriptDown
+        | tui::KeyDispatch::TranscriptHome
+        | tui::KeyDispatch::TranscriptEnd
         | tui::KeyDispatch::ScrollSessionUp
         | tui::KeyDispatch::ScrollSessionDown
         | tui::KeyDispatch::PageSessionUp
         | tui::KeyDispatch::PageSessionDown
+        | tui::KeyDispatch::SessionHome
+        | tui::KeyDispatch::SessionEnd
         | tui::KeyDispatch::SwitchSession { .. }
         | tui::KeyDispatch::OpenTranscriptViewer
         | tui::KeyDispatch::CloseTranscriptViewer
@@ -4747,15 +4769,9 @@ pub async fn run(
                     for entry in &mut entries {
                         entry.idle_warning = idle_warnings.contains(&entry.seq);
                     }
-                    let stale_strip_selection = {
+                    {
                         let mut mirror = chat_mirror.lock();
-                        refresh_sessions_cache_and_clear_stale_strip_selection(&mut mirror, entries.clone())
-                    };
-                    if stale_strip_selection {
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::StripSelectionChanged { selected: None },
-                            "chat.strip_selection_reaped",
-                        );
+                        refresh_sessions_cache(&mut mirror, entries.clone());
                     }
                     if entries != last_sessions_entries {
                         last_sessions_entries = entries.clone();
@@ -6004,15 +6020,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                     crate::chat::action::Action::SessionFocusChanged { focus: prev_focus },
                                     "chat.session_focus_attach_pty_done",
                                 );
-                                let _ = chat_dispatcher.dispatch_or_log(
-                                    crate::chat::action::Action::StripSelectionChanged { selected: None },
-                                    "chat.strip_selection_attach_pty_done",
-                                );
                                 {
                                     let mut mirror = chat_mirror.lock();
                                     mirror.focus = prev_focus;
                                     mirror.active_session_view = None;
-                                    mirror.strip_selection = None;
                                 }
                                 let _ = chat_dispatcher.dispatch_or_log(
                                     crate::chat::action::Action::ActiveSessionViewUpdated { view: None },
@@ -6080,17 +6091,12 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                         crate::chat::action::Action::SessionFocusChanged { focus },
                                         "chat.session_focus_attach",
                                     );
-                                    let _ = chat_dispatcher.dispatch_or_log(
-                                        crate::chat::action::Action::StripSelectionChanged { selected: None },
-                                        "chat.strip_selection_attach",
-                                    );
                                     #[cfg(feature = "terminal-tui")]
                                     {
                                         {
                                             let mut mirror = chat_mirror.lock();
                                             mirror.focus = focus;
                                             mirror.active_session_view = Some(active_projection.view.clone());
-                                            mirror.strip_selection = None;
                                         }
                                         let _ = chat_dispatcher.dispatch_or_log(
                                             crate::chat::action::Action::ActiveSessionViewUpdated {
@@ -11333,7 +11339,6 @@ fn open_provider_worker_view(
         );
         let focus = crate::chat::sessions::FocusTarget::Worker { sequence };
         guard.focus = focus;
-        guard.strip_selection = None;
         guard.active_session_view = Some(view.clone());
         (view, focus)
     };
@@ -11371,7 +11376,6 @@ fn close_provider_worker_view(
             return;
         }
         guard.focus = crate::chat::sessions::FocusTarget::Main;
-        guard.strip_selection = None;
         guard.active_session_view = None;
     }
     let _ = chat_dispatcher.dispatch_or_log(
@@ -11832,6 +11836,7 @@ fn run_tui_unified_loop(
 
     let mut terminal = new_fullscreen_terminal()?;
     let mut fullscreen_scroll = tui::FullscreenTranscriptScroll::default();
+    let mut last_directional_switch_at: Option<Instant> = None;
 
     terminal
         .draw(|f| {
@@ -11994,37 +11999,17 @@ fn run_tui_unified_loop(
                         continue;
                     }
                 }
-                if key.modifiers == crossterm::event::KeyModifiers::NONE
-                    && matches!(
-                        key.code,
-                        crossterm::event::KeyCode::PageUp
-                            | crossterm::event::KeyCode::PageDown
-                            | crossterm::event::KeyCode::Home
-                            | crossterm::event::KeyCode::End
-                    )
-                {
-                    let scroll_available =
-                        render_source.with_view(|view| tui::fullscreen_transcript_scroll_available(view));
-                    if scroll_available {
-                        let total_height = terminal.size().map(|s| s.height).unwrap_or(24);
-                        let page_rows =
-                            render_source.with_view(|view| tui::fullscreen_transcript_page_rows(view, total_height));
-                        match key.code {
-                            crossterm::event::KeyCode::PageUp => fullscreen_scroll.page_up(page_rows),
-                            crossterm::event::KeyCode::PageDown => fullscreen_scroll.page_down(page_rows),
-                            crossterm::event::KeyCode::Home => fullscreen_scroll.jump_top(),
-                            crossterm::event::KeyCode::End => fullscreen_scroll.jump_bottom(),
-                            _ => {}
-                        }
-                        let _ = redraw_tx.try_send(());
-                        continue;
-                    }
-                }
                 let _ = chat_dispatcher.dispatch_or_log(Action::KeyPressed(key), "chat.tui_key_pressed");
 
                 sync_key_mirror_observation_state(&render_source, &mirror);
                 let switcher_open_before_dispatch = mirror.lock().switcher.is_some();
-                let dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                let mut dispatch = tui::dispatch_global_key(key, &mut mirror.lock());
+                dispatch = debounce_directional_switch_dispatch(
+                    key,
+                    dispatch,
+                    &mut last_directional_switch_at,
+                    Instant::now(),
+                );
                 if !(key.code == crossterm::event::KeyCode::Esc
                     && key.modifiers == crossterm::event::KeyModifiers::NONE)
                 {
@@ -12210,12 +12195,6 @@ fn run_tui_unified_loop(
                             return Ok(());
                         }
                     }
-                    tui::KeyDispatch::StripSelectionChanged { selected } => {
-                        let _ = chat_dispatcher.dispatch_or_log(
-                            crate::chat::action::Action::StripSelectionChanged { selected },
-                            "chat.strip_selection_changed",
-                        );
-                    }
                     tui::KeyDispatch::SwitchSession { seq } => {
                         // P3: directional child-session switching reuses the
                         // exact same attach owner as Ctrl+G Enter. The key
@@ -12321,6 +12300,36 @@ fn run_tui_unified_loop(
                             return Ok(());
                         }
                     }
+                    tui::KeyDispatch::ScrollTranscriptUp => {
+                        fullscreen_scroll.line_up();
+                        let _ = redraw_tx.try_send(());
+                    }
+                    tui::KeyDispatch::ScrollTranscriptDown => {
+                        fullscreen_scroll.line_down();
+                        let _ = redraw_tx.try_send(());
+                    }
+                    tui::KeyDispatch::PageTranscriptUp => {
+                        let total_height = terminal.size().map(|s| s.height).unwrap_or(24);
+                        let page_rows =
+                            render_source.with_view(|view| tui::fullscreen_transcript_page_rows(view, total_height));
+                        fullscreen_scroll.page_up(page_rows);
+                        let _ = redraw_tx.try_send(());
+                    }
+                    tui::KeyDispatch::PageTranscriptDown => {
+                        let total_height = terminal.size().map(|s| s.height).unwrap_or(24);
+                        let page_rows =
+                            render_source.with_view(|view| tui::fullscreen_transcript_page_rows(view, total_height));
+                        fullscreen_scroll.page_down(page_rows);
+                        let _ = redraw_tx.try_send(());
+                    }
+                    tui::KeyDispatch::TranscriptHome => {
+                        fullscreen_scroll.jump_top();
+                        let _ = redraw_tx.try_send(());
+                    }
+                    tui::KeyDispatch::TranscriptEnd => {
+                        fullscreen_scroll.jump_bottom();
+                        let _ = redraw_tx.try_send(());
+                    }
                     tui::KeyDispatch::ScrollSessionUp => {
                         scroll_active_session_view(&mirror, chat_dispatcher, &redraw_tx, 1, true);
                     }
@@ -12344,6 +12353,12 @@ fn run_tui_unified_loop(
                             usize::from(tui::ACTIVE_SESSION_VIEW_DESIRED_ROWS),
                             false,
                         );
+                    }
+                    tui::KeyDispatch::SessionHome => {
+                        scroll_active_session_view(&mirror, chat_dispatcher, &redraw_tx, usize::MAX, true);
+                    }
+                    tui::KeyDispatch::SessionEnd => {
+                        scroll_active_session_view(&mirror, chat_dispatcher, &redraw_tx, usize::MAX, false);
                     }
                     tui::KeyDispatch::Cancelled => {
                         let _ = chat_dispatcher
@@ -15584,6 +15599,38 @@ mod p6b2_external_editor_tests {
         );
 
         CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(previous, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn directional_switch_debounce_suppresses_rapid_attach_dispatches() {
+        let key =
+            crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Right, crossterm::event::KeyModifiers::NONE);
+        let start = Instant::now();
+        let mut last = None;
+
+        assert_eq!(
+            debounce_directional_switch_dispatch(key, tui::KeyDispatch::AttachSession { seq: 1 }, &mut last, start,),
+            tui::KeyDispatch::AttachSession { seq: 1 }
+        );
+        assert_eq!(
+            debounce_directional_switch_dispatch(
+                key,
+                tui::KeyDispatch::SwitchSession { seq: 2 },
+                &mut last,
+                start + Duration::from_millis(20),
+            ),
+            tui::KeyDispatch::Consumed,
+            "rapid Left/Right repeats must not enqueue another synthetic attach"
+        );
+        assert_eq!(
+            debounce_directional_switch_dispatch(
+                key,
+                tui::KeyDispatch::SwitchSession { seq: 2 },
+                &mut last,
+                start + Duration::from_millis(120),
+            ),
+            tui::KeyDispatch::SwitchSession { seq: 2 }
+        );
     }
 }
 
