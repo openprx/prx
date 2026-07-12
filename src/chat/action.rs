@@ -275,6 +275,9 @@ pub enum Action {
     SlashCommandIssued { cmd: String, args: String },
     /// 模式切换（/plan /edit /auto）
     ModeChanged(ChatMode),
+    /// UI-only mouse-selection mode: true means mouse capture is temporarily
+    /// released so the terminal can do native drag selection.
+    MouseSelectionModeChanged { active: bool },
     /// 模型在线切换（/model <name>）— BUG-07.
     ///
     /// reducer 更新 `session.model`，让 status bar 立刻反映新 model；真正影响
@@ -598,6 +601,7 @@ impl Action {
             Self::InputCancelled => "InputCancelled",
             Self::SlashCommandIssued { .. } => "SlashCommandIssued",
             Self::ModeChanged(_) => "ModeChanged",
+            Self::MouseSelectionModeChanged { .. } => "MouseSelectionModeChanged",
             Self::ModelChanged { .. } => "ModelChanged",
             Self::ProviderChanged { .. } => "ProviderChanged",
             Self::HistoryCleared => "HistoryCleared",

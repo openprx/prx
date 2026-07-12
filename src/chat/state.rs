@@ -348,6 +348,9 @@ pub struct UiState {
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
+    /// True while mouse capture is temporarily released for native terminal
+    /// drag selection.
+    pub mouse_selection_mode_active: bool,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -416,6 +419,9 @@ pub struct UiSnapshot {
     pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker overlay.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
+    /// True while mouse capture is temporarily released for native terminal
+    /// drag selection.
+    pub mouse_selection_mode_active: bool,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -451,6 +457,7 @@ impl UiSnapshot {
             switcher: None,
             slash_menu: None,
             saved_session_picker: None,
+            mouse_selection_mode_active: false,
         }
     }
 }
@@ -766,6 +773,7 @@ struct SnapshotDirtyFields {
     focus: crate::chat::sessions::FocusTarget,
     token_usage_summary: MainSessionTokenUsageSummary,
     main_queue_status: MainQueueStatus,
+    mouse_selection_mode_active: bool,
 }
 
 impl ChatState {
@@ -813,6 +821,7 @@ impl ChatState {
                 slash_menu: None,
                 at_path_candidates: Vec::new(),
                 saved_session_picker: None,
+                mouse_selection_mode_active: false,
             },
             stream: StreamState {
                 visible_drafts: Vec::new(),
@@ -905,6 +914,7 @@ impl ChatState {
             switcher: self.ui.switcher.clone(),
             slash_menu: self.ui.slash_menu.clone(),
             saved_session_picker: self.ui.saved_session_picker.clone(),
+            mouse_selection_mode_active: self.ui.mouse_selection_mode_active,
         }
     }
 
@@ -963,6 +973,7 @@ impl ChatState {
             focus: self.ui.focus,
             token_usage_summary: self.ui.token_usage_summary,
             main_queue_status: self.ui.main_queue_status,
+            mouse_selection_mode_active: self.ui.mouse_selection_mode_active,
         }
     }
 
@@ -1013,6 +1024,7 @@ impl ChatState {
                 self.ui.chat_mode = mode;
                 vec![Effect::RequestRedraw]
             }
+            Action::MouseSelectionModeChanged { active } => self.reduce_mouse_selection_mode_changed(active),
             Action::ModelChanged { model } => {
                 // BUG-07: /model <name> 在线切换。更新 session.model 让 status bar
                 // 立刻显示新 model；后续 LLM turn 真切 model 由主循环写 EffectDeps
@@ -1184,6 +1196,9 @@ impl ChatState {
         }
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
             return vec![Effect::Quit];
+        }
+        if crate::chat::tui::is_mouse_selection_toggle_key(key) {
+            return vec![Effect::RequestRedraw];
         }
         if self.ui.saved_session_picker.is_some() {
             return self.reduce_saved_session_picker_key_pressed(key);
@@ -2971,6 +2986,16 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
+    /// `Action::MouseSelectionModeChanged` — update the footer/status hint for
+    /// Ctrl+Space mouse-selection mode. Idempotent to avoid redraw churn.
+    fn reduce_mouse_selection_mode_changed(&mut self, active: bool) -> Vec<Effect> {
+        if self.ui.mouse_selection_mode_active == active {
+            return Vec::new();
+        }
+        self.ui.mouse_selection_mode_active = active;
+        vec![Effect::RequestRedraw]
+    }
+
     /// `Action::SwitcherOpened` (v1.1b) — open the Ctrl+G switcher overlay over
     /// the supplied session snapshot, highlighting the first row.
     fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
@@ -3297,6 +3322,8 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SlashCommandIssued { .. } => false,
         // 模式切换：status bar 显示 mode 字段.
         Action::ModeChanged(_) => true,
+        // Footer/status hint for temporary native terminal selection mode.
+        Action::MouseSelectionModeChanged { .. } => true,
         // BUG-07: 模型切换写 session.model，status bar 显示该字段 → dirty.
         Action::ModelChanged { .. } => true,
         // Bug #3: provider 切换写 session.provider（status bar 显示该字段）→ dirty.
@@ -9651,6 +9678,7 @@ mod tests {
             assert!(snap.conversation_lines.is_empty());
             assert_eq!(snap.turn_count, 0);
             assert!(snap.streaming.is_none());
+            assert!(!snap.mouse_selection_mode_active);
         }
 
         #[test]
@@ -9670,6 +9698,18 @@ mod tests {
                 Arc::strong_count(&snap.conversation_lines)
             );
             assert_eq!(snap2.revision, 1);
+        }
+
+        #[test]
+        fn mouse_selection_mode_action_flows_to_snapshot() {
+            let mut state = make_state();
+
+            let effects = state.reduce(Action::MouseSelectionModeChanged { active: true });
+            let snap = state.build_ui_snapshot(1);
+
+            assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
+            assert!(state.ui.mouse_selection_mode_active);
+            assert!(snap.mouse_selection_mode_active);
         }
 
         #[test]

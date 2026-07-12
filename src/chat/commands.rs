@@ -456,6 +456,9 @@ pub fn help_text() -> String {
         out.push('\n');
         out.push_str(&format!("  {:<24} {}", spec.usage(), spec.description));
     }
+    out.push_str(
+        "\n\nHistory view & copy:\n  Home/PageUp scroll the in-app transcript; Ctrl+O opens the transcript viewer.\n  prx chat --plain or PRX_TUI=0 restores native terminal scrollback and drag selection.\n  /copy latest|N copies assistant replies; /export md|json writes the full session.",
+    );
     out
 }
 
@@ -1167,6 +1170,14 @@ mod mode_tests {
         assert!(help.contains("/theme"), "drift regression: /theme must be in help");
         assert!(help.contains("/approve"), "drift regression: /approve must be in help");
         assert!(help.contains("/deny"), "drift regression: /deny must be in help");
+        assert!(
+            help.contains("History view & copy"),
+            "help must explain history viewing and copy options: {help}"
+        );
+        assert!(
+            help.contains("prx chat --plain") && help.contains("/copy latest|N") && help.contains("/export md|json"),
+            "help must mention plain mode, /copy, and /export: {help}"
+        );
     }
 
     #[tokio::test]

@@ -1611,6 +1611,48 @@ fn apply_fullscreen_mouse_scroll(
     }
 }
 
+#[cfg(feature = "terminal-tui")]
+fn toggle_mouse_selection_mode(
+    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+    chat_dispatcher: &dispatcher::ChatDispatcher,
+    redraw_tx: &mpsc::Sender<()>,
+) {
+    let configured = CHAT_MOUSE_CAPTURE_CONFIGURED.load(Ordering::Acquire);
+    let selection_active = CHAT_MOUSE_SELECTION_MODE_ACTIVE.load(Ordering::Acquire);
+    let mut ops = CrosstermTerminalModeOps;
+    let outcome = match toggle_mouse_selection_mode_with_ops(&mut ops, configured, selection_active) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to toggle chat mouse selection mode");
+            return;
+        }
+    };
+
+    let active = match outcome {
+        MouseSelectionModeOutcome::NotConfigured => false,
+        MouseSelectionModeOutcome::SelectionEnabled => {
+            CHAT_MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
+            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(true, Ordering::Release);
+            true
+        }
+        MouseSelectionModeOutcome::MouseRestored => {
+            CHAT_MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
+            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, Ordering::Release);
+            false
+        }
+    };
+
+    {
+        let mut guard = mirror.lock();
+        guard.mouse_selection_mode_active = active;
+    }
+    let _ = chat_dispatcher.dispatch_or_log(
+        crate::chat::action::Action::MouseSelectionModeChanged { active },
+        "chat.mouse_selection_mode_changed",
+    );
+    let _ = redraw_tx.try_send(());
+}
+
 /// Surface a background-session system message into the chat (v1b reflow).
 ///
 /// Standalone (not the in-loop `emit_chat_output` closure) so the main loop's
@@ -2623,6 +2665,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
         tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
         tui::KeyDispatch::ModeChanged(_) => "ModeChanged",
+        tui::KeyDispatch::ToggleMouseSelectionMode => "ToggleMouseSelectionMode",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -2690,7 +2733,8 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::CloseDiffViewer
         | tui::KeyDispatch::ExternalEditorRequested
         | tui::KeyDispatch::ToolApprovalDecision { .. }
-        | tui::KeyDispatch::ModeChanged(_) => new_has_quit,
+        | tui::KeyDispatch::ModeChanged(_)
+        | tui::KeyDispatch::ToggleMouseSelectionMode => new_has_quit,
     };
 
     if is_diff {
@@ -2947,6 +2991,34 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_MOUSE_CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHAT_MOUSE_CAPTURE_CONFIGURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CHAT_MOUSE_SELECTION_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "terminal-tui")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MouseSelectionModeOutcome {
+    NotConfigured,
+    SelectionEnabled,
+    MouseRestored,
+}
+
+#[cfg(feature = "terminal-tui")]
+fn toggle_mouse_selection_mode_with_ops(
+    ops: &mut impl TerminalModeOps,
+    mouse_capture_configured: bool,
+    selection_mode_active: bool,
+) -> std::io::Result<MouseSelectionModeOutcome> {
+    if !mouse_capture_configured {
+        return Ok(MouseSelectionModeOutcome::NotConfigured);
+    }
+    if selection_mode_active {
+        ops.enable_mouse_capture()?;
+        Ok(MouseSelectionModeOutcome::MouseRestored)
+    } else {
+        ops.disable_mouse_capture()?;
+        Ok(MouseSelectionModeOutcome::SelectionEnabled)
+    }
+}
 
 fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
     let mouse_enabled = mouse_capture_enabled_by_env(
@@ -2966,6 +3038,8 @@ fn enter_terminal_state_with_ops_inner(
     state.raw_mode_active = true;
 
     CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
+    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     if let Err(e) = ops.enter_alternate_screen() {
         CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         let _ = ops.disable_raw_mode();
@@ -2984,6 +3058,8 @@ fn enter_terminal_state_with_ops_inner(
         }
         state.mouse_capture_active = true;
         CHAT_MOUSE_CAPTURE_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
+        CHAT_MOUSE_CAPTURE_CONFIGURED.store(true, std::sync::atomic::Ordering::Release);
+        CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
 
     match ops.supports_keyboard_enhancement() {
@@ -2992,6 +3068,8 @@ fn enter_terminal_state_with_ops_inner(
                 if state.mouse_capture_active {
                     let _ = ops.disable_mouse_capture();
                     CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+                    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
+                    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
                 }
                 if state.alternate_screen_active {
                     let _ = ops.leave_alternate_screen();
@@ -3017,6 +3095,8 @@ fn enter_terminal_state_with_ops_inner(
         if state.mouse_capture_active {
             let _ = ops.disable_mouse_capture();
             CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
+            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         }
         if state.alternate_screen_active {
             let _ = ops.leave_alternate_screen();
@@ -3043,6 +3123,8 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
         let _ = ops.disable_mouse_capture();
         CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
+    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
+    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     if state.alternate_screen_active {
         let _ = ops.leave_alternate_screen();
         CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
@@ -10711,6 +10793,7 @@ fn write_external_editor_restore_sequences(out: &mut dyn std::io::Write) {
     crate::chat::sessions::pty::write_handoff_terminal_restore(
         out,
         CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+        CHAT_MOUSE_CAPTURE_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
     );
 }
 
@@ -11509,6 +11592,7 @@ async fn reattach_pty(
             handoff,
             redraw_nudge,
             CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
+            CHAT_MOUSE_CAPTURE_ACTIVE.load(std::sync::atomic::Ordering::Acquire),
         ) else {
             return PtyOutcome::AttachAborted;
         };
@@ -12281,6 +12365,9 @@ fn run_tui_unified_loop(
                             .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed_key");
                         let _ = redraw_tx.try_send(());
                     }
+                    tui::KeyDispatch::ToggleMouseSelectionMode => {
+                        toggle_mouse_selection_mode(&mirror, chat_dispatcher, &redraw_tx);
+                    }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
                         // synthetic `/detach` so the main loop clears
@@ -12400,6 +12487,9 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Mouse(mouse) => {
+                if CHAT_MOUSE_SELECTION_MODE_ACTIVE.load(Ordering::Acquire) {
+                    continue;
+                }
                 if apply_fullscreen_mouse_scroll(mouse.kind, &mut fullscreen_scroll) {
                     let _ = redraw_tx.try_send(());
                 } else if matches!(
@@ -14488,6 +14578,28 @@ mod terminal_guard_tests {
     }
 
     #[test]
+    fn ctrl_space_mouse_selection_toggle_releases_and_restores_mouse_capture() {
+        let mut ops = FakeTerminalModeOps::default();
+
+        let released = toggle_mouse_selection_mode_with_ops(&mut ops, true, false).unwrap();
+        let restored = toggle_mouse_selection_mode_with_ops(&mut ops, true, true).unwrap();
+
+        assert_eq!(released, MouseSelectionModeOutcome::SelectionEnabled);
+        assert_eq!(restored, MouseSelectionModeOutcome::MouseRestored);
+        assert_eq!(ops.calls, vec!["disable_mouse_capture", "enable_mouse_capture"]);
+    }
+
+    #[test]
+    fn ctrl_space_mouse_selection_toggle_is_noop_when_mouse_was_not_configured() {
+        let mut ops = FakeTerminalModeOps::default();
+
+        let outcome = toggle_mouse_selection_mode_with_ops(&mut ops, false, false).unwrap();
+
+        assert_eq!(outcome, MouseSelectionModeOutcome::NotConfigured);
+        assert!(ops.calls.is_empty());
+    }
+
+    #[test]
     fn fullscreen_enter_rolls_back_alternate_screen_when_mouse_capture_fails() {
         let mut ops = FakeTerminalModeOps {
             fail_enable_mouse_capture: true,
@@ -15554,6 +15666,7 @@ mod p6b2_external_editor_tests {
     #[test]
     fn external_editor_fullscreen_suspend_leaves_alt_and_restore_reenters() {
         CHAT_KEYBOARD_ENHANCEMENT_ACTIVE.store(false, Ordering::SeqCst);
+        let previous_mouse_capture = CHAT_MOUSE_CAPTURE_ACTIVE.swap(true, Ordering::SeqCst);
         let mut suspend = Vec::new();
         write_external_editor_suspend_sequences(&mut suspend);
         let suspend = String::from_utf8(suspend).expect("test: suspend escape bytes are utf-8");
@@ -15565,6 +15678,7 @@ mod p6b2_external_editor_tests {
         let mut restore = Vec::new();
         write_external_editor_restore_sequences(&mut restore);
         let restore = String::from_utf8(restore).expect("test: restore escape bytes are utf-8");
+        CHAT_MOUSE_CAPTURE_ACTIVE.store(previous_mouse_capture, Ordering::SeqCst);
         assert!(
             restore.contains("\x1b[?1049l") && restore.contains("\x1b[?47l"),
             "fullscreen editor restore must reset any child/editor alt-screen first: {restore:?}"

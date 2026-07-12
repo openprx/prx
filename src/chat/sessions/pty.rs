@@ -209,6 +209,7 @@ impl HandoffControl {
 pub struct PtyHandoffGuard {
     control: Arc<HandoffControl>,
     keyboard_enhancement_active: bool,
+    mouse_capture_active: bool,
     /// Best-effort redraw nudge so the render loop repaints immediately on
     /// resume rather than waiting out its idle poll. `None` when the chat has no
     /// TUI render loop (fallback path); restoration still works via the flag.
@@ -233,6 +234,7 @@ impl PtyHandoffGuard {
         control: Arc<HandoffControl>,
         redraw_nudge: Option<Box<dyn Fn() + Send>>,
         keyboard_enhancement_active: bool,
+        mouse_capture_active: bool,
     ) -> Option<Self> {
         // Block (bounded) until the render loop confirms it has parked.
         if control.pause_and_wait(PAUSE_ACK_TIMEOUT) {
@@ -241,6 +243,7 @@ impl PtyHandoffGuard {
             return Some(Self {
                 control,
                 keyboard_enhancement_active,
+                mouse_capture_active,
                 redraw_nudge,
             });
         }
@@ -284,14 +287,17 @@ impl Drop for PtyHandoffGuard {
         //     Done while the render loop is still parked so we are the sole writer.
         {
             let mut out = std::io::stdout();
-            write_handoff_terminal_restore(&mut out, self.keyboard_enhancement_active);
+            write_handoff_terminal_restore(&mut out, self.keyboard_enhancement_active, self.mouse_capture_active);
         }
 
         // 1b. Defensively re-assert the chat terminal modes the PTY child may
         //     have clobbered, while the render loop is still parked so we are the
-        //     sole writer of these escape/kernel operations. Best-effort.
+        //     sole writer of these escape/kernel operations. Mouse capture is
+        //     restored only if chat owned it before the handoff. Best-effort.
         let _ = crossterm::terminal::enable_raw_mode();
-        let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        if self.mouse_capture_active {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture);
+        }
         let _ = crossterm::execute!(std::io::stdout(), crossterm::event::EnableBracketedPaste);
 
         // 2 & 3. Arm the full redraw (to wipe PTY residue) and only THEN unpause,
@@ -355,10 +361,16 @@ pub(crate) fn write_chat_alt_screen_leave_for_handoff(out: &mut dyn std::io::Wri
     }
 }
 
-pub(crate) fn write_handoff_terminal_restore(out: &mut dyn std::io::Write, keyboard_enhancement_active: bool) {
+pub(crate) fn write_handoff_terminal_restore(
+    out: &mut dyn std::io::Write,
+    keyboard_enhancement_active: bool,
+    mouse_capture_active: bool,
+) {
     let result = out.write_all(HOST_MODE_RESET).and_then(|()| {
         out.write_all(CHAT_ALT_SCREEN_ENTER)?;
-        out.write_all(CHAT_MOUSE_CAPTURE_ENABLE)?;
+        if mouse_capture_active {
+            out.write_all(CHAT_MOUSE_CAPTURE_ENABLE)?;
+        }
         if keyboard_enhancement_active {
             out.write_all(CHAT_KEYBOARD_ENHANCEMENT_PUSH)?;
         }
@@ -1439,6 +1451,7 @@ mod tests {
                 Arc::clone(&control),
                 Some(Box::new(move || nudged2.store(true, Ordering::Release))),
                 true,
+                true,
             )
             .expect("test: ack arrives so acquire succeeds");
             // During the handoff the render loop is paused.
@@ -1461,7 +1474,7 @@ mod tests {
         let acker = spawn_acking_render_loop(&control);
         let control2 = Arc::clone(&control);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, true)
+            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, true, true)
                 .expect("test: ack arrives so acquire succeeds");
             assert!(control2.is_paused());
             panic!("test: simulate a fault during PTY handoff");
@@ -1483,7 +1496,7 @@ mod tests {
         let acker = spawn_acking_render_loop(&control);
         let control2 = Arc::clone(&control);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, true)
+            let _guard = PtyHandoffGuard::acquire(Arc::clone(&control2), None, true, true)
                 .expect("test: ack arrives so acquire succeeds");
             assert!(control2.is_paused());
             panic!("test: simulate a fullscreen PTY handoff fault");
@@ -1504,7 +1517,7 @@ mod tests {
         // untouched), never proceed with a half-done handoff.
         let control = Arc::new(HandoffControl::new());
         // No acker thread → the ack will time out.
-        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None, true);
+        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None, true, true);
         assert!(guard.is_none(), "acquire must refuse when the render loop never parks");
         assert!(
             !control.is_paused(),
@@ -1522,8 +1535,8 @@ mod tests {
         // `!is_paused()` always also sees `force_redraw == true`.
         let control = Arc::new(HandoffControl::new());
         let acker = spawn_acking_render_loop(&control);
-        let guard =
-            PtyHandoffGuard::acquire(Arc::clone(&control), None, true).expect("test: ack arrives so acquire succeeds");
+        let guard = PtyHandoffGuard::acquire(Arc::clone(&control), None, true, true)
+            .expect("test: ack arrives so acquire succeeds");
         assert!(control.is_paused());
         drop(guard);
         acker.join().expect("test: acker joins");
@@ -1544,7 +1557,7 @@ mod tests {
         // so a regression that drops one (re-introducing the residual-mode bug)
         // fails loudly.
         let mut captured: Vec<u8> = Vec::new();
-        write_handoff_terminal_restore(&mut captured, true);
+        write_handoff_terminal_restore(&mut captured, true, true);
         let s = String::from_utf8(captured).expect("test: reset is valid utf-8");
 
         // Mouse tracking off (X10 / button / any-motion / utf8 / sgr coords).
@@ -1582,8 +1595,8 @@ mod tests {
         // whether a child actually changed them, including the no-TUI path).
         let mut a: Vec<u8> = Vec::new();
         let mut b: Vec<u8> = Vec::new();
-        write_handoff_terminal_restore(&mut a, true);
-        write_handoff_terminal_restore(&mut b, true);
+        write_handoff_terminal_restore(&mut a, true, true);
+        write_handoff_terminal_restore(&mut b, true, true);
         assert_eq!(a, b, "host mode reset must be a deterministic constant");
         assert!(
             a.starts_with(HOST_MODE_RESET) && a.ends_with(CHAT_KEYBOARD_ENHANCEMENT_PUSH),
@@ -1594,7 +1607,7 @@ mod tests {
     #[test]
     fn fullscreen_handoff_restore_resets_child_then_reenters_chat_alt_screen_and_mouse() {
         let mut captured: Vec<u8> = Vec::new();
-        write_handoff_terminal_restore(&mut captured, true);
+        write_handoff_terminal_restore(&mut captured, true, true);
         assert!(
             captured.starts_with(HOST_MODE_RESET),
             "fullscreen restore must first reset child terminal modes: {captured:?}"
@@ -1614,6 +1627,29 @@ mod tests {
         assert!(
             captured.ends_with(CHAT_KEYBOARD_ENHANCEMENT_PUSH),
             "fullscreen restore must re-push keyboard enhancement flags after handoff: {captured:?}"
+        );
+    }
+
+    #[test]
+    fn fullscreen_handoff_restore_does_not_enable_mouse_when_chat_mouse_was_off() {
+        let mut captured: Vec<u8> = Vec::new();
+        write_handoff_terminal_restore(&mut captured, true, false);
+
+        assert!(
+            captured.starts_with(HOST_MODE_RESET),
+            "fullscreen restore must still reset child terminal modes: {captured:?}"
+        );
+        assert!(
+            captured
+                .windows(CHAT_ALT_SCREEN_ENTER.len())
+                .any(|window| window == CHAT_ALT_SCREEN_ENTER),
+            "fullscreen restore must still re-enter chat alt-screen: {captured:?}"
+        );
+        assert!(
+            !captured
+                .windows(CHAT_MOUSE_CAPTURE_ENABLE.len())
+                .any(|window| window == CHAT_MOUSE_CAPTURE_ENABLE),
+            "mouse-off chat sessions must not re-enable mouse capture after PTY detach: {captured:?}"
         );
     }
 
@@ -1655,7 +1691,7 @@ mod tests {
         );
 
         let mut restore = Vec::new();
-        write_handoff_terminal_restore(&mut restore, false);
+        write_handoff_terminal_restore(&mut restore, false, true);
         assert!(
             !restore
                 .windows(CHAT_KEYBOARD_ENHANCEMENT_PUSH.len())
@@ -1679,7 +1715,7 @@ mod tests {
         }
         let mut sink = FailingSink;
         // Must return normally (no panic) despite the write error.
-        write_handoff_terminal_restore(&mut sink, true);
+        write_handoff_terminal_restore(&mut sink, true, true);
     }
 
     // ── Interruptible reader (P0-A: bounded stop, no EOF dependency) ──────────
