@@ -323,6 +323,11 @@ pub enum Action {
         provider_turn_sequence: Option<u64>,
         draft_id: String,
         history: Vec<crate::providers::ChatMessage>,
+        /// Optional original/persisted history source for compaction guards and
+        /// injection-overbudget diagnostics. Live chat passes the same
+        /// canonical view used for persistence so provider-only enrichment never
+        /// becomes the reducer's guard source.
+        compaction_guard_history: Option<Vec<crate::providers::ChatMessage>>,
         /// P5 proactive budgeting: resolved context budget for this turn.
         /// `None` keeps tests and non-chat callers budget-neutral.
         compaction_config: Option<crate::config::AgentCompactionConfig>,
