@@ -1764,6 +1764,60 @@ async fn send_redux_compaction_feedback(
     Ok(true)
 }
 
+fn format_injection_overbudget_diagnostic(injected_tokens: usize) -> String {
+    format!(
+        "Note: your @path/memory context (~{injected_tokens} tokens) exceeded the model's context budget and was trimmed for this turn; the reply may miss some injected context."
+    )
+}
+
+fn redux_injection_overbudget_diagnostic_text(
+    enriched_history: &[crate::providers::traits::ChatMessage],
+    original_history: &[crate::providers::traits::ChatMessage],
+    config: &crate::config::AgentCompactionConfig,
+) -> Option<String> {
+    let enriched_budget = crate::agent::loop_::plan_context_budget(
+        enriched_history,
+        config,
+        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+    );
+    if !enriched_budget.over_hard_limit {
+        return None;
+    }
+    let original_budget = crate::agent::loop_::plan_context_budget(
+        original_history,
+        config,
+        crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+    );
+    if original_budget.over_hard_limit {
+        return None;
+    }
+    let injected_tokens = enriched_budget.used_tokens.saturating_sub(original_budget.used_tokens);
+    if injected_tokens == 0 {
+        return None;
+    }
+    Some(format_injection_overbudget_diagnostic(injected_tokens))
+}
+
+async fn send_redux_injection_overbudget_diagnostic(
+    action_tx: &mpsc::Sender<Action>,
+    text: Option<String>,
+    context: &'static str,
+    last_feedback: &mut Option<String>,
+) -> Result<bool, ()> {
+    let Some(text) = text else {
+        return Ok(false);
+    };
+    if last_feedback.as_deref() == Some(text.as_str()) {
+        return Ok(false);
+    }
+    if let Err(error) = action_tx.send(Action::SystemMessageAdded { text: text.clone() }).await {
+        tracing::debug!(%error, context, "StartTurn: action_tx closed on injection-overbudget diagnostic");
+        return Err(());
+    }
+    *last_feedback = Some(text);
+    Ok(true)
+}
+
 async fn send_redux_context_window_update(
     action_tx: &mpsc::Sender<Action>,
     history: &[crate::providers::traits::ChatMessage],
@@ -1845,6 +1899,7 @@ async fn drive_start_turn_stream(
     let mut iteration: usize = 0;
     let mut overflow_retries: u8 = 0;
     let mut last_compaction_feedback: Option<String> = None;
+    let mut last_injection_overbudget_feedback: Option<String> = None;
     // 已经执行过的 tool_call_id（防 context overflow 重试后重复执行同一工具）.
     let mut executed_tool_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     // BUG-03: count how many times each unrecoverable tool-failure signature has
@@ -1877,6 +1932,8 @@ async fn drive_start_turn_stream(
             if budget.over_hard_limit {
                 let turns_before = chat_history_turn_count(&history);
                 let tokens_before = super::estimate_chat_history_tokens(&history);
+                let injection_overbudget_diagnostic =
+                    redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
                 let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
                 let summary_replacement_len = if compaction_off {
                     None
@@ -1918,6 +1975,17 @@ async fn drive_start_turn_stream(
                         trimmed,
                         "redux driver context budget preflight remediated with summary-compaction/token-aware trim"
                     );
+                }
+                if send_redux_injection_overbudget_diagnostic(
+                    &action_tx,
+                    injection_overbudget_diagnostic,
+                    "redux_preflight_injection_overbudget_diagnostic",
+                    &mut last_injection_overbudget_feedback,
+                )
+                .await
+                .is_err()
+                {
+                    return;
                 }
                 if send_redux_context_window_update(
                     &action_tx,
@@ -3726,6 +3794,244 @@ mod tests {
         assert!(
             action_rx.try_recv().is_err(),
             "duplicate feedback must not queue an action"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_injection_overbudget_diagnostic_emits_only_for_injected_delta_and_dedupes() {
+        use crate::providers::traits::ChatMessage as PMsg;
+
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let original_history = vec![PMsg::system("sys"), PMsg::user("please inspect @huge.txt")];
+        let mut enriched_history = original_history.clone();
+        let Some(user_message) = enriched_history.get_mut(1) else {
+            panic!("test fixture must include a user message");
+        };
+        user_message.content.push_str(&format!(
+            "\n\n[Attached file context from @path mentions]\nHIDDEN_FILE_SENTINEL {}\n[End attached file context]",
+            "hidden ".repeat(1000)
+        ));
+        let text = redux_injection_overbudget_diagnostic_text(&enriched_history, &original_history, &config)
+            .expect("injection-only pressure should produce a diagnostic");
+        assert!(text.contains("@path/memory context"));
+        assert!(text.contains('~'));
+        assert!(
+            !text.contains("HIDDEN_FILE_SENTINEL"),
+            "diagnostic must not include injected content"
+        );
+
+        let mut last_feedback = None;
+        assert!(
+            send_redux_injection_overbudget_diagnostic(
+                &action_tx,
+                Some(text.clone()),
+                "test_injection_diag",
+                &mut last_feedback,
+            )
+            .await
+            .expect("first diagnostic send"),
+            "first diagnostic should be emitted"
+        );
+        assert!(
+            !send_redux_injection_overbudget_diagnostic(
+                &action_tx,
+                Some(text),
+                "test_injection_diag",
+                &mut last_feedback,
+            )
+            .await
+            .expect("duplicate diagnostic send"),
+            "identical diagnostic should be suppressed"
+        );
+
+        let sent = action_rx.try_recv().expect("diagnostic action should be queued");
+        match sent {
+            Action::SystemMessageAdded { text } => {
+                assert!(text.contains("@path/memory context"));
+                assert!(!text.contains("HIDDEN_FILE_SENTINEL"));
+            }
+            other => panic!("expected SystemMessageAdded, got {other:?}"),
+        }
+        assert!(
+            action_rx.try_recv().is_err(),
+            "duplicate diagnostic must not queue an action"
+        );
+    }
+
+    #[test]
+    fn redux_injection_overbudget_diagnostic_skips_normal_history_overflow() {
+        use crate::providers::traits::ChatMessage as PMsg;
+
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let normal_overflow = vec![
+            PMsg::system("sys"),
+            PMsg::user(format!("ordinary visible history {}", "visible ".repeat(1000))),
+        ];
+        assert!(
+            redux_injection_overbudget_diagnostic_text(&normal_overflow, &normal_overflow, &config).is_none(),
+            "normal history overflow must not be reported as injection-driven"
+        );
+
+        let original_already_over = vec![
+            PMsg::system("sys"),
+            PMsg::user(format!("large original user {}", "visible ".repeat(1000))),
+        ];
+        let mut enriched = original_already_over.clone();
+        let Some(user_message) = enriched.get_mut(1) else {
+            panic!("test fixture must include a user message");
+        };
+        user_message.content.push_str(&format!(" {}", "hidden ".repeat(1000)));
+        assert!(
+            redux_injection_overbudget_diagnostic_text(&enriched, &original_already_over, &config).is_none(),
+            "when original is already over budget, D5 diagnostic must not fire"
+        );
+    }
+
+    #[tokio::test]
+    async fn redux_driver_preflight_emits_injection_overbudget_diagnostic_without_hidden_content() {
+        use crate::providers::traits::{
+            ChatMessage as PMsg, ChatRequest, ChatResponse, ProviderCapabilities, StreamChunk, StreamOptions,
+            StreamResult,
+        };
+        use async_trait::async_trait;
+        use futures::stream::{self, BoxStream, StreamExt};
+
+        struct DiagnosticProvider;
+
+        #[async_trait]
+        impl Provider for DiagnosticProvider {
+            fn capabilities(&self) -> ProviderCapabilities {
+                ProviderCapabilities::default()
+            }
+
+            async fn chat_with_system(&self, _: Option<&str>, _: &str, _: &str, _: f64) -> anyhow::Result<String> {
+                Ok("unused".to_string())
+            }
+
+            async fn chat(&self, _: ChatRequest<'_>, _: &str, _: f64) -> anyhow::Result<ChatResponse> {
+                Ok(ChatResponse {
+                    text: Some("unused".into()),
+                    tool_calls: Vec::new(),
+                    reasoning_content: None,
+                })
+            }
+
+            fn supports_streaming(&self) -> bool {
+                true
+            }
+
+            fn stream_chat_with_history(
+                &self,
+                _: &[PMsg],
+                _: &str,
+                _: f64,
+                _: StreamOptions,
+            ) -> BoxStream<'static, StreamResult<StreamChunk>> {
+                stream::iter(vec![
+                    Ok(StreamChunk::delta("diagnostic-ok")),
+                    Ok(StreamChunk::final_chunk()),
+                ])
+                .boxed()
+            }
+
+            async fn warmup(&self) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let original_history = vec![PMsg::system("sys"), PMsg::user("please inspect @huge.txt")];
+        let mut enriched_history = original_history.clone();
+        let Some(user_message) = enriched_history.get_mut(1) else {
+            panic!("test fixture must include a user message");
+        };
+        user_message.content.push_str(&format!(
+            "\n\n[Attached file context from @path mentions]\nHIDDEN_FILE_SENTINEL {}\n[End attached file context]",
+            "hidden ".repeat(1000)
+        ));
+        let config = crate::config::AgentCompactionConfig {
+            mode: crate::config::AgentCompactionMode::Off,
+            reserve_tokens: 10,
+            keep_recent_messages: 1,
+            memory_flush: false,
+            max_context_tokens: 120,
+            max_context_tokens_explicit: true,
+            ..crate::config::AgentCompactionConfig::default()
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(16);
+
+        drive_start_turn_stream(
+            None,
+            Arc::new(DiagnosticProvider),
+            enriched_history,
+            original_history.clone(),
+            "model".to_string(),
+            0.0,
+            Some(config),
+            CancellationToken::new(),
+            "draft-injection-diagnostic".to_string(),
+            action_tx,
+            None,
+            0,
+            None,
+            None,
+            crate::agent::loop_::ChatMode::Edit,
+        )
+        .await;
+
+        let mut saw_diagnostic = false;
+        let mut saw_completion = false;
+        while let Ok(action) = action_rx.try_recv() {
+            match action {
+                Action::SystemMessageAdded { text } if text.contains("@path/memory context") => {
+                    saw_diagnostic = true;
+                    assert!(
+                        !text.contains("HIDDEN_FILE_SENTINEL"),
+                        "diagnostic must not leak injected file content"
+                    );
+                }
+                Action::SystemMessageAdded { text } => {
+                    assert!(
+                        !text.contains("HIDDEN_FILE_SENTINEL"),
+                        "ordinary feedback must not leak injected file content"
+                    );
+                }
+                Action::StreamCompleted { final_text, .. } => {
+                    saw_completion = final_text.contains("diagnostic-ok");
+                }
+                Action::RecordUserTurn(content) => {
+                    assert!(
+                        !content.contains("HIDDEN_FILE_SENTINEL"),
+                        "driver must not persist enriched user content"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_diagnostic, "preflight must emit the D5 diagnostic");
+        assert!(saw_completion, "driver must still complete after trim");
+        assert!(
+            original_history
+                .iter()
+                .all(|message| !message.content.contains("HIDDEN_FILE_SENTINEL")),
+            "original guard history fixture remains free of injected content"
         );
     }
 
@@ -7297,6 +7603,7 @@ mod real_mode_tests {
                 provider_turn_sequence: None,
                 draft_id: "draft-timeout".to_string(),
                 history: Vec::new(),
+                compaction_guard_history: None,
                 compaction_config: None,
                 cancel: cancel.clone(),
                 turn_spawn_ctx: None,
@@ -7344,6 +7651,7 @@ mod real_mode_tests {
             provider_turn_sequence: None,
             draft_id: "d1".to_string(),
             history: Vec::new(),
+            compaction_guard_history: None,
             compaction_config: None,
             cancel: CancellationToken::new(),
             turn_spawn_ctx: None,
