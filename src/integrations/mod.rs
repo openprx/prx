@@ -208,7 +208,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         _ => {
             if status == IntegrationStatus::ComingSoon {
                 println!("  This integration is planned. Stay tuned!");
-                println!("  Track progress: https://github.com/theonlyhennygod/openprx");
+                println!("  Track progress: https://github.com/openprx/prx");
             }
         }
     }
