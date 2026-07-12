@@ -144,9 +144,6 @@ pub struct TuiState {
     pub token_usage_summary: MainSessionTokenUsageSummary,
     /// First half of the `Ctrl+X Ctrl+E` external-editor chord.
     pub external_editor_prefix_armed: bool,
-    /// True while Ctrl+Space has temporarily released mouse capture so the
-    /// terminal can do native drag selection.
-    pub mouse_selection_mode_active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -706,9 +703,6 @@ pub enum KeyDispatch {
     ToolApprovalDecision { tool_id: String, approved: bool },
     /// P8: cycle the in-session chat mode via Shift+Tab.
     ModeChanged(ChatMode),
-    /// Toggle mouse-selection mode (`Ctrl+Space`) for users who opted into
-    /// TUI mouse capture.
-    ToggleMouseSelectionMode,
 }
 
 pub(crate) fn sync_slash_menu_for_sources(
@@ -1575,9 +1569,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
     if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && state.input.is_empty() {
         return KeyDispatch::Exit;
     }
-    if is_mouse_selection_toggle_key(key) {
-        return KeyDispatch::ToggleMouseSelectionMode;
-    }
     // P7c: the saved chat-session picker has top overlay priority. It is
     // distinct from the child-TUI Ctrl+G switcher and captures all keys while
     // open so navigation cannot leak into input history or child switching.
@@ -1810,10 +1801,6 @@ pub fn dispatch_global_key(key: KeyEvent, state: &mut TuiState) -> KeyDispatch {
         InputOutcome::Consumed | InputOutcome::Unhandled => KeyDispatch::Consumed,
         InputOutcome::Ignored => KeyDispatch::Ignored,
     }
-}
-
-pub(crate) fn is_mouse_selection_toggle_key(key: KeyEvent) -> bool {
-    key.modifiers == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char(' ') | KeyCode::Null)
 }
 
 /// Resolve a key while the Ctrl+G session switcher overlay is open (v1.1b).
@@ -3152,7 +3139,6 @@ impl TuiState {
             context_window_tokens: None,
             token_usage_summary: MainSessionTokenUsageSummary::default(),
             external_editor_prefix_armed: false,
-            mouse_selection_mode_active: false,
         }
     }
 
@@ -3504,8 +3490,9 @@ impl TuiState {
     }
 }
 
-pub(crate) fn tool_result_defaults_expanded(tool_name: &str) -> bool {
-    matches!(tool_name, "file_edit" | "file_write")
+pub(crate) const fn tool_result_defaults_expanded(tool_name: &str) -> bool {
+    let _ = tool_name;
+    false
 }
 
 // ── P3-4: TuiMirrorSink adapter ─────────────────────────────────────────────
@@ -3768,6 +3755,10 @@ pub trait BottomChromeView {
     fn ascii_fallback(&self) -> bool;
     fn conversation_lines(&self) -> &[ConversationLine];
     fn streaming(&self) -> Option<&StreamingDraft>;
+    /// Duration of the most recently completed main turn, if any.
+    fn last_turn_duration_ms(&self) -> Option<u64> {
+        None
+    }
     fn input(&self) -> &TuiInput;
     /// Persistent child-session status line (v1b). Empty hides the row.
     fn sessions_status(&self) -> &str;
@@ -3796,9 +3787,6 @@ pub trait BottomChromeView {
     fn slash_menu(&self) -> Option<&SlashMenuState>;
     /// Open saved chat-session picker overlay (P7c), or `None` when closed.
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState>;
-    /// True while mouse capture has been temporarily released for native
-    /// terminal drag selection.
-    fn mouse_selection_mode_active(&self) -> bool;
 }
 
 impl BottomChromeView for TuiState {
@@ -3871,9 +3859,6 @@ impl BottomChromeView for TuiState {
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
         self.saved_session_picker.as_ref()
     }
-    fn mouse_selection_mode_active(&self) -> bool {
-        self.mouse_selection_mode_active
-    }
 }
 
 impl BottomChromeView for crate::chat::state::UiSnapshot {
@@ -3903,6 +3888,9 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn streaming(&self) -> Option<&StreamingDraft> {
         self.streaming.as_ref()
+    }
+    fn last_turn_duration_ms(&self) -> Option<u64> {
+        self.last_turn_duration_ms
     }
     fn input(&self) -> &TuiInput {
         &self.input
@@ -3945,9 +3933,6 @@ impl BottomChromeView for crate::chat::state::UiSnapshot {
     }
     fn saved_session_picker(&self) -> Option<&crate::chat::session::SavedSessionPickerState> {
         self.saved_session_picker.as_ref()
-    }
-    fn mouse_selection_mode_active(&self) -> bool {
-        self.mouse_selection_mode_active
     }
 }
 
@@ -4007,6 +3992,70 @@ impl FullscreenTranscriptScroll {
         self.offset_from_bottom = 0;
         self.anchor_top_row = None;
         self.new_output_below = false;
+    }
+}
+
+/// A mouse drag selection over rendered transcript rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TranscriptSelection {
+    anchor_row: usize,
+    anchor_column: usize,
+    active_row: usize,
+    active_column: usize,
+}
+
+impl TranscriptSelection {
+    #[must_use]
+    pub const fn new(row: usize, column: usize) -> Self {
+        Self {
+            anchor_row: row,
+            anchor_column: column,
+            active_row: row,
+            active_column: column,
+        }
+    }
+
+    pub const fn update(&mut self, row: usize, column: usize) {
+        self.active_row = row;
+        self.active_column = column;
+    }
+
+    #[must_use]
+    pub const fn moved(self) -> bool {
+        self.anchor_row != self.active_row || self.anchor_column != self.active_column
+    }
+
+    #[must_use]
+    pub fn ordered_points(self) -> ((usize, usize), (usize, usize)) {
+        if (self.anchor_row, self.anchor_column) <= (self.active_row, self.active_column) {
+            (
+                (self.anchor_row, self.anchor_column),
+                (self.active_row, self.active_column),
+            )
+        } else {
+            (
+                (self.active_row, self.active_column),
+                (self.anchor_row, self.anchor_column),
+            )
+        }
+    }
+
+    #[must_use]
+    pub fn columns_for_row(self, row: usize, width: usize) -> Option<(usize, usize)> {
+        let ((start_row, start_column), (end_row, end_column)) = self.ordered_points();
+        if row < start_row || row > end_row {
+            return None;
+        }
+        if start_row == end_row {
+            return Some((start_column, end_column.saturating_add(1).min(width)));
+        }
+        if row == start_row {
+            Some((start_column, width))
+        } else if row == end_row {
+            Some((0, end_column.saturating_add(1).min(width)))
+        } else {
+            Some((0, width))
+        }
     }
 }
 
@@ -4155,6 +4204,61 @@ fn fullscreen_transcript_top_scroll<V: BottomChromeView + ?Sized>(
     max_scroll.saturating_sub(scroll.offset_from_bottom.min(max_scroll))
 }
 
+pub(crate) fn transcript_render_row_at_point<V: BottomChromeView + ?Sized>(
+    state: &V,
+    scroll: &FullscreenTranscriptScroll,
+    total_width: u16,
+    total_height: u16,
+    column: u16,
+    row: u16,
+) -> Option<(usize, usize)> {
+    if state.switcher().is_some()
+        || state.saved_session_picker().is_some()
+        || state.slash_menu().is_some()
+        || state.pending_tool_approval().is_some()
+    {
+        return None;
+    }
+    let area = fullscreen_transcript_area(state, total_width, total_height);
+    if area.width == 0
+        || area.height == 0
+        || column < area.x
+        || column >= area.x.saturating_add(area.width)
+        || row < area.y
+        || row >= area.y.saturating_add(area.height)
+    {
+        return None;
+    }
+    Some((
+        fullscreen_transcript_top_scroll(state, scroll, area).saturating_add(usize::from(row.saturating_sub(area.y))),
+        usize::from(column.saturating_sub(area.x)),
+    ))
+}
+
+pub(crate) fn transcript_plain_rows<V: BottomChromeView + ?Sized>(state: &V, width: u16) -> Vec<String> {
+    let mut lines: Vec<Line<'_>> = Vec::new();
+    push_conversation_transcript_lines(&mut lines, state);
+    let streaming_tail = state.streaming().map(|streaming| ConversationLine::StreamingAssistant {
+        content: streaming.accumulated.clone(),
+    });
+    if let Some(streaming_line) = streaming_tail.as_ref() {
+        render_conversation_line(&mut lines, streaming_line, state.ascii_fallback());
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("(transcript is empty)"));
+    }
+
+    lines
+        .iter()
+        .flat_map(|line| {
+            let text: String = line.spans.iter().map(|span| span.content.as_ref()).collect();
+            wrap_line_ranges(&text, usize::from(width.max(1)))
+                .into_iter()
+                .map(move |(start, end)| text.get(start..end).unwrap_or("").to_string())
+        })
+        .collect()
+}
+
 fn push_conversation_transcript_lines<'a, V: BottomChromeView + ?Sized>(lines: &mut Vec<Line<'a>>, state: &'a V) {
     for line in state.conversation_lines() {
         render_conversation_line(lines, line, state.ascii_fallback());
@@ -4234,6 +4338,15 @@ pub fn render_fullscreen_chat<V: BottomChromeView + ?Sized>(
     state: &V,
     scroll: &mut FullscreenTranscriptScroll,
 ) {
+    render_fullscreen_chat_with_selection(frame, state, scroll, None);
+}
+
+pub fn render_fullscreen_chat_with_selection<V: BottomChromeView + ?Sized>(
+    frame: &mut Frame,
+    state: &V,
+    scroll: &mut FullscreenTranscriptScroll,
+    selection: Option<&TranscriptSelection>,
+) {
     let frame_area = frame.area();
     frame.render_widget(Clear, frame_area);
 
@@ -4247,7 +4360,7 @@ pub fn render_fullscreen_chat<V: BottomChromeView + ?Sized>(
     #[allow(clippy::indexing_slicing)]
     {
         let (transcript_area, panel_area) = fullscreen_content_areas(chunks[0], state);
-        render_fullscreen_transcript(frame, transcript_area, state, scroll);
+        render_fullscreen_transcript(frame, transcript_area, state, scroll, selection);
         render_fullscreen_panel(frame, panel_area, state);
         render_fullscreen_bottom_chrome_at(frame, chunks[1], state, scroll.new_output_below);
         render_fullscreen_overlays(frame, chunks[0], state);
@@ -4304,6 +4417,7 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
     area: Rect,
     state: &V,
     scroll: &mut FullscreenTranscriptScroll,
+    selection: Option<&TranscriptSelection>,
 ) {
     if area.height == 0 {
         scroll.offset_from_bottom = 0;
@@ -4363,6 +4477,23 @@ fn render_fullscreen_transcript<V: BottomChromeView + ?Sized>(
         .wrap(Wrap { trim: false })
         .scroll((top_scroll, 0));
     frame.render_widget(paragraph, area);
+    if let Some(selection) = selection {
+        let top_scroll = usize::from(top_scroll);
+        let highlight = Style::default().bg(Color::DarkGray);
+        for screen_row in 0..area.height {
+            let rendered_row = top_scroll.saturating_add(usize::from(screen_row));
+            if let Some((start, end)) = selection.columns_for_row(rendered_row, usize::from(area.width)) {
+                for column in start..end {
+                    if let Some(cell) = frame.buffer_mut().cell_mut((
+                        area.x.saturating_add(u16::try_from(column).unwrap_or(u16::MAX)),
+                        area.y.saturating_add(screen_row),
+                    )) {
+                        cell.set_style(highlight);
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn render_fullscreen_overlays<V: BottomChromeView + ?Sized>(frame: &mut Frame, frame_area: Rect, state: &V) {
@@ -5513,11 +5644,23 @@ fn render_status_bar_text<V: BottomChromeView + ?Sized>(state: &V, width: u16) -
 }
 
 fn render_generation_activity<V: BottomChromeView + ?Sized>(state: &V) -> Option<String> {
-    if !execution_activity_active_for_view(state) {
-        return None;
+    if execution_activity_active_for_view(state) {
+        let frame = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
+        return Some(format!("{frame} generating (esc to interrupt)"));
     }
-    let frame = spinner_frame_for_tick(state.ascii_fallback(), current_animation_tick());
-    Some(format!("{frame} generating (esc to interrupt)"))
+    state.last_turn_duration_ms().map(|duration_ms| {
+        let elapsed = if duration_ms < 1_000 {
+            format!("{duration_ms}ms")
+        } else {
+            let seconds = duration_ms / 1_000;
+            if seconds < 60 {
+                format!("{seconds}s")
+            } else {
+                format!("{}m{:02}s", seconds / 60, seconds % 60)
+            }
+        };
+        format!("Worked {elapsed}")
+    })
 }
 
 fn render_main_queue_status(status: MainQueueStatus) -> Option<String> {
@@ -7153,15 +7296,12 @@ fn render_input<V: BottomChromeView + ?Sized>(frame: &mut Frame, area: Rect, sta
     }
 }
 
-fn footer_text(ascii: bool, show_session_hint: bool, mouse_selection_mode_active: bool) -> String {
+fn footer_text(ascii: bool, show_session_hint: bool) -> String {
     // Claude Code style: dim gray, middle-dot separators, action-oriented
     // hints rather than key/label pairs.
     // P6b2: Ctrl+G remains PRX's sessions switcher; Claude-style external
     // editor parity is available through the alternate Ctrl+X Ctrl+E chord.
     let sep = if ascii { " | " } else { " \u{00B7} " };
-    if mouse_selection_mode_active {
-        return format!(" selection mode: drag select/copy{sep}Ctrl+Space restore mouse ");
-    }
     let mut parts = Vec::from([
         if ascii {
             "Up/Down scroll"
@@ -7173,7 +7313,7 @@ fn footer_text(ascii: bool, show_session_hint: bool, mouse_selection_mode_active
         "Ctrl+G sessions",
         "Ctrl+O transcript",
         "/copy latest",
-        "--plain drag copy",
+        "drag select/copy",
         "Shift+Enter newline",
         "Ctrl+X Ctrl+E edit",
         "Tab fold",
@@ -7185,15 +7325,8 @@ fn footer_text(ascii: bool, show_session_hint: bool, mouse_selection_mode_active
     format!(" {} ", parts.join(sep))
 }
 
-fn render_footer(
-    frame: &mut Frame,
-    area: Rect,
-    ascii: bool,
-    show_session_hint: bool,
-    mouse_selection_mode_active: bool,
-) {
-    let footer = Paragraph::new(footer_text(ascii, show_session_hint, mouse_selection_mode_active))
-        .style(Style::default().fg(Color::DarkGray));
+fn render_footer(frame: &mut Frame, area: Rect, ascii: bool, show_session_hint: bool) {
+    let footer = Paragraph::new(footer_text(ascii, show_session_hint)).style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, area);
 }
 
@@ -7228,13 +7361,7 @@ fn render_fullscreen_footer<V: BottomChromeView + ?Sized>(
     if render_session_list_footer(frame, area, state) {
         return;
     }
-    render_footer(
-        frame,
-        area,
-        state.ascii_fallback(),
-        session_footer_has_sessions(state),
-        state.mouse_selection_mode_active(),
-    );
+    render_footer(frame, area, state.ascii_fallback(), session_footer_has_sessions(state));
 }
 
 /// Render a tool approval prompt.
@@ -7986,14 +8113,14 @@ mod tests {
     }
 
     #[test]
-    fn file_edit_and_write_cards_default_expanded() {
+    fn file_edit_and_write_cards_default_folded() {
         for tool_name in ["file_edit", "file_write"] {
             let mut state = TuiState::new("p", "m");
             state.push_tool_result_started(tool_name, r#"{"path":"src/lib.rs"}"#);
             let idx = state.last_tool_result_index().expect("test: tool result exists");
             match state.conversation_lines.get(idx).expect("test: idx valid") {
                 ConversationLine::ToolResult { folded, .. } => {
-                    assert!(!*folded, "{tool_name} should default to expanded");
+                    assert!(*folded, "{tool_name} should default to folded");
                 }
                 other => panic!("test: expected ToolResult, got {other:?}"),
             }
@@ -9851,25 +9978,6 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_space_dispatches_mouse_selection_toggle_without_touching_input() {
-        let mut state = TuiState::new("p", "m");
-
-        let out = dispatch_global_key(key_mod(KeyCode::Char(' '), KeyModifiers::CONTROL), &mut state);
-
-        assert_eq!(out, KeyDispatch::ToggleMouseSelectionMode);
-        assert!(state.input.is_empty());
-    }
-
-    #[test]
-    fn ctrl_space_null_form_dispatches_mouse_selection_toggle() {
-        let mut state = TuiState::new("p", "m");
-
-        let out = dispatch_global_key(key_mod(KeyCode::Null, KeyModifiers::CONTROL), &mut state);
-
-        assert_eq!(out, KeyDispatch::ToggleMouseSelectionMode);
-    }
-
-    #[test]
     fn dispatch_backtab_cycles_chat_mode_when_input_empty() {
         let mut state = TuiState::new("p", "m");
         state.chat_mode = ChatMode::Plan;
@@ -11401,38 +11509,44 @@ mod tests {
             "session footer should expose horizontal session navigation: {rows:?}"
         );
         assert!(
-            footer_text(false, true, false).contains("←/→ session")
-                && footer_text(false, true, false).contains("Ctrl+P/N history"),
+            footer_text(false, true).contains("←/→ session") && footer_text(false, true).contains("Ctrl+P/N history"),
             "static footer text helper also includes the dynamic hint"
         );
     }
 
     #[test]
     fn footer_exposes_history_and_plain_copy_guidance() {
-        let footer = footer_text(false, false, false);
+        let footer = footer_text(false, false);
 
         assert!(
             footer.contains("Home/PageUp history"),
             "footer should expose in-app history scrolling: {footer}"
         );
         assert!(
-            footer.contains("--plain drag copy"),
-            "footer should point native drag-copy users to plain mode: {footer}"
+            footer.contains("drag select/copy"),
+            "footer should point users to native drag-copy mode: {footer}"
         );
     }
 
     #[test]
-    fn footer_selection_mode_exposes_restore_key() {
-        let footer = footer_text(false, false, true);
+    fn transcript_selection_normalizes_drag_direction() {
+        let mut selection = TranscriptSelection::new(8, 4);
+        assert!(!selection.moved());
 
-        assert!(
-            footer.contains("selection mode"),
-            "selection footer missing mode: {footer}"
-        );
-        assert!(
-            footer.contains("Ctrl+Space restore mouse"),
-            "selection footer missing restore key: {footer}"
-        );
+        selection.update(3, 2);
+
+        assert!(selection.moved());
+        assert_eq!(selection.ordered_points(), ((3, 2), (8, 4)));
+    }
+
+    #[test]
+    fn transcript_plain_rows_follow_rendered_wrapping() {
+        let mut state = TuiState::new("p", "m");
+        state.conversation_lines.push(ConversationLine::User {
+            content: "abcdefgh".to_string(),
+        });
+
+        assert_eq!(transcript_plain_rows(&state, 4), vec!["> ab", "cdef", "gh", ""]);
     }
 
     #[test]
@@ -12262,8 +12376,8 @@ mod tests {
             "footer should advertise /copy: {joined}"
         );
         assert!(
-            joined.contains("--plain") && joined.contains("drag copy"),
-            "footer should advertise plain-mode native selection: {joined}"
+            joined.contains("drag select/copy"),
+            "footer should advertise native selection: {joined}"
         );
     }
 
@@ -13383,6 +13497,23 @@ mod tests {
         assert!(
             line.contains("generating") && line.contains("(esc to interrupt)"),
             "running tool keeps generation activity visible: {line}"
+        );
+    }
+
+    #[test]
+    fn status_bar_shows_last_turn_worked_duration_when_idle() {
+        let mut snapshot = crate::chat::state::UiSnapshot::initial(Arc::from("provider"), Arc::from("model"));
+        snapshot.last_turn_duration_ms = Some(3_200);
+
+        let line = render_status_bar_text(&snapshot, 120);
+
+        assert!(
+            line.contains("Worked 3s"),
+            "completed turn keeps worked duration: {line}"
+        );
+        assert!(
+            !line.contains("generating"),
+            "idle completed turn is not marked generating: {line}"
         );
     }
 

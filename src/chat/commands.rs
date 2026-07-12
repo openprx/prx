@@ -457,7 +457,7 @@ pub fn help_text() -> String {
         out.push_str(&format!("  {:<24} {}", spec.usage(), spec.description));
     }
     out.push_str(
-        "\n\nHistory view & copy:\n  Home/PageUp scroll the in-app transcript; Ctrl+O opens the transcript viewer.\n  prx chat --plain or PRX_TUI=0 restores native terminal scrollback and drag selection.\n  /copy latest|N copies assistant replies; /export md|json writes the full session.",
+        "\n\nHistory view & copy:\n  Home/PageUp or the mouse wheel scroll the in-app transcript; Ctrl+O opens the transcript viewer.\n  Drag across transcript rows to copy the selected text; /copy latest|N copies assistant replies.\n  prx chat --plain or PRX_TUI=0 restores native terminal scrollback.\n  /export md|json writes the full session.",
     );
     out
 }
@@ -1175,8 +1175,12 @@ mod mode_tests {
             "help must explain history viewing and copy options: {help}"
         );
         assert!(
-            help.contains("prx chat --plain") && help.contains("/copy latest|N") && help.contains("/export md|json"),
-            "help must mention plain mode, /copy, and /export: {help}"
+            help.contains("mouse wheel")
+                && help.contains("Drag across transcript rows")
+                && help.contains("prx chat --plain")
+                && help.contains("/copy latest|N")
+                && help.contains("/export md|json"),
+            "help must mention mouse scrolling, drag selection, plain mode, /copy, and /export: {help}"
         );
     }
 

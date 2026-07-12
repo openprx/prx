@@ -546,13 +546,11 @@ fn mouse_capture_disabled_by_env(value: Option<&str>) -> bool {
         .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
-fn mouse_capture_enabled_by_env(enable_value: Option<&str>, disable_value: Option<&str>) -> bool {
+fn mouse_capture_enabled_by_env(disable_value: Option<&str>) -> bool {
     if mouse_capture_disabled_by_env(disable_value) {
         return false;
     }
-    enable_value
-        .map(str::trim)
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+    true
 }
 
 /// Compact conversation history in-place to fit within context window limits.
@@ -1613,45 +1611,91 @@ fn apply_fullscreen_mouse_scroll(
 }
 
 #[cfg(feature = "terminal-tui")]
-fn toggle_mouse_selection_mode(
-    mirror: &Arc<parking_lot::Mutex<tui::TuiState>>,
+fn copy_transcript_selection(
+    render_source: &RenderSource,
+    selection: tui::TranscriptSelection,
+    width: u16,
     chat_dispatcher: &dispatcher::ChatDispatcher,
     redraw_tx: &mpsc::Sender<()>,
 ) {
-    let configured = CHAT_MOUSE_CAPTURE_CONFIGURED.load(Ordering::Acquire);
-    let selection_active = CHAT_MOUSE_SELECTION_MODE_ACTIVE.load(Ordering::Acquire);
-    let mut ops = CrosstermTerminalModeOps;
-    let outcome = match toggle_mouse_selection_mode_with_ops(&mut ops, configured, selection_active) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to toggle chat mouse selection mode");
-            return;
-        }
-    };
-
-    let active = match outcome {
-        MouseSelectionModeOutcome::NotConfigured => false,
-        MouseSelectionModeOutcome::SelectionEnabled => {
-            CHAT_MOUSE_CAPTURE_ACTIVE.store(false, Ordering::Release);
-            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(true, Ordering::Release);
-            true
-        }
-        MouseSelectionModeOutcome::MouseRestored => {
-            CHAT_MOUSE_CAPTURE_ACTIVE.store(true, Ordering::Release);
-            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, Ordering::Release);
-            false
-        }
-    };
-
-    {
-        let mut guard = mirror.lock();
-        guard.mouse_selection_mode_active = active;
+    if !selection.moved() {
+        return;
     }
-    let _ = chat_dispatcher.dispatch_or_log(
-        crate::chat::action::Action::MouseSelectionModeChanged { active },
-        "chat.mouse_selection_mode_changed",
-    );
-    let _ = redraw_tx.try_send(());
+    let ((start_row, start_column), (end_row, end_column)) = selection.ordered_points();
+    let content = render_source.with_view(|view| {
+        let rows = tui::transcript_plain_rows(view, width);
+        if rows.is_empty() || start_row >= rows.len() {
+            return String::new();
+        }
+        let end_row = end_row.min(rows.len().saturating_sub(1));
+        (start_row..=end_row)
+            .map(|row| {
+                let text = rows.get(row).map(String::as_str).unwrap_or("");
+                let width = unicode_width::UnicodeWidthStr::width(text);
+                let (start, end) = if start_row == end_row {
+                    (start_column, end_column.saturating_add(1).min(width))
+                } else if row == start_row {
+                    (start_column, width)
+                } else if row == end_row {
+                    (0, end_column.saturating_add(1).min(width))
+                } else {
+                    (0, width)
+                };
+                slice_display_columns(text, start, end)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    if content.is_empty() {
+        return;
+    }
+    let (content, truncated) = truncate_utf8_to_byte_cap(&content, COPY_OSC52_MAX_BYTES);
+    if content.trim().is_empty() {
+        return;
+    }
+    match terminal_proto::copy_to_clipboard(&content) {
+        Ok(()) => {
+            let suffix = if truncated { " (truncated to 74 KiB)" } else { "" };
+            surface_session_message(
+                chat_dispatcher,
+                Some(redraw_tx),
+                &format!("Copied selected transcript rows to clipboard{suffix}."),
+            );
+        }
+        Err(error) => surface_session_message(chat_dispatcher, Some(redraw_tx), &format!("Copy failed: {error}")),
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
+fn slice_display_columns(input: &str, start: usize, end: usize) -> String {
+    if start >= end {
+        return String::new();
+    }
+    let mut output = String::new();
+    let mut column = 0usize;
+    for ch in input.chars() {
+        let char_width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        let next_column = column.saturating_add(char_width);
+        if next_column > start && column < end {
+            output.push(ch);
+        }
+        column = next_column;
+        if column >= end {
+            break;
+        }
+    }
+    output
+}
+
+#[cfg(all(test, feature = "terminal-tui"))]
+mod transcript_selection_tests {
+    use super::slice_display_columns;
+
+    #[test]
+    fn slice_display_columns_uses_terminal_width() {
+        assert_eq!(slice_display_columns("○ line-1", 2, 6), "line");
+        assert_eq!(slice_display_columns("中文 line", 0, 4), "中文");
+    }
 }
 
 /// Surface a background-session system message into the chat (v1b reflow).
@@ -2022,9 +2066,9 @@ mod runtime_display_tests {
         for disabled in [None, Some(""), Some("0"), Some("false"), Some("off"), Some("no")] {
             assert!(!mouse_capture_disabled_by_env(disabled), "{disabled:?}");
         }
-        assert!(!mouse_capture_enabled_by_env(None, None));
-        assert!(mouse_capture_enabled_by_env(Some("1"), None));
-        assert!(!mouse_capture_enabled_by_env(Some("1"), Some("true")));
+        assert!(mouse_capture_enabled_by_env(None));
+        assert!(mouse_capture_enabled_by_env(Some("0")));
+        assert!(!mouse_capture_enabled_by_env(Some("true")));
     }
 
     #[test]
@@ -2666,7 +2710,6 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         tui::KeyDispatch::ExternalEditorRequested => "ExternalEditorRequested",
         tui::KeyDispatch::ToolApprovalDecision { .. } => "ToolApprovalDecision",
         tui::KeyDispatch::ModeChanged(_) => "ModeChanged",
-        tui::KeyDispatch::ToggleMouseSelectionMode => "ToggleMouseSelectionMode",
     };
     let new_kinds: Vec<&'static str> = new_effects
         .iter()
@@ -2734,8 +2777,7 @@ fn log_redux_key_diff(old: &tui::KeyDispatch, new_effects: &[state::Effect]) {
         | tui::KeyDispatch::CloseDiffViewer
         | tui::KeyDispatch::ExternalEditorRequested
         | tui::KeyDispatch::ToolApprovalDecision { .. }
-        | tui::KeyDispatch::ModeChanged(_)
-        | tui::KeyDispatch::ToggleMouseSelectionMode => new_has_quit,
+        | tui::KeyDispatch::ModeChanged(_) => new_has_quit,
     };
 
     if is_diff {
@@ -2992,40 +3034,8 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 static CHAT_FULLSCREEN_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_KEYBOARD_ENHANCEMENT_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static CHAT_MOUSE_CAPTURE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CHAT_MOUSE_CAPTURE_CONFIGURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-static CHAT_MOUSE_SELECTION_MODE_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(feature = "terminal-tui")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MouseSelectionModeOutcome {
-    NotConfigured,
-    SelectionEnabled,
-    MouseRestored,
-}
-
-#[cfg(feature = "terminal-tui")]
-fn toggle_mouse_selection_mode_with_ops(
-    ops: &mut impl TerminalModeOps,
-    mouse_capture_configured: bool,
-    selection_mode_active: bool,
-) -> std::io::Result<MouseSelectionModeOutcome> {
-    if !mouse_capture_configured {
-        return Ok(MouseSelectionModeOutcome::NotConfigured);
-    }
-    if selection_mode_active {
-        ops.enable_mouse_capture()?;
-        Ok(MouseSelectionModeOutcome::MouseRestored)
-    } else {
-        ops.disable_mouse_capture()?;
-        Ok(MouseSelectionModeOutcome::SelectionEnabled)
-    }
-}
-
 fn enter_terminal_state_with_ops(ops: &mut impl TerminalModeOps) -> std::io::Result<TerminalGuardState> {
-    let mouse_enabled = mouse_capture_enabled_by_env(
-        std::env::var("PRX_TUI_ENABLE_MOUSE").ok().as_deref(),
-        std::env::var("PRX_TUI_DISABLE_MOUSE").ok().as_deref(),
-    );
+    let mouse_enabled = mouse_capture_enabled_by_env(std::env::var("PRX_TUI_DISABLE_MOUSE").ok().as_deref());
     enter_terminal_state_with_ops_inner(ops, mouse_enabled)
 }
 
@@ -3039,8 +3049,6 @@ fn enter_terminal_state_with_ops_inner(
     state.raw_mode_active = true;
 
     CHAT_FULLSCREEN_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
-    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
-    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     if let Err(e) = ops.enter_alternate_screen() {
         CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         let _ = ops.disable_raw_mode();
@@ -3059,8 +3067,6 @@ fn enter_terminal_state_with_ops_inner(
         }
         state.mouse_capture_active = true;
         CHAT_MOUSE_CAPTURE_ACTIVE.store(true, std::sync::atomic::Ordering::Release);
-        CHAT_MOUSE_CAPTURE_CONFIGURED.store(true, std::sync::atomic::Ordering::Release);
-        CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
 
     match ops.supports_keyboard_enhancement() {
@@ -3069,8 +3075,6 @@ fn enter_terminal_state_with_ops_inner(
                 if state.mouse_capture_active {
                     let _ = ops.disable_mouse_capture();
                     CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-                    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
-                    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
                 }
                 if state.alternate_screen_active {
                     let _ = ops.leave_alternate_screen();
@@ -3096,8 +3100,6 @@ fn enter_terminal_state_with_ops_inner(
         if state.mouse_capture_active {
             let _ = ops.disable_mouse_capture();
             CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
-            CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
-            CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
         }
         if state.alternate_screen_active {
             let _ = ops.leave_alternate_screen();
@@ -3124,8 +3126,6 @@ fn leave_terminal_state_with_ops(ops: &mut impl TerminalModeOps, state: Terminal
         let _ = ops.disable_mouse_capture();
         CHAT_MOUSE_CAPTURE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     }
-    CHAT_MOUSE_CAPTURE_CONFIGURED.store(false, std::sync::atomic::Ordering::Release);
-    CHAT_MOUSE_SELECTION_MODE_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
     if state.alternate_screen_active {
         let _ = ops.leave_alternate_screen();
         CHAT_FULLSCREEN_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
@@ -11922,12 +11922,18 @@ fn run_tui_unified_loop(
 
     let mut terminal = new_fullscreen_terminal()?;
     let mut fullscreen_scroll = tui::FullscreenTranscriptScroll::default();
+    let mut transcript_selection: Option<tui::TranscriptSelection> = None;
     let mut last_directional_switch_at: Option<Instant> = None;
 
     terminal
         .draw(|f| {
             render_source.with_view(|view| {
-                tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
+                tui::render_fullscreen_chat_with_selection(
+                    f,
+                    view,
+                    &mut fullscreen_scroll,
+                    transcript_selection.as_ref(),
+                );
             });
         })
         .map_err(|e| anyhow::anyhow!("initial TUI draw failed: {e}"))?;
@@ -11989,7 +11995,12 @@ fn run_tui_unified_loop(
         } else if redraw_requested || periodic_redraw_active {
             if let Err(e) = terminal.draw(|f| {
                 render_source.with_view(|view| {
-                    tui::render_fullscreen_chat(f, view, &mut fullscreen_scroll);
+                    tui::render_fullscreen_chat_with_selection(
+                        f,
+                        view,
+                        &mut fullscreen_scroll,
+                        transcript_selection.as_ref(),
+                    );
                 });
             }) {
                 tracing::warn!(error = %e, "TUI draw failed");
@@ -12126,6 +12137,19 @@ fn run_tui_unified_loop(
                         let trimmed = text.trim().to_string();
                         if trimmed.is_empty() {
                             continue;
+                        }
+                        // Exit commands should not wait behind the async input
+                        // consumer or an in-flight provider turn. Handle them
+                        // at the TUI submit boundary and let the outer chat
+                        // loop perform its normal child-session cleanup.
+                        if is_chat_quit_command(&trimmed) {
+                            let _ = chat_dispatcher.dispatch_or_log(Action::ForceQuit, "chat.tui_quit_submitted");
+                            shutdown.cancel();
+                            let _ = terminal.draw(|frame| {
+                                let area = frame.area();
+                                frame.render_widget(ratatui::widgets::Clear, area);
+                            });
+                            return Ok(());
                         }
                         let (input_priority, _) = input_priority_from_text(&trimmed);
                         let activity_active = render_source
@@ -12366,9 +12390,6 @@ fn run_tui_unified_loop(
                             .dispatch_or_log(crate::chat::action::Action::ModeChanged(mode), "chat.mode_changed_key");
                         let _ = redraw_tx.try_send(());
                     }
-                    tui::KeyDispatch::ToggleMouseSelectionMode => {
-                        toggle_mouse_selection_mode(&mirror, chat_dispatcher, &redraw_tx);
-                    }
                     tui::KeyDispatch::RequestDetach => {
                         // Esc on empty input while a session is focused → route a
                         // synthetic `/detach` so the main loop clears
@@ -12488,30 +12509,67 @@ fn run_tui_unified_loop(
                 let _ = redraw_tx.try_send(());
             }
             Event::Mouse(mouse) => {
-                if CHAT_MOUSE_SELECTION_MODE_ACTIVE.load(Ordering::Acquire) {
-                    continue;
-                }
                 if apply_fullscreen_mouse_scroll(mouse.kind, &mut fullscreen_scroll) {
+                    transcript_selection = None;
                     let _ = redraw_tx.try_send(());
-                } else if matches!(
-                    mouse.kind,
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                ) {
-                    if let Ok(size) = terminal.size() {
-                        let toggled = {
-                            let mut guard = mirror.lock();
-                            tui::toggle_reasoning_at_fullscreen_point(
-                                &mut guard,
+                } else if let Ok(size) = terminal.size() {
+                    let point = {
+                        render_source.with_view(|view| {
+                            tui::transcript_render_row_at_point(
+                                view,
                                 &fullscreen_scroll,
                                 size.width,
                                 size.height,
                                 mouse.column,
                                 mouse.row,
                             )
-                        };
-                        if toggled {
-                            let _ = redraw_tx.try_send(());
+                        })
+                    };
+                    match mouse.kind {
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                            if let Some((row, column)) = point {
+                                transcript_selection = Some(tui::TranscriptSelection::new(row, column));
+                                let _ = redraw_tx.try_send(());
+                            }
                         }
+                        crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                            if let (Some(selection), Some((row, column))) = (transcript_selection.as_mut(), point) {
+                                selection.update(row, column);
+                                let _ = redraw_tx.try_send(());
+                            }
+                        }
+                        crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                            if let Some(mut selection) = transcript_selection.take() {
+                                if let Some((row, column)) = point {
+                                    selection.update(row, column);
+                                }
+                                if selection.moved() {
+                                    copy_transcript_selection(
+                                        &render_source,
+                                        selection,
+                                        size.width,
+                                        chat_dispatcher,
+                                        &redraw_tx,
+                                    );
+                                } else {
+                                    let toggled = {
+                                        let mut guard = mirror.lock();
+                                        tui::toggle_reasoning_at_fullscreen_point(
+                                            &mut guard,
+                                            &fullscreen_scroll,
+                                            size.width,
+                                            size.height,
+                                            mouse.column,
+                                            mouse.row,
+                                        )
+                                    };
+                                    if toggled {
+                                        let _ = redraw_tx.try_send(());
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -14534,31 +14592,9 @@ mod terminal_guard_tests {
         let mut ops = FakeTerminalModeOps::default();
         let state = enter_terminal_state_with_ops(&mut ops).unwrap();
         assert!(
-            !state.mouse_capture_active,
-            "mouse capture is opt-in so native terminal selection works"
+            state.mouse_capture_active,
+            "fullscreen enables transcript mouse scrolling and drag selection by default"
         );
-        leave_terminal_state_with_ops(&mut ops, state);
-
-        assert_eq!(
-            ops.calls,
-            vec![
-                "enable_raw_mode",
-                "enter_alternate_screen",
-                "supports_keyboard_enhancement",
-                "enable_bracketed_paste",
-                "disable_bracketed_paste",
-                "show_cursor",
-                "leave_alternate_screen",
-                "disable_raw_mode"
-            ]
-        );
-    }
-
-    #[test]
-    fn fullscreen_terminal_lifecycle_can_opt_into_mouse_capture() {
-        let mut ops = FakeTerminalModeOps::default();
-        let state = enter_terminal_state_with_ops_inner(&mut ops, true).unwrap();
-        assert!(state.mouse_capture_active);
         leave_terminal_state_with_ops(&mut ops, state);
 
         assert_eq!(
@@ -14579,25 +14615,25 @@ mod terminal_guard_tests {
     }
 
     #[test]
-    fn ctrl_space_mouse_selection_toggle_releases_and_restores_mouse_capture() {
+    fn fullscreen_terminal_lifecycle_can_disable_mouse_capture() {
         let mut ops = FakeTerminalModeOps::default();
+        let state = enter_terminal_state_with_ops_inner(&mut ops, false).unwrap();
+        assert!(!state.mouse_capture_active);
+        leave_terminal_state_with_ops(&mut ops, state);
 
-        let released = toggle_mouse_selection_mode_with_ops(&mut ops, true, false).unwrap();
-        let restored = toggle_mouse_selection_mode_with_ops(&mut ops, true, true).unwrap();
-
-        assert_eq!(released, MouseSelectionModeOutcome::SelectionEnabled);
-        assert_eq!(restored, MouseSelectionModeOutcome::MouseRestored);
-        assert_eq!(ops.calls, vec!["disable_mouse_capture", "enable_mouse_capture"]);
-    }
-
-    #[test]
-    fn ctrl_space_mouse_selection_toggle_is_noop_when_mouse_was_not_configured() {
-        let mut ops = FakeTerminalModeOps::default();
-
-        let outcome = toggle_mouse_selection_mode_with_ops(&mut ops, false, false).unwrap();
-
-        assert_eq!(outcome, MouseSelectionModeOutcome::NotConfigured);
-        assert!(ops.calls.is_empty());
+        assert_eq!(
+            ops.calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "supports_keyboard_enhancement",
+                "enable_bracketed_paste",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode"
+            ]
+        );
     }
 
     #[test]
@@ -14637,8 +14673,10 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
+                "enable_mouse_capture",
                 "supports_keyboard_enhancement",
                 "enable_bracketed_paste",
+                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -14666,8 +14704,10 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
+                "enable_mouse_capture",
                 "supports_keyboard_enhancement",
                 "push_keyboard_enhancement_flags",
+                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]
@@ -14690,12 +14730,14 @@ mod terminal_guard_tests {
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
+                "enable_mouse_capture",
                 "supports_keyboard_enhancement",
                 "push_keyboard_enhancement_flags",
                 "enable_bracketed_paste",
                 "disable_bracketed_paste",
                 "show_cursor",
                 "pop_keyboard_enhancement_flags",
+                "disable_mouse_capture",
                 "leave_alternate_screen",
                 "disable_raw_mode"
             ]

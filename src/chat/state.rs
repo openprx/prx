@@ -348,9 +348,6 @@ pub struct UiState {
     /// P7c saved chat-session history picker. Distinct from the child-TUI
     /// Ctrl+G switcher.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
-    /// True while mouse capture is temporarily released for native terminal
-    /// drag selection.
-    pub mouse_selection_mode_active: bool,
 }
 
 /// 不可变 UI 快照（renderer 仅读，dispatcher 在 ui_dirty=true 时构造）.
@@ -391,6 +388,9 @@ pub struct UiSnapshot {
     pub streaming: Option<StreamingDraft>,
     /// In-flight visible streaming drafts keyed by provider worker sequence.
     pub visible_streaming_drafts: Arc<Vec<VisibleStreamingDraftView>>,
+    /// Duration of the most recently completed main turn, shown in the pinned
+    /// bottom status bar until the next turn starts.
+    pub last_turn_duration_ms: Option<u64>,
     /// 输入 buffer 快照（clone 成本接受，多行场景 < INPUT_MAX_VISIBLE_ROWS）.
     pub input: TuiInput,
     /// 后台会话常驻状态行（v1b）。空字符串表示无后台会话（renderer 隐藏该行）。
@@ -419,9 +419,6 @@ pub struct UiSnapshot {
     pub slash_menu: Option<SlashMenuState>,
     /// P7c saved chat-session history picker overlay.
     pub saved_session_picker: Option<crate::chat::session::SavedSessionPickerState>,
-    /// True while mouse capture is temporarily released for native terminal
-    /// drag selection.
-    pub mouse_selection_mode_active: bool,
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -443,6 +440,7 @@ impl UiSnapshot {
             conversation_generation: 0,
             streaming: None,
             visible_streaming_drafts: Arc::new(Vec::new()),
+            last_turn_duration_ms: None,
             input: TuiInput::new(),
             sessions_status: Arc::from(""),
             sessions_entries: Arc::new(Vec::new()),
@@ -457,7 +455,6 @@ impl UiSnapshot {
             switcher: None,
             slash_menu: None,
             saved_session_picker: None,
-            mouse_selection_mode_active: false,
         }
     }
 }
@@ -502,6 +499,10 @@ pub struct StreamState {
     /// This is the single source of truth for streaming draft state. The legacy
     /// single-draft snapshot is computed from [`Self::primary_draft`].
     pub visible_drafts: Vec<StreamingTurnDraft>,
+    /// Wall-clock start of the current primary turn.
+    pub started_at_ms: Option<i64>,
+    /// Completed duration retained for the bottom status bar.
+    pub last_duration_ms: Option<u64>,
 }
 
 impl StreamState {
@@ -773,7 +774,6 @@ struct SnapshotDirtyFields {
     focus: crate::chat::sessions::FocusTarget,
     token_usage_summary: MainSessionTokenUsageSummary,
     main_queue_status: MainQueueStatus,
-    mouse_selection_mode_active: bool,
 }
 
 impl ChatState {
@@ -821,10 +821,11 @@ impl ChatState {
                 slash_menu: None,
                 at_path_candidates: Vec::new(),
                 saved_session_picker: None,
-                mouse_selection_mode_active: false,
             },
             stream: StreamState {
                 visible_drafts: Vec::new(),
+                started_at_ms: None,
+                last_duration_ms: None,
             },
             control: ControlState {
                 active_cancel: None,
@@ -900,6 +901,7 @@ impl ChatState {
             conversation_generation: self.ui.conversation_generation,
             streaming: self.stream.primary_streaming_draft().cloned(),
             visible_streaming_drafts: Arc::new(self.stream.visible_streaming_draft_views()),
+            last_turn_duration_ms: self.stream.last_duration_ms,
             input: self.ui.input.clone(),
             sessions_status: Arc::from(self.ui.sessions_status.as_str()),
             sessions_entries: Arc::new(self.ui.sessions_entries.clone()),
@@ -914,7 +916,6 @@ impl ChatState {
             switcher: self.ui.switcher.clone(),
             slash_menu: self.ui.slash_menu.clone(),
             saved_session_picker: self.ui.saved_session_picker.clone(),
-            mouse_selection_mode_active: self.ui.mouse_selection_mode_active,
         }
     }
 
@@ -973,7 +974,6 @@ impl ChatState {
             focus: self.ui.focus,
             token_usage_summary: self.ui.token_usage_summary,
             main_queue_status: self.ui.main_queue_status,
-            mouse_selection_mode_active: self.ui.mouse_selection_mode_active,
         }
     }
 
@@ -1024,7 +1024,6 @@ impl ChatState {
                 self.ui.chat_mode = mode;
                 vec![Effect::RequestRedraw]
             }
-            Action::MouseSelectionModeChanged { active } => self.reduce_mouse_selection_mode_changed(active),
             Action::ModelChanged { model } => {
                 // BUG-07: /model <name> 在线切换。更新 session.model 让 status bar
                 // 立刻显示新 model；后续 LLM turn 真切 model 由主循环写 EffectDeps
@@ -1196,9 +1195,6 @@ impl ChatState {
         }
         if key.code == KeyCode::Char('d') && key.modifiers == KeyModifiers::CONTROL && self.ui.input.is_empty() {
             return vec![Effect::Quit];
-        }
-        if crate::chat::tui::is_mouse_selection_toggle_key(key) {
-            return vec![Effect::RequestRedraw];
         }
         if self.ui.saved_session_picker.is_some() {
             return self.reduce_saved_session_picker_key_pressed(key);
@@ -1611,6 +1607,8 @@ impl ChatState {
     #[cfg(feature = "terminal-tui")]
     fn reduce_turn_started(&mut self, draft_id: String, cancel: CancellationToken) -> Vec<Effect> {
         self.insert_visible_streaming_draft(None, None, draft_id.clone(), String::new());
+        self.stream.started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        self.stream.last_duration_ms = None;
         self.control.clear_tool_buffer(ToolTaskKey::Primary);
         self.control.register_turn_cancel(ToolTaskKey::Primary, cancel);
         self.control.generating = true;
@@ -1667,6 +1665,8 @@ impl ChatState {
             draft_id.clone(),
             Self::prompt_preview_from_history(&history),
         );
+        self.stream.started_at_ms = Some(chrono::Utc::now().timestamp_millis());
+        self.stream.last_duration_ms = None;
         self.control
             .clear_tool_buffer(ToolTaskKey::from_task_id(provider_turn_task_id));
         self.control
@@ -1802,6 +1802,15 @@ impl ChatState {
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.stream.last_duration_ms = self.stream.started_at_ms.take().map(|started_at_ms| {
+                let elapsed = chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(started_at_ms)
+                    .max(0);
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            });
+        }
         self.remove_pending_tool_cards(tool_key);
         if no_visible_drafts && !self.control.has_task_turn_cancels() {
             self.control.active_cancel = None;
@@ -1887,6 +1896,15 @@ impl ChatState {
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.stream.last_duration_ms = self.stream.started_at_ms.take().map(|started_at_ms| {
+                let elapsed = chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(started_at_ms)
+                    .max(0);
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            });
+        }
         let orphan_user_removed = if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn()
         } else {
@@ -1932,6 +1950,15 @@ impl ChatState {
         let tool_key = ToolTaskKey::from_task_id(removed_draft.task_id);
         self.control.remove_turn_cancel(tool_key);
         let no_visible_drafts = !self.stream.has_visible_drafts();
+        if no_visible_drafts {
+            self.stream.last_duration_ms = self.stream.started_at_ms.take().map(|started_at_ms| {
+                let elapsed = chrono::Utc::now()
+                    .timestamp_millis()
+                    .saturating_sub(started_at_ms)
+                    .max(0);
+                u64::try_from(elapsed).unwrap_or(u64::MAX)
+            });
+        }
         self.finalize_pending_tool_cards(tool_key, false, Some("turn cancelled before tool finish event"));
         if no_visible_drafts {
             self.rollback_trailing_answerless_user_turn();
@@ -2986,16 +3013,6 @@ impl ChatState {
         vec![Effect::RequestRedraw]
     }
 
-    /// `Action::MouseSelectionModeChanged` — update the footer/status hint for
-    /// Ctrl+Space mouse-selection mode. Idempotent to avoid redraw churn.
-    fn reduce_mouse_selection_mode_changed(&mut self, active: bool) -> Vec<Effect> {
-        if self.ui.mouse_selection_mode_active == active {
-            return Vec::new();
-        }
-        self.ui.mouse_selection_mode_active = active;
-        vec![Effect::RequestRedraw]
-    }
-
     /// `Action::SwitcherOpened` (v1.1b) — open the Ctrl+G switcher overlay over
     /// the supplied session snapshot, highlighting the first row.
     fn reduce_switcher_opened(&mut self, entries: Vec<crate::chat::sessions::SwitcherEntry>) -> Vec<Effect> {
@@ -3322,8 +3339,6 @@ const fn ui_dirty_for(action: &Action) -> bool {
         Action::SlashCommandIssued { .. } => false,
         // 模式切换：status bar 显示 mode 字段.
         Action::ModeChanged(_) => true,
-        // Footer/status hint for temporary native terminal selection mode.
-        Action::MouseSelectionModeChanged { .. } => true,
         // BUG-07: 模型切换写 session.model，status bar 显示该字段 → dirty.
         Action::ModelChanged { .. } => true,
         // Bug #3: provider 切换写 session.provider（status bar 显示该字段）→ dirty.
@@ -5610,9 +5625,9 @@ mod tests {
         }
 
         #[test]
-        fn test_redux_file_tool_cards_default_expanded() {
+        fn test_redux_file_tool_cards_default_folded() {
             use crate::chat::tui::ConversationLine;
-            for (tool_name, expected_folded) in [("file_edit", false), ("file_write", false), ("shell", true)] {
+            for (tool_name, expected_folded) in [("file_edit", true), ("file_write", true), ("shell", true)] {
                 let mut state = s();
                 let _ = state.reduce(Action::ToolStarted {
                     task_id: None,
@@ -9678,7 +9693,6 @@ mod tests {
             assert!(snap.conversation_lines.is_empty());
             assert_eq!(snap.turn_count, 0);
             assert!(snap.streaming.is_none());
-            assert!(!snap.mouse_selection_mode_active);
         }
 
         #[test]
@@ -9698,18 +9712,6 @@ mod tests {
                 Arc::strong_count(&snap.conversation_lines)
             );
             assert_eq!(snap2.revision, 1);
-        }
-
-        #[test]
-        fn mouse_selection_mode_action_flows_to_snapshot() {
-            let mut state = make_state();
-
-            let effects = state.reduce(Action::MouseSelectionModeChanged { active: true });
-            let snap = state.build_ui_snapshot(1);
-
-            assert!(effects.iter().any(|effect| matches!(effect, Effect::RequestRedraw)));
-            assert!(state.ui.mouse_selection_mode_active);
-            assert!(snap.mouse_selection_mode_active);
         }
 
         #[test]
