@@ -282,6 +282,10 @@ cargo test --lib process_termination_ / owner_mediated_process_kill_reaps_leader
 
 cargo test --bin prx shutdown_all_
 7 passed
+
+cargo test --test architecture_boundaries -- --nocapture
+expected red after the Stage 0.2 rebase exposed eight reviewed test-fixture
+spawn sites; after the explicit allowlist update, 4 passed
 ```
 
 Runtime-destruction boundary: there is no synchronous Drop watchdog and no
