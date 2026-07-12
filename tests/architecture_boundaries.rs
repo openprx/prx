@@ -4,6 +4,8 @@
 //! route the behavior through the owning repository/adapter/event fabric, or update the
 //! allowlist with an explicit architecture decision.
 
+#![allow(clippy::expect_used, clippy::indexing_slicing, clippy::panic, clippy::unwrap_used)]
+
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
