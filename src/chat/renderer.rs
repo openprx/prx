@@ -212,7 +212,7 @@ fn take_digits(s: &str) -> (usize, &str) {
 ///
 /// We intentionally do NOT trigger on the mere presence of `+`/`-` prefixes:
 /// regular markdown lists (`- item`, `+ item`) would falsely match.
-fn is_diff_block(buffer: &str, language: Option<&str>) -> bool {
+pub(crate) fn is_diff_block(buffer: &str, language: Option<&str>) -> bool {
     if let Some(lang) = language
         && is_diff_language(lang)
     {

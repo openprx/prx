@@ -54,6 +54,7 @@ pub mod sessions_spawn;
 pub mod shell;
 pub mod stay_silent;
 pub mod subagents;
+pub(crate) mod tool_diff;
 pub mod traits;
 pub mod web_fetch;
 pub mod web_search_tool;

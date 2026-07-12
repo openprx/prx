@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::op_id;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
+use crate::tools::tool_diff::build_unified_diff;
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -25,29 +26,6 @@ impl FileEditTool {
     pub const fn new(security: Arc<SecurityPolicy>) -> Self {
         Self { security }
     }
-}
-
-/// Build a minimal unified-diff-style preview of the change. This is
-/// self-contained (the chat renderer's `render_diff_block` lives in the binary
-/// crate and is not reachable here) and intentionally compact: it shows the
-/// removed text as `-` lines and the inserted text as `+` lines under a single
-/// hunk header naming the file.
-fn build_unified_diff(path: &str, old_string: &str, new_string: &str) -> String {
-    let mut out = String::with_capacity(old_string.len() + new_string.len() + 64);
-    out.push_str(&format!("--- a/{path}\n"));
-    out.push_str(&format!("+++ b/{path}\n"));
-    out.push_str("@@ edit @@\n");
-    for line in old_string.split('\n') {
-        out.push('-');
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in new_string.split('\n') {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-    }
-    out
 }
 
 #[async_trait]
@@ -285,6 +263,7 @@ impl Tool for FileEditTool {
             // Exactly one occurrence: replacen with count 1 is sufficient.
             (contents.replacen(old_string, new_string, 1), 1)
         };
+        let diff = build_unified_diff(path, &contents, &new_contents);
 
         // Write the result back. O_NOFOLLOW again guards against a symlink being
         // swapped in between read and write.
@@ -317,7 +296,6 @@ impl Tool for FileEditTool {
                 if !self.security.record_action() {
                     tracing::warn!("file_edit succeeded for {path} but action budget was already exhausted");
                 }
-                let diff = build_unified_diff(path, old_string, new_string);
                 let suffix = if replacements == 1 { "" } else { "s" };
                 Ok(ToolResult {
                     success: true,
@@ -439,6 +417,11 @@ mod tests {
             .unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert!(result.output.contains("Applied 1 replacement"));
+        assert!(result.output.contains("--- a/f.txt"));
+        assert!(result.output.contains("+++ b/f.txt"));
+        assert!(result.output.contains("@@ -"));
+        assert!(result.output.contains("-hello world"));
+        assert!(result.output.contains("+hello rust"));
 
         let content = tokio::fs::read_to_string(dir.join("f.txt")).await.unwrap();
         assert_eq!(content, "hello rust\n");
@@ -507,6 +490,10 @@ mod tests {
             .unwrap();
         assert!(result.success, "error: {:?}", result.error);
         assert!(result.output.contains("Applied 4 replacements"));
+        assert!(result.output.contains("--- a/f.txt"));
+        assert!(result.output.contains("+++ b/f.txt"));
+        assert!(result.output.contains("-x x x x"));
+        assert!(result.output.contains("+y y y y"));
 
         let content = tokio::fs::read_to_string(dir.join("f.txt")).await.unwrap();
         assert_eq!(content, "y y y y");
@@ -642,10 +629,13 @@ mod tests {
 
     #[test]
     fn build_unified_diff_shows_minus_and_plus() {
-        let diff = build_unified_diff("f.txt", "old", "new");
+        let diff = build_unified_diff("f.txt", "one\nold\nthree\n", "one\nnew\nthree\n");
         assert!(diff.contains("--- a/f.txt"));
         assert!(diff.contains("+++ b/f.txt"));
+        assert!(diff.contains("@@ -"));
+        assert!(diff.contains(" one"));
         assert!(diff.contains("-old"));
         assert!(diff.contains("+new"));
+        assert!(diff.contains(" three"));
     }
 }

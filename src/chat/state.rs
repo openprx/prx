@@ -2041,8 +2041,10 @@ impl ChatState {
     ) -> Vec<Effect> {
         use crate::chat::tui::{
             ARGS_PREVIEW_ELLIPSIS, ARGS_PREVIEW_MAX_CHARS, ConversationLine, ToolStatus, build_tool_args_preview,
+            tool_result_defaults_expanded,
         };
         let args_preview = build_tool_args_preview(&name, &args, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
+        let folded = !tool_result_defaults_expanded(&name);
         let tool_key = ToolTaskKey::from_task_id(task_id);
         let invocation_key = ToolInvocationKey::new(tool_call_id, &name);
         self.control
@@ -2056,7 +2058,7 @@ impl ChatState {
             result: None,
             status: ToolStatus::Running,
             elapsed_ms: None,
-            folded: true,
+            folded,
         });
         let idx = self.ui.conversation_lines.len().saturating_sub(1);
         self.control.tool_buffer_mut(tool_key).pending_tool_cards.push(idx);
@@ -5577,6 +5579,27 @@ mod tests {
                 assert_eq!(*status, ToolStatus::Running);
             } else {
                 panic!("最后一行应是 Running ToolResult");
+            }
+        }
+
+        #[test]
+        fn test_redux_file_tool_cards_default_expanded() {
+            use crate::chat::tui::ConversationLine;
+            for (tool_name, expected_folded) in [("file_edit", false), ("file_write", false), ("shell", true)] {
+                let mut state = s();
+                let _ = state.reduce(Action::ToolStarted {
+                    task_id: None,
+                    sequence: None,
+                    tool_call_id: None,
+                    name: tool_name.to_string(),
+                    args: r#"{"path":"demo.txt"}"#.to_string(),
+                });
+                match state.ui.conversation_lines.last() {
+                    Some(ConversationLine::ToolResult { folded, .. }) => {
+                        assert_eq!(*folded, expected_folded, "{tool_name} folded default mismatch");
+                    }
+                    other => panic!("expected ToolResult for {tool_name}, got {other:?}"),
+                }
             }
         }
 

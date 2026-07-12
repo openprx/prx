@@ -2,6 +2,7 @@ use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::security::op_id;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
+use crate::tools::tool_diff::{build_new_file_preview, build_unified_diff};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -151,6 +152,17 @@ impl Tool for FileWriteTool {
             });
         }
 
+        let existing_contents = match read_existing_file_for_diff(&resolved_target).await {
+            Ok(contents) => contents,
+            Err(error) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(error.to_string()),
+                });
+            }
+        };
+
         // Use O_NOFOLLOW on Unix to atomically reject symlinks during open,
         // eliminating the TOCTOU race between symlink check and write.
         let target = resolved_target.clone();
@@ -176,11 +188,20 @@ impl Tool for FileWriteTool {
         .await;
 
         match write_result {
-            Ok(Ok(())) => Ok(ToolResult {
-                success: true,
-                output: format!("Written {} bytes to {path}", content.len()),
-                error: None,
-            }),
+            Ok(Ok(())) => {
+                let mut output = format!("Written {} bytes to {path}", content.len());
+                output.push_str("\n\n");
+                if let Some(old_contents) = existing_contents {
+                    output.push_str(&build_unified_diff(path, &old_contents, content));
+                } else {
+                    output.push_str(&build_new_file_preview(path, content));
+                }
+                Ok(ToolResult {
+                    success: true,
+                    output,
+                    error: None,
+                })
+            }
             Ok(Err(e)) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
@@ -200,6 +221,39 @@ impl Tool for FileWriteTool {
 
     fn categories(&self) -> &'static [ToolCategory] {
         &[ToolCategory::FileSystem]
+    }
+}
+
+async fn read_existing_file_for_diff(path: &std::path::Path) -> anyhow::Result<Option<String>> {
+    if !tokio::fs::try_exists(path).await? {
+        return Ok(None);
+    }
+
+    let target = path.to_path_buf();
+    let read_result = tokio::task::spawn_blocking(move || -> Result<String, String> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        opts.custom_flags(libc::O_NOFOLLOW);
+
+        let mut file = opts.open(&target).map_err(|e| {
+            #[cfg(unix)]
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return format!("Refusing to overwrite symlink: {}", target.display());
+            }
+            format!("Failed to read existing file for diff: {e}")
+        })?;
+        let mut contents = String::new();
+        std::io::Read::read_to_string(&mut file, &mut contents)
+            .map_err(|e| format!("Failed to read existing file for diff: {e}"))?;
+        Ok(contents)
+    })
+    .await;
+
+    match read_result {
+        Ok(Ok(contents)) => Ok(Some(contents)),
+        Ok(Err(error)) => anyhow::bail!(error),
+        Err(error) => anyhow::bail!("Failed to read existing file for diff: {error}"),
     }
 }
 
@@ -275,6 +329,9 @@ mod tests {
         let result = tool.execute(approved_args(&dir, "out.txt", "written!")).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("8 bytes"));
+        assert!(result.output.contains("--- /dev/null"));
+        assert!(result.output.contains("+++ b/out.txt"));
+        assert!(result.output.contains("   1 | written!"));
 
         let content = tokio::fs::read_to_string(dir.join("out.txt")).await.unwrap();
         assert_eq!(content, "written!");
@@ -311,6 +368,12 @@ mod tests {
         let tool = FileWriteTool::new(test_security(dir.clone()));
         let result = tool.execute(approved_args(&dir, "exist.txt", "new")).await.unwrap();
         assert!(result.success);
+        assert!(result.output.contains("Written 3 bytes to exist.txt"));
+        assert!(result.output.contains("--- a/exist.txt"));
+        assert!(result.output.contains("+++ b/exist.txt"));
+        assert!(result.output.contains("@@ -"));
+        assert!(result.output.contains("-old"));
+        assert!(result.output.contains("+new"));
 
         let content = tokio::fs::read_to_string(dir.join("exist.txt")).await.unwrap();
         assert_eq!(content, "new");
@@ -390,6 +453,26 @@ mod tests {
         let result = tool.execute(approved_args(&dir, "empty.txt", "")).await.unwrap();
         assert!(result.success);
         assert!(result.output.contains("0 bytes"));
+        assert!(result.output.contains("--- /dev/null"));
+        assert!(result.output.contains("+++ b/empty.txt"));
+        assert!(result.output.contains("   1 | "));
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_write_new_file_preview_is_bounded() {
+        let dir = std::env::temp_dir().join("openprx_test_file_write_preview_bound");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+
+        let content = (1..=45).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n");
+        let tool = FileWriteTool::new(test_security(dir.clone()));
+        let result = tool.execute(approved_args(&dir, "long.txt", &content)).await.unwrap();
+        assert!(result.success);
+        assert!(result.output.contains("  40 | line 40"));
+        assert!(result.output.contains("... +5 more lines"));
+        assert!(!result.output.contains("line 41\n"));
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
     }
