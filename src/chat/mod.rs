@@ -1524,6 +1524,7 @@ mod session_cleanup_tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: std::sync::Arc::new(tokio::sync::RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,

@@ -5,7 +5,7 @@
 //! - kill: terminate a running sub-agent
 //! - steer: send a message to a running sub-agent
 
-use super::sessions_spawn::{SubAgentRun, SubAgentStatus};
+use super::sessions_spawn::{ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus};
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -165,6 +165,39 @@ impl SubagentsTool {
                         error: Some(error),
                     });
                 }
+                if let Some(control) = run.process_control.clone() {
+                    drop(runs);
+                    return match control.request_termination("killed by operator").await {
+                        ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated) => Ok(ToolResult {
+                            success: true,
+                            output: format!("Subagent `{run_id}` terminated."),
+                            error: None,
+                        }),
+                        ProcessTerminationRequestResult::Finalized(ProcessFinalization::Natural) => Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Subagent `{run_id}` finalized before the termination request won."
+                            )),
+                        }),
+                        ProcessTerminationRequestResult::Finalized(ProcessFinalization::TerminationFailed) => {
+                            Ok(ToolResult {
+                                success: false,
+                                output: String::new(),
+                                error: Some(format!(
+                                    "Subagent `{run_id}` could not be terminated by its process owner."
+                                )),
+                            })
+                        }
+                        ProcessTerminationRequestResult::Pending => Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!(
+                                "Termination was requested for subagent `{run_id}`, but its process owner is still pending reap; the run remains active."
+                            )),
+                        }),
+                    };
+                }
                 if let Some(ref abort_handle) = run.abort_handle {
                     abort_handle.abort();
                 }
@@ -186,11 +219,21 @@ impl SubagentsTool {
                 output: String::new(),
                 error: Some(format!("Subagent `{run_id}` already completed.")),
             }),
-            SubAgentStatus::Failed(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Subagent `{run_id}` already failed: {e}")),
-            }),
+            SubAgentStatus::Failed(e) => {
+                let was_terminated = run
+                    .process_control
+                    .as_ref()
+                    .is_some_and(|control| control.finalization() == Some(ProcessFinalization::Terminated));
+                Ok(ToolResult {
+                    success: was_terminated,
+                    output: if was_terminated {
+                        format!("Subagent `{run_id}` terminated.")
+                    } else {
+                        String::new()
+                    },
+                    error: (!was_terminated).then(|| format!("Subagent `{run_id}` already failed: {e}")),
+                })
+            }
         }
     }
 
@@ -385,6 +428,7 @@ impl Tool for SubagentsTool {
 mod tests {
     use super::*;
     use crate::memory::{MemoryPrincipal, SqliteMemory};
+    use crate::tools::sessions_spawn::ProcessRunControl;
     use chrono::Utc;
 
     fn make_run(id: &str, status: SubAgentStatus) -> SubAgentRun {
@@ -400,6 +444,7 @@ mod tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -448,6 +493,76 @@ mod tests {
         let guard = runs.read().await;
         let run = guard.iter().find(|r| r.id == "run-1").unwrap();
         assert!(matches!(run.status, SubAgentStatus::Failed(_)));
+    }
+
+    #[tokio::test]
+    async fn process_kill_waits_for_owner_and_is_idempotent() {
+        let control = ProcessRunControl::new_for_test();
+        let mut run = make_run("process-run", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let tool = SubagentsTool::new(runs.clone());
+        let owner = {
+            let control = control.clone();
+            let runs = runs.clone();
+            tokio::spawn(async move {
+                let reason = control.wait_for_termination_for_test().await;
+                assert_eq!(reason, "killed by operator");
+                runs.write().await[0].status = SubAgentStatus::Failed(reason);
+                control.finalize_for_test(ProcessFinalization::Terminated);
+            })
+        };
+        let args = || {
+            json!({
+                "action":"kill",
+                "run_id":"process-run",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "subagents",
+                        "subagents:kill:process-run",
+                        "test",
+                        None
+                    )).unwrap()
+            })
+        };
+
+        let first = tool.execute(args()).await.unwrap();
+        assert!(first.success);
+        owner.await.unwrap();
+        let repeated = tool.execute(args()).await.unwrap();
+        assert!(repeated.success);
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+    }
+
+    #[tokio::test]
+    async fn process_kill_reports_pending_without_claiming_owner_failure() {
+        let control = ProcessRunControl::new_pending_for_test();
+        let mut run = make_run("pending-process", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let tool = SubagentsTool::new(runs.clone());
+
+        let result = tool
+            .execute(json!({
+                "action":"kill",
+                "run_id":"pending-process",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "subagents",
+                        "subagents:kill:pending-process",
+                        "test",
+                        None
+                    )).unwrap()
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap();
+        assert!(error.contains("still pending reap"));
+        assert!(!error.contains("could not be terminated"));
+        assert_eq!(control.finalization(), None);
+        assert!(matches!(runs.read().await[0].status, SubAgentStatus::Running));
     }
 
     #[tokio::test]
@@ -541,6 +656,7 @@ mod tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
             parent_run_id: None,
@@ -575,6 +691,7 @@ mod tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: Some(tx),
             parent_run_id: Some("parent-b".to_string()),

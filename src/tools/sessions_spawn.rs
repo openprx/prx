@@ -26,11 +26,12 @@ use crate::security::{SecurityPolicy, SideEffectGate};
 use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use serde_json::json;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, watch};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -39,6 +40,10 @@ use uuid::Uuid;
 /// A value of `0` means "no timeout" (run until natural completion), matching
 /// the session-worker semantics in `session_worker/runner.rs`.
 const DEFAULT_SUB_AGENT_TIMEOUT_SECS: u64 = 600;
+const PROCESS_OUTPUT_DRAIN_TIMEOUT_SECS: u64 = 1;
+const PROCESS_REAP_TIMEOUT_SECS: u64 = 5;
+const PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS: u64 = 5;
+const MAX_SUBPROCESS_OUTPUT: u64 = 10 * 1024 * 1024;
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
 You are a sub-agent handling a specific delegated task. \
 Complete the task thoroughly and report results concisely. \
@@ -95,6 +100,10 @@ pub struct SubAgentRun {
     pub channel_name: Option<String>,
     /// Handle to abort the spawned tokio task (supports kill action).
     pub abort_handle: Option<tokio::task::AbortHandle>,
+    /// Owner-mediated lifecycle control for process-mode runs. This deliberately
+    /// exposes no PID/PGID: only the monitor that owns `Child` may signal and
+    /// reap it. Task-mode runs leave this as `None` and retain abort semantics.
+    pub(crate) process_control: Option<Arc<ProcessRunControl>>,
     /// Accumulated conversation history from the sub-agent's execution.
     pub history: Arc<RwLock<Vec<HistoryEntry>>>,
     /// Channel to inject steering messages into the running sub-agent.
@@ -103,6 +112,163 @@ pub struct SubAgentRun {
     pub session_scope_key: String,
     pub spawn_depth: usize,
     pub token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessFinalization {
+    Natural,
+    Terminated,
+    TerminationFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProcessTerminationRequestResult {
+    Finalized(ProcessFinalization),
+    Pending,
+}
+
+/// Per-run process lifecycle control. The first termination reason wins and
+/// every requester waits for the sole process owner to publish finalization.
+#[derive(Debug)]
+pub(crate) struct ProcessRunControl {
+    termination_tx: watch::Sender<Option<String>>,
+    finalized_tx: watch::Sender<Option<ProcessFinalization>>,
+    request_timeout: std::time::Duration,
+    #[cfg(test)]
+    timeout_barrier: Option<Arc<tokio::sync::Barrier>>,
+}
+
+impl ProcessRunControl {
+    fn new() -> Arc<Self> {
+        Self::new_with_request_timeout(std::time::Duration::from_secs(PROCESS_TERMINATION_REQUEST_TIMEOUT_SECS))
+    }
+
+    fn new_with_request_timeout(request_timeout: std::time::Duration) -> Arc<Self> {
+        let (termination_tx, _) = watch::channel(None);
+        let (finalized_tx, _) = watch::channel(None);
+        Arc::new(Self {
+            termination_tx,
+            finalized_tx,
+            request_timeout,
+            #[cfg(test)]
+            timeout_barrier: None,
+        })
+    }
+
+    async fn termination_requested(&self) -> String {
+        let mut receiver = self.termination_tx.subscribe();
+        loop {
+            let reason = receiver.borrow_and_update().clone();
+            if let Some(reason) = reason {
+                return reason;
+            }
+            if receiver.changed().await.is_err() {
+                return "process owner stopped".to_string();
+            }
+        }
+    }
+
+    pub(crate) async fn request_termination(&self, reason: &str) -> ProcessTerminationRequestResult {
+        self.request_termination_with_timeout(reason, self.request_timeout)
+            .await
+    }
+
+    async fn request_termination_with_timeout(
+        &self,
+        reason: &str,
+        wait_timeout: std::time::Duration,
+    ) -> ProcessTerminationRequestResult {
+        let reason = reason.to_string();
+        self.termination_tx.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(reason);
+                true
+            }
+        });
+
+        let wait_for_owner = async {
+            let mut receiver = self.finalized_tx.subscribe();
+            loop {
+                let finalization = *receiver.borrow_and_update();
+                if let Some(finalization) = finalization {
+                    return ProcessTerminationRequestResult::Finalized(finalization);
+                }
+                if receiver.changed().await.is_err() {
+                    return ProcessTerminationRequestResult::Pending;
+                }
+            }
+        };
+        // The test-only timeout barrier must be awaited before the final state
+        // read, so this branch cannot use Clippy's synchronous map_or_else form.
+        #[allow(clippy::option_if_let_else)]
+        match tokio::time::timeout(wait_timeout, wait_for_owner).await {
+            Ok(result) => result,
+            Err(_) => {
+                #[cfg(test)]
+                if let Some(barrier) = &self.timeout_barrier {
+                    barrier.wait().await;
+                    barrier.wait().await;
+                }
+                self.finalization().map_or_else(
+                    || ProcessTerminationRequestResult::Pending,
+                    ProcessTerminationRequestResult::Finalized,
+                )
+            }
+        }
+    }
+
+    fn finalize(&self, finalization: ProcessFinalization) {
+        self.finalized_tx.send_if_modified(|current| {
+            if current.is_some() {
+                false
+            } else {
+                *current = Some(finalization);
+                true
+            }
+        });
+    }
+
+    pub(crate) fn finalization(&self) -> Option<ProcessFinalization> {
+        *self.finalized_tx.borrow()
+    }
+
+    fn termination_reason(&self) -> Option<String> {
+        self.termination_tx.borrow().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Arc<Self> {
+        Self::new()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_pending_for_test() -> Arc<Self> {
+        Self::new_with_request_timeout(std::time::Duration::from_millis(20))
+    }
+
+    #[cfg(test)]
+    fn new_timeout_boundary_for_test(barrier: Arc<tokio::sync::Barrier>) -> Arc<Self> {
+        let (termination_tx, _) = watch::channel(None);
+        let (finalized_tx, _) = watch::channel(None);
+        Arc::new(Self {
+            termination_tx,
+            finalized_tx,
+            request_timeout: std::time::Duration::from_millis(20),
+            timeout_barrier: Some(barrier),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn wait_for_termination_for_test(&self) -> String {
+        self.termination_requested().await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn finalize_for_test(&self, finalization: ProcessFinalization) {
+        self.finalize(finalization);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -693,6 +859,7 @@ async fn record_spawn_result_event(
     result_text: &str,
     status: &SubAgentStatus,
     lineage: &SpawnLineage,
+    terminal_event_type: Option<&str>,
 ) {
     let Some(fabric) = fabric else {
         return;
@@ -728,7 +895,7 @@ async fn record_spawn_result_event(
     {
         tracing::warn!("failed to record sessions_spawn result event: {error}");
     }
-    let task_event_type = if success { "task.completed" } else { "task.failed" };
+    let task_event_type = terminal_event_type.unwrap_or(if success { "task.completed" } else { "task.failed" });
     if let Err(error) = fabric
         .record_task_event(
             task_event_scope,
@@ -751,6 +918,63 @@ async fn record_spawn_result_event(
     {
         tracing::warn!("failed to record sessions_spawn {task_event_type} event: {error}");
     }
+}
+
+#[cfg(test)]
+struct ProcessTerminalCommitHook {
+    entered: tokio::sync::oneshot::Sender<()>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+async fn commit_process_terminal_state(
+    active_runs: &Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: &str,
+    status: SubAgentStatus,
+    token_usage_records: Vec<crate::llm::route_decision::MeteredTokenUsageRecord>,
+    process_control: &ProcessRunControl,
+    finalization: ProcessFinalization,
+    #[cfg(test)] commit_hook: Option<ProcessTerminalCommitHook>,
+) {
+    let mut runs = active_runs.write().await;
+    if let Some(run) = runs.iter_mut().find(|run| run.id == run_id) {
+        run.finished_at = Some(Utc::now());
+        run.status = status;
+        run.token_usage_records.extend(token_usage_records);
+        run.steer_tx = None;
+    }
+
+    #[cfg(test)]
+    if let Some(hook) = commit_hook {
+        let _ = hook.entered.send(());
+        let _ = hook.release.await;
+    }
+
+    // Registry readers remain excluded by the write lock until both terminal
+    // status and finalization are committed, so no caller can observe an early
+    // slot release or terminal status with an unfinalized process control.
+    process_control.finalize(finalization);
+}
+
+async fn commit_process_owner_failure_if_unfinalized(
+    active_runs: &Arc<RwLock<Vec<SubAgentRun>>>,
+    run_id: &str,
+    process_control: &ProcessRunControl,
+    error: String,
+) {
+    if process_control.finalization().is_some() {
+        return;
+    }
+    commit_process_terminal_state(
+        active_runs,
+        run_id,
+        SubAgentStatus::Failed(error),
+        Vec::new(),
+        process_control,
+        ProcessFinalization::TerminationFailed,
+        #[cfg(test)]
+        None,
+    )
+    .await;
 }
 
 #[async_trait]
@@ -1205,6 +1429,7 @@ impl Tool for SessionsSpawnTool {
         if mode == "process" {
             let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
+            let process_control = ProcessRunControl::new();
 
             {
                 let mut runs = self.active_runs.write().await;
@@ -1220,6 +1445,7 @@ impl Tool for SessionsSpawnTool {
                     recipient: recipient.clone(),
                     channel_name: run_channel_name.clone(),
                     abort_handle: None,
+                    process_control: Some(process_control.clone()),
                     history: history_arc,
                     steer_tx: None,
                     parent_run_id: parent_run_id.clone(),
@@ -1299,107 +1525,153 @@ impl Tool for SessionsSpawnTool {
             let process_result_scope = spawn_scope_for_event.clone();
             let process_lineage = run_lineage.clone();
             let process_cost_config = self.cost_config.clone();
+            let monitor_process_control = process_control.clone();
 
             let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(process_execution_ctx, async move {
-                tracing::info!(run_id = %rid, "Sub-agent process starting");
+                let failure_active_runs = active_runs.clone();
+                let failure_run_id = rid.clone();
+                let monitor_result = std::panic::AssertUnwindSafe(async {
+                    tracing::info!(run_id = %rid, "Sub-agent process starting");
 
-                let worker_result = run_sub_agent_process(
-                    &rid,
-                    &task_owned,
-                    &provider_name,
-                    &model,
-                    api_key.as_deref(),
-                    temperature,
-                    timeout_secs,
-                    max_iterations,
-                    &workspace_root,
-                    &worker_workspace_root,
-                    identity_dir.as_deref(),
-                    &allowed_tools,
-                    keep_workspace,
-                    process_scope.as_ref(),
-                    process_spawn_depth,
-                    &process_session_scope_key,
-                    process_parent_run_id.as_deref(),
-                    process_agent_id.as_deref(),
-                    &process_lineage,
-                    &process_memory_strategy,
-                    process_event_recording,
-                    &process_compaction_config,
-                )
+                    let worker_result = run_sub_agent_process(
+                        &rid,
+                        &task_owned,
+                        &provider_name,
+                        &model,
+                        api_key.as_deref(),
+                        temperature,
+                        timeout_secs,
+                        max_iterations,
+                        &workspace_root,
+                        &worker_workspace_root,
+                        identity_dir.as_deref(),
+                        &allowed_tools,
+                        keep_workspace,
+                        process_scope.as_ref(),
+                        process_spawn_depth,
+                        &process_session_scope_key,
+                        process_parent_run_id.as_deref(),
+                        process_agent_id.as_deref(),
+                        &process_lineage,
+                        &process_memory_strategy,
+                        process_event_recording,
+                        &process_compaction_config,
+                        monitor_process_control.as_ref(),
+                    )
+                    .await;
+
+                    let (status, result_text, token_usage_records, finalization) = match worker_result {
+                        Ok(ProcessWorkerOutcome::Finished(result)) if result.success => {
+                            let token_usage_records = result
+                                .tokens_used
+                                .as_ref()
+                                .and_then(|usage| {
+                                    crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
+                                        &provider_name,
+                                        &model,
+                                        usage,
+                                        &process_cost_config,
+                                    )
+                                })
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            (
+                                SubAgentStatus::Completed(result.output.clone()),
+                                result.output,
+                                token_usage_records,
+                                ProcessFinalization::Natural,
+                            )
+                        }
+                        Ok(ProcessWorkerOutcome::Finished(result)) => {
+                            let error = result.error.unwrap_or_else(|| "worker failed".to_string());
+                            let msg = format!("Sub-agent error: {error}");
+                            (
+                                SubAgentStatus::Failed(error),
+                                msg,
+                                Vec::new(),
+                                ProcessFinalization::Natural,
+                            )
+                        }
+                        Ok(ProcessWorkerOutcome::Terminated(reason)) => {
+                            let msg = format!("Sub-agent process terminated: {reason}");
+                            (
+                                SubAgentStatus::Failed(reason),
+                                msg,
+                                Vec::new(),
+                                ProcessFinalization::Terminated,
+                            )
+                        }
+                        Ok(ProcessWorkerOutcome::TerminationFailed(error)) => {
+                            let msg = format!("Sub-agent process termination failed: {error}");
+                            (
+                                SubAgentStatus::Failed(error),
+                                msg,
+                                Vec::new(),
+                                ProcessFinalization::TerminationFailed,
+                            )
+                        }
+                        Err(error) => {
+                            let msg = format!("Sub-agent process error: {error}");
+                            (
+                                SubAgentStatus::Failed(error.to_string()),
+                                msg,
+                                Vec::new(),
+                                ProcessFinalization::Natural,
+                            )
+                        }
+                    };
+
+                    let announce = format_announce_message(&rid, &status, &result_text);
+                    record_spawn_result_event(
+                        process_memory_fabric.as_ref(),
+                        process_result_scope,
+                        &result_text,
+                        &status,
+                        &process_lineage,
+                        (finalization == ProcessFinalization::Terminated).then_some("task.killed"),
+                    )
+                    .await;
+
+                    commit_process_terminal_state(
+                        &active_runs,
+                        &rid,
+                        status,
+                        token_usage_records,
+                        monitor_process_control.as_ref(),
+                        finalization,
+                        #[cfg(test)]
+                        None,
+                    )
+                    .await;
+                    if let Some(target) = recipient {
+                        let msg = SendMessage::new(&announce, &target);
+                        if let Err(error) = channel.send(&msg).await {
+                            tracing::error!(
+                                run_id = %rid,
+                                "Failed to announce sub-agent process result: {error}"
+                            );
+                        }
+                    }
+
+                    tracing::info!(run_id = %rid, "Sub-agent process finished");
+                })
+                .catch_unwind()
                 .await;
 
-                let (status, result_text, token_usage_records) = match worker_result {
-                    Ok(result) if result.success => {
-                        let token_usage_records = result
-                            .tokens_used
-                            .as_ref()
-                            .and_then(|usage| {
-                                crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                                    &provider_name,
-                                    &model,
-                                    usage,
-                                    &process_cost_config,
-                                )
-                            })
-                            .into_iter()
-                            .collect::<Vec<_>>();
-                        (
-                            SubAgentStatus::Completed(result.output.clone()),
-                            result.output,
-                            token_usage_records,
-                        )
-                    }
-                    Ok(result) => {
-                        let error = result.error.unwrap_or_else(|| "worker failed".to_string());
-                        let msg = format!("Sub-agent error: {error}");
-                        (SubAgentStatus::Failed(error), msg, Vec::new())
-                    }
-                    Err(error) => {
-                        let msg = format!("Sub-agent process error: {error}");
-                        (SubAgentStatus::Failed(error.to_string()), msg, Vec::new())
-                    }
-                };
-
-                let announce = format_announce_message(&rid, &status, &result_text);
-                record_spawn_result_event(
-                    process_memory_fabric.as_ref(),
-                    process_result_scope,
-                    &result_text,
-                    &status,
-                    &process_lineage,
-                )
-                .await;
-
-                {
-                    let mut runs = active_runs.write().await;
-                    if let Some(run) = runs.iter_mut().find(|r| r.id == rid) {
-                        run.finished_at = Some(Utc::now());
-                        run.status = status;
-                        run.token_usage_records.extend(token_usage_records);
-                        run.steer_tx = None;
-                    }
+                if monitor_result.is_err() {
+                    commit_process_owner_failure_if_unfinalized(
+                        &failure_active_runs,
+                        &failure_run_id,
+                        monitor_process_control.as_ref(),
+                        "process owner panicked".to_string(),
+                    )
+                    .await;
                 }
-
-                if let Some(target) = recipient {
-                    let msg = SendMessage::new(&announce, &target);
-                    if let Err(error) = channel.send(&msg).await {
-                        tracing::error!(
-                            run_id = %rid,
-                            "Failed to announce sub-agent process result: {error}"
-                        );
-                    }
-                }
-
-                tracing::info!(run_id = %rid, "Sub-agent process finished");
             }));
 
-            {
-                let mut runs = self.active_runs.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                    run.abort_handle = Some(jh.abort_handle());
-                }
-            }
+            // Process-mode callers must never abort this monitor: it is the
+            // sole owner responsible for signalling and reaping the OS child.
+            drop(jh);
 
             return Ok(ToolResult {
                 success: true,
@@ -1429,6 +1701,7 @@ impl Tool for SessionsSpawnTool {
                 recipient: recipient.clone(),
                 channel_name: run_channel_name.clone(),
                 abort_handle: None,
+                process_control: None,
                 history: history_arc.clone(),
                 steer_tx: Some(steer_tx),
                 parent_run_id: parent_run_id.clone(),
@@ -1625,6 +1898,7 @@ impl Tool for SessionsSpawnTool {
                 &result_text,
                 &status,
                 &task_lineage,
+                None,
             )
             .await;
 
@@ -1759,65 +2033,106 @@ impl SessionsSpawnTool {
 
     /// Kill a running sub-agent by its run ID.
     async fn execute_kill(&self, run_id: &str, approval_grant: Option<&ApprovalGrant>) -> anyhow::Result<ToolResult> {
-        let kill_target = {
-            let mut runs = self.active_runs.write().await;
-            match runs.iter_mut().find(|r| r.id == run_id) {
-                Some(run) => {
-                    match &run.status {
-                        // A live run (executing) or one suspended awaiting approval
-                        // (NeedsInput) is killable: aborting the task tears down the
-                        // suspended approval resolver's pending await along with it.
-                        SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
-                            let operation_name = format!("sessions_spawn:kill:{run_id}");
-                            if let Err(error) = SideEffectGate::new(self.security.as_ref())
-                                .authorize_resource_operation(
-                                    self.name(),
-                                    &operation_name,
-                                    ResourceRiskLevel::Medium,
-                                    approval_grant,
-                                )
-                            {
+        let (process_control, task_kill_target) =
+            {
+                let mut runs = self.active_runs.write().await;
+                match runs.iter_mut().find(|r| r.id == run_id) {
+                    Some(run) => {
+                        match &run.status {
+                            // A live run (executing) or one suspended awaiting approval
+                            // (NeedsInput) is killable: aborting the task tears down the
+                            // suspended approval resolver's pending await along with it.
+                            SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. } => {
+                                let operation_name = format!("sessions_spawn:kill:{run_id}");
+                                if let Err(error) = SideEffectGate::new(self.security.as_ref())
+                                    .authorize_resource_operation(
+                                        self.name(),
+                                        &operation_name,
+                                        ResourceRiskLevel::Medium,
+                                        approval_grant,
+                                    )
+                                {
+                                    return Ok(ToolResult {
+                                        success: false,
+                                        output: String::new(),
+                                        error: Some(error),
+                                    });
+                                }
+                                if let Some(control) = run.process_control.clone() {
+                                    (Some(control), None)
+                                } else {
+                                    if let Some(ah) = run.abort_handle.as_ref() {
+                                        ah.abort();
+                                    }
+                                    let recipient = run.recipient.clone();
+                                    // Per-turn channel bound at spawn time — kill-notify routes
+                                    // to the same channel + recipient as the launching message,
+                                    // not the shared active channel (avoids cross-channel leak).
+                                    let channel_name = run.channel_name.clone();
+                                    let rid = run.id.clone();
+                                    run.finished_at = Some(Utc::now());
+                                    run.status = SubAgentStatus::Failed("killed by user".into());
+                                    run.steer_tx = None;
+                                    (None, Some((recipient, channel_name, rid, run.clone())))
+                                }
+                            }
+                            SubAgentStatus::Completed(_) => {
                                 return Ok(ToolResult {
                                     success: false,
                                     output: String::new(),
-                                    error: Some(error),
+                                    error: Some(format!("Run `{run_id}` already completed.")),
                                 });
                             }
-                            if let Some(ah) = run.abort_handle.as_ref() {
-                                ah.abort();
+                            SubAgentStatus::Failed(e) => {
+                                if run.process_control.as_ref().is_some_and(|control| {
+                                    control.finalization() == Some(ProcessFinalization::Terminated)
+                                }) {
+                                    return Ok(ToolResult {
+                                        success: true,
+                                        output: format!("Sub-agent `{run_id}` has been killed."),
+                                        error: None,
+                                    });
+                                }
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(format!("Run `{run_id}` already failed: {e}")),
+                                });
                             }
-                            let recipient = run.recipient.clone();
-                            // Per-turn channel bound at spawn time — kill-notify routes
-                            // to the same channel + recipient as the launching message,
-                            // not the shared active channel (avoids cross-channel leak).
-                            let channel_name = run.channel_name.clone();
-                            let rid = run.id.clone();
-                            run.finished_at = Some(Utc::now());
-                            run.status = SubAgentStatus::Failed("killed by user".into());
-                            run.steer_tx = None;
-                            Some((recipient, channel_name, rid, run.clone()))
-                        }
-                        SubAgentStatus::Completed(_) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Run `{run_id}` already completed.")),
-                            });
-                        }
-                        SubAgentStatus::Failed(e) => {
-                            return Ok(ToolResult {
-                                success: false,
-                                output: String::new(),
-                                error: Some(format!("Run `{run_id}` already failed: {e}")),
-                            });
                         }
                     }
+                    None => (None, None),
                 }
-                None => None,
-            }
-        };
+            };
 
-        let Some((recipient_opt, channel_name_opt, rid, killed_run)) = kill_target else {
+        if let Some(control) = process_control {
+            return match control.request_termination("killed by user").await {
+                ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated) => Ok(ToolResult {
+                    success: true,
+                    output: format!("Sub-agent `{run_id}` has been killed."),
+                    error: None,
+                }),
+                ProcessTerminationRequestResult::Finalized(ProcessFinalization::Natural) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` finalized before the termination request won.")),
+                }),
+                ProcessTerminationRequestResult::Finalized(ProcessFinalization::TerminationFailed) => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Run `{run_id}` could not be terminated by its process owner.")),
+                }),
+                ProcessTerminationRequestResult::Pending => Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Termination was requested for run `{run_id}`, but its process owner is still pending reap; the run remains active."
+                    )),
+                }),
+            };
+        }
+
+        let Some((recipient_opt, channel_name_opt, rid, killed_run)) = task_kill_target else {
             return Ok(self.no_runtime_run_result(run_id).await);
         };
 
@@ -2807,18 +3122,475 @@ fn build_session_worker_manifest(
     Ok((manifest, sealed_capability, capability_expiry))
 }
 
-async fn wait_with_parent_timeout(
+#[derive(Debug)]
+enum OwnedChildExit {
+    Exited(std::process::ExitStatus),
+    Terminated(String),
+    TerminationFailed(String),
+}
+
+async fn hold_unresolved_child_ownership<T>(child: &tokio::process::Child, error: impl std::fmt::Display) -> T {
+    tracing::error!(
+        error = %error,
+        "session-worker reap state is unresolved; retaining Child ownership and run slot"
+    );
+    let owned_child = child;
+    loop {
+        std::future::pending::<()>().await;
+        let _ = owned_child.id();
+    }
+}
+
+async fn start_kill_and_reap_direct_child(
     child: &mut tokio::process::Child,
-    parent_timeout: std::time::Duration,
 ) -> anyhow::Result<std::process::ExitStatus> {
-    match tokio::time::timeout(parent_timeout, child.wait()).await {
-        Ok(result) => Ok(result?),
+    let start_kill_error = child.start_kill().err();
+    let bounded_wait =
+        tokio::time::timeout(std::time::Duration::from_secs(PROCESS_REAP_TIMEOUT_SECS), child.wait()).await;
+    let mut bounded_wait_timed_out = false;
+    let status = match bounded_wait {
+        Ok(Ok(status)) => status,
+        Ok(Err(wait_error)) => {
+            let error = match start_kill_error {
+                Some(start_error) => anyhow::anyhow!(
+                    "failed to start direct-child kill: {start_error}; direct-child wait failed: {wait_error}"
+                ),
+                None => wait_error.into(),
+            };
+            return hold_unresolved_child_ownership(child, error).await;
+        }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            bounded_wait_timed_out = true;
+            match child.wait().await {
+                Ok(status) => status,
+                Err(wait_error) => {
+                    let error = start_kill_error.as_ref().map_or_else(
+                        || {
+                            anyhow::anyhow!(
+                                "direct child was not reaped within {PROCESS_REAP_TIMEOUT_SECS}s and the continuing owner wait failed: {wait_error}"
+                            )
+                        },
+                        |start_error| {
+                            anyhow::anyhow!(
+                                "failed to start direct-child kill: {start_error}; direct child was not reaped within {PROCESS_REAP_TIMEOUT_SECS}s and the continuing owner wait failed: {wait_error}"
+                            )
+                        },
+                    );
+                    return hold_unresolved_child_ownership(child, error).await;
+                }
+            }
+        }
+    };
+    if let Some(start_error) = start_kill_error {
+        if bounded_wait_timed_out {
+            anyhow::bail!(
+                "failed to start direct-child kill: {start_error}; direct child was not reaped within {PROCESS_REAP_TIMEOUT_SECS}s, but the continuing owner wait later confirmed reap"
+            );
+        }
+        anyhow::bail!("failed to start direct-child kill before confirmed reap: {start_error}");
+    }
+    Ok(status)
+}
+
+async fn wait_for_reap_after_group_termination(
+    child: &mut tokio::process::Child,
+    #[cfg(test)] inject_wait_error: bool,
+) -> anyhow::Result<std::process::ExitStatus> {
+    #[cfg(test)]
+    if inject_wait_error {
+        return hold_unresolved_child_ownership(child, "injected post-termination child.wait error").await;
+    }
+    match child.wait().await {
+        Ok(status) => Ok(status),
+        Err(error) => hold_unresolved_child_ownership(child, error).await,
+    }
+}
+
+async fn terminate_owned_child(
+    child: &mut tokio::process::Child,
+    process_group: &mut OwnedProcessGroup,
+) -> anyhow::Result<std::process::ExitStatus> {
+    #[cfg(unix)]
+    {
+        if let Err(group_error) = process_group.terminate() {
+            process_group.disarm();
+            start_kill_and_reap_direct_child(child).await.map_err(|direct_error| {
+                anyhow::anyhow!(
+                    "failed to kill session-worker process group: {group_error}; direct-child fallback failed: {direct_error}"
+                )
+            })?;
+            return Err(group_error);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        process_group.disarm();
+        return start_kill_and_reap_direct_child(child).await;
+    }
+
+    wait_for_reap_after_group_termination(
+        child,
+        #[cfg(test)]
+        false,
+    )
+    .await
+}
+
+async fn wait_for_owned_process(
+    child: &mut tokio::process::Child,
+    process_group: &mut OwnedProcessGroup,
+    parent_timeout: std::time::Duration,
+    process_control: &ProcessRunControl,
+    #[cfg(test)] inject_wait_error: bool,
+) -> anyhow::Result<OwnedChildExit> {
+    #[cfg(test)]
+    if inject_wait_error {
+        relinquish_process_group_after_leader_exit(process_group);
+        return hold_unresolved_child_ownership(child, "injected child.wait error").await;
+    }
+    tokio::select! {
+        biased;
+        status = child.wait() => match status {
+            Ok(status) => Ok(OwnedChildExit::Exited(status)),
+            Err(error) => {
+                relinquish_process_group_after_leader_exit(process_group);
+                hold_unresolved_child_ownership(child, error).await
+            }
+        },
+        reason = process_control.termination_requested() => {
+            match terminate_owned_child(child, process_group).await {
+                Ok(_) => Ok(OwnedChildExit::Terminated(reason)),
+                Err(error) => Ok(OwnedChildExit::TerminationFailed(error.to_string())),
+            }
+        }
+        () = tokio::time::sleep(parent_timeout) => {
+            terminate_owned_child(child, process_group).await?;
             anyhow::bail!(
                 "session-worker exceeded parent timeout of {}s and was killed",
                 parent_timeout.as_secs()
+            )
+        }
+    }
+}
+
+enum ProcessWorkerOutcome {
+    Finished(WorkerResult),
+    Terminated(String),
+    TerminationFailed(String),
+}
+
+#[derive(Debug)]
+struct OwnedProcessGroup {
+    #[cfg(unix)]
+    pgid: i32,
+    armed: bool,
+    #[cfg(test)]
+    termination_calls: Option<Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
+    skip_signal: bool,
+}
+
+impl OwnedProcessGroup {
+    fn from_child(child: &tokio::process::Child) -> anyhow::Result<Self> {
+        #[cfg(unix)]
+        {
+            let pgid = child
+                .id()
+                .and_then(|pid| i32::try_from(pid).ok())
+                .filter(|pid| *pid > 0)
+                .ok_or_else(|| anyhow::anyhow!("owned session-worker has no valid process group"))?;
+            Ok(Self {
+                pgid,
+                armed: true,
+                #[cfg(test)]
+                termination_calls: None,
+                #[cfg(test)]
+                skip_signal: false,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = child;
+            Ok(Self {
+                armed: true,
+                #[cfg(test)]
+                termination_calls: None,
+                #[cfg(test)]
+                skip_signal: false,
+            })
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn terminate(&mut self) -> anyhow::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        #[cfg(test)]
+        if let Some(calls) = &self.termination_calls {
+            calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.skip_signal {
+                self.armed = false;
+                return Ok(());
+            }
+        }
+        #[cfg(unix)]
+        {
+            // SAFETY: `pgid` is captured from a child spawned with
+            // `process_group(0)` and is never exposed outside its owner.
+            let rc = unsafe { libc::killpg(self.pgid, libc::SIGKILL) };
+            if rc != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(anyhow::anyhow!(
+                        "failed to kill session-worker process group {}: {error}",
+                        self.pgid
+                    ));
+                }
+            }
+        }
+        self.armed = false;
+        Ok(())
+    }
+
+    const fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    #[cfg(test)]
+    const fn test_stub(termination_calls: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            #[cfg(unix)]
+            pgid: 1,
+            armed: true,
+            termination_calls: Some(termination_calls),
+            skip_signal: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn observe_termination_calls(&mut self, termination_calls: Arc<std::sync::atomic::AtomicUsize>) {
+        self.termination_calls = Some(termination_calls);
+    }
+}
+
+enum ProcessOutputDrain {
+    Finished { stdout: Vec<u8>, stderr: Vec<u8> },
+    TerminationFailed(String),
+}
+
+enum OwnedProcessPhase {
+    Exited {
+        status: std::process::ExitStatus,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    Terminated(String),
+    TerminationFailed(String),
+}
+
+async fn drain_process_output_after_leader_exit(
+    stdout_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    process_control: &ProcessRunControl,
+    drain_timeout: std::time::Duration,
+) -> anyhow::Result<ProcessOutputDrain> {
+    let stdout_abort = stdout_task.abort_handle();
+    let stderr_abort = stderr_task.abort_handle();
+    let drain = async move {
+        let stdout = stdout_task.await??;
+        let stderr = stderr_task.await??;
+        Ok::<_, anyhow::Error>(ProcessOutputDrain::Finished { stdout, stderr })
+    };
+    tokio::pin!(drain);
+
+    tokio::select! {
+        biased;
+        output = &mut drain => output,
+        reason = process_control.termination_requested() => {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            Ok(ProcessOutputDrain::TerminationFailed(format!(
+                "termination requested after session-worker leader exit ({reason}); process group ownership was already relinquished"
+            )))
+        }
+        () = tokio::time::sleep(drain_timeout) => {
+            stdout_abort.abort();
+            stderr_abort.abort();
+            anyhow::bail!(
+                "session-worker descendants held output pipes open after leader exit for {}s",
+                drain_timeout.as_secs_f64()
+            )
+        }
+    }
+}
+
+const fn relinquish_process_group_after_leader_exit(process_group: &mut OwnedProcessGroup) {
+    // Once wait() has reaped the leader, the numeric PGID is no longer a safe
+    // capability: the group may be empty and the id may be reused immediately.
+    process_group.disarm();
+}
+
+async fn run_owned_child_phase(
+    child: &mut tokio::process::Child,
+    process_group: &mut OwnedProcessGroup,
+    stdout_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    stderr_task: tokio::task::JoinHandle<anyhow::Result<Vec<u8>>>,
+    parent_timeout: std::time::Duration,
+    process_control: &ProcessRunControl,
+) -> anyhow::Result<OwnedProcessPhase> {
+    let process_exit = match wait_for_owned_process(
+        child,
+        process_group,
+        parent_timeout,
+        process_control,
+        #[cfg(test)]
+        false,
+    )
+    .await
+    {
+        Ok(exit) => exit,
+        Err(error) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            return Err(error);
+        }
+    };
+
+    match process_exit {
+        OwnedChildExit::Exited(status) => {
+            relinquish_process_group_after_leader_exit(process_group);
+            match drain_process_output_after_leader_exit(
+                stdout_task,
+                stderr_task,
+                process_control,
+                std::time::Duration::from_secs(PROCESS_OUTPUT_DRAIN_TIMEOUT_SECS),
+            )
+            .await?
+            {
+                ProcessOutputDrain::Finished { stdout, stderr } => {
+                    Ok(OwnedProcessPhase::Exited { status, stdout, stderr })
+                }
+                ProcessOutputDrain::TerminationFailed(error) => Ok(OwnedProcessPhase::TerminationFailed(error)),
+            }
+        }
+        OwnedChildExit::Terminated(reason) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Ok(OwnedProcessPhase::Terminated(reason))
+        }
+        OwnedChildExit::TerminationFailed(error) => {
+            stdout_task.abort();
+            stderr_task.abort();
+            Ok(OwnedProcessPhase::TerminationFailed(error))
+        }
+    }
+}
+
+async fn run_spawned_child_lifecycle(
+    child: &mut tokio::process::Child,
+    process_group: &mut OwnedProcessGroup,
+    payload: &str,
+    parent_timeout: std::time::Duration,
+    process_control: &ProcessRunControl,
+    #[cfg(test)] panic_before_wait: bool,
+) -> anyhow::Result<OwnedProcessPhase> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(payload.as_bytes()).await?;
+        stdin.write_all(b"\n").await?;
+        stdin.flush().await?;
+    }
+
+    let stdout_stream = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("session-worker stdout pipe was not configured"))?;
+    let stderr_stream = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut stdout_buf = Vec::new();
+        let bytes_read = stdout_stream
+            .take(MAX_SUBPROCESS_OUTPUT)
+            .read_to_end(&mut stdout_buf)
+            .await?;
+        if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
+            tracing::warn!(
+                limit_bytes = MAX_SUBPROCESS_OUTPUT,
+                "session-worker stdout reached size limit; output truncated"
+            );
+            stdout_buf.extend_from_slice(b"\n[output truncated at 10MB]");
+        }
+        Ok::<Vec<u8>, anyhow::Error>(stdout_buf)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut stderr_buf = Vec::new();
+        let bytes_read = stderr_stream
+            .take(MAX_SUBPROCESS_OUTPUT)
+            .read_to_end(&mut stderr_buf)
+            .await?;
+        if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
+            tracing::warn!(
+                limit_bytes = MAX_SUBPROCESS_OUTPUT,
+                "session-worker stderr reached size limit; output truncated"
+            );
+            stderr_buf.extend_from_slice(b"\n[output truncated at 10MB]");
+        }
+        Ok::<Vec<u8>, anyhow::Error>(stderr_buf)
+    });
+
+    #[cfg(test)]
+    assert!(!panic_before_wait, "injected owned-child lifecycle panic");
+
+    run_owned_child_phase(
+        child,
+        process_group,
+        stdout_task,
+        stderr_task,
+        parent_timeout,
+        process_control,
+    )
+    .await
+}
+
+async fn cleanup_owned_child_after_panic(
+    child: &mut tokio::process::Child,
+    process_group: &mut OwnedProcessGroup,
+    #[cfg(test)] inject_try_wait_error: bool,
+) -> anyhow::Result<()> {
+    #[cfg(test)]
+    if inject_try_wait_error {
+        relinquish_process_group_after_leader_exit(process_group);
+        return hold_unresolved_child_ownership(child, "injected panic-cleanup try_wait error").await;
+    }
+    match child.try_wait() {
+        Ok(Some(_)) => {
+            relinquish_process_group_after_leader_exit(process_group);
+            Ok(())
+        }
+        Ok(None) => {
+            terminate_owned_child(child, process_group).await?;
+            Ok(())
+        }
+        Err(error) => {
+            relinquish_process_group_after_leader_exit(process_group);
+            hold_unresolved_child_ownership(child, error).await
+        }
+    }
+}
+
+fn cleanup_process_worker_workspace(run_id: &str, worker_workspace: &std::path::Path, keep_workspace: bool) {
+    if !keep_workspace {
+        if let Err(error) = std::fs::remove_dir_all(worker_workspace) {
+            tracing::warn!(
+                run_id,
+                "Failed to cleanup worker workspace {}: {error}",
+                worker_workspace.display()
             );
         }
     }
@@ -2847,9 +3619,8 @@ async fn run_sub_agent_process(
     memory_strategy: &str,
     event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
-) -> anyhow::Result<WorkerResult> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
+    process_control: &ProcessRunControl,
+) -> anyhow::Result<ProcessWorkerOutcome> {
     let worker_workspace = worker_workspace_root.join(run_id);
     std::fs::create_dir_all(&worker_workspace)?;
     let shared_memory_db_path = shared_worker_memory_db_path(workspace_root);
@@ -2921,6 +3692,11 @@ async fn run_sub_agent_process(
         compaction_config,
     )?;
 
+    if let Some(reason) = process_control.termination_reason() {
+        cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+        return Ok(ProcessWorkerOutcome::Terminated(reason));
+    }
+
     let executable = std::env::current_exe()?;
     let cli_args = build_session_worker_cli_args(&manifest)?;
     let mut command = tokio::process::Command::new(executable);
@@ -2930,16 +3706,22 @@ async fn run_sub_agent_process(
         .args(cli_args)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
 
+    let payload = serde_json::to_string(&manifest)?;
     let mut child = command.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let payload = serde_json::to_string(&manifest)?;
-        stdin.write_all(payload.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await?;
-    }
-
+    let mut process_group = match OwnedProcessGroup::from_child(&child) {
+        Ok(group) => group,
+        Err(error) => {
+            start_kill_and_reap_direct_child(&mut child)
+                .await
+                .map_err(|cleanup_error| anyhow::anyhow!("{error}; direct-child cleanup failed: {cleanup_error}"))?;
+            return Err(error);
+        }
+    };
     // `timeout_secs == 0` means "no timeout" — the child (see
     // `session_worker/runner.rs`) runs until natural completion, so the parent
     // must not kill it prematurely. We use a far-future cap (30 days) as an
@@ -2951,71 +3733,55 @@ async fn run_sub_agent_process(
     } else {
         std::time::Duration::from_secs(timeout_secs)
     };
-    let stdout_stream = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("session-worker stdout pipe was not configured"))?;
-    let stderr_stream = child
-        .stderr
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("session-worker stderr pipe was not configured"))?;
-
-    const MAX_SUBPROCESS_OUTPUT: u64 = 10 * 1024 * 1024; // 10 MB per stream
-
-    let process_outcome = tokio::time::timeout(parent_timeout, async {
-        let stdout_future = async {
-            let mut stdout_buf = Vec::new();
-            let bytes_read = stdout_stream
-                .take(MAX_SUBPROCESS_OUTPUT)
-                .read_to_end(&mut stdout_buf)
-                .await?;
-            if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
-                tracing::warn!(
-                    limit_bytes = MAX_SUBPROCESS_OUTPUT,
-                    "session-worker stdout reached size limit; output truncated"
-                );
-                stdout_buf.extend_from_slice(b"\n[output truncated at 10MB]");
-            }
-            Ok::<Vec<u8>, anyhow::Error>(stdout_buf)
-        };
-        let stderr_future = async {
-            let mut stderr_buf = Vec::new();
-            let bytes_read = stderr_stream
-                .take(MAX_SUBPROCESS_OUTPUT)
-                .read_to_end(&mut stderr_buf)
-                .await?;
-            if bytes_read as u64 >= MAX_SUBPROCESS_OUTPUT {
-                tracing::warn!(
-                    limit_bytes = MAX_SUBPROCESS_OUTPUT,
-                    "session-worker stderr reached size limit; output truncated"
-                );
-                stderr_buf.extend_from_slice(b"\n[output truncated at 10MB]");
-            }
-            Ok::<Vec<u8>, anyhow::Error>(stderr_buf)
-        };
-
-        let (status_result, stdout_result, stderr_result) = tokio::join!(
-            wait_with_parent_timeout(&mut child, parent_timeout),
-            stdout_future,
-            stderr_future
-        );
-
-        let status = status_result?;
-        let stdout = stdout_result?;
-        let stderr = stderr_result?;
-        Ok::<(std::process::ExitStatus, Vec<u8>, Vec<u8>), anyhow::Error>((status, stdout, stderr))
-    })
+    let owned_phase = std::panic::AssertUnwindSafe(run_spawned_child_lifecycle(
+        &mut child,
+        &mut process_group,
+        &payload,
+        parent_timeout,
+        process_control,
+        #[cfg(test)]
+        false,
+    ))
+    .catch_unwind()
     .await;
-
-    let (status, stdout, stderr) = match process_outcome {
-        Ok(result) => result?,
+    let owned_phase = match owned_phase {
+        Ok(Ok(phase)) => phase,
+        Ok(Err(error)) => {
+            let cleanup = cleanup_owned_child_after_panic(
+                &mut child,
+                &mut process_group,
+                #[cfg(test)]
+                false,
+            )
+            .await;
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+            cleanup.map_err(|cleanup_error| {
+                anyhow::anyhow!("session-worker lifecycle failed: {error}; cleanup failed: {cleanup_error}")
+            })?;
+            return Err(error);
+        }
         Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            anyhow::bail!(
-                "session-worker process pipeline exceeded timeout of {}s",
-                parent_timeout.as_secs()
-            );
+            let cleanup = cleanup_owned_child_after_panic(
+                &mut child,
+                &mut process_group,
+                #[cfg(test)]
+                false,
+            )
+            .await;
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+            cleanup.map_err(|error| anyhow::anyhow!("process owner panicked; cleanup failed: {error}"))?;
+            anyhow::bail!("process owner panicked while owning session-worker child");
+        }
+    };
+    let (status, stdout, stderr) = match owned_phase {
+        OwnedProcessPhase::Exited { status, stdout, stderr } => (status, stdout, stderr),
+        OwnedProcessPhase::Terminated(reason) => {
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+            return Ok(ProcessWorkerOutcome::Terminated(reason));
+        }
+        OwnedProcessPhase::TerminationFailed(error) => {
+            cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
+            return Ok(ProcessWorkerOutcome::TerminationFailed(error));
         }
     };
     let output = std::process::Output { status, stdout, stderr };
@@ -3030,15 +3796,7 @@ async fn run_sub_agent_process(
         )
     })?;
 
-    if !keep_workspace {
-        if let Err(error) = std::fs::remove_dir_all(&worker_workspace) {
-            tracing::warn!(
-                run_id = run_id,
-                "Failed to cleanup worker workspace {}: {error}",
-                worker_workspace.display()
-            );
-        }
-    }
+    cleanup_process_worker_workspace(run_id, &worker_workspace, keep_workspace);
 
     if !output.status.success() && parsed.success {
         return Err(anyhow::anyhow!(
@@ -3047,7 +3805,7 @@ async fn run_sub_agent_process(
         ));
     }
 
-    Ok(parsed)
+    Ok(ProcessWorkerOutcome::Finished(parsed))
 }
 
 #[cfg(test)]
@@ -3069,6 +3827,7 @@ mod tests {
     use anyhow::anyhow;
     use std::collections::HashMap;
     use std::sync::Arc;
+    use tokio::io::AsyncReadExt;
     use tokio::sync::Mutex;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -4486,6 +5245,7 @@ mod tests {
                 recipient: None,
                 channel_name: None,
                 abort_handle: None,
+                process_control: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: None,
                 parent_run_id: None,
@@ -4545,6 +5305,91 @@ mod tests {
         assert_eq!(payload["owner_id"].as_str(), Some("owner-a"));
         assert_eq!(payload["topic_id"].as_str(), Some("topic-a"));
         assert_eq!(payload["source_message_event_id"].as_str(), Some("msg-a"));
+    }
+
+    #[tokio::test]
+    async fn sessions_spawn_process_kill_waits_for_owner_and_is_idempotent() {
+        let (channel, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(channel),
+            Arc::new(EchoProvider {
+                response: "done".to_string(),
+            }),
+        );
+        let control = ProcessRunControl::new();
+        let mut run = restore_test_run("process-run", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        tool.active_runs.write().await.push(run);
+        let owner = {
+            let control = control.clone();
+            let runs = tool.active_runs.clone();
+            tokio::spawn(async move {
+                let reason = control.termination_requested().await;
+                assert_eq!(reason, "killed by user");
+                runs.write().await[0].status = SubAgentStatus::Failed(reason);
+                control.finalize(ProcessFinalization::Terminated);
+            })
+        };
+        let args = || {
+            json!({
+                "action": "kill",
+                "run_id": "process-run",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "sessions_spawn",
+                        "sessions_spawn:kill:process-run",
+                        "test",
+                        None
+                    )).unwrap()
+            })
+        };
+
+        let first = tool.execute(args()).await.unwrap();
+        assert!(first.success);
+        owner.await.unwrap();
+        let repeated = tool.execute(args()).await.unwrap();
+        assert!(repeated.success);
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+    }
+
+    #[tokio::test]
+    async fn sessions_spawn_process_kill_reports_pending_without_claiming_owner_failure() {
+        let (channel, _) = RecordingChannel::new();
+        let tool = make_tool(
+            Arc::new(channel),
+            Arc::new(EchoProvider {
+                response: "done".to_string(),
+            }),
+        );
+        let control = ProcessRunControl::new_with_request_timeout(std::time::Duration::from_millis(20));
+        let mut run = restore_test_run("pending-process", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        tool.active_runs.write().await.push(run);
+
+        let result = tool
+            .execute(json!({
+                "action": "kill",
+                "run_id": "pending-process",
+                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
+                    serde_json::to_value(ApprovalGrant::for_resource_operation(
+                        "sessions_spawn",
+                        "sessions_spawn:kill:pending-process",
+                        "test",
+                        None
+                    )).unwrap()
+            }))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let error = result.error.unwrap();
+        assert!(error.contains("still pending reap"));
+        assert!(!error.contains("could not be terminated"));
+        assert_eq!(control.finalization(), None);
+        assert!(matches!(
+            tool.active_runs.read().await[0].status,
+            SubAgentStatus::Running
+        ));
     }
 
     #[tokio::test]
@@ -4691,6 +5536,7 @@ mod tests {
                 recipient: None,
                 channel_name: None,
                 abort_handle: None,
+                process_control: None,
                 history: Arc::new(RwLock::new(Vec::new())),
                 steer_tx: Some(steer_tx),
                 parent_run_id: None,
@@ -4804,6 +5650,7 @@ mod tests {
                 recipient: None,
                 channel_name: None,
                 abort_handle: None,
+                process_control: None,
                 history,
                 steer_tx: None,
                 parent_run_id: Some("parent".to_string()),
@@ -5066,6 +5913,7 @@ mod tests {
         assert_eq!(lineage.source_message_event_id.as_deref(), Some("msg-a"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn process_mode_parent_timeout_kills_stuck_process() {
         let mut command = tokio::process::Command::new("sleep");
@@ -5073,16 +5921,655 @@ mod tests {
         command
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
         let mut child = command.spawn().unwrap();
+        let control = ProcessRunControl::new();
+        let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        process_group.observe_termination_calls(calls.clone());
 
-        let result = wait_with_parent_timeout(&mut child, std::time::Duration::from_millis(50)).await;
+        let result = wait_for_owned_process(
+            &mut child,
+            &mut process_group,
+            std::time::Duration::from_millis(50),
+            &control,
+            false,
+        )
+        .await;
         assert!(result.is_err());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!process_group.armed);
         assert!(
             result
                 .unwrap_err()
                 .to_string()
                 .contains("session-worker exceeded parent timeout")
+        );
+    }
+
+    #[cfg(unix)]
+    async fn assert_explicit_cleanup_signals_once() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("300")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
+        process_group.observe_termination_calls(calls.clone());
+
+        terminate_owned_child(&mut child, &mut process_group).await.unwrap();
+
+        assert!(
+            !process_group.armed,
+            "the single group owner must be disarmed before the direct child is reaped"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn live_termination_disarms_single_group_owner_before_reap() {
+        assert_explicit_cleanup_signals_once().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_error_cleanup_signals_group_once() {
+        assert_explicit_cleanup_signals_once().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn pipe_setup_error_cleanup_signals_group_once() {
+        assert_explicit_cleanup_signals_once().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owned_child_panic_cleanup_signals_once_and_reaps_before_return() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("300")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().unwrap();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
+        process_group.observe_termination_calls(calls.clone());
+
+        let control = ProcessRunControl::new();
+        let panic_result = std::panic::AssertUnwindSafe(run_spawned_child_lifecycle(
+            &mut child,
+            &mut process_group,
+            "{}",
+            std::time::Duration::from_secs(30),
+            &control,
+            true,
+        ))
+        .catch_unwind()
+        .await;
+        assert!(panic_result.is_err());
+        cleanup_owned_child_after_panic(&mut child, &mut process_group, false)
+            .await
+            .unwrap();
+
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(!process_group.armed);
+        assert!(
+            child.try_wait().unwrap().is_some(),
+            "direct child must be reaped before cleanup returns"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn owner_mediated_process_kill_reaps_leader_and_terminates_group() {
+        let temp = tempfile::tempdir().expect("test temp directory should be created");
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > '{}'; wait",
+                descendant_pid_file.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .process_group(0);
+        let child = command.spawn().expect("test child should spawn");
+        let pid = child.id().expect("test child should have a pid");
+        let control = ProcessRunControl::new();
+        let owner_control = control.clone();
+        let monitor = tokio::spawn(async move {
+            let mut child = child;
+            let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
+            let result = wait_for_owned_process(
+                &mut child,
+                &mut process_group,
+                std::time::Duration::from_secs(30),
+                owner_control.as_ref(),
+                false,
+            )
+            .await;
+            let finalization = match result {
+                Ok(OwnedChildExit::Terminated(_)) => ProcessFinalization::Terminated,
+                _ => ProcessFinalization::Natural,
+            };
+            owner_control.finalize(finalization);
+        });
+
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = tokio::fs::read_to_string(&descendant_pid_file).await {
+                    if let Ok(pid) = raw.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("background descendant pid should be published");
+
+        assert_eq!(
+            control.request_termination("test termination").await,
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+        monitor.await.expect("process owner should finish");
+        let leader_pid = i32::try_from(pid).expect("test pid should fit pid_t");
+        let process_exists = |pid| {
+            // SAFETY: signal 0 sends no signal; it only probes test-owned pids.
+            (unsafe { libc::kill(pid, 0) }) == 0
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while process_exists(leader_pid) || process_exists(descendant_pid) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process owner must reap its leader and terminate the descendant group");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[allow(unsafe_code)]
+    async fn termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe() {
+        let temp = tempfile::tempdir().expect("test temp directory should be created");
+        let descendant_pid_file = temp.path().join("descendant.pid");
+        let mut command = tokio::process::Command::new("sh");
+        command
+            .arg("-c")
+            .arg(format!(
+                "sleep 300 & echo $! > '{}'; exit 0",
+                descendant_pid_file.display()
+            ))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .process_group(0);
+        let mut child = command.spawn().expect("test leader should spawn");
+        let mut process_group = OwnedProcessGroup::from_child(&child).unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let mut stderr = child.stderr.take().unwrap();
+        let stdout_reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).await?;
+            Ok::<_, anyhow::Error>(output)
+        });
+        let stderr_reader = tokio::spawn(async move {
+            let mut output = Vec::new();
+            stderr.read_to_end(&mut output).await?;
+            Ok::<_, anyhow::Error>(output)
+        });
+        child.wait().await.expect("leader should exit naturally");
+        relinquish_process_group_after_leader_exit(&mut process_group);
+
+        let descendant_pid = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(raw) = tokio::fs::read_to_string(&descendant_pid_file).await {
+                    if let Ok(pid) = raw.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("descendant pid should be published");
+        // SAFETY: signal 0 only probes the test-owned descendant PID.
+        assert!((unsafe { libc::kill(descendant_pid, 0) }) == 0);
+
+        let control = ProcessRunControl::new();
+        let request = {
+            let control = control.clone();
+            tokio::spawn(async move { control.request_termination("kill after leader exit").await })
+        };
+        tokio::task::yield_now().await;
+        let owner_control = control.clone();
+        let owner = tokio::spawn(async move {
+            let outcome = drain_process_output_after_leader_exit(
+                stdout_reader,
+                stderr_reader,
+                owner_control.as_ref(),
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            .unwrap();
+            let finalization = match outcome {
+                ProcessOutputDrain::TerminationFailed(_) => ProcessFinalization::TerminationFailed,
+                ProcessOutputDrain::Finished { .. } => ProcessFinalization::Natural,
+            };
+            owner_control.finalize(finalization);
+        });
+        let request = tokio::time::timeout(std::time::Duration::from_secs(2), request)
+            .await
+            .expect("kill request must still reach the owner after leader exit")
+            .unwrap();
+        owner.await.unwrap();
+
+        assert_eq!(
+            request,
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::TerminationFailed)
+        );
+        // The owner deliberately relinquished the PGID after reaping the
+        // leader; clean up this test-only escaped descendant by its known pid.
+        // SAFETY: this PID was created by the test fixture and is cleaned up here.
+        let _ = unsafe { libc::kill(descendant_pid, libc::SIGKILL) };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            // SAFETY: signal 0 only probes the same test-owned descendant PID.
+            while (unsafe { libc::kill(descendant_pid, 0) }) == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("test descendant should exit after explicit fixture cleanup");
+    }
+
+    #[test]
+    fn normal_leader_output_completion_disarms_group_without_signal() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut process_group = OwnedProcessGroup::test_stub(calls.clone());
+            relinquish_process_group_after_leader_exit(&mut process_group);
+            assert!(!process_group.armed);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn inherited_pipe_after_leader_reap_relinquishes_without_signal() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        {
+            let mut process_group = OwnedProcessGroup::test_stub(calls.clone());
+            relinquish_process_group_after_leader_exit(&mut process_group);
+            assert!(!process_group.armed);
+        }
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_termination_requests_share_one_finalization() {
+        let control = ProcessRunControl::new();
+        let first = {
+            let control = control.clone();
+            tokio::spawn(async move { control.request_termination("first reason").await })
+        };
+        let second = {
+            let control = control.clone();
+            tokio::spawn(async move { control.request_termination("second reason").await })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(control.finalization(), None, "requesters must wait for the owner");
+        control.finalize(ProcessFinalization::Terminated);
+
+        assert_eq!(
+            first.await.unwrap(),
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+        assert_eq!(
+            second.await.unwrap(),
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+        assert_eq!(
+            control.request_termination("repeated after finalization").await,
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+    }
+
+    #[tokio::test]
+    async fn termination_request_timeout_does_not_finalize_or_release_slot() {
+        let control = ProcessRunControl::new();
+        let mut runs = vec![restore_test_run("process-run", SubAgentStatus::Running)];
+        runs[0].process_control = Some(control.clone());
+
+        let result = control
+            .request_termination_with_timeout("stuck owner", std::time::Duration::from_millis(20))
+            .await;
+
+        assert_eq!(result, ProcessTerminationRequestResult::Pending);
+        assert_eq!(control.finalization(), None);
+        assert_eq!(running_run_count(&runs), 1);
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn termination_request_timeout_observes_boundary_finalization() {
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let control = ProcessRunControl::new_timeout_boundary_for_test(barrier.clone());
+        let requester = {
+            let control = control.clone();
+            tokio::spawn(async move { control.request_termination("boundary finalization").await })
+        };
+
+        barrier.wait().await;
+        control.finalize(ProcessFinalization::Terminated);
+        barrier.wait().await;
+
+        assert_eq!(
+            requester.await.unwrap(),
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_keeps_child_after_requester_timeout_until_reap() {
+        let mut command = tokio::process::Command::new("sleep");
+        command
+            .arg("0.2")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let control = ProcessRunControl::new();
+        let owner_control = control.clone();
+        let owner = tokio::spawn(async move {
+            let mut child = child;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut process_group = OwnedProcessGroup::test_stub(calls);
+            let exit = wait_for_owned_process(
+                &mut child,
+                &mut process_group,
+                std::time::Duration::from_secs(30),
+                owner_control.as_ref(),
+                false,
+            )
+            .await
+            .unwrap();
+            assert!(matches!(exit, OwnedChildExit::Terminated(_)));
+            owner_control.finalize(ProcessFinalization::Terminated);
+        });
+
+        let result = control
+            .request_termination_with_timeout("slow reap", std::time::Duration::from_millis(20))
+            .await;
+        assert_eq!(result, ProcessTerminationRequestResult::Pending);
+        assert_eq!(control.finalization(), None);
+        assert!(!owner.is_finished(), "owner must retain Child while reap is pending");
+
+        owner.await.unwrap();
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_wait_error_keeps_child_finalization_and_slot_pending() {
+        let mut command = tokio::process::Command::new("true");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let control = ProcessRunControl::new_with_request_timeout(std::time::Duration::from_millis(20));
+        let mut runs = vec![restore_test_run("unresolved-process", SubAgentStatus::Running)];
+        runs[0].process_control = Some(control.clone());
+        let owner_control = control.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let owner_calls = calls.clone();
+        let owner = tokio::spawn(async move {
+            let mut child = child;
+            let mut process_group = OwnedProcessGroup::test_stub(owner_calls);
+            let _ = wait_for_owned_process(
+                &mut child,
+                &mut process_group,
+                std::time::Duration::from_secs(30),
+                owner_control.as_ref(),
+                true,
+            )
+            .await;
+        });
+
+        assert_eq!(
+            control.request_termination("unresolved wait").await,
+            ProcessTerminationRequestResult::Pending
+        );
+        assert_eq!(control.finalization(), None);
+        assert_eq!(running_run_count(&runs), 1);
+        assert!(!owner.is_finished());
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        owner.abort();
+        let _ = owner.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_termination_wait_error_keeps_owner_pending() {
+        let mut command = tokio::process::Command::new("true");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let control = ProcessRunControl::new_with_request_timeout(std::time::Duration::from_millis(20));
+        let owner_control = control.clone();
+        let owner = tokio::spawn(async move {
+            let mut child = child;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut process_group = OwnedProcessGroup::test_stub(calls);
+            let reason = owner_control.termination_requested().await;
+            assert_eq!(reason, "termination wait error");
+            process_group.terminate().unwrap();
+            let _ = wait_for_reap_after_group_termination(&mut child, true).await;
+        });
+
+        assert_eq!(
+            control.request_termination("termination wait error").await,
+            ProcessTerminationRequestResult::Pending
+        );
+        assert_eq!(control.finalization(), None);
+        assert!(!owner.is_finished());
+
+        owner.abort();
+        let _ = owner.await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn injected_panic_cleanup_try_wait_error_keeps_owner_pending() {
+        let mut command = tokio::process::Command::new("true");
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        let child = command.spawn().unwrap();
+        let control = ProcessRunControl::new_with_request_timeout(std::time::Duration::from_millis(20));
+        let owner = tokio::spawn(async move {
+            let mut child = child;
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut process_group = OwnedProcessGroup::test_stub(calls);
+            let _ = cleanup_owned_child_after_panic(&mut child, &mut process_group, true).await;
+        });
+
+        assert_eq!(
+            control.request_termination("panic cleanup unresolved").await,
+            ProcessTerminationRequestResult::Pending
+        );
+        assert_eq!(control.finalization(), None);
+        assert!(!owner.is_finished());
+
+        owner.abort();
+        let _ = owner.await;
+    }
+
+    #[tokio::test]
+    async fn owner_panic_commits_failed_registry_state_before_finalization() {
+        let control = ProcessRunControl::new();
+        let mut run = restore_test_run("process-run", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+
+        let panic_result = std::panic::AssertUnwindSafe(async {
+            panic!("simulated process owner panic");
+        })
+        .catch_unwind()
+        .await;
+        assert!(panic_result.is_err());
+        commit_process_owner_failure_if_unfinalized(
+            &runs,
+            "process-run",
+            control.as_ref(),
+            "process owner panicked".to_string(),
+        )
+        .await;
+
+        let runs = runs.read().await;
+        assert!(matches!(runs[0].status, SubAgentStatus::Failed(ref error) if error == "process owner panicked"));
+        assert_eq!(control.finalization(), Some(ProcessFinalization::TerminationFailed));
+        assert_eq!(running_run_count(&runs), 0);
+    }
+
+    #[tokio::test]
+    async fn terminal_commit_does_not_release_slot_before_control_finalization() {
+        let control = ProcessRunControl::new();
+        let mut run = restore_test_run("process-run", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let commit = {
+            let runs = runs.clone();
+            let control = control.clone();
+            tokio::spawn(async move {
+                commit_process_terminal_state(
+                    &runs,
+                    "process-run",
+                    SubAgentStatus::Failed("killed".to_string()),
+                    Vec::new(),
+                    control.as_ref(),
+                    ProcessFinalization::Terminated,
+                    Some(ProcessTerminalCommitHook {
+                        entered: entered_tx,
+                        release: release_rx,
+                    }),
+                )
+                .await;
+            })
+        };
+
+        entered_rx.await.expect("commit should reach the guarded window");
+        assert_eq!(control.finalization(), None);
+        let early_visibility = tokio::time::timeout(std::time::Duration::from_millis(50), async {
+            running_run_count(&runs.read().await)
+        })
+        .await;
+        assert!(
+            early_visibility.is_err(),
+            "registry readers must remain blocked until status and finalization commit together"
+        );
+
+        release_tx.send(()).unwrap();
+        commit.await.unwrap();
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+        assert_eq!(running_run_count(&runs.read().await), 0);
+    }
+
+    #[tokio::test]
+    async fn process_termination_keeps_concurrency_slot_until_owner_finalizes() {
+        let control = ProcessRunControl::new();
+        let mut runs = vec![restore_test_run("process-run", SubAgentStatus::Running)];
+        runs[0].process_control = Some(control.clone());
+        let requester = {
+            let control = control.clone();
+            tokio::spawn(async move { control.request_termination("shutdown").await })
+        };
+
+        tokio::task::yield_now().await;
+        assert_eq!(running_run_count(&runs), 1);
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
+
+        runs[0].status = SubAgentStatus::Failed("shutdown".to_string());
+        control.finalize(ProcessFinalization::Terminated);
+        assert_eq!(
+            requester.await.unwrap(),
+            ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+        );
+        assert_eq!(running_run_count(&runs), 0);
+    }
+
+    #[tokio::test]
+    async fn process_termination_records_killed_terminal_event_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), "/tmp");
+        let scope = MessageEventScope::new("sessions_spawn", MemoryVisibility::Workspace)
+            .with_session_key("process-kill-event")
+            .with_run_id("process-run");
+
+        record_spawn_result_event(
+            Some(&fabric),
+            scope,
+            "Sub-agent process terminated: killed by operator",
+            &SubAgentStatus::Failed("killed by operator".to_string()),
+            &SpawnLineage::default(),
+            Some("task.killed"),
+        )
+        .await;
+
+        let events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("process-kill-event".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            events.iter().filter(|event| event.event_type == "task.killed").count(),
+            1
+        );
+        assert_eq!(
+            events.iter().filter(|event| event.event_type == "task.failed").count(),
+            0
         );
     }
 
@@ -5107,6 +6594,7 @@ mod tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: Arc::new(RwLock::new(Vec::new())),
             steer_tx: None,
             parent_run_id: None,

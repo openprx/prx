@@ -17,7 +17,7 @@ use super::model::{
     ManagedKind, ManagedSessionView, ManagedStatus, project_run, project_shell, project_shell_status, project_status,
 };
 use super::shell::ShellSession;
-use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
+use crate::tools::sessions_spawn::{ProcessFinalization, ProcessTerminationRequestResult, SubAgentRun, SubAgentStatus};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Duration, Utc};
 use parking_lot::Mutex;
@@ -596,7 +596,8 @@ impl ChatSessionsHandle {
         (report.summaries, report.ignored_ids)
     }
 
-    /// Terminate every live child and clear all live registries.
+    /// Terminate every live child and clear finalized live registry entries.
+    /// Process runs whose owner has not confirmed reap remain registered.
     pub async fn shutdown_all(&mut self, reason: &str) -> ShutdownReport {
         let views = self.snapshot().await;
         let summaries = views
@@ -604,18 +605,65 @@ impl ChatSessionsHandle {
             .map(|view| super::model::PersistedSessionSummary::from_view(view, String::new()))
             .collect::<Vec<_>>();
         let ignored_ids = views.iter().map(|view| view.id.clone()).collect::<Vec<_>>();
+        let snapshot_run_ids = views
+            .iter()
+            .filter(|view| view.kind == ManagedKind::Agent)
+            .map(|view| view.id.as_str().to_string())
+            .collect::<HashSet<_>>();
+        let snapshot_shell_ids = views
+            .iter()
+            .filter(|view| view.kind == ManagedKind::Shell)
+            .map(|view| view.id.clone())
+            .collect::<HashSet<_>>();
+        #[cfg(feature = "terminal-tui")]
+        let snapshot_pty_ids = views
+            .iter()
+            .filter(|view| view.kind == ManagedKind::Pty)
+            .map(|view| view.id.clone())
+            .collect::<HashSet<_>>();
         let mut aborted_agents = 0usize;
+        let mut process_controls = Vec::new();
         {
-            let mut runs = self.runs.write().await;
-            for run in runs.iter() {
-                if let Some(handle) = run.abort_handle.as_ref() {
+            let runs = self.runs.write().await;
+            for run in runs.iter().filter(|run| snapshot_run_ids.contains(&run.id)) {
+                if !matches!(
+                    run.status,
+                    SubAgentStatus::Running | SubAgentStatus::AwaitingInput { .. }
+                ) {
+                    continue;
+                }
+                if let Some(control) = run.process_control.clone() {
+                    process_controls.push(control);
+                } else if let Some(handle) = run.abort_handle.as_ref() {
                     handle.abort();
                     aborted_agents = aborted_agents.saturating_add(1);
                 }
             }
-            runs.clear();
         }
-        let shells = self.shells.lock().clone();
+        for control in process_controls {
+            if control.request_termination(reason).await
+                == ProcessTerminationRequestResult::Finalized(ProcessFinalization::Terminated)
+            {
+                aborted_agents = aborted_agents.saturating_add(1);
+            }
+        }
+        {
+            let mut runs = self.runs.write().await;
+            runs.retain(|run| {
+                !snapshot_run_ids.contains(&run.id)
+                    || run
+                        .process_control
+                        .as_ref()
+                        .is_some_and(|control| control.finalization().is_none())
+            });
+        }
+        let shells = self
+            .shells
+            .lock()
+            .iter()
+            .filter(|shell| snapshot_shell_ids.contains(&shell.id))
+            .cloned()
+            .collect::<Vec<_>>();
         let mut killed_shells = 0usize;
         for shell in &shells {
             if !shell.is_terminal() {
@@ -625,12 +673,20 @@ impl ChatSessionsHandle {
                 }
             }
         }
-        self.shells.lock().clear();
+        self.shells
+            .lock()
+            .retain(|shell| !snapshot_shell_ids.contains(&shell.id));
         #[cfg(feature = "terminal-tui")]
         let mut killed_ptys = 0usize;
         #[cfg(feature = "terminal-tui")]
         {
-            let ptys = self.ptys.lock().clone();
+            let ptys = self
+                .ptys
+                .lock()
+                .iter()
+                .filter(|pty| snapshot_pty_ids.contains(&pty.id))
+                .cloned()
+                .collect::<Vec<_>>();
             for pty in &ptys {
                 if !pty.has_exited() {
                     match pty.kill().await {
@@ -639,7 +695,7 @@ impl ChatSessionsHandle {
                     }
                 }
             }
-            self.ptys.lock().clear();
+            self.ptys.lock().retain(|pty| !snapshot_pty_ids.contains(&pty.id));
         }
         self.seq_map.clear();
         self.next_seq = 1;
@@ -947,7 +1003,9 @@ pub fn status_summary(views: &[ManagedSessionView]) -> String {
 #[allow(clippy::indexing_slicing)]
 mod tests {
     use super::*;
-    use crate::tools::sessions_spawn::{HistoryEntry, SubAgentRun, SubAgentStatus};
+    use crate::tools::sessions_spawn::{
+        HistoryEntry, ProcessFinalization, ProcessRunControl, SubAgentRun, SubAgentStatus,
+    };
     use chrono::Utc;
 
     fn make_run(id: &str, task: &str, status: SubAgentStatus) -> SubAgentRun {
@@ -963,6 +1021,7 @@ mod tests {
             recipient: None,
             channel_name: None,
             abort_handle: None,
+            process_control: None,
             history: Arc::new(RwLock::new(Vec::<HistoryEntry>::new())),
             steer_tx: None,
             parent_run_id: None,
@@ -1082,6 +1141,127 @@ mod tests {
         assert!(runs.read().await.is_empty(), "agent registry cleared");
         assert!(handle.shell_registry().lock().is_empty(), "shell registry cleared");
         assert!(shell.is_terminal(), "shell process group was killed");
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_waits_for_process_owner_before_clearing_registry() {
+        let control = ProcessRunControl::new_for_test();
+        let mut run = make_run("process-agent", "agent", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let owner = {
+            let control = control.clone();
+            let runs = runs.clone();
+            tokio::spawn(async move {
+                let reason = control.wait_for_termination_for_test().await;
+                assert_eq!(reason, "test-shutdown");
+                assert_eq!(runs.read().await.len(), 1, "slot remains live before finalization");
+                runs.write().await[0].status = SubAgentStatus::Failed(reason);
+                control.finalize_for_test(ProcessFinalization::Terminated);
+            })
+        };
+
+        let report = handle.shutdown_all("test-shutdown").await;
+        owner.await.unwrap();
+
+        assert_eq!(report.aborted_agents, 1);
+        assert!(runs.read().await.is_empty());
+        assert_eq!(control.finalization(), Some(ProcessFinalization::Terminated));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_retains_unfinalized_process_run() {
+        let control = ProcessRunControl::new_for_test();
+        let mut run = make_run("stuck-process", "agent", SubAgentStatus::Running);
+        run.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![run]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+
+        let report = handle.shutdown_all("test-shutdown").await;
+
+        assert_eq!(report.aborted_agents, 0);
+        assert_eq!(control.finalization(), None);
+        let runs = runs.read().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "stuck-process");
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_clears_terminal_snapshot_but_preserves_new_run() {
+        let control = ProcessRunControl::new_for_test();
+        let terminal = make_run("terminal-snapshot", "agent", SubAgentStatus::Completed("done".into()));
+        let mut process = make_run("process-snapshot", "agent", SubAgentStatus::Running);
+        process.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![terminal, process]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let owner = {
+            let control = control.clone();
+            let runs = runs.clone();
+            tokio::spawn(async move {
+                control.wait_for_termination_for_test().await;
+                runs.write()
+                    .await
+                    .push(make_run("new-window-run", "agent", SubAgentStatus::Running));
+                control.finalize_for_test(ProcessFinalization::Terminated);
+            })
+        };
+
+        let report = handle.shutdown_all("test-shutdown").await;
+        owner.await.unwrap();
+
+        assert_eq!(report.aborted_agents, 1);
+        let runs = runs.read().await;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].id, "new-window-run");
+        assert!(matches!(runs[0].status, SubAgentStatus::Running));
+    }
+
+    #[tokio::test]
+    async fn shutdown_all_preserves_shell_inserted_after_snapshot() {
+        let control = ProcessRunControl::new_for_test();
+        let mut process = make_run("process-snapshot", "agent", SubAgentStatus::Running);
+        process.process_control = Some(control.clone());
+        let runs = Arc::new(RwLock::new(vec![process]));
+        let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
+        let (sink, _rx) = super::super::event::SessionEventSink::channel();
+        let sec = permissive_security();
+        let initial_shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("initial shell");
+        let new_shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("new shell");
+        handle.add_shell(initial_shell.clone());
+        let shell_registry = handle.shell_registry();
+        let owner = {
+            let control = control.clone();
+            let shell_registry = shell_registry.clone();
+            let new_shell = new_shell.clone();
+            tokio::spawn(async move {
+                control.wait_for_termination_for_test().await;
+                shell_registry.lock().push(new_shell);
+                control.finalize_for_test(ProcessFinalization::Terminated);
+            })
+        };
+
+        let report = handle.shutdown_all("test-shutdown").await;
+        owner.await.unwrap();
+
+        assert_eq!(report.killed_shells, 1);
+        assert!(initial_shell.is_terminal());
+        assert!(!new_shell.is_terminal());
+        {
+            let remaining = shell_registry.lock();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, new_shell.id);
+        }
+        assert!(!report.ignored_ids.contains(&new_shell.id));
+        assert!(
+            !report
+                .summaries
+                .iter()
+                .any(|summary| summary.id == new_shell.id.as_str())
+        );
+
+        new_shell.kill().await.unwrap();
     }
 
     #[tokio::test]
