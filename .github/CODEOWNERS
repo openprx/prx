@@ -1,28 +1,28 @@
 # Default owner for all files
-* @theonlyhennygod
+* @g1e2x87
 
 # High-risk surfaces
-/src/security/** @willsarg
-/src/runtime/** @theonlyhennygod
-/src/memory/** @theonlyhennygod @chumyin
-/.github/** @theonlyhennygod
-/Cargo.toml @theonlyhennygod
-/Cargo.lock @theonlyhennygod
+/src/security/** @g1e2x87
+/src/runtime/** @g1e2x87
+/src/memory/** @g1e2x87
+/.github/** @g1e2x87
+/Cargo.toml @g1e2x87
+/Cargo.lock @g1e2x87
 
 # CI
-/.github/workflows/**  @theonlyhennygod @willsarg
-/.github/codeql/**     @willsarg
-/.github/dependabot.yml @willsarg
+/.github/workflows/**  @g1e2x87
+/.github/codeql/**     @g1e2x87
+/.github/dependabot.yml @g1e2x87
 
 # Docs & governance
-/docs/**                @chumyin
-/AGENTS.md              @chumyin
-/CLAUDE.md              @chumyin
-/CONTRIBUTING.md        @chumyin
-/docs/pr-workflow.md    @chumyin
-/docs/reviewer-playbook.md @chumyin
+/docs/**                @g1e2x87
+/AGENTS.md              @g1e2x87
+/CLAUDE.md              @g1e2x87
+/CONTRIBUTING.md        @g1e2x87
+/docs/pr-workflow.md    @g1e2x87
+/docs/reviewer-playbook.md @g1e2x87
 
 # Security / CI-CD governance overrides (last-match wins)
-/SECURITY.md              @willsarg
-/docs/actions-source-policy.md @willsarg
-/docs/ci-map.md           @willsarg
+/SECURITY.md              @g1e2x87
+/docs/actions-source-policy.md @g1e2x87
+/docs/ci-map.md           @g1e2x87

@@ -271,7 +271,7 @@ use config::Config;
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
 #[command(name = "prx")]
-#[command(author = "theonlyhennygod")]
+#[command(author = "g1e2x87")]
 #[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "The fastest, smallest AI assistant.", long_about = None)]
 struct Cli {
