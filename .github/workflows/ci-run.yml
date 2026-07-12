@@ -43,7 +43,7 @@ jobs:
     lint:
         name: Lint Gate (Format + Clippy + Strict Delta)
         needs: [changes]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full'))
+        if: needs.changes.outputs.rust_changed == 'true'
         runs-on: ubuntu-latest
         timeout-minutes: 25
         steps:
@@ -71,7 +71,7 @@ jobs:
     test:
         name: Test
         needs: [changes, lint]
-        if: needs.changes.outputs.rust_changed == 'true' && (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:full')) && needs.lint.result == 'success'
+        if: needs.changes.outputs.rust_changed == 'true' && needs.lint.result == 'success'
         runs-on: ubuntu-latest
         timeout-minutes: 30
         steps:
@@ -283,8 +283,8 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$build_result" != "success" ]; then
-                      echo "Required PR build job did not pass."
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                      echo "Required PR CI jobs did not pass."
                       exit 1
                     fi
                     echo "PR required checks passed."
