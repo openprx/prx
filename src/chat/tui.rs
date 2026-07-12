@@ -3351,7 +3351,7 @@ impl TuiState {
             result: None,
             status: ToolStatus::Running,
             elapsed_ms: None,
-            folded: true,
+            folded: !tool_result_defaults_expanded(tool_name),
         });
     }
 
@@ -3488,6 +3488,10 @@ impl TuiState {
             .map(|l| estimate_line_height(l) as usize)
             .sum()
     }
+}
+
+pub(crate) fn tool_result_defaults_expanded(tool_name: &str) -> bool {
+    matches!(tool_name, "file_edit" | "file_write")
 }
 
 // ── P3-4: TuiMirrorSink adapter ─────────────────────────────────────────────
@@ -6111,16 +6115,26 @@ fn render_tool_result<'a>(
     }
 
     if folded {
-        push_folded_tool_summary(lines, hook, status, elapsed_ms, result, ascii);
+        push_folded_tool_summary(lines, hook, tool_name, status, elapsed_ms, result, ascii);
         return;
     }
 
-    push_expanded_tool_io(lines, hook, status, &display_preview, args_full, result, ascii);
+    push_expanded_tool_io(
+        lines,
+        hook,
+        tool_name,
+        status,
+        &display_preview,
+        args_full,
+        result,
+        ascii,
+    );
 }
 
 fn push_folded_tool_summary<'a>(
     lines: &mut Vec<Line<'a>>,
     hook: &str,
+    tool_name: &str,
     status: ToolStatus,
     elapsed_ms: Option<u64>,
     result: Option<&str>,
@@ -6150,10 +6164,10 @@ fn push_folded_tool_summary<'a>(
         Span::styled(status_glyph, Style::default().fg(status_color)),
         Span::styled(format!(" {metrics}"), metrics_style),
     ]));
-    push_folded_tool_result_preview(lines, result_text, ascii);
+    push_folded_tool_result_preview(lines, tool_name, result_text, ascii);
 }
 
-fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &str, ascii: bool) {
+fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, tool_name: &str, result_text: &str, ascii: bool) {
     if result_text.trim().is_empty() {
         return;
     }
@@ -6164,6 +6178,24 @@ fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &
     };
     let body_style = Style::default().fg(Color::DarkGray);
     let pipe = if ascii { "|" } else { "\u{2502}" };
+    if let Some(rendered) = tool_result_rendered_diff_body_lines(tool_name, result_text, body_style) {
+        let total_lines = rendered.len();
+        for body in rendered.iter().take(TOOL_FOLDED_RESULT_PREVIEW_LINES) {
+            push_prefixed_tool_body_line(lines, format!("    {pipe} "), body.clone(), body_style);
+        }
+        let hidden_lines = total_lines.saturating_sub(TOOL_FOLDED_RESULT_PREVIEW_LINES);
+        if hidden_lines > 0 {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {pipe} {ellipsis} +{hidden_lines} {}",
+                    if hidden_lines == 1 { "line" } else { "lines" }
+                ),
+                body_style,
+            )));
+        }
+        return;
+    }
+
     let result_lines = result_text.lines().collect::<Vec<_>>();
     let total_lines = result_lines.len();
     for body in result_lines.iter().take(TOOL_FOLDED_RESULT_PREVIEW_LINES) {
@@ -6185,6 +6217,7 @@ fn push_folded_tool_result_preview<'a>(lines: &mut Vec<Line<'a>>, result_text: &
 fn push_expanded_tool_io<'a>(
     lines: &mut Vec<Line<'a>>,
     hook: &str,
+    tool_name: &str,
     status: ToolStatus,
     display_preview: &str,
     args_full: &str,
@@ -6236,6 +6269,31 @@ fn push_expanded_tool_io<'a>(
         return;
     }
 
+    if let Some(rendered) = tool_result_rendered_diff_body_lines(tool_name, result_text, body_style) {
+        let total_lines = rendered.len();
+        let mut shown_lines = 0usize;
+        for body in rendered.iter().take(TOOL_EXPANDED_OUTPUT_MAX_LINES) {
+            push_prefixed_tool_body_line(lines, "    ".to_string(), body.clone(), body_style);
+            shown_lines = shown_lines.saturating_add(1);
+        }
+        let hidden_lines = total_lines.saturating_sub(shown_lines);
+        if hidden_lines > 0 {
+            let ellipsis = if ascii {
+                ARGS_PREVIEW_ELLIPSIS_ASCII
+            } else {
+                ARGS_PREVIEW_ELLIPSIS
+            };
+            lines.push(Line::from(Span::styled(
+                format!(
+                    "    {ellipsis} truncated: {hidden_lines} {} hidden · Ctrl+O for full transcript",
+                    if hidden_lines == 1 { "line" } else { "lines" }
+                ),
+                body_style,
+            )));
+        }
+        return;
+    }
+
     let ellipsis = if ascii {
         ARGS_PREVIEW_ELLIPSIS_ASCII
     } else {
@@ -6270,6 +6328,57 @@ fn push_expanded_tool_io<'a>(
             body_style,
         )));
     }
+}
+
+fn tool_result_rendered_diff_body_lines(
+    tool_name: &str,
+    result_text: &str,
+    prefix_style: Style,
+) -> Option<Vec<Line<'static>>> {
+    if !matches!(tool_name, "file_edit" | "file_write") {
+        return None;
+    }
+    let diff_start = find_tool_result_diff_start(result_text)?;
+    let (prefix, diff) = result_text.split_at(diff_start);
+    if !crate::chat::renderer::is_diff_block(diff, None) {
+        return None;
+    }
+
+    let mut lines = prefix
+        .trim_end_matches('\n')
+        .lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), prefix_style)))
+        .collect::<Vec<_>>();
+    lines.extend(ansi_sgr_to_lines(&crate::chat::renderer::render_diff_block(diff)));
+    Some(lines)
+}
+
+fn find_tool_result_diff_start(result_text: &str) -> Option<usize> {
+    let mut offset = 0usize;
+    for line in result_text.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\n', '\r']);
+        if content.starts_with("diff --git ") || content.starts_with("--- a/") || content.starts_with("--- /") {
+            return Some(offset);
+        }
+        offset = offset.saturating_add(line.len());
+    }
+    let trailing = &result_text[offset..];
+    if trailing.starts_with("diff --git ") || trailing.starts_with("--- a/") || trailing.starts_with("--- /") {
+        return Some(offset);
+    }
+    None
+}
+
+fn push_prefixed_tool_body_line<'a>(
+    lines: &mut Vec<Line<'a>>,
+    prefix: String,
+    body: Line<'static>,
+    prefix_style: Style,
+) {
+    let mut spans = Vec::with_capacity(body.spans.len().saturating_add(1));
+    spans.push(Span::styled(prefix, prefix_style));
+    spans.extend(body.spans);
+    lines.push(Line::from(spans));
 }
 
 fn tool_card_metrics(status: ToolStatus, elapsed_ms: Option<u64>, result_text: &str, ascii: bool) -> String {
@@ -7837,6 +7946,21 @@ mod tests {
     }
 
     #[test]
+    fn file_edit_and_write_cards_default_expanded() {
+        for tool_name in ["file_edit", "file_write"] {
+            let mut state = TuiState::new("p", "m");
+            state.push_tool_result_started(tool_name, r#"{"path":"src/lib.rs"}"#);
+            let idx = state.last_tool_result_index().expect("test: tool result exists");
+            match state.conversation_lines.get(idx).expect("test: idx valid") {
+                ConversationLine::ToolResult { folded, .. } => {
+                    assert!(!*folded, "{tool_name} should default to expanded");
+                }
+                other => panic!("test: expected ToolResult, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn args_preview_truncates_long_input_and_collapses_newlines() {
         let raw = "x".repeat(150);
         let prev = build_args_preview(&raw, ARGS_PREVIEW_MAX_CHARS, ARGS_PREVIEW_ELLIPSIS);
@@ -8087,6 +8211,59 @@ mod tests {
         assert!(join(2).contains("2 lines"), "output metrics: {}", join(2));
         assert!(join(3).contains("total 24"), "first body row: {}", join(3));
         assert!(join(4).contains("drwxrwxrwt"), "second body row: {}", join(4));
+    }
+
+    #[test]
+    fn render_file_edit_diff_card_uses_colored_spans() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let diff = "Applied 1 replacement in src/lib.rs\n\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old\n+new\n context\n";
+        let card = ConversationLine::ToolResult {
+            tool_name: "file_edit".to_string(),
+            args_preview: "path=src/lib.rs".to_string(),
+            args_full: r#"{"path":"src/lib.rs"}"#.to_string(),
+            result: Some(diff.to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(42),
+            folded: false,
+        };
+
+        render_conversation_line(&mut lines, &card, false);
+
+        let rendered = lines.iter().map(line_to_plain).collect::<Vec<_>>().join("\n");
+        assert!(rendered.contains("@@ -1,2 +1,2 @@"), "hunk visible: {rendered}");
+        assert!(rendered.contains("-old"), "deletion visible: {rendered}");
+        assert!(rendered.contains("+new"), "addition visible: {rendered}");
+        assert_eq!(span_fg_for_content(&lines, "-old"), Some(Color::Red));
+        assert_eq!(span_fg_for_content(&lines, "+new"), Some(Color::Green));
+        assert_eq!(span_fg_for_content(&lines, "@@ -1,2 +1,2 @@"), Some(Color::Cyan));
+    }
+
+    #[test]
+    fn render_folded_file_write_diff_preview_keeps_color() {
+        let mut lines: Vec<Line<'_>> = Vec::new();
+        let diff = "Written 5 bytes to new.txt\n\n--- /dev/null\n+++ b/new.txt\n@@ new file preview: first 40 lines @@\n   1 | hello\n";
+        let card = ConversationLine::ToolResult {
+            tool_name: "file_write".to_string(),
+            args_preview: "path=new.txt, bytes=5B".to_string(),
+            args_full: r#"{"path":"new.txt","content":"hello"}"#.to_string(),
+            result: Some(diff.to_string()),
+            status: ToolStatus::Done,
+            elapsed_ms: Some(10),
+            folded: true,
+        };
+
+        render_conversation_line(&mut lines, &card, false);
+
+        assert_eq!(
+            span_fg_for_content(&lines, "--- /dev/null"),
+            Some(Color::Gray),
+            "file header should be highlighted"
+        );
+        assert_eq!(
+            span_fg_for_content(&lines, "+++ b/new.txt"),
+            Some(Color::Gray),
+            "new file header should be highlighted"
+        );
     }
 
     #[test]

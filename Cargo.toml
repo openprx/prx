@@ -82,6 +82,7 @@ thiserror = "2.0"
 
 # String similarity for tool name suggestions
 strsim = "0.11"
+similar = "2.7"
 
 # UUID generation
 uuid = { version = "1.11", default-features = false, features = ["v4", "v7", "std"] }
