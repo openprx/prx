@@ -89,8 +89,8 @@ use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
 use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::llm::route_decision::{
-    ProviderExecutionOutcome, RouteDecision, record_provider_outcome_events, record_route_decision_event,
-    route_event_scope,
+    ProviderExecutionOutcome, RouteDecision, record_provider_outcome_events as record_raw_provider_outcome_events,
+    record_route_decision_event as record_raw_route_decision_event, route_event_scope,
 };
 use crate::memory::{
     self, CompactionRunInput, Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata,
@@ -2867,7 +2867,7 @@ async fn record_chat_user_message_event(
     memory_fabric
         .record_inbound_user_message(
             chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name),
-            user_input.to_string(),
+            sanitize::sanitize_for_persistence(user_input),
             Some(format!("chat:{}:{chat_run_id}:{turn_seq}:user", chat_session.id)),
             None,
         )
@@ -2887,9 +2887,31 @@ async fn record_chat_assistant_message_event(
             chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name)
                 .with_sender(format!("{provider_name}/{model_name}"))
                 .with_recipient("local-user"),
-            response.to_string(),
+            sanitize::sanitize_for_persistence(response),
         )
         .await
+}
+
+async fn record_route_decision_event(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    decision: &RouteDecision,
+) -> anyhow::Result<crate::memory::MessageEvent> {
+    let sanitized = sanitize::sanitize_json_structure(decision)?;
+    record_raw_route_decision_event(fabric, scope, &sanitized).await
+}
+
+async fn record_provider_outcome_events(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    outcome: &ProviderExecutionOutcome,
+) -> anyhow::Result<()> {
+    let sanitized = sanitize::sanitize_json_structure(outcome)?;
+    record_raw_provider_outcome_events(fabric, scope, &sanitized).await
+}
+
+fn sanitize_chat_semantic_memory_content(content: &str) -> String {
+    sanitize::sanitize_for_persistence(content)
 }
 
 /// Aggregate the model's reasoning/thinking content from the turn's history
@@ -6467,10 +6489,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // Auto-save user message to memory
         if config.memory.should_auto_promote_user_message(&user_input) {
             let user_key = autosave_memory_key("user_msg");
+            let safe_user_input = sanitize_chat_semantic_memory_content(&user_input);
             let _ = memory_fabric
                 .record_semantic_memory_from_event(
                     &user_key,
-                    &user_input,
+                    &safe_user_input,
                     MemoryCategory::Conversation,
                     None,
                     chat_user_event.as_ref().map(|event| event.event_id.as_str()),
@@ -7220,7 +7243,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 "Failed to append provider.final_outcome message event for empty Redux driver turn"
                             );
                         }
-                        chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
+                        chat_session.add_user_turn(&user_input);
                         if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
                             record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                             #[cfg(feature = "terminal-tui")]
@@ -7309,13 +7332,11 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // round-1 fix populated only that legacy path, so interactive
                     // `/export` / `/cost` (which read `ctx.chat_session.turns`) still
                     // saw an empty session. Mirror the live turn into the in-memory
-                    // `chat_session` here as well, sanitizing for persistence to match
-                    // the legacy path. The reducer remains the single *persistence*
+                    // `chat_session` here as well. The reducer remains the single *persistence*
                     // source (it dispatched RecordAssistantTurn + Effect::SaveSession),
                     // so this only backs the slash commands and never double-writes.
-                    chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&user_input));
-                    chat_session
-                        .add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
+                    chat_session.add_user_turn(&user_input);
+                    chat_session.add_assistant_turn(&recorded_response, Vec::new());
                     if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
                         record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                         #[cfg(feature = "terminal-tui")]
@@ -7925,8 +7946,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE,
             );
 
-            let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
-            chat_session.add_user_turn(&sanitized_input);
+            chat_session.add_user_turn(&user_input);
             if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
                 record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                 #[cfg(feature = "terminal-tui")]
@@ -8082,8 +8102,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         // ── Record turn in session + persist ───────────────────
-        // Sanitize content before persistence (redact secrets, truncate large outputs).
-        //
         // S2-B Step 4: RecordUserTurn / RecordAssistantTurn 已经在上面（enriched /
         // history_response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 在
         // `Off` / `Both` / `Redux` 模式下保留，因为 `chat_session` 仍是
@@ -8093,8 +8111,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // `RecordUserTurn` / `RecordAssistantTurn` + `Effect::SaveSession` 接管
         // 单源持久化，下方 `save_session(...)` 也由 `dual_write_guard` 抑制。
         // 这关闭了 S2-D/E 阶段保留的最后一处双写残留。
-        let sanitized_input = sanitize::sanitize_for_persistence(&user_input);
-        let sanitized_response = sanitize::sanitize_for_persistence(&response);
         // BUG-06 / BUG-08 fix: always keep the in-memory `chat_session.turns`
         // populated so interactive `/cost` and `/export` (which read
         // `ctx.chat_session.turns`) reflect the live conversation. In Pure mode
@@ -8103,8 +8119,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // below is independently suppressed by `dual_write_guard`. Populating the
         // in-memory turns therefore does NOT cause double-persistence — it only
         // backs the slash commands that read from `chat_session`.
-        chat_session.add_user_turn(&sanitized_input);
-        chat_session.add_assistant_turn(&sanitized_response, Vec::new());
+        chat_session.add_user_turn(&user_input);
+        chat_session.add_assistant_turn(&response, Vec::new());
         if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
             record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
             #[cfg(feature = "terminal-tui")]
@@ -9496,7 +9512,7 @@ async fn commit_completed_provider_turn(
                 "Failed to append provider.final_outcome message event for empty Redux driver turn"
             );
         }
-        chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&pending.user_input));
+        chat_session.add_user_turn(&pending.user_input);
         if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
             record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
             chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
@@ -9565,8 +9581,8 @@ async fn commit_completed_provider_turn(
         attempts_count,
         "success",
     );
-    chat_session.add_user_turn(&sanitize::sanitize_for_persistence(&pending.user_input));
-    chat_session.add_assistant_turn(&sanitize::sanitize_for_persistence(&recorded_response), Vec::new());
+    chat_session.add_user_turn(&pending.user_input);
+    chat_session.add_assistant_turn(&recorded_response, Vec::new());
     if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
         record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
         chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
@@ -12584,7 +12600,8 @@ fn run_tui_unified_loop(
 
 /// Save a session to the Memory backend.
 async fn save_session(mem: &dyn Memory, session: &session::ChatSession) -> Result<()> {
-    let json = session.to_json().map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
+    let sanitized = sanitize::sanitize_session_content(session);
+    let json = sanitized.to_json().map_err(|e| anyhow::anyhow!("serialize: {e}"))?;
     mem.store(&session.memory_key(), &json, MemoryCategory::Conversation, None)
         .await
         .map_err(|e| anyhow::anyhow!("store: {e}"))?;
@@ -13903,6 +13920,134 @@ mod legacy_chat_compaction_audit_tests {
             user1.parent_run_id.is_none() && asst1.parent_run_id.is_none() && user2.parent_run_id.is_none(),
             "chat turns must not set parent_run_id (session relation is via session_key)"
         );
+    }
+
+    #[tokio::test]
+    async fn save_and_message_event_boundaries_redact_aws_keys() {
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
+        let mut session = session::ChatSession::new("mock", "model");
+        session.title = format!("标题 {secret}");
+        session.add_user_turn(&format!("用户 你好 {secret}"));
+        session.add_assistant_turn(&format!("助手 مرحبا {secret}"), Vec::new());
+
+        save_session(memory.as_ref(), &session).await.unwrap();
+        let stored = memory.get(&session.memory_key()).await.unwrap().unwrap();
+        assert!(!stored.content.contains(secret), "stored Memory content leaked AWS key");
+        let recalled = memory.recall(secret, 10, None).await.unwrap();
+        assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
+
+        let session_key = format!("chat:{}", session.id);
+        let user_event = record_chat_user_message_event(
+            &fabric,
+            &session,
+            &session_key,
+            "run-secret",
+            "mock",
+            "model",
+            1,
+            &format!("用户 {secret} 你好"),
+        )
+        .await
+        .unwrap();
+        let assistant_event = record_chat_assistant_message_event(
+            &fabric,
+            &session_key,
+            "run-secret",
+            "mock",
+            "model",
+            &format!("助手 {secret} 🌍"),
+        )
+        .await
+        .unwrap();
+        assert!(!user_event.content.contains(secret));
+        assert!(!assistant_event.content.contains(secret));
+        assert!(user_event.content.contains("你好"));
+        assert!(assistant_event.content.contains('🌍'));
+
+        let semantic_key = "chat_auto_promote_secret";
+        let safe_semantic = sanitize_chat_semantic_memory_content(&format!("promote {secret} Unicode 你好"));
+        fabric
+            .record_semantic_memory_from_event(
+                semantic_key,
+                &safe_semantic,
+                MemoryCategory::Conversation,
+                None,
+                Some(&user_event.event_id),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        let semantic = memory.get(semantic_key).await.unwrap().unwrap();
+        assert!(!semantic.content.contains(secret));
+        assert!(semantic.content.contains("你好"));
+        let recalled = memory.recall(secret, 10, None).await.unwrap();
+        assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
+    }
+
+    #[tokio::test]
+    async fn chat_route_payloads_remain_valid_json_and_redact_nested_secrets() {
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let bearer = "Authorization: Bearer abcdefghijklmnop";
+        let tmp = TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), tmp.path().to_string_lossy());
+        let session_key = "chat-route-sanitize".to_string();
+        let scope = route_event_scope(
+            "chat",
+            None,
+            Some(session_key.clone()),
+            Some("route-run".to_string()),
+            Some("local-user".to_string()),
+            None,
+        );
+        let mut decision = RouteDecision::single_candidate("provider", "model");
+        decision.user_hint = Some(format!("hint {secret}"));
+        decision
+            .filtered_out
+            .push(crate::llm::route_decision::RouteFilterReason {
+                provider: "fallback".to_string(),
+                model: "model".to_string(),
+                reason: "auth".to_string(),
+                detail: Some(bearer.to_string()),
+            });
+        let route_event = record_route_decision_event(&fabric, scope.clone(), &decision)
+            .await
+            .unwrap();
+        let route_payload = route_event.raw_payload_json.as_deref().unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(route_payload).is_ok());
+        assert!(!route_payload.contains(secret));
+        assert!(!route_payload.contains("abcdefghijklmnop"));
+
+        let error = anyhow::anyhow!("provider failed: {bearer}; aws={secret}");
+        let outcome = ProviderExecutionOutcome::failed_for_decision(&decision, chrono::Utc::now(), &error);
+        record_provider_outcome_events(&fabric, scope, &outcome).await.unwrap();
+        let events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some(session_key),
+                    channel: Some("runtime".to_string()),
+                    sender: Some("local-user".to_string()),
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+        assert!(!events.is_empty());
+        for payload in events.iter().filter_map(|event| event.raw_payload_json.as_deref()) {
+            assert!(serde_json::from_str::<serde_json::Value>(payload).is_ok());
+            assert!(!payload.contains(secret));
+            assert!(!payload.contains("abcdefghijklmnop"));
+        }
     }
 }
 

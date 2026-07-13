@@ -666,6 +666,8 @@ pub async fn handle_clear(mem: &dyn Memory, _session_id: Option<&str>) -> u32 {
 
 /// Export a chat session to a file (Markdown or JSON).
 fn export_session(session: &session::ChatSession, format: &str) -> Result<String> {
+    let safe_session = super::sanitize::sanitize_session_content(session);
+    let session = &safe_session;
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S");
     let ext = match format {
         "json" => "json",
@@ -1689,5 +1691,43 @@ mod mode_tests {
             super::dispatch("/rewind", &ctx).await,
             CommandResult::HistoryAction(super::HistoryCommand::Rewind(n)) if n.is_empty()
         ));
+    }
+
+    #[test]
+    fn export_redacts_session_content_without_losing_unicode_or_tool_shape() {
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let mut session = crate::chat::session::ChatSession::new("provider", "model");
+        session.title = format!("导出 {secret} ✅");
+        session.add_assistant_turn(
+            &format!("Unicode 保留：你好 🌍；secret={secret}"),
+            vec![crate::chat::session::ToolCallSummary {
+                name: "shell".to_string(),
+                args_preview: format!(r#"{{"password":"tiny","cmd":"echo {secret} مرحبا","count":2}}"#),
+                success: true,
+                task_id: Some(3),
+                sequence: Some(4),
+            }],
+        );
+
+        let json = export_session_body_in_unique_tempdir(&session, "json");
+        let markdown = export_session_body_in_unique_tempdir(&session, "md");
+        assert!(!json.contains(secret));
+        assert!(!markdown.contains(secret));
+        assert!(json.contains("你好"));
+        let decoded: crate::chat::session::ChatSession = serde_json::from_str(&json).unwrap();
+        let tool_call = decoded
+            .turns
+            .first()
+            .and_then(|turn| turn.tool_calls.first())
+            .expect("tool summary shape must round-trip");
+        assert_eq!(tool_call.task_id, Some(3));
+        assert_eq!(tool_call.sequence, Some(4));
+        assert!(tool_call.args_preview.contains("[REDACTED]"));
+        let args: serde_json::Value = serde_json::from_str(&tool_call.args_preview).unwrap();
+        assert_eq!(
+            args.get("password").and_then(serde_json::Value::as_str),
+            Some("[REDACTED]")
+        );
+        assert_eq!(args.get("count").and_then(serde_json::Value::as_i64), Some(2));
     }
 }

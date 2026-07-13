@@ -1148,6 +1148,7 @@ impl EffectExecutor {
                 }
             }
             Effect::SaveSession(session) => {
+                let session = crate::chat::sanitize::sanitize_session_content(&session);
                 // T3-3-fixB D1：inline await 替代 tokio::spawn，让主循环
                 // executor.execute(effect).await 的串行性贯穿到底，关闭
                 // SaveSession 还在写盘时 RequestRedraw 已刷屏的不一致窗口.
@@ -4651,23 +4652,68 @@ mod real_mode_tests {
 
     #[tokio::test]
     async fn real_mode_save_session_triggers_memory_store() {
-        // 证明 SaveSession effect 在 real 模式下真调用 memory.store.
-        let store_count = Arc::new(AtomicUsize::new(0));
-        let memory: Arc<dyn Memory> = Arc::new(CountingMemory {
-            inner: NoneMemory::new(),
-            store_count: Arc::clone(&store_count),
-        });
+        // 证明 reducer 预清洗 snapshot 经 dispatcher 二次清洗后真写入 Memory，
+        // 且 marker/hash/byte-count 保持单份。
+        let temp_memory = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp_memory.path()).unwrap());
         let shutdown = CancellationToken::new();
         let (deps, _action_rx, _hooks, _temp) = build_deps(memory, shutdown.clone());
         let executor = EffectExecutor::new_with_deps(deps.clone());
         assert!(!executor.is_shadow());
 
-        let session = ChatSession::new("prov", "model");
-        executor.execute(Effect::SaveSession(session)).await;
+        let secret = "AKIAABCDEFGHIJKLMNOP";
+        let long_content = format!(
+            "raw effect {secret} Authorization: Bearer abcdefghijklmnop\n{}",
+            "你".repeat(5_000)
+        );
+        let pre_truncate_len = crate::chat::sanitize::redact_secrets(&long_content).len();
+        let mut state =
+            crate::chat::state::ChatState::new(Arc::from("prov"), Arc::from("model"), CancellationToken::new());
+        state.session.id = "dispatcher-sanitize-session".to_string();
+        let _ = state.reduce(Action::RecordUserTurn(long_content));
+        let effects = state.reduce(Action::BackgroundSessionRecorded {
+            summary: crate::chat::sessions::PersistedSessionSummary {
+                id: "child".to_string(),
+                seq: 1,
+                kind: "agent".to_string(),
+                origin: "model".to_string(),
+                status: "completed".to_string(),
+                title: "child".to_string(),
+                summary: "done".to_string(),
+                token_usage_records: Vec::new(),
+                created_at: chrono::Utc::now(),
+            },
+        });
+        let save_effect = effects
+            .into_iter()
+            .find(|effect| matches!(effect, Effect::SaveSession(_)))
+            .expect("reducer must emit sanitized SaveSession");
+        let memory_key = format!("{}:{}", crate::chat::session::SESSION_MEMORY_PREFIX, state.session.id);
+        executor.execute(save_effect).await;
 
-        // 轮询等异步 spawn 子任务完成，避免固定 sleep 在慢机器上抖动
-        let final_count = wait_for_count(&store_count, 1, Duration::from_secs(2)).await;
-        assert_eq!(final_count, 1, "memory.store should be called exactly once");
+        let stored = deps.memory.get(&memory_key).await.unwrap().unwrap();
+        assert!(!stored.content.contains(secret));
+        assert!(stored.content.contains('你'));
+        let stored_session = ChatSession::from_json(&stored.content).unwrap();
+        let stored_content = stored_session.turns.first().map(|turn| turn.content.as_str()).unwrap();
+        assert!(stored_content.len() <= 10 * 1024);
+        assert_eq!(stored_content.matches("[... truncated (").count(), 1);
+        assert_eq!(stored_content.matches("bytes total, ref:").count(), 1);
+        assert!(stored_content.contains(&format!("{pre_truncate_len} bytes total")));
+        assert_eq!(
+            crate::chat::sanitize::sanitize_for_persistence(stored_content),
+            stored_content,
+            "dispatcher-stored projection must be idempotent"
+        );
+        let recalled = deps.memory.recall(secret, 10, None).await.unwrap();
+        assert!(recalled.iter().all(|entry| !entry.content.contains(secret)));
+        let mut raw_session = ChatSession::new("prov", "model");
+        raw_session.id = "dispatcher-raw-session".to_string();
+        raw_session.add_assistant_turn(&format!("manual raw effect {secret}"), Vec::new());
+        let raw_key = raw_session.memory_key();
+        executor.execute(Effect::SaveSession(raw_session)).await;
+        let raw_stored = deps.memory.get(&raw_key).await.unwrap().unwrap();
+        assert!(!raw_stored.content.contains(secret));
         // RAII scope：子任务完成后 guard 应自动复位（不粘住）.
         assert!(
             !deps.dual_write_guard.is_active(),

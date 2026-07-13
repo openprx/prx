@@ -2600,7 +2600,7 @@ impl ChatState {
     /// 构造路径，避免字段错漏。
     fn build_session_snapshot(&self) -> ChatSession {
         let now = chrono::Utc::now();
-        ChatSession {
+        let snapshot = ChatSession {
             id: self.session.id.clone(),
             schema_version: crate::chat::session::SCHEMA_VERSION,
             title: self.session.title.clone(),
@@ -2614,7 +2614,8 @@ impl ChatState {
             background_sessions: self.session.background_sessions.clone(),
             token_usage_records: self.session.token_usage_records.clone(),
             mode: self.session.mode,
-        }
+        };
+        crate::chat::sanitize::sanitize_session_content(&snapshot)
     }
 
     /// `Action::RecordUserTurn(text)` — 请求 reducer 持久化用户回合到 session 记录和 LLM history.
@@ -10151,6 +10152,56 @@ mod tests {
                     .any(|e| matches!(e, Effect::SaveSession(_))),
                 "StreamCancelled 不应 emit SaveSession（附录 B Cancelled 行）"
             );
+        }
+
+        #[test]
+        fn save_session_effect_redacts_all_authoritative_content_fields() {
+            let secret = "AKIAABCDEFGHIJKLMNOP";
+            let mut state = fresh_state();
+            state.session.title = format!("部署 {secret} ✅");
+            state.session.turns.push(crate::chat::session::ChatTurn {
+                role: "assistant".to_string(),
+                content: format!("保留 Unicode 内容，隐藏 {secret} 🚀"),
+                timestamp: chrono::Utc::now(),
+                tool_calls: vec![crate::chat::session::ToolCallSummary {
+                    name: "shell".to_string(),
+                    args_preview: format!("echo {secret} 你好"),
+                    success: true,
+                    task_id: Some(7),
+                    sequence: Some(9),
+                }],
+            });
+            let effects = state.reduce(Action::BackgroundSessionRecorded {
+                summary: crate::chat::sessions::PersistedSessionSummary {
+                    id: "child".to_string(),
+                    seq: 1,
+                    kind: "agent".to_string(),
+                    origin: "model".to_string(),
+                    status: "completed".to_string(),
+                    title: format!("子任务 {secret}"),
+                    summary: format!("完成 {secret} 🌍"),
+                    token_usage_records: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            let snapshot = effects
+                .iter()
+                .find_map(|effect| match effect {
+                    Effect::SaveSession(session) => Some(session),
+                    _ => None,
+                })
+                .expect("background record must save");
+            let blob = snapshot.to_json().unwrap();
+            assert!(!blob.contains(secret), "authoritative SaveSession blob leaked AWS key");
+            assert!(blob.contains("Unicode"));
+            assert!(blob.contains("你好"));
+            let tool_call = snapshot
+                .turns
+                .first()
+                .and_then(|turn| turn.tool_calls.first())
+                .expect("tool summary shape must be retained");
+            assert_eq!(tool_call.task_id, Some(7));
+            assert_eq!(tool_call.sequence, Some(9));
         }
     }
 }
