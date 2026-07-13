@@ -665,9 +665,9 @@ mod tests {
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let job = make_job(&config, "*/5 * * * *", None, "echo original");
 
-        // Phase 1: Full autonomy authorizes every command unconditionally, including
-        // one with an output redirect that Supervised would reject structurally.
-        let result = run_update(&config, &job.id, None, None, Some("echo pwn > /tmp/out.txt"), None);
+        // Full autonomy bypasses the structural redirect restriction, while the
+        // target still remains inside the shared workspace path boundary.
+        let result = run_update(&config, &job.id, None, None, Some("echo pwn > out.txt"), None);
         assert!(
             result.is_ok(),
             "Full autonomy must allow the command (relaxed): {result:?}"

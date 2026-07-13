@@ -1,41 +1,49 @@
 use super::traits::{TOOL_EXECUTION_CANCELLED, Tool, ToolCategory, ToolResult, ToolTier};
 use crate::runtime::RuntimeAdapter;
+use crate::runtime::shell_process::{
+    SHELL_OUTPUT_TRUNCATED_MARKER, ShellProcessAdapter, ShellProcessError, ShellProcessRequest,
+};
 use crate::security::policy::ApprovalGrant;
 use crate::security::traits::Sandbox;
 use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
-use std::io;
-use std::process::{Output, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 /// Maximum shell command execution time before kill.
 const SHELL_TIMEOUT_SECS: u64 = 60;
-/// Maximum output size in bytes (1MB).
-const MAX_OUTPUT_BYTES: usize = 1_048_576;
-/// Environment variables safe to pass to shell commands.
-/// Only functional variables are included — never API keys or secrets.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
 /// Shell command execution tool with sandboxing
 pub struct ShellTool {
     security: Arc<SecurityPolicy>,
-    runtime: Arc<dyn RuntimeAdapter>,
-    sandbox: Arc<dyn Sandbox>,
+    process: ShellProcessAdapter,
     acl_enabled: bool,
-    /// Bug #2: opt-in extra directories appended to the hardened shell PATH.
-    /// Empty by default (hardened PATH unchanged). When non-empty these MUST be
-    /// the same resolved dirs granted execute access by the sandbox backend, or
-    /// the kernel will deny the binaries the extended PATH points at.
-    extra_path_dirs: Vec<std::path::PathBuf>,
 }
 
 impl ShellTool {
+    fn legacy_truncation_marker(mut output: String, truncated: bool, marker: &str) -> String {
+        if truncated && output.ends_with(SHELL_OUTPUT_TRUNCATED_MARKER) {
+            output.truncate(output.len() - SHELL_OUTPUT_TRUNCATED_MARKER.len());
+            output.push_str(marker);
+        }
+        output
+    }
+
+    fn legacy_process_error_message(error: ShellProcessError) -> String {
+        match error {
+            ShellProcessError::Cancelled => TOOL_EXECUTION_CANCELLED.to_string(),
+            ShellProcessError::Timeout(_) => {
+                format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")
+            }
+            ShellProcessError::Runtime(error) => format!("Failed to build runtime command: {error}"),
+            ShellProcessError::Sandbox(error) => format!("Sandbox failed to wrap command: {error}"),
+            ShellProcessError::Spawn(error) | ShellProcessError::Wait(error) | ShellProcessError::Output(error) => {
+                format!("Failed to execute command: {error}")
+            }
+        }
+    }
+
     pub fn new(
         security: Arc<SecurityPolicy>,
         runtime: Arc<dyn RuntimeAdapter>,
@@ -60,37 +68,14 @@ impl ShellTool {
     ) -> Self {
         Self {
             security,
-            runtime,
-            sandbox,
+            process: ShellProcessAdapter::new(runtime, sandbox, extra_path_dirs),
             acl_enabled,
-            extra_path_dirs,
         }
     }
 
-    /// Build the PATH value for shell execution: the hardened system default,
-    /// optionally extended with the operator-trusted `extra_path_dirs` (Bug #2).
-    ///
-    /// When no extra dirs are configured this returns exactly the historic
-    /// hardened default, preserving the secure baseline.
+    #[cfg(test)]
     fn build_shell_path(&self) -> String {
-        let base = if cfg!(target_os = "windows") {
-            r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
-        } else {
-            "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        };
-        if self.extra_path_dirs.is_empty() {
-            return base.to_string();
-        }
-        let sep = if cfg!(target_os = "windows") { ';' } else { ':' };
-        // Extra (trusted) dirs go FIRST so a user toolchain (e.g. ~/.cargo/bin)
-        // is preferred, matching how an interactive shell prepends them.
-        let mut path = String::new();
-        for dir in &self.extra_path_dirs {
-            path.push_str(&dir.to_string_lossy());
-            path.push(sep);
-        }
-        path.push_str(base);
-        path
+        self.process.shell_path()
     }
 
     fn references_protected_memory_path(command: &str) -> bool {
@@ -157,180 +142,40 @@ impl ShellTool {
             });
         }
 
-        let mut cmd = match self.runtime.build_shell_command(command, &self.security.workspace_dir) {
-            Ok(cmd) => cmd,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to build runtime command: {e}")),
-                });
-            }
-        };
-        cmd.env_clear();
-
-        for var in SAFE_ENV_VARS {
-            if let Ok(val) = std::env::var(var) {
-                cmd.env(var, val);
-            }
-        }
-        cmd.env("PATH", self.build_shell_path());
-
-        if let Err(e) = self.sandbox.wrap_command(cmd.as_std_mut()) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Sandbox failed to wrap command: {e}")),
-            });
-        }
-
-        let child = match spawn_managed_shell_child(cmd) {
-            Ok(child) => child,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to execute command: {e}")),
-                });
-            }
-        };
-
-        let wait = tokio::time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output());
-        let result = if let Some(cancellation) = cancellation {
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
-                    });
-                }
-                result = wait => result,
-            }
-        } else {
-            wait.await
-        };
-
-        match result {
-            Ok(Ok(output)) => {
-                let mut stdout = String::from_utf8_lossy(&output.stdout).to_string();
-                let mut stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-                if stdout.len() > MAX_OUTPUT_BYTES {
-                    stdout.truncate(stdout.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stdout.push_str("\n... [output truncated at 1MB]");
-                }
-                if stderr.len() > MAX_OUTPUT_BYTES {
-                    stderr.truncate(stderr.floor_char_boundary(MAX_OUTPUT_BYTES));
-                    stderr.push_str("\n... [stderr truncated at 1MB]");
-                }
-
+        match self
+            .process
+            .execute(ShellProcessRequest {
+                command,
+                workspace_dir: &self.security.workspace_dir,
+                timeout: Duration::from_secs(SHELL_TIMEOUT_SECS),
+                cancellation,
+            })
+            .await
+        {
+            Ok(output) => {
+                let stdout = Self::legacy_truncation_marker(
+                    output.stdout,
+                    output.stdout_truncated,
+                    "\n... [output truncated at 1MB]",
+                );
+                let stderr = Self::legacy_truncation_marker(
+                    output.stderr,
+                    output.stderr_truncated,
+                    "\n... [stderr truncated at 1MB]",
+                );
                 Ok(ToolResult {
                     success: output.status.success(),
                     output: stdout,
                     error: if stderr.is_empty() { None } else { Some(stderr) },
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
+            Err(error) => Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to execute command: {e}")),
-            }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Command timed out after {SHELL_TIMEOUT_SECS}s and was killed")),
+                error: Some(Self::legacy_process_error_message(error)),
             }),
         }
     }
-}
-
-struct ManagedShellChild {
-    child: Option<tokio::process::Child>,
-    #[cfg(unix)]
-    pgid: Option<i32>,
-    reaped: bool,
-}
-
-impl ManagedShellChild {
-    async fn wait_with_output(mut self) -> io::Result<Output> {
-        let child = self
-            .child
-            .as_mut()
-            .ok_or_else(|| io::Error::other("shell child already taken"))?;
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let stdout_fut = async move {
-            let mut buf = Vec::new();
-            if let Some(mut stream) = stdout {
-                stream.read_to_end(&mut buf).await?;
-            }
-            io::Result::Ok(buf)
-        };
-        let stderr_fut = async move {
-            let mut buf = Vec::new();
-            if let Some(mut stream) = stderr {
-                stream.read_to_end(&mut buf).await?;
-            }
-            io::Result::Ok(buf)
-        };
-
-        let (status, stdout, stderr) = tokio::try_join!(child.wait(), stdout_fut, stderr_fut)?;
-        self.reaped = true;
-        #[cfg(unix)]
-        {
-            self.pgid = None;
-        }
-        self.child.take();
-        Ok(Output { status, stdout, stderr })
-    }
-}
-
-impl Drop for ManagedShellChild {
-    #[allow(unsafe_code)]
-    fn drop(&mut self) {
-        if self.reaped || self.child.is_none() {
-            return;
-        }
-
-        #[cfg(unix)]
-        if let Some(pgid) = self.pgid {
-            // SAFETY: `pgid` is the process-group id created for this child by
-            // `process_group(0)`. `killpg` sends a signal only; it dereferences
-            // no pointers and has no memory-safety preconditions.
-            let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-            return;
-        }
-
-        if let Some(child) = &mut self.child {
-            let _ = child.start_kill();
-        }
-    }
-}
-
-fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io::Result<ManagedShellChild> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    #[cfg(unix)]
-    cmd.process_group(0);
-
-    let child = cmd.spawn()?;
-    #[cfg(unix)]
-    let pgid = child
-        .id()
-        .and_then(|pid| i32::try_from(pid).ok())
-        .filter(|pid| *pid > 0);
-
-    Ok(ManagedShellChild {
-        child: Some(child),
-        #[cfg(unix)]
-        pgid,
-        reaped: false,
-    })
 }
 
 #[async_trait]
@@ -381,9 +226,11 @@ impl Tool for ShellTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::shell_process::{MAX_SHELL_OUTPUT_BYTES, SAFE_ENV_VARS};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::traits::NoopSandbox;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use tempfile::TempDir;
 
     fn test_security(autonomy: AutonomyLevel) -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -472,14 +319,46 @@ mod tests {
             .await
             .expect("disallowed command execution should return a result");
         assert!(!result.success);
-        // Phase 1: the per-command allowlist + high-risk hard-block were removed.
-        // A High-risk command under Supervised without a grant is now denied by
-        // the runtime-approval-grant requirement instead.
         let error = result.error.as_deref().unwrap_or("");
         assert!(
-            error.contains("runtime approval grant"),
-            "expected grant-required denial, got: {error:?}"
+            error.contains("forbidden path argument: /"),
+            "expected shared forbidden-path denial, got: {error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn shell_forbidden_path_denial_has_single_shell_audit_identity() {
+        let temp = TempDir::new().expect("temp workspace");
+        let tool = ShellTool::new(
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Full,
+                workspace_dir: temp.path().to_path_buf(),
+                ..SecurityPolicy::default()
+            }),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
+
+        let result = tool
+            .execute(json!({"command": "cat /etc/passwd"}))
+            .await
+            .expect("forbidden command result");
+        assert!(!result.success);
+        assert_eq!(result.error.as_deref(), Some("forbidden path argument: /etc/passwd"));
+
+        let audit = std::fs::read_to_string(temp.path().join("audit.log")).expect("audit log");
+        let events: Vec<crate::security::audit::AuditEvent> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit event"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let action = events
+            .first()
+            .and_then(|event| event.action.as_ref())
+            .and_then(|action| action.command.as_deref())
+            .unwrap_or_default();
+        assert!(action.starts_with("shell:"), "{action}");
     }
 
     #[tokio::test]
@@ -668,7 +547,59 @@ mod tests {
 
     #[test]
     fn shell_output_limit_is_1mb() {
-        assert_eq!(MAX_OUTPUT_BYTES, 1_048_576, "max output must be 1 MB to prevent OOM");
+        assert_eq!(
+            MAX_SHELL_OUTPUT_BYTES, 1_048_576,
+            "max output must be 1 MB to prevent OOM"
+        );
+    }
+
+    #[test]
+    fn shell_legacy_process_error_messages_are_stable() {
+        assert_eq!(
+            ShellTool::legacy_process_error_message(ShellProcessError::Runtime(anyhow::anyhow!("build"))),
+            "Failed to build runtime command: build"
+        );
+        assert_eq!(
+            ShellTool::legacy_process_error_message(ShellProcessError::Sandbox(std::io::Error::other("sandbox"))),
+            "Sandbox failed to wrap command: sandbox"
+        );
+        for error in [
+            ShellProcessError::Spawn(std::io::Error::other("spawn")),
+            ShellProcessError::Wait(std::io::Error::other("wait")),
+            ShellProcessError::Output(std::io::Error::other("output")),
+        ] {
+            assert!(ShellTool::legacy_process_error_message(error).starts_with("Failed to execute command: "));
+        }
+        assert_eq!(
+            ShellTool::legacy_process_error_message(ShellProcessError::Timeout(Duration::from_secs(1))),
+            "Command timed out after 60s and was killed"
+        );
+        assert_eq!(
+            ShellTool::legacy_process_error_message(ShellProcessError::Cancelled),
+            TOOL_EXECUTION_CANCELLED
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_preserves_legacy_stdout_and_stderr_truncation_markers() {
+        let tool = ShellTool::new(
+            test_security(AutonomyLevel::Full),
+            test_runtime(),
+            test_sandbox(),
+            false,
+        );
+        let result = tool
+            .execute(json!({"command": "yes x | head -c 1100000; yes y | head -c 1100000 >&2"}))
+            .await
+            .expect("large shell output");
+        assert!(result.success);
+        assert!(result.output.ends_with("\n... [output truncated at 1MB]"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.ends_with("\n... [stderr truncated at 1MB]"))
+        );
     }
 
     // -- Non-UTF8 binary output tests --
@@ -845,11 +776,7 @@ mod tests {
             .expect("test temp directory should be created");
         let child_pid_file = dir.join("child.pid");
         let marker_file = dir.join("should-not-exist.txt");
-        let command = format!(
-            "sleep 30 & echo $! > {}; sleep 2; echo SHOULD_NOT_PRINT > {}",
-            shell_quote_path(&child_pid_file),
-            shell_quote_path(&marker_file)
-        );
+        let command = "sleep 30 & echo $! > child.pid; sleep 2; echo SHOULD_NOT_PRINT > should-not-exist.txt";
 
         let tool = ShellTool::new(
             Arc::new(SecurityPolicy {
@@ -901,11 +828,7 @@ mod tests {
             .expect("test temp directory should be created");
         let parent_pid_file = dir.join("parent.pid");
         let child_pid_file = dir.join("child.pid");
-        let command = format!(
-            "echo $$ > {}; sleep 300 & echo $! > {}; sleep 300",
-            shell_quote_path(&parent_pid_file),
-            shell_quote_path(&child_pid_file)
-        );
+        let command = "echo $$ > parent.pid; sleep 300 & echo $! > child.pid; sleep 300";
 
         let tool = ShellTool::new(
             Arc::new(SecurityPolicy {
@@ -936,12 +859,6 @@ mod tests {
         wait_for_process_exit(child_pid).await;
         wait_for_process_exit(parent_pid).await;
         let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[cfg(unix)]
-    fn shell_quote_path(path: &std::path::Path) -> String {
-        let value = path.to_string_lossy();
-        format!("'{}'", value.replace('\'', "'\\''"))
     }
 
     #[cfg(unix)]

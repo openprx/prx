@@ -9,6 +9,304 @@ use std::time::Instant;
 
 pub const PERSISTED_APPROVAL_GRANT_TTL_SECS: i64 = 24 * 60 * 60;
 
+fn is_env_assignment(word: &str) -> bool {
+    word.contains('=') && word.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+}
+
+enum CommandPathViolation {
+    Forbidden(String),
+    Dynamic(String),
+    ActiveSubstitution,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellLexTokenKind {
+    Word,
+    Redirection,
+    CommandSeparator,
+}
+
+struct ShellLexToken {
+    text: String,
+    kind: ShellLexTokenKind,
+    dynamic: bool,
+    active_substitution: bool,
+}
+
+const MAX_NESTED_SHELL_VALIDATION_DEPTH: usize = 4;
+
+fn forbidden_path_argument(policy: &SecurityPolicy, command: &str) -> Option<CommandPathViolation> {
+    forbidden_path_argument_inner(policy, command, 0)
+}
+
+fn forbidden_path_argument_inner(policy: &SecurityPolicy, command: &str, depth: usize) -> Option<CommandPathViolation> {
+    let folded_command = fold_shell_line_continuations(command);
+    for segment in split_unquoted_segments(&folded_command) {
+        let tokens = shell_words_and_redirections(&segment);
+        let mut index = 0;
+        while index < tokens.len() {
+            while tokens
+                .get(index)
+                .is_some_and(|token| token.kind == ShellLexTokenKind::CommandSeparator)
+            {
+                index += 1;
+            }
+            while tokens.get(index).is_some_and(|token| {
+                token.kind == ShellLexTokenKind::Word && !token.active_substitution && is_env_assignment(&token.text)
+            }) {
+                index += 1;
+            }
+            let Some(executable) = tokens.get(index) else {
+                break;
+            };
+            if executable.kind == ShellLexTokenKind::CommandSeparator {
+                continue;
+            }
+            if executable.active_substitution {
+                return Some(CommandPathViolation::ActiveSubstitution);
+            }
+            if executable.dynamic {
+                return Some(CommandPathViolation::Dynamic(executable.text.clone()));
+            }
+            let benign_dynamic_arguments = allows_benign_dynamic_arguments(&executable.text);
+            index += 1;
+            let arguments_start = index;
+            let mut expects_redirection_operand = false;
+
+            while let Some(token) = tokens.get(index) {
+                if token.kind == ShellLexTokenKind::CommandSeparator {
+                    break;
+                }
+                if token.active_substitution {
+                    return Some(CommandPathViolation::ActiveSubstitution);
+                }
+                if token.kind == ShellLexTokenKind::Redirection {
+                    expects_redirection_operand = true;
+                    index += 1;
+                    continue;
+                }
+                if token.dynamic
+                    && (expects_redirection_operand || token.text.contains('/') || !benign_dynamic_arguments)
+                {
+                    return Some(CommandPathViolation::Dynamic(token.text.clone()));
+                }
+                expects_redirection_operand = false;
+                let candidate = token.text.as_str();
+                if candidate.is_empty() || candidate.starts_with('-') || candidate.contains("://") {
+                    index += 1;
+                    continue;
+                }
+                let looks_like_path = candidate.starts_with('/')
+                    || candidate.starts_with("./")
+                    || candidate.starts_with("../")
+                    || candidate.starts_with("~/")
+                    || (candidate.contains('/') && !candidate.chars().any(char::is_whitespace));
+                if looks_like_path && !policy.is_path_allowed(candidate) {
+                    return Some(CommandPathViolation::Forbidden(candidate.to_string()));
+                }
+                index += 1;
+            }
+            if let Some(violation) = nested_wrapper_violation(
+                policy,
+                &executable.text,
+                tokens.get(arguments_start..index).unwrap_or_default(),
+                depth,
+            ) {
+                return Some(violation);
+            }
+            if tokens
+                .get(index)
+                .is_some_and(|token| token.kind == ShellLexTokenKind::CommandSeparator)
+            {
+                index += 1;
+            }
+        }
+    }
+    None
+}
+
+fn shell_command_basename(executable: &str) -> &str {
+    executable.rsplit(['/', '\\']).next().unwrap_or(executable)
+}
+
+fn allows_benign_dynamic_arguments(executable: &str) -> bool {
+    matches!(shell_command_basename(executable), "echo" | "printf" | "sleep")
+}
+
+fn nested_wrapper_violation(
+    policy: &SecurityPolicy,
+    executable: &str,
+    arguments: &[ShellLexToken],
+    depth: usize,
+) -> Option<CommandPathViolation> {
+    let words = arguments
+        .iter()
+        .filter(|token| token.kind == ShellLexTokenKind::Word)
+        .map(|token| token.text.as_str())
+        .collect::<Vec<_>>();
+    let base = shell_command_basename(executable);
+    let payload = match base {
+        "eval" => Some(words.join(" ")),
+        "command" => {
+            let start = words
+                .iter()
+                .position(|word| !word.starts_with('-'))
+                .unwrap_or(words.len());
+            Some(words.get(start..).unwrap_or_default().join(" "))
+        }
+        "env" => {
+            let start = words
+                .iter()
+                .position(|word| !word.starts_with('-') && !is_env_assignment(word))
+                .unwrap_or(words.len());
+            Some(words.get(start..).unwrap_or_default().join(" "))
+        }
+        "sh" | "bash" | "dash" | "zsh" | "ksh" | "fish" => words
+            .iter()
+            .position(|word| *word == "-c")
+            .and_then(|flag| words.get(flag + 1))
+            .map(|payload| (*payload).to_string()),
+        "python" | "python3" | "perl" | "ruby" | "node" | "php" => {
+            let payload = words
+                .iter()
+                .position(|word| matches!(*word, "-c" | "-e"))
+                .and_then(|flag| words.get(flag + 1))?;
+            return code_payload_violation(policy, payload);
+        }
+        _ => None,
+    }?;
+    if payload.is_empty() {
+        return None;
+    }
+    if depth >= MAX_NESTED_SHELL_VALIDATION_DEPTH {
+        return Some(CommandPathViolation::Dynamic(payload));
+    }
+    forbidden_path_argument_inner(policy, &payload, depth + 1)
+}
+
+fn code_payload_violation(policy: &SecurityPolicy, payload: &str) -> Option<CommandPathViolation> {
+    if payload.contains('$') {
+        return Some(CommandPathViolation::Dynamic(payload.to_string()));
+    }
+    for candidate in payload
+        .split(|character: char| !(character.is_alphanumeric() || matches!(character, '/' | '.' | '_' | '-' | '~')))
+    {
+        let looks_like_path = candidate.starts_with('/')
+            || candidate.starts_with("./")
+            || candidate.starts_with("../")
+            || candidate.starts_with("~/");
+        if looks_like_path && !policy.is_path_allowed(candidate) {
+            return Some(CommandPathViolation::Forbidden(candidate.to_string()));
+        }
+    }
+    None
+}
+
+/// Tokenize one already-separated shell segment into quote-aware words and
+/// unquoted redirection operators. Redirections are emitted as their own token
+/// even when attached to a command/operand (`cat</etc/passwd`), while `<`/`>`
+/// inside quotes remain literal word content.
+fn shell_words_and_redirections(segment: &str) -> Vec<ShellLexToken> {
+    let mut tokens = Vec::new();
+    let mut word = String::new();
+    let mut word_dynamic = false;
+    let mut word_active_substitution = false;
+    let mut quote = QuoteState::None;
+    let mut chars = segment.chars().peekable();
+
+    let flush_word =
+        |tokens: &mut Vec<ShellLexToken>, word: &mut String, dynamic: &mut bool, active_substitution: &mut bool| {
+            if !word.is_empty() {
+                tokens.push(ShellLexToken {
+                    text: std::mem::take(word),
+                    kind: ShellLexTokenKind::Word,
+                    dynamic: *dynamic,
+                    active_substitution: *active_substitution,
+                });
+                *dynamic = false;
+                *active_substitution = false;
+            }
+        };
+
+    while let Some(ch) = chars.next() {
+        match quote {
+            QuoteState::Single => {
+                if ch == '\'' {
+                    quote = QuoteState::None;
+                } else {
+                    word.push(ch);
+                }
+            }
+            QuoteState::Double => match ch {
+                '"' => quote = QuoteState::None,
+                '$' => {
+                    word_dynamic = true;
+                    word_active_substitution |= chars.peek().is_some_and(|next| *next == '(');
+                    word.push(ch);
+                }
+                '`' => {
+                    word_active_substitution = true;
+                    word.push(ch);
+                }
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    }
+                }
+                _ => word.push(ch),
+            },
+            QuoteState::None => match ch {
+                '\'' => quote = QuoteState::Single,
+                '"' => quote = QuoteState::Double,
+                '\\' => {
+                    if let Some(escaped) = chars.next() {
+                        word.push(escaped);
+                    }
+                }
+                '$' => {
+                    word_dynamic = true;
+                    word_active_substitution |= chars.peek().is_some_and(|next| *next == '(');
+                    word.push(ch);
+                }
+                '`' => {
+                    word_active_substitution = true;
+                    word.push(ch);
+                }
+                '<' | '>' => {
+                    flush_word(&mut tokens, &mut word, &mut word_dynamic, &mut word_active_substitution);
+                    tokens.push(ShellLexToken {
+                        text: ch.to_string(),
+                        kind: ShellLexTokenKind::Redirection,
+                        dynamic: false,
+                        active_substitution: chars.peek().is_some_and(|next| *next == '('),
+                    });
+                }
+                '&' => {
+                    flush_word(&mut tokens, &mut word, &mut word_dynamic, &mut word_active_substitution);
+                    tokens.push(ShellLexToken {
+                        text: ch.to_string(),
+                        kind: ShellLexTokenKind::CommandSeparator,
+                        dynamic: false,
+                        active_substitution: false,
+                    });
+                }
+                _ if ch.is_whitespace() => {
+                    flush_word(&mut tokens, &mut word, &mut word_dynamic, &mut word_active_substitution)
+                }
+                _ => word.push(ch),
+            },
+        }
+    }
+    flush_word(&mut tokens, &mut word, &mut word_dynamic, &mut word_active_substitution);
+    tokens
+}
+
+fn contains_active_shell_substitution(command: &str) -> bool {
+    shell_words_and_redirections(command)
+        .iter()
+        .any(|token| token.active_substitution)
+}
+
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]
@@ -947,6 +1245,74 @@ enum QuoteState {
     Double,
 }
 
+/// Apply POSIX shell line continuation before policy parsing.
+///
+/// An unquoted or double-quoted, unescaped backslash immediately followed by
+/// LF or CRLF removes both the final backslash and the physical line ending.
+/// Single-quoted content is literal. Counting each consecutive backslash run
+/// is important: only an odd run leaves a final backslash that escapes the line
+/// ending; an even run leaves the line ending intact as a command separator.
+fn fold_shell_line_continuations(command: &str) -> String {
+    let chars = command.chars().collect::<Vec<_>>();
+    let mut folded = String::with_capacity(command.len());
+    let mut quote = QuoteState::None;
+    let mut index = 0;
+
+    while index < chars.len() {
+        let Some(ch) = chars.get(index).copied() else {
+            break;
+        };
+        if quote == QuoteState::Single {
+            folded.push(ch);
+            if ch == '\'' {
+                quote = QuoteState::None;
+            }
+            index += 1;
+            continue;
+        }
+
+        if ch == '\\' {
+            let run_start = index;
+            while chars.get(index).is_some_and(|character| *character == '\\') {
+                index += 1;
+            }
+            let run_length = index - run_start;
+            let line_ending_length = match chars.get(index..) {
+                Some(['\r', '\n', ..]) => 2,
+                Some(['\n', ..]) => 1,
+                _ => 0,
+            };
+            if line_ending_length != 0 && run_length % 2 == 1 {
+                folded.extend(std::iter::repeat_n('\\', run_length - 1));
+                index += line_ending_length;
+                continue;
+            }
+
+            folded.extend(std::iter::repeat_n('\\', run_length));
+            if run_length % 2 == 1
+                && let Some(escaped_character) = chars.get(index).copied()
+            {
+                // The following character is escaped, so it cannot transition
+                // the quote state even when it is a quote delimiter.
+                folded.push(escaped_character);
+                index += 1;
+            }
+            continue;
+        }
+
+        folded.push(ch);
+        match (quote, ch) {
+            (QuoteState::None, '\'') => quote = QuoteState::Single,
+            (QuoteState::None, '"') => quote = QuoteState::Double,
+            (QuoteState::Double, '"') => quote = QuoteState::None,
+            _ => {}
+        }
+        index += 1;
+    }
+
+    folded
+}
+
 /// Split a shell command into sub-commands by unquoted separators.
 ///
 /// Separators:
@@ -1156,9 +1522,10 @@ impl SecurityPolicy {
 
     /// Classify command risk. Any high-risk segment marks the whole command high.
     pub fn command_risk_level(&self, command: &str) -> CommandRiskLevel {
+        let folded_command = fold_shell_line_continuations(command);
         let mut saw_medium = false;
 
-        for segment in split_unquoted_segments(command) {
+        for segment in split_unquoted_segments(&folded_command) {
             let cmd_part = skip_env_assignments(&segment);
             let mut words = cmd_part.split_whitespace();
             let Some(base_raw) = words.next() else {
@@ -1270,6 +1637,14 @@ impl SecurityPolicy {
         command: &str,
         runtime_approval_granted: bool,
     ) -> Result<CommandRiskLevel, String> {
+        if let Some(violation) = forbidden_path_argument(self, command) {
+            return Err(match violation {
+                CommandPathViolation::Forbidden(path) => format!("forbidden path argument: {path}"),
+                CommandPathViolation::Dynamic(token) => format!("forbidden dynamic path argument: {token}"),
+                CommandPathViolation::ActiveSubstitution => "forbidden active shell substitution".to_string(),
+            });
+        }
+
         if !self.is_command_allowed(command) {
             // Redact secrets before the raw command lands in an error string that
             // can propagate (via `?`) all the way to stderr / caller logs.
@@ -1281,8 +1656,8 @@ impl SecurityPolicy {
 
         let risk = self.command_risk_level(command);
 
-        // Full autonomy authorizes every command unconditionally (Phase 1: full
-        // =真·全开). Risk grading is preserved in the return value for callers.
+        // Full autonomy bypasses approval risk grading, but workspace path
+        // boundaries above remain a shared invariant for every shell entry.
         if self.autonomy == AutonomyLevel::Full {
             return Ok(risk);
         }
@@ -1313,6 +1688,8 @@ impl SecurityPolicy {
     /// - Blocks output redirections (`>`, `>>`) that could write outside workspace
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
+        let folded_command = fold_shell_line_continuations(command);
+        let command = folded_command.as_str();
         if self.autonomy == AutonomyLevel::ReadOnly {
             return false;
         }
@@ -1321,12 +1698,7 @@ impl SecurityPolicy {
         if self.autonomy != AutonomyLevel::Full {
             // Block subshell/expansion operators — these allow hiding arbitrary
             // commands inside an allowed command (e.g. `echo $(rm -rf /)`)
-            if command.contains('`')
-                || command.contains("$(")
-                || command.contains("${")
-                || command.contains("<(")
-                || command.contains(">(")
-            {
+            if contains_active_shell_substitution(command) {
                 return false;
             }
 
@@ -2443,6 +2815,137 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_redirection_gate_records_one_deny_for_each_shell_entry_name_and_bypass() {
+        let (tmp, policy) = audited_policy();
+        let gate = SideEffectGate::new(&policy);
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            for command in ["cat </etc/passwd", "cat</etc/passwd"] {
+                let reason = gate
+                    .authorize_command_execution(tool_name, command, None)
+                    .expect_err("forbidden redirection path should be denied");
+                assert_eq!(reason, "forbidden path argument: /etc/passwd");
+            }
+        }
+
+        let events = read_audit_events(tmp.path());
+        assert_eq!(events.len(), 6, "each gate call must emit exactly one audit event");
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            let prefix = format!("{tool_name}:");
+            let matching = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .action
+                        .as_ref()
+                        .and_then(|action| action.command.as_deref())
+                        .is_some_and(|command| command.starts_with(&prefix))
+                })
+                .count();
+            assert_eq!(matching, 2, "expected one audit decision per bypass for {tool_name}");
+        }
+    }
+
+    #[test]
+    fn dynamic_path_gate_records_one_deny_for_each_shell_entry_name() {
+        let (tmp, policy) = audited_policy();
+        let gate = SideEffectGate::new(&policy);
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            let reason = gate
+                .authorize_command_execution(tool_name, "FILE=/etc/passwd; eval 'cat $FILE'", None)
+                .expect_err("wrapper-hidden dynamic shell path should fail closed");
+            assert_eq!(reason, "forbidden dynamic path argument: $FILE");
+        }
+
+        let events = read_audit_events(tmp.path());
+        assert_eq!(events.len(), 3, "each gate call must emit exactly one audit event");
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            let prefix = format!("{tool_name}:");
+            let matching = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .action
+                        .as_ref()
+                        .and_then(|action| action.command.as_deref())
+                        .is_some_and(|command| command.starts_with(&prefix))
+                })
+                .count();
+            assert_eq!(matching, 1, "expected one dynamic-path audit decision for {tool_name}");
+        }
+    }
+
+    #[test]
+    fn active_substitution_gate_records_one_deny_per_tool_and_form() {
+        let (tmp, policy) = audited_policy();
+        let gate = SideEffectGate::new(&policy);
+        let commands = [
+            r#"cat `printf '\057etc\057passwd'`"#,
+            r#"echo "$(cat /etc/passwd)""#,
+            "cat <(printf secret)",
+        ];
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            for command in commands {
+                let reason = gate
+                    .authorize_command_execution(tool_name, command, None)
+                    .expect_err("active substitution must fail closed");
+                assert_eq!(reason, "forbidden active shell substitution");
+            }
+        }
+
+        let events = read_audit_events(tmp.path());
+        assert_eq!(events.len(), 9, "each gate call must emit exactly one audit event");
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            let prefix = format!("{tool_name}:");
+            let matching = events
+                .iter()
+                .filter(|event| {
+                    event
+                        .action
+                        .as_ref()
+                        .and_then(|action| action.command.as_deref())
+                        .is_some_and(|command| command.starts_with(&prefix))
+                })
+                .count();
+            assert_eq!(matching, 3, "expected one audit decision per substitution form");
+        }
+    }
+
+    #[test]
+    fn line_continuation_substitution_gate_records_original_command_once_per_tool_and_form() {
+        let (tmp, policy) = audited_policy();
+        let gate = SideEffectGate::new(&policy);
+        let commands = [
+            "echo $\\\n(printf secret)",
+            "cat <\\\n(printf secret)",
+            "echo $\\\r\n(printf secret)",
+            "cat <\\\r\n(printf secret)",
+        ];
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            for command in commands {
+                let reason = gate
+                    .authorize_command_execution(tool_name, command, None)
+                    .expect_err("line continuation must not split an active substitution operator");
+                assert_eq!(reason, "forbidden active shell substitution");
+            }
+        }
+
+        let events = read_audit_events(tmp.path());
+        assert_eq!(events.len(), 12, "each gate call must emit exactly one audit event");
+        for tool_name in ["shell", "cron_scheduler", "xin_runner"] {
+            for command in commands {
+                let expected = format!("{tool_name}:{command}");
+                let matching = events
+                    .iter()
+                    .filter(|event| {
+                        event.action.as_ref().and_then(|action| action.command.as_deref()) == Some(expected.as_str())
+                    })
+                    .count();
+                assert_eq!(matching, 1, "audit must retain the original physical command exactly");
+            }
+        }
+    }
+
+    #[test]
     fn gate_allow_writes_audit_event_with_compliance_fields() {
         use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
         let _guard = global_keyring_guard();
@@ -2778,12 +3281,203 @@ mod tests {
             ..SecurityPolicy::default()
         };
 
-        let denied = p.validate_command_execution("rm -rf /tmp/test", false);
+        let denied = p.validate_command_execution("rm -rf tmp/test", false);
         assert!(denied.is_err());
         assert!(denied.unwrap_err().contains("runtime approval grant"));
 
-        let allowed = p.validate_command_execution("rm -rf /tmp/test", true);
+        let allowed = p.validate_command_execution("rm -rf tmp/test", true);
         assert_eq!(allowed.unwrap(), CommandRiskLevel::High);
+    }
+
+    #[test]
+    fn validate_command_rejects_forbidden_path_for_supervised_and_full() {
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            for command in ["cat /etc/passwd", "cat </etc/passwd", "cat</etc/passwd"] {
+                let error = policy
+                    .validate_command_execution(command, true)
+                    .expect_err("forbidden path must be rejected");
+                assert_eq!(error, "forbidden path argument: /etc/passwd");
+            }
+            assert!(
+                policy
+                    .validate_command_execution("echo 'literal </etc/passwd in documentation'", true)
+                    .is_ok(),
+                "quoted redirection-like prose must remain literal"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_command_rejects_dynamic_shell_paths_but_preserves_single_quote_literals() {
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            for (command, expected_error) in [
+                (
+                    r#"cat "$HOME/.ssh/id_rsa""#,
+                    "forbidden dynamic path argument: $HOME/.ssh/id_rsa",
+                ),
+                ("X=/etc/passwd; cat <$X", "forbidden dynamic path argument: $X"),
+                ("cat $FILE", "forbidden dynamic path argument: $FILE"),
+                (
+                    "FILE=/etc/passwd; command cat $FILE",
+                    "forbidden dynamic path argument: $FILE",
+                ),
+                (
+                    "FILE=/etc/passwd; eval 'cat $FILE'",
+                    "forbidden dynamic path argument: $FILE",
+                ),
+                (
+                    r#"FILE=/etc/passwd sh -c 'cat "$FILE"'"#,
+                    "forbidden dynamic path argument: $FILE",
+                ),
+                (
+                    r#"python -c 'open("/etc/passwd").read()'"#,
+                    "forbidden path argument: /etc/passwd",
+                ),
+            ] {
+                let error = policy
+                    .validate_command_execution(command, true)
+                    .expect_err("dynamic shell path must fail closed");
+                assert_eq!(error, expected_error);
+            }
+            assert!(
+                policy.validate_command_execution("echo '$HOME/.ssh'", true).is_ok(),
+                "single-quoted dollar expressions are literal"
+            );
+            for command in ["echo $HOME", "printf $KEY", "sleep $SECONDS"] {
+                assert!(
+                    policy.validate_command_execution(command, true).is_ok(),
+                    "benign no-slash dynamic argument should remain compatible: {command}"
+                );
+            }
+            for command in ["sh ./script.sh", "python script.py", "python ./script.py"] {
+                assert!(
+                    policy.validate_command_execution(command, true).is_ok(),
+                    "literal relative interpreter script should remain compatible: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_command_rejects_active_substitutions_but_allows_single_quoted_prose() {
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            for command in [
+                r#"cat `printf '\057etc\057passwd'`"#,
+                r#"echo "$(cat /etc/passwd)""#,
+                "cat <(printf secret)",
+                "cat >(cat)",
+            ] {
+                assert_eq!(
+                    policy
+                        .validate_command_execution(command, true)
+                        .expect_err("active substitution must fail closed"),
+                    "forbidden active shell substitution"
+                );
+            }
+            for command in [
+                "echo '$(cat /etc/passwd)'",
+                "echo 'literal `cat /etc/passwd` prose'",
+                "echo 'literal <(cat /etc/passwd) prose'",
+            ] {
+                assert!(
+                    policy.validate_command_execution(command, true).is_ok(),
+                    "single-quoted substitution-like prose must remain literal: {command}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validate_command_folds_line_continuations_before_substitution_policy_parsing() {
+        let continued = [
+            "echo $\\\n(printf secret)",
+            "cat <\\\n(printf secret)",
+            "echo $\\\r\n(printf secret)",
+            "cat <\\\r\n(printf secret)",
+        ];
+        let direct = ["echo $(printf secret)", "cat <(printf secret)"];
+        let single_quoted = [
+            "echo 'literal $\\\n(printf secret) prose'",
+            "echo 'literal <\\\r\n(printf secret) prose'",
+        ];
+
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            for command in continued.into_iter().chain(direct) {
+                assert_eq!(
+                    policy
+                        .validate_command_execution(command, true)
+                        .expect_err("continued and direct substitutions must fail closed"),
+                    "forbidden active shell substitution"
+                );
+            }
+            for command in single_quoted {
+                assert!(
+                    policy.validate_command_execution(command, true).is_ok(),
+                    "single-quoted backslash-newline prose must remain literal: {command:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fold_shell_line_continuations_honors_quotes_crlf_and_backslash_parity() {
+        assert_eq!(fold_shell_line_continuations("echo $\\\n(value)"), "echo $(value)");
+        assert_eq!(fold_shell_line_continuations("echo $\\\r\n(value)"), "echo $(value)");
+        assert_eq!(
+            fold_shell_line_continuations("echo \"$\\\n(value)\""),
+            "echo \"$(value)\""
+        );
+
+        let single_quoted = "echo 'literal \\\nprose'";
+        assert_eq!(fold_shell_line_continuations(single_quoted), single_quoted);
+
+        let even_backslashes = ["echo ", r"\\", "\nnext"].concat();
+        assert_eq!(fold_shell_line_continuations(&even_backslashes), even_backslashes);
+        let odd_backslashes = ["echo ", r"\\\", "\nnext"].concat();
+        assert_eq!(
+            fold_shell_line_continuations(&odd_backslashes),
+            ["echo ", r"\\", "next"].concat()
+        );
+    }
+
+    #[test]
+    fn structural_path_and_risk_parsers_use_the_folded_command() {
+        let supervised = default_policy();
+        assert!(!supervised.is_command_allowed("find . -e\\\nxec printf {} \\;"));
+        assert!(!supervised.is_command_allowed("find . -exec printf {} \\;"));
+
+        for autonomy in [AutonomyLevel::Supervised, AutonomyLevel::Full] {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            for command in ["cat /etc/pass\\\nwd", "cat /etc/passwd"] {
+                assert_eq!(
+                    policy
+                        .validate_command_execution(command, true)
+                        .expect_err("continued and direct forbidden paths must both fail closed"),
+                    "forbidden path argument: /etc/passwd"
+                );
+            }
+            assert_eq!(policy.command_risk_level("r\\\nm -rf tmp"), CommandRiskLevel::High);
+            assert_eq!(policy.command_risk_level("rm -rf tmp"), CommandRiskLevel::High);
+        }
     }
 
     #[test]
@@ -3104,7 +3798,12 @@ mod tests {
     #[test]
     fn command_injection_dollar_brace_blocked() {
         let p = default_policy();
-        assert!(!p.is_command_allowed("echo ${IFS}cat${IFS}/etc/passwd"));
+        assert!(
+            p.validate_command_execution("echo ${IFS}cat${IFS}/etc/passwd", true)
+                .is_err()
+        );
+        let benign_dynamic = ["echo $", "{SAFE:-unset}"].concat();
+        assert!(p.validate_command_execution(&benign_dynamic, true).is_ok());
     }
 
     #[test]

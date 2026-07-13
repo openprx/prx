@@ -2239,7 +2239,7 @@ mod tests {
         // assert the ring captured the output (proof the reader drained it).
         let sec = auto_security();
         let session = PtyShellSession::spawn(
-            "for i in $(seq 1 200); do echo line-$i; done; sleep 5",
+            "awk 'BEGIN { for (i = 1; i <= 200; i++) print \"line-\" i }'; sleep 5",
             &sec,
             PtySize::default(),
         )
@@ -2360,7 +2360,7 @@ mod tests {
         // via `reap_reader` — this is exactly the detach-then-kill path that must
         // never freeze the chat.
         let sec = auto_security();
-        let session = PtyShellSession::spawn("(setsid sleep 300 >/dev/null 2>&1 &) ; exit", &sec, PtySize::default())
+        let session = PtyShellSession::spawn("(setsid sleep 300 &) ; exit", &sec, PtySize::default())
             .expect("test: spawn shell that orphans a sleeper");
 
         // Give the shell time to spawn the orphan and exit; the orphan now holds

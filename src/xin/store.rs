@@ -781,6 +781,15 @@ const fn effective_lease_ttl(mode: &ExecutionMode, persisted_ttl: u64, ttl_secs:
     }
 }
 
+/// Exact Xin lease generation. Reusing the same worker id after expiry creates
+/// a distinct token because the persisted expiry is part of every mutation
+/// fence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct XinStepLease {
+    pub(crate) worker_id: String,
+    pub(crate) expires_at: DateTime<Utc>,
+}
+
 /// Read a step's `(execution_mode, lease_ttl_secs)` for TTL resolution.
 fn step_lease_params(conn: &Connection, step_id: &str) -> Option<(ExecutionMode, u64)> {
     conn.query_row(
@@ -802,11 +811,16 @@ fn step_lease_params(conn: &Connection, step_id: &str) -> Option<(ExecutionMode,
 /// step), or when it is `claimed`/`running` with an expired (or null) lease. On
 /// success the step becomes `claimed` with a fresh lease and heartbeat. Returns
 /// `true` iff this worker won the claim.
-pub fn claim_step(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64) -> Result<bool> {
-    let now = Utc::now();
-    let changed = with_connection(config, |conn| {
+pub(crate) fn claim_step_with_lease(
+    config: &Config,
+    step_id: &str,
+    worker_id: &str,
+    ttl_secs: u64,
+) -> Result<Option<XinStepLease>> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
         let Some((mode, persisted)) = step_lease_params(conn, step_id) else {
-            return Ok(0usize);
+            return Ok(None);
         };
         let ttl = effective_lease_ttl(&mode, persisted, ttl_secs);
         let expires = now + chrono::Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX));
@@ -831,15 +845,22 @@ pub fn claim_step(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64
         if changed > 0 {
             emit_step_event(conn, config, step_id, "xin.step.claimed", Some("claimed"))?;
         }
-        Ok(changed)
-    })?;
-    Ok(changed > 0)
+        Ok((changed > 0).then(|| XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at: expires,
+        }))
+    })
+}
+
+#[cfg(test)]
+pub fn claim_step(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64) -> Result<bool> {
+    Ok(claim_step_with_lease(config, step_id, worker_id, ttl_secs)?.is_some())
 }
 
 /// Transition a claimed step to `running` (sets `started_at` on first run).
-pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Result<bool> {
-    let now = Utc::now();
-    let changed = with_connection(config, |conn| {
+pub(crate) fn mark_step_running_with_lease(config: &Config, step_id: &str, lease: &XinStepLease) -> Result<bool> {
+    let changed = with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
         let changed = conn
             .execute(
                 "UPDATE xin_steps
@@ -847,8 +868,14 @@ pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Res
                      started_at = COALESCE(started_at, ?1),
                      last_heartbeat_at = ?1,
                      updated_at = ?1
-                 WHERE id = ?2 AND lease_owner = ?3 AND status IN ('claimed', 'running')",
-                params![now.to_rfc3339(), step_id, worker_id],
+                 WHERE id = ?2 AND lease_owner = ?3 AND lease_expires_at = ?4
+                   AND status IN ('claimed', 'running') AND lease_expires_at >= ?1",
+                params![
+                    now.to_rfc3339(),
+                    step_id,
+                    lease.worker_id,
+                    lease.expires_at.to_rfc3339()
+                ],
             )
             .context("Failed to mark xin step running")?;
         if changed > 0 {
@@ -859,32 +886,282 @@ pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Res
     Ok(changed > 0)
 }
 
+#[cfg(test)]
+pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Result<bool> {
+    let Some(step) = get_step(config, step_id).ok() else {
+        return Ok(false);
+    };
+    let Some(expires_at) = step.lease_expires_at else {
+        return Ok(false);
+    };
+    mark_step_running_with_lease(
+        config,
+        step_id,
+        &XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at,
+        },
+    )
+}
+
 /// Atomically renew a lease. Succeeds only when the caller still owns a
 /// non-expired lease — this is what keeps long agent runs from being marked
 /// stale mid-flight. Returns `true` iff the lease was extended.
+#[cfg(test)]
 pub fn renew_step_lease(config: &Config, step_id: &str, worker_id: &str, ttl_secs: u64) -> Result<bool> {
-    let now = Utc::now();
-    let changed = with_connection(config, |conn| {
+    Ok(renew_step_lease_with_expiry(config, step_id, worker_id, ttl_secs)?.is_some())
+}
+
+/// Renew a lease and return the exact persisted expiry used for subsequent
+/// owner/expiry fences.
+#[cfg(test)]
+pub fn renew_step_lease_with_expiry(
+    config: &Config,
+    step_id: &str,
+    worker_id: &str,
+    ttl_secs: u64,
+) -> Result<Option<DateTime<Utc>>> {
+    let Some(step) = get_step(config, step_id).ok() else {
+        return Ok(None);
+    };
+    let Some(expires_at) = step.lease_expires_at else {
+        return Ok(None);
+    };
+    Ok(renew_step_lease_generation(
+        config,
+        step_id,
+        &XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at,
+        },
+        ttl_secs,
+    )?
+    .map(|lease| lease.expires_at))
+}
+
+pub(crate) fn renew_step_lease_generation(
+    config: &Config,
+    step_id: &str,
+    lease: &XinStepLease,
+    ttl_secs: u64,
+) -> Result<Option<XinStepLease>> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
         let Some((mode, persisted)) = step_lease_params(conn, step_id) else {
-            return Ok(0usize);
+            return Ok(None);
         };
         let ttl = effective_lease_ttl(&mode, persisted, ttl_secs);
         let expires = now + chrono::Duration::seconds(i64::try_from(ttl).unwrap_or(i64::MAX));
 
-        conn.execute(
-            "UPDATE xin_steps
+        let changed = conn
+            .execute(
+                "UPDATE xin_steps
              SET lease_expires_at = ?1, last_heartbeat_at = ?2, updated_at = ?2
              WHERE id = ?3 AND lease_owner = ?4
                AND status IN ('claimed', 'running')
-               AND (lease_expires_at IS NULL OR lease_expires_at >= ?2)",
-            params![expires.to_rfc3339(), now.to_rfc3339(), step_id, worker_id],
-        )
-        .context("Failed to renew xin step lease")
-    })?;
-    Ok(changed > 0)
+               AND lease_expires_at = ?5 AND lease_expires_at >= ?2",
+                params![
+                    expires.to_rfc3339(),
+                    now.to_rfc3339(),
+                    step_id,
+                    lease.worker_id,
+                    lease.expires_at.to_rfc3339()
+                ],
+            )
+            .context("Failed to renew xin step lease")?;
+        Ok((changed > 0).then(|| XinStepLease {
+            worker_id: lease.worker_id.clone(),
+            expires_at: expires,
+        }))
+    })
+}
+
+/// Persist a checkpoint only if the exact lease generation is still current.
+pub(crate) fn save_step_checkpoint_with_lease(
+    config: &Config,
+    step_id: &str,
+    lease: &XinStepLease,
+    checkpoint_json: &str,
+) -> Result<bool> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let changed = conn.execute(
+            "UPDATE xin_steps SET checkpoint_json = ?1, updated_at = ?2
+             WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5
+               AND lease_expires_at >= ?2 AND status IN ('claimed', 'running')",
+            params![
+                checkpoint_json,
+                now.to_rfc3339(),
+                step_id,
+                lease.worker_id,
+                lease.expires_at.to_rfc3339()
+            ],
+        )?;
+        Ok(changed > 0)
+    })
+}
+
+#[cfg(test)]
+pub fn save_step_checkpoint_if_claim_current(
+    config: &Config,
+    step_id: &str,
+    worker_id: &str,
+    expected_expiry: DateTime<Utc>,
+    checkpoint_json: &str,
+) -> Result<bool> {
+    save_step_checkpoint_with_lease(
+        config,
+        step_id,
+        &XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at: expected_expiry,
+        },
+        checkpoint_json,
+    )
+}
+
+/// Complete only the exact lease generation that performed the work.
+pub(crate) fn complete_step_with_lease(
+    config: &Config,
+    step_id: &str,
+    lease: &XinStepLease,
+    output: &str,
+) -> Result<bool> {
+    let bounded = truncate_output(output);
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let goal_id: Option<String> = conn
+            .query_row("SELECT goal_id FROM xin_steps WHERE id = ?1", params![step_id], |row| {
+                row.get(0)
+            })
+            .ok();
+        let changed = conn.execute(
+            "UPDATE xin_steps
+             SET status = 'completed', completed_at = ?1, last_output = ?2,
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+             WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5
+               AND lease_expires_at >= ?1 AND status IN ('claimed', 'running')",
+            params![
+                now.to_rfc3339(),
+                bounded,
+                step_id,
+                lease.worker_id,
+                lease.expires_at.to_rfc3339()
+            ],
+        )?;
+        if changed == 0 {
+            return Ok(false);
+        }
+        emit_step_event(conn, config, step_id, "xin.step.completed", Some("completed"))?;
+        if let Some(goal_id) = goal_id {
+            recompute_goal_progress(conn, config, &goal_id, now)?;
+        }
+        Ok(true)
+    })
+}
+
+#[cfg(test)]
+pub fn complete_step_if_claim_current(
+    config: &Config,
+    step_id: &str,
+    worker_id: &str,
+    expected_expiry: DateTime<Utc>,
+    output: &str,
+) -> Result<bool> {
+    complete_step_with_lease(
+        config,
+        step_id,
+        &XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at: expected_expiry,
+        },
+        output,
+    )
+}
+
+/// Fail/retry only the exact lease generation that performed the work.
+pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinStepLease, output: &str) -> Result<bool> {
+    let bounded = truncate_output(output);
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let row: Option<(String, i64, i64)> = conn
+            .query_row(
+                "SELECT goal_id, retry_count, max_retries FROM xin_steps
+                 WHERE id = ?1 AND lease_owner = ?2 AND lease_expires_at = ?3
+                   AND lease_expires_at >= ?4 AND status IN ('claimed', 'running')",
+                params![
+                    step_id,
+                    lease.worker_id,
+                    lease.expires_at.to_rfc3339(),
+                    now.to_rfc3339()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .ok();
+        let Some((goal_id, retry_count, max_retries)) = row else {
+            return Ok(false);
+        };
+        if retry_count < max_retries {
+            conn.execute(
+                "UPDATE xin_steps
+                 SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
+                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+                 WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5",
+                params![
+                    bounded,
+                    now.to_rfc3339(),
+                    step_id,
+                    lease.worker_id,
+                    lease.expires_at.to_rfc3339()
+                ],
+            )?;
+            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"))?;
+        } else {
+            conn.execute(
+                "UPDATE xin_steps
+                 SET status = 'failed', retry_count = retry_count + 1, last_output = ?1,
+                     completed_at = ?2, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
+                 WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5",
+                params![
+                    bounded,
+                    now.to_rfc3339(),
+                    step_id,
+                    lease.worker_id,
+                    lease.expires_at.to_rfc3339()
+                ],
+            )?;
+            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"))?;
+            conn.execute(
+                "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
+                params![now.to_rfc3339(), goal_id],
+            )?;
+        }
+        Ok(true)
+    })
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub fn fail_step_if_claim_current(
+    config: &Config,
+    step_id: &str,
+    worker_id: &str,
+    expected_expiry: DateTime<Utc>,
+    output: &str,
+) -> Result<bool> {
+    fail_step_with_lease(
+        config,
+        step_id,
+        &XinStepLease {
+            worker_id: worker_id.to_string(),
+            expires_at: expected_expiry,
+        },
+        output,
+    )
 }
 
 /// Persist a checkpoint without changing status — replayed on crash recovery.
+#[allow(dead_code)]
 pub fn save_step_checkpoint(config: &Config, step_id: &str, checkpoint_json: &str) -> Result<()> {
     let now = Utc::now();
     with_connection(config, |conn| {
@@ -903,6 +1180,7 @@ pub fn save_step_checkpoint(config: &Config, step_id: &str, checkpoint_json: &st
 
 /// Mark a step completed, recompute the goal's progress and roll the goal up to
 /// `completed` once every step is done.
+#[allow(dead_code)]
 pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -936,6 +1214,7 @@ pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()>
 /// Mark a step failed. If retries remain the step is reset to `pending` (lease
 /// released) for re-execution; otherwise it is terminally `failed` and the goal
 /// rolls up to `failed`.
+#[allow(dead_code)]
 pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -1628,6 +1907,27 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     f(&conn)
 }
 
+fn with_immediate_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    with_connection(config, |conn| {
+        conn.execute_batch("BEGIN IMMEDIATE")?;
+        match f(conn) {
+            Ok(value) => {
+                conn.execute_batch("COMMIT")?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    })
+}
+
+fn authoritative_now(conn: &Connection) -> Result<DateTime<Utc>> {
+    let raw: String = conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |row| row.get(0))?;
+    Ok(DateTime::parse_from_rfc3339(&raw)?.with_timezone(&Utc))
+}
+
 #[allow(clippy::indexing_slicing)]
 #[cfg(test)]
 mod tests {
@@ -1642,6 +1942,15 @@ mod tests {
         };
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
+    }
+
+    /// Opens the Xin repository database for tests that must hold a write lock
+    /// across a concurrent repository call or deliberately expire a lease.
+    fn open_xin_test_connection(config: &Config) -> Connection {
+        let db_path = config.workspace_dir.join("xin").join("tasks.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+        conn
     }
 
     fn sample_task() -> NewXinTask {
@@ -2170,6 +2479,58 @@ mod tests {
     }
 
     #[test]
+    fn claim_waiting_on_write_lock_starts_ttl_after_authoritative_lock_time() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+
+        let lock = open_xin_test_connection(&config);
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let claim_config = config.clone();
+        let step_id = step.id.clone();
+        let claim = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            claim_step(&claim_config, &step_id, "prx:1:locked-claim", 2).unwrap()
+        });
+        started_rx.recv().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2_200));
+        let released_at = Utc::now();
+        lock.execute_batch("COMMIT").unwrap();
+
+        assert!(claim.join().unwrap());
+        let expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+        assert!(
+            expiry >= released_at + chrono::Duration::milliseconds(1_500),
+            "claim TTL must start after acquiring the write lock: expiry={expiry}, released_at={released_at}"
+        );
+    }
+
+    #[test]
+    fn expired_claim_cannot_transition_to_running() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let worker = "prx:1:expired";
+        assert!(claim_step(&config, &step.id, worker, 60).unwrap());
+
+        let conn = open_xin_test_connection(&config);
+        conn.execute(
+            "UPDATE xin_steps SET lease_expires_at = ?1 WHERE id = ?2",
+            params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), &step.id],
+        )
+        .unwrap();
+
+        assert!(!mark_step_running(&config, &step.id, worker).unwrap());
+        let current = get_step(&config, &step.id).unwrap();
+        assert_eq!(current.status, StepStatus::Claimed);
+        assert!(current.started_at.is_none());
+    }
+
+    #[test]
     fn renew_lease_extends_then_rejects_other_owner() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
@@ -2186,6 +2547,109 @@ mod tests {
 
         // A different owner cannot renew.
         assert!(!renew_step_lease(&config, &step.id, "prx:2:bbbb", 120).unwrap());
+    }
+
+    #[test]
+    fn old_expiry_fence_rejects_same_worker_reclaim_generation() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let worker = "prx:1:same";
+        assert!(claim_step(&config, &step.id, worker, 60).unwrap());
+        assert!(mark_step_running(&config, &step.id, worker).unwrap());
+        let old_expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+
+        let future = old_expiry + chrono::Duration::seconds(1);
+        assert_eq!(mark_steps_stale(&config, future).unwrap(), vec![step.id.clone()]);
+        assert!(claim_step(&config, &step.id, worker, 120).unwrap());
+        assert!(mark_step_running(&config, &step.id, worker).unwrap());
+        let new_expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+        assert_ne!(old_expiry, new_expiry);
+        save_step_checkpoint(&config, &step.id, r#"{"owner":"new-generation"}"#).unwrap();
+
+        assert!(
+            !save_step_checkpoint_if_claim_current(
+                &config,
+                &step.id,
+                worker,
+                old_expiry,
+                r#"{"owner":"old-generation"}"#,
+            )
+            .unwrap()
+        );
+        assert!(!complete_step_if_claim_current(&config, &step.id, worker, old_expiry, "old-output").unwrap());
+        let current = get_step(&config, &step.id).unwrap();
+        assert_eq!(current.status, StepStatus::Running);
+        assert_eq!(current.lease_owner.as_deref(), Some(worker));
+        assert_eq!(current.lease_expires_at, Some(new_expiry));
+        assert_eq!(
+            current.checkpoint_json.as_deref(),
+            Some(r#"{"owner":"new-generation"}"#)
+        );
+    }
+
+    #[test]
+    fn paused_same_worker_old_token_cannot_mark_or_renew_after_reclaim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let worker = "prx:1:same-process";
+        let old_lease = claim_step_with_lease(&config, &step.id, worker, 60)
+            .unwrap()
+            .expect("old generation claim");
+
+        let after_expiry = old_lease.expires_at + chrono::Duration::milliseconds(1);
+        assert_eq!(mark_steps_stale(&config, after_expiry).unwrap(), vec![step.id.clone()]);
+        let new_lease = claim_step_with_lease(&config, &step.id, worker, 120)
+            .unwrap()
+            .expect("same worker new generation claim");
+        assert_ne!(old_lease.expires_at, new_lease.expires_at);
+
+        let marker = config.workspace_dir.join("old-generation-marker");
+        if mark_step_running_with_lease(&config, &step.id, &old_lease).unwrap() {
+            std::fs::write(&marker, "stale generation executed").unwrap();
+        }
+        assert!(
+            renew_step_lease_generation(&config, &step.id, &old_lease, 60)
+                .unwrap()
+                .is_none(),
+            "old generation must not renew a same-worker reclaim"
+        );
+        assert!(!marker.exists(), "old generation must not execute its marker");
+        assert!(mark_step_running_with_lease(&config, &step.id, &new_lease).unwrap());
+    }
+
+    #[test]
+    fn renewal_waiting_on_write_lock_rechecks_authoritative_expiry() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let worker = "prx:1:locked";
+        assert!(claim_step(&config, &step.id, worker, 1).unwrap());
+        let expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+
+        let lock = open_xin_test_connection(&config);
+        lock.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let renewal_config = config;
+        let step_id = step.id;
+        let renewal = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            renew_step_lease_with_expiry(&renewal_config, &step_id, worker, 60).unwrap()
+        });
+        started_rx.recv().unwrap();
+        while Utc::now() <= expiry {
+            std::thread::yield_now();
+        }
+        lock.execute_batch("COMMIT").unwrap();
+
+        assert!(
+            renewal.join().unwrap().is_none(),
+            "expired lease must not renew after lock wait"
+        );
     }
 
     #[test]

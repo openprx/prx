@@ -1069,14 +1069,9 @@ impl Tool for CronTool {
                     });
                 }
                 let started_at = Utc::now();
-                let (success, output) = cron::scheduler::execute_claimed_job_with_runtime_approval_for_tool(
-                    &cfg,
-                    &job,
-                    manual_claim,
-                    self.name(),
-                    approval_grant,
-                )
-                .await;
+                let (success, output) =
+                    cron::scheduler::execute_claimed_job_preauthorized_for_tool(&cfg, &job, manual_claim, self.name())
+                        .await;
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds();
                 let status = if success { "ok" } else { "error" };
@@ -1775,14 +1770,14 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
-        let marker = tmp.path().join("must-not-exist");
-        let command = format!("touch {}", marker.display());
+        let marker = cfg_snap.workspace_dir.join("must-not-exist");
+        let command = "touch must-not-exist";
         let at = Utc::now() + chrono::Duration::hours(1);
         let job = cron::add_shell_job(
             &cfg_snap,
             Some("terminal-conflict".into()),
             Schedule::At { at },
-            &command,
+            command,
         )
         .unwrap();
         let now = Utc::now();
@@ -1872,7 +1867,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
-        let command = format!("touch {}", cfg_snap.workspace_dir.join("grant-marker").display());
+        let command = "touch grant-marker".to_string();
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", &command).unwrap();
         cron::claim_job_if_current_for_manual_run(
             &cfg_snap,
@@ -1927,6 +1922,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_risky_run_consumes_v2_grant_and_action_exactly_once() {
+        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
+        use crate::security::policy::{CommandRiskLevel, RUNTIME_APPROVAL_GRANT_ARG};
+
+        let tmp = TempDir::new().unwrap();
+        let base = test_config(&tmp).await;
+        let mut config = (*base.load_full()).clone();
+        config.autonomy.max_actions_per_hour = 1;
+        let cfg = new_shared(config);
+        let cfg_snap = cfg.load_full();
+        let command = "touch single-use-marker";
+        let job = cron::add_job(&cfg_snap, "*/5 * * * *", command).unwrap();
+        let security = test_security(&cfg_snap);
+        let risk = match security.command_risk_level(command) {
+            CommandRiskLevel::Low => RiskLevel::Low,
+            CommandRiskLevel::Medium => RiskLevel::Medium,
+            CommandRiskLevel::High => RiskLevel::High,
+        };
+        let grant_v2 = ApprovalGrantV2::issue_one_shot(
+            WitnessKeyring::global().unwrap(),
+            Subject {
+                agent_id: "prx:test:cron".into(),
+                principal_id: "test:cron-user".into(),
+                owner_id: "test:owner".into(),
+                workspace_id: "test:workspace".into(),
+                session_key: Some("test:session".into()),
+            },
+            IssuerAuthority::HumanReview,
+            command,
+            risk,
+        )
+        .unwrap();
+        let grant = ApprovalGrant::from_verified_v2("cron", "test", grant_v2);
+        let tool = CronTool::new(Arc::clone(&cfg), Arc::clone(&security));
+
+        let result = tool
+            .execute(json!({
+                "action": "run",
+                "job_id": job.id,
+                RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(grant).unwrap(),
+                "_zc_scope_trusted": true,
+                "_zc_scope": {"principal_id": "test:cron-user"},
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "{:?}", result.error);
+        assert!(cfg_snap.workspace_dir.join("single-use-marker").exists());
+        assert!(
+            security.is_rate_limited(),
+            "exactly one action should exhaust the one-action budget"
+        );
+        let audit = std::fs::read_to_string(cfg_snap.workspace_dir.join("audit.log")).unwrap();
+        assert_eq!(audit.lines().filter(|line| !line.trim().is_empty()).count(), 1);
+    }
+
+    #[tokio::test]
     async fn manual_run_authorization_rejection_releases_claim_immediately() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
@@ -1949,7 +2001,7 @@ mod tests {
             &cfg_snap,
             &job.id,
             CronJobPatch {
-                command: Some(format!("touch {}", marker.display())),
+                command: Some("touch must-remain-absent".into()),
                 ..CronJobPatch::default()
             },
         )

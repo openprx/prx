@@ -7,6 +7,7 @@
 //! - Persist results and reschedule
 
 use crate::config::Config;
+use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ApprovalGrant;
 use crate::xin::builtin::BuiltinRegistry;
@@ -15,9 +16,7 @@ use crate::xin::types::{ExecutionMode, GoalStatus, XinGoal, XinStep, XinTask, Xi
 use anyhow::Result;
 use chrono::Utc;
 use futures_util::{StreamExt, stream};
-use std::process::Stdio;
 use std::sync::Arc;
-use tokio::process::Command;
 use tokio::time::{self, Duration};
 use tokio_util::sync::CancellationToken;
 
@@ -400,11 +399,11 @@ async fn advance_goal(
     let lease_ttl = lease_ttl_for(&step);
 
     // Atomically claim the step; if another worker won, bail out quietly.
-    if !store::claim_step(config, &step.id, &worker, lease_ttl)? {
+    let Some(lease) = store::claim_step_with_lease(config, &step.id, &worker, lease_ttl)? else {
         tracing::debug!(target: "xin", step_id = %step.id, "step already claimed by another worker");
         return Ok(());
-    }
-    if !store::mark_step_running(config, &step.id, &worker)? {
+    };
+    if !store::mark_step_running_with_lease(config, &step.id, &lease)? {
         tracing::debug!(target: "xin", step_id = %step.id, "step running transition lost the lease");
         return Ok(());
     }
@@ -413,16 +412,44 @@ async fn advance_goal(
     // checkpoint state rather than the pre-claim snapshot.
     let step = store::get_step(config, &step.id)?;
 
-    let (success, output) = execute_step_with_heartbeat(config, security, registry, &step, &worker, lease_ttl).await;
-
-    if success {
-        if let Err(e) = store::complete_step(config, &step.id, &output) {
-            tracing::warn!(target: "xin", step_id = %step.id, "failed to complete step: {e}");
-        }
-    } else if let Err(e) = store::fail_step(config, &step.id, &output) {
-        tracing::warn!(target: "xin", step_id = %step.id, "failed to fail step: {e}");
-    }
+    let outcome = execute_step_with_heartbeat(config, security, registry, &step, lease, lease_ttl).await;
+    persist_step_execution_outcome(config, &step, outcome);
     Ok(())
+}
+
+enum StepExecutionOutcome {
+    Authorized {
+        success: bool,
+        output: String,
+        lease: store::XinStepLease,
+    },
+    AuthorityLost,
+}
+
+fn persist_step_execution_outcome(config: &Config, step: &XinStep, outcome: StepExecutionOutcome) {
+    match outcome {
+        StepExecutionOutcome::AuthorityLost => {
+            tracing::warn!(target: "xin", step_id = %step.id, "lease authority lost; skipping step persistence");
+        }
+        StepExecutionOutcome::Authorized {
+            success: true,
+            output,
+            lease,
+        } => match store::complete_step_with_lease(config, &step.id, &lease, &output) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(target: "xin", step_id = %step.id, "completion fence lost lease authority"),
+            Err(e) => tracing::warn!(target: "xin", step_id = %step.id, "failed to complete step: {e}"),
+        },
+        StepExecutionOutcome::Authorized {
+            success: false,
+            output,
+            lease,
+        } => match store::fail_step_with_lease(config, &step.id, &lease, &output) {
+            Ok(true) => {}
+            Ok(false) => tracing::warn!(target: "xin", step_id = %step.id, "failure fence lost lease authority"),
+            Err(e) => tracing::warn!(target: "xin", step_id = %step.id, "failed to fail step: {e}"),
+        },
+    }
 }
 
 /// Resolve the effective lease TTL for a step: honor the per-step override,
@@ -445,48 +472,103 @@ async fn execute_step_with_heartbeat(
     security: &SecurityPolicy,
     registry: &BuiltinRegistry,
     step: &XinStep,
-    worker: &str,
+    initial_lease: store::XinStepLease,
     lease_ttl_secs: u64,
-) -> (bool, String) {
+) -> StepExecutionOutcome {
     let heartbeat_secs = (lease_ttl_secs / 3).max(MIN_HEARTBEAT_SECS);
-    let cancel = CancellationToken::new();
-    let cancel_hb = cancel.clone();
+    let heartbeat_stop = CancellationToken::new();
+    let heartbeat_stop_child = heartbeat_stop.clone();
+    let lease_lost = CancellationToken::new();
+    let lease_lost_hb = lease_lost.clone();
 
     let hb_config = config.clone();
     let hb_step_id = step.id.clone();
-    let hb_worker = worker.to_string();
+    let initial_expiry = initial_lease.expires_at;
+    let exact_lease = Arc::new(parking_lot::Mutex::new(initial_lease));
+    let heartbeat_lease = Arc::clone(&exact_lease);
+    let initial_deadline = (initial_expiry - Utc::now()).to_std().unwrap_or(Duration::ZERO);
     let hb_handle = tokio::spawn(async move {
+        let mut current_lease = heartbeat_lease.lock().clone();
         let mut ticker = time::interval(Duration::from_secs(heartbeat_secs));
         // Skip the immediate first tick (lease was just set by claim).
         ticker.tick().await;
+        let lease_deadline = time::sleep(initial_deadline);
+        tokio::pin!(lease_deadline);
         loop {
             tokio::select! {
+                biased;
+                () = &mut lease_deadline => {
+                    tracing::warn!(target: "xin", step_id = %hb_step_id, "lease deadline elapsed; cancelling execution");
+                    lease_lost_hb.cancel();
+                    return true;
+                }
                 _ = ticker.tick() => {
-                    match store::renew_step_lease(&hb_config, &hb_step_id, &hb_worker, lease_ttl_secs) {
-                        Ok(true) => {
+                    match store::renew_step_lease_generation(&hb_config, &hb_step_id, &current_lease, lease_ttl_secs) {
+                        Ok(Some(renewed_lease)) => {
                             tracing::debug!(target: "xin", step_id = %hb_step_id, "lease renewed");
+                            let remaining = (renewed_lease.expires_at - Utc::now())
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+                            current_lease = renewed_lease.clone();
+                            *heartbeat_lease.lock() = renewed_lease;
+                            lease_deadline.as_mut().reset(time::Instant::now() + remaining);
                         }
-                        Ok(false) => {
+                        Ok(None) => {
                             tracing::warn!(target: "xin", step_id = %hb_step_id, "lease lost; stopping heartbeat");
-                            break;
+                            lease_lost_hb.cancel();
+                            return true;
                         }
                         Err(e) => {
                             tracing::warn!(target: "xin", step_id = %hb_step_id, "heartbeat renewal failed: {e}");
                         }
                     }
                 }
-                _ = cancel_hb.cancelled() => break,
+                _ = heartbeat_stop_child.cancelled() => return false,
             }
         }
     });
 
-    let result = execute_step_inner(config, security, registry, step).await;
+    let mut execution = Box::pin(execute_step_inner(
+        config,
+        security,
+        registry,
+        step,
+        Some(lease_lost.clone()),
+    ));
+    let result = tokio::select! {
+        biased;
+        () = lease_lost.cancelled() => None,
+        result = &mut execution => Some(result),
+    };
+    // Dropping the whole execution future is the authority boundary. For Shell
+    // this invokes the shared adapter's process-group kill/reap Drop path; for
+    // AgentSession it cancels the in-flight agent future as well.
+    drop(execution);
 
-    cancel.cancel();
-    if let Err(e) = hb_handle.await {
-        tracing::warn!(target: "xin", step_id = %step.id, "heartbeat task join error: {e}");
+    heartbeat_stop.cancel();
+    let authority_lost = match hb_handle.await {
+        Ok(authority_lost) => authority_lost,
+        Err(e) => {
+            tracing::warn!(target: "xin", step_id = %step.id, "heartbeat task join error: {e}");
+            true
+        }
+    };
+    let Some(result) = result else {
+        return StepExecutionOutcome::AuthorityLost;
+    };
+    if authority_lost {
+        return StepExecutionOutcome::AuthorityLost;
     }
-    result
+
+    let lease = exact_lease.lock().clone();
+    if !save_step_checkpoint(config, step, &lease, result.0) {
+        return StepExecutionOutcome::AuthorityLost;
+    }
+    StepExecutionOutcome::Authorized {
+        success: result.0,
+        output: result.1,
+        lease,
+    }
 }
 
 /// Run a step's actual work, reusing the same execution backends as XinTask.
@@ -495,29 +577,34 @@ async fn execute_step_inner(
     security: &SecurityPolicy,
     registry: &BuiltinRegistry,
     step: &XinStep,
+    cancellation: Option<CancellationToken>,
 ) -> (bool, String) {
     // Bridge the step into the existing XinTask-shaped execution backends.
     let bridge = step_as_task(step);
-    let result = match step.execution_mode {
+    match step.execution_mode {
         ExecutionMode::Internal => run_internal(config, registry, &bridge).await,
         ExecutionMode::AgentSession => run_agent(config, security, &bridge).await,
-        ExecutionMode::Shell => run_shell(config, security, &bridge).await,
-    };
+        ExecutionMode::Shell => run_shell_with_cancellation(config, security, &bridge, cancellation).await,
+    }
+}
 
-    // Persist a checkpoint snapshot so a crash mid-goal can be diagnosed and the
-    // next attempt can resume from a known marker rather than from scratch.
+fn save_step_checkpoint(config: &Config, step: &XinStep, lease: &store::XinStepLease, succeeded: bool) -> bool {
+    // Persist only while the heartbeat still confirms our authority. A lost
+    // lease may already belong to another worker, whose checkpoint must win.
     let checkpoint = serde_json::json!({
         "sequence": step.sequence,
         "attempt": step.retry_count + 1,
-        "succeeded": result.0,
+        "succeeded": succeeded,
         "at": Utc::now().to_rfc3339(),
     })
     .to_string();
-    if let Err(e) = store::save_step_checkpoint(config, &step.id, &checkpoint) {
-        tracing::warn!(target: "xin", step_id = %step.id, "failed to save step checkpoint: {e}");
+    match store::save_step_checkpoint_with_lease(config, &step.id, lease, &checkpoint) {
+        Ok(saved) => saved,
+        Err(e) => {
+            tracing::warn!(target: "xin", step_id = %step.id, "failed to save step checkpoint: {e}");
+            false
+        }
     }
-
-    result
 }
 
 /// Adapt a `XinStep` into a `XinTask` view for the shared execution backends.
@@ -606,6 +693,29 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
 }
 
 async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
+    run_shell_with_cancellation(config, security, task, None).await
+}
+
+async fn run_shell_with_cancellation(
+    config: &Config,
+    security: &SecurityPolicy,
+    task: &XinTask,
+    cancellation: Option<CancellationToken>,
+) -> (bool, String) {
+    let process = match ShellProcessAdapter::from_config(config) {
+        Ok(process) => process,
+        Err(error) => return (false, format!("runtime error: {error}")),
+    };
+    run_shell_with_adapter(config, security, task, cancellation, &process).await
+}
+
+async fn run_shell_with_adapter(
+    config: &Config,
+    security: &SecurityPolicy,
+    task: &XinTask,
+    cancellation: Option<CancellationToken>,
+    process: &ShellProcessAdapter,
+) -> (bool, String) {
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
@@ -627,47 +737,31 @@ async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         return (false, "blocked by security policy: action budget exhausted".into());
     }
 
-    let mut command = Command::new("sh");
-    command
-        .arg("-lc")
-        .arg(&task.payload)
-        .current_dir(&config.workspace_dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-
-    // P0-39: apply OS-level sandbox isolation before spawning, mirroring the
-    // ShellTool path (tools/shell.rs). The Sandbox trait mutates the inner
-    // std::process::Command, reached here via tokio's `as_std_mut`. A fail-closed
-    // backend (UnavailableSandbox) blocks execution rather than running unsandboxed.
-    let sandbox = crate::security::create_sandbox_with_workspace(&config.autonomy.sandbox, Some(&config.workspace_dir));
-    if let Err(e) = sandbox.wrap_command(command.as_std_mut()) {
-        return (
-            false,
-            format!("blocked by security policy: sandbox failed to wrap command: {e}"),
-        );
-    }
-
-    let child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => return (false, format!("spawn error: {e}")),
-    };
-
-    match time::timeout(Duration::from_secs(SHELL_TIMEOUT_SECS), child.wait_with_output()).await {
-        Ok(Ok(output)) => {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
+    match process
+        .execute(ShellProcessRequest {
+            command: &task.payload,
+            workspace_dir: &config.workspace_dir,
+            timeout: Duration::from_secs(SHELL_TIMEOUT_SECS),
+            cancellation,
+        })
+        .await
+    {
+        Ok(output) => {
             let combined = format!(
                 "status={}\nstdout:\n{}\nstderr:\n{}",
                 output.status,
-                stdout.trim(),
-                stderr.trim()
+                output.stdout.trim(),
+                output.stderr.trim()
             );
             (output.status.success(), combined)
         }
-        Ok(Err(e)) => (false, format!("spawn error: {e}")),
-        Err(_) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
+        Err(ShellProcessError::Timeout(_)) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
+        Err(ShellProcessError::Cancelled) => (false, "task cancelled after lease loss".into()),
+        Err(ShellProcessError::Sandbox(error)) => (
+            false,
+            format!("blocked by security policy: sandbox failed to wrap command: {error}"),
+        ),
+        Err(error) => (false, format!("spawn error: {error}")),
     }
 }
 
@@ -680,8 +774,43 @@ fn persisted_task_approval_grant(task: &XinTask) -> Option<ApprovalGrant> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::{NativeRuntime, RuntimeAdapter};
+    use crate::security::traits::NoopSandbox;
     use crate::xin::types::{NewXinTask, TaskKind, TaskPriority};
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
+
+    struct SpyRuntime {
+        called: Arc<AtomicBool>,
+    }
+
+    impl RuntimeAdapter for SpyRuntime {
+        fn name(&self) -> &str {
+            "xin-spy"
+        }
+
+        fn has_shell_access(&self) -> bool {
+            true
+        }
+
+        fn has_filesystem_access(&self) -> bool {
+            true
+        }
+
+        fn storage_path(&self) -> PathBuf {
+            PathBuf::new()
+        }
+
+        fn supports_long_running(&self) -> bool {
+            true
+        }
+
+        fn build_shell_command(&self, command: &str, workspace_dir: &Path) -> anyhow::Result<tokio::process::Command> {
+            self.called.store(true, Ordering::SeqCst);
+            NativeRuntime::new().build_shell_command(command, workspace_dir)
+        }
+    }
 
     fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config {
@@ -756,6 +885,95 @@ mod tests {
 
         assert!(success, "shell task should succeed: {output}");
         assert!(output.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn xin_entry_uses_runtime_adapter_builder() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = store::add_task(
+            &config,
+            &NewXinTask {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "runtime_spy".into(),
+                description: None,
+                kind: TaskKind::User,
+                priority: TaskPriority::Normal,
+                execution_mode: ExecutionMode::Shell,
+                payload: "echo xin-runtime-spy".into(),
+                recurring: false,
+                interval_secs: 0,
+                max_failures: 1,
+                approval_grant_json: None,
+            },
+        )
+        .unwrap();
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+        let called = Arc::new(AtomicBool::new(false));
+        let process = ShellProcessAdapter::new(
+            Arc::new(SpyRuntime {
+                called: Arc::clone(&called),
+            }),
+            Arc::new(NoopSandbox),
+            Vec::new(),
+        );
+
+        let (success, output) = run_shell_with_adapter(&config, &security, &task, None, &process).await;
+
+        assert!(success, "{output}");
+        assert!(output.contains("xin-runtime-spy"));
+        assert!(
+            called.load(Ordering::SeqCst),
+            "Xin must use RuntimeAdapter::build_shell_command"
+        );
+    }
+
+    #[tokio::test]
+    async fn xin_forbidden_path_denial_has_single_runner_audit_identity() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let task = store::add_task(
+            &config,
+            &NewXinTask {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "forbidden_path".into(),
+                description: None,
+                kind: TaskKind::User,
+                priority: TaskPriority::Normal,
+                execution_mode: ExecutionMode::Shell,
+                payload: "cat /etc/passwd".into(),
+                recurring: false,
+                interval_secs: 0,
+                max_failures: 1,
+                approval_grant_json: None,
+            },
+        )
+        .unwrap();
+        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
+
+        let (success, output) = run_shell(&config, &security, &task).await;
+        assert!(!success);
+        assert!(output.contains("forbidden path argument: /etc/passwd"), "{output}");
+
+        let audit = std::fs::read_to_string(config.workspace_dir.join("audit.log")).expect("audit log");
+        let events: Vec<crate::security::audit::AuditEvent> = audit
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("audit event"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        let action = events
+            .first()
+            .and_then(|event| event.action.as_ref())
+            .and_then(|action| action.command.as_deref())
+            .unwrap_or_default();
+        assert!(action.starts_with("xin_runner:"), "{action}");
     }
 
     #[tokio::test]
@@ -1050,15 +1268,21 @@ mod tests {
         .unwrap();
         let step = store::list_steps(&config, &goal.id).unwrap().remove(0);
         let worker = worker_id();
-        assert!(store::claim_step(&config, &step.id, &worker, 6).unwrap());
-        assert!(store::mark_step_running(&config, &step.id, &worker).unwrap());
+        let lease = store::claim_step_with_lease(&config, &step.id, &worker, 6)
+            .unwrap()
+            .expect("lease claim");
+        assert!(store::mark_step_running_with_lease(&config, &step.id, &lease).unwrap());
+        let step = store::get_step(&config, &step.id).unwrap();
 
         // Run the heartbeat-wrapped step; the wrapper must keep the short lease
         // alive for the duration so a concurrent stale sweep does not reap it.
         let registry = BuiltinRegistry::new();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (ok, _out) = execute_step_with_heartbeat(&config, &security, &registry, &step, &worker, 6).await;
-        assert!(ok);
+        let outcome = execute_step_with_heartbeat(&config, &security, &registry, &step, lease, 6).await;
+        assert!(matches!(
+            outcome,
+            StepExecutionOutcome::Authorized { success: true, .. }
+        ));
         // The step ran under a live lease (never marked stale during the run).
         let stale = store::mark_steps_stale(&config, Utc::now()).unwrap();
         assert!(stale.is_empty(), "running step must not be reaped: {stale:?}");
@@ -1067,6 +1291,88 @@ mod tests {
         assert_eq!(
             store::get_step(&config, &step.id).unwrap().status,
             StepStatus::Completed
+        );
+    }
+
+    #[tokio::test]
+    async fn lease_loss_cancels_shell_without_overwriting_new_owner_state() {
+        use crate::xin::types::{NewXinGoal, NewXinStep, StepStatus};
+
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let goal = store::add_goal(
+            &config,
+            &NewXinGoal {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "lease_loss_goal".into(),
+                description: None,
+                kind: TaskKind::User,
+                priority: TaskPriority::Normal,
+                target_completion_at: None,
+                initial_steps: vec![NewXinStep {
+                    sequence: 1,
+                    name: "lost-shell".into(),
+                    description: None,
+                    execution_mode: ExecutionMode::Shell,
+                    payload: "sleep 3; touch old-owner-marker".into(),
+                    max_retries: 1,
+                    approval_grant_json: None,
+                    lease_ttl_secs: 1,
+                }],
+            },
+        )
+        .unwrap();
+        let step_id = store::list_steps(&config, &goal.id).unwrap().remove(0).id;
+        let old_owner = "prx:test:old";
+        let old_lease = store::claim_step_with_lease(&config, &step_id, old_owner, 1)
+            .unwrap()
+            .expect("old lease claim");
+        assert!(store::mark_step_running_with_lease(&config, &step_id, &old_lease).unwrap());
+        let step = store::get_step(&config, &step_id).unwrap();
+
+        let execution_config = config.clone();
+        let execution_step = step.clone();
+        let execution = tokio::spawn(async move {
+            let registry = BuiltinRegistry::new();
+            let security = SecurityPolicy::from_config(&execution_config.autonomy, &execution_config.workspace_dir);
+            execute_step_with_heartbeat(&execution_config, &security, &registry, &execution_step, old_lease, 1).await
+        });
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let stale = store::mark_steps_stale(&config, Utc::now()).unwrap();
+                if stale.iter().any(|id| id == &step_id) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("old lease should expire");
+
+        let new_owner = "prx:test:new";
+        let new_lease = store::claim_step_with_lease(&config, &step_id, new_owner, 60)
+            .unwrap()
+            .expect("new lease claim");
+        assert!(store::mark_step_running_with_lease(&config, &step_id, &new_lease).unwrap());
+        store::save_step_checkpoint(&config, &step_id, r#"{"owner":"new"}"#).unwrap();
+
+        let outcome = execution.await.expect("lease-managed execution task");
+        assert!(matches!(&outcome, StepExecutionOutcome::AuthorityLost));
+        persist_step_execution_outcome(&config, &step, outcome);
+
+        let current = store::get_step(&config, &step_id).unwrap();
+        assert_eq!(current.lease_owner.as_deref(), Some(new_owner));
+        assert_eq!(current.status, StepStatus::Running);
+        assert_eq!(current.retry_count, 0, "lost owner must not call fail_step");
+        assert_eq!(current.checkpoint_json.as_deref(), Some(r#"{"owner":"new"}"#));
+        assert!(
+            !config.workspace_dir.join("old-owner-marker").exists(),
+            "lost owner's process must be cancelled before writing its marker"
         );
     }
 }

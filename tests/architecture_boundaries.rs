@@ -62,6 +62,7 @@ const ALLOWED_BRAIN_DB_OPENS_OUTSIDE_SQLITE_REPOSITORY: &[&str] = &[
     "src/xin/evolution.rs::tick::Connection::open(&db_path).with_context(|| format!(\"failed to open memory db: {}\", db_path.display()))?;",
     "src/xin/store.rs::add_task_persists_owner_topic_lineage_and_event::let memory_conn = Connection::open(config.workspace_dir.join(\"memory\").join(\"brain.db\")).unwrap();",
     "src/xin/store.rs::legacy_xin_tasks_schema_migrates_lineage_columns_and_events_table::let conn = Connection::open(&db_path).unwrap();",
+    "src/xin/store.rs::open_xin_test_connection::let conn = Connection::open(&db_path).unwrap();",
     "src/xin/store.rs::with_connection::let conn = Connection::open(&db_path).with_context(|| format!(\"Failed to open xin DB: {}\", db_path.display()))?;",
 ];
 
@@ -71,7 +72,6 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/chat/mod.rs::run_git_diff_bounded::.spawn()",
     "src/chat/sessions/shell.rs::spawn_shell_with_origin::.spawn()",
     "src/chat/terminal_proto.rs::copy_to_tmux_buffer::.spawn()?;",
-    "src/cron/scheduler.rs::run_job_command_with_timeout::.spawn()",
     "src/hooks/mod.rs::run_action::let mut child = cmd.spawn()?;",
     "src/tools/sessions_spawn.rs::assert_explicit_cleanup_signals_once::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::injected_panic_cleanup_try_wait_error_keeps_owner_pending::let child = command.spawn().unwrap();",
@@ -83,13 +83,12 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
     "src/tools/sessions_spawn.rs::process_mode_parent_timeout_kills_stuck_process::let mut child = command.spawn().unwrap();",
     "src/tools/sessions_spawn.rs::run_sub_agent_process::let mut child = command.spawn()?;",
     "src/tools/sessions_spawn.rs::termination_after_leader_exit_does_not_wait_forever_on_inherited_pipe::let mut child = command.spawn().expect(\"test leader should spawn\");",
-    "src/tools/shell.rs::spawn_managed_shell_child::let child = cmd.spawn()?;",
+    "src/runtime/shell_process.rs::spawn_managed_shell_child::let child = cmd.spawn()?;",
     "src/tunnel/cloudflare.rs::start::.spawn()?;",
     "src/tunnel/custom.rs::start::.spawn()?;",
     "src/tunnel/mod.rs::kill_shared_terminates_and_clears_child::.spawn()",
     "src/tunnel/ngrok.rs::start::.spawn()?;",
     "src/tunnel/tailscale.rs::start::.spawn()?;",
-    "src/xin/runner.rs::run_shell::let child = match command.spawn() {",
 ];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
@@ -196,6 +195,31 @@ fn enclosing_function(lines: &[&str], line_index: usize) -> String {
     "<module>".to_string()
 }
 
+fn function_body(source: &str, name: &str) -> String {
+    let needle = format!("fn {name}(");
+    let start = source
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing production function {name}"));
+    let body_start = source[start..].find('{').map_or_else(
+        || panic!("missing body for production function {name}"),
+        |offset| start + offset,
+    );
+    let mut depth = 0usize;
+    for (offset, character) in source[body_start..].char_indices() {
+        match character {
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1).expect("function brace depth underflow");
+                if depth == 0 {
+                    return source[start..=body_start + offset].to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("unterminated production function {name}")
+}
+
 fn assert_inventory(boundary: &str, actual: Vec<String>, expected: &[&str]) {
     let mut actual = actual;
     actual.sort();
@@ -273,6 +297,53 @@ fn raw_child_process_spawns_are_explicitly_allowlisted() {
         actual,
         ALLOWED_RAW_CHILD_PROCESS_SPAWNS,
     );
+}
+
+#[test]
+fn shell_entrypoints_delegate_process_execution_to_shared_adapter() {
+    for (relative, entrypoint, execution_helper) in [
+        ("src/tools/shell.rs", "execute_inner", "execute_inner"),
+        (
+            "src/cron/scheduler.rs",
+            "run_job_command_with_timeout_authorization",
+            "run_job_command_with_timeout_and_adapter",
+        ),
+        (
+            "src/xin/runner.rs",
+            "run_shell_with_cancellation",
+            "run_shell_with_adapter",
+        ),
+    ] {
+        let source = fs::read_to_string(repository_root().join(relative))
+            .unwrap_or_else(|error| panic!("read {relative}: {error}"));
+        let entrypoint_body = function_body(&source, entrypoint);
+        let helper_body = function_body(&source, execution_helper);
+        if entrypoint != execution_helper {
+            let helper_call_marker = format!("{execution_helper}(");
+            assert!(
+                entrypoint_body.contains(&helper_call_marker),
+                "{relative}::{entrypoint} must call the inspected helper {execution_helper}"
+            );
+        }
+        assert!(
+            helper_body.contains(".execute(") && helper_body.contains("ShellProcessRequest"),
+            "{relative}::{execution_helper} must execute a ShellProcessRequest through ShellProcessAdapter"
+        );
+        let inspected_chain = format!("{entrypoint_body}\n{helper_body}");
+        for forbidden in [
+            "tokio::process::Command",
+            "std::process::Command",
+            "Command::new",
+            ".spawn(",
+            ".output(",
+            ".status(",
+        ] {
+            assert!(
+                !inspected_chain.contains(forbidden),
+                "{relative}::{entrypoint}->{execution_helper} reintroduced raw process execution via {forbidden}"
+            );
+        }
+    }
 }
 
 #[test]
