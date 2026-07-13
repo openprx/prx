@@ -861,7 +861,9 @@ fn scheduler_template(spec: Spec) -> String {
 
 # [scheduler]
 # enabled = true
+# max_tasks = 64
 # max_concurrent = 4
+# claim_lease_secs = 90
 
 # [cron]
 # [[cron.jobs]]
@@ -880,7 +882,9 @@ fn scheduler_template(spec: Spec) -> String {
 
 [scheduler]
 enabled = true
+max_tasks = 64
 max_concurrent = 4
+claim_lease_secs = 90
 # storage_path = "workspace/cron/scheduler.db"
 
 [cron]
@@ -1606,6 +1610,7 @@ mod tests {
 
         let scheduler = fs::read_to_string(dir.join("config.d/scheduler.toml")).expect("test: read scheduler");
         assert!(scheduler.contains("# [scheduler]"));
+        assert!(scheduler.contains("# claim_lease_secs = 90"));
         let channels = fs::read_to_string(dir.join("config.d/channels.toml")).expect("test: read channels");
         assert!(channels.contains("# [channels_config.telegram]"));
 

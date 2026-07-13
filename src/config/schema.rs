@@ -3672,6 +3672,10 @@ pub struct SchedulerConfig {
     /// Maximum tasks executed per scheduler polling cycle.
     #[serde(default = "default_scheduler_max_concurrent")]
     pub max_concurrent: usize,
+    /// Execution claim lease. Active jobs renew this lease every one third of
+    /// the interval; expired claims may be recovered by another scheduler.
+    #[serde(default = "default_scheduler_claim_lease_secs")]
+    pub claim_lease_secs: u64,
 }
 
 const fn default_scheduler_enabled() -> bool {
@@ -3686,12 +3690,17 @@ const fn default_scheduler_max_concurrent() -> usize {
     4
 }
 
+const fn default_scheduler_claim_lease_secs() -> u64 {
+    90
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
+            claim_lease_secs: default_scheduler_claim_lease_secs(),
         }
     }
 }
@@ -5811,6 +5820,9 @@ impl Config {
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
         }
+        if self.scheduler.claim_lease_secs < 3 {
+            anyhow::bail!("scheduler.claim_lease_secs must be at least 3");
+        }
         if !matches!(
             self.agent.concurrency_rollout_stage.as_str(),
             "off" | "stage_a" | "stage_b" | "stage_c" | "full"
@@ -6304,6 +6316,18 @@ min_chars = 12
         let config = ChatConfig::default();
 
         assert_eq!(config.max_concurrent_visible_turns, 2);
+    }
+
+    #[test]
+    async fn scheduler_claim_lease_defaults_and_validates() {
+        let scheduler = SchedulerConfig::default();
+        assert_eq!(scheduler.claim_lease_secs, 90);
+
+        let mut config = Config::default();
+        config.scheduler.claim_lease_secs = 2;
+        assert!(config.validate().is_err());
+        config.scheduler.claim_lease_secs = 3;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

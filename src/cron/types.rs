@@ -118,6 +118,19 @@ const fn default_true() -> bool {
     true
 }
 
+/// Fencing handle for one scheduler execution attempt.
+///
+/// A handle is authoritative only while the matching database lease is still
+/// unexpired. Callers must pass the complete handle back when renewing or
+/// finishing a run; `last_status` is deliberately not part of lease authority.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CronClaim {
+    pub worker_id: String,
+    pub attempt_id: String,
+    pub claimed_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CronJob {
     pub id: String,
@@ -142,6 +155,8 @@ pub struct CronJob {
     pub last_status: Option<String>,
     pub last_output: Option<String>,
     #[serde(default)]
+    pub claim: Option<CronClaim>,
+    #[serde(default)]
     pub terminal_state: Option<CronJobTerminalState>,
     pub approval_grant_json: Option<String>,
 }
@@ -163,6 +178,8 @@ pub struct CronRun {
     pub status: String,
     pub output: Option<String>,
     pub duration_ms: Option<i64>,
+    pub attempt_id: Option<String>,
+    pub worker_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

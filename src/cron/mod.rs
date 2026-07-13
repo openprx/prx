@@ -15,16 +15,18 @@ pub use schedule::normalize_expression;
 pub use schedule::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 #[cfg(test)]
 pub use store::add_job;
+pub(crate) use store::finish_claimed_run_preserving_schedule;
 #[allow(unused_imports)]
 pub use store::{
-    add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
-    add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete, claim_job,
-    claim_job_if_current, claim_job_if_current_for_manual_run, due_jobs, get_job, list_job_events, list_jobs,
-    list_runs, record_last_run, record_one_shot_terminal_run, record_run, remove_job, reschedule_after_run, update_job,
+    abandon_job_claim, add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
+    add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete,
+    claim_job_if_current, claim_job_if_current_for_manual_run, claim_terminal_job_for_manual_rerun, due_jobs,
+    finish_claimed_run, get_job, list_job_events, list_jobs, list_runs, record_claim_lost, record_terminal_manual_run,
+    remove_job, renew_job_claim, update_job,
 };
 pub use types::{
-    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig, JobType,
-    Schedule, SessionTarget,
+    CronClaim, CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig,
+    JobType, Schedule, SessionTarget,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -44,14 +46,26 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 let last_run = job.last_run.map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
                 let terminal = job.terminal_state.map_or("none", CronJobTerminalState::as_str);
+                let claim = job.claim.as_ref().map_or_else(
+                    || "unclaimed".to_string(),
+                    |claim| {
+                        format!(
+                            "owner={} attempt={} expires={}",
+                            claim.worker_id,
+                            claim.attempt_id,
+                            claim.expires_at.to_rfc3339()
+                        )
+                    },
+                );
                 println!(
-                    "- {} | {:?} | next={} | last={} ({}) | terminal={}",
+                    "- {} | {:?} | next={} | last={} ({}) | terminal={} | claim={}",
                     job.id,
                     job.schedule,
                     job.next_run.to_rfc3339(),
                     last_run,
                     last_status,
                     terminal,
+                    claim,
                 );
                 if !job.command.is_empty() {
                     println!("    cmd: {}", job.command);

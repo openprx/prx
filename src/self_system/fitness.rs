@@ -517,6 +517,7 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            claim: None,
             terminal_state: None,
             approval_grant_json: None,
         };
