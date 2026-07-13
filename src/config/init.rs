@@ -940,7 +940,7 @@ max_recalled_pages = 10
 
 [sessions_spawn]
 enabled = false
-# process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private | hybrid
+# process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private
 # 🔴 fork-bomb safeguards (high-position; never set to 0):
 # max_concurrent = 64
 # max_spawn_depth = 8

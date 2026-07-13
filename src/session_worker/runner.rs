@@ -128,7 +128,7 @@ fn normalized_worker_memory_strategy(manifest: &WorkerManifest) -> Result<&'stat
     match manifest.memory_strategy.as_deref().unwrap_or("shared_fabric").trim() {
         "" | "shared_fabric" => Ok("shared_fabric"),
         "isolated_private" => Ok("isolated_private"),
-        "hybrid" => Ok("hybrid"),
+        "hybrid" => anyhow::bail!(crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE),
         other => anyhow::bail!("Invalid session-worker memory_strategy '{other}'"),
     }
 }
@@ -1067,6 +1067,35 @@ mod tests {
     fn parse_tools_override_rejects_invalid_json_shape() {
         let error = parse_tools_override(r#"{"tool":"shell"}"#).unwrap_err();
         assert!(error.to_string().contains("parse --tools JSON as string array"));
+    }
+
+    #[test]
+    fn worker_manifest_rejects_hybrid_memory_without_merge_consumer() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut manifest = base_manifest(tmp.path(), "capability-a");
+
+        assert_eq!(normalized_worker_memory_strategy(&manifest).unwrap(), "shared_fabric");
+        manifest.memory_strategy = Some("isolated_private".to_string());
+        assert_eq!(
+            normalized_worker_memory_strategy(&manifest).unwrap(),
+            "isolated_private"
+        );
+        manifest.memory_strategy = Some("hybrid".to_string());
+        manifest.memory_db_path = manifest.worker_memory_db_path.clone().unwrap();
+
+        let serialized = serde_json::to_string(&manifest).unwrap();
+        let parsed: WorkerManifest = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed.memory_strategy.as_deref(), Some("hybrid"));
+
+        let expiry = cap_now() + 300;
+        let (manifest, cap, expiry) = seal(parsed, expiry);
+        set_expiry_env(expiry);
+        let error = validate_worker_manifest_with_capability_env(&manifest, Some(&cap))
+            .unwrap_err()
+            .to_string();
+        clear_expiry_env();
+        assert_eq!(error, crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE);
     }
 
     #[test]

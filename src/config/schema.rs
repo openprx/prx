@@ -1153,7 +1153,6 @@ pub struct SessionsSpawnConfig {
     /// Supported values:
     /// - `shared_fabric`: worker uses the parent workspace memory DB.
     /// - `isolated_private`: worker uses its private DB.
-    /// - `hybrid`: worker uses its private DB while the parent records spawn/result events.
     #[serde(default = "default_sessions_spawn_process_memory_strategy")]
     pub process_memory_strategy: String,
     /// Optional root directory for process-mode worker workspaces.
@@ -1173,6 +1172,20 @@ pub struct SessionsSpawnConfig {
     /// Maximum concurrent child runs allowed per parent session.
     #[serde(default = "default_sessions_spawn_max_children_per_agent")]
     pub max_children_per_agent: usize,
+}
+
+pub const HYBRID_PROCESS_MEMORY_UNAVAILABLE: &str = "sessions_spawn.process_memory_strategy='hybrid' is unavailable: the production merge consumer and merge/reject/ack/cleanup protocol do not exist; use 'shared_fabric' or 'isolated_private'";
+
+impl SessionsSpawnConfig {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        match self.process_memory_strategy.trim() {
+            "" | "shared_fabric" | "isolated_private" => Ok(()),
+            "hybrid" => anyhow::bail!(HYBRID_PROCESS_MEMORY_UNAVAILABLE),
+            other => anyhow::bail!(
+                "Invalid sessions_spawn.process_memory_strategy '{other}'. Expected 'shared_fabric' or 'isolated_private'."
+            ),
+        }
+    }
 }
 
 impl Default for SessionsSpawnConfig {
@@ -5850,6 +5863,7 @@ impl Config {
         // Memory subtree (FIX-P2-09): previously the [memory] subtree was not
         // validated at all; wire it into the top-level validator.
         self.memory.validate()?;
+        self.sessions_spawn.validate()?;
 
         // Smart group-reply pre-gate numeric ranges.
         self.smart_group.validate()?;
@@ -6076,6 +6090,20 @@ mod tests {
         assert!(!c.skills.open_skills_enabled);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
+    }
+
+    #[test]
+    async fn config_rejects_hybrid_process_memory_without_merge_consumer() {
+        let mut config = Config::default();
+        config.sessions_spawn.process_memory_strategy = "hybrid".to_string();
+
+        let error = config.validate().unwrap_err().to_string();
+        assert_eq!(error, HYBRID_PROCESS_MEMORY_UNAVAILABLE);
+
+        config.sessions_spawn.process_memory_strategy = "shared_fabric".to_string();
+        config.validate().unwrap();
+        config.sessions_spawn.process_memory_strategy = "isolated_private".to_string();
+        config.validate().unwrap();
     }
 
     #[test]

@@ -1094,7 +1094,6 @@ impl Tool for SessionsSpawnTool {
 
     async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
         let action = args.get("action").and_then(|v| v.as_str()).unwrap_or("spawn");
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
 
         match action {
             "list" => return self.execute_list().await,
@@ -1105,6 +1104,7 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'run_id' parameter for kill action"))?;
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 return self.execute_kill(run_id, approval_grant.as_ref()).await;
             }
             "history" => {
@@ -1138,6 +1138,7 @@ impl Tool for SessionsSpawnTool {
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
                     .ok_or_else(|| anyhow::anyhow!("Missing 'message' parameter for steer action"))?;
+                let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 return self.execute_steer(run_id, message, approval_grant.as_ref()).await;
             }
             _ => {} // fall through to spawn
@@ -1176,6 +1177,11 @@ impl Tool for SessionsSpawnTool {
                 error: Some(format!("Invalid 'mode' value '{mode}'. Expected 'task' or 'process'.")),
             });
         }
+        let process_memory_strategy = if mode == "process" {
+            normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string()
+        } else {
+            String::new()
+        };
 
         let model_override = args
             .get("model")
@@ -1278,6 +1284,7 @@ impl Tool for SessionsSpawnTool {
         // consumes resources and carries a potential sandbox-escape surface,
         // so it is a Medium-risk side effect (requires an approval grant under
         // supervised autonomy; denied outright under read-only) rather than Low.
+        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
         if let Err(error) = SideEffectGate::new(self.security.as_ref()).authorize_resource_operation(
             self.name(),
             "sessions_spawn:spawn",
@@ -1508,8 +1515,6 @@ impl Tool for SessionsSpawnTool {
             let process_spawn_depth = spawn_depth;
             let process_compaction_config = resolved_compaction.config.clone();
             let process_event_recording = self.event_recording;
-            let process_memory_strategy =
-                normalize_process_memory_strategy(&self.spawn_config.process_memory_strategy)?.to_string();
             let process_execution_ctx = SpawnExecutionContext {
                 run_id: rid.clone(),
                 session_scope_key: session_scope_key.clone(),
@@ -3046,9 +3051,9 @@ fn normalize_process_memory_strategy(strategy: &str) -> anyhow::Result<&'static 
     match strategy.trim() {
         "" | PROCESS_MEMORY_STRATEGY_SHARED => Ok(PROCESS_MEMORY_STRATEGY_SHARED),
         PROCESS_MEMORY_STRATEGY_ISOLATED => Ok(PROCESS_MEMORY_STRATEGY_ISOLATED),
-        PROCESS_MEMORY_STRATEGY_HYBRID => Ok(PROCESS_MEMORY_STRATEGY_HYBRID),
+        PROCESS_MEMORY_STRATEGY_HYBRID => anyhow::bail!(crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE),
         other => anyhow::bail!(
-            "Invalid sessions_spawn.process_memory_strategy '{other}'. Expected 'shared_fabric', 'isolated_private', or 'hybrid'."
+            "Invalid sessions_spawn.process_memory_strategy '{other}'. Expected 'shared_fabric' or 'isolated_private'."
         ),
     }
 }
@@ -5872,8 +5877,52 @@ mod tests {
             normalize_process_memory_strategy("isolated_private").unwrap(),
             "isolated_private"
         );
-        assert_eq!(normalize_process_memory_strategy("hybrid").unwrap(), "hybrid");
+        let hybrid = normalize_process_memory_strategy("hybrid").unwrap_err().to_string();
+        assert!(hybrid.contains("production merge consumer"));
+        assert!(hybrid.contains("merge/reject/ack/cleanup protocol"));
         assert!(normalize_process_memory_strategy("worker-only").is_err());
+    }
+
+    #[tokio::test]
+    async fn hybrid_process_spawn_is_rejected_before_events_or_registry_side_effects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let mut spawn_config = crate::config::SessionsSpawnConfig::default();
+        spawn_config.process_memory_strategy = "hybrid".to_string();
+        let (channel, _) = RecordingChannel::new();
+        let tool = make_tool_with_spawn_config(
+            Arc::new(channel),
+            Arc::new(EchoProvider { response: "ok".into() }),
+            spawn_config,
+        )
+        .with_shared_memory(memory.clone());
+
+        let error = tool
+            .execute(json!({"task": "must not start", "mode": "process"}))
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert_eq!(error, crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE);
+        assert!(tool.active_runs_snapshot().await.is_empty());
+        let events = memory
+            .list_memory_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "/tmp".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: Some("sessions_spawn:global".to_string()),
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert!(events.is_empty(), "hybrid rejection must not record spawn events");
     }
 
     #[test]
