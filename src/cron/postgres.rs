@@ -14,7 +14,8 @@
 use crate::config::Config;
 use crate::cron::store::{decode_delivery, decode_schedule, truncate_cron_output};
 use crate::cron::types::{
-    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig, JobType,
+    Schedule, SessionTarget,
 };
 use crate::cron::{next_run_for_schedule, schedule_cron_expression, validate_schedule};
 use anyhow::{Context, Result};
@@ -27,6 +28,12 @@ use uuid::Uuid;
 
 /// Cap connect timeouts so a misconfigured value cannot hang startup forever.
 const CONNECT_TIMEOUT_CAP_SECS: u64 = 30;
+const TERMINAL_STATE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT EXISTS terminal_state TEXT;
+     UPDATE cron_jobs
+     SET terminal_state = CASE WHEN last_status = 'ok' THEN 'succeeded' ELSE 'failed' END,
+         enabled = FALSE
+     WHERE terminal_state IS NULL AND last_run IS NOT NULL AND last_status IN ('ok', 'error')
+       AND schedule LIKE '%\"kind\":\"at\"%';";
 
 /// PostgreSQL-backed cron store. One instance owns a single pooled connection
 /// guarded by a `parking_lot::Mutex` (no poison, no unwrap), matching the
@@ -72,13 +79,15 @@ impl PostgresCronStore {
         f(&mut guard)
     }
 
-    pub fn add_shell_job_with_lineage_and_approval_grant(
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_shell_job_with_lineage_approval_and_delete(
         &self,
         workspace_id: &str,
         name: Option<String>,
         schedule: Schedule,
         command: &str,
         approval_grant_json: Option<String>,
+        delete_after_run: bool,
         lineage: CronJobLineage,
     ) -> Result<CronJob> {
         let now = Utc::now();
@@ -97,7 +106,7 @@ impl PostgresCronStore {
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
                  ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'shell', NULL, $9, 'isolated', NULL,
-                           TRUE, $10, FALSE, $11, $12, $13)",
+                           TRUE, $10, $11, $12, $13, $14)",
                 &[
                     &id,
                     &lineage.owner_id,
@@ -109,6 +118,7 @@ impl PostgresCronStore {
                     &schedule_json,
                     &name,
                     &delivery_json,
+                    &delete_after_run,
                     &now.to_rfc3339(),
                     &next_run.to_rfc3339(),
                     &approval_grant_json,
@@ -271,7 +281,8 @@ impl PostgresCronStore {
             let changed = tx
                 .execute(
                     "UPDATE cron_jobs SET last_status = 'running'
-                     WHERE id = $1 AND enabled = TRUE AND (last_status IS NULL OR last_status <> 'running')",
+                     WHERE id = $1 AND enabled = TRUE AND terminal_state IS NULL
+                       AND (last_status IS NULL OR last_status <> 'running')",
                     &[&job_id],
                 )
                 .context("Failed to claim cron job")?;
@@ -293,13 +304,67 @@ impl PostgresCronStore {
         })
     }
 
+    pub fn claim_job_if_current(
+        &self,
+        workspace_id: &str,
+        job: &CronJob,
+        due_by: Option<DateTime<Utc>>,
+    ) -> Result<bool> {
+        let schedule_json = serde_json::to_string(&job.schedule)?;
+        self.with_client(|client| {
+            let mut tx = client
+                .transaction()
+                .context("failed to open cron snapshot claim transaction")?;
+            let changed = if let Some(due_by) = due_by {
+                tx.execute(
+                    "UPDATE cron_jobs SET last_status = 'running'
+                     WHERE id = $1 AND enabled = TRUE AND terminal_state IS NULL AND next_run = $2 AND next_run <= $3
+                       AND (schedule = $4 OR (schedule IS NULL AND expression = $5))
+                       AND (last_status IS NULL OR last_status <> 'running')",
+                    &[
+                        &job.id,
+                        &job.next_run.to_rfc3339(),
+                        &due_by.to_rfc3339(),
+                        &schedule_json,
+                        &job.expression,
+                    ],
+                )
+            } else {
+                tx.execute(
+                    "UPDATE cron_jobs SET last_status = 'running'
+                     WHERE id = $1 AND terminal_state IS NULL AND next_run = $2
+                       AND (schedule = $3 OR (schedule IS NULL AND expression = $4))
+                       AND (last_status IS NULL OR last_status <> 'running')",
+                    &[&job.id, &job.next_run.to_rfc3339(), &schedule_json, &job.expression],
+                )
+            }
+            .context("Failed to claim current cron job snapshot")?;
+            if changed > 0
+                && let Some(lineage) = load_job_lineage(&mut tx, &job.id)?
+            {
+                insert_job_event(
+                    &mut tx,
+                    workspace_id,
+                    &job.id,
+                    &lineage,
+                    "cron.job.claimed",
+                    Some("running"),
+                    None,
+                )?;
+            }
+            tx.commit().context("failed to commit cron snapshot claim")?;
+            Ok(changed > 0)
+        })
+    }
+
     pub fn due_jobs(&self, now: DateTime<Utc>, max_tasks: usize) -> Result<Vec<CronJob>> {
         let lim = i64::try_from(max_tasks.max(1)).context("Scheduler max_tasks overflows i64")?;
         self.with_client(|client| {
             let rows = client
                 .query(
                     &format!(
-                        "{SELECT_JOB_COLUMNS} WHERE enabled = TRUE AND next_run <= $1 ORDER BY next_run ASC LIMIT $2"
+                        "{SELECT_JOB_COLUMNS} WHERE enabled = TRUE AND terminal_state IS NULL
+                         AND next_run <= $1 ORDER BY next_run ASC LIMIT $2"
                     ),
                     &[&now.to_rfc3339(), &lim],
                 )
@@ -311,14 +376,30 @@ impl PostgresCronStore {
     pub fn update_job(&self, workspace_id: &str, job_id: &str, patch: CronJobPatch) -> Result<CronJob> {
         let mut job = self.get_job(job_id)?;
         let was_enabled = job.enabled;
+        let expected_schedule_json = serde_json::to_string(&job.schedule)?;
+        let expected_expression = job.expression.clone();
+        let expected_next_run = job.next_run.to_rfc3339();
+        let expected_last_status = job.last_status.clone();
         let approval_grant_json = patch.approval_grant_json.clone();
         let schedule_changed = if let Some(schedule) = patch.schedule {
             validate_schedule(&schedule, Utc::now())?;
+            if job.terminal_state.is_none()
+                && matches!(job.schedule, Schedule::At { .. })
+                && job.last_status.as_deref() == Some("running")
+            {
+                anyhow::bail!("cannot update the schedule of an in-flight Schedule::At job");
+            }
+            let rearm_terminal_at = job.terminal_state.is_some()
+                && matches!(job.schedule, Schedule::At { .. })
+                && matches!(schedule, Schedule::At { .. });
+            if job.terminal_state.is_some() && matches!(job.schedule, Schedule::At { .. }) && !rearm_terminal_at {
+                anyhow::bail!("a terminal Schedule::At job can only be re-armed with a new future Schedule::At");
+            }
             job.schedule = schedule;
             job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-            true
+            Some(rearm_terminal_at)
         } else {
-            false
+            None
         };
         if let Some(command) = patch.command {
             job.command = command;
@@ -345,8 +426,15 @@ impl PostgresCronStore {
         if let Some(delete_after_run) = patch.delete_after_run {
             job.delete_after_run = delete_after_run;
         }
-        if schedule_changed {
+        if let Some(rearm_terminal_at) = schedule_changed {
             job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+            if rearm_terminal_at {
+                job.last_run = None;
+                job.last_status = None;
+                job.last_output = None;
+                job.terminal_state = None;
+                job.enabled = true;
+            }
         }
 
         let schedule_json = serde_json::to_string(&job.schedule)?;
@@ -361,8 +449,11 @@ impl PostgresCronStore {
                     "UPDATE cron_jobs
                      SET expression = $1, command = $2, schedule = $3, job_type = $4, prompt = $5, name = $6,
                          session_target = $7, model = $8, enabled = $9, delivery = $10, delete_after_run = $11,
-                         next_run = $12, approval_grant_json = $13
-                     WHERE id = $14",
+                         next_run = $12, last_run = $13, last_status = $14, last_output = $15,
+                         terminal_state = $16, approval_grant_json = $17
+                     WHERE id = $18 AND next_run = $19
+                       AND (schedule = $20 OR (schedule IS NULL AND expression = $21))
+                       AND last_status IS NOT DISTINCT FROM $22",
                     &[
                         &job.expression,
                         &job.command,
@@ -376,8 +467,16 @@ impl PostgresCronStore {
                         &delivery_json,
                         &job.delete_after_run,
                         &job.next_run.to_rfc3339(),
+                        &job.last_run.map(|value| value.to_rfc3339()),
+                        &job.last_status,
+                        &job.last_output,
+                        &job.terminal_state.map(CronJobTerminalState::as_str),
                         &job.approval_grant_json,
                         &job.id,
+                        &expected_next_run,
+                        &expected_schedule_json,
+                        &expected_expression,
+                        &expected_last_status,
                     ],
                 )
                 .context("Failed to update cron job")?;
@@ -458,6 +557,9 @@ impl PostgresCronStore {
     }
 
     pub fn reschedule_after_run(&self, workspace_id: &str, job: &CronJob, success: bool, output: &str) -> Result<()> {
+        if matches!(job.schedule, Schedule::At { .. }) {
+            anyhow::bail!("Schedule::At is terminal after its attempt and cannot be rescheduled");
+        }
         let now = Utc::now();
         let next_run = next_run_for_schedule(&job.schedule, now)?;
         let status = if success { "ok" } else { "error" };
@@ -497,6 +599,129 @@ impl PostgresCronStore {
             }
             tx.commit().context("failed to commit cron reschedule")?;
             Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_one_shot_terminal_run(
+        &self,
+        workspace_id: &str,
+        job: &CronJob,
+        started_at: DateTime<Utc>,
+        finished_at: DateTime<Utc>,
+        success: bool,
+        output: &str,
+        duration_ms: i64,
+        max_run_history: u32,
+    ) -> Result<bool> {
+        if !matches!(job.schedule, Schedule::At { .. }) {
+            anyhow::bail!("terminal one-shot persistence requires Schedule::At");
+        }
+        let status = if success { "ok" } else { "error" };
+        let terminal_state = if success {
+            CronJobTerminalState::Succeeded
+        } else {
+            CronJobTerminalState::Failed
+        };
+        let terminal_event_type = if success {
+            "cron.job.completed"
+        } else {
+            "cron.job.failed"
+        };
+        let bounded_output = truncate_cron_output(output);
+        let keep = i64::from(max_run_history.max(1));
+        let schedule_json = serde_json::to_string(&job.schedule)?;
+        self.with_client(|client| {
+            let mut tx = client
+                .transaction()
+                .context("failed to open terminal cron run transaction")?;
+            tx.execute(
+                "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+                 VALUES ($1, $2, $3, $4, $5, $6)",
+                &[
+                    &job.id,
+                    &started_at.to_rfc3339(),
+                    &finished_at.to_rfc3339(),
+                    &status,
+                    &bounded_output,
+                    &duration_ms,
+                ],
+            )
+            .context("Failed to insert terminal cron run")?;
+            tx.execute(
+                "DELETE FROM cron_runs
+                 WHERE job_id = $1
+                   AND id NOT IN (
+                     SELECT id FROM cron_runs
+                     WHERE job_id = $1
+                     ORDER BY started_at DESC, id DESC
+                     LIMIT $2
+                   )",
+                &[&job.id, &keep],
+            )
+            .context("Failed to prune terminal cron run history")?;
+            let changed = tx
+                .execute(
+                    "UPDATE cron_jobs
+                     SET last_run = $1, last_status = $2, last_output = $3, terminal_state = $4
+                     WHERE id = $5 AND terminal_state IS NULL AND next_run = $6 AND schedule = $7
+                       AND last_status = 'running'",
+                    &[
+                        &finished_at.to_rfc3339(),
+                        &status,
+                        &bounded_output,
+                        &terminal_state.as_str(),
+                        &job.id,
+                        &job.next_run.to_rfc3339(),
+                        &schedule_json,
+                    ],
+                )
+                .context("Failed to persist terminal cron job state")?;
+            if changed == 0 {
+                anyhow::bail!("cron one-shot '{}' was deleted or already terminal", job.id);
+            }
+            if let Some(lineage) = load_job_lineage(&mut tx, &job.id)? {
+                insert_job_event(
+                    &mut tx,
+                    workspace_id,
+                    &job.id,
+                    &lineage,
+                    "cron.job.run_recorded",
+                    Some(status),
+                    Some(
+                        serde_json::json!({
+                            "started_at": started_at.to_rfc3339(),
+                            "finished_at": finished_at.to_rfc3339(),
+                            "duration_ms": duration_ms,
+                        })
+                        .to_string(),
+                    )
+                    .as_deref(),
+                )?;
+                insert_job_event(
+                    &mut tx,
+                    workspace_id,
+                    &job.id,
+                    &lineage,
+                    terminal_event_type,
+                    Some(status),
+                    Some(
+                        serde_json::json!({
+                            "terminal_state": terminal_state.as_str(),
+                            "success": success,
+                        })
+                        .to_string(),
+                    )
+                    .as_deref(),
+                )?;
+            }
+            let deleted = tx.execute(
+                "DELETE FROM cron_jobs
+                     WHERE id = $1 AND terminal_state = 'succeeded' AND delete_after_run = TRUE",
+                &[&job.id],
+            )? > 0;
+            tx.commit().context("failed to commit terminal cron run")?;
+            Ok(deleted)
         })
     }
 
@@ -608,7 +833,7 @@ impl PostgresCronStore {
 const SELECT_JOB_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
             expression, command, schedule, job_type, prompt, name, session_target, model,
             enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-            approval_grant_json
+            terminal_state, approval_grant_json
      FROM cron_jobs";
 
 /// Lineage + last-known status of a job, used to enrich emitted events.
@@ -673,7 +898,11 @@ fn map_cron_job_row(row: &Row) -> Result<CronJob> {
         },
         last_status: row.try_get(19)?,
         last_output: row.try_get(20)?,
-        approval_grant_json: row.try_get(21)?,
+        terminal_state: row
+            .try_get::<_, Option<String>>(21)?
+            .map(|raw| CronJobTerminalState::parse(&raw))
+            .transpose()?,
+        approval_grant_json: row.try_get(22)?,
     })
 }
 
@@ -793,6 +1022,7 @@ fn init_schema(client: &mut Client) -> Result<()> {
                 last_run         TEXT,
                 last_status      TEXT,
                 last_output      TEXT,
+                terminal_state   TEXT,
                 approval_grant_json TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
@@ -832,6 +1062,9 @@ fn init_schema(client: &mut Client) -> Result<()> {
             CREATE INDEX IF NOT EXISTS idx_cron_job_events_type ON cron_job_events(event_type, id);",
         )
         .context("Failed to initialize cron postgres schema")?;
+    client
+        .batch_execute(TERMINAL_STATE_MIGRATION_SQL)
+        .context("Failed to migrate cron postgres terminal state")?;
     Ok(())
 }
 
@@ -859,6 +1092,23 @@ pub fn resolve(config: &Config) -> Result<Option<PostgresCronStore>> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn postgres_terminal_schema_and_projection_fixture_are_aligned() {
+        assert!(SELECT_JOB_COLUMNS.contains("terminal_state, approval_grant_json"));
+        assert!(TERMINAL_STATE_MIGRATION_SQL.contains("ADD COLUMN IF NOT EXISTS terminal_state"));
+        assert!(TERMINAL_STATE_MIGRATION_SQL.contains("last_run IS NOT NULL"));
+        assert!(TERMINAL_STATE_MIGRATION_SQL.contains("last_status IN ('ok', 'error')"));
+        assert!(TERMINAL_STATE_MIGRATION_SQL.contains("enabled = FALSE"));
+        assert_eq!(
+            CronJobTerminalState::parse(CronJobTerminalState::Succeeded.as_str()).unwrap(),
+            CronJobTerminalState::Succeeded
+        );
+        assert_eq!(
+            CronJobTerminalState::parse(CronJobTerminalState::Failed.as_str()).unwrap(),
+            CronJobTerminalState::Failed
+        );
+    }
+
     /// End-to-end cron lifecycle against a real PostgreSQL instance. Gated on
     /// `OPENPRX_TEST_POSTGRES_URL`; a no-op (returns early) when unset so the
     /// suite stays green without a database, mirroring the memory backend tests.
@@ -868,6 +1118,73 @@ mod tests {
             return;
         };
         let store = PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres");
+
+        store
+            .with_client(|client| {
+                client.batch_execute(
+                    "DROP TABLE IF EXISTS cron_job_events;
+                     DROP TABLE IF EXISTS cron_runs;
+                     DROP TABLE IF EXISTS cron_jobs;
+                     CREATE TABLE cron_jobs (
+                        id TEXT PRIMARY KEY,
+                        owner_id TEXT,
+                        topic_id TEXT,
+                        parent_task_id TEXT,
+                        source_message_event_id TEXT,
+                        expression TEXT NOT NULL,
+                        command TEXT NOT NULL,
+                        schedule TEXT,
+                        job_type TEXT NOT NULL DEFAULT 'shell',
+                        prompt TEXT,
+                        name TEXT,
+                        session_target TEXT NOT NULL DEFAULT 'isolated',
+                        model TEXT,
+                        enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                        delivery TEXT,
+                        delete_after_run BOOLEAN NOT NULL DEFAULT FALSE,
+                        created_at TEXT NOT NULL,
+                        next_run TEXT NOT NULL,
+                        last_run TEXT,
+                        last_status TEXT,
+                        last_output TEXT,
+                        approval_grant_json TEXT
+                     );",
+                )?;
+                let at = Utc::now() - chrono::Duration::hours(1);
+                let schedule_json = serde_json::to_string(&Schedule::At { at })?;
+                for (id, status) in [
+                    ("legacy-at-ok", Some("ok")),
+                    ("legacy-at-error", Some("error")),
+                    ("legacy-at-running", Some("running")),
+                    ("legacy-at-unknown", Some("unknown")),
+                    ("legacy-at-null", None),
+                ] {
+                    client.execute(
+                        "INSERT INTO cron_jobs (
+                            id, expression, command, schedule, created_at, next_run, last_run, last_status
+                         ) VALUES ($1, '', 'echo legacy', $2, $3, $3, $3, $4)",
+                        &[&id, &schedule_json, &at.to_rfc3339(), &status],
+                    )?;
+                }
+                init_schema(client)?;
+                let rows = client.query("SELECT id, terminal_state, enabled FROM cron_jobs ORDER BY id", &[])?;
+                let states = rows
+                    .iter()
+                    .map(|row| {
+                        (
+                            row.get::<_, String>(0),
+                            (row.get::<_, Option<String>>(1), row.get::<_, bool>(2)),
+                        )
+                    })
+                    .collect::<std::collections::HashMap<_, _>>();
+                assert_eq!(states["legacy-at-ok"], (Some("succeeded".to_string()), false));
+                assert_eq!(states["legacy-at-error"], (Some("failed".to_string()), false));
+                assert_eq!(states["legacy-at-running"], (None, true));
+                assert_eq!(states["legacy-at-unknown"], (None, true));
+                assert_eq!(states["legacy-at-null"], (None, true));
+                Ok(())
+            })
+            .expect("test: migrate legacy terminal state");
 
         // Isolate from prior runs: drop and recreate the cron tables.
         store
@@ -893,7 +1210,7 @@ mod tests {
 
         // Insert a shell job and verify round-trip + created event.
         let job = store
-            .add_shell_job_with_lineage_and_approval_grant(
+            .add_shell_job_with_lineage_approval_and_delete(
                 ws,
                 Some("pg-shell".to_string()),
                 Schedule::Cron {
@@ -902,6 +1219,7 @@ mod tests {
                 },
                 "echo pg",
                 None,
+                false,
                 lineage,
             )
             .expect("test: add shell job");
@@ -962,6 +1280,230 @@ mod tests {
         // due_jobs excludes a disabled job even far in the future.
         let far_future = Utc::now() + chrono::Duration::days(365);
         assert!(store.due_jobs(far_future, 10).expect("test: due").is_empty());
+
+        let at = Utc::now() + chrono::Duration::minutes(10);
+        let retained_one_shot = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                ws,
+                Some("pg-retained-one-shot".to_string()),
+                Schedule::At { at },
+                "echo once",
+                None,
+                false,
+                CronJobLineage::default(),
+            )
+            .expect("test: add retained one-shot");
+        assert!(
+            !store
+                .claim_job_if_current(ws, &retained_one_shot, Some(Utc::now()))
+                .expect("test: future one-shot is not scheduler-due")
+        );
+        assert!(
+            store
+                .claim_job_if_current(ws, &retained_one_shot, None)
+                .expect("test: manual claim one-shot")
+        );
+        let started = Utc::now();
+        store
+            .record_one_shot_terminal_run(
+                ws,
+                &retained_one_shot,
+                started,
+                started + chrono::Duration::milliseconds(3),
+                true,
+                "done once",
+                3,
+                50,
+            )
+            .expect("test: terminal one-shot");
+        let terminal = store.get_job(&retained_one_shot.id).expect("test: reload one-shot");
+        assert_eq!(terminal.terminal_state, Some(CronJobTerminalState::Succeeded));
+        assert!(
+            store
+                .due_jobs(at + chrono::Duration::days(1), 10)
+                .expect("test: due after terminal")
+                .iter()
+                .all(|job| job.id != retained_one_shot.id)
+        );
+        store
+            .remove_job(ws, &retained_one_shot.id)
+            .expect("test: remove retained one-shot");
+
+        let stale_at = Utc::now() + chrono::Duration::minutes(20);
+        let stale = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                ws,
+                Some("pg-stale-snapshot".to_string()),
+                Schedule::At { at: stale_at },
+                "echo stale",
+                None,
+                false,
+                CronJobLineage::default(),
+            )
+            .expect("test: add stale snapshot fixture");
+        let rearmed_at = Utc::now() + chrono::Duration::minutes(30);
+        let current = store
+            .update_job(
+                ws,
+                &stale.id,
+                CronJobPatch {
+                    schedule: Some(Schedule::At { at: rearmed_at }),
+                    ..CronJobPatch::default()
+                },
+            )
+            .expect("test: rearm snapshot fixture");
+        let due_by = rearmed_at + chrono::Duration::seconds(1);
+        assert!(
+            !store
+                .claim_job_if_current(ws, &stale, Some(due_by))
+                .expect("test: stale snapshot claim")
+        );
+        assert!(
+            store
+                .claim_job_if_current(ws, &current, Some(due_by))
+                .expect("test: current snapshot claim")
+        );
+        let in_flight_update = store.update_job(
+            ws,
+            &current.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At {
+                    at: Utc::now() + chrono::Duration::minutes(40),
+                }),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            in_flight_update
+                .expect_err("test: in-flight At update must fail")
+                .to_string()
+                .contains("in-flight Schedule::At")
+        );
+        let started = Utc::now();
+        store
+            .record_one_shot_terminal_run(ws, &current, started, started, true, "done", 0, 50)
+            .expect("test: terminal current snapshot");
+        assert_eq!(store.list_runs(&current.id, 10).expect("test: current runs").len(), 1);
+        let final_at = Utc::now() + chrono::Duration::minutes(50);
+        let final_plan = store
+            .update_job(
+                ws,
+                &current.id,
+                CronJobPatch {
+                    schedule: Some(Schedule::At { at: final_at }),
+                    ..CronJobPatch::default()
+                },
+            )
+            .expect("test: rearm terminal snapshot");
+        assert_eq!(final_plan.terminal_state, None);
+        assert_eq!(final_plan.next_run, final_at);
+        store
+            .remove_job(ws, &current.id)
+            .expect("test: remove snapshot fixture");
+
+        let toggle_at = Utc::now() + chrono::Duration::minutes(60);
+        let toggle_job = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                ws,
+                Some("pg-retention-toggle".to_string()),
+                Schedule::At { at: toggle_at },
+                "echo toggle",
+                None,
+                true,
+                CronJobLineage::default(),
+            )
+            .expect("test: add retention toggle fixture");
+        assert!(
+            store
+                .claim_job_if_current(ws, &toggle_job, None)
+                .expect("test: claim retention toggle fixture")
+        );
+        let toggled = store
+            .update_job(
+                ws,
+                &toggle_job.id,
+                CronJobPatch {
+                    delete_after_run: Some(false),
+                    ..CronJobPatch::default()
+                },
+            )
+            .expect("test: toggle retention while running");
+        assert!(!toggled.delete_after_run);
+        let started = Utc::now();
+        assert!(
+            !store
+                .record_one_shot_terminal_run(ws, &toggle_job, started, started, true, "done", 0, 50)
+                .expect("test: retain toggled terminal")
+        );
+        assert_eq!(
+            store
+                .get_job(&toggle_job.id)
+                .expect("test: retained toggled terminal")
+                .terminal_state,
+            Some(CronJobTerminalState::Succeeded)
+        );
+        store
+            .remove_job(ws, &toggle_job.id)
+            .expect("test: remove retention toggle fixture");
+
+        let delete_at = Utc::now() + chrono::Duration::minutes(70);
+        let delete_stale = store
+            .add_shell_job_with_lineage_approval_and_delete(
+                ws,
+                Some("pg-delete-race".to_string()),
+                Schedule::At { at: delete_at },
+                "echo delete",
+                None,
+                true,
+                CronJobLineage::default(),
+            )
+            .expect("test: add delete race fixture");
+        let delete_rearmed_at = Utc::now() + chrono::Duration::minutes(80);
+        let delete_current = store
+            .update_job(
+                ws,
+                &delete_stale.id,
+                CronJobPatch {
+                    schedule: Some(Schedule::At { at: delete_rearmed_at }),
+                    ..CronJobPatch::default()
+                },
+            )
+            .expect("test: rearm before delete claim");
+        assert!(
+            !store
+                .claim_job_if_current(
+                    ws,
+                    &delete_stale,
+                    Some(delete_rearmed_at + chrono::Duration::seconds(1))
+                )
+                .expect("test: stale delete claim")
+        );
+        assert!(
+            store
+                .claim_job_if_current(ws, &delete_current, None)
+                .expect("test: manual current delete claim")
+        );
+        let started = Utc::now();
+        assert!(
+            store
+                .record_one_shot_terminal_run(ws, &delete_current, started, started, true, "done", 0, 50)
+                .expect("test: atomic terminal delete")
+        );
+        assert!(store.get_job(&delete_current.id).is_err());
+        assert!(
+            store
+                .update_job(
+                    ws,
+                    &delete_current.id,
+                    CronJobPatch {
+                        schedule: Some(Schedule::At {
+                            at: Utc::now() + chrono::Duration::minutes(90),
+                        }),
+                        ..CronJobPatch::default()
+                    }
+                )
+                .is_err()
+        );
 
         // Remove cascades the run history.
         store.remove_job(ws, &job.id).expect("test: remove");

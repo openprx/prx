@@ -3,8 +3,8 @@ use crate::channels::{
 };
 use crate::config::Config;
 use crate::cron::{
-    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job, due_jobs,
-    next_run_for_schedule, record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    CronJob, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job_if_current, due_jobs,
+    next_run_for_schedule, record_last_run, record_one_shot_terminal_run, record_run, reschedule_after_run, update_job,
 };
 use crate::security::policy::ApprovalGrant;
 use crate::security::{SecurityPolicy, SideEffectGate};
@@ -149,7 +149,7 @@ async fn execute_and_persist_job(
     component: &str,
 ) -> (String, bool) {
     // Atomically claim the job to prevent double-execution across instances.
-    match claim_job(config, &job.id) {
+    match claim_job_if_current(config, job, Utc::now()) {
         Ok(true) => {} // claimed successfully
         Ok(false) => {
             tracing::debug!(job_id = %job.id, "cron job already claimed, skipping");
@@ -247,6 +247,15 @@ async fn persist_job_result(
         }
     }
 
+    if matches!(job.schedule, Schedule::At { .. }) {
+        if let Err(e) = record_one_shot_terminal_run(config, job, started_at, finished_at, success, output, duration_ms)
+        {
+            tracing::warn!(job_id = %job.id, "Failed to atomically persist terminal one-shot run: {e}");
+            return false;
+        }
+        return success;
+    }
+
     if let Err(e) = record_run(
         config,
         &job.id,
@@ -257,29 +266,6 @@ async fn persist_job_result(
         duration_ms,
     ) {
         tracing::warn!(job_id = %job.id, "Failed to persist cron run record: {e}");
-    }
-
-    if is_one_shot_auto_delete(job) {
-        if success {
-            if let Err(e) = remove_job(config, &job.id) {
-                tracing::warn!("Failed to remove one-shot cron job after success: {e}");
-            }
-        } else {
-            if let Err(e) = record_last_run(config, &job.id, finished_at, false, output) {
-                tracing::warn!(job_id = %job.id, "Failed to persist one-shot last_run: {e}");
-            }
-            if let Err(e) = update_job(
-                config,
-                &job.id,
-                CronJobPatch {
-                    enabled: Some(false),
-                    ..CronJobPatch::default()
-                },
-            ) {
-                tracing::warn!("Failed to disable failed one-shot cron job: {e}");
-            }
-        }
-        return success;
     }
 
     if !success && should_disable_after_deterministic_failure(job, output) {
@@ -309,10 +295,6 @@ async fn persist_job_result(
     }
 
     success
-}
-
-const fn is_one_shot_auto_delete(job: &CronJob) -> bool {
-    job.delete_after_run && matches!(job.schedule, Schedule::At { .. })
 }
 
 fn should_disable_after_deterministic_failure(job: &CronJob, output: &str) -> bool {
@@ -670,6 +652,7 @@ mod tests {
             last_run: None,
             last_status: None,
             last_output: None,
+            terminal_state: None,
             approval_grant_json: None,
         }
     }
@@ -949,6 +932,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn successful_retained_at_job_executes_once_across_ticks_and_restart() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::milliseconds(100);
+        let job = cron::add_shell_job(
+            &config,
+            Some("retained-one-shot".to_string()),
+            Schedule::At { at },
+            "echo one-shot",
+        )
+        .unwrap();
+        let security = Arc::new(SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let tick = Utc::now();
+
+        for _ in 0..2 {
+            let due = cron::due_jobs(&config, tick).unwrap();
+            process_due_jobs(&config, &security, due, &unique_component("one-shot-tick")).await;
+        }
+
+        let restarted = Config {
+            workspace_dir: config.workspace_dir.clone(),
+            config_path: config.config_path.clone(),
+            ..Config::default()
+        };
+        let due_after_restart = cron::due_jobs(&restarted, tick).unwrap();
+        process_due_jobs(
+            &restarted,
+            &security,
+            due_after_restart,
+            &unique_component("one-shot-restart"),
+        )
+        .await;
+
+        let runs = cron::list_runs(&restarted, &job.id, 10).unwrap();
+        assert_eq!(runs.len(), 1, "a successful retained At job must execute exactly once");
+        assert!(cron::due_jobs(&restarted, tick).unwrap().is_empty());
+        let stored = cron::get_job(&restarted, &job.id).unwrap();
+        assert_eq!(
+            stored.terminal_state,
+            Some(crate::cron::CronJobTerminalState::Succeeded)
+        );
+        let events = cron::list_job_events(&restarted, &job.id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "cron.job.completed")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn persist_job_result_success_deletes_one_shot() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
@@ -964,6 +1000,7 @@ mod tests {
             true,
         )
         .unwrap();
+        assert!(cron::claim_job_if_current_for_manual_run(&config, &job).unwrap());
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
@@ -974,7 +1011,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persist_job_result_failure_disables_one_shot() {
+    async fn persist_job_result_failure_retains_auto_delete_one_shot_audit() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
         let at = Utc::now() + ChronoDuration::minutes(10);
@@ -989,14 +1026,54 @@ mod tests {
             true,
         )
         .unwrap();
+        assert!(cron::claim_job_if_current_for_manual_run(&config, &job).unwrap());
         let started = Utc::now();
         let finished = started + ChronoDuration::milliseconds(10);
 
         let success = persist_job_result(&config, &job, false, "boom", started, finished).await;
         assert!(!success);
-        let updated = cron::get_job(&config, &job.id).unwrap();
-        assert!(!updated.enabled);
-        assert_eq!(updated.last_status.as_deref(), Some("error"));
+        let retained = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(retained.terminal_state, Some(crate::cron::CronJobTerminalState::Failed));
+        assert_eq!(cron::list_runs(&config, &job.id, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_retained_at_job_is_terminal_and_not_due_again() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp).await;
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = cron::add_agent_job(
+            &config,
+            Some("retained-failure".into()),
+            Schedule::At { at },
+            "terminal failure",
+            SessionTarget::Isolated,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(cron::claim_job_if_current_for_manual_run(&config, &job).unwrap());
+        let started = Utc::now();
+        let finished = started + ChronoDuration::milliseconds(10);
+
+        assert!(!persist_job_result(&config, &job, false, "boom", started, finished).await);
+
+        let stored = cron::get_job(&config, &job.id).unwrap();
+        assert_eq!(stored.terminal_state, Some(crate::cron::CronJobTerminalState::Failed));
+        let events = cron::list_job_events(&config, &job.id).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "cron.job.failed")
+                .count(),
+            1
+        );
+        assert!(
+            cron::due_jobs(&config, at + ChronoDuration::seconds(1))
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

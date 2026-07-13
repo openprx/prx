@@ -248,12 +248,13 @@ impl CronTool {
                 )
                 .map(|grant| serde_json::to_string(&grant))
                 .transpose()?;
-                cron::add_shell_job_with_lineage_and_approval_grant(
+                cron::add_shell_job_with_lineage_approval_and_delete(
                     cfg,
                     name,
                     schedule,
                     command,
                     persisted_grant,
+                    delete_after_run,
                     lineage,
                 )
             }
@@ -530,11 +531,20 @@ impl Tool for CronTool {
                         for job in &jobs {
                             let paused = !job.enabled;
                             let one_shot = matches!(job.schedule, Schedule::At { .. });
-                            let flags = match (paused, one_shot) {
-                                (true, true) => " [disabled, one-shot]",
-                                (true, false) => " [disabled]",
-                                (false, true) => " [one-shot]",
-                                (false, false) => "",
+                            let mut flag_values = Vec::new();
+                            if paused {
+                                flag_values.push("disabled".to_string());
+                            }
+                            if one_shot {
+                                flag_values.push("one-shot".to_string());
+                            }
+                            if let Some(terminal) = job.terminal_state {
+                                flag_values.push(format!("terminal={}", terminal.as_str()));
+                            }
+                            let flags = if flag_values.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" [{}]", flag_values.join(", "))
                             };
                             let last_run = job.last_run.map_or_else(|| "never".to_string(), |v| v.to_rfc3339());
                             let last_status = job.last_status.as_deref().unwrap_or("n/a");
@@ -586,6 +596,7 @@ impl Tool for CronTool {
                             "next_run": job.next_run.to_rfc3339(),
                             "last_run": job.last_run.map(|v| v.to_rfc3339()),
                             "last_status": job.last_status,
+                            "terminal_state": job.terminal_state,
                             "enabled": job.enabled,
                             "one_shot": matches!(job.schedule, Schedule::At { .. }),
                         });
@@ -608,18 +619,23 @@ impl Tool for CronTool {
                     return Ok(r);
                 }
                 let jobs = cron::list_jobs(&cfg).unwrap_or_default();
-                let enabled_count = jobs.iter().filter(|j| j.enabled).count();
-                let disabled_count = jobs.len() - enabled_count;
+                let terminal_count = jobs.iter().filter(|job| job.terminal_state.is_some()).count();
+                let enabled_count = jobs
+                    .iter()
+                    .filter(|job| job.enabled && job.terminal_state.is_none())
+                    .count();
+                let disabled_count = jobs.len() - enabled_count - terminal_count;
                 Ok(ToolResult {
                     success: true,
                     output: format!(
                         "⏰ Cron Status\n\
                          ─────────────\n\
                          Enabled:  true\n\
-                         Jobs:     {} total ({} active, {} paused)",
+                         Jobs:     {} total ({} active, {} paused, {} terminal)",
                         jobs.len(),
                         enabled_count,
                         disabled_count,
+                        terminal_count,
                     ),
                     error: None,
                 })
@@ -954,6 +970,7 @@ impl Tool for CronTool {
                         });
                     }
                 };
+                let consume_one_shot = matches!(job.schedule, Schedule::At { .. }) && job.terminal_state.is_none();
                 if approval_grant.is_none()
                     && args
                         .get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG)
@@ -982,6 +999,13 @@ impl Tool for CronTool {
                         error: Some("Rate limit exceeded: action budget exhausted".into()),
                     });
                 }
+                if consume_one_shot && !cron::claim_job_if_current_for_manual_run(&cfg, &job)? {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("one-shot cron job '{}' changed or is already running", job.id)),
+                    });
+                }
                 let started_at = Utc::now();
                 let (success, output) = cron::scheduler::execute_job_now_with_runtime_approval_for_tool(
                     &cfg,
@@ -993,16 +1017,36 @@ impl Tool for CronTool {
                 let finished_at = Utc::now();
                 let duration_ms = (finished_at - started_at).num_milliseconds();
                 let status = if success { "ok" } else { "error" };
-                let _ = cron::record_run(
-                    &cfg,
-                    &job.id,
-                    started_at,
-                    finished_at,
-                    status,
-                    Some(&output),
-                    duration_ms,
-                );
-                let _ = cron::record_last_run(&cfg, &job.id, finished_at, success, &output);
+                let persist_result = if consume_one_shot {
+                    cron::record_one_shot_terminal_run(
+                        &cfg,
+                        &job,
+                        started_at,
+                        finished_at,
+                        success,
+                        &output,
+                        duration_ms,
+                    )
+                    .map(|_| ())
+                } else {
+                    cron::record_run(
+                        &cfg,
+                        &job.id,
+                        started_at,
+                        finished_at,
+                        status,
+                        Some(&output),
+                        duration_ms,
+                    )
+                    .and_then(|()| cron::record_last_run(&cfg, &job.id, finished_at, success, &output))
+                };
+                if let Err(error) = persist_result {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!("cron job executed but its outcome was not persisted: {error}")),
+                    });
+                }
                 Ok(ToolResult {
                     success,
                     output: serde_json::to_string_pretty(&json!({
@@ -1552,6 +1596,125 @@ mod tests {
             .expect("test: one job");
         assert!(matches!(job.schedule, Schedule::At { .. }));
         assert!(job.delete_after_run, "At-scheduled agent jobs are one-shot by default");
+    }
+
+    #[tokio::test]
+    async fn add_shell_schedule_at_persists_explicit_delete_after_run() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "at", "at": at },
+                "job_type": "shell",
+                "command": "echo once",
+                "delete_after_run": false
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+
+        let job = cron::list_jobs(&cfg_snap)
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("test: one job");
+        assert!(matches!(job.schedule, Schedule::At { .. }));
+        assert!(!job.delete_after_run);
+    }
+
+    #[tokio::test]
+    async fn force_run_consumes_nonterminal_at_but_allows_terminal_manual_rerun() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "at", "at": at },
+                "job_type": "shell",
+                "command": "echo force-once",
+                "delete_after_run": false
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job = cron::list_jobs(&cfg_snap).unwrap().remove(0);
+
+        let first = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
+        assert!(first.success, "{:?}", first.error);
+        let terminal = cron::get_job(&cfg_snap, &job.id).unwrap();
+        assert_eq!(terminal.terminal_state, Some(cron::CronJobTerminalState::Succeeded));
+
+        let second = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
+        assert!(second.success, "{:?}", second.error);
+        let rerun = cron::get_job(&cfg_snap, &job.id).unwrap();
+        assert_eq!(rerun.terminal_state, Some(cron::CronJobTerminalState::Succeeded));
+        assert_eq!(cron::list_runs(&cfg_snap, &job.id, 10).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_force_run_retains_auto_delete_at_audit() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let at = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let add = tool
+            .execute(json!({
+                "action": "add",
+                "schedule": { "kind": "at", "at": at },
+                "job_type": "shell",
+                "command": "false"
+            }))
+            .await
+            .unwrap();
+        assert!(add.success, "{:?}", add.error);
+        let job = cron::list_jobs(&cfg_snap).unwrap().remove(0);
+
+        let run = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
+        assert!(!run.success);
+        let retained = cron::get_job(&cfg_snap, &job.id).unwrap();
+        assert_eq!(retained.terminal_state, Some(cron::CronJobTerminalState::Failed));
+        assert_eq!(cron::list_runs(&cfg_snap, &job.id, 10).unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn force_run_paused_at_preserves_manual_run_compatibility() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = test_config(&tmp).await;
+        let cfg_snap = cfg.load_full();
+        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let at = Utc::now() + chrono::Duration::hours(1);
+        let job = cron::add_shell_job(
+            &cfg_snap,
+            Some("paused-manual-at".to_string()),
+            Schedule::At { at },
+            "echo paused-manual",
+        )
+        .unwrap();
+        let paused = cron::update_job(
+            &cfg_snap,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!paused.enabled);
+
+        let run = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
+        assert!(run.success, "{:?}", run.error);
+        let terminal = cron::get_job(&cfg_snap, &job.id).unwrap();
+        assert!(!terminal.enabled);
+        assert_eq!(terminal.terminal_state, Some(cron::CronJobTerminalState::Succeeded));
     }
 
     /// `Schedule::Every` agent jobs persist the `Every` schedule (every_ms).

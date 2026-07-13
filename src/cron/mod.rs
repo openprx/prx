@@ -18,11 +18,13 @@ pub use store::add_job;
 #[allow(unused_imports)]
 pub use store::{
     add_agent_job, add_agent_job_with_lineage, add_shell_job, add_shell_job_with_approval_grant,
-    add_shell_job_with_lineage_and_approval_grant, claim_job, due_jobs, get_job, list_job_events, list_jobs, list_runs,
-    record_last_run, record_run, remove_job, reschedule_after_run, update_job,
+    add_shell_job_with_lineage_and_approval_grant, add_shell_job_with_lineage_approval_and_delete, claim_job,
+    claim_job_if_current, claim_job_if_current_for_manual_run, due_jobs, get_job, list_job_events, list_jobs,
+    list_runs, record_last_run, record_one_shot_terminal_run, record_run, remove_job, reschedule_after_run, update_job,
 };
 pub use types::{
-    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
+    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig, JobType,
+    Schedule, SessionTarget,
 };
 
 #[allow(clippy::needless_pass_by_value)]
@@ -41,13 +43,15 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
             for job in jobs {
                 let last_run = job.last_run.map_or_else(|| "never".into(), |d| d.to_rfc3339());
                 let last_status = job.last_status.unwrap_or_else(|| "n/a".into());
+                let terminal = job.terminal_state.map_or("none", CronJobTerminalState::as_str);
                 println!(
-                    "- {} | {:?} | next={} | last={} ({})",
+                    "- {} | {:?} | next={} | last={} ({}) | terminal={}",
                     job.id,
                     job.schedule,
                     job.next_run.to_rfc3339(),
                     last_run,
                     last_status,
+                    terminal,
                 );
                 if !job.command.is_empty() {
                     println!("    cmd: {}", job.command);

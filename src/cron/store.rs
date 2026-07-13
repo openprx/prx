@@ -19,8 +19,8 @@
 
 use crate::config::Config;
 use crate::cron::{
-    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronRun, DeliveryConfig, JobType, Schedule, SessionTarget,
-    next_run_for_schedule, schedule_cron_expression, validate_schedule,
+    CronJob, CronJobEvent, CronJobLineage, CronJobPatch, CronJobTerminalState, CronRun, DeliveryConfig, JobType,
+    Schedule, SessionTarget, next_run_for_schedule, schedule_cron_expression, validate_schedule,
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -74,13 +74,27 @@ pub fn add_shell_job_with_lineage_and_approval_grant(
     approval_grant_json: Option<String>,
     lineage: CronJobLineage,
 ) -> Result<CronJob> {
+    add_shell_job_with_lineage_approval_and_delete(config, name, schedule, command, approval_grant_json, false, lineage)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn add_shell_job_with_lineage_approval_and_delete(
+    config: &Config,
+    name: Option<String>,
+    schedule: Schedule,
+    command: &str,
+    approval_grant_json: Option<String>,
+    delete_after_run: bool,
+    lineage: CronJobLineage,
+) -> Result<CronJob> {
     if let Some(store) = pg_store(config)? {
-        return store.add_shell_job_with_lineage_and_approval_grant(
+        return store.add_shell_job_with_lineage_approval_and_delete(
             &workspace_id(config),
             name,
             schedule,
             command,
             approval_grant_json,
+            delete_after_run,
             lineage,
         );
     }
@@ -101,7 +115,7 @@ pub fn add_shell_job_with_lineage_and_approval_grant(
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 expression, command, schedule, job_type, prompt, name, session_target, model,
                 enabled, delivery, delete_after_run, created_at, next_run, approval_grant_json
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, 0, ?11, ?12, ?13)",
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'shell', NULL, ?9, 'isolated', NULL, 1, ?10, ?11, ?12, ?13, ?14)",
             params![
                 id,
                 owner_id.as_deref(),
@@ -113,6 +127,7 @@ pub fn add_shell_job_with_lineage_and_approval_grant(
                 schedule_json.as_str(),
                 name.as_deref(),
                 serde_json::to_string(&DeliveryConfig::default())?,
+                if delete_after_run { 1 } else { 0 },
                 now.to_rfc3339(),
                 next_run.to_rfc3339(),
                 approval_grant_json,
@@ -276,7 +291,7 @@ pub fn list_jobs(config: &Config) -> Result<Vec<CronJob>> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    approval_grant_json
+                    terminal_state, approval_grant_json
              FROM cron_jobs ORDER BY next_run ASC",
         )?;
 
@@ -299,7 +314,7 @@ pub fn get_job(config: &Config, job_id: &str) -> Result<CronJob> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    approval_grant_json
+                    terminal_state, approval_grant_json
              FROM cron_jobs WHERE id = ?1",
         )?;
 
@@ -354,7 +369,8 @@ pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
     with_connection(config, |conn| {
         let changed = conn.execute(
             "UPDATE cron_jobs SET last_status = 'running'
-             WHERE id = ?1 AND enabled = 1 AND (last_status IS NULL OR last_status != 'running')",
+             WHERE id = ?1 AND enabled = 1 AND terminal_state IS NULL
+               AND (last_status IS NULL OR last_status != 'running')",
             params![job_id],
         )?;
         if changed > 0 {
@@ -374,6 +390,63 @@ pub fn claim_job(config: &Config, job_id: &str) -> Result<bool> {
     })
 }
 
+pub fn claim_job_if_current(config: &Config, job: &CronJob, now: DateTime<Utc>) -> Result<bool> {
+    if let Some(store) = pg_store(config)? {
+        return store.claim_job_if_current(&workspace_id(config), job, Some(now));
+    }
+    claim_sqlite_job_snapshot(config, job, Some(now))
+}
+
+pub fn claim_job_if_current_for_manual_run(config: &Config, job: &CronJob) -> Result<bool> {
+    if let Some(store) = pg_store(config)? {
+        return store.claim_job_if_current(&workspace_id(config), job, None);
+    }
+    claim_sqlite_job_snapshot(config, job, None)
+}
+
+fn claim_sqlite_job_snapshot(config: &Config, job: &CronJob, due_by: Option<DateTime<Utc>>) -> Result<bool> {
+    let schedule_json = serde_json::to_string(&job.schedule)?;
+    with_connection(config, |conn| {
+        let changed = if let Some(due_by) = due_by {
+            conn.execute(
+                "UPDATE cron_jobs SET last_status = 'running'
+                 WHERE id = ?1 AND enabled = 1 AND terminal_state IS NULL AND next_run = ?2 AND next_run <= ?3
+                   AND (schedule = ?4 OR (schedule IS NULL AND expression = ?5))
+                   AND (last_status IS NULL OR last_status != 'running')",
+                params![
+                    job.id,
+                    job.next_run.to_rfc3339(),
+                    due_by.to_rfc3339(),
+                    schedule_json,
+                    job.expression,
+                ],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE cron_jobs SET last_status = 'running'
+                 WHERE id = ?1 AND terminal_state IS NULL AND next_run = ?2
+                   AND (schedule = ?3 OR (schedule IS NULL AND expression = ?4))
+                   AND (last_status IS NULL OR last_status != 'running')",
+                params![job.id, job.next_run.to_rfc3339(), schedule_json, job.expression],
+            )?
+        };
+        if changed > 0
+            && let Some(lineage) = load_job_lineage(conn, &job.id)?
+        {
+            insert_job_event(
+                conn,
+                &workspace_id(config),
+                &job.id,
+                lineage,
+                "cron.job.claimed",
+                Some("running"),
+                None,
+            )?;
+        }
+        Ok(changed > 0)
+    })
+}
+
 pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
     if let Some(store) = pg_store(config)? {
         return store.due_jobs(now, config.scheduler.max_tasks);
@@ -384,9 +457,9 @@ pub fn due_jobs(config: &Config, now: DateTime<Utc>) -> Result<Vec<CronJob>> {
             "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
                     expression, command, schedule, job_type, prompt, name, session_target, model,
                     enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
-                    approval_grant_json
+                    terminal_state, approval_grant_json
              FROM cron_jobs
-             WHERE enabled = 1 AND next_run <= ?1
+             WHERE enabled = 1 AND terminal_state IS NULL AND next_run <= ?1
              ORDER BY next_run ASC
              LIMIT ?2",
         )?;
@@ -407,14 +480,30 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
     }
     let mut job = get_job(config, job_id)?;
     let was_enabled = job.enabled;
+    let expected_schedule_json = serde_json::to_string(&job.schedule)?;
+    let expected_expression = job.expression.clone();
+    let expected_next_run = job.next_run.to_rfc3339();
+    let expected_last_status = job.last_status.clone();
     let approval_grant_json = patch.approval_grant_json.clone();
     let schedule_changed = if let Some(schedule) = patch.schedule {
         validate_schedule(&schedule, Utc::now())?;
+        if job.terminal_state.is_none()
+            && matches!(job.schedule, Schedule::At { .. })
+            && job.last_status.as_deref() == Some("running")
+        {
+            anyhow::bail!("cannot update the schedule of an in-flight Schedule::At job");
+        }
+        let rearm_terminal_at = job.terminal_state.is_some()
+            && matches!(job.schedule, Schedule::At { .. })
+            && matches!(schedule, Schedule::At { .. });
+        if job.terminal_state.is_some() && matches!(job.schedule, Schedule::At { .. }) && !rearm_terminal_at {
+            anyhow::bail!("a terminal Schedule::At job can only be re-armed with a new future Schedule::At");
+        }
         job.schedule = schedule;
         job.expression = schedule_cron_expression(&job.schedule).unwrap_or_default();
-        true
+        Some(rearm_terminal_at)
     } else {
-        false
+        None
     };
     if let Some(command) = patch.command {
         job.command = command;
@@ -442,8 +531,15 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
         job.delete_after_run = delete_after_run;
     }
 
-    if schedule_changed {
+    if let Some(rearm_terminal_at) = schedule_changed {
         job.next_run = next_run_for_schedule(&job.schedule, Utc::now())?;
+        if rearm_terminal_at {
+            job.last_run = None;
+            job.last_status = None;
+            job.last_output = None;
+            job.terminal_state = None;
+            job.enabled = true;
+        }
     }
 
     with_connection(config, |conn| {
@@ -452,8 +548,11 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                 "UPDATE cron_jobs
              SET expression = ?1, command = ?2, schedule = ?3, job_type = ?4, prompt = ?5, name = ?6,
                  session_target = ?7, model = ?8, enabled = ?9, delivery = ?10, delete_after_run = ?11,
-                 next_run = ?12, approval_grant_json = ?13
-             WHERE id = ?14",
+                 next_run = ?12, last_run = ?13, last_status = ?14, last_output = ?15,
+                 terminal_state = ?16, approval_grant_json = ?17
+             WHERE id = ?18 AND next_run = ?19
+               AND (schedule = ?20 OR (schedule IS NULL AND expression = ?21))
+               AND last_status IS ?22",
                 params![
                     job.expression,
                     job.command,
@@ -467,8 +566,16 @@ pub fn update_job(config: &Config, job_id: &str, patch: CronJobPatch) -> Result<
                     serde_json::to_string(&job.delivery)?,
                     if job.delete_after_run { 1 } else { 0 },
                     job.next_run.to_rfc3339(),
+                    job.last_run.map(|value| value.to_rfc3339()),
+                    job.last_status,
+                    job.last_output,
+                    job.terminal_state.map(CronJobTerminalState::as_str),
                     job.approval_grant_json,
                     job.id,
+                    expected_next_run,
+                    expected_schedule_json,
+                    expected_expression,
+                    expected_last_status,
                 ],
             )
             .context("Failed to update cron job")?;
@@ -548,6 +655,9 @@ pub fn record_last_run(
 }
 
 pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, output: &str) -> Result<()> {
+    if matches!(job.schedule, Schedule::At { .. }) {
+        anyhow::bail!("Schedule::At is terminal after its attempt and cannot be rescheduled");
+    }
     if let Some(store) = pg_store(config)? {
         return store.reschedule_after_run(&workspace_id(config), job, success, output);
     }
@@ -583,6 +693,136 @@ pub fn reschedule_after_run(config: &Config, job: &CronJob, success: bool, outpu
             )?;
         }
         Ok(())
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn record_one_shot_terminal_run(
+    config: &Config,
+    job: &CronJob,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    success: bool,
+    output: &str,
+    duration_ms: i64,
+) -> Result<bool> {
+    if !matches!(job.schedule, Schedule::At { .. }) {
+        anyhow::bail!("terminal one-shot persistence requires Schedule::At");
+    }
+    if let Some(store) = pg_store(config)? {
+        return store.record_one_shot_terminal_run(
+            &workspace_id(config),
+            job,
+            started_at,
+            finished_at,
+            success,
+            output,
+            duration_ms,
+            config.cron.max_run_history,
+        );
+    }
+
+    let status = if success { "ok" } else { "error" };
+    let terminal_state = if success {
+        CronJobTerminalState::Succeeded
+    } else {
+        CronJobTerminalState::Failed
+    };
+    let terminal_event_type = if success {
+        "cron.job.completed"
+    } else {
+        "cron.job.failed"
+    };
+    let bounded_output = truncate_cron_output(output);
+    let keep = i64::from(config.cron.max_run_history.max(1));
+    let schedule_json = serde_json::to_string(&job.schedule)?;
+    with_connection(config, |conn| {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                job.id,
+                started_at.to_rfc3339(),
+                finished_at.to_rfc3339(),
+                status,
+                bounded_output,
+                duration_ms,
+            ],
+        )
+        .context("Failed to insert terminal cron run")?;
+        tx.execute(
+            "DELETE FROM cron_runs
+             WHERE job_id = ?1
+               AND id NOT IN (
+                 SELECT id FROM cron_runs
+                 WHERE job_id = ?1
+                 ORDER BY started_at DESC, id DESC
+                 LIMIT ?2
+               )",
+            params![job.id, keep],
+        )
+        .context("Failed to prune terminal cron run history")?;
+        let changed = tx.execute(
+            "UPDATE cron_jobs
+             SET last_run = ?1, last_status = ?2, last_output = ?3, terminal_state = ?4
+             WHERE id = ?5 AND terminal_state IS NULL AND next_run = ?6 AND schedule = ?7
+               AND last_status = 'running'",
+            params![
+                finished_at.to_rfc3339(),
+                status,
+                bounded_output,
+                terminal_state.as_str(),
+                job.id,
+                job.next_run.to_rfc3339(),
+                schedule_json,
+            ],
+        )?;
+        if changed == 0 {
+            anyhow::bail!("cron one-shot '{}' was deleted or already terminal", job.id);
+        }
+        if let Some(lineage) = load_job_lineage(&tx, &job.id)? {
+            insert_job_event(
+                &tx,
+                &workspace_id(config),
+                &job.id,
+                lineage.clone(),
+                "cron.job.run_recorded",
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "started_at": started_at.to_rfc3339(),
+                        "finished_at": finished_at.to_rfc3339(),
+                        "duration_ms": duration_ms,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+            insert_job_event(
+                &tx,
+                &workspace_id(config),
+                &job.id,
+                lineage,
+                terminal_event_type,
+                Some(status),
+                Some(
+                    serde_json::json!({
+                        "terminal_state": terminal_state.as_str(),
+                        "success": success,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
+        let deleted = tx.execute(
+            "DELETE FROM cron_jobs
+             WHERE id = ?1 AND terminal_state = 'succeeded' AND delete_after_run = 1",
+            params![job.id],
+        )? > 0;
+        tx.commit().context("Failed to commit terminal cron run")?;
+        Ok(deleted)
     })
 }
 
@@ -783,7 +1023,11 @@ fn map_cron_job_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJob> {
         },
         last_status: row.get(19)?,
         last_output: row.get(20)?,
-        approval_grant_json: row.get(21)?,
+        terminal_state: row
+            .get::<_, Option<String>>(21)?
+            .map(|raw| CronJobTerminalState::parse(&raw).map_err(sql_conversion_error))
+            .transpose()?,
+        approval_grant_json: row.get(22)?,
     })
 }
 
@@ -1036,6 +1280,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             last_run         TEXT,
             last_status      TEXT,
             last_output      TEXT,
+            terminal_state   TEXT,
             approval_grant_json TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_cron_jobs_next_run ON cron_jobs(next_run);
@@ -1091,6 +1336,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "cron_jobs", "last_run", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "last_status", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "last_output", "TEXT")?;
+    add_column_if_missing(&conn, "cron_jobs", "terminal_state", "TEXT")?;
     add_column_if_missing(&conn, "cron_jobs", "approval_grant_json", "TEXT")?;
     add_column_if_missing(&conn, "cron_job_events", "source_message_event_id", "TEXT")?;
     conn.execute_batch(
@@ -1099,6 +1345,16 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
          CREATE INDEX IF NOT EXISTS idx_cron_jobs_parent ON cron_jobs(parent_task_id, id);",
     )
     .context("Failed to initialize cron lineage indexes")?;
+
+    conn.execute(
+        "UPDATE cron_jobs
+         SET terminal_state = CASE WHEN last_status = 'ok' THEN 'succeeded' ELSE 'failed' END,
+             enabled = 0
+         WHERE terminal_state IS NULL AND last_run IS NOT NULL AND last_status IN ('ok', 'error')
+           AND schedule LIKE '%\"kind\":\"at\"%'",
+        [],
+    )
+    .context("Failed to backfill terminal state for historical one-shot jobs")?;
 
     f(&conn)
 }
@@ -1300,6 +1556,7 @@ mod tests {
                 "topic_id",
                 "parent_task_id",
                 "source_message_event_id",
+                "terminal_state",
                 "approval_grant_json",
             ] {
                 assert!(names.iter().any(|existing| existing == name), "missing {name}");
@@ -1378,6 +1635,300 @@ mod tests {
         assert_eq!(stored.last_status.as_deref(), Some("error"));
         assert!(stored.last_run.is_some());
         assert_eq!(stored.last_output.as_deref(), Some("failed output"));
+    }
+
+    #[test]
+    fn historical_completed_at_job_is_backfilled_terminal_and_disabled() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let succeeded = add_shell_job(&config, None, Schedule::At { at }, "echo legacy-success").unwrap();
+        let failed = add_shell_job(&config, None, Schedule::At { at }, "echo legacy-failure").unwrap();
+        let running = add_shell_job(&config, None, Schedule::At { at }, "echo legacy-running").unwrap();
+        let unknown = add_shell_job(&config, None, Schedule::At { at }, "echo legacy-unknown").unwrap();
+        let null_status = add_shell_job(&config, None, Schedule::At { at }, "echo legacy-null").unwrap();
+
+        with_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET last_run = ?1, last_status = 'ok', terminal_state = NULL, enabled = 1
+                 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), succeeded.id],
+            )?;
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET last_run = ?1, last_status = 'error', terminal_state = NULL, enabled = 1
+                 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), failed.id],
+            )?;
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET last_run = ?1, last_status = 'running', terminal_state = NULL, enabled = 1
+                 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), running.id],
+            )?;
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET last_run = ?1, last_status = 'unknown', terminal_state = NULL, enabled = 1
+                 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), unknown.id],
+            )?;
+            conn.execute(
+                "UPDATE cron_jobs
+                 SET last_run = ?1, last_status = NULL, terminal_state = NULL, enabled = 1
+                 WHERE id = ?2",
+                params![Utc::now().to_rfc3339(), null_status.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let migrated_success = get_job(&config, &succeeded.id).unwrap();
+        assert_eq!(migrated_success.terminal_state, Some(CronJobTerminalState::Succeeded));
+        assert!(!migrated_success.enabled);
+        let migrated_failure = get_job(&config, &failed.id).unwrap();
+        assert_eq!(migrated_failure.terminal_state, Some(CronJobTerminalState::Failed));
+        assert!(!migrated_failure.enabled);
+        let unresolved_running = get_job(&config, &running.id).unwrap();
+        assert_eq!(unresolved_running.terminal_state, None);
+        assert!(unresolved_running.enabled);
+        let unresolved_unknown = get_job(&config, &unknown.id).unwrap();
+        assert_eq!(unresolved_unknown.terminal_state, None);
+        assert!(unresolved_unknown.enabled);
+        let unresolved_null = get_job(&config, &null_status.id).unwrap();
+        assert_eq!(unresolved_null.terminal_state, None);
+        assert!(unresolved_null.enabled);
+    }
+
+    #[test]
+    fn schedule_update_rearms_terminal_job_but_enable_alone_does_not() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = add_shell_job(&config, None, Schedule::At { at }, "echo once").unwrap();
+        let started = Utc::now();
+        assert!(claim_job_if_current_for_manual_run(&config, &job).unwrap());
+        record_one_shot_terminal_run(&config, &job, started, started, true, "ok", 0).unwrap();
+
+        let enabled = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(true),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(enabled.terminal_state, Some(CronJobTerminalState::Succeeded));
+        let disabled = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                enabled: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!disabled.enabled);
+
+        let rearmed_at = Utc::now() + ChronoDuration::minutes(20);
+        let rearmed = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At { at: rearmed_at }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rearmed.terminal_state, None);
+        assert_eq!(rearmed.last_run, None);
+        assert_eq!(rearmed.last_status, None);
+        assert_eq!(rearmed.last_output, None);
+        assert_eq!(rearmed.next_run, rearmed_at);
+        assert!(rearmed.enabled);
+    }
+
+    #[test]
+    fn recurring_schedule_update_preserves_run_history() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let job = add_job(&config, "*/15 * * * *", "echo recurring").unwrap();
+        reschedule_after_run(&config, &job, false, "previous failure").unwrap();
+        let before = get_job(&config, &job.id).unwrap();
+
+        let updated = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                schedule: Some(Schedule::Cron {
+                    expr: "*/30 * * * *".to_string(),
+                    tz: None,
+                }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(updated.last_run, before.last_run);
+        assert_eq!(updated.last_status, before.last_status);
+        assert_eq!(updated.last_output, before.last_output);
+        assert_eq!(updated.terminal_state, None);
+    }
+
+    #[test]
+    fn at_snapshot_fences_claim_update_and_terminal_commit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let original_at = Utc::now() + ChronoDuration::minutes(10);
+        let stale = add_shell_job(&config, None, Schedule::At { at: original_at }, "echo stale").unwrap();
+        let rearmed_at = Utc::now() + ChronoDuration::minutes(20);
+        let current = update_job(
+            &config,
+            &stale.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At { at: rearmed_at }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+
+        let due_by = rearmed_at + ChronoDuration::seconds(1);
+        assert!(!claim_job_if_current(&config, &stale, due_by).unwrap());
+        assert!(claim_job_if_current(&config, &current, due_by).unwrap());
+
+        let in_flight_update = update_job(
+            &config,
+            &current.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At {
+                    at: Utc::now() + ChronoDuration::minutes(30),
+                }),
+                ..CronJobPatch::default()
+            },
+        );
+        assert!(
+            in_flight_update
+                .unwrap_err()
+                .to_string()
+                .contains("in-flight Schedule::At")
+        );
+
+        let started = Utc::now();
+        record_one_shot_terminal_run(&config, &current, started, started, true, "done", 0).unwrap();
+        assert_eq!(list_runs(&config, &current.id, 10).unwrap().len(), 1);
+        assert_eq!(
+            list_job_events(&config, &current.id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "cron.job.completed")
+                .count(),
+            1
+        );
+
+        let final_at = Utc::now() + ChronoDuration::minutes(40);
+        let rearmed = update_job(
+            &config,
+            &current.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At { at: final_at }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(rearmed.terminal_state, None);
+        assert_eq!(rearmed.next_run, final_at);
+        assert_eq!(rearmed.last_run, None);
+    }
+
+    #[test]
+    fn one_shot_terminal_delete_uses_current_retention_flag_atomically() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let at = Utc::now() + ChronoDuration::minutes(10);
+        let job = add_shell_job_with_lineage_approval_and_delete(
+            &config,
+            None,
+            Schedule::At { at },
+            "echo retained-by-toggle",
+            None,
+            true,
+            CronJobLineage::default(),
+        )
+        .unwrap();
+        assert!(claim_job_if_current_for_manual_run(&config, &job).unwrap());
+        let toggled = update_job(
+            &config,
+            &job.id,
+            CronJobPatch {
+                delete_after_run: Some(false),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!toggled.delete_after_run);
+
+        let started = Utc::now();
+        let deleted = record_one_shot_terminal_run(&config, &job, started, started, true, "done", 0).unwrap();
+        assert!(!deleted);
+        let retained = get_job(&config, &job.id).unwrap();
+        assert_eq!(retained.terminal_state, Some(CronJobTerminalState::Succeeded));
+    }
+
+    #[test]
+    fn rearm_and_terminal_auto_delete_are_serialized() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let original_at = Utc::now() + ChronoDuration::minutes(10);
+        let stale = add_shell_job_with_lineage_approval_and_delete(
+            &config,
+            None,
+            Schedule::At { at: original_at },
+            "echo delete-race",
+            None,
+            true,
+            CronJobLineage::default(),
+        )
+        .unwrap();
+        let rearmed_at = Utc::now() + ChronoDuration::minutes(20);
+        let current = update_job(
+            &config,
+            &stale.id,
+            CronJobPatch {
+                schedule: Some(Schedule::At { at: rearmed_at }),
+                ..CronJobPatch::default()
+            },
+        )
+        .unwrap();
+        assert!(!claim_job_if_current(&config, &stale, rearmed_at + ChronoDuration::seconds(1)).unwrap());
+
+        assert!(claim_job_if_current_for_manual_run(&config, &current).unwrap());
+        let started = Utc::now();
+        let deleted = record_one_shot_terminal_run(&config, &current, started, started, true, "done", 0).unwrap();
+        assert!(deleted);
+        assert!(get_job(&config, &current.id).is_err());
+        assert!(
+            update_job(
+                &config,
+                &current.id,
+                CronJobPatch {
+                    schedule: Some(Schedule::At {
+                        at: Utc::now() + ChronoDuration::minutes(30),
+                    }),
+                    ..CronJobPatch::default()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(
+            list_job_events(&config, &current.id)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == "cron.job.completed")
+                .count(),
+            1
+        );
+        assert!(list_runs(&config, &current.id, 10).unwrap().is_empty());
     }
 
     #[test]

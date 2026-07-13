@@ -67,6 +67,30 @@ pub enum Schedule {
     },
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CronJobTerminalState {
+    Succeeded,
+    Failed,
+}
+
+impl CronJobTerminalState {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+        }
+    }
+
+    pub(crate) fn parse(raw: &str) -> anyhow::Result<Self> {
+        match raw {
+            "succeeded" => Ok(Self::Succeeded),
+            "failed" => Ok(Self::Failed),
+            other => anyhow::bail!("Invalid cron terminal state: {other}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeliveryConfig {
     #[serde(default)]
@@ -117,6 +141,8 @@ pub struct CronJob {
     pub last_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub last_output: Option<String>,
+    #[serde(default)]
+    pub terminal_state: Option<CronJobTerminalState>,
     pub approval_grant_json: Option<String>,
 }
 
