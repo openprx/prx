@@ -162,7 +162,21 @@ pub trait Tool: Send + Sync {
         if !self.supports_name(name) {
             bail!("Tool '{}' does not handle name '{}'", self.name(), name);
         }
-        self.execute_with_cancellation(args, cancellation).await
+        if name == self.name() {
+            return self.execute_with_cancellation(args, cancellation).await;
+        }
+        let Some(cancellation) = cancellation else {
+            return self.execute_named(name, args).await;
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
+            }),
+            result = self.execute_named(name, args) => result,
+        }
     }
 }
 

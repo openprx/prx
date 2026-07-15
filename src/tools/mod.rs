@@ -24,6 +24,7 @@ pub mod delegate;
 pub mod document_get_chunk;
 pub mod document_search;
 pub mod error_hints;
+pub mod execution;
 pub mod file_edit;
 pub mod file_read;
 pub mod file_write;
@@ -68,6 +69,13 @@ pub use cron::CronTool;
 pub use delegate::DelegateTool;
 pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_search::DocumentSearchTool;
+pub use execution::{
+    AdapterOwnedSandboxStrategy, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
+    SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolDescriptor,
+    ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand, ToolExecutionContext,
+    ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionService, ToolExecutionStatus, ToolSandboxPermit,
+    ToolSandboxStrategy, TracingToolExecutionAudit,
+};
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;
 pub use file_write::FileWriteTool;
