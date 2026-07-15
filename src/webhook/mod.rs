@@ -1,9 +1,11 @@
-use crate::memory::principal::MemoryWriteContext;
-use crate::memory::traits::MemoryCategory;
-use crate::memory::{Memory, SqliteMemory};
+use crate::config::Config;
+use crate::memory::filter::{MemorySafetyFilter, SourceMetadata};
+use crate::memory::{MemoryBackendKind, classify_memory_backend, effective_memory_backend_name};
 use crate::security::policy::ResourceRiskLevel;
 use crate::security::{SecurityPolicy, SideEffectGate};
+use crate::self_system::evolution::record::Actor;
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::State,
@@ -12,11 +14,11 @@ use axum::{
     routing::post,
 };
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use parking_lot::Mutex as ParkingMutex;
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,10 +45,8 @@ struct WebhookState {
     token: Arc<str>,
     /// Optional HMAC signing secret for `X-Webhook-Signature` verification.
     signing_secret: Option<Arc<str>>,
-    db_path: Arc<PathBuf>,
-    acl_enabled: bool,
+    repository: Arc<dyn WebhookRepository>,
     rate_limiter: Arc<WebhookRateLimiter>,
-    idempotency_store: Arc<IdempotencyStore>,
     /// Security policy governing whether verified inbound events may be
     /// persisted into the topic store (FIX-P1-03). Under autonomy=ReadOnly the
     /// standalone webhook server must not write, so the persist step is gated
@@ -62,8 +62,8 @@ struct WebhookAck {
 
 const WEBHOOK_RATE_LIMIT_WINDOW_SECS: u64 = 60;
 const WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE: u32 = 60;
-const WEBHOOK_IDEMPOTENCY_TTL_SECS: u64 = 300;
-const WEBHOOK_IDEMPOTENCY_MAX_KEYS: usize = 10_000;
+const WEBHOOK_INGESTION_LEASE_SECS: i64 = 30;
+const WEBHOOK_MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
 
 #[derive(Debug)]
 struct WebhookRateLimiter {
@@ -98,69 +98,453 @@ impl WebhookRateLimiter {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WebhookIngestionClaim {
+    ingestion_key: String,
+    event_identity: String,
+    request_hash: String,
+    generation: i64,
+}
+
 #[derive(Debug)]
-struct IdempotencyStore {
-    ttl: Duration,
-    max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+enum WebhookClaimOutcome {
+    Acquired(WebhookIngestionClaim),
+    Committed { topic_id: String },
+    Processing,
+    Conflict,
 }
 
-impl IdempotencyStore {
-    fn new(ttl: Duration, max_keys: usize) -> Self {
-        Self {
-            ttl,
-            max_keys: max_keys.max(1),
-            keys: Mutex::new(HashMap::new()),
-        }
+#[async_trait]
+trait WebhookRepository: Send + Sync {
+    async fn claim(
+        &self,
+        ingestion_key: String,
+        event_identity: String,
+        request_hash: String,
+        event: &WebhookEvent,
+    ) -> Result<WebhookClaimOutcome>;
+
+    async fn commit(
+        &self,
+        claim: &WebhookIngestionClaim,
+        event: &WebhookEvent,
+        memory_content: &str,
+        memory_saved: bool,
+    ) -> Result<String>;
+
+    async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()>;
+}
+
+#[derive(Debug)]
+struct SqliteWebhookRepository {
+    conn: Arc<ParkingMutex<Connection>>,
+    workspace_id: Arc<str>,
+}
+
+#[derive(Debug)]
+struct ExistingIngestion {
+    ingestion_key: String,
+    event_identity: String,
+    request_hash: String,
+    status: String,
+    generation: i64,
+    lease_expires_at: Option<i64>,
+    topic_id: Option<String>,
+}
+
+impl SqliteWebhookRepository {
+    fn new(db_path: PathBuf, workspace_id: String) -> Result<Self> {
+        ensure_memory_schema(&db_path)?;
+        let conn = Connection::open(&db_path)
+            .with_context(|| format!("failed to open webhook repository {}", db_path.display()))?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("failed to configure webhook repository busy_timeout")?;
+        conn.execute_batch(
+            "PRAGMA foreign_keys = ON;
+             CREATE TABLE IF NOT EXISTS webhook_ingestions (
+                 ingestion_key    TEXT PRIMARY KEY,
+                 event_identity   TEXT NOT NULL UNIQUE,
+                 request_hash     TEXT NOT NULL,
+                 source           TEXT NOT NULL,
+                 project          TEXT,
+                 external_id      TEXT NOT NULL,
+                 event_type       TEXT NOT NULL,
+                 status           TEXT NOT NULL CHECK(status IN ('pending', 'committed', 'failed')),
+                 generation       INTEGER NOT NULL,
+                 lease_expires_at INTEGER,
+                 topic_id         TEXT,
+                 memory_key       TEXT,
+                 last_error       TEXT,
+                 created_at       TEXT NOT NULL,
+                 updated_at       TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_status
+                 ON webhook_ingestions(status, lease_expires_at);
+             CREATE INDEX IF NOT EXISTS idx_webhook_ingestions_external
+                 ON webhook_ingestions(source, project, external_id, event_type);",
+        )
+        .context("failed to initialize durable webhook ingestion schema")?;
+        Ok(Self {
+            conn: Arc::new(ParkingMutex::new(conn)),
+            workspace_id: Arc::from(workspace_id),
+        })
     }
 
-    async fn record_if_new(&self, key: &str) -> bool {
-        let now = Instant::now();
-        let mut keys = self.keys.lock().await;
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
-        if keys.contains_key(key) {
-            return false;
-        }
-        if keys.len() >= self.max_keys {
-            let evict_key = keys.iter().min_by_key(|(_, seen_at)| *seen_at).map(|(k, _)| k.clone());
-            if let Some(evict_key) = evict_key {
-                keys.remove(&evict_key);
+    fn existing_ingestion(
+        tx: &Transaction<'_>,
+        ingestion_key: &str,
+        event_identity: &str,
+    ) -> Result<Option<ExistingIngestion>> {
+        tx.query_row(
+            "SELECT ingestion_key, event_identity, request_hash, status, generation,
+                    lease_expires_at, topic_id
+               FROM webhook_ingestions
+              WHERE ingestion_key = ?1 OR event_identity = ?2
+              ORDER BY CASE WHEN ingestion_key = ?1 THEN 0 ELSE 1 END
+              LIMIT 1",
+            params![ingestion_key, event_identity],
+            |row| {
+                Ok(ExistingIngestion {
+                    ingestion_key: row.get(0)?,
+                    event_identity: row.get(1)?,
+                    request_hash: row.get(2)?,
+                    status: row.get(3)?,
+                    generation: row.get(4)?,
+                    lease_expires_at: row.get(5)?,
+                    topic_id: row.get(6)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    fn claim_blocking(
+        &self,
+        ingestion_key: String,
+        event_identity: String,
+        request_hash: String,
+        event: &WebhookEvent,
+    ) -> Result<WebhookClaimOutcome> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now_unix = Utc::now().timestamp();
+        let now = Utc::now().to_rfc3339();
+        let lease_expires_at = now_unix.saturating_add(WEBHOOK_INGESTION_LEASE_SECS);
+
+        let outcome = if let Some(existing) = Self::existing_ingestion(&tx, &ingestion_key, &event_identity)? {
+            if existing.request_hash != request_hash || existing.event_identity != event_identity {
+                WebhookClaimOutcome::Conflict
+            } else if existing.status == "committed" {
+                let topic_id = existing
+                    .topic_id
+                    .context("committed webhook ingestion is missing topic identity")?;
+                WebhookClaimOutcome::Committed { topic_id }
+            } else if existing.status == "pending" && existing.lease_expires_at.is_some_and(|lease| lease > now_unix) {
+                WebhookClaimOutcome::Processing
+            } else {
+                let generation = existing
+                    .generation
+                    .checked_add(1)
+                    .context("webhook ingestion generation exhausted")?;
+                tx.execute(
+                    "UPDATE webhook_ingestions
+                        SET status = 'pending', generation = ?2, lease_expires_at = ?3,
+                            topic_id = NULL, memory_key = NULL, last_error = NULL, updated_at = ?4
+                      WHERE ingestion_key = ?1",
+                    params![existing.ingestion_key, generation, lease_expires_at, now],
+                )?;
+                WebhookClaimOutcome::Acquired(WebhookIngestionClaim {
+                    ingestion_key: existing.ingestion_key,
+                    event_identity,
+                    request_hash,
+                    generation,
+                })
             }
+        } else {
+            tx.execute(
+                "INSERT INTO webhook_ingestions (
+                    ingestion_key, event_identity, request_hash, source, project, external_id,
+                    event_type, status, generation, lease_expires_at, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', 1, ?8, ?9, ?9)",
+                params![
+                    ingestion_key,
+                    event_identity,
+                    request_hash,
+                    event.source,
+                    event.project,
+                    event.external_id,
+                    event.event_type,
+                    lease_expires_at,
+                    now,
+                ],
+            )?;
+            WebhookClaimOutcome::Acquired(WebhookIngestionClaim {
+                ingestion_key,
+                event_identity,
+                request_hash,
+                generation: 1,
+            })
+        };
+
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    fn commit_blocking(
+        &self,
+        claim: &WebhookIngestionClaim,
+        event: &WebhookEvent,
+        memory_content: &str,
+        memory_saved: bool,
+    ) -> Result<String> {
+        let mut conn = self.conn.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = Utc::now().to_rfc3339();
+        let owns_claim: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM webhook_ingestions
+                 WHERE ingestion_key = ?1 AND generation = ?2 AND status = 'pending'
+                   AND event_identity = ?3 AND request_hash = ?4
+             )",
+            params![
+                claim.ingestion_key,
+                claim.generation,
+                claim.event_identity,
+                claim.request_hash,
+            ],
+            |row| row.get(0),
+        )?;
+        if !owns_claim {
+            anyhow::bail!("webhook ingestion ownership was lost before commit");
         }
-        keys.insert(key.to_string(), now);
-        true
+        let topic_id = match crate::memory::topic::find_topic_by_project_and_external(
+            &tx,
+            event.project.as_deref(),
+            &event.external_id,
+        )? {
+            Some(topic) => topic.id,
+            None => {
+                let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
+                crate::memory::topic::create_topic(
+                    &tx,
+                    &event.title,
+                    event.project.as_deref(),
+                    Some(&event.external_id),
+                    &fingerprint,
+                )?
+            }
+        };
+
+        if let Some(url) = event.external_url.as_deref() {
+            tx.execute(
+                "UPDATE topics
+                    SET external_url = COALESCE(external_url, ?1), updated_at = ?2
+                  WHERE id = ?3",
+                params![url, now, topic_id],
+            )?;
+        }
+
+        let system_sender = format!("system:{}", event.source);
+        crate::memory::topic::add_participant(&tx, &topic_id, &system_sender, "observer")?;
+        match event.event_type.as_str() {
+            "issue.closed" => crate::memory::topic::update_topic_status(&tx, &topic_id, "resolved")?,
+            "issue.reopened" => crate::memory::topic::update_topic_status(&tx, &topic_id, "open")?,
+            _ => crate::memory::topic::touch_topic(&tx, &topic_id)?,
+        }
+
+        let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, claim.ingestion_key);
+        if memory_saved {
+            let memory_id = Uuid::new_v4().to_string();
+            tx.execute(
+                "INSERT INTO memories (
+                    id, key, content, category, created_at, updated_at, workspace_id,
+                    owner_id, source, channel, chat_type, chat_id, sender_id, raw_sender,
+                    topic_id, visibility, sensitivity, risk_signals, policy_version
+                 ) VALUES (
+                    ?1, ?2, ?3, 'conversation', ?4, ?4, ?5,
+                    ?6, 'webhook', 'webhook', 'dm', ?7, ?6, ?6,
+                    ?8, 'owner', 'normal', '[]', 1
+                 )
+                 ON CONFLICT(key) DO UPDATE SET
+                    content = excluded.content,
+                    updated_at = excluded.updated_at,
+                    topic_id = excluded.topic_id",
+                params![
+                    memory_id,
+                    memory_key,
+                    memory_content,
+                    event.timestamp,
+                    self.workspace_id.as_ref(),
+                    system_sender,
+                    format!("{}:{}", event.source, event.external_id),
+                    topic_id,
+                ],
+            )?;
+        }
+
+        let payload_json = serde_json::json!({
+            "source": event.source,
+            "project": event.project,
+            "external_id": event.external_id,
+            "event_type": event.event_type,
+            "topic_id": topic_id,
+            "memory_saved": memory_saved,
+        })
+        .to_string();
+        tx.execute(
+            "INSERT INTO memory_events (
+                event_id, workspace_id, event_type, subject_table, subject_id,
+                visibility, payload_json, created_at
+             ) VALUES (?1, ?2, 'webhook.event.committed', 'webhook_ingestions', ?3,
+                       'owner', ?4, ?5)",
+            params![
+                Uuid::new_v4().to_string(),
+                self.workspace_id.as_ref(),
+                claim.ingestion_key,
+                payload_json,
+                now,
+            ],
+        )?;
+
+        let updated = tx.execute(
+            "UPDATE webhook_ingestions
+                SET status = 'committed', lease_expires_at = NULL, topic_id = ?3,
+                    memory_key = ?4, last_error = NULL, updated_at = ?5
+              WHERE ingestion_key = ?1 AND generation = ?2 AND status = 'pending'
+                AND event_identity = ?6 AND request_hash = ?7",
+            params![
+                claim.ingestion_key,
+                claim.generation,
+                topic_id,
+                memory_saved.then_some(memory_key),
+                now,
+                claim.event_identity,
+                claim.request_hash,
+            ],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("webhook ingestion ownership was lost before commit");
+        }
+
+        tx.commit()?;
+        Ok(topic_id)
+    }
+
+    fn fail_blocking(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
+        let error = error.chars().take(1024).collect::<String>();
+        let now = Utc::now().to_rfc3339();
+        let conn = self.conn.lock();
+        conn.execute(
+            "UPDATE webhook_ingestions
+                SET status = 'failed', lease_expires_at = NULL, last_error = ?3, updated_at = ?4
+              WHERE ingestion_key = ?1 AND generation = ?2 AND status = 'pending'",
+            params![claim.ingestion_key, claim.generation, error, now],
+        )?;
+        Ok(())
     }
 }
 
-pub async fn run(
-    bind: &str,
-    token: &str,
-    workspace_dir: &Path,
-    acl_enabled: bool,
-    security: Arc<SecurityPolicy>,
-) -> Result<()> {
-    run_with_signing_secret(bind, token, None, workspace_dir, acl_enabled, security).await
+#[async_trait]
+impl WebhookRepository for SqliteWebhookRepository {
+    async fn claim(
+        &self,
+        ingestion_key: String,
+        event_identity: String,
+        request_hash: String,
+        event: &WebhookEvent,
+    ) -> Result<WebhookClaimOutcome> {
+        let repository = self.clone_for_worker();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || {
+            repository.claim_blocking(ingestion_key, event_identity, request_hash, &event)
+        })
+        .await
+        .context("webhook claim worker panicked")?
+    }
+
+    async fn commit(
+        &self,
+        claim: &WebhookIngestionClaim,
+        event: &WebhookEvent,
+        memory_content: &str,
+        memory_saved: bool,
+    ) -> Result<String> {
+        let repository = self.clone_for_worker();
+        let claim = claim.clone();
+        let event = event.clone();
+        let memory_content = memory_content.to_string();
+        tokio::task::spawn_blocking(move || repository.commit_blocking(&claim, &event, &memory_content, memory_saved))
+            .await
+            .context("webhook commit worker panicked")?
+    }
+
+    async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
+        let repository = self.clone_for_worker();
+        let claim = claim.clone();
+        let error = error.to_string();
+        tokio::task::spawn_blocking(move || repository.fail_blocking(&claim, &error))
+            .await
+            .context("webhook failure worker panicked")?
+    }
 }
 
-/// Run the standalone webhook server with optional HMAC signing secret.
-///
-/// When `signing_secret` is `Some`, every request must include a valid
-/// `X-Webhook-Signature` header (HMAC-SHA256 of the request body).
-pub async fn run_with_signing_secret(
+impl SqliteWebhookRepository {
+    fn clone_for_worker(&self) -> Self {
+        Self {
+            conn: Arc::clone(&self.conn),
+            workspace_id: Arc::clone(&self.workspace_id),
+        }
+    }
+}
+
+/// Run the standalone webhook receiver from the authoritative application
+/// configuration. The configured memory backend selects the durable repository;
+/// unsupported backends fail closed instead of silently writing `brain.db`.
+pub async fn run_configured(config: &Config, security: Arc<SecurityPolicy>) -> Result<()> {
+    let token = config
+        .webhook
+        .token
+        .as_deref()
+        .context("webhook.token must be configured when webhook.enabled=true")?;
+    let repository = repository_from_config(config)?;
+    run_with_repository(
+        &config.webhook.bind,
+        token,
+        config.webhook.signing_secret.as_deref(),
+        repository,
+        security,
+    )
+    .await
+}
+
+fn repository_from_config(config: &Config) -> Result<Arc<dyn WebhookRepository>> {
+    let backend_name = effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    match classify_memory_backend(&backend_name) {
+        MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid => {
+            let db_path = config.workspace_dir.join("memory").join("brain.db");
+            Ok(Arc::new(SqliteWebhookRepository::new(
+                db_path,
+                config.workspace_dir.to_string_lossy().to_string(),
+            )?))
+        }
+        _ => anyhow::bail!(
+            "standalone webhook durable ingestion does not support configured memory backend '{backend_name}'"
+        ),
+    }
+}
+
+async fn run_with_repository(
     bind: &str,
     token: &str,
     signing_secret: Option<&str>,
-    workspace_dir: &Path,
-    acl_enabled: bool,
+    repository: Arc<dyn WebhookRepository>,
     security: Arc<SecurityPolicy>,
 ) -> Result<()> {
     let trimmed_token = token.trim();
     if trimmed_token.is_empty() {
         anyhow::bail!("webhook token must not be empty when webhook is enabled");
     }
-
-    let db_path = workspace_dir.join("memory").join("brain.db");
-    ensure_memory_schema(&db_path)?;
 
     let listener = TcpListener::bind(bind)
         .await
@@ -175,15 +559,10 @@ pub async fn run_with_signing_secret(
             .map(|s| s.trim())
             .filter(|s| !s.is_empty())
             .map(|s| Arc::<str>::from(s.to_string())),
-        db_path: Arc::new(db_path),
-        acl_enabled,
+        repository,
         rate_limiter: Arc::new(WebhookRateLimiter::new(
             WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE,
             Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
-        )),
-        idempotency_store: Arc::new(IdempotencyStore::new(
-            Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
-            WEBHOOK_IDEMPOTENCY_MAX_KEYS,
         )),
         security,
     };
@@ -268,31 +647,12 @@ async fn handle_webhook_event(
         }
     };
 
-    let replay_key = headers
-        .get("X-Idempotency-Key")
-        .and_then(|value| value.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(|value| format!("header:{value}"))
-        .unwrap_or_else(|| format!("event:{}", webhook_replay_fingerprint(&event)));
-    if !state.idempotency_store.record_if_new(&replay_key).await {
-        return (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "status": "duplicate",
-                "idempotent": true,
-                "message": "Request already processed"
-            })),
-        )
-            .into_response();
-    }
-
     // ── Persist side-effect gate (FIX-P1-03) ────────────────────────────────
     // Writing a verified event into the topic store is a state mutation, so it
     // must respect autonomy: under ReadOnly the standalone webhook server must
     // not persist. Low/read-style judgement — denies only when ReadOnly (or the
-    // action budget is exhausted). Signature/idempotency checks have already
-    // passed at this point; a deny returns 403 and skips the write.
+    // action budget is exhausted). Authentication and payload validation have
+    // already passed; a deny returns 403 without claiming durable ingestion.
     let persist_op = format!("webhook:{}:persist", event.source);
     if let Err(reason) = SideEffectGate::new(state.security.as_ref()).authorize_resource_operation(
         "webhook",
@@ -308,9 +668,98 @@ async fn handle_webhook_event(
             .into_response();
     }
 
-    match persist_event(&state.db_path, &event, state.acl_enabled).await {
+    let raw_idempotency_key = match headers.get("X-Idempotency-Key") {
+        None => None,
+        Some(value) => {
+            let Ok(value) = value.to_str() else {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "X-Idempotency-Key must be valid UTF-8" })),
+                )
+                    .into_response();
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else if value.len() > WEBHOOK_MAX_IDEMPOTENCY_KEY_BYTES {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": "X-Idempotency-Key exceeds the 256-byte limit" })),
+                )
+                    .into_response();
+            } else {
+                Some(value)
+            }
+        }
+    };
+    let request_hash = webhook_request_hash(&body);
+    let event_identity = webhook_event_identity(&event, &request_hash);
+    let ingestion_key = raw_idempotency_key.map_or_else(
+        || format!("event:{event_identity}"),
+        |key| format!("header:{}", webhook_scoped_key_digest(&state.token, key)),
+    );
+    let claim = match state
+        .repository
+        .claim(ingestion_key, event_identity, request_hash, &event)
+        .await
+    {
+        Ok(WebhookClaimOutcome::Acquired(claim)) => claim,
+        Ok(WebhookClaimOutcome::Committed { topic_id }) => {
+            return (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "duplicate",
+                    "idempotent": true,
+                    "topic_id": topic_id,
+                    "message": "Request already processed"
+                })),
+            )
+                .into_response();
+        }
+        Ok(WebhookClaimOutcome::Processing) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "processing",
+                    "idempotent": true,
+                    "message": "Request is still processing"
+                })),
+            )
+                .into_response();
+        }
+        Ok(WebhookClaimOutcome::Conflict) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "status": "request_conflict",
+                    "idempotent": true,
+                    "message": "Idempotency identity was used for a different event"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::error!("failed to claim webhook ingestion: {error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "Failed to claim event" })),
+            )
+                .into_response();
+        }
+    };
+
+    let memory_content = format_event_memory(&event);
+    let memory_saved = should_store_webhook_memory(&memory_content).await;
+    match state
+        .repository
+        .commit(&claim, &event, &memory_content, memory_saved)
+        .await
+    {
         Ok(topic_id) => (StatusCode::OK, Json(serde_json::json!(WebhookAck { topic_id }))).into_response(),
         Err(error) => {
+            if let Err(fail_error) = state.repository.fail(&claim, &error.to_string()).await {
+                tracing::error!("failed to mark webhook ingestion failed: {fail_error}");
+            }
             tracing::error!("failed to persist webhook event: {error}");
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -522,134 +971,6 @@ fn normalize_openpr_event_type(raw: &str) -> String {
     format!("issue.{normalized}")
 }
 
-async fn persist_event(db_path: &Path, event: &WebhookEvent, acl_enabled: bool) -> Result<String> {
-    let topic_id = {
-        let db_path = db_path.to_path_buf();
-        let event = event.clone();
-        tokio::task::spawn_blocking(move || persist_event_topic(&db_path, &event))
-            .await
-            .context("webhook topic worker panicked")??
-    };
-
-    let system_sender = format!("system:{}", event.source);
-    let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, Uuid::new_v4());
-    let content = format_event_memory(event);
-    let memory_ctx = MemoryWriteContext {
-        channel: Some("webhook".to_string()),
-        chat_type: Some("webhook".to_string()),
-        chat_id: Some(format!("{}:{}", event.source, event.external_id)),
-        sender_id: None,
-        raw_sender: Some(system_sender),
-    };
-
-    let is_group_event = memory_ctx
-        .chat_id
-        .as_deref()
-        .is_some_and(|chat_id| chat_id.contains("group:") || chat_id.contains("@g.us"));
-    let mut memory_saved = !is_group_event && crate::memory::should_autosave_content(&content);
-    if memory_saved {
-        let memory = SqliteMemory::new_with_path_and_acl(db_path.to_path_buf(), acl_enabled)?;
-        if let Err(error) = memory
-            .store_with_context(
-                &memory_key,
-                &content,
-                MemoryCategory::Conversation,
-                None,
-                Some(&memory_ctx),
-            )
-            .await
-        {
-            if error.to_string().contains("memory safety rejected write") {
-                tracing::warn!("webhook memory autosave skipped by safety filter: {error}");
-                memory_saved = false;
-            } else {
-                return Err(error);
-            }
-        }
-    }
-
-    {
-        let db_path = db_path.to_path_buf();
-        let event = event.clone();
-        let topic_id_for_worker = topic_id.clone();
-        tokio::task::spawn_blocking(move || {
-            finalize_persisted_event(&db_path, &event, &topic_id_for_worker, memory_saved, &memory_key)
-        })
-        .await
-        .context("webhook finalization worker panicked")??;
-    }
-
-    Ok(topic_id)
-}
-
-fn persist_event_topic(db_path: &Path, event: &WebhookEvent) -> Result<String> {
-    let conn = Connection::open(db_path).with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .context("failed to configure webhook sqlite busy_timeout")?;
-
-    let topic_id = match crate::memory::topic::find_topic_by_project_and_external(
-        &conn,
-        event.project.as_deref(),
-        &event.external_id,
-    )? {
-        Some(topic) => topic.id,
-        None => {
-            let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
-            crate::memory::topic::create_topic(
-                &conn,
-                &event.title,
-                event.project.as_deref(),
-                Some(&event.external_id),
-                &fingerprint,
-            )?
-        }
-    };
-
-    if let Some(url) = event.external_url.as_deref() {
-        conn.execute(
-            "UPDATE topics
-             SET external_url = COALESCE(external_url, ?1),
-                 updated_at = ?2
-             WHERE id = ?3",
-            params![url, Utc::now().to_rfc3339(), &topic_id],
-        )?;
-    }
-
-    let system_sender = format!("system:{}", event.source);
-    crate::memory::topic::add_participant(&conn, &topic_id, &system_sender, "observer")?;
-    Ok(topic_id)
-}
-
-fn finalize_persisted_event(
-    db_path: &Path,
-    event: &WebhookEvent,
-    topic_id: &str,
-    memory_saved: bool,
-    memory_key: &str,
-) -> Result<()> {
-    let conn = Connection::open(db_path).with_context(|| format!("failed to open webhook db {}", db_path.display()))?;
-    conn.busy_timeout(Duration::from_secs(5))
-        .context("failed to configure webhook sqlite busy_timeout")?;
-
-    if memory_saved {
-        conn.execute(
-            "UPDATE memories
-             SET topic_id = ?1,
-                 created_at = ?2,
-                 updated_at = ?2
-             WHERE key = ?3",
-            params![topic_id, &event.timestamp, memory_key],
-        )?;
-    }
-
-    match event.event_type.as_str() {
-        "issue.closed" => crate::memory::topic::update_topic_status(&conn, topic_id, "resolved")?,
-        "issue.reopened" => crate::memory::topic::update_topic_status(&conn, topic_id, "open")?,
-        _ => crate::memory::topic::touch_topic(&conn, topic_id)?,
-    }
-    Ok(())
-}
-
 fn format_event_memory(event: &WebhookEvent) -> String {
     let mut lines = vec![
         format!("source: {}", event.source),
@@ -688,18 +1009,51 @@ fn webhook_topic_fingerprint(project: Option<&str>, external_id: &str, title: &s
     format!("{digest:x}")
 }
 
-fn webhook_replay_fingerprint(event: &WebhookEvent) -> String {
+fn webhook_request_hash(body: &[u8]) -> String {
+    let digest = Sha256::digest(body);
+    format!("{digest:x}")
+}
+
+fn webhook_scoped_key_digest(token: &str, raw_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(Sha256::digest(token.as_bytes()));
+    hasher.update([0]);
+    hasher.update(raw_key.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn webhook_event_identity(event: &WebhookEvent, request_hash: &str) -> String {
     let payload = format!(
-        "{}:{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}:{}",
         event.source.trim().to_lowercase(),
-        event.event_type.trim().to_lowercase(),
         event.project.as_deref().unwrap_or("_global").trim().to_lowercase(),
         event.external_id.trim().to_lowercase(),
-        event.actor.as_deref().unwrap_or_default().trim().to_lowercase(),
-        event.timestamp.trim()
+        event.event_type.trim().to_lowercase(),
+        request_hash,
     );
     let digest = Sha256::digest(payload.as_bytes());
     format!("{digest:x}")
+}
+
+async fn should_store_webhook_memory(content: &str) -> bool {
+    if !crate::memory::should_autosave_content(content) {
+        return false;
+    }
+    let safety = MemorySafetyFilter::default()
+        .check(
+            content,
+            &SourceMetadata {
+                actor: Actor::System,
+                historical_accuracy: Some(1.0),
+            },
+        )
+        .await;
+    if safety.passed {
+        true
+    } else {
+        tracing::warn!(issues = ?safety.issues, "webhook memory autosave skipped by safety filter");
+        false
+    }
 }
 
 fn ensure_memory_schema(db_path: &Path) -> Result<()> {
@@ -723,19 +1077,15 @@ mod tests {
 
     fn setup_state(tmp: &TempDir, token: &str) -> WebhookState {
         let db_path = tmp.path().join("memory").join("brain.db");
-        ensure_memory_schema(&db_path).unwrap();
+        let repository: Arc<dyn WebhookRepository> =
+            Arc::new(SqliteWebhookRepository::new(db_path, tmp.path().to_string_lossy().to_string()).unwrap());
         WebhookState {
             token: Arc::<str>::from(token.to_string()),
             signing_secret: None,
-            db_path: Arc::new(db_path),
-            acl_enabled: false,
+            repository,
             rate_limiter: Arc::new(WebhookRateLimiter::new(
                 WEBHOOK_DEFAULT_RATE_LIMIT_PER_MINUTE,
                 Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
-            )),
-            idempotency_store: Arc::new(IdempotencyStore::new(
-                Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
-                WEBHOOK_IDEMPOTENCY_MAX_KEYS,
             )),
             security: Arc::new(SecurityPolicy::default()),
         }
@@ -745,22 +1095,18 @@ mod tests {
         tmp: &TempDir,
         token: &str,
         rate_limit_per_minute: u32,
-        idempotency_max_keys: usize,
+        _idempotency_max_keys: usize,
     ) -> WebhookState {
         let db_path = tmp.path().join("memory").join("brain.db");
-        ensure_memory_schema(&db_path).unwrap();
+        let repository: Arc<dyn WebhookRepository> =
+            Arc::new(SqliteWebhookRepository::new(db_path, tmp.path().to_string_lossy().to_string()).unwrap());
         WebhookState {
             token: Arc::<str>::from(token.to_string()),
             signing_secret: None,
-            db_path: Arc::new(db_path),
-            acl_enabled: false,
+            repository,
             rate_limiter: Arc::new(WebhookRateLimiter::new(
                 rate_limit_per_minute,
                 Duration::from_secs(WEBHOOK_RATE_LIMIT_WINDOW_SECS),
-            )),
-            idempotency_store: Arc::new(IdempotencyStore::new(
-                Duration::from_secs(WEBHOOK_IDEMPOTENCY_TTL_SECS),
-                idempotency_max_keys,
             )),
             security: Arc::new(SecurityPolicy::default()),
         }
@@ -1017,6 +1363,356 @@ mod tests {
         let body2 = to_bytes(resp2.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&body2).unwrap();
         assert_eq!(parsed["status"], "duplicate");
+    }
+
+    #[tokio::test]
+    async fn committed_ingestion_replays_after_state_restart_without_duplicate_rows() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let body = json!({
+            "source": "custom",
+            "event_type": "issue.created",
+            "project": "openpr",
+            "external_id": "issue#restart-replay",
+            "title": "Restart replay",
+            "content": "durable webhook replay remains stable across repository reconstruction",
+            "timestamp": "2026-07-15T13:15:00Z"
+        })
+        .to_string();
+        let make_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .header("X-Idempotency-Key", "restart-replay-key")
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+
+        let first = router(setup_state(&tmp, "secret"))
+            .oneshot(make_request())
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let replay = router(setup_state(&tmp, "secret"))
+            .oneshot(make_request())
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::OK);
+        let replay_body = to_bytes(replay.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&replay_body).unwrap();
+        assert_eq!(parsed["status"], "duplicate");
+        assert!(parsed["topic_id"].as_str().is_some());
+
+        let conn = Connection::open(db_path).unwrap();
+        let ingestion_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM webhook_ingestions WHERE external_id = 'issue#restart-replay'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key LIKE 'webhook:custom:issue#restart-replay:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events
+                  WHERE event_type = 'webhook.event.committed'
+                    AND subject_table = 'webhook_ingestions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored_key: String = conn
+            .query_row(
+                "SELECT ingestion_key FROM webhook_ingestions WHERE external_id = 'issue#restart-replay'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(ingestion_count, 1);
+        assert_eq!(memory_count, 1);
+        assert_eq!(outbox_count, 1);
+        assert!(!stored_key.contains("restart-replay-key"));
+    }
+
+    #[tokio::test]
+    async fn same_idempotency_key_with_different_body_conflicts() {
+        let tmp = TempDir::new().unwrap();
+        let app = router(setup_state(&tmp, "secret"));
+        let make_request = |title: &str| {
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .header("X-Idempotency-Key", "body-bound-key")
+                .body(Body::from(
+                    json!({
+                        "source": "custom",
+                        "event_type": "issue.created",
+                        "external_id": "issue#body-bound",
+                        "title": title,
+                        "content": "same external identity with a different request body",
+                        "timestamp": "2026-07-15T13:20:00Z"
+                    })
+                    .to_string(),
+                ))
+                .unwrap()
+        };
+
+        let first = app.clone().oneshot(make_request("first body")).await.unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let conflict = app.oneshot(make_request("second body")).await.unwrap();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let conflict_body = to_bytes(conflict.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&conflict_body).unwrap();
+        assert_eq!(parsed["status"], "request_conflict");
+    }
+
+    #[tokio::test]
+    async fn pending_ingestion_reports_processing_and_expired_lease_is_reclaimed() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let repository =
+            SqliteWebhookRepository::new(db_path.clone(), tmp.path().to_string_lossy().to_string()).unwrap();
+        let event = WebhookEvent {
+            source: "custom".to_string(),
+            event_type: "issue.created".to_string(),
+            project: Some("openpr".to_string()),
+            external_id: "issue#pending".to_string(),
+            external_url: None,
+            title: "Pending lease".to_string(),
+            content: "pending request recovery".to_string(),
+            actor: None,
+            timestamp: "2026-07-15T13:25:00Z".to_string(),
+        };
+        let request_hash = webhook_request_hash(b"pending-body");
+        let event_identity = webhook_event_identity(&event, &request_hash);
+        let first = repository
+            .claim(
+                "event:pending".to_string(),
+                event_identity.clone(),
+                request_hash.clone(),
+                &event,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(first, WebhookClaimOutcome::Acquired(_)));
+
+        let processing = repository
+            .claim(
+                "event:pending".to_string(),
+                event_identity.clone(),
+                request_hash.clone(),
+                &event,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(processing, WebhookClaimOutcome::Processing));
+
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute(
+            "UPDATE webhook_ingestions SET lease_expires_at = 0 WHERE ingestion_key = 'event:pending'",
+            [],
+        )
+        .unwrap();
+        let reclaimed = repository
+            .claim("event:pending".to_string(), event_identity, request_hash, &event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            reclaimed,
+            WebhookClaimOutcome::Acquired(WebhookIngestionClaim { generation: 2, .. })
+        ));
+    }
+
+    #[test]
+    fn configured_non_sqlite_webhook_backend_fails_closed() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.memory.backend = "markdown".to_string();
+        config.webhook.enabled = true;
+        config.webhook.token = Some("receiver-token".to_string());
+
+        let result = repository_from_config(&config);
+        assert!(result.is_err(), "markdown webhook repository must fail closed");
+        let error = result.err().map_or_else(String::new, |error| error.to_string());
+        assert!(error.contains("does not support configured memory backend 'markdown'"));
+        let validation_error = config
+            .validate()
+            .err()
+            .map_or_else(String::new, |error| error.to_string());
+        assert!(validation_error.contains("requires memory backend 'sqlite' or 'lucid'"));
+    }
+
+    #[tokio::test]
+    async fn configured_signing_secret_requires_valid_hmac() {
+        let tmp = TempDir::new().unwrap();
+        let mut state = setup_state(&tmp, "secret");
+        state.signing_secret = Some(Arc::from("signing-secret"));
+        let app = router(state);
+        let body = json!({
+            "source": "custom",
+            "event_type": "issue.created",
+            "external_id": "issue#signed",
+            "title": "Signed event",
+            "content": "valid HMAC permits durable standalone webhook ingestion",
+            "timestamp": "2026-07-15T13:30:00Z"
+        })
+        .to_string();
+
+        let missing = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .body(Body::from(body.clone()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        use hmac::{Hmac, Mac};
+        let mut mac = Hmac::<sha2::Sha256>::new_from_slice(b"signing-secret").unwrap();
+        mac.update(body.as_bytes());
+        let signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+        let signed = Request::builder()
+            .method("POST")
+            .uri("/webhook/events")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer secret")
+            .header("X-Webhook-Signature", signature)
+            .body(Body::from(body))
+            .unwrap();
+        assert_eq!(app.oneshot(signed).await.unwrap().status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn failed_ingestion_rolls_back_all_state_and_same_key_retries() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("memory").join("brain.db");
+        let app = router(setup_state(&tmp, "secret"));
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_webhook_memory_insert
+             BEFORE INSERT ON memories
+             WHEN NEW.key LIKE 'webhook:%'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected webhook memory failure');
+             END;",
+        )
+        .unwrap();
+
+        let body = json!({
+            "source": "custom",
+            "event_type": "issue.created",
+            "project": "openpr",
+            "external_id": "issue#transaction-retry",
+            "title": "Transactional retry",
+            "content": "this content is long enough to exercise webhook memory persistence",
+            "actor": "project_bot",
+            "timestamp": "2026-07-15T13:00:00Z"
+        })
+        .to_string();
+        let make_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/webhook/events")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer secret")
+                .header("X-Idempotency-Key", "transaction-retry-key")
+                .body(Body::from(body.clone()))
+                .unwrap()
+        };
+
+        let failed = app.clone().oneshot(make_request()).await.unwrap();
+        assert_eq!(failed.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#transaction-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let participant_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                   FROM topic_participants tp
+                   JOIN topics t ON t.id = tp.topic_id
+                  WHERE t.external_id = 'issue#transaction-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let memory_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key LIKE 'webhook:custom:issue#transaction-retry:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(topic_count, 0, "failed ingestion must not strand a topic");
+        assert_eq!(participant_count, 0, "failed ingestion must not strand a participant");
+        assert_eq!(memory_count, 0, "failed ingestion must not strand memory");
+
+        let failed_status: String = conn
+            .query_row(
+                "SELECT status FROM webhook_ingestions WHERE external_id = 'issue#transaction-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(failed_status, "failed");
+
+        conn.execute_batch("DROP TRIGGER fail_webhook_memory_insert;").unwrap();
+        let retry = app.oneshot(make_request()).await.unwrap();
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let committed_status: String = conn
+            .query_row(
+                "SELECT status FROM webhook_ingestions WHERE external_id = 'issue#transaction-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_status, "committed");
+        let committed_topic_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM topics WHERE external_id = 'issue#transaction-retry'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let committed_memory_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE key LIKE 'webhook:custom:issue#transaction-retry:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events
+                  WHERE event_type = 'webhook.event.committed'
+                    AND subject_table = 'webhook_ingestions'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(committed_topic_count, 1);
+        assert_eq!(committed_memory_count, 1);
+        assert_eq!(outbox_count, 1);
     }
 
     #[tokio::test]

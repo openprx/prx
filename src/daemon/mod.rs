@@ -222,21 +222,10 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             move || {
                 let cfg = webhook_cfg.clone();
                 async move {
-                    let token =
-                        cfg.webhook.token.as_deref().ok_or_else(|| {
-                            anyhow::anyhow!("webhook.token must be configured when webhook.enabled=true")
-                        })?;
                     // FIX-P1-03: pass the security policy so the standalone webhook
                     // server gates topic-store persistence on autonomy (ReadOnly = no write).
                     let webhook_security = crate::runtime::bootstrap::build_security_policy(&cfg);
-                    crate::webhook::run(
-                        &cfg.webhook.bind,
-                        token,
-                        &cfg.workspace_dir,
-                        cfg.memory.acl_enabled,
-                        webhook_security,
-                    )
-                    .await
+                    crate::webhook::run_configured(&cfg, webhook_security).await
                 }
             },
         ));

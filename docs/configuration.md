@@ -43,6 +43,15 @@ auto_promote_user_messages = true
 auto_promote_assistant_messages = false
 min_chars = 30
 
+# Optional standalone external-event receiver. Durable topic, participant,
+# memory, ingestion-state, and outbox writes use one SQLite transaction.
+[webhook]
+enabled = false
+bind = "127.0.0.1:16899"
+token = "replace-with-a-secret-token"
+# When set, requests must also send X-Webhook-Signature: sha256=<HMAC hex>.
+signing_secret = "replace-with-a-separate-hmac-secret"
+
 [channels_config.signal]
 enabled = true
 account = "+1234567890"
@@ -123,6 +132,20 @@ PRX treats `chat`, `agent`, `gateway`, `channel`, `delegate`, and `sessions_spaw
 `[memory.semantic]` controls promotion from event/message content into durable semantic memory. Assistant promotion is disabled by default to reduce noisy self-generated memory.
 
 For `sessions_spawn`, `task` runs an in-process sub-agent and `process` launches a worker process. Process mode uses a manifest with `memory_strategy`, `shared_memory_db_path`, and `worker_memory_db_path`; the default `shared_fabric` strategy writes worker events into the parent workspace fabric while still keeping the execution boundary explicit. Set `[sessions_spawn].process_memory_strategy = "isolated_private"` for a private worker DB. `hybrid` is fail-closed because no production merge consumer or merge/reject/ack/cleanup protocol exists; use `shared_fabric` or `isolated_private` instead.
+
+## Standalone Webhook Ingestion
+
+`[webhook]` is the authenticated external-event receiver used to synchronize
+topics. `token` is always required when enabled. `signing_secret` is optional;
+when configured, bearer/token authentication and a valid HMAC-SHA256
+`X-Webhook-Signature` are both required.
+
+Durable ingestion currently supports configured `sqlite` and `lucid` memory
+backends. Other configured backends fail startup explicitly instead of silently
+writing a separate local `brain.db`. SQLite/Lucid ingestion persists a durable
+pending/committed/failed state and atomically commits the topic, participant,
+eligible memory, and memory-fabric outbox row. Failed or expired pending attempts
+can be retried with the same idempotency identity.
 
 ## Agent Concurrency Env Overrides
 

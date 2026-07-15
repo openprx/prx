@@ -1884,6 +1884,9 @@ pub struct MemoryWebhookConfig {
     /// Required bearer token for incoming webhook events.
     #[serde(default)]
     pub token: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `X-Webhook-Signature` verification.
+    #[serde(default)]
+    pub signing_secret: Option<String>,
 }
 
 fn default_memory_webhook_bind() -> String {
@@ -1896,6 +1899,7 @@ impl Default for MemoryWebhookConfig {
             enabled: false,
             bind: default_memory_webhook_bind(),
             token: None,
+            signing_secret: None,
         }
     }
 }
@@ -5806,6 +5810,22 @@ impl Config {
             {
                 anyhow::bail!("webhook.token must be set when webhook.enabled is true");
             }
+            let webhook_backend = self
+                .storage
+                .provider
+                .config
+                .provider
+                .trim()
+                .is_empty()
+                .then_some(self.memory.backend.as_str())
+                .unwrap_or(self.storage.provider.config.provider.as_str())
+                .trim()
+                .to_ascii_lowercase();
+            if !matches!(webhook_backend.as_str(), "sqlite" | "lucid") {
+                anyhow::bail!(
+                    "standalone webhook durable ingestion requires memory backend 'sqlite' or 'lucid' (got '{webhook_backend}')"
+                );
+            }
         }
 
         // Autonomy
@@ -7732,6 +7752,31 @@ default_temperature = 0.7
             !parsed.gateway.allow_public_bind,
             "Missing [gateway] must default to allow_public_bind=false"
         );
+    }
+
+    #[test]
+    async fn memory_webhook_config_signing_secret_roundtrip() {
+        let config: MemoryWebhookConfig = toml::from_str(
+            r#"
+enabled = true
+bind = "127.0.0.1:16899"
+token = "receiver-token"
+signing_secret = "hmac-secret"
+"#,
+        )
+        .unwrap();
+        assert!(config.enabled);
+        assert_eq!(config.token.as_deref(), Some("receiver-token"));
+        assert_eq!(config.signing_secret.as_deref(), Some("hmac-secret"));
+
+        let legacy: MemoryWebhookConfig = toml::from_str(
+            r#"
+enabled = false
+bind = "127.0.0.1:16899"
+"#,
+        )
+        .unwrap();
+        assert!(legacy.signing_secret.is_none());
     }
 
     #[test]
