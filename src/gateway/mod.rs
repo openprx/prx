@@ -2640,7 +2640,7 @@ mod tests {
         let state = authz_test_state(Config::default());
         assert!(
             authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low).is_ok(),
-            "default (Supervised) autonomy should allow a low-risk core gateway mutation"
+            "default autonomous policy should allow a low-risk core gateway mutation"
         );
 
         let read_only = Config {

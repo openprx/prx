@@ -781,7 +781,7 @@ fn security_template(spec: Spec) -> String {
 # level (read_only | supervised | full) drives the unified decision point.
 
 [autonomy]
-level = "supervised"
+level = "full"
 workspace_only = true
 # Behavior-limits Phase 1: rate/cost caps opened to u32::MAX (high-position
 # billing/runaway safeguards). NOTE: 0 means "blocked", NOT "unlimited".
@@ -1597,6 +1597,14 @@ mod tests {
         // template; the autonomy level + sandbox section are now the permission knobs.
         assert!(content.contains("[autonomy.sandbox]"));
         assert!(content.contains("enabled = false"));
+    }
+
+    #[test]
+    fn server_security_template_defaults_to_autonomous_with_workspace_boundary() {
+        let content = security_template(Spec::Server);
+        assert!(content.contains("level = \"full\""));
+        assert!(content.contains("workspace_only = true"));
+        assert!(!content.contains("level = \"supervised\""));
     }
 
     #[test]

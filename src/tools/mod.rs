@@ -74,7 +74,7 @@ pub use execution::{
     SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolCatalog,
     ToolDescriptor, ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand,
     ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionService, ToolExecutionStatus,
-    ToolSandboxPermit, ToolSandboxStrategy, TracingToolExecutionAudit,
+    ToolSandboxPermit, ToolSandboxStrategy, TracingToolExecutionAudit, decide_tool_execution,
 };
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;

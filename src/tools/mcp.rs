@@ -1193,13 +1193,16 @@ mod tests {
 
     // ── SideEffectGate coverage (design d03 / P0-C, largest un-gated surface) ──
 
-    /// Default (Supervised) policy: a *matching* runtime grant lets a High-risk
+    /// Explicit Supervised policy: a *matching* runtime grant lets a High-risk
     /// `mcp:call` traverse the gate (Phase 1: no separate high-risk hard-block).
     fn mcp_gate_security() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::default())
+        Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })
     }
 
-    /// Under the default Supervised policy, an MCP `call` without a runtime
+    /// Under an explicit Supervised policy, an MCP `call` without a runtime
     /// approval grant must be denied by the gate before reaching the server.
     #[tokio::test]
     async fn call_denied_without_grant() {
@@ -1222,11 +1225,7 @@ mod tests {
     /// because the server does not exist, but never with a gate denial).
     #[tokio::test]
     async fn call_allowed_through_gate_with_grant() {
-        let tool = McpTool::new(
-            Arc::new(SecurityPolicy::default()),
-            McpConfig::default(),
-            std::env::temp_dir(),
-        );
+        let tool = McpTool::new(mcp_gate_security(), McpConfig::default(), std::env::temp_dir());
         let op = op_id::op_id(MCP_ROOT_NAME, "call", &["srv", "act"]);
         let result = tool
             .execute(json!({
@@ -1320,8 +1319,8 @@ mod tests {
         cfg.enabled = false;
         // The SideEffectGate now precedes the downstream call. To reach the
         // "disabled/not found" path we must pass the High-risk gate first by
-        // presenting a matching runtime grant (Phase 1: default Supervised policy).
-        let security = Arc::new(SecurityPolicy::default());
+        // presenting a matching runtime grant under explicit Supervised policy.
+        let security = mcp_gate_security();
         let tool = McpTool::new(security, cfg, std::env::temp_dir());
         let op = op_id::op_id(MCP_ROOT_NAME, "call", &["s", "t"]);
         let result = tool

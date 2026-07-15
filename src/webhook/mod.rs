@@ -2278,7 +2278,7 @@ mod tests {
 
     #[tokio::test]
     async fn supervised_autonomy_allows_persist() {
-        // Sanity counterpart to the ReadOnly test: default (Supervised) policy
+        // Sanity counterpart to the ReadOnly test: default autonomous policy
         // permits a Low-risk persist, proving the gate is not over-blocking.
         let tmp = TempDir::new().unwrap();
         let db_path = tmp.path().join("memory").join("brain.db");

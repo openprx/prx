@@ -538,7 +538,12 @@ mod tests {
         };
         cfg.save().await.unwrap();
         let shared = new_shared(cfg.clone());
-        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]);
+        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(
+            SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            },
+        ));
 
         let result = tool
             .execute(json!({
@@ -593,7 +598,12 @@ mod tests {
         };
         cfg.save().await.unwrap();
         let shared = new_shared(cfg);
-        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]);
+        let tool = GatewayTool::new(shared, "anthropic", "claude-sonnet-4-6", vec![]).with_security(Arc::new(
+            SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            },
+        ));
 
         let result = tool
             .execute(json!({

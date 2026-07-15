@@ -281,16 +281,31 @@ impl SecurityEffectPolicy {
 
 impl EffectPolicy for SecurityEffectPolicy {
     fn decide(&self, descriptor: &ToolDescriptor, context: &ToolExecutionContext) -> ToolExecutionDecision {
-        match self.policy.decide(
+        decide_tool_execution(
+            self.policy.as_ref(),
             &descriptor.public_name,
             context.sender(),
             context.channel(),
             &context.chat_type,
-        ) {
-            ToolDecision::Allow => ToolExecutionDecision::Allow,
-            ToolDecision::Ask => ToolExecutionDecision::Ask,
-            ToolDecision::Deny => ToolExecutionDecision::Deny,
-        }
+        )
+    }
+}
+
+/// Canonical autonomy/scope decision projection used by both the legacy Agent
+/// loop and [`ToolExecutionService`]. Approval UI and execution are downstream;
+/// neither entry point may reinterpret the policy result.
+#[must_use]
+pub fn decide_tool_execution(
+    policy: &SecurityPolicy,
+    tool_name: &str,
+    sender: &str,
+    channel: &str,
+    chat_type: &str,
+) -> ToolExecutionDecision {
+    match policy.decide(tool_name, sender, channel, chat_type) {
+        ToolDecision::Allow => ToolExecutionDecision::Allow,
+        ToolDecision::Ask => ToolExecutionDecision::Ask,
+        ToolDecision::Deny => ToolExecutionDecision::Deny,
     }
 }
 
@@ -1542,6 +1557,26 @@ mod tests {
             }))
         };
 
+        let assert_projection = |autonomy, name, expected| {
+            let policy = SecurityPolicy {
+                autonomy,
+                ..SecurityPolicy::default()
+            };
+            assert_eq!(
+                decide_tool_execution(&policy, name, "alice", "terminal", "dm"),
+                expected
+            );
+            assert_eq!(
+                SecurityEffectPolicy::new(Arc::new(policy)).decide(&descriptor(name), &context()),
+                expected
+            );
+        };
+
+        assert_projection(AutonomyLevel::ReadOnly, "file_read", ToolExecutionDecision::Allow);
+        assert_projection(AutonomyLevel::ReadOnly, "native_write", ToolExecutionDecision::Deny);
+        assert_projection(AutonomyLevel::Supervised, "native_write", ToolExecutionDecision::Ask);
+        assert_projection(AutonomyLevel::Full, "native_write", ToolExecutionDecision::Allow);
+
         assert_eq!(
             policy(AutonomyLevel::ReadOnly).decide(&descriptor("file_read"), &context()),
             ToolExecutionDecision::Allow
@@ -1558,6 +1593,48 @@ mod tests {
             policy(AutonomyLevel::Full).decide(&descriptor("native_write"), &context()),
             ToolExecutionDecision::Allow
         );
+    }
+
+    #[tokio::test]
+    async fn default_full_policy_executes_ready_tool_without_prompt_and_keeps_typed_audit() {
+        let fixture = fixture();
+        let tool = RecordingTool {
+            root_name: "native_write",
+            aliases: Vec::new(),
+            calls: Arc::clone(&fixture.calls),
+            arguments: Arc::clone(&fixture.arguments),
+            stages: Arc::clone(&fixture.stages),
+        };
+        let service = ToolExecutionService::new(
+            vec![Arc::new(tool)],
+            Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy::default()))),
+            Arc::new(DenyApprovalStrategy),
+            Arc::new(RecordingSandbox {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
+        );
+
+        let outcome = service
+            .execute(
+                ToolExecutionCommand::new("native_write", serde_json::json!({"value":"ok"})),
+                context(),
+                None,
+            )
+            .await;
+
+        assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(outcome.decision, Some(ToolExecutionDecision::Allow));
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+        let records = fixture.records.lock();
+        let record = records.first().expect("typed audit record");
+        assert_eq!(record.decision, Some(ToolExecutionDecision::Allow));
+        assert_eq!(record.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(record.effect, Some(ToolEffect::Act));
     }
 
     struct HangingTool;

@@ -4296,9 +4296,9 @@ fn is_read_only_tool_name(name: &str) -> bool {
 fn decide_tool_call(
     call: &ParsedToolCall,
     scope_ctx: Option<&ScopeContext<'_>>,
-) -> crate::security::policy::ToolDecision {
-    scope_ctx.map_or(crate::security::policy::ToolDecision::Allow, |ctx| {
-        ctx.policy.decide(&call.name, ctx.sender, ctx.channel, ctx.chat_type)
+) -> crate::tools::ToolExecutionDecision {
+    scope_ctx.map_or(crate::tools::ToolExecutionDecision::Allow, |ctx| {
+        crate::tools::decide_tool_execution(ctx.policy, &call.name, ctx.sender, ctx.channel, ctx.chat_type)
     })
 }
 
@@ -4308,7 +4308,7 @@ fn decide_tool_call(
 /// unattended read-only fast path. When no scope context is present the call is
 /// not gated (matches [`decide_tool_call`] returning `Allow`).
 fn requires_approval(call: &ParsedToolCall, scope_ctx: Option<&ScopeContext<'_>>) -> bool {
-    decide_tool_call(call, scope_ctx) == crate::security::policy::ToolDecision::Ask
+    decide_tool_call(call, scope_ctx) == crate::tools::ToolExecutionDecision::Ask
 }
 
 /// Denial message returned to the model when [`decide_tool_call`] yields `Deny`.
@@ -4331,15 +4331,15 @@ async fn execute_tool_call_serial(
     approval_resolver: Option<&Arc<dyn ApprovalResolver>>,
 ) -> Result<String> {
     // Permission-model Phase 1: single unified decision point.
-    use crate::security::policy::ToolDecision;
+    use crate::tools::ToolExecutionDecision;
     let decision = decide_tool_call(call, scope_ctx);
-    if decision == ToolDecision::Deny {
+    if decision == ToolExecutionDecision::Deny {
         return Ok(scope_denial_message(call));
     }
 
     // `Ask` routes through the approval flow (manager + grant). `Allow` falls
     // through to direct execution below.
-    if decision == ToolDecision::Ask {
+    if decision == ToolExecutionDecision::Ask {
         // P0 fail-closed: `decide` demands approval but no `ApprovalManager` is
         // wired to satisfy it (non-CLI channel / session-worker / gateway paths
         // that pass `approval = None` while carrying a scope under supervised
@@ -4462,7 +4462,7 @@ async fn execute_read_only_batch(
         .map(|(idx, call)| async move {
             // Read-only batch: only a scope/autonomy `Deny` blocks. Read-only
             // tools never yield `Ask`, so `Allow`/`Ask` both proceed here.
-            if decide_tool_call(&call, scope_ctx) == crate::security::policy::ToolDecision::Deny {
+            if decide_tool_call(&call, scope_ctx) == crate::tools::ToolExecutionDecision::Deny {
                 return Ok((idx, scope_denial_message(&call)));
             }
 
@@ -4844,8 +4844,8 @@ pub(crate) enum ApprovalDecision {
 /// channels / gateway keep `None`.
 #[async_trait::async_trait]
 pub(crate) trait ApprovalResolver: Send + Sync {
-    /// Resolve an approval decision for a tool call that
-    /// [`ApprovalManager::needs_approval`] flagged.
+    /// Resolve an approval decision for a tool call after the authoritative
+    /// `SecurityPolicy::decide` returned `Ask`.
     ///
     /// Implementations may await an external decision (e.g. a UI card). The
     /// returned [`ApprovalDecision`] determines whether the call proceeds, is
@@ -6074,7 +6074,7 @@ pub async fn run(
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+    let approval_manager = ApprovalManager::new();
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -8184,11 +8184,7 @@ mod tests {
             )),
         ];
 
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::new();
 
         let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool calls")];
         let observer = NoopObserver;
@@ -8363,11 +8359,7 @@ mod tests {
             )),
         ];
 
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Full,
-            ..crate::config::AutonomyConfig::default()
-        };
-        let approval_mgr = ApprovalManager::from_config(&approval_cfg);
+        let approval_mgr = ApprovalManager::new();
 
         let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool calls")];
         let observer = NoopObserver;
@@ -8543,6 +8535,58 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn default_full_policy_executes_installed_act_tool_without_approval_manager() {
+        let execution_order = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(RecordingTool {
+            name: "delegate".to_string(),
+            execution_order: Arc::clone(&execution_order),
+        })];
+        let policy = crate::security::SecurityPolicy::default();
+        let scope_ctx = ScopeContext {
+            policy: &policy,
+            sender: "user@example.com",
+            channel: "telegram",
+            chat_type: "private",
+            chat_id: "chat-1",
+            owner_id: None,
+            topic_id: None,
+            task_id: None,
+            source_message_event_id: None,
+        };
+        let call = ParsedToolCall {
+            name: "delegate".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            decide_tool_call(&call, Some(&scope_ctx)),
+            crate::tools::ToolExecutionDecision::Allow
+        );
+        let result = execute_tool_call_serial(
+            &call,
+            &tools_registry,
+            &NoopObserver,
+            None,
+            "telegram",
+            None,
+            Some(&scope_ctx),
+            ChatMode::default(),
+            None,
+        )
+        .await
+        .expect("default autonomous execution");
+
+        assert_eq!(result, "delegate");
+        assert_eq!(
+            execution_order
+                .lock()
+                .expect("execution order lock should be valid")
+                .as_slice(),
+            ["delegate"]
+        );
+    }
+
     /// Companion to the fail-closed test: under the SAME conditions (supervised,
     /// scope present, no `ApprovalManager`) a genuinely read-only tool resolves
     /// to `Allow` and still executes — the fix denies side effects without
@@ -8629,7 +8673,7 @@ mod tests {
         };
 
         // Seed the session "Always" allowlist for `delegate`.
-        let mgr = ApprovalManager::from_autonomy_level(crate::security::AutonomyLevel::Supervised);
+        let mgr = ApprovalManager::new();
         mgr.record_decision("delegate", &serde_json::json!({}), ApprovalResponse::Always, "telegram");
         assert!(mgr.is_session_allowlisted("delegate"));
 

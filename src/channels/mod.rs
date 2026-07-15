@@ -8610,7 +8610,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    /// FIX-P0-10/11/12: under the default Supervised autonomy the inbound gate
+    /// FIX-P0-10/11/12: under explicit Supervised autonomy the inbound gate
     /// must let normal traffic through — `append_conversation_turn` runs for the
     /// inbound user turn (and at least one reply is appended), proving the gate
     /// does not falsely reject low-risk inbound messages.
@@ -9289,7 +9289,7 @@ BTC is currently around $65,000 based on latest tool output."#
         let security: Arc<arc_swap::ArcSwap<SecurityGen>> = Arc::new(arc_swap::ArcSwap::new(make_gen(
             crate::security::AutonomyLevel::Supervised,
         )));
-        // Before: default Supervised generation allows the tool in scope.
+        // Before: the explicit Supervised generation allows the tool in scope.
         assert!(
             security
                 .load_full()
@@ -9328,7 +9328,7 @@ BTC is currently around $65,000 based on latest tool output."#
             crate::security::AutonomyLevel::Supervised,
         )));
 
-        // Before: the default Supervised generation's unified decision allows
+        // Before: the explicit Supervised generation's unified decision allows
         // (scope allows; Supervised would Ask for a side-effecting tool, but a
         // read-only tool is Allow) — assert the read-only tool is allowed.
         assert_eq!(
@@ -9352,7 +9352,7 @@ BTC is currently around $65,000 based on latest tool output."#
             "after storing a deny-by-default scope generation, the unified decision must be Deny"
         );
         // The autonomy half came from the SAME stored generation (coherent gen):
-        // from_config(default) keeps Supervised, proving policy and scope ACL
+        // The configured policy keeps Supervised, proving policy and scope ACL
         // travel together in one SecurityGen.
         assert_eq!(
             live.security.autonomy,

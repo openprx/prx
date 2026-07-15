@@ -2921,7 +2921,7 @@ async fn run_sub_agent_task(
             // suspend.
             let approval_manager = approval_resolver_iter
                 .as_ref()
-                .map(|_| crate::approval::ApprovalManager::from_autonomy_level(security.autonomy));
+                .map(|_| crate::approval::ApprovalManager::new());
             let loop_outcome = crate::agent::loop_::run_tool_call_loop_outcome(
                 provider_instance.as_ref(),
                 &mut task_history,
@@ -4204,12 +4204,26 @@ mod tests {
     }
 
     fn make_tool(channel: Arc<dyn Channel>, provider: Arc<dyn crate::providers::Provider>) -> SessionsSpawnTool {
-        make_tool_with_spawn_config(channel, provider, crate::config::SessionsSpawnConfig::default())
+        make_tool_with_security_and_spawn_config(
+            channel,
+            provider,
+            test_security(),
+            crate::config::SessionsSpawnConfig::default(),
+        )
     }
 
     fn make_tool_with_spawn_config(
         channel: Arc<dyn Channel>,
         provider: Arc<dyn crate::providers::Provider>,
+        spawn_config: crate::config::SessionsSpawnConfig,
+    ) -> SessionsSpawnTool {
+        make_tool_with_security_and_spawn_config(channel, provider, test_security(), spawn_config)
+    }
+
+    fn make_tool_with_security_and_spawn_config(
+        channel: Arc<dyn Channel>,
+        provider: Arc<dyn crate::providers::Provider>,
+        security: Arc<SecurityPolicy>,
         spawn_config: crate::config::SessionsSpawnConfig,
     ) -> SessionsSpawnTool {
         SessionsSpawnTool::new(
@@ -4218,7 +4232,7 @@ mod tests {
             "test-provider",
             "test-model",
             0.7,
-            test_security(),
+            security,
             std::path::PathBuf::from("/tmp"),
             crate::config::MultimodalConfig::default(),
             crate::config::AgentCompactionConfig::default(),
@@ -4325,7 +4339,7 @@ mod tests {
     }
 
     /// FIX-P0-37: spawning is now a Medium-risk side effect, which requires an
-    /// approval grant under the default (supervised) autonomy. Tests that drive
+    /// approval grant under explicit supervised autonomy. Tests that drive
     /// the real `spawn` path must inject a matching grant — mirroring how the
     /// production agent loop issues one after operator approval. The operation
     /// name MUST equal the one the gate authorizes (`sessions_spawn:spawn`).
@@ -4782,17 +4796,22 @@ mod tests {
         );
     }
 
-    /// FIX-P0-37: spawning is a Medium-risk side effect. Under the default
-    /// (supervised) autonomy and with NO approval grant supplied, the gate must
+    /// FIX-P0-37: spawning is a Medium-risk side effect. Under explicit
+    /// Supervised autonomy and with NO approval grant supplied, the gate must
     /// deny the spawn outright — no run is registered and no announcement fires.
     #[tokio::test]
     async fn spawn_denied_without_grant_under_supervised() {
         let (ch, sent) = RecordingChannel::new();
-        let tool = make_tool(
+        let tool = make_tool_with_security_and_spawn_config(
             Arc::new(ch),
             Arc::new(EchoProvider {
                 response: "should never run".into(),
             }),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            crate::config::SessionsSpawnConfig::default(),
         );
         tool.set_default_recipient(Some("test-recipient".to_string())).await;
 

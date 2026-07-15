@@ -99,7 +99,7 @@ fn authz_low_risk_mutation(shared: &openprx::config::SharedConfig, workspace: &s
 /// T3: watcher → SharedConfig → gateway authorization end-to-end.
 ///
 /// 1. Write a Supervised `config.toml` to a temp directory (full serialization).
-/// 2. Seed SharedConfig with `Config::default()` (Supervised) and wire
+/// 2. Seed SharedConfig with an explicit Supervised config and wire
 ///    `HotReloadManager::spawn` to it — exactly as `daemon/mod.rs` does.
 /// 3. **Pre-reload**: assert the authorization helper **allows** a low-risk mutation.
 /// 4. Overwrite `config.toml` with a ReadOnly config (full serialization).
@@ -110,11 +110,11 @@ fn authz_low_risk_mutation(shared: &openprx::config::SharedConfig, workspace: &s
 /// This proves: file write → `notify` event → HotReloadManager.try_reload() →
 /// SharedConfig.store() → authz reads new policy — the complete "断链 1" chain.
 ///
-/// # Why SharedConfig is seeded with Config::default() rather than from the file
+/// # Why SharedConfig is seeded explicitly rather than loaded from the file
 ///
 /// `Config::load_from_path` is `pub(crate)`, unavailable to integration tests.
-/// `Config::default()` has `autonomy.level = Supervised` by construction, which is
-/// what the Supervised TOML also produces — so the pre-reload baseline is correct.
+/// The test overrides the product's autonomous default to Supervised so the
+/// pre-reload baseline exactly matches the serialized test file.
 /// The watcher internally calls the crate-private loader on every reload event, so
 /// the watcher→SharedConfig leg is fully production-code-exercised.
 #[test]
@@ -158,12 +158,12 @@ fn watcher_shared_config_gateway_authz_e2e() {
     //   let _hot_reload = HotReloadManager::spawn(config.config_path.clone(), Arc::clone(&shared_config));
     //   // shared_config injected into gateway supervisor
     //
-    // We replicate this minimal wiring with Config::default() as the initial seed.
-    let initial = Config::default();
+    // We replicate this minimal wiring with the same explicit Supervised seed.
+    let initial = supervised_cfg.clone();
     assert_eq!(
         initial.autonomy.level,
         AutonomyLevel::Supervised,
-        "sanity: Config::default() must be Supervised — T3 pre-reload baseline"
+        "sanity: explicit T3 pre-reload baseline must be Supervised"
     );
     let shared = new_shared(initial);
 
@@ -275,13 +275,19 @@ fn shared_config_direct_store_authz_flip() {
     let workspace = tmp.path().join("workspace");
     std::fs::create_dir_all(&workspace).expect("test: create workspace");
 
-    let supervised = Config::default(); // autonomy is Supervised by default
+    let supervised = Config {
+        autonomy: openprx::config::AutonomyConfig {
+            level: AutonomyLevel::Supervised,
+            ..openprx::config::AutonomyConfig::default()
+        },
+        ..Config::default()
+    };
     let shared = new_shared(supervised);
 
     assert_eq!(
         shared.load_full().autonomy.level,
         AutonomyLevel::Supervised,
-        "sanity: Config::default() must be Supervised"
+        "sanity: explicit baseline must be Supervised"
     );
 
     // Pre-store: allowed

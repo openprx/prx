@@ -472,7 +472,13 @@ mod tests {
     async fn kill_running_marks_failed() {
         let run = make_run("run-1", SubAgentStatus::Running);
         let runs = Arc::new(RwLock::new(vec![run]));
-        let tool = SubagentsTool::new(runs.clone());
+        let tool = SubagentsTool::with_security(
+            runs.clone(),
+            Arc::new(crate::security::SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..crate::security::SecurityPolicy::default()
+            }),
+        );
 
         let result = tool
             .execute(json!({
@@ -630,7 +636,13 @@ mod tests {
     async fn kill_running_requires_resource_grant() {
         let run = make_run("run-1", SubAgentStatus::Running);
         let runs = Arc::new(RwLock::new(vec![run]));
-        let tool = SubagentsTool::new(runs.clone());
+        let tool = SubagentsTool::with_security(
+            runs.clone(),
+            Arc::new(crate::security::SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..crate::security::SecurityPolicy::default()
+            }),
+        );
 
         let result = tool.execute(json!({"action":"kill","run_id":"run-1"})).await.unwrap();
         assert!(!result.success);

@@ -1072,7 +1072,7 @@ mod tests {
     fn authz_reads_hot_shared_config_after_reload() {
         use crate::security::policy::{AutonomyLevel, ResourceRiskLevel};
 
-        // Start in the default (Supervised) autonomy: a low-risk gateway mutation is
+        // Start in the default autonomous policy: a low-risk gateway mutation is
         // allowed.
         let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
         let state = test_app_state(Config::default(), provider);
@@ -1083,7 +1083,7 @@ mod tests {
                 ResourceRiskLevel::Low,
             )
             .is_ok(),
-            "default (Supervised) autonomy should allow a low-risk mutation"
+            "default autonomous policy should allow a low-risk mutation"
         );
 
         // Hot-reload: publish a ReadOnly config into D only. C is intentionally left
@@ -1219,7 +1219,7 @@ mod tests {
         // --- Denial: D = ReadOnly, SAME on-disk path → reload BLOCKED by the gate. ---
         let provider: Arc<dyn Provider> = Arc::new(CapturingProvider::default());
         let state = test_app_state(base, provider);
-        // Publish ReadOnly to D only; C stays permissive (default Supervised).
+        // Publish ReadOnly to D only; C stays permissive (default Full).
         let mut read_only = Config::default();
         read_only.config_path = config_path;
         read_only.workspace_dir = workspace;

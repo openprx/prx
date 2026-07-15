@@ -5,9 +5,6 @@
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
-use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
-use crate::config::AutonomyConfig;
-use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
@@ -53,52 +50,28 @@ pub struct ApprovalLogEntry {
 /// were removed. Whether a tool call requires approval is now decided by the
 /// unified [`crate::security::SecurityPolicy::decide`] entry point (the tool-call
 /// loop only constructs an approval request when `decide` returns `Ask`). The
-/// manager is now purely the UI / audit / grant-minting layer:
+/// manager is now purely the UI / audit layer:
 ///
 /// - Maintains a session-scoped "always" allowlist (skips re-prompting).
 /// - Records an audit trail of all decisions.
-/// - Mints single-use `ApprovalGrantV2` capability grants for the gate runtime.
+/// Runtime grants are minted by the execution strategy from the complete typed
+/// command/context after approval; this UI owner never stores authority.
 pub struct ApprovalManager {
-    /// Autonomy level from config (retained for audit / context).
-    autonomy_level: AutonomyLevel,
     /// Session-scoped allowlist built from "Always" responses.
     session_allowlist: Mutex<HashSet<String>>,
     /// Audit trail of approval decisions.
     audit_log: Mutex<Vec<ApprovalLogEntry>>,
-    /// FIX-P3-09: capability grants generated when an interactive `Yes`/`Always`
-    /// decision is recorded. Bridges the interactive CLI approval track to the
-    /// gate-runtime `ApprovalGrantV2` track so a human "yes" can be honoured by
-    /// the cryptographic gate. Generation is best-effort: if the witness keyring
-    /// cannot be loaded the decision is still recorded, only the grant is skipped.
-    generated_grants: Mutex<Vec<ApprovalGrantV2>>,
 }
 
 impl ApprovalManager {
-    /// Create from autonomy config.
-    pub fn from_config(config: &AutonomyConfig) -> Self {
-        Self::from_autonomy_level(config.level)
-    }
-
-    /// Create a manager driven solely by an [`AutonomyLevel`].
-    ///
-    /// Used by the background sub-agent NeedsInput path, which only knows the
-    /// effective autonomy level (from the live [`crate::security::SecurityPolicy`]).
-    /// Whether a given call suspends for approval is decided upstream by
-    /// `SecurityPolicy::decide`; this manager only services the resulting `Ask`.
+    /// Create a session-local UI/audit owner. Whether this manager is consulted
+    /// is decided exclusively by `SecurityPolicy::decide` upstream.
     #[must_use]
-    pub fn from_autonomy_level(level: AutonomyLevel) -> Self {
+    pub fn new() -> Self {
         Self {
-            autonomy_level: level,
             session_allowlist: Mutex::new(HashSet::new()),
             audit_log: Mutex::new(Vec::new()),
-            generated_grants: Mutex::new(Vec::new()),
         }
-    }
-
-    /// The autonomy level this manager was built with.
-    #[must_use]
-    pub const fn autonomy_level(&self) -> AutonomyLevel {
-        self.autonomy_level
     }
 
     /// Whether `tool_name` is on the session "Always" allowlist (skips a prompt).
@@ -110,25 +83,6 @@ impl ApprovalManager {
     #[must_use]
     pub fn is_session_allowlisted(&self, tool_name: &str) -> bool {
         self.session_allowlist.lock().contains(tool_name)
-    }
-
-    /// Whether a tool call requires interactive approval under the unified
-    /// permission model (`decide` → `Ask`), for call sites that have no
-    /// `SecurityPolicy`/scope context (the chat dispatcher's terminal path).
-    ///
-    /// Mirrors [`crate::security::SecurityPolicy::decide`] for the no-scope case:
-    /// read-only tools never prompt; `full` / `read_only` never prompt
-    /// (`read_only` blocks side-effecting tools elsewhere); only `supervised`
-    /// side-effecting tools prompt, unless already session-allowlisted.
-    #[must_use]
-    pub fn needs_approval(&self, tool_name: &str) -> bool {
-        if crate::security::policy::is_read_only_tool(tool_name) {
-            return false;
-        }
-        if self.autonomy_level != AutonomyLevel::Supervised {
-            return false;
-        }
-        !self.is_session_allowlisted(tool_name)
     }
 
     /// Record an approval decision and update session state.
@@ -154,15 +108,6 @@ impl ApprovalManager {
             }
         }
 
-        // FIX-P3-09: a human `Yes`/`Always` is an issuance event for the gate
-        // runtime. Mint a signed single-use capability grant so the gate can honour
-        // the interactive approval. `No` never produces a grant. Generation is
-        // best-effort and must never make `record_decision` fail: if the witness
-        // keyring is unavailable we log and continue with the audit entry only.
-        if matches!(decision, ApprovalResponse::Yes | ApprovalResponse::Always) {
-            self.bridge_decision_to_grant(tool_name, channel);
-        }
-
         // Append to audit log.
         let summary = summarize_args(args);
         let entry = ApprovalLogEntry {
@@ -174,61 +119,6 @@ impl ApprovalManager {
         };
         let mut log = self.audit_log.lock();
         log.push(entry);
-    }
-
-    /// FIX-P3-09: build and store a signed `ApprovalGrantV2` for an approved tool
-    /// call, bridging the interactive track to the gate-runtime track.
-    ///
-    /// The interactive `ApprovalManager` has no full principal/workspace context,
-    /// so the subject is derived from the approval `channel` (the only identity
-    /// signal available at this layer); the grant's `op_id` is the `tool_name`
-    /// (exact match) at `Medium` risk. The gate, when it consults these grants,
-    /// still applies its own principal binding (`verify_for_operation_bound`),
-    /// so a channel-derived subject can never widen authority beyond that check.
-    fn bridge_decision_to_grant(&self, tool_name: &str, channel: &str) {
-        let keyring = match WitnessKeyring::global() {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = %e,
-                    "approval grant bridge: witness keyring unavailable; recording decision without a grant"
-                );
-                return;
-            }
-        };
-        let subject = Subject {
-            agent_id: format!("prx:interactive:{channel}"),
-            principal_id: channel.to_string(),
-            owner_id: channel.to_string(),
-            workspace_id: "interactive".to_string(),
-            session_key: None,
-        };
-        match ApprovalGrantV2::issue_one_shot(
-            keyring,
-            subject,
-            IssuerAuthority::HumanReview,
-            tool_name,
-            RiskLevel::Medium,
-        ) {
-            Ok(grant) => {
-                let mut grants = self.generated_grants.lock();
-                grants.push(grant);
-            }
-            Err(e) => {
-                tracing::warn!(
-                    tool = tool_name,
-                    error = %e,
-                    "approval grant bridge: failed to issue grant; recording decision without a grant"
-                );
-            }
-        }
-    }
-
-    /// FIX-P3-09: snapshot of grants minted from interactive `Yes`/`Always`
-    /// decisions, for the gate runtime to consult.
-    pub fn generated_grants(&self) -> Vec<ApprovalGrantV2> {
-        self.generated_grants.lock().clone()
     }
 
     /// Get a snapshot of the audit log.
@@ -243,10 +133,15 @@ impl ApprovalManager {
 
     /// Prompt the user on the CLI and return their decision.
     ///
-    /// For non-CLI channels, returns `Yes` automatically (interactive
-    /// approval is only supported on CLI for now).
+    /// This blocking prompt is called only by the CLI adapter.
     pub fn prompt_cli(&self, request: &ApprovalRequest) -> ApprovalResponse {
         prompt_cli_interactive(request)
+    }
+}
+
+impl Default for ApprovalManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -316,101 +211,12 @@ fn truncate_for_summary(input: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::AutonomyConfig;
-
-    fn supervised_config() -> AutonomyConfig {
-        AutonomyConfig {
-            level: AutonomyLevel::Supervised,
-            ..AutonomyConfig::default()
-        }
-    }
-
-    fn full_config() -> AutonomyConfig {
-        AutonomyConfig {
-            level: AutonomyLevel::Full,
-            ..AutonomyConfig::default()
-        }
-    }
-
-    // ── needs_approval ───────────────────────────────────────
-
-    #[test]
-    fn read_only_tools_skip_prompt_under_supervised() {
-        // Phase 1: read-only tools never require approval, regardless of level.
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(!mgr.needs_approval("file_read"));
-        assert!(!mgr.needs_approval("memory_recall"));
-    }
-
-    #[test]
-    fn side_effecting_tools_prompt_under_supervised() {
-        // Phase 1: a non-read-only tool prompts under Supervised.
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(mgr.needs_approval("shell"));
-    }
-
-    #[test]
-    fn unknown_tool_needs_approval_in_supervised() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-        assert!(mgr.needs_approval("http_request"));
-    }
-
-    #[test]
-    fn from_autonomy_level_gates_per_level() {
-        // Supervised: every non-explicitly-allowed tool needs approval (drives
-        // the background NeedsInput suspend path).
-        let supervised = ApprovalManager::from_autonomy_level(AutonomyLevel::Supervised);
-        assert!(supervised.needs_approval("shell"));
-        assert!(supervised.needs_approval("file_write"));
-        // Full / ReadOnly: never flagged, so no suspension occurs for backgrounded runs.
-        let full = ApprovalManager::from_autonomy_level(AutonomyLevel::Full);
-        assert!(!full.needs_approval("shell"));
-        let read_only = ApprovalManager::from_autonomy_level(AutonomyLevel::ReadOnly);
-        assert!(!read_only.needs_approval("shell"));
-    }
-
-    #[test]
-    fn supervised_level_gates_side_effecting_but_not_read_only_tools() {
-        // Permission-model Phase 1: the per-tool auto_approve/always_ask lists are
-        // gone. `needs_approval` now keys off the read-only classification + level.
-        // Under Supervised, read-only tools never suspend while side-effecting tools
-        // do (driving the background NeedsInput suspend path).
-        let mgr = ApprovalManager::from_autonomy_level(AutonomyLevel::Supervised);
-        // Read-only tools: no suspension under supervised.
-        assert!(!mgr.needs_approval("file_read"));
-        assert!(!mgr.needs_approval("memory_recall"));
-        // Side-effecting tools under supervised: default-suspends.
-        assert!(mgr.needs_approval("shell"));
-        assert!(mgr.needs_approval("file_write"));
-    }
-
-    #[test]
-    fn full_autonomy_never_prompts() {
-        // Permission-model Phase 1: under Full autonomy no tool requires interactive
-        // approval (the always_ask list was removed); side-effecting tools included.
-        let mgr = ApprovalManager::from_config(&full_config());
-        assert!(!mgr.needs_approval("shell"));
-        assert!(!mgr.needs_approval("file_write"));
-        assert!(!mgr.needs_approval("anything"));
-    }
-
-    #[test]
-    fn readonly_never_prompts() {
-        let config = AutonomyConfig {
-            level: AutonomyLevel::ReadOnly,
-            ..AutonomyConfig::default()
-        };
-        let mgr = ApprovalManager::from_config(&config);
-        assert!(!mgr.needs_approval("shell"));
-    }
-
     // ── session allowlist ────────────────────────────────────
 
     #[test]
     fn always_response_adds_to_session_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
+        let mgr = ApprovalManager::new();
+        assert!(!mgr.is_session_allowlisted("file_write"));
 
         mgr.record_decision(
             "file_write",
@@ -419,18 +225,13 @@ mod tests {
             "cli",
         );
 
-        // Now file_write should be in session allowlist.
-        assert!(!mgr.needs_approval("file_write"));
+        assert!(mgr.is_session_allowlisted("file_write"));
     }
 
     #[test]
     fn always_response_allowlists_side_effecting_tool() {
-        // Permission-model Phase 1: the always_ask override is gone, so an "Always"
-        // decision now session-allowlists even a side-effecting tool like shell.
-        let mgr = ApprovalManager::from_config(&supervised_config());
-
-        // Under Supervised, shell prompts before any "Always" decision.
-        assert!(mgr.needs_approval("shell"));
+        let mgr = ApprovalManager::new();
+        assert!(!mgr.is_session_allowlisted("shell"));
 
         mgr.record_decision(
             "shell",
@@ -439,22 +240,21 @@ mod tests {
             "cli",
         );
 
-        // After "Always", shell is session-allowlisted and no longer prompts.
-        assert!(!mgr.needs_approval("shell"));
+        assert!(mgr.is_session_allowlisted("shell"));
     }
 
     #[test]
     fn yes_response_does_not_add_to_allowlist() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::new();
         mgr.record_decision("file_write", &serde_json::json!({}), ApprovalResponse::Yes, "cli");
-        assert!(mgr.needs_approval("file_write"));
+        assert!(!mgr.is_session_allowlisted("file_write"));
     }
 
     // ── audit log ────────────────────────────────────────────
 
     #[test]
     fn audit_log_records_decisions() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::new();
 
         mgr.record_decision(
             "shell",
@@ -479,7 +279,7 @@ mod tests {
 
     #[test]
     fn audit_log_contains_timestamp_and_channel() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
+        let mgr = ApprovalManager::new();
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
@@ -549,57 +349,5 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ApprovalRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tool_name, "shell");
-    }
-
-    // ── FIX-P3-09: ApprovalManager ↔ ApprovalGrant bridge ────────
-
-    #[test]
-    fn yes_and_always_decisions_generate_grants_when_keyring_available() {
-        // Best-effort bridge: grant generation depends on the process-global
-        // witness keyring (`WitnessKeyring::global()`), which needs $HOME or the
-        // `OPENPRX_WITNESS_KEY_PATH` env. We do NOT mutate the environment here
-        // (env mutation is `unsafe` under Rust 2024 and banned by the workspace
-        // lint), so generation may legitimately be skipped. The contract this
-        // test pins is: when generation does succeed, the grants are well-formed
-        // and exactly mirror the approved tool names; when it is skipped the
-        // decision is still recorded without panicking.
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        let before = mgr.generated_grants().len();
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "out.txt"}),
-            ApprovalResponse::Yes,
-            "cli",
-        );
-        mgr.record_decision(
-            "http_request",
-            &serde_json::json!({"url": "https://example.com"}),
-            ApprovalResponse::Always,
-            "cli",
-        );
-
-        let grants = mgr.generated_grants();
-        // Either both grants were minted (keyring available) or none were
-        // (best-effort skip). A partial count would indicate a real bug.
-        assert!(grants.len() == before || grants.len() == before + 2);
-        for g in &grants {
-            assert_eq!(g.version, ApprovalGrantV2::VERSION);
-            assert_eq!(g.max_uses, 1);
-            assert!(g.capability.op_id == "file_write" || g.capability.op_id == "http_request");
-        }
-    }
-
-    #[test]
-    fn no_decision_generates_no_grant() {
-        let mgr = ApprovalManager::from_config(&supervised_config());
-        let before = mgr.generated_grants().len();
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "rm -rf /"}),
-            ApprovalResponse::No,
-            "cli",
-        );
-        // `No` must never mint a grant.
-        assert_eq!(mgr.generated_grants().len(), before);
     }
 }

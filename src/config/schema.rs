@@ -3409,7 +3409,7 @@ impl Default for ScopeConfig {
 /// (NoopSandbox); Phase 2 may re-enable it per risk level.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
-    /// Autonomy level: `read_only`, `supervised` (default), or `full`.
+    /// Autonomy level: `read_only`, `supervised`, or `full` (default).
     pub level: AutonomyLevel,
     /// Restrict file writes and command paths to the workspace directory. Default: `true`.
     pub workspace_only: bool,
@@ -3444,7 +3444,7 @@ fn default_disabled_sandbox() -> SandboxConfig {
 impl Default for AutonomyConfig {
     fn default() -> Self {
         Self {
-            level: AutonomyLevel::Supervised,
+            level: AutonomyLevel::Full,
             workspace_only: true,
             forbidden_paths: vec![
                 "/etc".into(),
@@ -6244,7 +6244,7 @@ mod tests {
     #[test]
     async fn autonomy_config_default() {
         let a = AutonomyConfig::default();
-        assert_eq!(a.level, AutonomyLevel::Supervised);
+        assert_eq!(a.level, AutonomyLevel::Full);
         assert!(a.workspace_only);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         // Behavior-limits Phase 1: opened to u32::MAX (high-position safeguard).
@@ -6563,7 +6563,7 @@ default_temperature = 0.7
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
         assert_eq!(parsed.observability.backend, "none");
-        assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
+        assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels_config.cli);

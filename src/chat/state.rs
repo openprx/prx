@@ -8040,7 +8040,6 @@ mod tests {
 
         #[test]
         fn p8_mode_changed_does_not_escalate_autonomy_or_policy() {
-            use crate::approval::ApprovalManager;
             use crate::config::AutonomyConfig;
             use crate::security::policy::ToolDecision;
             use crate::security::{AutonomyLevel, SecurityPolicy};
@@ -8053,7 +8052,6 @@ mod tests {
             autonomy.sandbox.enabled = Some(false);
             let autonomy_before = autonomy.clone();
             let policy_before = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
-            let approval_before = ApprovalManager::from_config(&autonomy);
             state.ui.autonomy_level = autonomy.level;
 
             for mode in [ChatMode::Plan, ChatMode::Edit, ChatMode::Auto, ChatMode::Plan] {
@@ -8062,13 +8060,11 @@ mod tests {
             }
 
             let policy_after = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
-            let approval_after = ApprovalManager::from_config(&autonomy);
 
             assert_eq!(autonomy.level, autonomy_before.level);
             assert_eq!(autonomy.workspace_only, autonomy_before.workspace_only);
             assert_eq!(autonomy.sandbox.enabled, autonomy_before.sandbox.enabled);
             assert_eq!(policy_after.autonomy, policy_before.autonomy);
-            assert_eq!(approval_after.autonomy_level(), approval_before.autonomy_level());
             assert_eq!(state.session.mode, ChatMode::Plan);
             assert_eq!(
                 policy_after.decide("file_write", "user", "terminal", "chat"),

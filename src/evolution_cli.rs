@@ -577,16 +577,17 @@ mod tests {
     use chrono::Duration as ChronoDuration;
     use tempfile::TempDir;
 
-    /// Build a minimal `Config` whose workspace points into `tmp`. The default
-    /// autonomy level is `Supervised`, under which medium/high-risk side effects
+    /// Build a minimal `Config` whose workspace points into `tmp`, with autonomy
+    /// explicitly set to `Supervised`, under which medium/high-risk side effects
     /// require a runtime grant — exactly the policy that must DENY a manual
     /// evolution trigger (the one-shot CLI has no approval manager to issue one).
     fn supervised_config(tmp: &TempDir) -> Config {
-        let config = Config {
+        let mut config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         std::fs::create_dir_all(&config.workspace_dir).expect("test: create workspace dir");
         config
     }
@@ -666,7 +667,7 @@ mod tests {
     }
 
     /// FIX-P0-40 (manual path, hard acceptance): `prx evolution trigger` under the
-    /// default Supervised autonomy must be DENIED by the side-effect gate, return a
+    /// explicit Supervised autonomy must be DENIED by the side-effect gate, return a
     /// non-zero (Err) result, and never append an evolution log to disk. This
     /// proves the manual entry point is gated identically to the daemon scheduler
     /// and cannot bypass the autonomy gate.
@@ -696,11 +697,11 @@ mod tests {
             let _ = analyzer.generate_daily_digest(now - ChronoDuration::days(offset)).await;
         }
 
-        // Sanity: default autonomy is Supervised (the gating policy under test).
+        // Sanity: the fixture explicitly selects the gating policy under test.
         assert_eq!(
             config.autonomy.level,
             crate::security::AutonomyLevel::Supervised,
-            "test relies on default Supervised autonomy"
+            "test fixture must select Supervised autonomy"
         );
 
         let result = handle_trigger(false, &config, Some(EvolutionLayerArg::L1)).await;

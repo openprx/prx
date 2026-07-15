@@ -4251,17 +4251,18 @@ mod tests {
 
     #[test]
     fn s5_release_p0_3_full_autonomy_skips_approval_entirely() {
-        use crate::approval::ApprovalManager;
-        use crate::config::AutonomyConfig;
-        use crate::security::AutonomyLevel;
-        let config = AutonomyConfig {
-            level: AutonomyLevel::Full,
-            ..AutonomyConfig::default()
+        let policy = crate::security::SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            ..crate::security::SecurityPolicy::default()
         };
-        let mgr = ApprovalManager::from_config(&config);
-        // Full autonomy 完全跳过 approval — 不走 Effect::RequestApproval 路径
-        assert!(!mgr.needs_approval("shell"));
-        assert!(!mgr.needs_approval("file_write"));
+        assert_eq!(
+            policy.decide("shell", "user", "terminal", "private"),
+            crate::security::policy::ToolDecision::Allow
+        );
+        assert_eq!(
+            policy.decide("file_write", "user", "terminal", "private"),
+            crate::security::policy::ToolDecision::Allow
+        );
     }
 }
 
@@ -10223,7 +10224,7 @@ mod real_mode_tests {
         assert!(!router.resolve("call-1", false), "second resolve must miss");
     }
 
-    /// **S3 T3-1 Step 4**: approval 路径 — needs_approval=true 时 driver 走 router 等响应；
+    /// **S3 T3-1 Step 4**: approval path — policy `Ask` waits on the router;
     /// stub EffectExecutor::RequestApproval 默认 auto-approve.
     #[tokio::test]
     async fn t31_driver_approval_path_auto_approves_via_stub() {

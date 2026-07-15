@@ -708,7 +708,7 @@ fn int_ts_02_pip_install_passes_command_gate() {
     // (`is_command_allowed`) no longer rejects a base command merely because it
     // is not on a curated list; only subshell/redirect/tee/single-`&`/dangerous
     // args block in non-full modes. `pip install foo` has none of those, so it
-    // now passes the gate (default autonomy is Supervised).
+    // now passes the gate (including under the autonomous default).
     let policy = SecurityPolicy::default();
 
     assert!(

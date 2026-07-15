@@ -3613,7 +3613,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
 
     // ── Approval manager ─────────────────────────────────────────
-    let approval_manager = ApprovalManager::from_config(&config.autonomy);
+    let approval_manager = ApprovalManager::new();
 
     // ── Create TerminalChannel (Arc-wrapped for sharing with streaming tasks) ──
     let terminal: Arc<TerminalChannel> = Arc::new(TerminalChannel::new(plain_mode));

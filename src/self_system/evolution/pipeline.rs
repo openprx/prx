@@ -1049,9 +1049,12 @@ mod tests {
     #[tokio::test]
     async fn authorize_commit_blocks_under_supervised_policy_without_grant() {
         let dir = tempdir().unwrap();
-        // Default policy is Supervised + require_approval_for_medium_risk → a
-        // Medium-risk evolution commit with no runtime grant is denied.
-        let policy = Arc::new(SecurityPolicy::default());
+        // Explicit Supervised policy requires a runtime grant for this
+        // Medium-risk evolution commit.
+        let policy = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        });
         let pipeline = gated_pipeline(dir.path(), policy).await;
         let reason = pipeline
             .authorize_commit(&EvolutionLayer::Prompt, "exp-blocked")

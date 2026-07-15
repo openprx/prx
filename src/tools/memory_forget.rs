@@ -147,10 +147,13 @@ mod tests {
         Arc::new(SecurityPolicy::default())
     }
 
-    // Phase 1: the high-risk hard-block was removed; a matching runtime grant
-    // lets a High-risk op traverse the default (Supervised) gate.
+    // A matching runtime grant lets a High-risk op traverse an explicit
+    // Supervised gate.
     fn test_security_allow_high() -> Arc<SecurityPolicy> {
-        Arc::new(SecurityPolicy::default())
+        Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        })
     }
 
     fn test_mem() -> (TempDir, Arc<dyn Memory>) {

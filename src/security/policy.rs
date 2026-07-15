@@ -314,9 +314,9 @@ pub enum AutonomyLevel {
     /// Read-only: can observe but not act
     ReadOnly,
     /// Supervised: acts but requires approval for risky operations
-    #[default]
     Supervised,
     /// Full: autonomous execution within policy bounds
+    #[default]
     Full,
 }
 
@@ -1179,7 +1179,7 @@ pub struct SecurityPolicy {
 impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
-            autonomy: AutonomyLevel::Supervised,
+            autonomy: AutonomyLevel::Full,
             workspace_dir: PathBuf::from("."),
             workspace_only: true,
             forbidden_paths: vec![
@@ -2067,8 +2067,8 @@ mod tests {
     // ── AutonomyLevel ────────────────────────────────────────
 
     #[test]
-    fn autonomy_default_is_supervised() {
-        assert_eq!(AutonomyLevel::default(), AutonomyLevel::Supervised);
+    fn autonomy_default_is_full() {
+        assert_eq!(AutonomyLevel::default(), AutonomyLevel::Full);
     }
 
     #[test]
@@ -3591,7 +3591,7 @@ mod tests {
     #[test]
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
-        assert_eq!(p.autonomy, AutonomyLevel::Supervised);
+        assert_eq!(p.autonomy, AutonomyLevel::Full);
         assert!(p.workspace_only);
         assert!(!p.forbidden_paths.is_empty());
         assert!(p.max_actions_per_hour > 0);
