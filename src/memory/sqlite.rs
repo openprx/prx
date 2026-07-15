@@ -1582,7 +1582,7 @@ impl SqliteMemory {
     }
 
     /// SHA-256 (hex) of a migration's canonical descriptor text.
-    fn schema_migration_checksum(sql: &str) -> String {
+    pub(crate) fn schema_migration_checksum(sql: &str) -> String {
         use sha2::{Digest, Sha256};
         let mut hasher = Sha256::new();
         hasher.update(sql.as_bytes());
@@ -1592,7 +1592,7 @@ impl SqliteMemory {
     /// Versioned registry of the canonical schema steps created by `init_schema`,
     /// retro-fitted in execution order. Each text is a stable canonical descriptor
     /// used only as a checksum anchor (version unchanged ⇒ text unchanged).
-    const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
+    pub(crate) const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
         &[
             (
                 1,

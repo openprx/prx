@@ -38,48 +38,34 @@ pub async fn handle_command(command: crate::MigrateCommands, config: &Config) ->
 }
 
 fn show_schema_migration_status(config: &Config) -> Result<()> {
-    let conn = schema_migration::open_sqlite_memory_db(config)?;
-    let status = schema_migration::status_sqlite(&conn)?;
-    println!("Memory DB: {}", schema_migration::memory_db_path(config).display());
-    print_schema_migration_status(&status);
+    let report = schema_migration::inspect_configured_backend(config)?;
+    print_schema_migration_status(&report);
     Ok(())
 }
 
 fn verify_schema_migrations(config: &Config) -> Result<()> {
-    let conn = schema_migration::open_sqlite_memory_db(config)?;
-    let mismatches = schema_migration::verify_sqlite(&conn)?;
-    if mismatches.is_empty() {
-        println!("Schema migration checksums OK");
-        return Ok(());
-    }
-
-    println!("Schema migration checksum mismatch(es): {}", mismatches.len());
-    for mismatch in &mismatches {
-        println!(
-            "- {} expected={} actual={}",
-            mismatch.version, mismatch.expected, mismatch.actual
-        );
-    }
-    bail!("schema migration checksum verification failed")
+    let report = schema_migration::inspect_configured_backend(config)?;
+    println!(
+        "Schema migration ledger verified: backend={} target={} applied={} pending={}",
+        report.backend,
+        report.target,
+        report.status.applied.len(),
+        report.status.pending.len()
+    );
+    Ok(())
 }
 
 fn dry_run_schema_migrations(config: &Config) -> Result<()> {
-    let db_path = schema_migration::memory_db_path(config);
-    let conn = if db_path.exists() {
-        Some(
-            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("open memory db read-only {}", db_path.display()))?,
-        )
-    } else {
-        None
-    };
-    let status = schema_migration::dry_run_sqlite(conn.as_ref())?;
-    println!("Dry run: schema migrations for {}", db_path.display());
-    if status.pending.is_empty() {
+    let report = schema_migration::inspect_configured_backend(config)?;
+    println!(
+        "Dry run: schema migrations for backend={} target={}",
+        report.backend, report.target
+    );
+    if report.status.pending.is_empty() {
         println!("No pending migrations.");
     } else {
-        println!("Would apply ({}):", status.pending.len());
-        for pending in &status.pending {
+        println!("Would apply ({}):", report.status.pending.len());
+        for pending in &report.status.pending {
             println!("  {}  {}", pending.version, pending.name);
         }
     }
@@ -92,27 +78,19 @@ fn plan_schema_migrations(config: &Config, target_version: &str) -> Result<()> {
         bail!("--target-version must not be empty");
     }
 
-    let db_path = schema_migration::memory_db_path(config);
-    let conn = if db_path.exists() {
-        Some(
-            Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-                .with_context(|| format!("open memory db read-only {}", db_path.display()))?,
-        )
-    } else {
-        None
-    };
-
-    let status = schema_migration::dry_run_sqlite(conn.as_ref())?;
+    let report = schema_migration::inspect_configured_backend(config)?;
+    let target_version = schema_migration::known_target_version(&report, target_version)?;
 
     // Only migrations at or below the target version are part of the plan.
-    let planned: Vec<&schema_migration::PendingMigration> = status
+    let planned: Vec<&schema_migration::PendingMigration> = report
+        .status
         .pending
         .iter()
         .filter(|pending| pending.version <= target_version)
         .collect();
-    let deferred = status.pending.len() - planned.len();
+    let deferred = report.status.pending.len() - planned.len();
 
-    println!("Migration plan for {}", db_path.display());
+    println!("Migration plan for backend={} target={}", report.backend, report.target);
     println!("Target version: {target_version}");
     if planned.is_empty() {
         println!("No pending migrations at or below the target version.");
@@ -121,7 +99,7 @@ fn plan_schema_migrations(config: &Config, target_version: &str) -> Result<()> {
         for pending in &planned {
             println!("  {}  {}", pending.version, pending.name);
         }
-        println!("This is a dry run. Run `prx migrate baseline` to record the baseline.");
+        println!("This is a read-only plan; backend startup owns migration application.");
     }
     if deferred > 0 {
         println!("Deferred (above target): {deferred}");
@@ -130,48 +108,54 @@ fn plan_schema_migrations(config: &Config, target_version: &str) -> Result<()> {
 }
 
 fn baseline_schema_migrations(config: &Config) -> Result<()> {
-    let mut conn = schema_migration::open_sqlite_memory_db(config)?;
-    let inserted = schema_migration::baseline_sqlite(&mut conn, "prx-cli")?;
-    if inserted {
-        println!(
-            "Recorded schema migration baseline {} ({})",
-            schema_migration::BASELINE_VERSION,
-            schema_migration::BASELINE_NAME
-        );
-    } else {
-        println!(
-            "Schema migration baseline already present: {}",
-            schema_migration::BASELINE_VERSION
-        );
-    }
-    Ok(())
+    let _ = config;
+    bail!(
+        "`prx migrate baseline` is disabled: the legacy synthetic schema_migrations ledger is read-only compatibility evidence; backend startup owns the authoritative memory_schema_migrations ledger"
+    )
 }
 
-fn print_schema_migration_status(status: &schema_migration::MigrationStatus) {
-    println!("Applied ({}):", status.applied.len());
-    if status.applied.is_empty() {
+fn print_schema_migration_status(report: &schema_migration::MigrationReport) {
+    println!("Backend: {}", report.backend);
+    println!("Target: {}", report.target);
+    println!("Authoritative applied ({}):", report.status.applied.len());
+    if report.status.applied.is_empty() {
         println!("  <none>");
     } else {
-        for record in &status.applied {
+        for record in &report.status.applied {
+            println!(
+                "  {}  {}  {}  checksum={}",
+                record.version, record.name, record.applied_at, record.checksum
+            );
+        }
+    }
+
+    println!("Pending ({}):", report.status.pending.len());
+    if report.status.pending.is_empty() {
+        println!("  <none>");
+    } else {
+        for pending in &report.status.pending {
+            println!("  {}  {}", pending.version, pending.name);
+        }
+    }
+
+    if !report.status.legacy_applied.is_empty() {
+        println!(
+            "Legacy synthetic evidence (not authoritative) ({}):",
+            report.status.legacy_applied.len()
+        );
+        for record in &report.status.legacy_applied {
             let duration = record
                 .duration_ms
                 .map(|duration_ms| format!("{duration_ms}ms"))
                 .unwrap_or_else(|| "n/a".to_string());
             println!(
-                "  {}  {}  {}  {}  {}",
-                record.version, record.name, record.applied_at, record.applied_by, duration
+                "  {}  {}  {}  {}  {}  checksum={}",
+                record.version, record.name, record.applied_at, record.applied_by, duration, record.checksum
             );
         }
     }
-
-    println!("Pending ({}):", status.pending.len());
-    if status.pending.is_empty() {
-        println!("  <none>");
-    } else {
-        for pending in &status.pending {
-            println!("  {}  {}", pending.version, pending.name);
-        }
-        println!("Run `prx migrate baseline` to record the baseline.");
+    if let Some(warning) = &report.status.legacy_warning {
+        println!("Legacy synthetic evidence unreadable: {warning}");
     }
 }
 

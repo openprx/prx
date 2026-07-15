@@ -920,7 +920,7 @@ impl PostgresMemory {
     }
 
     /// SHA-256 (hex) of a migration's canonical descriptor text.
-    fn schema_migration_checksum(text: &str) -> String {
+    pub(crate) fn schema_migration_checksum(text: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(text.as_bytes());
         format!("{:x}", hasher.finalize())
@@ -930,7 +930,7 @@ impl PostgresMemory {
     /// retro-fitted in execution order. Each text is a stable canonical descriptor
     /// used only as a checksum anchor (version unchanged ⇒ text unchanged). NEVER
     /// mutate an existing entry's text; append a new version for new schema changes.
-    const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
+    pub(crate) const fn memory_schema_migration_registry() -> &'static [(i64, &'static str, &'static str)] {
         &[
             (
                 1,

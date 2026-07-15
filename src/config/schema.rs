@@ -5711,6 +5711,30 @@ impl Config {
         Self::load_or_init_with_config_dir(None).await
     }
 
+    /// Load an already-existing configuration without creating or migrating
+    /// the config directory, workspace, configuration file, or secrets.
+    pub async fn load_existing_read_only_with_config_dir(explicit_config_dir: Option<&str>) -> Result<Self> {
+        let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+        let (openprx_dir, workspace_dir, resolution_source) =
+            resolve_runtime_config_dirs(&default_openprx_dir, &default_workspace_dir, explicit_config_dir).await?;
+        let config_path = openprx_dir.join("config.toml");
+        if !config_path.is_file() {
+            anyhow::bail!(
+                "existing config is required for read-only inspection at {}; no config or workspace was created",
+                config_path.display()
+            );
+        }
+
+        let config = Self::load_from_path(&config_path, workspace_dir)?;
+        tracing::info!(
+            path = %config.config_path.display(),
+            workspace = %config.workspace_dir.display(),
+            source = resolution_source.as_str(),
+            "Config loaded read-only"
+        );
+        Ok(config)
+    }
+
     pub async fn load_or_init_with_config_dir(explicit_config_dir: Option<&str>) -> Result<Self> {
         let (default_openprx_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -8851,5 +8875,26 @@ classifier_timeout_secs = 8
             cfg.validate()
                 .unwrap_or_else(|e| panic!("valid path {good_path} must pass: {e}"));
         }
+    }
+
+    #[test]
+    async fn migration_read_only_config_load_does_not_initialize_missing_directory() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let config_dir = temp.path().join("missing-config");
+        let config_dir_arg = config_dir.to_string_lossy().to_string();
+
+        let error = Config::load_existing_read_only_with_config_dir(Some(&config_dir_arg))
+            .await
+            .expect_err("missing config must be an explicit non-success outcome");
+
+        assert!(error.to_string().contains("existing config is required"));
+        assert!(
+            !config_dir.exists(),
+            "read-only loading must not create the config directory"
+        );
+        assert!(
+            !config_dir.join("workspace").exists(),
+            "read-only loading must not create the workspace directory"
+        );
     }
 }

@@ -953,12 +953,12 @@ enum MigrateCommands {
     DryRun,
     /// Plan migrations up to a target version (dry-run diff, writes nothing)
     Plan {
-        /// Target schema version to plan up to (inclusive). Pending migrations
-        /// with a version greater than this are excluded from the plan.
+        /// Known numeric backend migration version to plan through (inclusive).
+        /// Pending migrations above this version are excluded.
         #[arg(long)]
         target_version: String,
     },
-    /// Record the current schema as the migration baseline
+    /// Deprecated compatibility command; never writes a synthetic baseline
     Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
@@ -1372,8 +1372,24 @@ async fn async_main() -> Result<()> {
         return result;
     }
 
-    // All other commands need config loaded first
-    let config = Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?;
+    // Schema inspection must not initialize config/workspace state. Baseline is
+    // routed through the same read-only loader because it is retained only as
+    // an explicit compatibility error, never as a write operation.
+    let read_only_schema_inspection = matches!(
+        &cli.command,
+        Commands::Migrate {
+            migrate_command: MigrateCommands::Status
+                | MigrateCommands::Verify
+                | MigrateCommands::DryRun
+                | MigrateCommands::Plan { .. }
+                | MigrateCommands::Baseline
+        }
+    );
+    let config = if read_only_schema_inspection {
+        Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
+    } else {
+        Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?
+    };
 
     mode::dispatch(cli.command, config).await
 }

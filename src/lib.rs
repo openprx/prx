@@ -236,7 +236,7 @@ pub enum MigrateCommands {
     Verify,
     /// Preview pending schema migrations without writing
     DryRun,
-    /// Record the current schema as the migration baseline
+    /// Deprecated compatibility command; never writes a synthetic baseline
     Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
     Openclaw {
