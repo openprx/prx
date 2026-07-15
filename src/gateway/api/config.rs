@@ -140,7 +140,7 @@ pub async fn post_config(State(state): State<AppState>, Json(incoming): Json<Val
         return error.into_response();
     }
 
-    // 5. Save to disk (Config::save handles backup + atomic write)
+    // 5. Save the complete effective tree through the config transaction API.
     if let Err(e) = merged_config.save().await {
         warn!("Failed to save config: {e}");
         return (
@@ -282,18 +282,27 @@ pub async fn put_config_file(
                     )
                         .into_response();
                 }
-            } else if let Err(error) = tokio::fs::create_dir_all(parent).await {
-                warn!("Failed to create config.d directory: {error}");
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({"error": "Failed to create configuration directory"})),
-                )
-                    .into_response();
             }
         }
     }
 
-    if let Err(error) = crate::config::schema::write_toml_string_atomic(&target_path, &payload.content).await {
+    let plan = match crate::config::files::plan_config_file_mutation(
+        &current.config_path,
+        &current.workspace_dir,
+        &filename,
+        payload.content,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            warn!("Failed to stage config file update: {error}");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": format!("Invalid effective configuration: {error}")})),
+            )
+                .into_response();
+        }
+    };
+    if let Err(error) = crate::config::files::commit_mutation_atomically(plan).await {
         warn!("Failed to save config file: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,

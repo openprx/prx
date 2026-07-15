@@ -5683,7 +5683,9 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
     let toml_str =
         toml::to_string_pretty(&toml::Value::try_from(&raw_config).context("Failed to serialize migrated config")?)
             .context("Failed to convert migrated config to TOML string")?;
-    write_toml_string_atomic(&config.config_path, &toml_str)
+    let plan = crate::config::files::plan_main_file_mutation(&config.config_path, &config.workspace_dir, toml_str)
+        .context("Failed to plan migrated config")?;
+    crate::config::files::commit_mutation_atomically(plan)
         .await
         .context("Failed to write migrated config")?;
 
@@ -5691,6 +5693,18 @@ pub(crate) async fn migrate_config_legacy_secrets(config: &Config) -> Result<()>
 }
 
 impl Config {
+    /// Validate a stored configuration tree without decrypting secrets or
+    /// performing any mutation. Used for staging multi-file config commits.
+    pub(crate) fn validate_stored_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
+        let merged = read_merged_toml_with_gate(config_path)?;
+        let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
+        let mut config: Self = merged.try_into().context("Failed to deserialize merged config")?;
+        config.config_path = config_path.to_path_buf();
+        config.workspace_dir = workspace_dir;
+        config.agent.compaction.max_context_tokens_explicit = compaction_max_context_explicit;
+        config.validate()
+    }
+
     pub(crate) fn load_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<Self> {
         let merged = read_merged_toml_with_gate(config_path)?;
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
@@ -5709,6 +5723,10 @@ impl Config {
 
     pub async fn load_or_init() -> Result<Self> {
         Self::load_or_init_with_config_dir(None).await
+    }
+
+    pub async fn load_existing_read_only() -> Result<Self> {
+        Self::load_existing_read_only_with_config_dir(None).await
     }
 
     /// Load an already-existing configuration without creating or migrating
@@ -5933,8 +5951,14 @@ impl Config {
     }
 
     pub async fn save(&self) -> Result<()> {
+        if crate::config::files::has_managed_fragments(&self.config_path)? {
+            crate::config::files::write_split_config(self, false).await?;
+            return Ok(());
+        }
+
         let toml_str = self.to_stored_toml_string()?;
-        write_toml_string_atomic(&self.config_path, &toml_str).await
+        let plan = crate::config::files::plan_mutation(&self.config_path, &self.workspace_dir, toml_str, Vec::new())?;
+        crate::config::files::commit_mutation_atomically(plan).await
     }
 
     pub(crate) fn to_stored_toml_value(&self) -> Result<toml::Value> {
@@ -6000,7 +6024,27 @@ fn agent_compaction_max_context_tokens_present(config: &toml::Value) -> bool {
         .is_some()
 }
 
+#[cfg(test)]
 pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Result<()> {
+    // FIX-P2-10: acquire a cross-process exclusive advisory lock before the
+    // write+rename critical section. Without it, two PRX processes saving the
+    // config concurrently can interleave their temp-write/backup/rename steps
+    // and silently drop one process's update (last-writer-wins data loss). The
+    // lock is created beside the config path (`<name>.<ext>.lock`) and is held
+    // until this function returns (the guard is dropped after the rename and
+    // permission fix-up complete). Reuses the existing, audited lock helper so
+    // no new dependency or `unsafe` is introduced.
+    let _config_write_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(path).await?;
+
+    write_toml_string_atomic_without_lock(path, toml_str).await
+}
+
+/// Replace one TOML file atomically while the caller owns the enclosing
+/// configuration transaction lock.
+///
+/// This is crate-visible only so multi-file config commits can hold one lock
+/// across the complete generation instead of deadlocking on per-file locks.
+pub(crate) async fn write_toml_string_atomic_without_lock(path: &Path, toml_str: &str) -> Result<()> {
     let parent_dir = path.parent().context("Config path must have a parent directory")?;
 
     if let Ok(metadata) = fs::symlink_metadata(path).await {
@@ -6012,16 +6056,6 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     fs::create_dir_all(parent_dir)
         .await
         .with_context(|| format!("Failed to create config directory: {}", parent_dir.display()))?;
-
-    // FIX-P2-10: acquire a cross-process exclusive advisory lock before the
-    // write+rename critical section. Without it, two PRX processes saving the
-    // config concurrently can interleave their temp-write/backup/rename steps
-    // and silently drop one process's update (last-writer-wins data loss). The
-    // lock is created beside the config path (`<name>.<ext>.lock`) and is held
-    // until this function returns (the guard is dropped after the rename and
-    // permission fix-up complete). Reuses the existing, audited lock helper so
-    // no new dependency or `unsafe` is introduced.
-    let _config_write_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(path).await?;
 
     let file_name = path.file_name().and_then(|v| v.to_str()).unwrap_or("config.toml");
     let temp_path = parent_dir.join(format!(".{file_name}.tmp-{}", uuid::Uuid::new_v4()));
@@ -6080,7 +6114,7 @@ pub(crate) async fn write_toml_string_atomic(path: &Path, toml_str: &str) -> Res
     Ok(())
 }
 
-async fn sync_directory(path: &Path) -> Result<()> {
+pub(crate) async fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         let dir = File::open(path)

@@ -1214,7 +1214,7 @@ async fn async_main() -> Result<()> {
                 .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
                 .join(".openprx"),
         };
-        return spec.generate(&target, *force);
+        return spec.generate(&target, *force).await;
     }
 
     // Initialize logging - respects RUST_LOG env var, defaults to INFO.

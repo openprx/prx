@@ -69,6 +69,11 @@ pub struct WorkerManifest {
 /// as the same concatenated byte stream.
 pub fn config_source_generation(config_dir: &Path) -> anyhow::Result<String> {
     let config_path = config_dir.join("config.toml");
+    crate::config::files::with_consistent_config_snapshot(&config_path, || config_source_generation_once(config_dir))
+}
+
+fn config_source_generation_once(config_dir: &Path) -> anyhow::Result<String> {
+    let config_path = config_dir.join("config.toml");
     if !config_path.is_file() {
         anyhow::bail!("session-worker config source is missing: {}", config_path.display());
     }

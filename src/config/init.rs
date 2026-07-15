@@ -89,7 +89,7 @@ impl Spec {
     }
 
     /// Generate the full configuration tree into `target_dir`.
-    pub fn generate(self, target_dir: &Path, force: bool) -> Result<()> {
+    pub async fn generate(self, target_dir: &Path, force: bool) -> Result<()> {
         // 1. Check for existing configuration
         if target_dir.join("config.toml").exists() && !force {
             bail!(
@@ -98,76 +98,70 @@ impl Spec {
             );
         }
 
-        // 2. Create directory structure
-        std::fs::create_dir_all(target_dir.join("config.d"))
-            .with_context(|| format!("Failed to create config.d in {}", target_dir.display()))?;
-        std::fs::create_dir_all(target_dir.join("workspace"))
-            .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
-
-        for subdir in &["sessions", "memory", "state", "cron", "skills"] {
-            std::fs::create_dir_all(target_dir.join("workspace").join(subdir))
-                .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
-        }
-
-        // 3. Write config.toml
-        let config_content = main_config_template(self);
-        write_config_file(&target_dir.join("config.toml"), &config_content)?;
-
-        // 4. Write config.d/*.toml (only for enabled modules)
+        // 2. Render the complete managed configuration generation.
         let modules = self.modules();
-
+        let mut fragments = Vec::new();
         if modules.memory {
-            write_config_file(&target_dir.join("config.d/memory.toml"), &memory_template(self))?;
+            fragments.push(("memory.toml".to_string(), memory_template(self)));
         }
         // Server also ships a commented-out channels scaffold even though the
         // module is disabled, so operators can opt-in without re-running init.
         if modules.channels || self == Self::Server {
-            write_config_file(&target_dir.join("config.d/channels.toml"), &channels_template(self))?;
+            fragments.push(("channels.toml".to_string(), channels_template(self)));
         }
         if modules.network {
-            write_config_file(&target_dir.join("config.d/network.toml"), &network_template(self))?;
+            fragments.push(("network.toml".to_string(), network_template(self)));
         }
         if modules.security {
-            write_config_file(&target_dir.join("config.d/security.toml"), &security_template(self))?;
+            fragments.push(("security.toml".to_string(), security_template(self)));
         }
         // Server also ships a commented-out scheduler scaffold even though the
         // module is disabled, so operators can opt-in without re-running init.
         if modules.scheduler || self == Self::Server {
-            write_config_file(&target_dir.join("config.d/scheduler.toml"), &scheduler_template(self))?;
+            fragments.push(("scheduler.toml".to_string(), scheduler_template(self)));
         }
         if modules.agent {
-            write_config_file(&target_dir.join("config.d/agent.toml"), &agent_template(self))?;
+            fragments.push(("agent.toml".to_string(), agent_template(self)));
         }
         if modules.identity {
-            write_config_file(&target_dir.join("config.d/identity.toml"), &identity_template(self))?;
+            fragments.push(("identity.toml".to_string(), identity_template(self)));
         }
         if modules.routing {
-            write_config_file(&target_dir.join("config.d/routing.toml"), &routing_template(self))?;
+            fragments.push(("routing.toml".to_string(), routing_template(self)));
         }
         if modules.tools {
-            write_config_file(&target_dir.join("config.d/tools.toml"), &tools_template(self))?;
+            fragments.push(("tools.toml".to_string(), tools_template(self)));
         }
         if modules.integrations {
-            write_config_file(
-                &target_dir.join("config.d/integrations.toml"),
-                &integrations_template(self),
-            )?;
+            fragments.push(("integrations.toml".to_string(), integrations_template(self)));
         }
         if modules.nodes {
-            write_config_file(&target_dir.join("config.d/nodes.toml"), &nodes_template(self))?;
+            fragments.push(("nodes.toml".to_string(), nodes_template(self)));
         }
         if modules.cost {
-            write_config_file(&target_dir.join("config.d/cost.toml"), &cost_template(self))?;
+            fragments.push(("cost.toml".to_string(), cost_template(self)));
         }
         if modules.observability {
-            write_config_file(
-                &target_dir.join("config.d/observability.toml"),
-                &observability_template(self),
-            )?;
+            fragments.push(("observability.toml".to_string(), observability_template(self)));
+        }
+
+        // 3. Stage and validate the complete effective configuration, including
+        // any unknown user-owned fragments, before mutating the target.
+        let config_path = target_dir.join("config.toml");
+        let workspace_dir = target_dir.join("workspace");
+        let plan = super::files::plan_mutation(&config_path, &workspace_dir, main_config_template(self), fragments)?;
+        super::files::commit_mutation_atomically(plan).await?;
+
+        // 4. Create the non-config workspace structure only after the complete
+        // configuration generation has committed.
+        std::fs::create_dir_all(&workspace_dir)
+            .with_context(|| format!("Failed to create workspace in {}", target_dir.display()))?;
+        for subdir in &["sessions", "memory", "state", "cron", "skills"] {
+            std::fs::create_dir_all(workspace_dir.join(subdir))
+                .with_context(|| format!("Failed to create workspace/{subdir} in {}", target_dir.display()))?;
         }
 
         // 5. Scaffold workspace .md files (default persona, skip existing)
-        let workspace_dir = target_dir.join("workspace");
         scaffold_workspace_defaults(&workspace_dir)?;
 
         // 6. Set directory permissions (Unix only)
@@ -1360,12 +1354,15 @@ mod tests {
         assert!(content.contains("default_model"));
     }
 
-    #[test]
-    fn generate_creates_expected_files() {
+    #[tokio::test]
+    async fn generate_creates_expected_files() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Minimal.generate(dir, false).expect("test: generate minimal");
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
 
         assert!(dir.join("config.toml").exists());
         assert!(dir.join("config.d").is_dir());
@@ -1382,12 +1379,12 @@ mod tests {
         assert!(!dir.join("config.d/network.toml").exists());
     }
 
-    #[test]
-    fn generate_full_creates_all_module_files() {
+    #[tokio::test]
+    async fn generate_full_creates_all_module_files() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Full.generate(dir, false).expect("test: generate full");
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
 
         for name in &[
             "memory.toml",
@@ -1408,8 +1405,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_templates_load_as_valid_config() {
+    #[tokio::test]
+    async fn generated_templates_load_as_valid_config() {
         // BUG-D1-03: the generated server/full templates must be loadable
         // out-of-the-box. Regression guard against illegal enum values / missing
         // required fields (compaction mode, autonomy.forbidden_paths,
@@ -1419,6 +1416,7 @@ mod tests {
             let tmp = tempfile::tempdir().expect("test: create tempdir");
             let dir = tmp.path();
             spec.generate(dir, false)
+                .await
                 .unwrap_or_else(|e| panic!("test: generate {}: {e}", spec.name()));
 
             let config_path = dir.join("config.toml");
@@ -1432,12 +1430,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generated_server_full_templates_do_not_pin_compaction_context() {
+    #[tokio::test]
+    async fn generated_server_full_templates_do_not_pin_compaction_context() {
         for spec in [Spec::Server, Spec::Full] {
             let tmp = tempfile::tempdir().expect("test: create tempdir");
             let dir = tmp.path();
             spec.generate(dir, false)
+                .await
                 .unwrap_or_else(|e| panic!("test: generate {}: {e}", spec.name()));
 
             let agent = fs::read_to_string(dir.join("config.d/agent.toml")).expect("test: read agent template");
@@ -1462,13 +1461,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn generate_refuses_overwrite_without_force() {
+    #[tokio::test]
+    async fn generate_refuses_overwrite_without_force() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Minimal.generate(dir, false).expect("test: first generate");
-        let result = Spec::Minimal.generate(dir, false);
+        Spec::Minimal.generate(dir, false).await.expect("test: first generate");
+        let result = Spec::Minimal.generate(dir, false).await;
         assert!(result.is_err());
         assert!(
             result
@@ -1478,27 +1477,67 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generate_allows_overwrite_with_force() {
+    #[tokio::test]
+    async fn generate_allows_overwrite_with_force() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Minimal.generate(dir, false).expect("test: first generate");
-        Spec::Server.generate(dir, true).expect("test: force overwrite");
+        Spec::Minimal.generate(dir, false).await.expect("test: first generate");
+        Spec::Server.generate(dir, true).await.expect("test: force overwrite");
 
         let content = fs::read_to_string(dir.join("config.toml")).expect("test: read config");
         assert!(content.contains("--spec server"));
     }
 
+    #[tokio::test]
+    async fn force_regeneration_removes_stale_managed_fragments_but_preserves_unknown() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+        let unknown = dir.join("config.d/operator-owned.toml");
+        fs::write(&unknown, "[operator_owned]\nvalue = 7\n").expect("test: write unknown fragment");
+
+        Spec::Minimal
+            .generate(dir, true)
+            .await
+            .expect("test: force regenerate minimal");
+
+        assert!(dir.join("config.d/memory.toml").exists());
+        assert!(dir.join("config.d/agent.toml").exists());
+        assert!(unknown.exists(), "unknown user-owned fragment must be preserved");
+        for stale in [
+            "channels.toml",
+            "network.toml",
+            "security.toml",
+            "scheduler.toml",
+            "identity.toml",
+            "routing.toml",
+            "tools.toml",
+            "integrations.toml",
+            "nodes.toml",
+            "cost.toml",
+            "observability.toml",
+        ] {
+            assert!(
+                !dir.join("config.d").join(stale).exists(),
+                "stale managed fragment survived force regeneration: {stale}"
+            );
+        }
+    }
+
     #[cfg(unix)]
-    #[test]
-    fn generated_files_have_restricted_permissions() {
+    #[tokio::test]
+    async fn generated_files_have_restricted_permissions() {
         use std::os::unix::fs::PermissionsExt;
 
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Minimal.generate(dir, false).expect("test: generate minimal");
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
 
         let config_perms = fs::metadata(dir.join("config.toml"))
             .expect("test: config metadata")
@@ -1508,12 +1547,12 @@ mod tests {
         assert_eq!(config_perms & 0o777, 0o600);
     }
 
-    #[test]
-    fn generate_creates_workspace_md_files() {
+    #[tokio::test]
+    async fn generate_creates_workspace_md_files() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Full.generate(dir, false).expect("test: generate full");
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
 
         let ws = dir.join("workspace");
         for name in &[
@@ -1597,12 +1636,12 @@ mod tests {
         assert!(!content.contains("\n[channels_config.telegram]\n"));
     }
 
-    #[test]
-    fn server_generate_writes_scheduler_and_channels_scaffolds() {
+    #[tokio::test]
+    async fn server_generate_writes_scheduler_and_channels_scaffolds() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Server.generate(dir, false).expect("test: generate server");
+        Spec::Server.generate(dir, false).await.expect("test: generate server");
 
         // Server preset writes commented scaffolds for the disabled modules.
         assert!(dir.join("config.d/scheduler.toml").exists());
@@ -1620,19 +1659,19 @@ mod tests {
         assert!(config.contains("channels = false"));
     }
 
-    #[test]
-    fn scaffold_skips_existing_md_files() {
+    #[tokio::test]
+    async fn scaffold_skips_existing_md_files() {
         let tmp = tempfile::tempdir().expect("test: create tempdir");
         let dir = tmp.path();
 
-        Spec::Minimal.generate(dir, false).expect("test: first generate");
+        Spec::Minimal.generate(dir, false).await.expect("test: first generate");
 
         // Write a custom SOUL.md before second generate
         let soul_path = dir.join("workspace/SOUL.md");
         fs::write(&soul_path, "# My custom soul\n").expect("test: write custom soul");
 
         // Force regenerate — config files are overwritten, but .md files should be skipped
-        Spec::Full.generate(dir, true).expect("test: force overwrite");
+        Spec::Full.generate(dir, true).await.expect("test: force overwrite");
 
         let soul = fs::read_to_string(&soul_path).expect("test: read SOUL.md");
         assert_eq!(soul, "# My custom soul\n", "existing .md files must not be overwritten");

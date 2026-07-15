@@ -12,6 +12,23 @@ openprx onboard
 openprx onboard --quick
 ```
 
+## Configuration Tree Transactions
+
+`config.toml` and the recognized files under `config.d/` form one effective
+configuration generation. PRX stages and validates the complete effective tree
+before split, merge, or `prx init --force` mutations, then publishes it through
+an odd/even `.config-generation` barrier. Runtime loaders and hot reload retry
+while a generation is being committed, so they do not accept a mixed set of
+old and new files. A failed commit restores the previous managed files before
+the stable generation is republished.
+
+`prx init --force` owns only the recognized managed fragment names. It removes
+managed files that are obsolete for the selected preset, but never deletes
+unknown operator-owned files under `config.d/`; unknown fragments remain
+fail-closed and are not loaded as configuration. A process that finds an odd
+generation left by an interrupted commit fails closed; restore the last
+known-good configuration and an even generation before restarting.
+
 ## Example Configuration
 
 ```toml
