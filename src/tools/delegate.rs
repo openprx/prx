@@ -1,5 +1,5 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, run_tool_call_loop};
+use crate::agent::loop_::{DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig};
 use crate::config::DelegateAgentConfig;
 use crate::hooks::HookManager;
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
@@ -19,6 +19,12 @@ use std::time::Duration;
 const DELEGATE_TIMEOUT_SECS: u64 = 120;
 /// Default timeout for agentic sub-agent runs.
 const DELEGATE_AGENTIC_TIMEOUT_SECS: u64 = 300;
+
+struct DelegateAgenticExecution {
+    result: ToolResult,
+    trace: Option<crate::agent::loop_::ToolLoopTrace>,
+    history_commit_len: usize,
+}
 
 /// Tool that delegates a subtask to a named agent with a different
 /// provider/model configuration. Enables multi-agent workflows where
@@ -513,10 +519,29 @@ impl Tool for DelegateTool {
             )
             .await;
         }
+        let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+            effective_provider.clone(),
+            effective_model.clone(),
+            scope
+                .as_ref()
+                .and_then(|scope| scope.owner_id.clone())
+                .unwrap_or_else(|| "owner:delegate".to_string()),
+            event_scope
+                .session_key
+                .clone()
+                .unwrap_or_else(|| format!("delegate:{delegate_run_id}")),
+            scope.as_ref().and_then(|scope| scope.source_message_event_id.clone()),
+            None,
+            "delegate",
+            u32::try_from(full_prompt.chars().count() / 4).unwrap_or(u32::MAX),
+            agent_config.agentic,
+            false,
+        );
+        let provider_started_at = chrono::Utc::now();
 
         // Agentic mode: run full tool-call loop with allowlisted tools.
         if agent_config.agentic {
-            let result = self
+            let execution = self
                 .execute_agentic(
                     agent_name,
                     agent_config,
@@ -527,8 +552,43 @@ impl Tool for DelegateTool {
                     temperature,
                     scope.as_ref(),
                 )
-                .await;
+                .await?;
+            let tool_result = execution.result;
+            let provider_outcome = execution.trace.map_or_else(
+                || {
+                    if tool_result.success {
+                        crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision(
+                            &route_decision,
+                            provider_started_at,
+                        )
+                    } else {
+                        crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                            &route_decision,
+                            provider_started_at,
+                            &anyhow::anyhow!(
+                                tool_result
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "delegate failed".to_string())
+                            ),
+                        )
+                    }
+                },
+                |trace| {
+                    crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace)
+                },
+            );
+            let result = Ok(tool_result.clone());
             if let Some(fabric) = memory_fabric.as_ref() {
+                finalize_delegate_turn(
+                    fabric,
+                    event_scope.clone(),
+                    &delegate_run_id,
+                    provider_outcome,
+                    &tool_result,
+                    execution.history_commit_len,
+                )
+                .await;
                 record_delegate_result_event(fabric, event_scope.clone(), &result).await;
                 record_delegate_terminal_task_event(
                     fabric,
@@ -543,7 +603,7 @@ impl Tool for DelegateTool {
                 )
                 .await;
             }
-            return result;
+            return Ok(tool_result);
         }
 
         // Wrap the provider call in a timeout to prevent indefinite blocking
@@ -567,6 +627,26 @@ impl Tool for DelegateTool {
                     error: Some(format!("Agent '{agent_name}' timed out after {DELEGATE_TIMEOUT_SECS}s")),
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
+                    let timeout_error = anyhow::anyhow!(
+                        tool_result
+                            .error
+                            .clone()
+                            .unwrap_or_else(|| "delegate timeout".to_string())
+                    );
+                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                        &timeout_error,
+                    );
+                    finalize_delegate_turn(
+                        fabric,
+                        event_scope.clone(),
+                        &delegate_run_id,
+                        provider_outcome,
+                        &tool_result,
+                        0,
+                    )
+                    .await;
                     record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
                     record_delegate_terminal_task_event(
                         fabric,
@@ -602,6 +682,19 @@ impl Tool for DelegateTool {
                     error: None,
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
+                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                    );
+                    finalize_delegate_turn(
+                        fabric,
+                        event_scope.clone(),
+                        &delegate_run_id,
+                        provider_outcome,
+                        &tool_result,
+                        2,
+                    )
+                    .await;
                     record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
                     record_delegate_terminal_task_event(
                         fabric,
@@ -625,6 +718,20 @@ impl Tool for DelegateTool {
                     error: Some(format!("Agent '{agent_name}' failed: {e}",)),
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
+                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                        &e,
+                    );
+                    finalize_delegate_turn(
+                        fabric,
+                        event_scope.clone(),
+                        &delegate_run_id,
+                        provider_outcome,
+                        &tool_result,
+                        0,
+                    )
+                    .await;
                     record_delegate_result_event(fabric, event_scope.clone(), &Ok(tool_result.clone())).await;
                     record_delegate_terminal_task_event(
                         fabric,
@@ -682,6 +789,52 @@ async fn record_delegate_result_event(
         .await
     {
         tracing::warn!("failed to record delegate result event: {error}");
+    }
+}
+
+async fn finalize_delegate_turn(
+    fabric: &MemoryFabric,
+    scope: MessageEventScope,
+    run_id: &str,
+    provider_outcome: crate::llm::route_decision::ProviderExecutionOutcome,
+    result: &ToolResult,
+    history_commit_len: usize,
+) {
+    let status = if result.success {
+        crate::agent::terminal::TurnTerminalStatus::Completed
+    } else {
+        crate::agent::terminal::TurnTerminalStatus::Failed
+    };
+    let summary = result
+        .error
+        .clone()
+        .unwrap_or_else(|| "delegate turn completed".to_string());
+    if let Err(error) = crate::agent::terminal::finalize_turn(
+        fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: run_id.to_string(),
+            scope,
+            status,
+            history: result.success.then(|| crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: result.output.clone(),
+                history_commit_len,
+            }),
+            history_scope: None,
+            provider_outcome: Some(provider_outcome.clone()),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary,
+                started_at: provider_outcome.started_at,
+                finished_at: provider_outcome.finished_at,
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Deferred {
+                route: "delegate_result".to_string(),
+            },
+        },
+        &crate::config::schema::CostConfig::default(),
+    )
+    .await
+    {
+        tracing::warn!(run_id, error = %error, "failed to commit delegate terminal event");
     }
 }
 
@@ -760,14 +913,18 @@ impl DelegateTool {
         full_prompt: &str,
         temperature: f64,
         scope: Option<&DelegateScope>,
-    ) -> anyhow::Result<ToolResult> {
+    ) -> anyhow::Result<DelegateAgenticExecution> {
         if agent_config.allowed_tools.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
-                )),
+            return Ok(DelegateAgenticExecution {
+                result: ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Agent '{agent_name}' has agentic=true but allowed_tools is empty"
+                    )),
+                },
+                trace: None,
+                history_commit_len: 0,
             });
         }
 
@@ -787,13 +944,17 @@ impl DelegateTool {
             .collect();
 
         if sub_tools.is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
-                    agent_config.allowed_tools.join(", ")
-                )),
+            return Ok(DelegateAgenticExecution {
+                result: ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
+                        agent_config.allowed_tools.join(", ")
+                    )),
+                },
+                trace: None,
+                history_commit_len: 0,
             });
         }
 
@@ -829,7 +990,7 @@ impl DelegateTool {
 
         let result = tokio::time::timeout(
             Duration::from_secs(DELEGATE_AGENTIC_TIMEOUT_SECS),
-            run_tool_call_loop(
+            crate::agent::loop_::run_tool_call_loop_traced(
                 provider,
                 &mut history,
                 Arc::new(sub_tools),
@@ -869,34 +1030,46 @@ impl DelegateTool {
         .await;
 
         match result {
-            Ok(Ok(response)) => {
+            Ok(Ok((response, trace))) => {
                 let rendered = if response.trim().is_empty() {
                     "[Empty response]".to_string()
                 } else {
                     response
                 };
 
-                Ok(ToolResult {
-                    success: true,
-                    output: format!(
-                        "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
-                        provider = effective_provider,
-                        model = effective_model
-                    ),
-                    error: None,
+                Ok(DelegateAgenticExecution {
+                    result: ToolResult {
+                        success: true,
+                        output: format!(
+                            "[Agent '{agent_name}' ({provider}/{model}, agentic)]\n{rendered}",
+                            provider = effective_provider,
+                            model = effective_model
+                        ),
+                        error: None,
+                    },
+                    trace: Some(trace),
+                    history_commit_len: history.len(),
                 })
             }
-            Ok(Err(e)) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Agent '{agent_name}' failed: {e}")),
+            Ok(Err(e)) => Ok(DelegateAgenticExecution {
+                result: ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Agent '{agent_name}' failed: {e}")),
+                },
+                trace: None,
+                history_commit_len: history.len(),
             }),
-            Err(_) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!(
-                    "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
-                )),
+            Err(_) => Ok(DelegateAgenticExecution {
+                result: ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Agent '{agent_name}' timed out after {DELEGATE_AGENTIC_TIMEOUT_SECS}s"
+                    )),
+                },
+                trace: None,
+                history_commit_len: history.len(),
             }),
         }
     }
@@ -1450,13 +1623,32 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].source, "delegate");
-        assert_eq!(events[0].role, "user");
-        assert_eq!(events[0].content, "delegate through fabric");
-        assert_eq!(events[1].source, "delegate");
-        assert_eq!(events[1].role, "event");
-        assert!(events[1].content.contains("tester"));
+        let request_event = events
+            .iter()
+            .find(|event| event.role == "user")
+            .expect("delegate request event");
+        let result_event = events
+            .iter()
+            .find(|event| event.role == "event" && event.content.contains("tester"))
+            .expect("delegate domain result event");
+        assert_eq!(request_event.source, "delegate");
+        assert_eq!(request_event.content, "delegate through fabric");
+        assert_eq!(result_event.source, "delegate");
+        assert_eq!(events.iter().filter(|event| event.role == "assistant").count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "provider.final_outcome")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "turn.finalized")
+                .count(),
+            1
+        );
 
         let task_events = memory
             .list_memory_events_since(
@@ -1654,9 +1846,9 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success);
-        assert!(result.output.contains("(openrouter/model-test, agentic)"));
-        assert!(result.output.contains("done"));
+        assert!(result.result.success);
+        assert!(result.result.output.contains("(openrouter/model-test, agentic)"));
+        assert!(result.result.output.contains("done"));
     }
 
     #[test]
@@ -1701,8 +1893,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("no executable tools"));
+        assert!(!result.result.success);
+        assert!(
+            result
+                .result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools")
+        );
     }
 
     #[tokio::test]
@@ -1726,9 +1925,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
+        assert!(!result.result.success);
         assert!(
             result
+                .result
                 .error
                 .as_deref()
                 .unwrap_or("")
@@ -1757,8 +1957,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("provider boom"));
+        assert!(!result.result.success);
+        assert!(result.result.error.as_deref().unwrap_or("").contains("provider boom"));
     }
 
     fn single_agent(name: &str, provider: &str, model: &str) -> HashMap<String, DelegateAgentConfig> {

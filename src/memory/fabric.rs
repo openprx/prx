@@ -242,6 +242,27 @@ impl MemoryFabric {
             .await
     }
 
+    /// Record an assistant projection with a stable idempotency key.
+    ///
+    /// Terminal finalization uses this form so a retry cannot append a second
+    /// assistant message before the terminal commit marker is observed.
+    pub async fn record_assistant_message_idempotent(
+        &self,
+        scope: MessageEventScope,
+        content: impl Into<String>,
+        idempotency_key: impl Into<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        self.record_message_event(
+            scope,
+            "assistant",
+            "message.created",
+            content,
+            Some(idempotency_key.into()),
+            None,
+        )
+        .await
+    }
+
     pub async fn record_tool_event(
         &self,
         scope: MessageEventScope,
@@ -278,6 +299,31 @@ impl MemoryFabric {
         let content = format!("{} {}", event_type, content.into());
         self.record_message_event(scope, "event", event_type, content, None, payload)
             .await
+    }
+
+    /// Append a runtime event with the caller's stable transition key.
+    pub async fn record_runtime_event_idempotent(
+        &self,
+        scope: MessageEventScope,
+        event_type: &str,
+        content: impl Into<String>,
+        raw_payload_json: Option<String>,
+        idempotency_key: impl Into<String>,
+    ) -> anyhow::Result<MessageEvent> {
+        let payload = raw_payload_json.map_or_else(
+            || Some(serde_json::json!({ "event_type": event_type }).to_string()),
+            Some,
+        );
+        let content = format!("{} {}", event_type, content.into());
+        self.record_message_event(
+            scope,
+            "event",
+            event_type,
+            content,
+            Some(idempotency_key.into()),
+            payload,
+        )
+        .await
     }
 
     pub async fn record_task_event(

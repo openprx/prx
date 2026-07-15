@@ -15,7 +15,7 @@ mod ui;
 
 use crate::agent::loop_::{
     DocumentIngestRuntime, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    run_tool_call_loop,
+    run_tool_call_loop_traced,
 };
 use crate::channels::{Channel, LinqChannel, NextcloudTalkChannel, SendMessage, SignalChannel, WhatsAppChannel};
 use crate::config::Config;
@@ -1643,7 +1643,20 @@ async fn run_gateway_chat_with_multimodal(
         source_message_event_id: None,
     };
 
-    let response = run_tool_call_loop(
+    let provider_started_at = chrono::Utc::now();
+    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        provider_label,
+        state.model.clone(),
+        runtime_envelope.resolved_owner_id(),
+        runtime_envelope.session_key.clone(),
+        runtime_envelope.source_message_event_id.clone(),
+        None,
+        "gateway_webhook",
+        u32::try_from(message.chars().count() / 4).unwrap_or(u32::MAX),
+        !state.tools_registry.is_empty(),
+        false,
+    );
+    let loop_result = run_tool_call_loop_traced(
         state.provider.as_ref(),
         &mut history,
         Arc::clone(&state.tools_registry),
@@ -1684,7 +1697,44 @@ async fn run_gateway_chat_with_multimodal(
         )),
         crate::agent::loop_::ChatMode::default(),
     )
-    .await?;
+    .await;
+    let (response, trace) = match loop_result {
+        Ok(result) => result,
+        Err(error) => {
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &error,
+            );
+            let terminal_id = runtime_envelope
+                .run_id
+                .clone()
+                .unwrap_or_else(|| provider_outcome.decision_id.clone());
+            if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
+                &fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id,
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: error.to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                },
+                &config_snapshot.cost,
+            )
+            .await
+            {
+                tracing::warn!(error = %finalize_error, "Failed to commit failed gateway terminal event");
+            }
+            return Err(error);
+        }
+    };
 
     authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:assistant", ResourceRiskLevel::Low)
         .map_err(|(_, body)| {
@@ -1696,20 +1746,56 @@ async fn run_gateway_chat_with_multimodal(
                 .to_string();
             anyhow::anyhow!(error)
         })?;
-    if let Err(error) = fabric
-        .record_assistant_message(
-            base_scope
-                .with_sender(format!("{provider_label}/{}", state.model))
-                .with_recipient(fabric_ctx.sender.clone()),
-            response.clone(),
-        )
-        .await
+    let provider_outcome =
+        crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
+    let terminal_id = runtime_envelope
+        .run_id
+        .clone()
+        .unwrap_or_else(|| provider_outcome.decision_id.clone());
+    if let Err(error) = crate::agent::terminal::finalize_turn(
+        &fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id,
+            scope: runtime_envelope.message_scope(),
+            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: response.clone(),
+                history_commit_len: history.len(),
+            }),
+            history_scope: Some(
+                base_scope
+                    .clone()
+                    .with_sender(format!("{provider_label}/{}", state.model))
+                    .with_recipient(fabric_ctx.sender.clone()),
+            ),
+            provider_outcome: Some(provider_outcome),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: "gateway webhook completed".to_string(),
+                started_at: provider_started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+        },
+        &config_snapshot.cost,
+    )
+    .await
     {
         tracing::warn!(
             channel = %fabric_ctx.channel,
             session_key = %fabric_ctx.session_key,
-            "Failed to append gateway assistant message event: {error}"
+            "Failed to commit shared gateway terminal event: {error}"
         );
+        if let Err(fallback_error) = fabric
+            .record_assistant_message(
+                base_scope
+                    .with_sender(format!("{provider_label}/{}", state.model))
+                    .with_recipient(fabric_ctx.sender.clone()),
+                response.clone(),
+            )
+            .await
+        {
+            tracing::warn!(error = %fallback_error, "Gateway assistant fallback projection also failed");
+        }
     }
     Ok(response)
 }
@@ -3733,7 +3819,8 @@ mod tests {
 
         // D4 C4: the durable session_key is now the recipient-aware canonical
         // (`gateway:webhook:client-a:prx`). Recalling by the canonical key (what
-        // the production envelope reads) returns both events.
+        // the production envelope reads) returns the request, shared terminal
+        // projections, and provider telemetry for the turn.
         let canonical_principal = MemoryPrincipal {
             workspace_id: tmp.path().to_string_lossy().to_string(),
             agent_id: None,
@@ -3749,26 +3836,45 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].source, "gateway");
-        assert_eq!(events[0].channel.as_deref(), Some("webhook"));
-        assert_eq!(events[0].role, "user");
-        assert_eq!(events[0].content, "hello gateway");
-        assert_eq!(events[0].session_key.as_deref(), Some("gateway:webhook:client-a:prx"));
+        let user_event = events
+            .iter()
+            .find(|event| event.role == "user")
+            .expect("gateway user event");
+        let assistant_event = events
+            .iter()
+            .find(|event| event.role == "assistant")
+            .expect("gateway assistant projection");
+        assert_eq!(user_event.source, "gateway");
+        assert_eq!(user_event.channel.as_deref(), Some("webhook"));
+        assert_eq!(user_event.content, "hello gateway");
+        assert_eq!(user_event.session_key.as_deref(), Some("gateway:webhook:client-a:prx"));
         let expected_digest = webhook_idempotency_digest("public", "gateway-event-1");
         assert_eq!(
-            events[0].idempotency_key.as_deref(),
+            user_event.idempotency_key.as_deref(),
             Some(format!("gateway:webhook:{expected_digest}").as_str())
         );
         assert!(
-            !events[0]
+            !user_event
                 .idempotency_key
                 .as_deref()
                 .expect("idempotency digest")
                 .contains("gateway-event-1")
         );
-        assert_eq!(events[1].role, "assistant");
-        assert_eq!(events[1].content, "ok");
+        assert_eq!(assistant_event.content, "ok");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "provider.final_outcome")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "turn.finalized")
+                .count(),
+            1
+        );
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
 
         // A principal still keyed on the legacy session_key only would NOT see the
@@ -3796,7 +3902,7 @@ mod tests {
                 .await
                 .unwrap()
                 .len(),
-            2
+            5
         );
     }
 

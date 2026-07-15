@@ -1350,6 +1350,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "openai".to_string(),
                 model: "gpt-4o-mini".to_string(),
                 prompt_tokens: 1_000,
@@ -1413,6 +1414,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
                 prompt_tokens: 1_000,
@@ -1448,6 +1450,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "openai".to_string(),
                 model: "gpt-4o-mini".to_string(),
                 prompt_tokens: 1_000,
@@ -1504,6 +1507,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "anthropic".to_string(),
                 model: "claude-sonnet-4-20250514".to_string(),
                 prompt_tokens: 1_500,
@@ -1542,6 +1546,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "other".to_string(),
                 model: "estimated-model".to_string(),
                 prompt_tokens: 0,
@@ -1582,6 +1587,7 @@ mod mode_tests {
         session
             .token_usage_records
             .push(crate::chat::session::MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "ollama".to_string(),
                 model: "llama3".to_string(),
                 prompt_tokens: 100,

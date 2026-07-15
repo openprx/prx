@@ -363,6 +363,23 @@ impl ChatSession {
         cost_config: &crate::config::schema::CostConfig,
     ) -> Option<MainSessionTokenUsageRecord> {
         let record = MainSessionTokenUsageRecord::from_provider_outcome(outcome, cost_config)?;
+        self.record_usage_settlement(record)
+    }
+
+    /// Project a metered terminal settlement into the session ledger exactly
+    /// once. Returns the inserted record, or `None` for a replay.
+    pub fn record_usage_settlement(
+        &mut self,
+        record: MainSessionTokenUsageRecord,
+    ) -> Option<MainSessionTokenUsageRecord> {
+        if let Some(settlement_id) = record.settlement_id.as_deref()
+            && self
+                .token_usage_records
+                .iter()
+                .any(|existing| existing.settlement_id.as_deref() == Some(settlement_id))
+        {
+            return None;
+        }
         self.token_usage_records.push(record.clone());
         Some(record)
     }
@@ -634,5 +651,25 @@ mod tests {
         assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Estimated);
         assert_eq!(record.total_tokens, 100);
         assert_eq!(record.cost_usd, None);
+    }
+
+    #[test]
+    fn usage_settlement_replay_is_projected_once() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("openai", "gpt-4o-mini");
+        let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            Utc::now(),
+            crate::llm::route_decision::TokenUsage::reported(Some(10), Some(5), Some(15)),
+        );
+        let mut record =
+            MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &crate::config::schema::CostConfig::default())
+                .expect("reported usage should produce a settlement");
+        record.settlement_id = Some("turn-1".to_string());
+        let mut session = ChatSession::new("openai", "gpt-4o-mini");
+
+        assert!(session.record_usage_settlement(record.clone()).is_some());
+        assert!(session.record_usage_settlement(record).is_none());
+        assert_eq!(session.token_usage_records.len(), 1);
+        assert_eq!(session.token_usage_summary().request_count, 1);
     }
 }

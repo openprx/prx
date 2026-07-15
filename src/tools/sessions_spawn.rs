@@ -1858,6 +1858,25 @@ impl Tool for SessionsSpawnTool {
         // Spawn async task (fire-and-forget); capture handle to support kill
         let jh = tokio::spawn(SPAWN_EXECUTION_CONTEXT.scope(task_execution_ctx, async move {
             tracing::info!(run_id = %rid, "Sub-agent task starting");
+            let provider_started_at = Utc::now();
+            let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+                provider_name.clone(),
+                model.clone(),
+                task_lineage
+                    .owner_id
+                    .clone()
+                    .unwrap_or_else(|| "owner:sessions-spawn".to_string()),
+                task_result_scope
+                    .session_key
+                    .clone()
+                    .unwrap_or_else(|| format!("sessions_spawn:{rid}")),
+                task_lineage.source_message_event_id.clone(),
+                None,
+                "sessions_spawn",
+                u32::try_from(task_owned.chars().count() / 4).unwrap_or(u32::MAX),
+                filtered_tools.as_ref().is_some_and(|tools| !tools.is_empty()),
+                false,
+            );
             let (run_on_delta, run_on_tool) = match run_event_streams {
                 Some((delta_tx, tool_tx)) => (Some(delta_tx), Some(tool_tx)),
                 None => (None, None),
@@ -1897,31 +1916,92 @@ impl Tool for SessionsSpawnTool {
             };
             tracing::info!(run_id = %rid, success = result.is_ok(), "Sub-agent task finished");
 
-            let (status, result_text, token_usage_records) = match result {
+            let (status, result_text, provider_outcome, terminal_status, history_projection) = match result {
                 Ok(Ok(task_result)) => {
-                    let token_usage_records = crate::llm::route_decision::MeteredTokenUsageRecord::from_parts(
-                        &provider_name,
-                        &model,
-                        &task_result.tokens_used,
-                        &cost_config,
-                    )
-                    .into_iter()
-                    .collect::<Vec<_>>();
+                    let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
+                        &route_decision,
+                        provider_started_at,
+                        task_result.trace,
+                    );
                     (
                         SubAgentStatus::Completed(task_result.output.clone()),
-                        task_result.output,
-                        token_usage_records,
+                        task_result.output.clone(),
+                        provider_outcome,
+                        crate::agent::terminal::TurnTerminalStatus::Completed,
+                        Some(crate::agent::terminal::TurnHistoryProjection {
+                            assistant_content: task_result.output,
+                            history_commit_len: task_result.history_commit_len,
+                        }),
                     )
                 }
                 Ok(Err(e)) => {
                     let msg = format!("Sub-agent error: {e}");
-                    (SubAgentStatus::Failed(e.to_string()), msg, Vec::new())
+                    (
+                        SubAgentStatus::Failed(e.to_string()),
+                        msg,
+                        crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                            &route_decision,
+                            provider_started_at,
+                            &e,
+                        ),
+                        crate::agent::terminal::TurnTerminalStatus::Failed,
+                        None,
+                    )
                 }
                 Err(_) => {
                     let msg = format!("Sub-agent timed out after {timeout_secs}s");
-                    (SubAgentStatus::Failed("timeout".into()), msg, Vec::new())
+                    let error = anyhow::anyhow!(msg.clone());
+                    (
+                        SubAgentStatus::Failed("timeout".into()),
+                        msg,
+                        crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                            &route_decision,
+                            provider_started_at,
+                            &error,
+                        ),
+                        crate::agent::terminal::TurnTerminalStatus::Failed,
+                        None,
+                    )
                 }
             };
+
+            let delivery_intent = recipient.as_ref().map_or_else(
+                || crate::agent::terminal::TurnDeliveryIntent::Deferred {
+                    route: "sessions_registry".to_string(),
+                },
+                |target| crate::agent::terminal::TurnDeliveryIntent::Reply { target: target.clone() },
+            );
+            let usage_settlement = if let Some(fabric) = task_memory_fabric.as_ref() {
+                match crate::agent::terminal::finalize_turn(
+                    fabric,
+                    crate::agent::terminal::TurnTerminalCommit {
+                        terminal_id: rid.clone(),
+                        scope: task_result_scope.clone(),
+                        status: terminal_status,
+                        history: history_projection,
+                        history_scope: None,
+                        provider_outcome: Some(provider_outcome.clone()),
+                        telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                            summary: result_text.clone(),
+                            started_at: provider_started_at,
+                            finished_at: Utc::now(),
+                        },
+                        delivery_intent,
+                    },
+                    &cost_config,
+                )
+                .await
+                {
+                    Ok(receipt) => receipt.usage_settlement,
+                    Err(error) => {
+                        tracing::warn!(run_id = %rid, error = %error, "failed to commit sessions_spawn terminal event");
+                        crate::agent::terminal::usage_settlement(&rid, &provider_outcome, &cost_config)
+                    }
+                }
+            } else {
+                crate::agent::terminal::usage_settlement(&rid, &provider_outcome, &cost_config)
+            };
+            let token_usage_records = usage_settlement.into_iter().collect::<Vec<_>>();
 
             let announce = format_announce_message(&rid, &status, &result_text);
             record_spawn_result_event(
@@ -2764,7 +2844,10 @@ fn restore_run_to_running(runs: &mut [SubAgentRun], run_id: &str) {
 
 struct SubAgentTaskResult {
     output: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     tokens_used: crate::llm::route_decision::TokenUsage,
+    trace: crate::agent::loop_::ToolLoopTrace,
+    history_commit_len: usize,
 }
 
 async fn run_sub_agent_task(
@@ -2838,9 +2921,20 @@ async fn run_sub_agent_task(
         } else {
             response
         };
+        let any_turn_had_fallback =
+            trace.attempts.len() > 1 || trace.final_provider != provider_name || trace.final_model != model;
+        let loop_trace = crate::agent::loop_::ToolLoopTrace {
+            final_provider: Some(trace.final_provider),
+            final_model: Some(trace.final_model),
+            attempts: trace.attempts,
+            any_turn_had_fallback,
+            tokens_used: trace.tokens_used.clone(),
+        };
         return Ok(SubAgentTaskResult {
             output,
             tokens_used: trace.tokens_used,
+            trace: loop_trace,
+            history_commit_len: 2,
         });
     };
 
@@ -2964,7 +3058,9 @@ async fn run_sub_agent_task(
             .await;
             let result = loop_outcome.map(|(outcome, trace)| SubAgentTaskResult {
                 output: outcome.into_text(),
-                tokens_used: trace.tokens_used,
+                tokens_used: trace.tokens_used.clone(),
+                trace,
+                history_commit_len: task_history.len(),
             });
             (task_history, result)
         });
@@ -4882,17 +4978,37 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].source, "sessions_spawn");
-        assert_eq!(events[0].role, "user");
-        assert_eq!(events[0].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
-        assert_eq!(events[0].content, "write through fabric");
-        assert_eq!(events[1].source, "sessions_spawn");
-        assert_eq!(events[1].role, "event");
-        assert_eq!(events[1].owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
-        assert!(events[1].content.contains("fabric result"));
-        let request_payload: serde_json::Value = serde_json::from_str(events[0].raw_payload_json.as_deref().unwrap())
-            .expect("request payload should be json");
+        let request_event = events
+            .iter()
+            .find(|event| event.role == "user")
+            .expect("spawn request event");
+        let result_event = events
+            .iter()
+            .find(|event| event.role == "event" && event.content.contains("fabric result"))
+            .expect("spawn domain result event");
+        assert_eq!(request_event.source, "sessions_spawn");
+        assert_eq!(request_event.owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
+        assert_eq!(request_event.content, "write through fabric");
+        assert_eq!(result_event.source, "sessions_spawn");
+        assert_eq!(result_event.owner_id.as_deref(), Some("owner:/tmp:telegram:alice"));
+        assert_eq!(events.iter().filter(|event| event.role == "assistant").count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "provider.final_outcome")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "turn.finalized")
+                .count(),
+            1
+        );
+        let request_payload: serde_json::Value =
+            serde_json::from_str(request_event.raw_payload_json.as_deref().unwrap())
+                .expect("request payload should be json");
         assert_eq!(request_payload["topic_id"].as_str(), Some("topic-1"));
         assert_eq!(request_payload["source_message_event_id"].as_str(), Some("msg-1"));
 
@@ -4927,7 +5043,7 @@ mod tests {
         assert!(
             task_events
                 .iter()
-                .all(|event| event.subject_id == events[0].run_id.as_deref().unwrap())
+                .all(|event| event.subject_id == request_event.run_id.as_deref().unwrap())
         );
         let task_payload: serde_json::Value =
             serde_json::from_str(task_events[0].payload_json.as_deref().unwrap()).unwrap();
@@ -5730,6 +5846,7 @@ mod tests {
                 session_scope_key: "test-session".to_string(),
                 spawn_depth: 0,
                 token_usage_records: vec![crate::llm::route_decision::MeteredTokenUsageRecord {
+                    settlement_id: None,
                     provider: "test-provider".to_string(),
                     model: "test-model".to_string(),
                     prompt_tokens: 1000,

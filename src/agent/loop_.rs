@@ -3560,8 +3560,8 @@ pub(crate) async fn agent_turn(
     low_priority_tool_names: Vec<String>,
     concurrency_governance: ToolConcurrencyGovernanceConfig,
     document_ingest: Option<DocumentIngestRuntime>,
-) -> Result<String> {
-    run_tool_call_loop(
+) -> Result<(String, ToolLoopTrace)> {
+    run_tool_call_loop_traced(
         provider,
         history,
         tools_registry,
@@ -5583,6 +5583,7 @@ fn shared_unrecoverable_tool_error(text: &str) -> bool {
 /// Pass `scope_ctx` to enable per-user/channel/chat_type tool access control.
 /// When `None`, no scope-based restriction is applied.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
@@ -6716,23 +6717,55 @@ async fn emit_cte_ask_approval(
     fabric_scope: &crate::memory::MessageEventScope,
     observer: &dyn Observer,
     hooks: &HookManager,
+    cost_config: &crate::config::schema::CostConfig,
     provider_name: &str,
     model_name: &str,
     session_id: &str,
     approval_msg: &str,
+    history_commit_len: usize,
     mode: &str,
 ) {
-    if let Err(error) = memory_fabric
-        .record_assistant_message(
-            fabric_scope
-                .clone()
-                .with_sender(format!("{provider_name}/{model_name}"))
-                .with_recipient("local-user"),
-            approval_msg.to_string(),
-        )
-        .await
+    if let Err(error) = crate::agent::terminal::finalize_turn(
+        memory_fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: session_id.to_string(),
+            scope: fabric_scope.clone(),
+            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: approval_msg.to_string(),
+                history_commit_len,
+            }),
+            history_scope: Some(
+                fabric_scope
+                    .clone()
+                    .with_sender(format!("{provider_name}/{model_name}"))
+                    .with_recipient("local-user"),
+            ),
+            provider_outcome: None,
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: format!("{mode} completed through CTE approval"),
+                started_at: chrono::Utc::now(),
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+        },
+        cost_config,
+    )
+    .await
     {
-        tracing::warn!(error = %error, "Failed to append CTE approval assistant message event");
+        tracing::warn!(error = %error, "Failed to commit CTE approval terminal event");
+        if let Err(fallback_error) = memory_fabric
+            .record_assistant_message(
+                fabric_scope
+                    .clone()
+                    .with_sender(format!("{provider_name}/{model_name}"))
+                    .with_recipient("local-user"),
+                approval_msg.to_string(),
+            )
+            .await
+        {
+            tracing::warn!(error = %fallback_error, "Failed to append fallback CTE approval assistant message event");
+        }
     }
     observer.record_event(&ObserverEvent::TurnComplete);
     hooks
@@ -6937,17 +6970,19 @@ pub async fn run(
         // aborts the in-flight turn instead of waiting it out. The interactive
         // branch below cannot do this because it blocks on synchronous
         // `stdin().read_line()`, which `tokio::select!` cannot poll.
+        fabric_turn_seq += 1;
+        // Keep the turn identity outside the raced future so a shutdown that
+        // drops it can still close the shared terminal boundary as Cancelled.
+        let turn_run_id = Uuid::new_v4().to_string();
+        let runtime_envelope = RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
+            .with_recipient("cli:local-user");
+        let fabric_scope = runtime_envelope
+            .message_scope()
+            .with_recipient(format!("{provider_name}/{model_name}"));
+        let cancel_turn_id = turn_run_id.clone();
+        let cancel_scope = runtime_envelope.message_scope();
+        let turn_started_at = chrono::Utc::now();
         let single_shot = async {
-            fabric_turn_seq += 1;
-            // D8-3: one run_id per turn (was per-run). Generated at the turn entry
-            // and used for both the message-event envelope and the user op-id.
-            let turn_run_id = Uuid::new_v4().to_string();
-            let runtime_envelope =
-                RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
-                    .with_recipient("cli:local-user");
-            let fabric_scope = runtime_envelope
-                .message_scope()
-                .with_recipient(format!("{provider_name}/{model_name}"));
             let agent_user_event = match memory_fabric
                 .record_inbound_user_message(
                     fabric_scope.clone(),
@@ -7034,10 +7069,12 @@ pub async fn run(
                             &fabric_scope,
                             observer.as_ref(),
                             &hooks,
+                            &config.cost,
                             provider_name,
                             model_name,
                             &turn_run_id,
                             &approval_msg,
+                            history.len() + 1,
                             "cte_ask_approval_single",
                         )
                         .await;
@@ -7061,10 +7098,23 @@ pub async fn run(
                 turn_run_id.clone(),
                 format!("agent:{turn_run_id}"),
             );
-            let response = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
+            let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+                provider_name,
+                model_name.to_string(),
+                runtime_envelope.resolved_owner_id(),
+                runtime_envelope.session_key.clone(),
+                runtime_envelope.source_message_event_id.clone(),
+                None,
+                "agent_cli_single",
+                u32::try_from(msg.chars().count() / 4).unwrap_or(u32::MAX),
+                !tools_registry.is_empty(),
+                false,
+            );
+            let provider_started_at = chrono::Utc::now();
+            let turn_result = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
                 .scope(
                     turn_spawn_ctx,
-                    run_tool_call_loop(
+                    run_tool_call_loop_traced(
                         provider.as_ref(),
                         &mut history,
                         Arc::clone(&tools_registry),
@@ -7103,18 +7153,83 @@ pub async fn run(
                         ChatMode::default(),
                     ),
                 )
-                .await?;
-            if let Err(error) = memory_fabric
-                .record_assistant_message(
-                    fabric_scope
-                        .clone()
-                        .with_sender(format!("{provider_name}/{model_name}"))
-                        .with_recipient("local-user"),
-                    response.clone(),
-                )
-                .await
+                .await;
+            let (response, turn_trace) = match turn_result {
+                Ok(result) => result,
+                Err(error) => {
+                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                        &error,
+                    );
+                    if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
+                        &memory_fabric,
+                        crate::agent::terminal::TurnTerminalCommit {
+                            terminal_id: turn_run_id.clone(),
+                            scope: runtime_envelope.message_scope(),
+                            status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                            history: None,
+                            history_scope: None,
+                            provider_outcome: Some(provider_outcome),
+                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                summary: error.to_string(),
+                                started_at: provider_started_at,
+                                finished_at: chrono::Utc::now(),
+                            },
+                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                        },
+                        &config.cost,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %finalize_error, "Failed to commit failed single-shot agent terminal event");
+                    }
+                    return Err(error);
+                }
+            };
+            let provider_outcome =
+                crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, turn_trace);
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &memory_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                    history: Some(crate::agent::terminal::TurnHistoryProjection {
+                        assistant_content: response.clone(),
+                        history_commit_len: history.len(),
+                    }),
+                    history_scope: Some(
+                        fabric_scope
+                            .clone()
+                            .with_sender(format!("{provider_name}/{model_name}"))
+                            .with_recipient("local-user"),
+                    ),
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: "single-shot agent turn completed".to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                },
+                &config.cost,
+            )
+            .await
             {
-                tracing::warn!(error = %error, "Failed to append agent assistant message event");
+                tracing::warn!(error = %error, "Failed to commit shared single-shot agent terminal event");
+                if let Err(fallback_error) = memory_fabric
+                    .record_assistant_message(
+                        fabric_scope
+                            .clone()
+                            .with_sender(format!("{provider_name}/{model_name}"))
+                            .with_recipient("local-user"),
+                        response.clone(),
+                    )
+                    .await
+                {
+                    tracing::warn!(error = %fallback_error, "Failed to append fallback single-shot agent assistant event");
+                }
             }
             increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
             final_output = response.clone();
@@ -7134,6 +7249,26 @@ pub async fn run(
         tokio::select! {
             biased;
             () = shutdown.cancelled() => {
+                if let Err(error) = crate::agent::terminal::finalize_turn(
+                    &memory_fabric,
+                    crate::agent::terminal::TurnTerminalCommit {
+                        terminal_id: cancel_turn_id,
+                        scope: cancel_scope,
+                        status: crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                        history: None,
+                        history_scope: None,
+                        provider_outcome: None,
+                        telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                            summary: "single-shot agent cancelled by shutdown signal".to_string(),
+                            started_at: turn_started_at,
+                            finished_at: chrono::Utc::now(),
+                        },
+                        delivery_intent: crate::agent::terminal::TurnDeliveryIntent::None,
+                    },
+                    &config.cost,
+                ).await {
+                    tracing::warn!(error = %error, "Failed to commit cancelled single-shot agent terminal event");
+                }
                 anyhow::bail!("agent single-shot run cancelled by shutdown signal");
             }
             result = single_shot => result?,
@@ -7329,10 +7464,12 @@ pub async fn run(
                             &fabric_scope,
                             observer.as_ref(),
                             &hooks,
+                            &config.cost,
                             provider_name,
                             model_name,
                             &turn_run_id,
                             &approval_msg,
+                            history.len() + 1,
                             "cte_ask_approval_interactive",
                         )
                         .await;
@@ -7375,10 +7512,23 @@ pub async fn run(
                 turn_run_id.clone(),
                 format!("agent:{turn_run_id}"),
             );
+            let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+                provider_name,
+                model_name.to_string(),
+                runtime_envelope.resolved_owner_id(),
+                runtime_envelope.session_key.clone(),
+                runtime_envelope.source_message_event_id.clone(),
+                None,
+                "agent_cli_interactive",
+                u32::try_from(user_input.chars().count() / 4).unwrap_or(u32::MAX),
+                !tools_registry.is_empty(),
+                false,
+            );
+            let provider_started_at = chrono::Utc::now();
             let response = match crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT
                 .scope(
                     turn_spawn_ctx,
-                    run_tool_call_loop(
+                    run_tool_call_loop_traced(
                         provider.as_ref(),
                         &mut history,
                         Arc::clone(&tools_registry),
@@ -7419,8 +7569,84 @@ pub async fn run(
                 )
                 .await
             {
-                Ok(resp) => resp,
+                Ok((response, turn_trace)) => {
+                    let provider_outcome = crate::agent::terminal::provider_outcome_from_trace(
+                        &route_decision,
+                        provider_started_at,
+                        turn_trace,
+                    );
+                    if let Err(error) = crate::agent::terminal::finalize_turn(
+                        &memory_fabric,
+                        crate::agent::terminal::TurnTerminalCommit {
+                            terminal_id: turn_run_id.clone(),
+                            scope: runtime_envelope.message_scope(),
+                            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                                assistant_content: response.clone(),
+                                history_commit_len: history.len(),
+                            }),
+                            history_scope: Some(
+                                fabric_scope
+                                    .clone()
+                                    .with_sender(format!("{provider_name}/{model_name}"))
+                                    .with_recipient("local-user"),
+                            ),
+                            provider_outcome: Some(provider_outcome),
+                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                summary: "interactive agent turn completed".to_string(),
+                                started_at: provider_started_at,
+                                finished_at: chrono::Utc::now(),
+                            },
+                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                        },
+                        &config.cost,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "Failed to commit shared interactive agent terminal event");
+                        if let Err(fallback_error) = memory_fabric
+                            .record_assistant_message(
+                                fabric_scope
+                                    .clone()
+                                    .with_sender(format!("{provider_name}/{model_name}"))
+                                    .with_recipient("local-user"),
+                                response.clone(),
+                            )
+                            .await
+                        {
+                            tracing::warn!(error = %fallback_error, "Failed to append fallback interactive agent assistant event");
+                        }
+                    }
+                    response
+                }
                 Err(e) => {
+                    let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                        &e,
+                    );
+                    if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
+                        &memory_fabric,
+                        crate::agent::terminal::TurnTerminalCommit {
+                            terminal_id: turn_run_id.clone(),
+                            scope: runtime_envelope.message_scope(),
+                            status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                            history: None,
+                            history_scope: None,
+                            provider_outcome: Some(provider_outcome),
+                            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                                summary: e.to_string(),
+                                started_at: provider_started_at,
+                                finished_at: chrono::Utc::now(),
+                            },
+                            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                        },
+                        &config.cost,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %finalize_error, "Failed to commit failed interactive agent terminal event");
+                    }
                     eprintln!("\nError: {e}\n");
                     hooks
                         .emit(HookEvent::Error, payload_error("agent-turn", &e.to_string()))
@@ -7429,18 +7655,6 @@ pub async fn run(
                 }
             };
             increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
-            if let Err(error) = memory_fabric
-                .record_assistant_message(
-                    fabric_scope
-                        .clone()
-                        .with_sender(format!("{provider_name}/{model_name}"))
-                        .with_recipient("local-user"),
-                    response.clone(),
-                )
-                .await
-            {
-                tracing::warn!(error = %error, "Failed to append agent assistant message event");
-            }
             final_output = response.clone();
             if let Err(e) = crate::channels::Channel::send(
                 &cli,
@@ -7630,7 +7844,20 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
     let mut history = vec![ChatMessage::system(&system_prompt), ChatMessage::user(&enriched)];
 
-    let response = agent_turn(
+    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        provider_name,
+        model_name.clone(),
+        runtime_envelope.resolved_owner_id(),
+        runtime_envelope.session_key.clone(),
+        runtime_envelope.source_message_event_id.clone(),
+        None,
+        "agent_process_message",
+        u32::try_from(message.chars().count() / 4).unwrap_or(u32::MAX),
+        !tools_registry.is_empty(),
+        false,
+    );
+    let provider_started_at = chrono::Utc::now();
+    let turn_result = agent_turn(
         provider.as_ref(),
         &mut history,
         Arc::clone(&tools_registry),
@@ -7659,17 +7886,82 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         },
         Some(DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)),
     )
-    .await?;
-    if let Err(error) = memory_fabric
-        .record_assistant_message(
-            fabric_scope
-                .with_sender(format!("{provider_name}/{model_name}"))
-                .with_recipient("local-user"),
-            response.clone(),
-        )
-        .await
+    .await;
+    let (response, turn_trace) = match turn_result {
+        Ok(result) => result,
+        Err(error) => {
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &error,
+            );
+            if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
+                &memory_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: agent_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: error.to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                },
+                &config.cost,
+            )
+            .await
+            {
+                tracing::warn!(error = %finalize_error, "Failed to commit failed process_message terminal event");
+            }
+            return Err(error);
+        }
+    };
+    let provider_outcome =
+        crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, turn_trace);
+    if let Err(error) = crate::agent::terminal::finalize_turn(
+        &memory_fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: agent_run_id.clone(),
+            scope: runtime_envelope.message_scope(),
+            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: response.clone(),
+                history_commit_len: history.len(),
+            }),
+            history_scope: Some(
+                fabric_scope
+                    .clone()
+                    .with_sender(format!("{provider_name}/{model_name}"))
+                    .with_recipient("local-user"),
+            ),
+            provider_outcome: Some(provider_outcome),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: "agent process_message completed".to_string(),
+                started_at: provider_started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+        },
+        &config.cost,
+    )
+    .await
     {
-        tracing::warn!(error = %error, "Failed to append process_message assistant event");
+        tracing::warn!(error = %error, "Failed to commit shared process_message terminal event");
+        if let Err(fallback_error) = memory_fabric
+            .record_assistant_message(
+                fabric_scope
+                    .with_sender(format!("{provider_name}/{model_name}"))
+                    .with_recipient("local-user"),
+                response.clone(),
+            )
+            .await
+        {
+            tracing::warn!(error = %fallback_error, "process_message assistant fallback projection also failed");
+        }
     }
     increment_recalled_useful_counts(mem.as_ref(), &mem_context.ids).await;
     hooks
@@ -12899,10 +13191,12 @@ Let me check the result."#;
                 &scope,
                 obs.as_ref(),
                 &hooks,
+                &crate::config::schema::CostConfig::default(),
                 "prov",
                 "model",
                 "run-cte-approval",
                 &approval,
+                2,
                 "cte_ask_approval_test",
             )
             .await;
@@ -12919,6 +13213,14 @@ Let me check the result."#;
                     .iter()
                     .any(|e| e.role == "assistant" && e.content.contains("high-risk")),
                 "assistant approval message must be recorded in the fabric: {events:?}"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.event_type == "turn.finalized")
+                    .count(),
+                1,
+                "CTE approval must close through the shared terminal commit: {events:?}"
             );
         }
 

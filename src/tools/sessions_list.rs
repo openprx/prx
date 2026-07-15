@@ -343,6 +343,7 @@ mod tests {
         let mut run = make_run("usage-run", SubAgentStatus::Completed("done".into()), "usage task");
         run.token_usage_records
             .push(crate::llm::route_decision::MeteredTokenUsageRecord {
+                settlement_id: None,
                 provider: "test-provider".to_string(),
                 model: "test-model".to_string(),
                 prompt_tokens: 1000,

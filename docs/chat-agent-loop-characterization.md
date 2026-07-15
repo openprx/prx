@@ -1,12 +1,13 @@
 # Chat and agent loop characterization
 
-Status: Step 7.2 routed baseline
+Status: Step 7.3 shared-terminal baseline
 
 Step 7.1 baseline commit: `e0740a468961536185c8c1ffc2a2a6411ad35152`
 
-Chat now joins the existing `agent::loop_::run_tool_call_loop_outcome` turn
-owner. Redux remains the TUI state and persistence projection, and the ordered
-Chat finalizer remains the terminal commit boundary until Step 7.3.
+Chat joins the existing `agent::loop_::run_tool_call_loop_outcome` turn owner.
+Redux remains the TUI state and persistence projection, while all production
+entry points now close through `agent::terminal::finalize_turn`. See
+`docs/shared-turn-terminal-commit.md` for the durable commit contract.
 
 ## Executable fixture
 
@@ -37,7 +38,7 @@ The fixture remains test-only and now guards the routed production path.
 | Provider-bound history | Before call two, both have roles `system,user,assistant,tool` | The shared owner writes one canonical native assistant/tool payload with call ID and content | UI success/status stays in `ToolFinished`, not provider history | Commit one canonical history projection |
 | Durable history commit | Final text is the same and one assistant result is produced | The shared owner mutates the turn-local history and returns the terminal outcome | Redux still emits `RecordAssistantTurn`; ordered Chat commit/finalizer still owns durable persistence | Replace ingress-specific terminal commit with one shared finalizer |
 | Cancellation | The same blocked call stops promptly and appends no false success | The shared owner returns `ToolLoopCancelled` | Redux maps it to exactly one `StreamCancelled`; no competing completion/failure action is emitted | Settle lease/attempt/telemetry once on cancellation |
-| Finalization | One semantic terminal result per invocation | `ToolLoopOutcome` plus `ToolLoopTrace` is the shared execution result | Chat still uses task-scoped `ProviderTurnReadyForCommit` and `ProviderTurnFinalizerEvent`; other entries finalize independently | Step 7.3 creates the cross-entry terminal commit owner |
+| Finalization | One semantic terminal result per invocation | `ToolLoopOutcome` plus `ToolLoopTrace` is the shared execution result; `agent::terminal::finalize_turn` owns the durable cross-entry close | Chat still uses task-scoped `ProviderTurnReadyForCommit` and `ProviderTurnFinalizerEvent` for ordering/domain state | Delivered: one idempotent `turn.finalized` marker and one settlement ID per turn |
 
 ## Routed source ownership snapshot
 

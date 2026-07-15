@@ -7,6 +7,7 @@ pub mod memory_loader;
 pub mod prompt;
 pub mod sanitize;
 pub mod stream_buffer;
+pub mod terminal;
 
 #[cfg(test)]
 mod tests;

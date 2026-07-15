@@ -586,6 +586,25 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
     let system_prompt = resolve_system_prompt(&manifest);
     let shared_context = load_worker_shared_context(&manifest, &config, memory.as_ref()).await;
+    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        manifest.provider_name.clone(),
+        manifest.model.clone(),
+        manifest
+            .owner_id
+            .clone()
+            .unwrap_or_else(|| "owner:session-worker".to_string()),
+        worker_event_scope
+            .session_key
+            .clone()
+            .unwrap_or_else(|| format!("session-worker:{}", manifest.run_id)),
+        manifest.source_message_event_id.clone(),
+        None,
+        "session_worker",
+        u32::try_from(manifest.task.chars().count() / 4).unwrap_or(u32::MAX),
+        !tools_registry.is_empty(),
+        false,
+    );
+    let provider_started_at = chrono::Utc::now();
 
     let run_future = async {
         let user_task = if shared_context.trim().is_empty() {
@@ -620,7 +639,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             }
             _ => None,
         };
-        run_tool_call_loop_traced(
+        let loop_result = run_tool_call_loop_traced(
             provider.as_ref(),
             &mut history,
             Arc::new(tools_registry),
@@ -660,7 +679,8 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
                 .map(|ctx| DocumentIngestRuntime::from_scope(memory.clone(), ctx)),
             crate::agent::loop_::ChatMode::default(),
         )
-        .await
+        .await;
+        (loop_result, history.len())
     };
 
     let run_future = with_manifest_spawn_context(&manifest, run_future);
@@ -671,35 +691,87 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
     } else {
         match tokio::time::timeout(std::time::Duration::from_secs(manifest.timeout_seconds), run_future).await {
             Ok(r) => r,
-            Err(_) => {
-                return Ok(WorkerResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Sub-agent timed out after {}s", manifest.timeout_seconds)),
-                    tokens_used: None,
-                });
-            }
+            Err(_) => (
+                Err(anyhow::anyhow!(
+                    "Sub-agent timed out after {}s",
+                    manifest.timeout_seconds
+                )),
+                0,
+            ),
         }
     };
 
-    let worker_result = match result {
-        Ok((output, trace)) => WorkerResult {
-            success: true,
-            output: if output.trim().is_empty() {
-                "[Sub-agent produced no output]".to_string()
-            } else {
-                output
+    let (loop_result, history_commit_len) = result;
+    let (worker_result, provider_outcome, terminal_status) = match loop_result {
+        Ok((output, trace)) => {
+            let tokens_used = trace.tokens_used.clone();
+            (
+                WorkerResult {
+                    success: true,
+                    output: if output.trim().is_empty() {
+                        "[Sub-agent produced no output]".to_string()
+                    } else {
+                        output
+                    },
+                    error: None,
+                    tokens_used: tokens_used.has_any_tokens().then_some(tokens_used),
+                },
+                crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace),
+                crate::agent::terminal::TurnTerminalStatus::Completed,
+            )
+        }
+        Err(error) => (
+            WorkerResult {
+                success: false,
+                output: String::new(),
+                error: Some(error.to_string()),
+                tokens_used: None,
             },
-            error: None,
-            tokens_used: trace.tokens_used.has_any_tokens().then_some(trace.tokens_used),
-        },
-        Err(error) => WorkerResult {
-            success: false,
-            output: String::new(),
-            error: Some(error.to_string()),
-            tokens_used: None,
-        },
+            crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &error,
+            ),
+            crate::agent::terminal::TurnTerminalStatus::Failed,
+        ),
     };
+
+    if let Err(error) = crate::agent::terminal::finalize_turn(
+        &memory_fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: manifest.run_id.clone(),
+            scope: worker_event_scope.clone(),
+            status: terminal_status,
+            history: worker_result
+                .success
+                .then(|| crate::agent::terminal::TurnHistoryProjection {
+                    assistant_content: worker_result.output.clone(),
+                    history_commit_len,
+                }),
+            history_scope: None,
+            provider_outcome: Some(provider_outcome),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: if worker_result.success {
+                    "session worker completed".to_string()
+                } else {
+                    worker_result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "session worker failed".to_string())
+                },
+                started_at: provider_started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Deferred {
+                route: "session_worker_callback".to_string(),
+            },
+        },
+        &config.cost,
+    )
+    .await
+    {
+        tracing::warn!(run_id = %manifest.run_id, error = %error, "failed to commit session-worker terminal event");
+    }
 
     let event_content = if worker_result.output.trim().is_empty() {
         worker_result

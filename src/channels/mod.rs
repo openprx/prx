@@ -1502,6 +1502,7 @@ async fn append_sender_turn(
     // assistant message events recorded for this turn carry the same run_id
     // (latent provenance, EU AI Act Art.12).
     run_id: &str,
+    record_message_event: bool,
 ) -> Option<crate::memory::MessageEvent> {
     let role = turn.role.clone();
     let content = turn.content.clone();
@@ -1567,6 +1568,9 @@ async fn append_sender_turn(
     } else {
         envelope.message_scope()
     };
+    if !record_message_event {
+        return None;
+    }
     let result = if role == "assistant" {
         fabric.record_assistant_message(scope, content).await
     } else {
@@ -2742,6 +2746,7 @@ async fn process_channel_message(
     }
 
     let started_at = Instant::now();
+    let provider_started_at = chrono::Utc::now();
 
     // ── Inbound side-effect gate (FIX-P0-10/11/12) ──────────────────────────
     // Every channel (telegram/discord/slack/signal/whatsapp/lark/qq/mattermost/
@@ -2804,6 +2809,7 @@ async fn process_channel_message(
         inbound_timestamp.as_deref(),
         Some(msg.id.as_str()),
         &turn_run_id,
+        true,
     )
     .await;
 
@@ -2985,6 +2991,7 @@ async fn process_channel_message(
                 None,
                 None,
                 &turn_run_id,
+                true,
             )
             .await;
             println!(
@@ -3019,6 +3026,18 @@ async fn process_channel_message(
     if let Some(event) = &inbound_event {
         runtime_envelope = runtime_envelope.with_source_message_event_id(event.event_id.clone());
     }
+    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        route.provider.clone(),
+        route.model.clone(),
+        runtime_envelope.resolved_owner_id(),
+        runtime_envelope.session_key.clone(),
+        runtime_envelope.source_message_event_id.clone(),
+        None,
+        "channel_reply",
+        u32::try_from(msg.content.chars().count() / 4).unwrap_or(u32::MAX),
+        !ctx.tools_registry.is_empty(),
+        true,
+    );
     let semantic_scope = runtime_envelope.memory_write_context(inferred_chat_type.to_string());
     let memory_context = build_context_with_shared_events_and_scope(
         ctx.memory.as_ref(),
@@ -3259,11 +3278,13 @@ async fn process_channel_message(
         Success {
             response: String,
             history_len_before_tools: usize,
+            trace: crate::agent::loop_::ToolLoopTrace,
         },
         /// Smart group-reply: the model chose to stay silent. No message is sent
         /// and no assistant turn is written to history.
         Silent {
             reason: String,
+            trace: crate::agent::loop_::ToolLoopTrace,
         },
         Error(anyhow::Error),
         Timeout,
@@ -3374,15 +3395,16 @@ async fn process_channel_message(
         match llm_result {
             LlmExecutionResult::Cancelled => break LlmFinalOutcome::Cancelled,
             LlmExecutionResult::Completed(result) => match *result {
-                Ok(Ok((outcome, _trace))) => match outcome {
+                Ok(Ok((outcome, trace))) => match outcome {
                     crate::agent::loop_::ToolLoopOutcome::Text(response) => {
                         break LlmFinalOutcome::Success {
                             response,
                             history_len_before_tools,
+                            trace,
                         };
                     }
                     crate::agent::loop_::ToolLoopOutcome::Silent { reason } => {
-                        break LlmFinalOutcome::Silent { reason };
+                        break LlmFinalOutcome::Silent { reason, trace };
                     }
                     // AwaitingApproval is not produced on this (None-resolver) path;
                     // treat it defensively as a no-op silent turn rather than panic.
@@ -3393,6 +3415,7 @@ async fn process_channel_message(
                         );
                         break LlmFinalOutcome::Silent {
                             reason: "unexpected awaiting-approval outcome".to_string(),
+                            trace,
                         };
                     }
                 },
@@ -3460,8 +3483,38 @@ async fn process_channel_message(
         log_worker_join_result(handle.await);
     }
 
+    let terminal_fabric = MemoryFabric::new(
+        ctx.memory.clone(),
+        ctx.workspace_dir.as_path().to_string_lossy().to_string(),
+    )
+    .with_event_recording(ctx.memory_event_recording);
+
     match final_outcome {
         LlmFinalOutcome::Cancelled => {
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: None,
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: "channel turn cancelled".to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress {
+                        reason: "cancelled".to_string(),
+                    },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit shared cancelled channel terminal event");
+            }
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
@@ -3476,6 +3529,7 @@ async fn process_channel_message(
         LlmFinalOutcome::Success {
             response,
             history_len_before_tools,
+            trace,
         } => {
             let sanitized_response = sanitize_channel_response(&response, ctx.tools_registry.as_ref());
             let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty() {
@@ -3495,6 +3549,40 @@ async fn process_channel_message(
                 format!("{tool_summary}\n{delivered_response}")
             };
 
+            let provider_outcome =
+                crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
+            let terminal_committed = match crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope().with_sender("prx"),
+                    status: crate::agent::terminal::TurnTerminalStatus::Completed,
+                    history: Some(crate::agent::terminal::TurnHistoryProjection {
+                        assistant_content: history_response.clone(),
+                        history_commit_len: history.len().saturating_add(1),
+                    }),
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: "channel turn completed".to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                        target: msg.reply_target.clone(),
+                    },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to commit shared channel terminal event");
+                    false
+                }
+            };
+
             let _ = append_sender_turn(
                 ctx.as_ref(),
                 &history_key,
@@ -3506,6 +3594,7 @@ async fn process_channel_message(
                 None,
                 None,
                 &turn_run_id,
+                !terminal_committed,
             )
             .await;
             println!(
@@ -3540,7 +3629,31 @@ async fn process_channel_message(
                 record_smart_proactive_reply(ctx.as_ref(), &msg);
             }
         }
-        LlmFinalOutcome::Silent { reason } => {
+        LlmFinalOutcome::Silent { reason, trace } => {
+            let provider_outcome =
+                crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Silent,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: reason.clone(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress { reason: reason.clone() },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit shared silent channel terminal event");
+            }
             // 🔴 Invariant: outbound suppression only happens on smart group
             // turns (`expose_stay_silent` was gated on `smart_group`, so Silent
             // can only originate there). Do NOT send and do NOT write an
@@ -3567,6 +3680,35 @@ async fn process_channel_message(
             }
         }
         LlmFinalOutcome::Error(e) => {
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &e,
+            );
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: e.to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                        target: msg.reply_target.clone(),
+                    },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit shared failed channel terminal event");
+            }
             eprintln!("  ❌ LLM error after {}ms: {e}", started_at.elapsed().as_millis());
             if let Some(channel) = target_channel.as_ref() {
                 if let Some(ref draft_id) = draft_message_id {
@@ -3592,6 +3734,36 @@ async fn process_channel_message(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
+            let timeout_error = anyhow::anyhow!(timeout_msg.clone());
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &timeout_error,
+            );
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: timeout_msg.clone(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                        target: msg.reply_target.clone(),
+                    },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit shared timeout channel terminal event");
+            }
             eprintln!("  ❌ {} (elapsed: {}ms)", timeout_msg, started_at.elapsed().as_millis());
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = "⚠️ Request timed out. Please try again shortly.";
@@ -3605,6 +3777,37 @@ async fn process_channel_message(
             }
         }
         LlmFinalOutcome::ContextOverflowExhausted => {
+            let summary = "channel context overflow exhausted";
+            let overflow_error = anyhow::anyhow!(summary);
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &overflow_error,
+            );
+            if let Err(error) = crate::agent::terminal::finalize_turn(
+                &terminal_fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id: turn_run_id.clone(),
+                    scope: runtime_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: summary.to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                        target: msg.reply_target.clone(),
+                    },
+                },
+                &crate::config::schema::CostConfig::default(),
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit shared overflow channel terminal event");
+            }
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = "Session context was too long and has been reset. Please resend your message.";
                 if let Some(ref draft_id) = draft_message_id {
@@ -6557,6 +6760,7 @@ mod tests {
             Some("2026-05-21T00:00:00Z"),
             Some("msg-1"),
             "turn-run-id-1",
+            true,
         )
         .await;
 
@@ -8894,9 +9098,9 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    /// D8-1 (E2E): a full channel turn must stamp the per-turn run_id on both the
-    /// inbound user message event and the outbound assistant message event, and
-    /// the two must share the same non-empty run_id (per-turn provenance). No
+    /// D8-1 / Step 7.3 (E2E): a full channel turn stamps the same per-turn
+    /// run_id on inbound, assistant, and shared terminal events. The finalizer
+    /// emits exactly one assistant projection and one terminal marker. No
     /// parent_run_id is set (no spawn lineage in this turn).
     #[tokio::test]
     async fn process_channel_message_stamps_per_turn_run_id_on_message_events() {
@@ -8981,10 +9185,37 @@ BTC is currently around $65,000 based on latest tool output."#
             .iter()
             .find(|e| e.role == "user")
             .expect("user message event recorded");
-        let assistant_event = events
+        let outbound_events = memory
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: tmp.path().to_string_lossy().to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: user_event.session_key.clone(),
+                    channel: Some("test-channel".to_string()),
+                    sender: Some("prx".to_string()),
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                20,
+            )
+            .await
+            .unwrap();
+        let assistant_event = outbound_events
             .iter()
             .find(|e| e.role == "assistant")
             .expect("assistant message event recorded");
+        let terminal_events = outbound_events
+            .iter()
+            .filter(|event| event.event_type == "turn.finalized")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            outbound_events.iter().filter(|event| event.role == "assistant").count(),
+            1,
+            "the shared finalizer must project one assistant event"
+        );
+        assert_eq!(terminal_events.len(), 1, "the channel turn must close once");
 
         let user_run_id = user_event.run_id.as_deref().expect("user event must carry a run_id");
         assert!(!user_run_id.is_empty(), "user run_id must be non-empty");
@@ -8992,6 +9223,11 @@ BTC is currently around $65,000 based on latest tool output."#
             assistant_event.run_id.as_deref(),
             Some(user_run_id),
             "user and assistant events of one turn must share the same run_id"
+        );
+        assert_eq!(
+            terminal_events.first().and_then(|event| event.run_id.as_deref()),
+            Some(user_run_id),
+            "the terminal marker must share the channel turn run_id"
         );
         assert!(
             user_event.parent_run_id.is_none() && assistant_event.parent_run_id.is_none(),

@@ -9575,6 +9575,7 @@ mod tests {
 
         fn record(total_tokens: u64) -> MainSessionTokenUsageRecord {
             MainSessionTokenUsageRecord {
+                settlement_id: None,
                 provider: "openai".to_string(),
                 model: "gpt-4o-mini".to_string(),
                 prompt_tokens: total_tokens / 2,

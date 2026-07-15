@@ -1927,6 +1927,7 @@ mod runtime_display_tests {
         source: crate::llm::route_decision::TokenUsageSource,
     ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
         crate::llm::route_decision::MeteredTokenUsageRecord {
+            settlement_id: None,
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
             prompt_tokens: 8_000,
@@ -2968,6 +2969,89 @@ async fn record_provider_outcome_events(
 ) -> anyhow::Result<()> {
     let sanitized = sanitize::sanitize_json_structure(outcome)?;
     record_raw_provider_outcome_events(fabric, scope, &sanitized).await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_chat_success_turn(
+    fabric: &MemoryFabric,
+    chat_session_key: &str,
+    chat_run_id: &str,
+    provider_name: &str,
+    model_name: &str,
+    route_scope: MessageEventScope,
+    provider_outcome: ProviderExecutionOutcome,
+    recorded_response: Option<String>,
+    history_commit_len: usize,
+    summary: &str,
+    cost_config: &crate::config::schema::CostConfig,
+) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+    let history = recorded_response.map(|assistant_content| crate::agent::terminal::TurnHistoryProjection {
+        assistant_content,
+        history_commit_len,
+    });
+    let history_scope = history.as_ref().map(|_| {
+        chat_message_event_scope(chat_session_key, chat_run_id, provider_name, model_name)
+            .with_sender(format!("{provider_name}/{model_name}"))
+            .with_recipient("local-user")
+    });
+    crate::agent::terminal::finalize_turn(
+        fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: chat_run_id.to_string(),
+            scope: route_scope,
+            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+            history,
+            history_scope,
+            provider_outcome: Some(provider_outcome.clone()),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: summary.to_string(),
+                started_at: provider_outcome.started_at,
+                finished_at: provider_outcome.finished_at,
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Reply {
+                target: "terminal:local-user".to_string(),
+            },
+        },
+        cost_config,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finalize_chat_non_success_turn(
+    fabric: &MemoryFabric,
+    chat_run_id: &str,
+    route_scope: MessageEventScope,
+    status: crate::agent::terminal::TurnTerminalStatus,
+    provider_outcome: Option<ProviderExecutionOutcome>,
+    started_at: chrono::DateTime<chrono::Utc>,
+    summary: &str,
+    cost_config: &crate::config::schema::CostConfig,
+) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
+    let finished_at = provider_outcome
+        .as_ref()
+        .map_or_else(chrono::Utc::now, |outcome| outcome.finished_at);
+    crate::agent::terminal::finalize_turn(
+        fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id: chat_run_id.to_string(),
+            scope: route_scope,
+            status,
+            history: None,
+            history_scope: None,
+            provider_outcome,
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: summary.to_string(),
+                started_at,
+                finished_at,
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress {
+                reason: summary.to_string(),
+            },
+        },
+        cost_config,
+    )
+    .await
 }
 
 fn sanitize_chat_semantic_memory_content(content: &str) -> String {
@@ -7293,6 +7377,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     recorded_response,
                     empty_response,
                     usage: redux_tokens_used,
+                    history_commit_len,
                     ..
                 } => {
                     if empty_response {
@@ -7312,16 +7397,31 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         if let Err(e) = terminal.cancel_draft("user", &d_id).await {
                             tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
                         }
-                        if let Err(e) =
-                            record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
+                        let terminal_usage = match finalize_chat_success_turn(
+                            &memory_fabric,
+                            &chat_session_key,
+                            &turn_run_id,
+                            provider_name,
+                            model_name,
+                            route_scope.clone(),
+                            provider_outcome.clone(),
+                            None,
+                            history_commit_len,
+                            "redux driver completed with empty response",
+                            &config.cost,
+                        )
+                        .await
                         {
-                            tracing::warn!(
-                                error = %e,
-                                "Failed to append provider.final_outcome message event for empty Redux driver turn"
-                            );
-                        }
+                            Ok(receipt) => receipt.usage_settlement,
+                            Err(error) => {
+                                tracing::warn!(error = %error, "Failed to commit shared empty Chat terminal event");
+                                crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                            }
+                        };
                         chat_session.add_user_turn(&user_input);
-                        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                        if let Some(record) =
+                            terminal_usage.and_then(|record| chat_session.record_usage_settlement(record))
+                        {
                             record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                             #[cfg(feature = "terminal-tui")]
                             {
@@ -7372,26 +7472,27 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     if let Err(e) = terminal.finalize_draft("user", &d_id, &final_text).await {
                         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
                     }
-                    if let Err(e) = record_chat_assistant_message_event(
+                    let terminal_usage = match finalize_chat_success_turn(
                         &memory_fabric,
                         &chat_session_key,
                         &turn_run_id,
                         provider_name,
                         model_name,
-                        &recorded_response,
+                        route_scope.clone(),
+                        provider_outcome.clone(),
+                        Some(recorded_response.clone()),
+                        history_commit_len,
+                        "redux driver completed",
+                        &config.cost,
                     )
                     .await
                     {
-                        tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
-                    }
-                    if let Err(e) =
-                        record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await
-                    {
-                        tracing::warn!(
-                            error = %e,
-                            "Failed to append provider.final_outcome message event for Redux driver turn"
-                        );
-                    }
+                        Ok(receipt) => receipt.usage_settlement,
+                        Err(error) => {
+                            tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
+                            crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                        }
+                    };
                     let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
                     crate::runtime::control_ladder::append_provider_outcome_trace(
                         std::path::Path::new(&config.workspace_dir),
@@ -7414,7 +7515,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     // so this only backs the slash commands and never double-writes.
                     chat_session.add_user_turn(&user_input);
                     chat_session.add_assistant_turn(&recorded_response, Vec::new());
-                    if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+                    if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record))
+                    {
                         record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                         #[cfg(feature = "terminal-tui")]
                         {
@@ -7445,6 +7547,25 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     let _ = final_text;
                 }
                 ProviderTurnTerminalPlan::Failed { err, .. } => {
+                    let failed_outcome = ProviderExecutionOutcome::failed_for_decision(
+                        &route_decision,
+                        provider_started_at,
+                        &anyhow::anyhow!(err.clone()),
+                    );
+                    if let Err(error) = finalize_chat_non_success_turn(
+                        &memory_fabric,
+                        &turn_run_id,
+                        route_scope.clone(),
+                        crate::agent::terminal::TurnTerminalStatus::Failed,
+                        Some(failed_outcome),
+                        provider_started_at,
+                        &format!("redux driver failed: {err}"),
+                        &config.cost,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
+                    }
                     // reducer NotifyHook(Error) 已发；这里不再 hooks.emit 避免双发.
                     #[cfg(feature = "terminal-tui")]
                     let interactive_tui_active = redraw_tx_for_main.is_some();
@@ -7471,6 +7592,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     publish_provider_worker_status(&chat_dispatcher, &provider_turn_workers);
                 }
                 ProviderTurnTerminalPlan::Cancelled { .. } => {
+                    if let Err(error) = finalize_chat_non_success_turn(
+                        &memory_fabric,
+                        &turn_run_id,
+                        route_scope.clone(),
+                        crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                        None,
+                        provider_started_at,
+                        "redux driver cancelled",
+                        &config.cost,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
+                    }
                     if let Some(ref id) = draft_id {
                         let _ = terminal.cancel_draft("user", id).await;
                     }
@@ -7829,6 +7964,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         "chat.stream_cancelled",
                     );
                 }
+                if let Err(error) = finalize_chat_non_success_turn(
+                    &memory_fabric,
+                    &turn_run_id,
+                    route_scope.clone(),
+                    crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                    None,
+                    provider_started_at,
+                    "legacy tool loop cancelled",
+                    &config.cost,
+                )
+                .await
+                {
+                    tracing::warn!(error = %error, "Failed to commit shared cancelled Chat terminal event");
+                }
             }
             TurnOutcome::FailedWithError { err, retryable } => {
                 if let Some(ref d_id) = draft_id {
@@ -7854,10 +8003,19 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 let failure = anyhow::anyhow!("{err}");
                 let failed_outcome =
                     ProviderExecutionOutcome::failed_for_decision(&route_decision, provider_started_at, &failure);
-                if let Err(e) =
-                    record_provider_outcome_events(&memory_fabric, route_scope.clone(), &failed_outcome).await
+                if let Err(error) = finalize_chat_non_success_turn(
+                    &memory_fabric,
+                    &turn_run_id,
+                    route_scope.clone(),
+                    crate::agent::terminal::TurnTerminalStatus::Failed,
+                    Some(failed_outcome.clone()),
+                    provider_started_at,
+                    &format!("legacy tool loop failed: {err}"),
+                    &config.cost,
+                )
+                .await
                 {
-                    tracing::warn!(error = %e, "Failed to append provider.final_outcome message event for failed turn");
+                    tracing::warn!(error = %error, "Failed to commit shared failed Chat terminal event");
                 }
                 surface_turn_elapsed_message(
                     &chat_dispatcher,
@@ -7945,9 +8103,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 )
             }
         };
-        if let Err(e) = record_provider_outcome_events(&memory_fabric, route_scope.clone(), &provider_outcome).await {
-            tracing::warn!(error = %e, "Failed to append provider.final_outcome message event");
-        }
         surface_turn_elapsed_message(
             &chat_dispatcher,
             sessions_redraw_handle.as_ref(),
@@ -8004,6 +8159,27 @@ Retry with a compatible model: /provider {new_provider} <model>"
         let response = sanitize_channel_response(&response, &tools_registry);
 
         if crate::agent::loop_::is_empty_assistant_response(&response, false) {
+            let terminal_usage = match finalize_chat_success_turn(
+                &memory_fabric,
+                &chat_session_key,
+                &turn_run_id,
+                provider_name,
+                model_name,
+                route_scope.clone(),
+                provider_outcome.clone(),
+                None,
+                history.len(),
+                "legacy tool loop completed with empty response",
+                &config.cost,
+            )
+            .await
+            {
+                Ok(receipt) => receipt.usage_settlement,
+                Err(error) => {
+                    tracing::warn!(error = %error, "Failed to commit shared empty Chat terminal event");
+                    crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+                }
+            };
             if let Some(ref d_id) = draft_id {
                 let _ = chat_dispatcher.dispatch_or_log(
                     crate::chat::action::Action::StreamCompleted {
@@ -8024,7 +8200,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             );
 
             chat_session.add_user_turn(&user_input);
-            if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+            if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
                 record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
                 #[cfg(feature = "terminal-tui")]
                 {
@@ -8073,18 +8249,27 @@ Retry with a compatible model: /provider {new_provider} <model>"
             continue;
         }
 
-        if let Err(e) = record_chat_assistant_message_event(
+        let terminal_usage = match finalize_chat_success_turn(
             &memory_fabric,
             &chat_session_key,
             &turn_run_id,
             provider_name,
             model_name,
-            &response,
+            route_scope.clone(),
+            provider_outcome.clone(),
+            Some(response.clone()),
+            history.len().saturating_add(1),
+            "legacy tool loop completed",
+            &config.cost,
         )
         .await
         {
-            tracing::warn!(error = %e, "Failed to append chat assistant message event");
-        }
+            Ok(receipt) => receipt.usage_settlement,
+            Err(error) => {
+                tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
+                crate::agent::terminal::usage_settlement(&turn_run_id, &provider_outcome, &config.cost)
+            }
+        };
 
         // ── Extract tool context summary for LLM awareness on next turn ──
         let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
@@ -8198,7 +8383,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // backs the slash commands that read from `chat_session`.
         chat_session.add_user_turn(&user_input);
         chat_session.add_assistant_turn(&response, Vec::new());
-        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+        if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
             record_provider_turn_usage(&mut turn_scheduler, provider_turn_task_id, &record);
             #[cfg(feature = "terminal-tui")]
             {
@@ -9551,6 +9736,7 @@ async fn commit_completed_provider_turn(
         recorded_response,
         empty_response,
         usage: redux_tokens_used,
+        history_commit_len,
         ..
     } = pending_commit.terminal_plan
     else {
@@ -9567,6 +9753,31 @@ async fn commit_completed_provider_turn(
         pending.provider_started_at,
         redux_tokens_used.clone(),
     );
+    let terminal_usage = match finalize_chat_success_turn(
+        memory_fabric,
+        chat_session_key,
+        &pending.turn_run_id,
+        &pending.provider_name,
+        &pending.model_name,
+        pending.route_scope.clone(),
+        provider_outcome.clone(),
+        (!empty_response).then(|| recorded_response.clone()),
+        history_commit_len,
+        if empty_response {
+            "redux driver completed with empty response"
+        } else {
+            "redux driver completed"
+        },
+        &config.cost,
+    )
+    .await
+    {
+        Ok(receipt) => receipt.usage_settlement,
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to commit shared Chat terminal event");
+            crate::agent::terminal::usage_settlement(&pending.turn_run_id, &provider_outcome, &config.cost)
+        }
+    };
     history.push(pending.history_user_message.clone());
     if empty_response {
         if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
@@ -9581,16 +9792,8 @@ async fn commit_completed_provider_turn(
             &reasoning,
             empty_response,
         );
-        if let Err(e) =
-            record_provider_outcome_events(memory_fabric, pending.route_scope.clone(), &provider_outcome).await
-        {
-            tracing::warn!(
-                error = %e,
-                "Failed to append provider.final_outcome message event for empty Redux driver turn"
-            );
-        }
         chat_session.add_user_turn(&pending.user_input);
-        if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+        if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
             record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
             chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
             let _ = chat_dispatcher.dispatch_or_log(
@@ -9630,25 +9833,6 @@ async fn commit_completed_provider_turn(
         &reasoning,
         empty_response,
     );
-    if let Err(e) = record_chat_assistant_message_event(
-        memory_fabric,
-        chat_session_key,
-        &pending.turn_run_id,
-        &pending.provider_name,
-        &pending.model_name,
-        &recorded_response,
-    )
-    .await
-    {
-        tracing::warn!(error = %e, "Failed to append Redux driver chat assistant message event");
-    }
-    if let Err(e) = record_provider_outcome_events(memory_fabric, pending.route_scope.clone(), &provider_outcome).await
-    {
-        tracing::warn!(
-            error = %e,
-            "Failed to append provider.final_outcome message event for Redux driver turn"
-        );
-    }
     let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
     crate::runtime::control_ladder::append_provider_outcome_trace(
         std::path::Path::new(&config.workspace_dir),
@@ -9660,7 +9844,7 @@ async fn commit_completed_provider_turn(
     );
     chat_session.add_user_turn(&pending.user_input);
     chat_session.add_assistant_turn(&recorded_response, Vec::new());
-    if let Some(record) = chat_session.record_provider_usage(&provider_outcome, &config.cost) {
+    if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
         record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
         chat_mirror.lock().token_usage_summary = chat_session.token_usage_summary();
         let _ = chat_dispatcher.dispatch_or_log(
@@ -9835,6 +10019,25 @@ async fn finalize_per_turn_context(
             }
         }
         ProviderTurnTerminalPlan::Failed { err, .. } => {
+            let failed_outcome = ProviderExecutionOutcome::failed_for_decision(
+                &pending.route_decision,
+                pending.provider_started_at,
+                &anyhow::anyhow!(err.clone()),
+            );
+            if let Err(error) = finalize_chat_non_success_turn(
+                memory_fabric,
+                &pending.turn_run_id,
+                pending.route_scope.clone(),
+                crate::agent::terminal::TurnTerminalStatus::Failed,
+                Some(failed_outcome),
+                pending.provider_started_at,
+                &format!("redux driver failed: {err}"),
+                &config.cost,
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit ordered failed Chat terminal event");
+            }
             let interactive_tui_active = redraw_tx_for_main.is_some();
             if !interactive_tui_active {
                 let _ = terminal.cancel_draft("user", &pending.draft_id).await;
@@ -9854,6 +10057,20 @@ async fn finalize_per_turn_context(
             publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
         }
         ProviderTurnTerminalPlan::Cancelled { .. } => {
+            if let Err(error) = finalize_chat_non_success_turn(
+                memory_fabric,
+                &pending.turn_run_id,
+                pending.route_scope.clone(),
+                crate::agent::terminal::TurnTerminalStatus::Cancelled,
+                None,
+                pending.provider_started_at,
+                "redux driver cancelled",
+                &config.cost,
+            )
+            .await
+            {
+                tracing::warn!(error = %error, "Failed to commit ordered cancelled Chat terminal event");
+            }
             let _ = terminal.cancel_draft("user", &pending.draft_id).await;
             rollback_cancelled_turn_history(history, pending.history_len_before_user_turn);
             publish_main_queue_status(chat_dispatcher, turn_scheduler);
@@ -19986,6 +20203,7 @@ mod v4_reload_recap_tests {
 
     fn usage_record() -> MeteredTokenUsageRecord {
         MeteredTokenUsageRecord {
+            settlement_id: None,
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
             prompt_tokens: 100,

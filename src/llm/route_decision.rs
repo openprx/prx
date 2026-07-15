@@ -157,6 +157,10 @@ pub struct TokenUsage {
 /// display cost. Shared by main chat sessions and sub-agent sessions.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct MeteredTokenUsageRecord {
+    /// Stable turn settlement identifier. Legacy records have no value; the
+    /// shared terminal finalizer always supplies one so projections can dedup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_id: Option<String>,
     pub provider: String,
     pub model: String,
     pub prompt_tokens: u64,
@@ -219,6 +223,7 @@ impl MeteredTokenUsageRecord {
         );
 
         Some(Self {
+            settlement_id: None,
             provider: provider.to_string(),
             model: model.to_string(),
             prompt_tokens,
@@ -934,7 +939,13 @@ pub async fn record_provider_outcome_events(
             outcome.decision_id, attempt.seq, attempt.provider, attempt.model
         );
         fabric
-            .record_runtime_event(scope.clone(), event_type, content, Some(payload))
+            .record_runtime_event_idempotent(
+                scope.clone(),
+                event_type,
+                content,
+                Some(payload),
+                format!("provider:{}:attempt:{}", outcome.decision_id, attempt.seq),
+            )
             .await?;
     }
     let payload = serde_json::to_string(outcome)?;
@@ -946,7 +957,13 @@ pub async fn record_provider_outcome_events(
         outcome.attempts.len()
     );
     fabric
-        .record_runtime_event(scope, "provider.final_outcome", content, Some(payload))
+        .record_runtime_event_idempotent(
+            scope,
+            "provider.final_outcome",
+            content,
+            Some(payload),
+            format!("provider:{}:final", outcome.decision_id),
+        )
         .await?;
     Ok(())
 }

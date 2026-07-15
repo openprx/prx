@@ -1046,6 +1046,7 @@ mod tests {
         source: crate::llm::route_decision::TokenUsageSource,
     ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
         crate::llm::route_decision::MeteredTokenUsageRecord {
+            settlement_id: None,
             provider: "openai".to_string(),
             model: "gpt-4o-mini".to_string(),
             prompt_tokens: 8_000,

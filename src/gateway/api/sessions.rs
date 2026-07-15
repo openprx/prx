@@ -1,7 +1,7 @@
 use super::{AppState, extract_resource_auth_token};
 use crate::agent::loop_::{
     DocumentIngestRuntime, ScopeContext, ToolConcurrencyGovernanceConfig, build_context_with_shared_events_and_scope,
-    build_runtime_system_prompt, run_tool_call_loop, select_prompt_skills,
+    build_runtime_system_prompt, run_tool_call_loop_traced, select_prompt_skills,
 };
 use crate::memory::MemoryFabric;
 use crate::observability::NoopObserver;
@@ -161,16 +161,21 @@ async fn append_console_turn(
     envelope: &RuntimeEnvelope,
     role: &str,
     content: &str,
+    record_message_event: bool,
 ) -> anyhow::Result<String> {
-    let fabric = MemoryFabric::new(state.mem.clone(), envelope.workspace_id.clone());
-    let event = if role == "assistant" {
-        fabric
-            .record_assistant_message(envelope.message_scope(), content)
-            .await?
+    let event = if record_message_event {
+        let fabric = MemoryFabric::new(state.mem.clone(), envelope.workspace_id.clone());
+        Some(if role == "assistant" {
+            fabric
+                .record_assistant_message(envelope.message_scope(), content)
+                .await?
+        } else {
+            fabric
+                .record_inbound_user_message(envelope.message_scope(), content, None, None)
+                .await?
+        })
     } else {
-        fabric
-            .record_inbound_user_message(envelope.message_scope(), content, None, None)
-            .await?
+        None
     };
     let owner_id = envelope.resolved_owner_id();
 
@@ -183,12 +188,21 @@ async fn append_console_turn(
             role,
             content,
             None,
-            Some(&event.event_id),
+            event.as_ref().map(|event| event.event_id.as_str()),
             Some(owner_id.as_str()),
         )
         .await?;
 
-    Ok(event.event_id)
+    Ok(event.map_or_else(String::new, |event| event.event_id))
+}
+
+struct ConsoleTurnResult {
+    reply: String,
+    trace: crate::agent::loop_::ToolLoopTrace,
+    route_decision: crate::llm::route_decision::RouteDecision,
+    provider_started_at: chrono::DateTime<chrono::Utc>,
+    history_commit_len: usize,
+    envelope: RuntimeEnvelope,
 }
 
 fn console_tool_descriptions(config: &crate::config::Config) -> Vec<(&'static str, &'static str)> {
@@ -217,7 +231,7 @@ async fn run_console_runtime_turn(
     visible_message: &str,
     previous_turns: Vec<crate::memory::ConversationTurn>,
     source_message_event_id: Option<String>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<ConsoleTurnResult> {
     // D2: this runtime turn rebuilds a `SecurityPolicy` (below) that gates tool
     // side-effects for the turn, so the config snapshot it derives from MUST be the
     // hot SharedConfig (D), not the cached `state.config` Mutex (C). Reading D here
@@ -249,10 +263,14 @@ async fn run_console_runtime_turn(
         state.tools_registry.as_ref(),
     );
 
-    let semantic_scope = envelope.memory_write_context("private");
+    let mut turn_envelope = envelope.clone().with_run_id(uuid::Uuid::new_v4().to_string());
+    if let Some(event_id) = source_message_event_id.as_ref() {
+        turn_envelope = turn_envelope.with_source_message_event_id(event_id.clone());
+    }
+    let semantic_scope = turn_envelope.memory_write_context("private");
     let mem_context = build_context_with_shared_events_and_scope(
         state.mem.as_ref(),
-        envelope.memory_principal(),
+        turn_envelope.memory_principal(),
         visible_message,
         config_snapshot.memory.min_relevance_score,
         Some(&semantic_scope),
@@ -279,21 +297,34 @@ async fn run_console_runtime_turn(
     // `config_snapshot` is already the hot SharedConfig (D) snapshot (see above), so
     // a reloaded autonomy / security.audit gates this console turn without a restart.
     let security = crate::runtime::bootstrap::build_security_policy(&config_snapshot);
-    let scope_owner_id = envelope.resolved_owner_id();
+    let scope_owner_id = turn_envelope.resolved_owner_id();
     let scope_ctx = ScopeContext {
         policy: security.as_ref(),
-        sender: envelope.sender.as_deref().unwrap_or("console-user"),
-        channel: envelope.channel.as_deref().unwrap_or("console"),
+        sender: turn_envelope.sender.as_deref().unwrap_or("console-user"),
+        channel: turn_envelope.channel.as_deref().unwrap_or("console"),
         chat_type: "private",
-        chat_id: &envelope.session_key,
+        chat_id: &turn_envelope.session_key,
         owner_id: Some(&scope_owner_id),
-        topic_id: envelope.topic_id.as_deref(),
-        task_id: envelope.resolved_task_id(),
-        source_message_event_id: envelope.source_message_event_id.as_deref(),
+        topic_id: turn_envelope.topic_id.as_deref(),
+        task_id: turn_envelope.resolved_task_id(),
+        source_message_event_id: turn_envelope.source_message_event_id.as_deref(),
     };
     let noop_observer = NoopObserver;
 
-    run_tool_call_loop(
+    let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
+        provider_label.clone(),
+        state.model.clone(),
+        scope_owner_id.clone(),
+        turn_envelope.session_key.clone(),
+        source_message_event_id.clone(),
+        None,
+        "console_message",
+        u32::try_from(visible_message.chars().count() / 4).unwrap_or(u32::MAX),
+        !state.tools_registry.is_empty(),
+        false,
+    );
+    let provider_started_at = chrono::Utc::now();
+    let loop_result = run_tool_call_loop_traced(
         state.provider.as_ref(),
         &mut history,
         std::sync::Arc::clone(&state.tools_registry),
@@ -329,12 +360,58 @@ async fn run_console_runtime_turn(
         None,
         Some(&config_snapshot.tool_tiering),
         Some(
-            DocumentIngestRuntime::from_envelope(state.mem.clone(), envelope)
+            DocumentIngestRuntime::from_envelope(state.mem.clone(), &turn_envelope)
                 .with_source_message_event_id(source_message_event_id),
         ),
         crate::agent::loop_::ChatMode::default(),
     )
-    .await
+    .await;
+    let (reply, trace) = match loop_result {
+        Ok(result) => result,
+        Err(error) => {
+            let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(
+                &route_decision,
+                provider_started_at,
+                &error,
+            );
+            let terminal_id = turn_envelope
+                .run_id
+                .clone()
+                .unwrap_or_else(|| provider_outcome.decision_id.clone());
+            let fabric = MemoryFabric::new(state.mem.clone(), turn_envelope.workspace_id.clone());
+            if let Err(finalize_error) = crate::agent::terminal::finalize_turn(
+                &fabric,
+                crate::agent::terminal::TurnTerminalCommit {
+                    terminal_id,
+                    scope: turn_envelope.message_scope(),
+                    status: crate::agent::terminal::TurnTerminalStatus::Failed,
+                    history: None,
+                    history_scope: None,
+                    provider_outcome: Some(provider_outcome),
+                    telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                        summary: error.to_string(),
+                        started_at: provider_started_at,
+                        finished_at: chrono::Utc::now(),
+                    },
+                    delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+                },
+                &config_snapshot.cost,
+            )
+            .await
+            {
+                tracing::warn!(error = %finalize_error, "Failed to commit failed console terminal event");
+            }
+            return Err(error);
+        }
+    };
+    Ok(ConsoleTurnResult {
+        reply,
+        trace,
+        route_decision,
+        provider_started_at,
+        history_commit_len: history.len(),
+        envelope: turn_envelope,
+    })
 }
 
 fn sanitize_upload_filename(raw_name: &str) -> String {
@@ -729,7 +806,7 @@ pub async fn post_session_message(
         return error.into_response();
     }
 
-    let user_message_event_id = match append_console_turn(&state, &runtime_envelope, "user", &message).await {
+    let user_message_event_id = match append_console_turn(&state, &runtime_envelope, "user", &message, true).await {
         Ok(event_id) => event_id,
         Err(error) => {
             tracing::error!("Failed to persist user session turn: {error}");
@@ -741,9 +818,9 @@ pub async fn post_session_message(
         }
     };
 
-    let reply =
+    let turn =
         match run_console_runtime_turn(&state, &runtime_envelope, &message, turns, Some(user_message_event_id)).await {
-            Ok(reply) => reply,
+            Ok(turn) => turn,
             Err(error) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -754,6 +831,7 @@ pub async fn post_session_message(
                     .into_response();
             }
         };
+    let reply = turn.reply.clone();
 
     if let Err(error) =
         super::authorize_resource_mutation(&state, "gateway_api:sessions:assistant_message", ResourceRiskLevel::Low)
@@ -761,7 +839,46 @@ pub async fn post_session_message(
         return error.into_response();
     }
 
-    if let Err(error) = append_console_turn(&state, &runtime_envelope, "assistant", &reply).await {
+    let provider_outcome =
+        crate::agent::terminal::provider_outcome_from_trace(&turn.route_decision, turn.provider_started_at, turn.trace);
+    let terminal_id = turn
+        .envelope
+        .run_id
+        .clone()
+        .unwrap_or_else(|| provider_outcome.decision_id.clone());
+    let terminal_fabric = MemoryFabric::new(state.mem.clone(), turn.envelope.workspace_id.clone());
+    let cost_config = state.shared_config.load().cost.clone();
+    let terminal_committed = match crate::agent::terminal::finalize_turn(
+        &terminal_fabric,
+        crate::agent::terminal::TurnTerminalCommit {
+            terminal_id,
+            scope: turn.envelope.message_scope(),
+            status: crate::agent::terminal::TurnTerminalStatus::Completed,
+            history: Some(crate::agent::terminal::TurnHistoryProjection {
+                assistant_content: reply.clone(),
+                history_commit_len: turn.history_commit_len,
+            }),
+            history_scope: None,
+            provider_outcome: Some(provider_outcome),
+            telemetry: crate::agent::terminal::TurnTerminalTelemetry {
+                summary: "console turn completed".to_string(),
+                started_at: turn.provider_started_at,
+                finished_at: chrono::Utc::now(),
+            },
+            delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
+        },
+        &cost_config,
+    )
+    .await
+    {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::warn!(error = %error, "Failed to commit shared console terminal event");
+            false
+        }
+    };
+
+    if let Err(error) = append_console_turn(&state, &turn.envelope, "assistant", &reply, !terminal_committed).await {
         tracing::error!("Failed to persist assistant session turn: {error}");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1040,7 +1157,7 @@ mod tests {
             message_id: Some("previous-event".to_string()),
         }];
 
-        let reply = run_console_runtime_turn(
+        let turn = run_console_runtime_turn(
             &state,
             &envelope,
             "current question",
@@ -1050,7 +1167,7 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(reply, "console-runtime-ok");
+        assert_eq!(turn.reply, "console-runtime-ok");
         let requests = provider_impl.requests.lock();
         assert_eq!(requests.len(), 1);
         let history = requests.first().expect("request should be recorded");
