@@ -61,14 +61,23 @@ pub const RATE_LIMIT_WINDOW_SECS: u64 = 60;
 pub const RATE_LIMIT_MAX_KEYS_DEFAULT: usize = 10_000;
 /// Fallback max distinct idempotency keys retained in gateway memory.
 pub const IDEMPOTENCY_MAX_KEYS_DEFAULT: usize = 10_000;
+/// Maximum accepted idempotency-key header length.
+const IDEMPOTENCY_MAX_KEY_BYTES: usize = 256;
+/// Maximum replay payload retained for one successful request.
+const IDEMPOTENCY_MAX_REPLAY_BYTES: usize = 1024 * 1024;
+/// Process-wide payload budget reserved by in-flight and successful requests.
+const IDEMPOTENCY_REPLAY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// Upper bound on how long the gateway waits for in-flight requests to drain
 /// after a shutdown signal before forcing exit (D5/D9 step 3). Gateway-local on
 /// purpose: `main.rs`'s private `RUNTIME_SHUTDOWN_TIMEOUT` is unreachable from
 /// the lib crate.
 const GATEWAY_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
 
-fn webhook_memory_key() -> String {
-    format!("webhook_msg_{}", Uuid::new_v4())
+fn webhook_memory_key(idempotency_digest: Option<&str>) -> String {
+    idempotency_digest.map_or_else(
+        || format!("webhook_msg_{}", Uuid::new_v4()),
+        |digest| format!("webhook_msg_{digest}"),
+    )
 }
 
 fn whatsapp_memory_key(msg: &crate::channels::traits::ChannelMessage) -> String {
@@ -269,7 +278,123 @@ impl GatewayRateLimiter {
 pub struct IdempotencyStore {
     ttl: Duration,
     max_keys: usize,
-    keys: Mutex<HashMap<String, Instant>>,
+    state: Mutex<IdempotencyStoreState>,
+}
+
+#[derive(Debug, Default)]
+struct IdempotencyStoreState {
+    entries: HashMap<String, IdempotencyEntry>,
+    next_generation: u64,
+    payload_bytes: usize,
+}
+
+#[derive(Debug)]
+enum IdempotencyEntry {
+    Processing {
+        generation: u64,
+        request_fingerprint: [u8; 32],
+        reserved_bytes: usize,
+    },
+    Succeeded {
+        request_fingerprint: [u8; 32],
+        completed_at: Instant,
+        response_id: Uuid,
+        result_hash: String,
+        replay: Option<IdempotencyReplay>,
+    },
+    Failed {
+        request_fingerprint: [u8; 32],
+        failed_at: Instant,
+        retry_eligible: bool,
+    },
+}
+
+impl IdempotencyEntry {
+    const fn request_fingerprint(&self) -> &[u8; 32] {
+        match self {
+            Self::Processing {
+                request_fingerprint, ..
+            }
+            | Self::Succeeded {
+                request_fingerprint, ..
+            }
+            | Self::Failed {
+                request_fingerprint, ..
+            } => request_fingerprint,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct IdempotencyReplay {
+    response_id: Uuid,
+    response: Arc<str>,
+    model: Arc<str>,
+}
+
+impl IdempotencyReplay {
+    fn payload_bytes(&self) -> usize {
+        self.response.len().saturating_add(self.model.len())
+    }
+
+    fn json_body(&self) -> serde_json::Value {
+        serde_json::json!({
+            "status": "duplicate",
+            "idempotent": true,
+            "response": self.response.as_ref(),
+            "model": self.model.as_ref(),
+            "response_id": self.response_id.to_string(),
+        })
+    }
+}
+
+#[derive(Debug)]
+enum IdempotencyClaimOutcome {
+    Acquired(IdempotencyClaim),
+    Processing,
+    Replay(IdempotencyReplay),
+    ReplayUnavailable { response_id: Uuid, result_hash: String },
+    RequestConflict,
+    RetryUnavailable,
+    AtCapacity,
+}
+
+#[derive(Debug)]
+struct IdempotencyClaim {
+    store: Arc<IdempotencyStore>,
+    key_digest: String,
+    generation: u64,
+    armed: bool,
+}
+
+impl IdempotencyClaim {
+    fn succeed(mut self, replay: IdempotencyReplay, result_hash: String) -> bool {
+        let transitioned = self
+            .store
+            .complete_if_owner(&self.key_digest, self.generation, replay, result_hash);
+        if transitioned {
+            self.armed = false;
+        }
+        transitioned
+    }
+
+    fn fail(mut self, retry_eligible: bool) -> bool {
+        let transitioned = self
+            .store
+            .fail_if_owner(&self.key_digest, self.generation, retry_eligible);
+        if transitioned {
+            self.armed = false;
+        }
+        transitioned
+    }
+}
+
+impl Drop for IdempotencyClaim {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.store.fail_if_owner(&self.key_digest, self.generation, true);
+        }
+    }
 }
 
 impl IdempotencyStore {
@@ -277,31 +402,220 @@ impl IdempotencyStore {
         Self {
             ttl,
             max_keys: max_keys.max(1),
-            keys: Mutex::new(HashMap::new()),
+            state: Mutex::new(IdempotencyStoreState::default()),
         }
     }
 
-    /// Returns true if this key is new and is now recorded.
-    fn record_if_new(&self, key: &str) -> bool {
+    fn prune_expired_terminal(&self, state: &mut IdempotencyStoreState, now: Instant) {
+        let expired = state
+            .entries
+            .iter()
+            .filter_map(|(key, entry)| {
+                let terminal_at = match entry {
+                    IdempotencyEntry::Processing { .. } => return None,
+                    IdempotencyEntry::Succeeded { completed_at, .. } => *completed_at,
+                    IdempotencyEntry::Failed { failed_at, .. } => *failed_at,
+                };
+                (now.saturating_duration_since(terminal_at) >= self.ttl).then(|| key.clone())
+            })
+            .collect::<Vec<_>>();
+
+        for key in expired {
+            if let Some(IdempotencyEntry::Succeeded {
+                replay: Some(replay), ..
+            }) = state.entries.remove(&key)
+            {
+                state.payload_bytes = state.payload_bytes.saturating_sub(replay.payload_bytes());
+            }
+        }
+    }
+
+    fn reserve_processing(
+        self: &Arc<Self>,
+        state: &mut IdempotencyStoreState,
+        key_digest: String,
+        request_fingerprint: [u8; 32],
+    ) -> IdempotencyClaimOutcome {
+        let Some(next_payload_bytes) = state.payload_bytes.checked_add(IDEMPOTENCY_MAX_REPLAY_BYTES) else {
+            return IdempotencyClaimOutcome::AtCapacity;
+        };
+        if next_payload_bytes > IDEMPOTENCY_REPLAY_BUDGET_BYTES {
+            return IdempotencyClaimOutcome::AtCapacity;
+        }
+        let Some(generation) = state.next_generation.checked_add(1) else {
+            return IdempotencyClaimOutcome::AtCapacity;
+        };
+        state.next_generation = generation;
+        state.payload_bytes = next_payload_bytes;
+        state.entries.insert(
+            key_digest.clone(),
+            IdempotencyEntry::Processing {
+                generation,
+                request_fingerprint,
+                reserved_bytes: IDEMPOTENCY_MAX_REPLAY_BYTES,
+            },
+        );
+        IdempotencyClaimOutcome::Acquired(IdempotencyClaim {
+            store: Arc::clone(self),
+            key_digest,
+            generation,
+            armed: true,
+        })
+    }
+
+    fn claim(self: &Arc<Self>, key_digest: String, request_fingerprint: [u8; 32]) -> IdempotencyClaimOutcome {
         let now = Instant::now();
-        let mut keys = self.keys.lock();
+        let mut state = self.state.lock();
+        self.prune_expired_terminal(&mut state, now);
 
-        keys.retain(|_, seen_at| now.duration_since(*seen_at) < self.ttl);
+        enum Existing {
+            Processing,
+            Replay(IdempotencyReplay),
+            ReplayUnavailable(Uuid, String),
+            Retry,
+            RetryUnavailable,
+            RequestConflict,
+        }
+        let existing = state.entries.get(&key_digest).map(|entry| {
+            if entry.request_fingerprint() != &request_fingerprint {
+                return Existing::RequestConflict;
+            }
+            match entry {
+                IdempotencyEntry::Processing { .. } => Existing::Processing,
+                IdempotencyEntry::Succeeded {
+                    response_id,
+                    result_hash,
+                    replay,
+                    ..
+                } => replay.as_ref().map_or_else(
+                    || Existing::ReplayUnavailable(*response_id, result_hash.clone()),
+                    |snapshot| Existing::Replay(snapshot.clone()),
+                ),
+                IdempotencyEntry::Failed { retry_eligible, .. } => {
+                    if *retry_eligible {
+                        Existing::Retry
+                    } else {
+                        Existing::RetryUnavailable
+                    }
+                }
+            }
+        });
 
-        if keys.contains_key(key) {
+        match existing {
+            Some(Existing::Processing) => IdempotencyClaimOutcome::Processing,
+            Some(Existing::Replay(replay)) => IdempotencyClaimOutcome::Replay(replay),
+            Some(Existing::ReplayUnavailable(response_id, result_hash)) => IdempotencyClaimOutcome::ReplayUnavailable {
+                response_id,
+                result_hash,
+            },
+            Some(Existing::RetryUnavailable) => IdempotencyClaimOutcome::RetryUnavailable,
+            Some(Existing::RequestConflict) => IdempotencyClaimOutcome::RequestConflict,
+            Some(Existing::Retry) => self.reserve_processing(&mut state, key_digest, request_fingerprint),
+            None => {
+                if state.entries.len() >= self.max_keys {
+                    return IdempotencyClaimOutcome::AtCapacity;
+                }
+                self.reserve_processing(&mut state, key_digest, request_fingerprint)
+            }
+        }
+    }
+
+    fn complete_if_owner(
+        &self,
+        key_digest: &str,
+        generation: u64,
+        replay: IdempotencyReplay,
+        result_hash: String,
+    ) -> bool {
+        let mut state = self.state.lock();
+        let Some(IdempotencyEntry::Processing {
+            generation: current_generation,
+            request_fingerprint,
+            reserved_bytes,
+            ..
+        }) = state.entries.get(key_digest)
+        else {
+            return false;
+        };
+        if *current_generation != generation {
             return false;
         }
 
-        if keys.len() >= self.max_keys {
-            let evict_key = keys.iter().min_by_key(|(_, seen_at)| *seen_at).map(|(k, _)| k.clone());
-            if let Some(evict_key) = evict_key {
-                keys.remove(&evict_key);
-            }
-        }
-
-        keys.insert(key.to_owned(), now);
+        let request_fingerprint = *request_fingerprint;
+        let reserved_bytes = *reserved_bytes;
+        let replay_bytes = replay.payload_bytes();
+        let response_id = replay.response_id;
+        state.payload_bytes = state.payload_bytes.saturating_sub(reserved_bytes);
+        let replay = if replay_bytes <= IDEMPOTENCY_MAX_REPLAY_BYTES {
+            state.payload_bytes = state.payload_bytes.saturating_add(replay_bytes);
+            Some(replay)
+        } else {
+            None
+        };
+        state.entries.insert(
+            key_digest.to_string(),
+            IdempotencyEntry::Succeeded {
+                request_fingerprint,
+                completed_at: Instant::now(),
+                response_id,
+                result_hash,
+                replay,
+            },
+        );
         true
     }
+
+    fn fail_if_owner(&self, key_digest: &str, generation: u64, retry_eligible: bool) -> bool {
+        let mut state = self.state.lock();
+        let Some(IdempotencyEntry::Processing {
+            generation: current_generation,
+            request_fingerprint,
+            reserved_bytes,
+            ..
+        }) = state.entries.get(key_digest)
+        else {
+            return false;
+        };
+        if *current_generation != generation {
+            return false;
+        }
+
+        let request_fingerprint = *request_fingerprint;
+        let reserved_bytes = *reserved_bytes;
+        state.payload_bytes = state.payload_bytes.saturating_sub(reserved_bytes);
+        state.entries.insert(
+            key_digest.to_string(),
+            IdempotencyEntry::Failed {
+                request_fingerprint,
+                failed_at: Instant::now(),
+                retry_eligible,
+            },
+        );
+        true
+    }
+}
+
+fn webhook_request_fingerprint(body: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(body).into()
+}
+
+fn webhook_idempotency_digest(scope: &str, raw_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(scope.as_bytes());
+    hasher.update([0]);
+    hasher.update(raw_key.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn webhook_result_hash(response: &str, model: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(response.as_bytes());
+    hasher.update([0]);
+    hasher.update(model.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 fn parse_client_ip(value: &str) -> Option<IpAddr> {
@@ -1461,6 +1775,15 @@ async fn handle_webhook(
     } else {
         "public".to_string()
     };
+    let idempotency_scope = if state.pairing.require_pairing() {
+        format!("bearer:{}", hash_webhook_secret(bearer_token))
+    } else if let (Some(_), Some(token)) = (&state.webhook_token_hash, webhook_token_header) {
+        format!("token:{}", hash_webhook_secret(token))
+    } else if let Some(signing_secret) = state.webhook_signing_secret.as_deref() {
+        format!("signing-secret:{}", hash_webhook_secret(signing_secret))
+    } else {
+        "public".to_string()
+    };
     if !state.rate_limiter.allow_webhook_credential(&credential_rate_key) {
         tracing::warn!("/webhook credential rate limit exceeded");
         let err = serde_json::json!({
@@ -1483,26 +1806,88 @@ async fn handle_webhook(
     };
 
     // ── Idempotency (optional) ──
-    let request_idempotency_key = headers
-        .get("X-Idempotency-Key")
-        .and_then(|v| v.to_str().ok())
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
-    if let Some(idempotency_key) = request_idempotency_key.as_deref() {
+    let request_idempotency_key = match headers.get("X-Idempotency-Key") {
+        None => None,
+        Some(value) => {
+            let Ok(value) = value.to_str() else {
+                let err = serde_json::json!({"error": "X-Idempotency-Key must be valid UTF-8"});
+                return (StatusCode::BAD_REQUEST, Json(err));
+            };
+            let value = value.trim();
+            if value.is_empty() {
+                None
+            } else if value.len() > IDEMPOTENCY_MAX_KEY_BYTES {
+                let err = serde_json::json!({
+                    "error": "X-Idempotency-Key exceeds the 256-byte limit"
+                });
+                return (StatusCode::BAD_REQUEST, Json(err));
+            } else {
+                Some(value.to_string())
+            }
+        }
+    };
+    let mut idempotency_digest = None;
+    let mut idempotency_claim = None;
+    if let Some(raw_key) = request_idempotency_key.as_deref() {
         if let Err(error) =
             authorize_gateway_resource_mutation(&state, "gateway:webhook:idempotency", ResourceRiskLevel::Low)
         {
             return error;
         }
-        if !state.idempotency_store.record_if_new(idempotency_key) {
-            tracing::info!("Webhook duplicate ignored (idempotency key: {idempotency_key})");
-            let body = serde_json::json!({
-                "status": "duplicate",
-                "idempotent": true,
-                "message": "Request already processed for this idempotency key"
-            });
-            return (StatusCode::OK, Json(body));
+        let digest = webhook_idempotency_digest(&idempotency_scope, raw_key);
+        let fingerprint = webhook_request_fingerprint(&body);
+        match state.idempotency_store.claim(digest.clone(), fingerprint) {
+            IdempotencyClaimOutcome::Acquired(claim) => {
+                idempotency_digest = Some(digest);
+                idempotency_claim = Some(claim);
+            }
+            IdempotencyClaimOutcome::Processing => {
+                let body = serde_json::json!({
+                    "status": "processing",
+                    "idempotent": true,
+                    "message": "A request with this idempotency key is still processing"
+                });
+                return (StatusCode::CONFLICT, Json(body));
+            }
+            IdempotencyClaimOutcome::Replay(replay) => {
+                return (StatusCode::OK, Json(replay.json_body()));
+            }
+            IdempotencyClaimOutcome::ReplayUnavailable {
+                response_id,
+                result_hash,
+            } => {
+                let body = serde_json::json!({
+                    "status": "replay_unavailable",
+                    "idempotent": true,
+                    "response_id": response_id.to_string(),
+                    "result_hash": result_hash,
+                    "message": "The original request succeeded, but its response is too large to replay"
+                });
+                return (StatusCode::CONFLICT, Json(body));
+            }
+            IdempotencyClaimOutcome::RequestConflict => {
+                let body = serde_json::json!({
+                    "status": "request_conflict",
+                    "idempotent": true,
+                    "message": "This idempotency key was used with a different request body"
+                });
+                return (StatusCode::CONFLICT, Json(body));
+            }
+            IdempotencyClaimOutcome::RetryUnavailable => {
+                let body = serde_json::json!({
+                    "status": "retry_unavailable",
+                    "idempotent": true,
+                    "message": "This failed request is not eligible for retry"
+                });
+                return (StatusCode::CONFLICT, Json(body));
+            }
+            IdempotencyClaimOutcome::AtCapacity => {
+                let body = serde_json::json!({
+                    "error": "Idempotency capacity is temporarily exhausted",
+                    "retryable": true
+                });
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(body));
+            }
         }
     }
 
@@ -1514,7 +1899,7 @@ async fn handle_webhook(
         {
             return error;
         }
-        let key = webhook_memory_key();
+        let key = webhook_memory_key(idempotency_digest.as_deref());
         let _ = state.mem.store(&key, message, MemoryCategory::Conversation, None).await;
     }
 
@@ -1543,10 +1928,28 @@ async fn handle_webhook(
 
     let fabric_ctx = GatewayFabricContext::generic_webhook(
         webhook_body.reply_target.as_deref(),
-        request_idempotency_key.map(|key| format!("gateway:webhook:{key}")),
+        idempotency_digest
+            .as_deref()
+            .map(|digest| format!("gateway:webhook:{digest}")),
     );
     match run_gateway_chat_with_multimodal(&state, &provider_label, message, &fabric_ctx).await {
         Ok(response) => {
+            let response_id = Uuid::new_v4();
+            let result_hash = webhook_result_hash(&response, &model_label);
+            if let Some(claim) = idempotency_claim.take() {
+                let replay = IdempotencyReplay {
+                    response_id,
+                    response: Arc::from(response.as_str()),
+                    model: Arc::from(model_label.as_str()),
+                };
+                if !claim.succeed(replay, result_hash) {
+                    tracing::error!("Webhook idempotency ownership was lost before success commit");
+                    let err = serde_json::json!({
+                        "error": "Request completed but its idempotency result could not be committed"
+                    });
+                    return (StatusCode::SERVICE_UNAVAILABLE, Json(err));
+                }
+            }
             let duration = started_at.elapsed();
             state
                 .observer
@@ -1570,10 +1973,17 @@ async fn handle_webhook(
                     cost_usd: None,
                 });
 
-            let body = serde_json::json!({"response": response, "model": state.model});
+            let body = serde_json::json!({
+                "response": response,
+                "model": state.model,
+                "response_id": response_id.to_string(),
+            });
             (StatusCode::OK, Json(body))
         }
         Err(e) => {
+            if let Some(claim) = idempotency_claim.take() {
+                let _ = claim.fail(true);
+            }
             let duration = started_at.elapsed();
             let sanitized = providers::sanitize_api_error(&e.to_string());
 
@@ -2088,6 +2498,7 @@ mod tests {
     use http_body_util::BodyExt;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
@@ -2405,12 +2816,41 @@ mod tests {
         }
     }
 
+    fn test_fingerprint(value: u8) -> [u8; 32] {
+        [value; 32]
+    }
+
+    fn acquire_idempotency_claim(store: &Arc<IdempotencyStore>, key: &str, fingerprint: [u8; 32]) -> IdempotencyClaim {
+        match store.claim(key.to_string(), fingerprint) {
+            IdempotencyClaimOutcome::Acquired(claim) => claim,
+            outcome => panic!("expected acquired idempotency claim, got {outcome:?}"),
+        }
+    }
+
+    fn test_idempotency_replay(response: &str) -> IdempotencyReplay {
+        IdempotencyReplay {
+            response_id: Uuid::new_v4(),
+            response: Arc::from(response),
+            model: Arc::from("test-model"),
+        }
+    }
+
     #[test]
-    fn idempotency_store_rejects_duplicate_key() {
-        let store = IdempotencyStore::new(Duration::from_secs(30), 10);
-        assert!(store.record_if_new("req-1"));
-        assert!(!store.record_if_new("req-1"));
-        assert!(store.record_if_new("req-2"));
+    fn idempotency_store_reports_processing_then_replays_success() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(30), 10));
+        let claim = acquire_idempotency_claim(&store, "req-1", test_fingerprint(1));
+        assert!(matches!(
+            store.claim("req-1".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Processing
+        ));
+
+        let replay = test_idempotency_replay("ok");
+        let response_id = replay.response_id;
+        assert!(claim.succeed(replay, "result-hash".to_string()));
+        assert!(matches!(
+            store.claim("req-1".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Replay(snapshot) if snapshot.response_id == response_id
+        ));
     }
 
     #[test]
@@ -2430,19 +2870,21 @@ mod tests {
     }
 
     #[test]
-    fn idempotency_store_bounded_cardinality_evicts_oldest_key() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 2);
-        assert!(store.record_if_new("k1"));
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k2"));
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("k3"));
+    fn idempotency_store_never_evicts_live_or_unexpired_entries() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 2));
+        let first = acquire_idempotency_claim(&store, "k1", test_fingerprint(1));
+        let second = acquire_idempotency_claim(&store, "k2", test_fingerprint(2));
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 2);
-        assert!(!keys.contains_key("k1"));
-        assert!(keys.contains_key("k2"));
-        assert!(keys.contains_key("k3"));
+        assert!(matches!(
+            store.claim("k3".to_string(), test_fingerprint(3)),
+            IdempotencyClaimOutcome::AtCapacity
+        ));
+        assert!(first.succeed(test_idempotency_replay("first"), "first-hash".to_string()));
+        assert!(second.succeed(test_idempotency_replay("second"), "second-hash".to_string()));
+        assert!(matches!(
+            store.claim("k3".to_string(), test_fingerprint(3)),
+            IdempotencyClaimOutcome::AtCapacity
+        ));
     }
 
     #[test]
@@ -2578,12 +3020,32 @@ mod tests {
 
     #[test]
     fn webhook_memory_key_is_unique() {
-        let key1 = webhook_memory_key();
-        let key2 = webhook_memory_key();
+        let key1 = webhook_memory_key(None);
+        let key2 = webhook_memory_key(None);
 
         assert!(key1.starts_with("webhook_msg_"));
         assert!(key2.starts_with("webhook_msg_"));
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn webhook_memory_key_is_stable_for_idempotent_retry() {
+        let key1 = webhook_memory_key(Some("digest"));
+        let key2 = webhook_memory_key(Some("digest"));
+
+        assert_eq!(key1, key2);
+        assert_eq!(key1, "webhook_msg_digest");
+    }
+
+    #[test]
+    fn webhook_idempotency_digest_is_scoped_and_hides_raw_key() {
+        let first_scope = webhook_idempotency_digest("scope-a", "sensitive-external-key");
+        let second_scope = webhook_idempotency_digest("scope-b", "sensitive-external-key");
+
+        assert_eq!(first_scope.len(), 64);
+        assert!(first_scope.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first_scope.contains("sensitive-external-key"));
+        assert_ne!(first_scope, second_scope);
     }
 
     #[test]
@@ -2682,6 +3144,70 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct FailFirstProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for FailFirstProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                anyhow::bail!("injected provider failure");
+            }
+            Ok("retry-ok".into())
+        }
+    }
+
+    #[derive(Default)]
+    struct BlockFirstProvider {
+        calls: AtomicUsize,
+        first_started: Notify,
+        release_first: Notify,
+    }
+
+    #[async_trait]
+    impl Provider for BlockFirstProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                self.first_started.notify_one();
+                self.release_first.notified().await;
+            }
+            Ok("released".into())
+        }
+    }
+
+    #[derive(Default)]
+    struct OversizeResponseProvider {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Provider for OversizeResponseProvider {
+        async fn chat_with_system(
+            &self,
+            _system_prompt: Option<&str>,
+            _message: &str,
+            _model: &str,
+            _temperature: f64,
+        ) -> anyhow::Result<String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok("x".repeat(IDEMPOTENCY_MAX_REPLAY_BYTES + 1))
+        }
+    }
+
+    #[derive(Default)]
     struct TrackingMemory {
         keys: Mutex<Vec<String>>,
     }
@@ -2742,19 +3268,14 @@ mod tests {
         ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 30_300)))
     }
 
-    #[tokio::test]
-    async fn webhook_idempotency_skips_duplicate_provider_calls() {
-        let provider_impl = Arc::new(MockProvider::default());
-        let provider: Arc<dyn Provider> = provider_impl.clone();
-        let memory: Arc<dyn Memory> = Arc::new(MockMemory);
-
-        let state = AppState {
+    fn webhook_test_state(provider: Arc<dyn Provider>) -> AppState {
+        AppState {
             config: Arc::new(Mutex::new(Config::default())),
             shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
-            mem: memory,
+            mem: Arc::new(MockMemory),
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
@@ -2786,7 +3307,14 @@ mod tests {
             wasm_cron_manager: None,
             #[cfg(feature = "wasm-plugins")]
             event_bus: None,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_skips_duplicate_provider_calls() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
 
         let mut headers = HeaderMap::new();
         headers.insert("X-Idempotency-Key", HeaderValue::from_static("abc-123"));
@@ -2800,6 +3328,12 @@ mod tests {
         .await
         .into_response();
         assert_eq!(first.status(), StatusCode::OK);
+        let first_payload = first.into_body().collect().await.unwrap().to_bytes();
+        let first_json: serde_json::Value = serde_json::from_slice(&first_payload).unwrap();
+        let response_id = first_json["response_id"]
+            .as_str()
+            .expect("successful idempotent request must expose a stable response identity")
+            .to_string();
 
         let second = handle_webhook(
             State(state),
@@ -2815,6 +3349,297 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
         assert_eq!(parsed["status"], "duplicate");
         assert_eq!(parsed["idempotent"], true);
+        assert_eq!(parsed["response"], "ok");
+        assert_eq!(parsed["model"], "test-model");
+        assert_eq!(parsed["response_id"], response_id);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_failed_attempt_can_retry() {
+        let provider_impl = Arc::new(FailFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-error"));
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let retry = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let payload = retry.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "retry-ok");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_retry_reuses_autosave_key() {
+        let provider_impl = Arc::new(FailFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let tracking_impl = Arc::new(TrackingMemory::default());
+        let mut state = webhook_test_state(provider);
+        state.mem = tracking_impl.clone();
+        state.auto_save = true;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("stable-autosave"));
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let retry = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"remember this stable autosave payload across the retry attempt"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
+
+        let keys = tracking_impl.keys.lock();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0], keys[1]);
+        assert!(keys[0].starts_with("webhook_msg_"));
+        assert!(!keys[0].contains("stable-autosave"));
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_cancelled_attempt_can_retry() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("retry-after-cancel"));
+
+        let started = provider_impl.first_started.notified();
+        let first_state = state.clone();
+        let first_headers = headers.clone();
+        let first = tokio::spawn(async move {
+            handle_webhook(
+                State(first_state),
+                test_connect_info(),
+                first_headers,
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            )
+            .await
+            .into_response()
+        });
+        started.await;
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        let retry = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(retry.status(), StatusCode::OK);
+        let payload = retry.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["response"], "released");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_concurrent_attempt_reports_processing() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("concurrent-key"));
+
+        let started = provider_impl.first_started.notified();
+        let first_state = state.clone();
+        let first_headers = headers.clone();
+        let first = tokio::spawn(async move {
+            handle_webhook(
+                State(first_state),
+                test_connect_info(),
+                first_headers,
+                Bytes::from_static(br#"{"message":"hello"}"#),
+            )
+            .await
+            .into_response()
+        });
+        started.await;
+
+        let concurrent = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        let concurrent_status = concurrent.status();
+        let payload = concurrent.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+
+        provider_impl.release_first.notify_one();
+        let first_response = first.await.unwrap();
+        assert_eq!(first_response.status(), StatusCode::OK);
+        assert_eq!(concurrent_status, StatusCode::CONFLICT);
+        assert_eq!(parsed["status"], "processing");
+        assert_eq!(parsed["idempotent"], true);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_full_capacity_returns_service_unavailable() {
+        let provider_impl = Arc::new(BlockFirstProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut state = webhook_test_state(provider);
+        state.idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1));
+
+        let mut first_headers = HeaderMap::new();
+        first_headers.insert("X-Idempotency-Key", HeaderValue::from_static("first-key"));
+        let started = provider_impl.first_started.notified();
+        let first_state = state.clone();
+        let first = tokio::spawn(async move {
+            handle_webhook(
+                State(first_state),
+                test_connect_info(),
+                first_headers,
+                Bytes::from_static(br#"{"message":"first"}"#),
+            )
+            .await
+            .into_response()
+        });
+        started.await;
+
+        let mut second_headers = HeaderMap::new();
+        second_headers.insert("X-Idempotency-Key", HeaderValue::from_static("second-key"));
+        let at_capacity = handle_webhook(
+            State(state),
+            test_connect_info(),
+            second_headers,
+            Bytes::from_static(br#"{"message":"second"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(at_capacity.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let payload = at_capacity.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["retryable"], true);
+
+        provider_impl.release_first.notify_one();
+        assert_eq!(first.await.unwrap().status(), StatusCode::OK);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_same_key_different_body_conflicts() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("body-bound-key"));
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            Bytes::from_static(br#"{"message":"first"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let conflict = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"second"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(conflict.status(), StatusCode::CONFLICT);
+        let payload = conflict.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "request_conflict");
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_rejects_oversize_key() {
+        let provider_impl = Arc::new(MockProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        let oversized_key = vec![b'x'; IDEMPOTENCY_MAX_KEY_BYTES + 1];
+        headers.insert("X-Idempotency-Key", HeaderValue::from_bytes(&oversized_key).unwrap());
+
+        let response = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn webhook_idempotency_oversize_success_is_not_reexecuted() {
+        let provider_impl = Arc::new(OversizeResponseProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let state = webhook_test_state(provider);
+        let mut headers = HeaderMap::new();
+        headers.insert("X-Idempotency-Key", HeaderValue::from_static("oversize-result"));
+
+        let first = handle_webhook(
+            State(state.clone()),
+            test_connect_info(),
+            headers.clone(),
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(first.status(), StatusCode::OK);
+
+        let duplicate = handle_webhook(
+            State(state),
+            test_connect_info(),
+            headers,
+            Bytes::from_static(br#"{"message":"hello"}"#),
+        )
+        .await
+        .into_response();
+        assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+        let payload = duplicate.into_body().collect().await.unwrap().to_bytes();
+        let parsed: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(parsed["status"], "replay_unavailable");
+        assert!(parsed["response_id"].as_str().is_some());
+        assert!(parsed["result_hash"].as_str().is_some());
         assert_eq!(provider_impl.calls.load(Ordering::SeqCst), 1);
     }
 
@@ -2903,9 +3728,17 @@ mod tests {
         assert_eq!(events[0].role, "user");
         assert_eq!(events[0].content, "hello gateway");
         assert_eq!(events[0].session_key.as_deref(), Some("gateway:webhook:client-a:prx"));
+        let expected_digest = webhook_idempotency_digest("public", "gateway-event-1");
         assert_eq!(
             events[0].idempotency_key.as_deref(),
-            Some("gateway:webhook:gateway-event-1")
+            Some(format!("gateway:webhook:{expected_digest}").as_str())
+        );
+        assert!(
+            !events[0]
+                .idempotency_key
+                .as_deref()
+                .expect("idempotency digest")
+                .contains("gateway-event-1")
         );
         assert_eq!(events[1].role, "assistant");
         assert_eq!(events[1].content, "ok");
@@ -3752,46 +4585,121 @@ mod tests {
 
     #[test]
     fn idempotency_store_allows_different_keys() {
-        let store = IdempotencyStore::new(Duration::from_secs(60), 100);
-        assert!(store.record_if_new("key-a"));
-        assert!(store.record_if_new("key-b"));
-        assert!(store.record_if_new("key-c"));
-        assert!(store.record_if_new("key-d"));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 100));
+        let claims = ["key-a", "key-b", "key-c", "key-d"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| acquire_idempotency_claim(&store, key, test_fingerprint(index as u8)))
+            .collect::<Vec<_>>();
+
+        assert_eq!(claims.len(), 4);
     }
 
     #[test]
     fn idempotency_store_max_keys_clamped_to_one() {
-        let store = IdempotencyStore::new(Duration::from_secs(60), 0);
-        assert!(store.record_if_new("only-key"));
-        assert!(!store.record_if_new("only-key"));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 0));
+        let _claim = acquire_idempotency_claim(&store, "only-key", test_fingerprint(1));
+        assert!(matches!(
+            store.claim("second-key".to_string(), test_fingerprint(2)),
+            IdempotencyClaimOutcome::AtCapacity
+        ));
     }
 
     #[test]
-    fn idempotency_store_rapid_duplicate_rejected() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 100);
-        assert!(store.record_if_new("rapid"));
-        assert!(!store.record_if_new("rapid"));
+    fn idempotency_store_same_key_different_body_conflicts() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 100));
+        let _claim = acquire_idempotency_claim(&store, "rapid", test_fingerprint(1));
+        assert!(matches!(
+            store.claim("rapid".to_string(), test_fingerprint(2)),
+            IdempotencyClaimOutcome::RequestConflict
+        ));
     }
 
     #[test]
-    fn idempotency_store_accepts_after_ttl_expires() {
-        let store = IdempotencyStore::new(Duration::from_millis(1), 100);
-        assert!(store.record_if_new("ttl-key"));
+    fn idempotency_store_processing_survives_ttl_and_failed_retry_expires() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_millis(1), 100));
+        let claim = acquire_idempotency_claim(&store, "ttl-key", test_fingerprint(1));
         std::thread::sleep(Duration::from_millis(10));
-        assert!(store.record_if_new("ttl-key"));
+        assert!(matches!(
+            store.claim("ttl-key".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Processing
+        ));
+
+        assert!(claim.fail(true));
+        std::thread::sleep(Duration::from_millis(10));
+        let _retry = acquire_idempotency_claim(&store, "ttl-key", test_fingerprint(1));
     }
 
     #[test]
-    fn idempotency_store_eviction_preserves_newest() {
-        let store = IdempotencyStore::new(Duration::from_secs(300), 1);
-        assert!(store.record_if_new("old-key"));
-        std::thread::sleep(Duration::from_millis(2));
-        assert!(store.record_if_new("new-key"));
+    fn idempotency_store_terminal_ttl_starts_at_completion() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_millis(20), 1));
+        let claim = acquire_idempotency_claim(&store, "old-key", test_fingerprint(1));
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(claim.succeed(test_idempotency_replay("ok"), "hash".to_string()));
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(matches!(
+            store.claim("old-key".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Replay(_)
+        ));
+        std::thread::sleep(Duration::from_millis(15));
+        let _retry = acquire_idempotency_claim(&store, "old-key", test_fingerprint(1));
+    }
 
-        let keys = store.keys.lock();
-        assert_eq!(keys.len(), 1);
-        assert!(!keys.contains_key("old-key"));
-        assert!(keys.contains_key("new-key"));
+    #[test]
+    fn idempotency_store_stale_generation_cannot_finish_new_attempt() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 1));
+        let first = acquire_idempotency_claim(&store, "key", test_fingerprint(1));
+        let first_generation = first.generation;
+        assert!(first.fail(true));
+        let second = acquire_idempotency_claim(&store, "key", test_fingerprint(1));
+
+        assert!(!store.complete_if_owner(
+            "key",
+            first_generation,
+            test_idempotency_replay("stale"),
+            "stale-hash".to_string(),
+        ));
+        assert!(matches!(
+            store.claim("key".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::Processing
+        ));
+        assert!(second.succeed(test_idempotency_replay("fresh"), "fresh-hash".to_string()));
+    }
+
+    #[test]
+    fn idempotency_store_payload_budget_is_released_after_failure() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 100));
+        let mut claims = (0..(IDEMPOTENCY_REPLAY_BUDGET_BYTES / IDEMPOTENCY_MAX_REPLAY_BYTES))
+            .map(|index| acquire_idempotency_claim(&store, &format!("key-{index}"), test_fingerprint(index as u8)))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.claim("over-budget".to_string(), test_fingerprint(250)),
+            IdempotencyClaimOutcome::AtCapacity
+        ));
+
+        assert!(claims.pop().expect("one claim").fail(true));
+        let _replacement = acquire_idempotency_claim(&store, "replacement", test_fingerprint(251));
+    }
+
+    #[test]
+    fn idempotency_store_oversize_success_keeps_non_reexecuting_tombstone() {
+        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 1));
+        let claim = acquire_idempotency_claim(&store, "oversize", test_fingerprint(1));
+        let replay = IdempotencyReplay {
+            response_id: Uuid::new_v4(),
+            response: Arc::from("x".repeat(IDEMPOTENCY_MAX_REPLAY_BYTES + 1)),
+            model: Arc::from("test-model"),
+        };
+        let response_id = replay.response_id;
+        assert!(claim.succeed(replay, "oversize-hash".to_string()));
+
+        assert!(matches!(
+            store.claim("oversize".to_string(), test_fingerprint(1)),
+            IdempotencyClaimOutcome::ReplayUnavailable {
+                response_id: id,
+                result_hash,
+            } if id == response_id && result_hash == "oversize-hash"
+        ));
     }
 
     /// S2.5 P1-A: /metrics 端点在 PrometheusObserver 模式下包含 chat counter 指标.
