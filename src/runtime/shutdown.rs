@@ -15,6 +15,6 @@ use tokio_util::sync::CancellationToken;
 /// would propagate cancellation — naming it explicitly avoids the misreading
 /// that an `CancellationToken::new()` passed here might ever fire. The owning
 /// supervisor terminates these tasks via abort/drop, not via this token.
-pub(crate) fn never_cancelled_shutdown() -> CancellationToken {
+pub fn never_cancelled_shutdown() -> CancellationToken {
     CancellationToken::new()
 }

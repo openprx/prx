@@ -5961,7 +5961,7 @@ impl Config {
         crate::config::files::commit_mutation_atomically(plan).await
     }
 
-    pub(crate) fn to_stored_toml_value(&self) -> Result<toml::Value> {
+    pub fn to_stored_toml_value(&self) -> Result<toml::Value> {
         let mut config_to_save = self.clone();
         let openprx_dir = self
             .config_path

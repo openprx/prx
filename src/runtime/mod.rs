@@ -4,7 +4,7 @@ pub mod docker;
 pub mod envelope;
 pub mod native;
 pub mod shell_process;
-pub(crate) mod shutdown;
+pub mod shutdown;
 pub mod traits;
 
 pub use docker::DockerRuntime;

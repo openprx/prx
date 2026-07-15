@@ -8,15 +8,11 @@
 //! or control-flow change is introduced.
 //!
 //! Crate-layout note: although the source file lives under `src/runtime/`, this
-//! module is declared from `main.rs` via `#[path = "runtime/mode.rs"] mod mode;`
-//! so that it is a child of the **binary** crate root rather than the shared
-//! `openprx` library crate. The dispatch references binary-only items
-//! (`Commands`, the `handle_*_command` helpers, binary-only modules such as
-//! `chat`/`doctor`/`integrations`/`evolution_cli`/`migration`/`service`); the
-//! `runtime/` directory is compiled into *both* the lib and the bin, so a
-//! `pub mod mode;` inside `runtime/mod.rs` would fail to compile in the lib.
-//! Scoping the declaration to the binary keeps `crate::` resolving to these
-//! items while preserving the requested file location.
+//! CLI-only dispatch remains declared from `main.rs` via
+//! `#[path = "runtime/mode.rs"] mod mode;`. Its `Commands` enum and local
+//! `handle_*_command` helpers belong to binary bootstrap, while every runtime
+//! subsystem and cross-boundary command DTO it calls is imported from the
+//! single library-owned module graph.
 //!
 //! Scope notes (intentional, per the D-series plan §2.4):
 //! - The five early-exit commands (`SessionWorker`, `Completions`, `Init`,

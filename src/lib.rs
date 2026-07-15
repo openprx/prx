@@ -91,18 +91,24 @@ pub mod approval;
 pub mod auth;
 pub(crate) mod causal_tree;
 pub mod channels;
+#[allow(dead_code, private_interfaces)]
+pub mod chat;
 pub mod config;
 pub mod cost;
 pub mod cron;
 pub mod daemon;
+pub mod doctor;
+pub mod evolution_cli;
 pub mod gateway;
 pub(crate) mod health;
 pub mod heartbeat;
 pub(crate) mod hooks;
 pub mod identity;
+pub mod integrations;
 pub mod llm;
 pub mod media;
 pub mod memory;
+pub mod migration;
 pub(crate) mod multimodal;
 pub mod nodes;
 pub mod observability;
@@ -116,24 +122,33 @@ pub mod runtime;
 pub mod schema_migration;
 pub mod security;
 pub mod self_system;
-// In the library crate, only the protocol types are needed (used by tools/sessions_spawn).
-// The runner module is a binary-only concern — main.rs loads the full session_worker module tree.
-pub(crate) mod session_worker {
-    #[path = "protocol.rs"]
-    pub mod protocol;
-}
-// In the library crate, only the scout module is needed (used by gateway/api/skills).
-// The evaluate/integrate pipeline and SkillForge orchestrator are binary-only concerns.
-pub(crate) mod skillforge {
-    #[path = "scout.rs"]
-    pub mod scout;
-}
+#[allow(dead_code)]
+pub mod service;
+#[allow(dead_code)]
+pub mod session_worker;
+pub mod skillforge;
 pub mod skills;
 pub mod tools;
 pub mod tunnel;
 pub(crate) mod util;
 pub mod webhook;
 pub(crate) mod xin;
+
+/// Subscriber stack wrapped by the reloadable chat tracing layer.
+pub type ChatSubscriber =
+    tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
+/// Type-erased tracing writer used while chat takes ownership of the terminal.
+pub type ChatWriter = tracing_subscriber::fmt::writer::BoxMakeWriter;
+/// Reloadable formatting layer shared by the binary bootstrap and chat runtime.
+pub type ChatFmtLayer = tracing_subscriber::fmt::Layer<
+    ChatSubscriber,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full>,
+    ChatWriter,
+>;
+/// Single process-global tracing reload registry shared by lib and bin.
+pub static CHAT_TRACING_RELOAD: std::sync::OnceLock<tracing_subscriber::reload::Handle<ChatFmtLayer, ChatSubscriber>> =
+    std::sync::OnceLock::new();
 
 pub use config::Config;
 
@@ -164,46 +179,25 @@ pub enum ServiceCommands {
 /// Channel management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ChannelCommands {
-    /// List all configured channels
+    /// List configured channels
     List,
-    /// Start all configured channels (handled in main.rs for async)
+    /// Start all configured channels (Telegram, Discord, Slack)
     Start,
-    /// Run health checks for configured channels (handled in main.rs for async)
+    /// Run health checks for configured channels
     Doctor,
-    /// Add a new channel configuration
-    #[command(long_about = "\
-Add a new channel configuration.
-
-Provide the channel type and a JSON object with the required \
-configuration keys for that channel type.
-
-Supported types: telegram, discord, slack, whatsapp, matrix, imessage, email.
-
-Examples:
-  prx channel add telegram '{\"bot_token\":\"...\",\"name\":\"my-bot\"}'
-  prx channel add discord '{\"bot_token\":\"...\",\"name\":\"my-discord\"}'")]
+    /// Add a new channel
     Add {
-        /// Channel type (telegram, discord, slack, whatsapp, matrix, imessage, email)
+        /// Channel type
         channel_type: String,
-        /// Optional configuration as JSON
+        /// Configuration JSON
         config: String,
     },
-    /// Remove a channel configuration
+    /// Remove a channel
     Remove {
-        /// Channel name to remove
+        /// Channel name
         name: String,
     },
     /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    #[command(long_about = "\
-Bind a Telegram identity into the allowlist.
-
-Adds a Telegram username (without the '@' prefix) or numeric user \
-ID to the channel allowlist so the agent will respond to messages \
-from that identity.
-
-Examples:
-  prx channel bind-telegram openprx_user
-  prx channel bind-telegram 123456789")]
     BindTelegram {
         /// Telegram identity to allow (username without '@' or numeric user ID)
         identity: String,
@@ -213,16 +207,16 @@ Examples:
 /// Skills management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SkillCommands {
-    /// List all installed skills
+    /// List installed skills
     List,
-    /// Install a new skill from a git URL (HTTPS/SSH) or local path
+    /// Install a skill from a git URL (HTTPS/SSH) or local path
     Install {
-        /// Source git URL (HTTPS/SSH) or local path
+        /// Git URL (HTTPS/SSH) or local path
         source: String,
     },
     /// Remove an installed skill
     Remove {
-        /// Skill name to remove
+        /// Skill name
         name: String,
     },
 }
@@ -236,6 +230,13 @@ pub enum MigrateCommands {
     Verify,
     /// Preview pending schema migrations without writing
     DryRun,
+    /// Plan migrations up to a target version (dry-run diff, writes nothing)
+    Plan {
+        /// Known numeric backend migration version to plan through (inclusive).
+        /// Pending migrations above this version are excluded.
+        #[arg(long)]
+        target_version: String,
+    },
     /// Deprecated compatibility command; never writes a synthetic baseline
     Baseline,
     /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
@@ -256,16 +257,6 @@ pub enum CronCommands {
     /// List all scheduled tasks
     List,
     /// Add a new scheduled task
-    #[command(long_about = "\
-Add a new recurring scheduled task.
-
-Uses standard 5-field cron syntax: 'min hour day month weekday'. \
-Times are evaluated in UTC by default; use --tz with an IANA \
-timezone name to override.
-
-Examples:
-  prx cron add '0 9 * * 1-5' 'Good morning' --tz America/New_York
-  prx cron add '*/30 * * * *' 'Check system health'")]
     Add {
         /// Cron expression
         expression: String,
@@ -276,14 +267,6 @@ Examples:
         command: String,
     },
     /// Add a one-shot scheduled task at an RFC3339 timestamp
-    #[command(long_about = "\
-Add a one-shot task that fires at a specific UTC timestamp.
-
-The timestamp must be in RFC 3339 format (e.g. 2025-01-15T14:00:00Z).
-
-Examples:
-  prx cron add-at 2025-01-15T14:00:00Z 'Send reminder'
-  prx cron add-at 2025-12-31T23:59:00Z 'Happy New Year!'")]
     AddAt {
         /// One-shot timestamp in RFC3339 format
         at: String,
@@ -291,14 +274,6 @@ Examples:
         command: String,
     },
     /// Add a fixed-interval scheduled task
-    #[command(long_about = "\
-Add a task that repeats at a fixed interval.
-
-Interval is specified in milliseconds. For example, 60000 = 1 minute.
-
-Examples:
-  prx cron add-every 60000 'Ping heartbeat'     # every minute
-  prx cron add-every 3600000 'Hourly report'    # every hour")]
     AddEvery {
         /// Interval in milliseconds
         every_ms: u64,
@@ -306,16 +281,6 @@ Examples:
         command: String,
     },
     /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    #[command(long_about = "\
-Add a one-shot task that fires after a delay from now.
-
-Accepts human-readable durations: s (seconds), m (minutes), \
-h (hours), d (days).
-
-Examples:
-  prx cron once 30m 'Run backup in 30 minutes'
-  prx cron once 2h 'Follow up on deployment'
-  prx cron once 1d 'Daily check'")]
     Once {
         /// Delay duration
         delay: String,
@@ -328,15 +293,6 @@ Examples:
         id: String,
     },
     /// Update a scheduled task
-    #[command(long_about = "\
-Update one or more fields of an existing scheduled task.
-
-Only the fields you specify are changed; others remain unchanged.
-
-Examples:
-  prx cron update <task-id> --expression '0 8 * * *'
-  prx cron update <task-id> --tz Europe/London --name 'Morning check'
-  prx cron update <task-id> --command 'Updated message'")]
     Update {
         /// Task ID
         id: String,
@@ -365,12 +321,132 @@ Examples:
     },
 }
 
+#[cfg(test)]
+mod module_ownership_tests {
+    #[test]
+    fn binary_imports_the_library_module_graph() {
+        let main = include_str!("main.rs");
+        for duplicate in [
+            "mod acl;",
+            "mod agent;",
+            "mod approval;",
+            "mod auth;",
+            "mod causal_tree;",
+            "mod channels;",
+            "mod chat;",
+            "mod config;",
+            "mod cost;",
+            "mod cron;",
+            "mod daemon;",
+            "mod doctor;",
+            "mod evolution_cli;",
+            "mod gateway;",
+            "mod health;",
+            "mod heartbeat;",
+            "mod hooks;",
+            "mod identity;",
+            "mod integrations;",
+            "mod llm;",
+            "mod media;",
+            "mod memory;",
+            "mod migration;",
+            "mod multimodal;",
+            "mod nodes;",
+            "mod observability;",
+            "mod onboard;",
+            "mod plugins;",
+            "mod providers;",
+            "mod recovery;",
+            "mod router;",
+            "mod runtime;",
+            "mod schema_migration;",
+            "mod security;",
+            "mod self_system;",
+            "mod service;",
+            "mod session_worker;",
+            "mod skillforge;",
+            "mod skills;",
+            "mod tools;",
+            "mod tunnel;",
+            "mod util;",
+            "mod webhook;",
+            "mod xin;",
+        ] {
+            assert!(
+                !main.lines().any(|line| line.trim() == duplicate),
+                "binary must import library-owned module instead of declaring `{duplicate}`"
+            );
+        }
+
+        for duplicate in [
+            "enum ServiceCommands",
+            "enum ChannelCommands",
+            "enum SkillCommands",
+            "enum MigrateCommands",
+            "enum CronCommands",
+            "enum EvolutionCommands",
+            "enum EvolutionLayerArg",
+            "enum IntegrationCommands",
+        ] {
+            assert!(
+                !main.contains(duplicate),
+                "binary must import library-owned command DTO `{duplicate}`"
+            );
+        }
+
+        assert!(
+            !main.contains("static CHAT_TRACING_RELOAD"),
+            "process-global chat tracing registry must be library-owned"
+        );
+    }
+}
+
 /// Integration subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IntegrationCommands {
+    /// List integrations
+    List,
     /// Show details about a specific integration
     Info {
         /// Integration name
         name: String,
     },
+}
+
+/// Evolution dashboard and operation subcommands.
+#[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum EvolutionCommands {
+    /// Show evolution runtime status dashboard
+    Status,
+    /// Show evolution history from JSONL logs
+    History {
+        /// Maximum rows to display
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// Show daily digest by date (YYYY-MM-DD)
+    Digest {
+        /// Date in YYYY-MM-DD format (default: today UTC)
+        #[arg(long)]
+        date: Option<String>,
+    },
+    /// Show parsed evolution_config.toml
+    Config,
+    /// Manually trigger one evolution cycle
+    Trigger {
+        /// Layer choice: L1 (memory), L2 (prompt), L3 (strategy/policy)
+        #[arg(long, value_enum)]
+        layer: Option<EvolutionLayerArg>,
+    },
+}
+
+/// Evolution layer selected by the CLI.
+#[derive(Copy, Clone, Debug, Eq, PartialEq, clap::ValueEnum, Serialize, Deserialize)]
+pub enum EvolutionLayerArg {
+    #[value(name = "L1")]
+    L1,
+    #[value(name = "L2")]
+    L2,
+    #[value(name = "L3")]
+    L3,
 }

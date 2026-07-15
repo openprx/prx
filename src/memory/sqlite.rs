@@ -112,7 +112,7 @@ pub fn append_task_event_mirror(workspace_dir: &Path, input: SqliteTaskEventMirr
     Ok(conn.last_insert_rowid())
 }
 
-pub(crate) fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()> {
+pub fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS approval_grants (
             grant_id                 TEXT PRIMARY KEY,

@@ -89,36 +89,17 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::{Input, Password};
+use openprx::{
+    CHAT_TRACING_RELOAD, ChannelCommands, ChatFmtLayer, Config, CronCommands, EvolutionCommands, IntegrationCommands,
+    MigrateCommands, ServiceCommands, SkillCommands, acl, agent, auth, channels, chat, config, cron, daemon, doctor,
+    evolution_cli, gateway, integrations, memory, migration, onboard, providers, runtime, security, service,
+    session_worker, skills,
+};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Write, path::PathBuf};
 use tracing::warn;
 use tracing_subscriber::{EnvFilter, fmt};
-
-// P3-1: Reload handle exposed to the `chat` subcommand so it can redirect
-// tracing output to ~/.openprx/chat.log while the TUI owns stderr.
-//
-// `BoxMakeWriter` lets us swap the writer at runtime without rebuilding the
-// entire subscriber stack. The boxed writer is `Send + Sync + 'static`,
-// which the reload layer requires.
-//
-// The fmt::Layer's `S` type parameter is the *inner* subscriber that the
-// layer wraps. Since the global subscriber stack is
-//   `Registry → EnvFilter → reload::Layer<fmt::Layer<...>>`,
-// the fmt::Layer is layered onto `Layered<EnvFilter, Registry>`, so that's
-// what `S` must be in both the layer's type and the reload handle's type.
-pub(crate) type ChatSubscriber =
-    tracing_subscriber::layer::Layered<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>;
-pub(crate) type ChatWriter = tracing_subscriber::fmt::writer::BoxMakeWriter;
-pub(crate) type ChatFmtLayer = tracing_subscriber::fmt::Layer<
-    ChatSubscriber,
-    tracing_subscriber::fmt::format::DefaultFields,
-    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full>,
-    ChatWriter,
->;
-pub(crate) static CHAT_TRACING_RELOAD: std::sync::OnceLock<
-    tracing_subscriber::reload::Handle<ChatFmtLayer, ChatSubscriber>,
-> = std::sync::OnceLock::new();
 
 const CONFIG_REDACTION_MASK: &str = "***";
 
@@ -210,63 +191,10 @@ fn is_config_show_sensitive_key(key: &str) -> bool {
         || key.contains("private_key")
 }
 
-mod acl;
-mod agent;
-mod approval;
-mod auth;
-mod causal_tree;
-mod channels;
-mod chat;
-mod config;
-mod cost;
-mod cron;
-mod daemon;
-mod doctor;
-mod evolution_cli;
-mod gateway;
-mod health;
-mod heartbeat;
-mod hooks;
-mod identity;
-mod integrations;
-mod llm;
-mod media;
-mod memory;
-mod migration;
-mod multimodal;
-mod nodes;
-mod observability;
-mod onboard;
-#[cfg(feature = "wasm-plugins")]
-mod plugins;
-mod providers;
-mod recovery;
-mod router;
-mod runtime;
-// D3 (FIX-P1-21a): the CLI dispatch lives at `src/runtime/mode.rs` but must be a
-// child of the *binary* crate root (this `main.rs`), not the shared `openprx`
-// library crate, because it references binary-only items (`Commands`, the
-// `handle_*_command` helpers, and binary-only modules such as `chat`/`doctor`/
-// `integrations`). The shared `runtime/` directory is compiled into both the lib
-// and the bin, so declaring `mode` inside `runtime/mod.rs` would break the lib
-// build. Declaring it here via `#[path]` keeps the file under `runtime/` while
-// scoping it to the binary, where `crate::` resolves to these items.
+// CLI dispatch remains binary-owned; every runtime subsystem it calls is owned
+// and compiled once by the openprx library.
 #[path = "runtime/mode.rs"]
 mod mode;
-mod schema_migration;
-mod security;
-mod self_system;
-mod service;
-mod session_worker;
-mod skillforge;
-mod skills;
-mod tools;
-mod tunnel;
-mod util;
-mod webhook;
-mod xin;
-
-use config::Config;
 
 /// `OpenPRX` - 100% Rust. 100% Agnostic. Your AI, your rules.
 #[derive(Parser, Debug)]
@@ -280,22 +208,6 @@ struct Cli {
 
     #[command(subcommand)]
     command: Commands,
-}
-
-#[derive(Subcommand, Debug)]
-enum ServiceCommands {
-    /// Install daemon service unit for auto-start and restart
-    Install,
-    /// Start daemon service
-    Start,
-    /// Stop daemon service
-    Stop,
-    /// Restart daemon service to apply latest config
-    Restart,
-    /// Check daemon service status
-    Status,
-    /// Uninstall daemon service unit
-    Uninstall,
 }
 
 #[derive(Subcommand, Debug)]
@@ -825,42 +737,6 @@ enum ConfigShowFormat {
 }
 
 #[derive(Subcommand, Debug)]
-enum EvolutionCommands {
-    /// Show evolution runtime status dashboard
-    Status,
-    /// Show evolution history from JSONL logs
-    History {
-        /// Maximum rows to display
-        #[arg(long, default_value_t = 20)]
-        limit: usize,
-    },
-    /// Show daily digest by date (YYYY-MM-DD)
-    Digest {
-        /// Date in YYYY-MM-DD format (default: today UTC)
-        #[arg(long)]
-        date: Option<String>,
-    },
-    /// Show parsed evolution_config.toml
-    Config,
-    /// Manually trigger one evolution cycle
-    Trigger {
-        /// Layer choice: L1 (memory), L2 (prompt), L3 (strategy/policy)
-        #[arg(long, value_enum)]
-        layer: Option<EvolutionLayerArg>,
-    },
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-enum EvolutionLayerArg {
-    #[value(name = "L1")]
-    L1,
-    #[value(name = "L2")]
-    L2,
-    #[value(name = "L3")]
-    L3,
-}
-
-#[derive(Subcommand, Debug)]
 enum AuthCommands {
     /// Login with OpenAI Codex OAuth
     Login {
@@ -944,104 +820,6 @@ enum AuthCommands {
 }
 
 #[derive(Subcommand, Debug)]
-enum MigrateCommands {
-    /// Show schema migration status for the memory database
-    Status,
-    /// Verify applied schema migration checksums
-    Verify,
-    /// Preview pending schema migrations without writing
-    DryRun,
-    /// Plan migrations up to a target version (dry-run diff, writes nothing)
-    Plan {
-        /// Known numeric backend migration version to plan through (inclusive).
-        /// Pending migrations above this version are excluded.
-        #[arg(long)]
-        target_version: String,
-    },
-    /// Deprecated compatibility command; never writes a synthetic baseline
-    Baseline,
-    /// Import memory from an `OpenClaw` workspace into this `OpenPRX` workspace
-    Openclaw {
-        /// Optional path to `OpenClaw` workspace (defaults to ~/.openclaw/workspace)
-        #[arg(long)]
-        source: Option<std::path::PathBuf>,
-
-        /// Validate and preview migration without writing any data
-        #[arg(long)]
-        dry_run: bool,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum CronCommands {
-    /// List all scheduled tasks
-    List,
-    /// Add a new scheduled task
-    Add {
-        /// Cron expression
-        expression: String,
-        /// Optional IANA timezone (e.g. America/Los_Angeles)
-        #[arg(long)]
-        tz: Option<String>,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot scheduled task at an RFC3339 timestamp
-    AddAt {
-        /// One-shot timestamp in RFC3339 format
-        at: String,
-        /// Command to run
-        command: String,
-    },
-    /// Add a fixed-interval scheduled task
-    AddEvery {
-        /// Interval in milliseconds
-        every_ms: u64,
-        /// Command to run
-        command: String,
-    },
-    /// Add a one-shot delayed task (e.g. "30m", "2h", "1d")
-    Once {
-        /// Delay duration
-        delay: String,
-        /// Command to run
-        command: String,
-    },
-    /// Remove a scheduled task
-    Remove {
-        /// Task ID
-        id: String,
-    },
-    /// Update a scheduled task
-    Update {
-        /// Task ID
-        id: String,
-        /// New cron expression
-        #[arg(long)]
-        expression: Option<String>,
-        /// New IANA timezone
-        #[arg(long)]
-        tz: Option<String>,
-        /// New command to run
-        #[arg(long)]
-        command: Option<String>,
-        /// New job name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// Pause a scheduled task
-    Pause {
-        /// Task ID
-        id: String,
-    },
-    /// Resume a paused task
-    Resume {
-        /// Task ID
-        id: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
 enum ModelCommands {
     /// List model catalogs
     List {
@@ -1077,60 +855,6 @@ enum DoctorCommands {
     Memory,
     /// Report live runtime validation matrix readiness
     Runtime,
-}
-
-#[derive(Subcommand, Debug)]
-pub(crate) enum ChannelCommands {
-    /// List configured channels
-    List,
-    /// Start all configured channels (Telegram, Discord, Slack)
-    Start,
-    /// Run health checks for configured channels
-    Doctor,
-    /// Add a new channel
-    Add {
-        /// Channel type
-        channel_type: String,
-        /// Configuration JSON
-        config: String,
-    },
-    /// Remove a channel
-    Remove {
-        /// Channel name
-        name: String,
-    },
-    /// Bind a Telegram identity (username or numeric user ID) into allowlist
-    BindTelegram {
-        /// Telegram identity to allow (username without '@' or numeric user ID)
-        identity: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum SkillCommands {
-    /// List installed skills
-    List,
-    /// Install a skill from a git URL (HTTPS/SSH) or local path
-    Install {
-        /// Git URL (HTTPS/SSH) or local path
-        source: String,
-    },
-    /// Remove an installed skill
-    Remove {
-        /// Skill name
-        name: String,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum IntegrationCommands {
-    /// List integrations
-    List,
-    /// Show details about a specific integration
-    Info {
-        /// Integration name
-        name: String,
-    },
 }
 
 /// Process-wide bound on how long the runtime drop will wait for stuck
@@ -2630,6 +2354,18 @@ mod tests {
                 integration_command: Some(IntegrationCommands::List),
             } => {}
             other => panic!("expected integrations list command, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn migrate_plan_uses_the_library_owned_dto() {
+        let cli = Cli::try_parse_from(["prx", "migrate", "plan", "--target-version", "7"])
+            .expect("migrate plan should parse");
+        match cli.command {
+            Commands::Migrate {
+                migrate_command: MigrateCommands::Plan { target_version },
+            } => assert_eq!(target_version, "7"),
+            other => panic!("expected migrate plan command, got {other:?}"),
         }
     }
 
