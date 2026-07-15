@@ -3676,10 +3676,8 @@ pub async fn run(
 
     // ── Skills ────────────────────────────────────────────────────
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
-    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    if config.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills =
+        crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
 
     // ── Tool descriptions for system prompt ──────────────────────
     let tool_descs: Vec<(&str, &str)> = vec![

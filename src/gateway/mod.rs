@@ -1573,12 +1573,14 @@ async fn run_gateway_chat_with_multimodal(
         )
     };
     let native_tools = state.provider.supports_native_tools();
-    let mut skills = crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
-    if config_snapshot.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills = crate::skills::load_skills_with_embeddings(
+        &config_snapshot.workspace_dir,
+        &config_snapshot,
+        skill_embedder.as_ref(),
+    )
+    .await?;
     let selected_skills = if config_snapshot.skill_rag.enabled {
         crate::skills::select_skills_by_relevance(
             message,

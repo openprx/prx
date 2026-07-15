@@ -247,10 +247,12 @@ async fn run_console_runtime_turn(
     let native_tools = state.provider.supports_native_tools();
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
-    let mut skills = crate::skills::load_skills_with_config(&config_snapshot.workspace_dir, &config_snapshot);
-    if config_snapshot.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills = crate::skills::load_skills_with_embeddings(
+        &config_snapshot.workspace_dir,
+        &config_snapshot,
+        skill_embedder.as_ref(),
+    )
+    .await?;
     let selected_skills =
         select_prompt_skills(visible_message, &skills, &config_snapshot, skill_embedder.as_ref()).await;
     let tool_descs = console_tool_descriptions(&config_snapshot);

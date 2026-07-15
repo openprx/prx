@@ -27,17 +27,28 @@ impl Integrator {
     /// Write SKILL.toml and SKILL.md for the given candidate.
     pub fn integrate(&self, candidate: &ScoutResult) -> Result<PathBuf> {
         let safe_name = sanitize_path_component(&candidate.name)?;
-        let skill_dir = self.output_dir.join(&safe_name);
-        fs::create_dir_all(&skill_dir).with_context(|| format!("Failed to create dir: {}", skill_dir.display()))?;
+        let (staging_dir, skill_dir) = crate::skills::skill_staging_paths(&self.output_dir, &safe_name)?;
+        fs::create_dir(&staging_dir)
+            .with_context(|| format!("Failed to create staging dir: {}", staging_dir.display()))?;
 
-        let toml_path = skill_dir.join("SKILL.toml");
-        let md_path = skill_dir.join("SKILL.md");
+        let toml_path = staging_dir.join("SKILL.toml");
+        let md_path = staging_dir.join("SKILL.md");
 
         let toml_content = self.generate_toml(candidate);
         let md_content = self.generate_md(candidate);
 
-        fs::write(&toml_path, &toml_content).with_context(|| format!("Failed to write {}", toml_path.display()))?;
-        fs::write(&md_path, &md_content).with_context(|| format!("Failed to write {}", md_path.display()))?;
+        let staged = (|| -> Result<()> {
+            fs::write(&toml_path, &toml_content).with_context(|| format!("Failed to write {}", toml_path.display()))?;
+            fs::write(&md_path, &md_content).with_context(|| format!("Failed to write {}", md_path.display()))?;
+            crate::skills::mark_staged_skill_untrusted(&staging_dir, &candidate.url)?;
+            let workspace_dir = self.output_dir.parent().unwrap_or(&self.output_dir);
+            crate::skills::activate_staged_skill(&staging_dir, &skill_dir, workspace_dir)?;
+            Ok(())
+        })();
+        if let Err(error) = staged {
+            crate::skills::cleanup_staged_skill(&staging_dir);
+            return Err(error);
+        }
 
         info!(
             skill = candidate.name.as_str(),
@@ -190,10 +201,9 @@ mod tests {
 
     #[tokio::test]
     async fn integrate_creates_files() {
-        let tmp = std::env::temp_dir().join("openprx-test-integrate");
-        let _ = fs::remove_dir_all(&tmp);
+        let tmp = tempfile::tempdir().unwrap();
 
-        let integrator = Integrator::new(tmp.to_string_lossy().into_owned());
+        let integrator = Integrator::new(tmp.path().to_string_lossy().into_owned());
         let c = sample_candidate();
         let path = integrator.integrate(&c).unwrap();
 
@@ -207,8 +217,18 @@ mod tests {
         let md = tokio::fs::read_to_string(path.join("SKILL.md")).await.unwrap();
         assert!(md.contains("# test-skill"));
         assert!(md.contains("A test skill for unit tests"));
-
-        let _ = fs::remove_dir_all(&tmp);
+        assert!(path.join(".openprx-untrusted-origin.json").is_file());
+        assert!(
+            integrator.integrate(&c).is_err(),
+            "existing active skill must never be replaced"
+        );
+        assert!(
+            fs::read_dir(tmp.path())
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".staging-")),
+            "failed integration must clean staging directories"
+        );
     }
 
     #[test]

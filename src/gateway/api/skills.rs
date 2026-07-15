@@ -194,10 +194,10 @@ pub async fn install_skill(
     Json(req): Json<InstallRequest>,
 ) -> Result<Json<InstallResponse>, (StatusCode, Json<serde_json::Value>)> {
     // Validate name (no path traversal)
-    if req.name.contains("..") || req.name.contains('/') || req.name.contains('\\') {
+    if let Err(error) = crate::skills::validate_skill_name(&req.name) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid skill name"})),
+            Json(serde_json::json!({"error": error.to_string()})),
         ));
     }
 
@@ -224,26 +224,40 @@ pub async fn install_skill(
         ));
     }
 
-    let target_dir = skills_dir.join(&req.name);
-    if target_dir.exists() {
-        return Err((
+    let (staging_dir, target_dir) = crate::skills::skill_staging_paths(&skills_dir, &req.name).map_err(|error| {
+        (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": "Skill already installed"})),
-        ));
-    }
+            Json(serde_json::json!({"error": error.to_string()})),
+        )
+    })?;
 
-    // Git clone
+    // This explicit mutation endpoint is a control-plane operation. Clone into
+    // an inactive same-filesystem directory, validate, then atomically rename.
     let output = tokio::process::Command::new("git")
-        .args(["clone", "--depth", "1", &req.url, &target_dir.display().to_string()])
+        .args(["clone", "--depth", "1", &req.url])
+        .arg(&staging_dir)
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
+            let activation = crate::skills::mark_staged_skill_untrusted(&staging_dir, &req.url)
+                .and_then(|()| crate::skills::activate_staged_skill(&staging_dir, &target_dir, &config.workspace_dir));
+            if let Err(error) = activation {
+                crate::skills::cleanup_staged_skill(&staging_dir);
+                warn!(name = req.name.as_str(), error = %error, "staged skill validation or activation failed");
+                return Err((
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    Json(serde_json::json!({"error": error.to_string()})),
+                ));
+            }
             info!(name = req.name.as_str(), "Skill installed successfully");
 
-            // Try to read description from SKILL.md
-            let description = read_skill_description(&target_dir);
+            let description = crate::skills::load_skills_with_config(&config.workspace_dir, &config)
+                .into_iter()
+                .find(|skill| skill.name.eq_ignore_ascii_case(&req.name))
+                .map(|skill| skill.description)
+                .unwrap_or_default();
 
             Ok(Json(InstallResponse {
                 status: "ok".into(),
@@ -258,14 +272,14 @@ pub async fn install_skill(
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr).to_string();
             warn!(name = req.name.as_str(), stderr = stderr.as_str(), "git clone failed");
-            // Clean up partial clone
-            let _ = std::fs::remove_dir_all(&target_dir);
+            crate::skills::cleanup_staged_skill(&staging_dir);
             Err((
                 StatusCode::BAD_GATEWAY,
                 Json(serde_json::json!({"error": format!("git clone failed: {stderr}")})),
             ))
         }
         Err(e) => {
+            crate::skills::cleanup_staged_skill(&staging_dir);
             warn!(error = %e, "Failed to run git");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -273,23 +287,6 @@ pub async fn install_skill(
             ))
         }
     }
-}
-
-/// Read description from SKILL.md if it exists
-fn read_skill_description(dir: &std::path::Path) -> String {
-    let skill_md = dir.join("SKILL.md");
-    if skill_md.exists() {
-        if let Ok(content) = std::fs::read_to_string(&skill_md) {
-            // Extract first paragraph or description line
-            for line in content.lines() {
-                let trimmed = line.trim();
-                if !trimmed.is_empty() && !trimmed.starts_with('#') && !trimmed.starts_with("---") {
-                    return trimmed.to_string();
-                }
-            }
-        }
-    }
-    String::new()
 }
 
 // ---------------------------------------------------------------------------
@@ -301,10 +298,10 @@ pub async fn uninstall_skill(
     Path(name): Path<String>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     // Validate name
-    if name.contains("..") || name.contains('/') || name.contains('\\') {
+    if let Err(error) = crate::skills::validate_skill_name(&name) {
         return Err((
             StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({"error": "Invalid skill name"})),
+            Json(serde_json::json!({"error": error.to_string()})),
         ));
     }
 
@@ -314,15 +311,23 @@ pub async fn uninstall_skill(
     let skills_dir = config.workspace_dir.join("skills");
     let target_dir = skills_dir.join(&name);
 
-    if !target_dir.exists() {
+    if std::fs::symlink_metadata(&target_dir).is_err() {
         return Err((
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "Skill not found"})),
         ));
     }
 
-    match std::fs::remove_dir_all(&target_dir) {
-        Ok(_) => {
+    let removal = std::fs::symlink_metadata(&target_dir).and_then(|metadata| {
+        if metadata.file_type().is_symlink() || metadata.is_file() {
+            std::fs::remove_file(&target_dir)
+        } else {
+            std::fs::remove_dir_all(&target_dir)
+        }
+    });
+    match removal {
+        Ok(()) => {
+            crate::skills::invalidate_skill_catalog(&config.workspace_dir);
             info!(name = name.as_str(), "Skill uninstalled");
             Ok(Json(serde_json::json!({
                 "status": "ok",

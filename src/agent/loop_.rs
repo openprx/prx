@@ -6975,10 +6975,8 @@ pub(crate) async fn run_with_runtime_envelope(
     }
     let native_tools = provider.supports_native_tools();
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
-    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-    if config.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills =
+        crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
 
     // ── Approval manager (supervised mode) ───────────────────────
     let approval_manager = Arc::new(ApprovalManager::new());
@@ -7822,7 +7820,6 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &provider_runtime_options,
     )?;
 
-    let mut skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
     let mut tool_descs: Vec<(&str, &str)> = vec![
         ("shell", "Execute terminal commands."),
         ("file_read", "Read file contents."),
@@ -7837,9 +7834,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     }
     let native_tools = provider.supports_native_tools();
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
-    if config.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills =
+        crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
     let selected_skills = select_prompt_skills(message, &skills, &config, skill_embedder.as_ref()).await;
     let system_prompt = build_runtime_system_prompt(
         &config,

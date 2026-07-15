@@ -210,6 +210,8 @@ pub enum ChannelCommands {
 pub enum SkillCommands {
     /// List installed skills
     List,
+    /// Explicitly synchronize enabled community skill repositories
+    Sync,
     /// Install a skill from a git URL (HTTPS/SSH) or local path
     Install {
         /// Git URL (HTTPS/SSH) or local path

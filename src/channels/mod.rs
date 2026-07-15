@@ -4966,10 +4966,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     );
 
     let skill_embedder = crate::memory::create_embedder_from_config(&config, config.api_key.as_deref());
-    let mut skills = crate::skills::load_skills_with_config(&workspace, &config);
-    if config.skill_rag.enabled {
-        crate::skills::hydrate_skill_embeddings(&mut skills, skill_embedder.as_ref()).await?;
-    }
+    let skills = crate::skills::load_skills_with_embeddings(&workspace, &config, skill_embedder.as_ref()).await?;
 
     // Collect tool descriptions for the prompt
     let mut tool_descs: Vec<(&str, &str)> = vec![
