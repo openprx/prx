@@ -7,7 +7,7 @@ use crate::self_system::evolution::{
     PromptEvolutionEngine, StrategyEvolutionEngine, new_shared_evolution_config,
 };
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Utc};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -125,17 +125,8 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         let heartbeat_ttl = u64::from(config.heartbeat.interval_minutes)
             .saturating_mul(120)
             .max(OPTIONAL_HEALTH_TTL_SECONDS);
-        register_optional_component("heartbeat", "heartbeat", true, heartbeat_ttl);
-        let heartbeat_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "heartbeat",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = heartbeat_cfg.clone();
-                async move { run_heartbeat_worker(cfg).await }
-            },
-        ));
+        register_optional_component("heartbeat", "xin", true, heartbeat_ttl);
+        tracing::info!("Heartbeat tasks are materialized and scheduled by xin");
     } else {
         register_optional_component("heartbeat", "heartbeat", false, OPTIONAL_HEALTH_TTL_SECONDS);
         if !config.modules.scheduler {
@@ -172,8 +163,8 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     }
 
     // ── Xin (心) autonomous task engine ──
-    if config.modules.scheduler && config.xin.enabled {
-        let xin_ttl = u64::from(config.xin.interval_minutes)
+    if xin_runtime_enabled(&config) {
+        let xin_ttl = u64::from(crate::xin::runner::runner_interval_minutes(&config))
             .saturating_mul(120)
             .max(OPTIONAL_HEALTH_TTL_SECONDS);
         register_optional_component("xin", "xin", true, xin_ttl);
@@ -192,7 +183,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         if !config.modules.scheduler {
             tracing::debug!("Scheduler module disabled, skipping xin startup");
         } else {
-            tracing::info!("Xin disabled; xin supervisor not started");
+            tracing::info!("Xin and Heartbeat disabled; xin supervisor not started");
         }
     }
 
@@ -394,6 +385,10 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     })
 }
 
+fn xin_runtime_enabled(config: &Config) -> bool {
+    config.modules.scheduler && (config.xin.enabled || config.heartbeat.enabled)
+}
+
 fn ensure_manual_daemon_start_allowed(config: &Config) -> Result<()> {
     if is_systemd_managed_start() {
         return Ok(());
@@ -506,55 +501,6 @@ where
             backoff = backoff.saturating_mul(2).min(max_backoff);
         }
     })
-}
-
-async fn run_heartbeat_worker(config: Config) -> Result<()> {
-    let observer: std::sync::Arc<dyn crate::observability::Observer> =
-        std::sync::Arc::from(crate::observability::create_observer(&config.observability));
-    let engine = crate::heartbeat::engine::HeartbeatEngine::new(
-        config.heartbeat.clone(),
-        config.workspace_dir.clone(),
-        observer,
-    );
-
-    let interval_mins = config.heartbeat.interval_minutes.max(5);
-    let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
-    crate::health::mark_component_ok("heartbeat");
-
-    loop {
-        interval.tick().await;
-        crate::health::mark_component_ok("heartbeat");
-        let local_hour = chrono::Local::now().hour() as u8;
-        if !crate::heartbeat::engine::HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour) {
-            continue;
-        }
-
-        let prompts = engine.collect_task_prompts().await?;
-        if prompts.is_empty() {
-            continue;
-        }
-
-        for prompt in prompts {
-            let temp = config.default_temperature;
-            // Background heartbeat: no cooperative shutdown signal of its own;
-            // the supervisor aborts the task. See never_cancelled_shutdown docs.
-            if let Err(e) = crate::agent::run(
-                config.clone(),
-                Some(prompt),
-                None,
-                None,
-                temp,
-                crate::runtime::shutdown::never_cancelled_shutdown(),
-            )
-            .await
-            {
-                crate::health::mark_component_error("heartbeat", e.to_string());
-                tracing::warn!("Heartbeat task failed: {e}");
-            } else {
-                crate::health::mark_component_ok("heartbeat");
-            }
-        }
-    }
 }
 
 async fn run_fitness_worker(config: Config) -> Result<()> {
@@ -998,6 +944,25 @@ mod tests {
 
         let path = state_file_path(&config);
         assert_eq!(path, tmp.path().join("daemon_state.json"));
+    }
+
+    #[test]
+    fn heartbeat_enables_the_shared_xin_runtime_without_enabling_other_xin_work() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.modules.scheduler = true;
+        config.xin.enabled = false;
+        config.heartbeat.enabled = true;
+        assert!(xin_runtime_enabled(&config));
+
+        config.heartbeat.enabled = false;
+        assert!(!xin_runtime_enabled(&config));
+
+        config.xin.enabled = true;
+        assert!(xin_runtime_enabled(&config));
+
+        config.modules.scheduler = false;
+        assert!(!xin_runtime_enabled(&config));
     }
 
     #[test]

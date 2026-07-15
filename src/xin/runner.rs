@@ -7,6 +7,7 @@
 //! - Persist results and reschedule
 
 use crate::config::Config;
+use crate::heartbeat::engine::{HEARTBEAT_TASK_PREFIX, HeartbeatEngine};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
@@ -15,7 +16,7 @@ use crate::xin::builtin::BuiltinRegistry;
 use crate::xin::store;
 use crate::xin::types::{ExecutionMode, GoalStatus, XinGoal, XinStep, XinTask, XinTickSummary, default_lease_ttl_secs};
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{Timelike, Utc};
 use futures_util::{StreamExt, stream};
 use std::sync::Arc;
 use tokio::time::{self, Duration};
@@ -51,7 +52,8 @@ fn hostname_hash() -> String {
 
 /// Run the xin heartbeat loop. Called by daemon supervisor.
 pub async fn run(config: Config) -> Result<()> {
-    let interval_secs = u64::from(config.xin.interval_minutes.max(1)) * 60;
+    let interval_minutes = runner_interval_minutes(&config);
+    let interval_secs = u64::from(interval_minutes) * 60;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
 
@@ -60,26 +62,36 @@ pub async fn run(config: Config) -> Result<()> {
     let registry = Arc::new(BuiltinRegistry::new());
 
     // Register built-in system tasks if configured
-    if config.xin.builtin_tasks {
+    if config.xin.enabled && config.xin.builtin_tasks {
         register_builtin_tasks(&config)?;
+    }
+
+    let heartbeat_engine = HeartbeatEngine::new(config.heartbeat.clone(), config.workspace_dir.clone());
+    if let Err(error) = reconcile_heartbeat_tasks(&config, &heartbeat_engine).await {
+        crate::health::mark_component_error("heartbeat", error.to_string());
+        return Err(error);
     }
 
     // Crash recovery: surface any goal steps whose lease expired while the
     // daemon was down so they get re-claimed (rather than silently orphaned).
-    match store::expired_step_leases(&config, Utc::now()) {
-        Ok(steps) if !steps.is_empty() => {
+    match config
+        .xin
+        .enabled
+        .then(|| store::expired_step_leases(&config, Utc::now()))
+    {
+        Some(Ok(steps)) if !steps.is_empty() => {
             tracing::info!(
                 target: "xin",
                 count = steps.len(),
                 "recovered goal steps with expired leases on startup"
             );
         }
-        Ok(_) => {}
-        Err(e) => tracing::warn!(target: "xin", "startup expired-lease scan failed: {e}"),
+        Some(Ok(_)) | None => {}
+        Some(Err(e)) => tracing::warn!(target: "xin", "startup expired-lease scan failed: {e}"),
     }
 
     // Optionally adopt orphaned legacy tasks into lease-managed goals.
-    if config.xin.adopt_legacy_tasks {
+    if config.xin.enabled && config.xin.adopt_legacy_tasks {
         match adopt_legacy_tasks(&config) {
             Ok(0) => {}
             Ok(n) => tracing::info!(target: "xin", count = n, "adopted legacy tasks into goals"),
@@ -90,7 +102,8 @@ pub async fn run(config: Config) -> Result<()> {
     crate::health::mark_component_ok(XIN_COMPONENT);
     tracing::info!(
         target: "xin",
-        interval_minutes = config.xin.interval_minutes,
+        interval_minutes,
+        heartbeat_materialization = config.heartbeat.enabled,
         max_concurrent = config.xin.max_concurrent,
         builtin_tasks = config.xin.builtin_tasks,
         evolution_integration = config.xin.evolution_integration,
@@ -101,34 +114,42 @@ pub async fn run(config: Config) -> Result<()> {
         interval.tick().await;
         crate::health::mark_component_ok(XIN_COMPONENT);
 
-        // Mark stale tasks
-        if let Err(e) = store::mark_stale(&config, config.xin.stale_timeout_minutes) {
+        if let Err(e) = reconcile_heartbeat_tasks(&config, &heartbeat_engine).await {
+            crate::health::mark_component_error("heartbeat", e.to_string());
+            tracing::warn!(target: "xin", "HEARTBEAT.md materialization failed: {e}");
+        }
+
+        // Mark stale tasks. Heartbeat-only mode must not mutate unrelated Xin
+        // work while the Xin runtime is disabled.
+        if let Err(e) = mark_stale_tasks_for_runtime(&config) {
             tracing::warn!(target: "xin", "failed to mark stale tasks: {e}");
         }
 
         // Reset goal steps whose lease expired so they can be re-claimed instead
         // of orphaned. Lease + heartbeat (not updated_at) drive step staleness,
         // so long agent runs survive across ticks.
-        match store::mark_steps_stale(&config, Utc::now()) {
-            Ok(ids) if !ids.is_empty() => {
-                tracing::info!(target: "xin", count = ids.len(), "reset expired-lease steps to stale");
+        if config.xin.enabled {
+            match store::mark_steps_stale(&config, Utc::now()) {
+                Ok(ids) if !ids.is_empty() => {
+                    tracing::info!(target: "xin", count = ids.len(), "reset expired-lease steps to stale");
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(target: "xin", "failed to mark steps stale: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!(target: "xin", "failed to mark steps stale: {e}"),
-        }
 
-        // Drive any goals that have runnable steps (crash-safe, lease-guarded).
-        if let Err(e) = drive_goals(&config, &security, &registry).await {
-            tracing::warn!(target: "xin", "goal driving failed: {e}");
-        }
+            // Drive any goals that have runnable steps (crash-safe, lease-guarded).
+            if let Err(e) = drive_goals(&config, &security, &registry).await {
+                tracing::warn!(target: "xin", "goal driving failed: {e}");
+            }
 
-        // Emit a per-goal progress snapshot for observability.
-        if let Err(e) = report_goal_progress(&config) {
-            tracing::warn!(target: "xin", "goal progress report failed: {e}");
+            // Emit a per-goal progress snapshot for observability.
+            if let Err(e) = report_goal_progress(&config) {
+                tracing::warn!(target: "xin", "goal progress report failed: {e}");
+            }
         }
 
         // Query due tasks
-        let tasks = match store::due_tasks(&config, Utc::now(), config.xin.max_concurrent) {
+        let mut tasks = match due_tasks_for_runtime(&config, Utc::now()) {
             Ok(tasks) => tasks,
             Err(e) => {
                 crate::health::mark_component_error(XIN_COMPONENT, e.to_string());
@@ -136,6 +157,8 @@ pub async fn run(config: Config) -> Result<()> {
                 continue;
             }
         };
+        let local_hour = chrono::Local::now().hour() as u8;
+        tasks.retain(|task| task_enabled_for_runtime(&config, task, local_hour));
 
         if tasks.is_empty() {
             continue;
@@ -154,6 +177,52 @@ pub async fn run(config: Config) -> Result<()> {
         );
 
         crate::health::mark_component_ok(XIN_COMPONENT);
+    }
+}
+
+pub(crate) fn runner_interval_minutes(config: &Config) -> u32 {
+    let xin = config.xin.enabled.then_some(config.xin.interval_minutes.max(1));
+    let heartbeat = config
+        .heartbeat
+        .enabled
+        .then_some(config.heartbeat.interval_minutes.max(5));
+    match (xin, heartbeat) {
+        (Some(xin), Some(heartbeat)) => xin.min(heartbeat),
+        (Some(xin), None) => xin,
+        (None, Some(heartbeat)) => heartbeat,
+        (None, None) => config.xin.interval_minutes.max(1),
+    }
+}
+
+async fn reconcile_heartbeat_tasks(config: &Config, engine: &HeartbeatEngine) -> Result<usize> {
+    let materialized = engine.materialize_xin_tasks(config).await?;
+    if config.heartbeat.enabled {
+        crate::health::mark_component_ok("heartbeat");
+    }
+    Ok(materialized.len())
+}
+
+fn task_enabled_for_runtime(config: &Config, task: &XinTask, local_hour: u8) -> bool {
+    if HeartbeatEngine::is_materialized_task(task) {
+        config.heartbeat.enabled && HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour)
+    } else {
+        config.xin.enabled
+    }
+}
+
+fn mark_stale_tasks_for_runtime(config: &Config) -> Result<usize> {
+    if config.xin.enabled {
+        store::mark_stale(config, config.xin.stale_timeout_minutes)
+    } else {
+        store::mark_stale_system_tasks_in_namespace(config, config.xin.stale_timeout_minutes, HEARTBEAT_TASK_PREFIX)
+    }
+}
+
+fn due_tasks_for_runtime(config: &Config, now: chrono::DateTime<Utc>) -> Result<Vec<XinTask>> {
+    if config.xin.enabled {
+        store::due_tasks(config, now, config.xin.max_concurrent)
+    } else {
+        store::due_system_tasks_in_namespace(config, now, config.xin.max_concurrent, HEARTBEAT_TASK_PREFIX)
     }
 }
 
@@ -902,6 +971,136 @@ mod tests {
         assert_eq!(goals[0].topic_id.as_deref(), Some("topic-a"));
         assert_eq!(goals[0].source_message_event_id.as_deref(), Some("message-a"));
         assert_eq!(store::list_steps(&config, &goals[0].id).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn heartbeat_and_xin_share_the_fastest_required_poll_interval() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.xin.enabled = false;
+        config.heartbeat.enabled = true;
+        config.heartbeat.interval_minutes = 30;
+        assert_eq!(runner_interval_minutes(&config), 30);
+
+        config.xin.enabled = true;
+        config.xin.interval_minutes = 5;
+        assert_eq!(runner_interval_minutes(&config), 5);
+
+        config.xin.interval_minutes = 60;
+        assert_eq!(runner_interval_minutes(&config), 30);
+    }
+
+    #[test]
+    fn heartbeat_only_runtime_filters_regular_xin_tasks_and_active_hours() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.xin.enabled = false;
+        config.heartbeat.enabled = true;
+        config.heartbeat.active_hours = vec![8, 10];
+
+        let heartbeat = store::add_task(
+            &config,
+            &NewXinTask {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "heartbeat:test".to_string(),
+                description: None,
+                kind: TaskKind::System,
+                priority: TaskPriority::Normal,
+                execution_mode: ExecutionMode::AgentSession,
+                payload: "heartbeat".to_string(),
+                recurring: true,
+                interval_secs: 300,
+                max_failures: 1,
+                approval_grant_json: None,
+            },
+        )
+        .unwrap();
+        let regular = store::add_task(
+            &config,
+            &NewXinTask {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "regular-xin".to_string(),
+                description: None,
+                kind: TaskKind::User,
+                priority: TaskPriority::Normal,
+                execution_mode: ExecutionMode::AgentSession,
+                payload: "regular".to_string(),
+                recurring: false,
+                interval_secs: 0,
+                max_failures: 1,
+                approval_grant_json: None,
+            },
+        )
+        .unwrap();
+
+        assert!(task_enabled_for_runtime(&config, &heartbeat, 9));
+        assert!(!task_enabled_for_runtime(&config, &heartbeat, 12));
+        assert!(!task_enabled_for_runtime(&config, &regular, 9));
+
+        config.xin.enabled = true;
+        assert!(task_enabled_for_runtime(&config, &regular, 9));
+    }
+
+    #[test]
+    fn heartbeat_only_due_query_cannot_be_starved_by_regular_xin_tasks() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = test_config(&tmp);
+        config.xin.enabled = false;
+        config.xin.max_concurrent = 1;
+        config.heartbeat.enabled = true;
+
+        for index in 0..3 {
+            store::add_task(
+                &config,
+                &NewXinTask {
+                    owner_id: None,
+                    topic_id: None,
+                    parent_task_id: None,
+                    source_message_event_id: None,
+                    name: format!("regular-critical-{index}"),
+                    description: None,
+                    kind: TaskKind::User,
+                    priority: TaskPriority::Critical,
+                    execution_mode: ExecutionMode::AgentSession,
+                    payload: "regular".to_string(),
+                    recurring: false,
+                    interval_secs: 0,
+                    max_failures: 1,
+                    approval_grant_json: None,
+                },
+            )
+            .unwrap();
+        }
+        let heartbeat = store::add_task(
+            &config,
+            &NewXinTask {
+                owner_id: None,
+                topic_id: None,
+                parent_task_id: None,
+                source_message_event_id: None,
+                name: "heartbeat:survives-priority-pressure".to_string(),
+                description: None,
+                kind: TaskKind::System,
+                priority: TaskPriority::Normal,
+                execution_mode: ExecutionMode::AgentSession,
+                payload: "heartbeat".to_string(),
+                recurring: false,
+                interval_secs: 0,
+                max_failures: 1,
+                approval_grant_json: None,
+            },
+        )
+        .unwrap();
+
+        let due = due_tasks_for_runtime(&config, Utc::now() + chrono::Duration::seconds(1)).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, heartbeat.id);
     }
 
     #[tokio::test]

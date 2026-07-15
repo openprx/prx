@@ -83,7 +83,7 @@ port = 16867
 [heartbeat]
 enabled = true
 interval_minutes = 30
-active_hours = "08:00-23:00"
+active_hours = [8, 23]
 
 [compaction]
 enabled = true
@@ -134,6 +134,13 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 # Provider fallbacks
 fallback_providers = ["xai"]
 ```
+
+`HEARTBEAT.md` remains the editable periodic checklist. When heartbeat is
+enabled, its dash-bullet entries are reconciled into stable recurring Xin
+tasks; Xin is the only execution scheduler even when `[xin].enabled` is false.
+In that heartbeat-only mode, ordinary Xin tasks and goals stay disabled.
+Reordering the file preserves task IDs, removed entries are disabled, and the
+configured prompt, interval, and active-hour window remain authoritative.
 
 ## Shared Memory Fabric
 

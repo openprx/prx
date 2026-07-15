@@ -1,68 +1,22 @@
+use crate::config::Config;
 use crate::config::HeartbeatConfig;
-use crate::observability::{Observer, ObserverEvent};
+use crate::xin::types::{ExecutionMode, NewXinTask, TaskKind, TaskPriority, XinTask, XinTaskPatch};
 use anyhow::Result;
-use chrono::Timelike;
+use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use tokio::time::{self, Duration};
-use tracing::{info, warn};
 
-/// Heartbeat engine — reads HEARTBEAT.md and executes tasks periodically
+pub const HEARTBEAT_TASK_PREFIX: &str = "heartbeat:";
+
+/// HEARTBEAT.md parser and Xin materialization adapter.
 pub struct HeartbeatEngine {
     config: HeartbeatConfig,
     workspace_dir: std::path::PathBuf,
-    observer: Arc<dyn Observer>,
 }
 
 impl HeartbeatEngine {
-    pub fn new(config: HeartbeatConfig, workspace_dir: std::path::PathBuf, observer: Arc<dyn Observer>) -> Self {
-        Self {
-            config,
-            workspace_dir,
-            observer,
-        }
-    }
-
-    /// Start the heartbeat loop (runs until cancelled)
-    pub async fn run(&self) -> Result<()> {
-        if !self.config.enabled {
-            info!("Heartbeat disabled");
-            return Ok(());
-        }
-
-        let interval_mins = self.config.interval_minutes.max(5);
-        info!("💓 Heartbeat started: every {} minutes", interval_mins);
-
-        let mut interval = time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
-
-        loop {
-            interval.tick().await;
-            self.observer.record_event(&ObserverEvent::HeartbeatTick);
-            let current_hour = chrono::Local::now().hour() as u8;
-            if !Self::is_within_active_hours(&self.config, current_hour) {
-                continue;
-            }
-
-            match self.tick().await {
-                Ok(tasks) => {
-                    if tasks > 0 {
-                        info!("💓 Heartbeat: processed {} tasks", tasks);
-                    }
-                }
-                Err(e) => {
-                    warn!("💓 Heartbeat error: {}", e);
-                    self.observer.record_event(&ObserverEvent::Error {
-                        component: "heartbeat".into(),
-                        message: e.to_string(),
-                    });
-                }
-            }
-        }
-    }
-
-    /// Single heartbeat tick — read HEARTBEAT.md, build task prompts, and return task count.
-    async fn tick(&self) -> Result<usize> {
-        Ok(self.collect_task_prompts().await?.len())
+    pub fn new(config: HeartbeatConfig, workspace_dir: std::path::PathBuf) -> Self {
+        Self { config, workspace_dir }
     }
 
     /// Read HEARTBEAT.md and return all parsed tasks.
@@ -88,6 +42,85 @@ impl HeartbeatEngine {
     /// Build the agent prompt for a single heartbeat task.
     pub fn task_prompt(&self, task: &str) -> String {
         format!("{}\n\n[Heartbeat Task] {task}", self.config.prompt)
+    }
+
+    /// Reconcile HEARTBEAT.md bullets into stable recurring Xin tasks. The
+    /// content-derived name preserves identity across reordering and restart;
+    /// removed bullets are disabled rather than deleted.
+    pub async fn materialize_xin_tasks(&self, config: &Config) -> Result<Vec<XinTask>> {
+        let tasks = if self.config.enabled {
+            self.collect_tasks().await?
+        } else {
+            Vec::new()
+        };
+        let interval_secs = u64::from(self.config.interval_minutes.max(5)).saturating_mul(60);
+        let definitions = tasks
+            .iter()
+            .map(|task| self.task_definition(task, interval_secs))
+            .collect::<Vec<_>>();
+        let keep_names = definitions.iter().map(|task| task.name.clone()).collect::<HashSet<_>>();
+
+        let mut materialized = Vec::with_capacity(definitions.len());
+        for definition in &definitions {
+            let existing = crate::xin::store::ensure_system_task(config, definition)?;
+            let needs_update = existing.description != definition.description
+                || existing.priority != definition.priority
+                || existing.payload != definition.payload
+                || existing.interval_secs != definition.interval_secs
+                || existing.max_failures != definition.max_failures
+                || !existing.enabled;
+            let task = if needs_update {
+                crate::xin::store::update_task(
+                    config,
+                    &existing.id,
+                    &XinTaskPatch {
+                        description: definition.description.clone(),
+                        priority: Some(definition.priority),
+                        payload: Some(definition.payload.clone()),
+                        interval_secs: Some(definition.interval_secs),
+                        enabled: Some(true),
+                        max_failures: Some(definition.max_failures),
+                        approval_grant_json: definition.approval_grant_json.clone(),
+                        ..XinTaskPatch::default()
+                    },
+                )?
+            } else {
+                existing
+            };
+            crate::xin::store::make_task_due_if_never_run(config, &task.id)?;
+            materialized.push(crate::xin::store::get_task(config, &task.id)?);
+        }
+
+        crate::xin::store::disable_system_tasks_except(config, HEARTBEAT_TASK_PREFIX, &keep_names)?;
+        Ok(materialized)
+    }
+
+    fn task_definition(&self, task: &str, interval_secs: u64) -> NewXinTask {
+        NewXinTask {
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            name: Self::stable_task_name(task),
+            description: Some(format!("Materialized from HEARTBEAT.md: {task}")),
+            kind: TaskKind::System,
+            priority: TaskPriority::Normal,
+            execution_mode: ExecutionMode::AgentSession,
+            payload: self.task_prompt(task),
+            recurring: true,
+            interval_secs,
+            max_failures: 10,
+            approval_grant_json: None,
+        }
+    }
+
+    fn stable_task_name(task: &str) -> String {
+        let digest = Sha256::digest(task.as_bytes());
+        format!("{HEARTBEAT_TASK_PREFIX}{}", hex::encode(digest))
+    }
+
+    pub fn is_materialized_task(task: &XinTask) -> bool {
+        task.kind == TaskKind::System && task.name.starts_with(HEARTBEAT_TASK_PREFIX)
     }
 
     /// Parse tasks from HEARTBEAT.md (lines starting with `- `)
@@ -325,54 +358,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_returns_zero_when_no_file() {
-        let dir = std::env::temp_dir().join("openprx_test_tick_no_file");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig {
-                enabled: true,
-                interval_minutes: 30,
-                ..HeartbeatConfig::default()
-            },
-            dir.clone(),
-            observer,
-        );
-        let count = engine.tick().await.unwrap();
-        assert_eq!(count, 0);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
-    async fn tick_counts_tasks_from_file() {
-        let dir = std::env::temp_dir().join("openprx_test_tick_count");
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-
-        tokio::fs::write(dir.join("HEARTBEAT.md"), "- A\n- B\n- C")
-            .await
-            .unwrap();
-
-        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig {
-                enabled: true,
-                interval_minutes: 30,
-                ..HeartbeatConfig::default()
-            },
-            dir.clone(),
-            observer,
-        );
-        let count = engine.tick().await.unwrap();
-        assert_eq!(count, 3);
-
-        let _ = tokio::fs::remove_dir_all(&dir).await;
-    }
-
-    #[tokio::test]
     async fn collect_task_prompts_uses_config_prompt() {
         let dir = std::env::temp_dir().join("openprx_test_heartbeat_prompts");
         let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -382,7 +367,6 @@ mod tests {
             .await
             .unwrap();
 
-        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
         let engine = HeartbeatEngine::new(
             HeartbeatConfig {
                 enabled: true,
@@ -391,7 +375,6 @@ mod tests {
                 ..HeartbeatConfig::default()
             },
             dir.clone(),
-            observer,
         );
 
         let prompts = engine.collect_task_prompts().await.unwrap();
@@ -404,19 +387,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_returns_immediately_when_disabled() {
-        let observer: Arc<dyn Observer> = Arc::new(crate::observability::NoopObserver);
-        let engine = HeartbeatEngine::new(
-            HeartbeatConfig {
-                enabled: false,
-                interval_minutes: 30,
-                ..HeartbeatConfig::default()
-            },
-            std::env::temp_dir(),
-            observer,
+    async fn materialization_is_stable_updates_in_place_and_disables_removed_tasks() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config {
+            workspace_dir: temp.path().to_path_buf(),
+            config_path: temp.path().join("config.toml"),
+            ..Config::default()
+        };
+        config.heartbeat.enabled = true;
+        config.heartbeat.interval_minutes = 30;
+        config.heartbeat.prompt = "Heartbeat prompt v1".to_string();
+        tokio::fs::write(temp.path().join("HEARTBEAT.md"), "- Check queue\n- Send digest")
+            .await
+            .unwrap();
+
+        let first_engine = HeartbeatEngine::new(config.heartbeat.clone(), temp.path().to_path_buf());
+        let first = first_engine.materialize_xin_tasks(&config).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert!(first.iter().all(|task| task.recurring && task.enabled));
+        assert!(first.iter().all(|task| task.interval_secs == 1_800));
+        assert!(first.iter().all(|task| task.next_run_at <= chrono::Utc::now()));
+        let first_ids = first
+            .iter()
+            .map(|task| (task.name.clone(), task.id.clone()))
+            .collect::<std::collections::HashMap<_, _>>();
+        let events_before_replay = first
+            .iter()
+            .map(|task| crate::xin::store::list_task_events(&config, &task.id).unwrap().len())
+            .sum::<usize>();
+        let replay = first_engine.materialize_xin_tasks(&config).await.unwrap();
+        assert_eq!(
+            replay.iter().map(|task| &task.id).collect::<Vec<_>>(),
+            first.iter().map(|task| &task.id).collect::<Vec<_>>()
         );
-        // Should return Ok immediately, not loop forever
-        let result = engine.run().await;
-        assert!(result.is_ok());
+        let events_after_replay = replay
+            .iter()
+            .map(|task| crate::xin::store::list_task_events(&config, &task.id).unwrap().len())
+            .sum::<usize>();
+        assert_eq!(events_after_replay, events_before_replay);
+
+        config.heartbeat.interval_minutes = 45;
+        config.heartbeat.prompt = "Heartbeat prompt v2".to_string();
+        tokio::fs::write(temp.path().join("HEARTBEAT.md"), "- Send digest\n- Check queue")
+            .await
+            .unwrap();
+        let updated_engine = HeartbeatEngine::new(config.heartbeat.clone(), temp.path().to_path_buf());
+        let updated = updated_engine.materialize_xin_tasks(&config).await.unwrap();
+        assert_eq!(updated.len(), 2);
+        for task in &updated {
+            assert_eq!(first_ids.get(&task.name), Some(&task.id));
+            assert_eq!(task.interval_secs, 2_700);
+            assert!(task.payload.contains("Heartbeat prompt v2"));
+        }
+
+        tokio::fs::write(temp.path().join("HEARTBEAT.md"), "- Send digest")
+            .await
+            .unwrap();
+        let retained = updated_engine.materialize_xin_tasks(&config).await.unwrap();
+        assert_eq!(retained.len(), 1);
+        let all = crate::xin::store::list_tasks(&config).unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.iter().filter(|task| task.enabled).count(), 1);
+
+        config.heartbeat.enabled = false;
+        let disabled_engine = HeartbeatEngine::new(config.heartbeat.clone(), temp.path().to_path_buf());
+        assert!(disabled_engine.materialize_xin_tasks(&config).await.unwrap().is_empty());
+        assert!(
+            crate::xin::store::list_tasks(&config)
+                .unwrap()
+                .iter()
+                .all(|task| !task.enabled)
+        );
     }
 }

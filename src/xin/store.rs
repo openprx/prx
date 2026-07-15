@@ -11,6 +11,7 @@ use crate::xin::types::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
+use std::collections::HashSet;
 use uuid::Uuid;
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
@@ -164,6 +165,33 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>, limit: usize) -> Result<Ve
             tasks.push(row?);
         }
         Ok(tasks)
+    })
+}
+
+/// Return due enabled system tasks inside one reserved name namespace.
+pub(crate) fn due_system_tasks_in_namespace(
+    config: &Config,
+    now: DateTime<Utc>,
+    limit: usize,
+    namespace_prefix: &str,
+) -> Result<Vec<XinTask>> {
+    let lim = i64::try_from(limit.max(1)).context("due namespace limit overflows i64")?;
+    let pattern = format!("{namespace_prefix}%");
+    with_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                    name, description, kind, status, priority, execution_mode,
+                    payload, recurring, interval_secs, created_at, updated_at,
+                    last_run_at, next_run_at, last_status, last_output,
+                    run_count, fail_count, max_failures, enabled, approval_grant_json
+             FROM xin_tasks
+             WHERE enabled = 1 AND kind = 'system' AND name LIKE ?1
+               AND status IN ('pending', 'stale') AND next_run_at <= ?2
+             ORDER BY priority DESC, next_run_at ASC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![pattern, now.to_rfc3339(), lim], map_task_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
     })
 }
 
@@ -466,6 +494,49 @@ pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> 
     })
 }
 
+/// Mark only running system tasks inside a reserved namespace as stale.
+pub(crate) fn mark_stale_system_tasks_in_namespace(
+    config: &Config,
+    stale_timeout_minutes: u32,
+    namespace_prefix: &str,
+) -> Result<usize> {
+    let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
+    let pattern = format!("{namespace_prefix}%");
+    with_immediate_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id FROM xin_tasks
+             WHERE kind = 'system' AND name LIKE ?1
+               AND status = 'running' AND updated_at < ?2",
+        )?;
+        let ids = stmt
+            .query_map(params![pattern, cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let now = Utc::now();
+        let changed = conn.execute(
+            "UPDATE xin_tasks SET status = 'stale', updated_at = ?1
+             WHERE kind = 'system' AND name LIKE ?2
+               AND status = 'running' AND updated_at < ?3",
+            params![now.to_rfc3339(), pattern, cutoff.to_rfc3339()],
+        )?;
+        for task_id in ids {
+            if let Some(lineage) = load_task_lineage(conn, &task_id)? {
+                insert_task_event(
+                    conn,
+                    &workspace_id(config),
+                    &task_id,
+                    lineage,
+                    "xin.task.stale",
+                    Some("stale"),
+                    Some(serde_json::json!({ "stale_timeout_minutes": stale_timeout_minutes }).to_string()).as_deref(),
+                )?;
+            }
+        }
+        Ok(changed)
+    })
+}
+
 /// Upsert a system task by name + kind=system. If it exists, update payload/interval; if not, insert.
 pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> {
     // Check if a system task with this name already exists
@@ -483,6 +554,13 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
     existing.map_or_else(
         || add_task(config, new),
         |id| {
+            let current = get_task(config, &id)?;
+            if current.payload == new.payload
+                && current.interval_secs == new.interval_secs
+                && current.max_failures == new.max_failures
+            {
+                return Ok(current);
+            }
             // Update payload and interval if changed
             let patch = XinTaskPatch {
                 payload: Some(new.payload.clone()),
@@ -493,6 +571,69 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
             update_task(config, &id, &patch)
         },
     )
+}
+
+/// Make a newly materialized recurring task immediately claimable. Repeated
+/// reconciliation is a no-op after the first run or once the due time passes.
+pub(crate) fn make_task_due_if_never_run(config: &Config, task_id: &str) -> Result<()> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        conn.execute(
+            "UPDATE xin_tasks SET next_run_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND run_count = 0 AND last_run_at IS NULL
+               AND next_run_at > ?1",
+            params![now.to_rfc3339(), task_id],
+        )?;
+        Ok(())
+    })
+}
+
+/// Disable enabled system tasks in a reserved namespace that are absent from
+/// the latest materialized source. Reconciliation is idempotent and converges
+/// after a partial prior pass.
+pub(crate) fn disable_system_tasks_except(
+    config: &Config,
+    namespace_prefix: &str,
+    keep_names: &HashSet<String>,
+) -> Result<usize> {
+    with_immediate_connection(config, |conn| {
+        let mut stmt = conn.prepare(
+            "SELECT id, name FROM xin_tasks
+             WHERE kind = 'system' AND enabled = 1",
+        )?;
+        let candidates = stmt
+            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let now = authoritative_now(conn)?;
+        let mut disabled = 0usize;
+        for (task_id, name) in candidates {
+            if !name.starts_with(namespace_prefix) || keep_names.contains(&name) {
+                continue;
+            }
+            let changed = conn.execute(
+                "UPDATE xin_tasks SET enabled = 0, updated_at = ?1
+                 WHERE id = ?2 AND enabled = 1",
+                params![now.to_rfc3339(), task_id],
+            )?;
+            if changed > 0 {
+                disabled += 1;
+                if let Some(lineage) = load_task_lineage(conn, &task_id)? {
+                    insert_task_event(
+                        conn,
+                        &workspace_id(config),
+                        &task_id,
+                        lineage,
+                        "xin.task.dematerialized",
+                        Some("disabled"),
+                        Some(serde_json::json!({ "name": name }).to_string()).as_deref(),
+                    )?;
+                }
+            }
+        }
+        Ok(disabled)
+    })
 }
 
 /// Commit one legacy Xin task execution as a single local transaction.
@@ -2908,6 +3049,33 @@ mod tests {
 
         let stale = get_task(&config, &task.id).unwrap();
         assert_eq!(stale.status, TaskStatus::Stale);
+    }
+
+    #[test]
+    fn heartbeat_namespace_stale_recovery_leaves_regular_xin_tasks_running() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let regular = add_task(&config, &sample_task()).unwrap();
+        let mut heartbeat_task = recurring_task();
+        heartbeat_task.name = "heartbeat:scoped-stale".to_string();
+        let heartbeat = add_task(&config, &heartbeat_task).unwrap();
+        assert!(claim_task(&config, &regular.id).unwrap());
+        assert!(claim_task(&config, &heartbeat.id).unwrap());
+
+        with_connection(&config, |conn| {
+            let old = (Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
+            conn.execute(
+                "UPDATE xin_tasks SET updated_at = ?1 WHERE id IN (?2, ?3)",
+                params![old, regular.id, heartbeat.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+        let stale_count = mark_stale_system_tasks_in_namespace(&config, 60, "heartbeat:").unwrap();
+        assert_eq!(stale_count, 1);
+        assert_eq!(get_task(&config, &heartbeat.id).unwrap().status, TaskStatus::Stale);
+        assert_eq!(get_task(&config, &regular.id).unwrap().status, TaskStatus::Running);
     }
 
     #[test]
