@@ -321,6 +321,8 @@ async fn run_chat_fixture(
         context,
         4,
         crate::agent::loop_::ChatMode::Edit,
+        Arc::new(crate::observability::noop::NoopObserver),
+        Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
     )
     .await;
 
@@ -344,7 +346,7 @@ async fn run_agent_fixture(
     let result = crate::agent::loop_::run_tool_call_loop_outcome(
         provider.as_ref(),
         &mut history,
-        &tools,
+        Arc::new(tools),
         &NoopObserver,
         &HookManager::new(temp.path().to_path_buf()),
         FIXTURE_PROVIDER,
@@ -371,6 +373,7 @@ async fn run_agent_fixture(
         crate::agent::loop_::ChatMode::Edit,
         None,
         false,
+        None,
     )
     .await;
     (result, history)
@@ -427,14 +430,14 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
     assert_eq!(
         chat_provider.stream_calls(),
         2,
-        "Chat owns real provider streaming today"
+        "shared Agent owner must preserve Chat's real streaming adapter"
     );
     assert_eq!(chat_provider.traced_calls(), 0);
     assert_eq!(agent_provider.stream_calls(), 0);
     assert_eq!(
         agent_provider.traced_calls(),
         2,
-        "Agent owns buffered traced provider calls today"
+        "the same owner keeps the buffered adapter for non-TUI callers"
     );
 
     assert_eq!(chat_tool_calls.load(Ordering::SeqCst), 1);
@@ -540,10 +543,13 @@ async fn step_7_1_same_success_fixture_characterizes_stream_tool_usage_history_a
     assert_eq!(message_roles(agent_follow_up), ["system", "user", "assistant", "tool"]);
     let chat_tool_message = chat_follow_up.get(3).expect("Chat tool result history");
     let agent_tool_message = agent_follow_up.get(3).expect("Agent tool result history");
-    assert!(chat_tool_message.content.contains("\"success\":true"));
     assert!(
-        !agent_tool_message.content.contains("\"success\":true"),
-        "Agent's current native tool history omits Chat's extra success projection"
+        !chat_tool_message.content.contains("\"success\":true"),
+        "UI status must not leak into provider-bound tool history"
+    );
+    assert_eq!(
+        chat_tool_message.content, agent_tool_message.content,
+        "Chat and buffered Agent adapters must now use one canonical tool-result payload"
     );
 }
 

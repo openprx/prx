@@ -16,7 +16,9 @@ use crate::providers::{self, ChatMessage, ChatRequest, Provider, ProviderCapabil
 use crate::runtime;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
-use crate::security::policy::{ApprovalGrant, RUNTIME_APPROVAL_GRANT_ARG, RUNTIME_APPROVAL_GRANTED_ARG};
+use crate::security::policy::ApprovalGrant;
+#[cfg(test)]
+use crate::security::policy::{RUNTIME_APPROVAL_GRANT_ARG, RUNTIME_APPROVAL_GRANTED_ARG};
 use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
@@ -2702,6 +2704,7 @@ pub(crate) fn build_runtime_system_prompt(
 }
 
 /// Find a tool by name in the registry.
+#[cfg(test)]
 fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
     tools.iter().find(|t| t.supports_name(name)).map(|t| t.as_ref())
 }
@@ -3541,7 +3544,7 @@ async fn acquire_tool_barrier(key: &'static str, tool_name: &str) -> Option<toki
 pub(crate) async fn agent_turn(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     hooks: &HookManager,
     provider_name: &str,
@@ -3934,6 +3937,7 @@ pub(crate) fn runtime_approval_grant_for_call(
     }
 }
 
+#[cfg(test)]
 async fn execute_one_tool(
     call_name: &str,
     mut call_arguments: serde_json::Value,
@@ -4139,6 +4143,7 @@ struct RolloutDecision {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct BatchExecutionOutcome {
     results: Vec<String>,
     total_calls: usize,
@@ -4293,6 +4298,7 @@ fn is_read_only_tool_name(name: &str) -> bool {
 /// When no scope context is present (callers that do not gate, e.g. internal
 /// sub-agent paths) the call is allowed. Otherwise the single
 /// [`SecurityPolicy::decide`] entry point governs the outcome.
+#[cfg(test)]
 fn decide_tool_call(
     call: &ParsedToolCall,
     scope_ctx: Option<&ScopeContext<'_>>,
@@ -4307,11 +4313,13 @@ fn decide_tool_call(
 /// Used by the parallel scheduler to keep approval-gated calls off the
 /// unattended read-only fast path. When no scope context is present the call is
 /// not gated (matches [`decide_tool_call`] returning `Allow`).
+#[cfg(test)]
 fn requires_approval(call: &ParsedToolCall, scope_ctx: Option<&ScopeContext<'_>>) -> bool {
     decide_tool_call(call, scope_ctx) == crate::tools::ToolExecutionDecision::Ask
 }
 
 /// Denial message returned to the model when [`decide_tool_call`] yields `Deny`.
+#[cfg(test)]
 fn scope_denial_message(call: &ParsedToolCall) -> String {
     format!(
         "Error: Tool '{}' is not permitted under the current autonomy policy / user context.",
@@ -4319,6 +4327,7 @@ fn scope_denial_message(call: &ParsedToolCall) -> String {
     )
 }
 
+#[cfg(test)]
 async fn execute_tool_call_serial(
     call: &ParsedToolCall,
     tools_registry: &[Box<dyn Tool>],
@@ -4443,6 +4452,7 @@ async fn execute_tool_call_serial(
     .await
 }
 
+#[cfg(test)]
 async fn execute_read_only_batch(
     calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -4530,6 +4540,7 @@ async fn execute_read_only_batch(
 // - tool_calls[index] where index comes from 0..tool_calls.len()
 // - results_by_original[index] where index is a valid tool_calls index
 #[allow(clippy::indexing_slicing)]
+#[cfg(test)]
 async fn execute_tools_with_policy(
     tool_calls: &[ParsedToolCall],
     tools_registry: &[Box<dyn Tool>],
@@ -4662,7 +4673,7 @@ async fn execute_tools_with_policy(
             call,
             tools_registry,
             observer,
-            approval,
+            approval.clone(),
             channel_name,
             cancellation_token,
             scope_ctx,
@@ -4730,6 +4741,77 @@ pub(crate) struct ToolLoopTrace {
     /// Aggregated provider usage across successful provider calls in this user
     /// turn. Empty/estimated by default until provider capture lands.
     pub tokens_used: TokenUsage,
+}
+
+/// Neutral event stream emitted by the existing turn owner.
+///
+/// Most ingress paths consume the loop as a buffered call/return API. Chat's
+/// TUI supplies a sink so the same owner can project true provider deltas and
+/// recovery/tool progress without importing Redux actions into `agent::loop_`.
+#[derive(Debug, Clone)]
+pub(crate) enum ToolLoopEvent {
+    TextDelta(String),
+    ReasoningDelta(String),
+    RetryAttempt {
+        attempt: u8,
+        reason: String,
+    },
+    ContextCompacted,
+    ContextCompactionPatch {
+        patch: CompactionPatch,
+        config: crate::config::AgentCompactionConfig,
+        turns_before: usize,
+        tokens_before: usize,
+        turns_after: usize,
+        tokens_after: usize,
+        used_context_tokens: usize,
+    },
+    ToolStarted {
+        tool_call_id: String,
+        name: String,
+        args: String,
+    },
+    ToolFinished {
+        tool_call_id: String,
+        name: String,
+        success: bool,
+        duration_ms: u64,
+        result: String,
+    },
+}
+
+#[async_trait::async_trait]
+pub(crate) trait ToolLoopEventSink: Send + Sync {
+    async fn emit(&self, event: ToolLoopEvent) -> Result<()>;
+}
+
+/// Optional adapters for an ingress that needs live provider events and an
+/// already-assembled canonical tool execution service.
+///
+/// Supplying this does not create a second loop: provider iterations, overflow
+/// recovery, history mutation, usage aggregation, cancellation, and terminal
+/// outcome remain inside [`run_tool_call_loop_outcome`].
+#[derive(Clone)]
+pub(crate) struct ToolLoopRuntimeAdapter {
+    pub events: Option<Arc<dyn ToolLoopEventSink>>,
+    pub stream_provider: bool,
+    pub tool_execution_service: Option<Arc<crate::tools::ToolExecutionService>>,
+    pub tool_execution_context: crate::tools::ToolExecutionContext,
+}
+
+#[derive(Debug)]
+struct ToolLoopEventSinkClosed;
+
+impl std::fmt::Display for ToolLoopEventSinkClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("turn event sink closed")
+    }
+}
+
+impl std::error::Error for ToolLoopEventSinkClosed {}
+
+pub(crate) fn is_tool_loop_event_sink_closed(err: &anyhow::Error) -> bool {
+    err.chain().any(|source| source.is::<ToolLoopEventSinkClosed>())
 }
 
 /// Terminal outcome of the agent tool-call loop.
@@ -4853,6 +4935,641 @@ pub(crate) trait ApprovalResolver: Send + Sync {
     async fn resolve(&self, request: &ApprovalRequest, channel: &str) -> ApprovalDecision;
 }
 
+#[derive(Debug)]
+struct StreamingProviderFailure {
+    message: String,
+    retryable: bool,
+}
+
+impl std::fmt::Display for StreamingProviderFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for StreamingProviderFailure {}
+
+pub(crate) fn tool_loop_error_is_retryable(err: &anyhow::Error) -> bool {
+    err.chain()
+        .find_map(|source| source.downcast_ref::<StreamingProviderFailure>())
+        .is_some_and(|failure| failure.retryable)
+}
+
+struct AgentToolApprovalStrategy {
+    manager: Option<Arc<ApprovalManager>>,
+    resolver: Option<Arc<dyn ApprovalResolver>>,
+    channel: String,
+    policy: Arc<SecurityPolicy>,
+    cancellation: Option<CancellationToken>,
+}
+
+impl AgentToolApprovalStrategy {
+    fn runtime_grant(&self, request: &crate::tools::ToolApprovalRequest) -> Option<serde_json::Value> {
+        let envelope = &request.context.envelope;
+        let scope = ScopeContext {
+            policy: self.policy.as_ref(),
+            sender: envelope.sender.as_deref().unwrap_or("unknown"),
+            channel: envelope.channel.as_deref().unwrap_or("unknown"),
+            chat_type: &request.context.chat_type,
+            chat_id: &request.context.chat_id,
+            owner_id: envelope.owner_id.as_deref(),
+            topic_id: envelope.topic_id.as_deref(),
+            task_id: envelope.task_id.as_deref(),
+            source_message_event_id: envelope.source_message_event_id.as_deref(),
+        };
+        runtime_approval_grant_for_call(
+            &request.descriptor.public_name,
+            &request.command.arguments,
+            Some(&scope),
+        )
+        .and_then(|grant| serde_json::to_value(grant).ok())
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tools::ApprovalStrategy for AgentToolApprovalStrategy {
+    async fn resolve(&self, request: crate::tools::ToolApprovalRequest) -> crate::tools::ToolApprovalDecision {
+        let Some(manager) = self.manager.as_ref() else {
+            return crate::tools::ToolApprovalDecision::Denied {
+                reason: "approval required but no approval resolver is available".to_string(),
+            };
+        };
+        let tool_name = request.descriptor.public_name.as_str();
+        if manager.is_session_allowlisted(tool_name) {
+            return crate::tools::ToolApprovalDecision::Approved {
+                runtime_approval_granted: true,
+                runtime_grant: self.runtime_grant(&request),
+            };
+        }
+
+        let approval_request = ApprovalRequest {
+            tool_name: tool_name.to_string(),
+            arguments: request.command.arguments.clone(),
+        };
+        let (decision, grant) = if let Some(resolver) = self.resolver.as_ref() {
+            let resolved = if let Some(token) = self.cancellation.as_ref() {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => None,
+                    decision = resolver.resolve(&approval_request, &self.channel) => Some(decision),
+                }
+            } else {
+                Some(resolver.resolve(&approval_request, &self.channel).await)
+            };
+            match resolved {
+                Some(ApprovalDecision::Allow) => (ApprovalResponse::Yes, false),
+                Some(ApprovalDecision::Grant) => (ApprovalResponse::Yes, true),
+                Some(ApprovalDecision::Deny) | None => (ApprovalResponse::No, false),
+            }
+        } else if self.channel == "cli" {
+            (manager.prompt_cli(&approval_request), true)
+        } else {
+            (ApprovalResponse::No, false)
+        };
+        manager.record_decision(tool_name, &request.command.arguments, decision, &self.channel);
+        if decision == ApprovalResponse::No {
+            return crate::tools::ToolApprovalDecision::Denied {
+                reason: "Denied by user".to_string(),
+            };
+        }
+        crate::tools::ToolApprovalDecision::Approved {
+            runtime_approval_granted: grant,
+            runtime_grant: grant.then(|| self.runtime_grant(&request)).flatten(),
+        }
+    }
+}
+
+fn agent_tool_execution_context(
+    scope: Option<&ScopeContext<'_>>,
+    channel_name: &str,
+) -> (Arc<SecurityPolicy>, crate::tools::ToolExecutionContext) {
+    let policy = Arc::new(scope.map_or_else(SecurityPolicy::default, |scope| scope.policy.clone()));
+    let workspace_id = policy.workspace_dir.to_string_lossy().to_string();
+    let session_key = scope.map_or_else(
+        || format!("agent:{}", Uuid::now_v7()),
+        |scope| scope.chat_id.to_string(),
+    );
+    let mut envelope = RuntimeEnvelope::chat_terminal(workspace_id, session_key, MemoryVisibility::Workspace)
+        .with_sender(scope.map_or("agent", |scope| scope.sender))
+        .with_channel(scope.map_or(channel_name, |scope| scope.channel));
+    if let Some(scope) = scope {
+        if let Some(owner_id) = scope.owner_id {
+            envelope = envelope.with_owner_id(owner_id);
+        }
+        if let Some(topic_id) = scope.topic_id {
+            envelope = envelope.with_topic_id(topic_id);
+        }
+        if let Some(task_id) = scope.task_id {
+            envelope = envelope.with_task_id(task_id);
+        }
+        if let Some(event_id) = scope.source_message_event_id {
+            envelope = envelope.with_source_message_event_id(event_id);
+        }
+    }
+    let chat_type = scope.map_or("private", |scope| scope.chat_type);
+    let chat_id = scope.map_or_else(|| "agent:local".to_string(), |scope| scope.chat_id.to_string());
+    (
+        Arc::clone(&policy),
+        crate::tools::ToolExecutionContext::new(envelope, chat_type).with_chat_id(chat_id),
+    )
+}
+
+fn streaming_error_is_context_overflow(err: &crate::providers::traits::StreamError) -> bool {
+    use crate::providers::traits::StreamError;
+    let message = match err {
+        StreamError::Provider(message) => message.as_str(),
+        StreamError::Http(http_error) => {
+            return matches!(http_error.status(), Some(status) if status.as_u16() == 413);
+        }
+        StreamError::Json(_) | StreamError::InvalidSse(_) | StreamError::Io(_) | StreamError::RateLimited { .. } => {
+            return false;
+        }
+    };
+    let lower = message.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context",
+        "exceeds maximum",
+        "prompt is too long",
+        "input token count",
+        "exceed the maximum",
+        "too many tokens",
+        "token limit",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
+fn streaming_error_is_network_timeout(err: &crate::providers::traits::StreamError) -> bool {
+    use crate::providers::traits::StreamError;
+    match err {
+        StreamError::Io(_) => true,
+        StreamError::Http(http_error) => http_error.is_timeout() || http_error.is_connect(),
+        StreamError::Json(_)
+        | StreamError::InvalidSse(_)
+        | StreamError::Provider(_)
+        | StreamError::RateLimited { .. } => false,
+    }
+}
+
+const SHARED_STREAM_NETWORK_RETRIES: u8 = 3;
+const SHARED_STREAM_BACKOFF_BASE_MS: u64 = 500;
+
+#[derive(Default)]
+struct SharedToolCallAggregator {
+    slots: HashMap<usize, SharedToolCallSlot>,
+    completed: std::collections::HashSet<usize>,
+}
+
+#[derive(Default)]
+struct SharedToolCallSlot {
+    id: String,
+    name: String,
+    args: String,
+}
+
+impl SharedToolCallAggregator {
+    fn ingest(&mut self, chunk: crate::providers::traits::ToolCallChunk) -> Option<ToolCall> {
+        use crate::providers::traits::ToolCallChunkStatus;
+        match chunk.status {
+            ToolCallChunkStatus::Streaming => {
+                let slot = self.slots.entry(chunk.index).or_default();
+                if slot.id.is_empty() && !chunk.id.is_empty() {
+                    slot.id = chunk.id;
+                }
+                if slot.name.is_empty() && !chunk.name.is_empty() {
+                    slot.name = chunk.name;
+                }
+                if let Some(delta) = chunk.arguments_delta {
+                    slot.args.push_str(&delta);
+                }
+                None
+            }
+            ToolCallChunkStatus::Completed => {
+                if !self.completed.insert(chunk.index) {
+                    return None;
+                }
+                let slot = self.slots.entry(chunk.index).or_default();
+                let id = if chunk.id.is_empty() { slot.id.clone() } else { chunk.id };
+                let name = if chunk.name.is_empty() {
+                    slot.name.clone()
+                } else {
+                    chunk.name
+                };
+                let arguments = if chunk.args.is_empty() {
+                    slot.args.clone()
+                } else {
+                    chunk.args
+                };
+                Some(ToolCall { id, name, arguments })
+            }
+        }
+    }
+}
+
+async fn emit_tool_loop_event(adapter: &ToolLoopRuntimeAdapter, event: ToolLoopEvent) -> Result<()> {
+    let Some(events) = adapter.events.as_ref() else {
+        return Ok(());
+    };
+    events
+        .emit(event)
+        .await
+        .map_err(|_| anyhow::Error::new(ToolLoopEventSinkClosed))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_streaming_provider_turn(
+    provider: &dyn Provider,
+    messages: &[ChatMessage],
+    tool_specs: Option<&[crate::tools::ToolSpec]>,
+    provider_name: &str,
+    model: &str,
+    temperature: f64,
+    cancellation: Option<&CancellationToken>,
+    adapter: &ToolLoopRuntimeAdapter,
+) -> Result<crate::providers::traits::ChatTrace> {
+    use crate::providers::traits::{ChatResponse, StreamChunk, StreamOptions};
+    use futures::StreamExt;
+
+    let mut network_attempt = 0_u8;
+    loop {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(ToolLoopCancelled.into());
+        }
+
+        let started_at = chrono::Utc::now();
+        let options = StreamOptions::new(true).with_tools(tool_specs.unwrap_or_default().to_vec());
+        let stream = provider.stream_chat_with_history(messages, model, temperature, options);
+        tokio::pin!(stream);
+        let mut text = String::new();
+        let mut reasoning = String::new();
+        let mut calls = Vec::new();
+        let mut call_aggregator = SharedToolCallAggregator::default();
+        let mut usage = ProviderUsageAccumulator::new();
+
+        let stream_result: Result<()> = loop {
+            let next = if let Some(token) = cancellation {
+                tokio::select! {
+                    biased;
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    next = stream.next() => next,
+                }
+            } else {
+                stream.next().await
+            };
+            match next {
+                Some(Ok(StreamChunk {
+                    delta,
+                    reasoning: reasoning_delta,
+                    is_final,
+                    usage: chunk_usage,
+                    tool_calls,
+                    ..
+                })) => {
+                    if let Some(chunk_usage) = chunk_usage {
+                        usage.record(chunk_usage);
+                    }
+                    for chunk in tool_calls {
+                        if let Some(call) = call_aggregator.ingest(chunk) {
+                            calls.push(call);
+                        }
+                    }
+                    if !delta.is_empty() {
+                        text.push_str(&delta);
+                        emit_tool_loop_event(adapter, ToolLoopEvent::TextDelta(delta)).await?;
+                    }
+                    if let Some(reasoning_delta) = reasoning_delta
+                        && !reasoning_delta.is_empty()
+                    {
+                        reasoning.push_str(&reasoning_delta);
+                        emit_tool_loop_event(adapter, ToolLoopEvent::ReasoningDelta(reasoning_delta)).await?;
+                    }
+                    if is_final {
+                        break Ok(());
+                    }
+                }
+                Some(Err(error)) => break Err(anyhow::Error::new(error)),
+                None => break Ok(()),
+            }
+        };
+
+        match stream_result {
+            Ok(()) => {
+                let finished_at = chrono::Utc::now();
+                let tokens_used = usage.finish_or_estimate_completion_chars(
+                    text.chars().count().saturating_add(reasoning.chars().count()),
+                );
+                return Ok(crate::providers::traits::ChatTrace {
+                    response: ChatResponse {
+                        text: Some(text),
+                        tool_calls: calls,
+                        reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
+                    },
+                    attempts: vec![crate::llm::route_decision::ProviderAttempt {
+                        seq: 1,
+                        provider: provider_name.to_string(),
+                        model: model.to_string(),
+                        started_at,
+                        finished_at,
+                        status: crate::llm::route_decision::AttemptStatus::Success,
+                        error_class: None,
+                        error_message: None,
+                    }],
+                    final_provider: provider_name.to_string(),
+                    final_model: model.to_string(),
+                    tokens_used,
+                });
+            }
+            Err(error) => {
+                let Some(stream_error) = error.downcast_ref::<crate::providers::traits::StreamError>() else {
+                    return Err(error);
+                };
+                if streaming_error_is_context_overflow(stream_error) {
+                    return Err(anyhow::anyhow!(stream_error.to_string()));
+                }
+                if !streaming_error_is_network_timeout(stream_error) {
+                    return Err(StreamingProviderFailure {
+                        message: stream_error.to_string(),
+                        retryable: matches!(
+                            stream_error,
+                            crate::providers::traits::StreamError::Http(_)
+                                | crate::providers::traits::StreamError::Io(_)
+                                | crate::providers::traits::StreamError::RateLimited { .. }
+                        ),
+                    }
+                    .into());
+                }
+                network_attempt = network_attempt.saturating_add(1);
+                if network_attempt > SHARED_STREAM_NETWORK_RETRIES {
+                    return Err(StreamingProviderFailure {
+                        message: format!("network retries exhausted ({SHARED_STREAM_NETWORK_RETRIES}): {stream_error}"),
+                        retryable: false,
+                    }
+                    .into());
+                }
+                emit_tool_loop_event(
+                    adapter,
+                    ToolLoopEvent::RetryAttempt {
+                        attempt: network_attempt,
+                        reason: stream_error.to_string(),
+                    },
+                )
+                .await?;
+                let backoff_ms =
+                    SHARED_STREAM_BACKOFF_BASE_MS.saturating_mul(1_u64 << network_attempt.saturating_sub(1).min(31));
+                let sleep = tokio::time::sleep(std::time::Duration::from_millis(backoff_ms));
+                tokio::pin!(sleep);
+                if let Some(token) = cancellation {
+                    tokio::select! {
+                        biased;
+                        () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                        () = &mut sleep => {}
+                    }
+                } else {
+                    sleep.await;
+                }
+            }
+        }
+    }
+}
+
+async fn execute_one_with_service(
+    index: usize,
+    call: &ParsedToolCall,
+    native_tool_calls: &[ToolCall],
+    adapter: &ToolLoopRuntimeAdapter,
+    cancellation: Option<&CancellationToken>,
+    chat_mode: ChatMode,
+    timeout: Option<std::time::Duration>,
+) -> Result<String> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Err(ToolLoopCancelled.into());
+    }
+    let tool_call_id = native_tool_calls
+        .get(index)
+        .map(|native| native.id.clone())
+        .filter(|id| !id.is_empty())
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
+
+    if chat_mode.intercepts_writes() && is_write_tool(&call.name) {
+        let preview = preview_tool_arguments(&call.arguments);
+        emit_tool_loop_event(
+            adapter,
+            ToolLoopEvent::ToolStarted {
+                tool_call_id: tool_call_id.clone(),
+                name: call.name.clone(),
+                args: call.arguments.to_string(),
+            },
+        )
+        .await?;
+        let result = format!("[plan mode] would call {} with {preview}", call.name);
+        emit_tool_loop_event(
+            adapter,
+            ToolLoopEvent::ToolFinished {
+                tool_call_id,
+                name: call.name.clone(),
+                success: true,
+                duration_ms: 0,
+                result: result.clone(),
+            },
+        )
+        .await?;
+        return Ok(result);
+    }
+
+    let command = crate::tools::ToolExecutionCommand::new(&call.name, call.arguments.clone())
+        .with_operation_id(tool_call_id.clone())
+        .with_idempotency_key(tool_call_id.clone());
+    let Some(service) = adapter.tool_execution_service.as_ref() else {
+        let result = "Error: ToolExecutionService is unavailable; tool rejected for safety".to_string();
+        emit_tool_loop_event(
+            adapter,
+            ToolLoopEvent::ToolFinished {
+                tool_call_id,
+                name: call.name.clone(),
+                success: false,
+                duration_ms: 0,
+                result: result.clone(),
+            },
+        )
+        .await?;
+        return Ok(result);
+    };
+
+    let _barrier = if let Some(key) = tool_barrier_key(&call.name) {
+        acquire_tool_barrier(key, &call.name).await
+    } else {
+        None
+    };
+    let execute = service.execute(command, adapter.tool_execution_context.clone(), cancellation.cloned());
+    let outcome = if let Some(timeout) = timeout {
+        match tokio::time::timeout(timeout, execute).await {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                let result = format!("Error: Tool '{}' timed out after {}s.", call.name, timeout.as_secs());
+                emit_tool_loop_event(
+                    adapter,
+                    ToolLoopEvent::ToolFinished {
+                        tool_call_id,
+                        name: call.name.clone(),
+                        success: false,
+                        duration_ms: timeout.as_millis() as u64,
+                        result: result.clone(),
+                    },
+                )
+                .await?;
+                return Ok(result);
+            }
+        }
+    } else {
+        execute.await
+    };
+    if outcome.status == crate::tools::ToolExecutionStatus::Cancelled {
+        return Err(ToolLoopCancelled.into());
+    }
+    let success = outcome.succeeded();
+    let result = outcome.model_content;
+    emit_tool_loop_event(
+        adapter,
+        ToolLoopEvent::ToolFinished {
+            tool_call_id,
+            name: call.name.clone(),
+            success,
+            duration_ms: outcome.duration_ms,
+            result: result.clone(),
+        },
+    )
+    .await?;
+    Ok(result)
+}
+
+#[allow(clippy::indexing_slicing)]
+async fn execute_tools_with_service(
+    tool_calls: &[ParsedToolCall],
+    native_tool_calls: &[ToolCall],
+    adapter: &ToolLoopRuntimeAdapter,
+    schedule: ReadOnlyToolScheduleConfig,
+    cancellation: Option<&CancellationToken>,
+    chat_mode: ChatMode,
+    observer: &dyn Observer,
+) -> Result<Vec<String>> {
+    use futures::stream::{self, StreamExt};
+
+    let mut ordered_indices = (0..tool_calls.len()).collect::<Vec<_>>();
+    if schedule.priority_enabled {
+        ordered_indices.sort_by_key(
+            |index| match classify_tool_priority(&tool_calls[*index].name, &schedule) {
+                ToolPriority::High => 0_u8,
+                ToolPriority::Low => 1_u8,
+            },
+        );
+    }
+    let mut results = vec![String::new(); tool_calls.len()];
+    let mut cursor = 0;
+    let mut force_serial = !schedule.parallel_enabled;
+    while cursor < ordered_indices.len() {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err(ToolLoopCancelled.into());
+        }
+        let index = ordered_indices[cursor];
+        if !force_serial && classify_tool_call(&tool_calls[index].name) == ToolSchedulingClass::ReadOnly {
+            let start = cursor;
+            let mut end = cursor + 1;
+            while end < ordered_indices.len()
+                && classify_tool_call(&tool_calls[ordered_indices[end]].name) == ToolSchedulingClass::ReadOnly
+            {
+                end += 1;
+            }
+            let timeout = std::time::Duration::from_secs(schedule.timeout_secs);
+            let batch = stream::iter(ordered_indices[start..end].iter().copied())
+                .map(|batch_index| async move {
+                    let result = execute_one_with_service(
+                        batch_index,
+                        &tool_calls[batch_index],
+                        native_tool_calls,
+                        adapter,
+                        cancellation,
+                        chat_mode,
+                        Some(timeout),
+                    )
+                    .await?;
+                    Ok::<_, anyhow::Error>((batch_index, result))
+                })
+                .buffer_unordered(schedule.concurrency_window.max(1))
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>>>()?;
+            let total = batch.len().max(1);
+            let timeout_count = batch.iter().filter(|(_, value)| value.contains("timed out")).count();
+            let cancel_count = batch
+                .iter()
+                .filter(|(_, value)| value.to_ascii_lowercase().contains("cancelled"))
+                .count();
+            let error_count = batch.iter().filter(|(_, value)| value.starts_with("Error")).count();
+            let timeout_rate = timeout_count as f64 / total as f64;
+            let cancel_rate = cancel_count as f64 / total as f64;
+            let error_rate = error_count as f64 / total as f64;
+            let rollback_reason =
+                if schedule.auto_rollback_enabled && timeout_rate > schedule.rollback_timeout_rate_threshold {
+                    Some("timeout_rate")
+                } else if schedule.auto_rollback_enabled && cancel_rate > schedule.rollback_cancel_rate_threshold {
+                    Some("cancel_rate")
+                } else if schedule.auto_rollback_enabled && error_rate > schedule.rollback_error_rate_threshold {
+                    Some("error_rate")
+                } else {
+                    None
+                };
+            force_serial |= rollback_reason.is_some();
+            observer.record_event(&ObserverEvent::ToolBatch {
+                rollout_stage: schedule.rollout_stage.clone(),
+                batch_size: batch.len(),
+                concurrency_window: schedule.concurrency_window,
+                timeout_count,
+                cancel_count,
+                error_count,
+                degraded: force_serial,
+                rollback: rollback_reason.is_some(),
+                rollback_reason: rollback_reason.map(str::to_string),
+                kill_switch_applied: schedule.kill_switch_applied,
+            });
+            for (batch_index, result) in batch {
+                results[batch_index] = result;
+            }
+            cursor = end;
+            continue;
+        }
+        results[index] = execute_one_with_service(
+            index,
+            &tool_calls[index],
+            native_tool_calls,
+            adapter,
+            cancellation,
+            chat_mode,
+            None,
+        )
+        .await?;
+        cursor += 1;
+    }
+    Ok(results)
+}
+
+fn shared_unrecoverable_tool_error(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    [
+        "permission denied",
+        "not permitted",
+        "not allowed",
+        "blocked by policy",
+        "approval denied",
+        "sandbox denied",
+        "unknown tool",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+}
+
 /// Execute a single turn of the agent loop: send messages, parse tool calls,
 /// execute tools, and loop until the LLM produces a final text response.
 ///
@@ -4869,14 +5586,14 @@ pub(crate) trait ApprovalResolver: Send + Sync {
 pub(crate) async fn run_tool_call_loop(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     hooks: &HookManager,
     provider_name: &str,
     model: &str,
     temperature: f64,
     silent: bool,
-    approval: Option<&ApprovalManager>,
+    approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
@@ -4951,14 +5668,14 @@ pub(crate) async fn run_tool_call_loop(
 pub(crate) async fn run_tool_call_loop_traced(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     hooks: &HookManager,
     provider_name: &str,
     model: &str,
     temperature: f64,
     silent: bool,
-    approval: Option<&ApprovalManager>,
+    approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
@@ -5007,6 +5724,7 @@ pub(crate) async fn run_tool_call_loop_traced(
         chat_mode,
         None,
         false,
+        None,
     )
     .await?;
     Ok((outcome.into_text(), trace))
@@ -5026,14 +5744,14 @@ pub(crate) async fn run_tool_call_loop_traced(
 pub(crate) async fn run_tool_call_loop_outcome(
     provider: &dyn Provider,
     history: &mut Vec<ChatMessage>,
-    tools_registry: &[Box<dyn Tool>],
+    tools_registry: Arc<Vec<Box<dyn Tool>>>,
     observer: &dyn Observer,
     hooks: &HookManager,
     provider_name: &str,
     model: &str,
     temperature: f64,
     silent: bool,
-    approval: Option<&ApprovalManager>,
+    approval: Option<Arc<ApprovalManager>>,
     channel_name: &str,
     multimodal_config: &crate::config::MultimodalConfig,
     max_tool_iterations: usize,
@@ -5053,12 +5771,36 @@ pub(crate) async fn run_tool_call_loop_outcome(
     chat_mode: ChatMode,
     approval_resolver: Option<Arc<dyn ApprovalResolver>>,
     expose_stay_silent: bool,
+    runtime_adapter: Option<ToolLoopRuntimeAdapter>,
 ) -> Result<(ToolLoopOutcome, ToolLoopTrace)> {
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations.min(MAX_TOOL_ITERATIONS_CAP)
     };
+    let runtime_adapter = runtime_adapter.unwrap_or_else(|| {
+        let (policy, tool_execution_context) = agent_tool_execution_context(scope_ctx, channel_name);
+        let approval_strategy = AgentToolApprovalStrategy {
+            manager: approval.clone(),
+            resolver: approval_resolver.clone(),
+            channel: channel_name.to_string(),
+            policy: Arc::clone(&policy),
+            cancellation: cancellation_token.clone(),
+        };
+        let service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&tools_registry),
+            Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
+            Arc::new(approval_strategy),
+            Arc::new(crate::tools::AdapterOwnedSandboxStrategy),
+            Arc::new(crate::tools::TracingToolExecutionAudit),
+        );
+        ToolLoopRuntimeAdapter {
+            events: None,
+            stream_provider: false,
+            tool_execution_service: Some(Arc::new(service)),
+            tool_execution_context,
+        }
+    });
 
     // FIX-P0-30/31: attribution of the final returning turn. Each provider call
     // overwrites this with that turn's real serving provider/model + attempts;
@@ -5073,7 +5815,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     let mut any_turn_had_fallback = false;
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
-        || crate::tools::ToolCatalog::from_boxed_registry(tools_registry).tool_specs(),
+        || crate::tools::ToolCatalog::from_boxed_registry(tools_registry.as_ref()).tool_specs(),
         |cfg| {
             let last_user_msg = history
                 .iter()
@@ -5082,7 +5824,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 .map(|m| m.content.as_str())
                 .unwrap_or_default();
             let filtered = crate::tools::intent::select_tools_for_intent(
-                tools_registry,
+                tools_registry.as_ref(),
                 last_user_msg,
                 &cfg.always_include,
                 &cfg.always_exclude,
@@ -5125,7 +5867,13 @@ pub(crate) async fn run_tool_call_loop_outcome(
         rollback_cancel_rate_threshold: concurrency_governance.rollback_cancel_rate_threshold.clamp(0.0, 1.0),
         rollback_error_rate_threshold: concurrency_governance.rollback_error_rate_threshold.clamp(0.0, 1.0),
     };
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+    // The Chat streaming contract historically advertises the registry on
+    // every `stream_chat_with_history` request. Some streaming-compatible test
+    // and custom providers do not override `supports_native_tools()`, so using
+    // that buffered-path capability gate here silently drops real Chat tools.
+    // Buffered Agent callers keep the provider capability gate unchanged.
+    let use_native_tools =
+        (runtime_adapter.stream_provider || provider.supports_native_tools()) && !tool_specs.is_empty();
 
     // FIX-P3-05: Letta/MemGPT-style OS-paging. Opt-in (`os_paging.enabled`);
     // when off this whole block is a no-op and the legacy compaction path below
@@ -5183,6 +5931,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
 
     let mut overflow_retries: usize = 0;
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
 
     for iteration in 0..max_iterations {
         // Notify progress for multi-iteration tool loops (skip the first iteration).
@@ -5227,7 +5976,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
         }
 
         let prepared_messages = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
-        for tool in tools_registry {
+        for tool in tools_registry.iter() {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
                 observer.record_event(&ObserverEvent::Error {
@@ -5270,22 +6019,35 @@ pub(crate) async fn run_tool_call_loop_outcome(
         // turn's real serving provider/model and failover attempts flow back
         // to the caller. The `ReliableProvider` overrides `chat_traced`; other
         // providers get a synthetic single-attempt trace via the trait default.
-        let chat_future = provider.chat_traced(
-            ChatRequest {
-                messages: &prepared_messages.messages,
-                tools: request_tools,
-            },
-            model,
-            temperature,
-        );
-
-        let chat_result = if let Some(token) = cancellation_token.as_ref() {
-            tokio::select! {
-                () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-                result = chat_future => result,
-            }
+        let chat_result = if runtime_adapter.stream_provider {
+            run_streaming_provider_turn(
+                provider,
+                &prepared_messages.messages,
+                request_tools,
+                provider_name,
+                model,
+                temperature,
+                cancellation_token.as_ref(),
+                &runtime_adapter,
+            )
+            .await
         } else {
-            chat_future.await
+            let chat_future = provider.chat_traced(
+                ChatRequest {
+                    messages: &prepared_messages.messages,
+                    tools: request_tools,
+                },
+                model,
+                temperature,
+            );
+            if let Some(token) = cancellation_token.as_ref() {
+                tokio::select! {
+                    () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                    result = chat_future => result,
+                }
+            } else {
+                chat_future.await
+            }
         };
 
         // P0-1: chat_processed is Result so we can detect context overflow below.
@@ -5419,29 +6181,94 @@ pub(crate) async fn run_tool_call_loop_outcome(
                         max = MAX_OVERFLOW_RETRIES,
                         "Context overflow detected; running compaction and retrying LLM call"
                     );
+                    let mut emitted_exact_patch = false;
                     if let Some(config) = compaction_config {
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
-                            apply_configurable_compaction(
-                                history,
-                                provider,
-                                model,
-                                config,
-                                document_ingest.as_ref(),
-                                "overflow_retry",
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(Ok(_)) => {}
-                            Ok(Err(e)) => tracing::warn!("Overflow retry compaction failed: {e}"),
-                            Err(_) => {
-                                tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
-                                apply_aggressive_trim(history, config.keep_recent_messages);
+                        if runtime_adapter.stream_provider {
+                            let turns_before = history.len().saturating_sub(usize::from(
+                                history.first().is_some_and(|message| message.role == "system"),
+                            ));
+                            let tokens_before = estimate_history_tokens(history);
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+                                build_configurable_compaction_patch(
+                                    history,
+                                    provider,
+                                    model,
+                                    config,
+                                    document_ingest.as_ref(),
+                                    "overflow_retry",
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(Some(patch))) => {
+                                    let replacement_len = patch.replacement.len();
+                                    apply_compaction_patch_exact(history, &patch);
+                                    trim_history_to_context_budget_preserving_compaction_replacement_with_floor(
+                                        history,
+                                        config,
+                                        replacement_len,
+                                    );
+                                    let turns_after = history.len().saturating_sub(usize::from(
+                                        history.first().is_some_and(|message| message.role == "system"),
+                                    ));
+                                    let tokens_after = estimate_history_tokens(history);
+                                    let used_context_tokens =
+                                        plan_context_budget(history, config, PRE_TURN_FLUSH_THRESHOLD).used_tokens;
+                                    emit_tool_loop_event(
+                                        &runtime_adapter,
+                                        ToolLoopEvent::ContextCompactionPatch {
+                                            patch,
+                                            config: config.clone(),
+                                            turns_before,
+                                            tokens_before,
+                                            turns_after,
+                                            tokens_after,
+                                            used_context_tokens,
+                                        },
+                                    )
+                                    .await?;
+                                    emitted_exact_patch = true;
+                                }
+                                Ok(Ok(None)) => {
+                                    trim_history_to_context_budget(history, config);
+                                }
+                                Ok(Err(error)) => {
+                                    tracing::warn!("Overflow retry compaction failed: {error}");
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                }
+                                Err(_) => {
+                                    tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                }
+                            }
+                        } else {
+                            match tokio::time::timeout(
+                                std::time::Duration::from_secs(COMPACTION_TIMEOUT_SECS),
+                                apply_configurable_compaction(
+                                    history,
+                                    provider,
+                                    model,
+                                    config,
+                                    document_ingest.as_ref(),
+                                    "overflow_retry",
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(_)) => {}
+                                Ok(Err(error)) => tracing::warn!("Overflow retry compaction failed: {error}"),
+                                Err(_) => {
+                                    tracing::warn!("Overflow retry compaction timed out, applying aggressive trim");
+                                    apply_aggressive_trim(history, config.keep_recent_messages);
+                                }
                             }
                         }
                     } else {
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
+                    }
+                    if !emitted_exact_patch && !(runtime_adapter.stream_provider && compaction_config.is_some()) {
+                        emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
                     }
                     continue;
                 }
@@ -5480,7 +6307,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 // it to decide whether an isolated `{"name":...}` JSON object
                 // really is a tool call. Reused for every flushed chunk on
                 // the hot path; rebuilding it per word would be wasteful.
-                let tool_names = known_tool_names(tools_registry);
+                let tool_names = known_tool_names(tools_registry.as_ref());
                 // Feed deltas roughly word-sized so progressive flushes still happen
                 // inside long plain-text runs.
                 for word in display_text.split_inclusive(char::is_whitespace) {
@@ -5519,6 +6346,17 @@ pub(crate) async fn run_tool_call_loop_outcome(
             last_turn_trace.any_turn_had_fallback = any_turn_had_fallback;
             last_turn_trace.tokens_used = usage_accumulator.finish();
             return Ok((ToolLoopOutcome::Text(display_text), last_turn_trace));
+        }
+
+        // A streaming ingress cannot execute a structured provider tool call
+        // unless it supplied a registry. Fail at the ownership boundary rather
+        // than manufacturing repeated unknown-tool results until the iteration
+        // cap is exhausted. This preserves the Redux driver's permanent,
+        // immediate no-registry rejection contract.
+        if runtime_adapter.stream_provider && tools_registry.is_empty() {
+            return Err(anyhow::anyhow!(
+                "provider returned tool_calls but no tools_registry is configured"
+            ));
         }
 
         // Smart group-reply: a `stay_silent` call is a *terminal* decision for the
@@ -5576,17 +6414,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
         }
 
         let tools_started_at = Instant::now();
-        let individual_results = execute_tools_with_policy(
+        let individual_results = execute_tools_with_service(
             &tool_calls,
-            tools_registry,
-            observer,
-            approval,
-            channel_name,
+            &native_tool_calls,
+            &runtime_adapter,
             read_only_schedule.clone(),
             cancellation_token.as_ref(),
-            scope_ctx,
             chat_mode,
-            approval_resolver.as_ref(),
+            observer,
         )
         .await?;
         let tools_elapsed_ms = tools_started_at.elapsed().as_millis() as u64;
@@ -5596,8 +6431,9 @@ pub(crate) async fn run_tool_call_loop_outcome(
         // mode. The native-history branch below reuses the document status captured
         // here instead of persisting a second time.
         let mut document_statuses: Vec<&'static str> = Vec::with_capacity(individual_results.len());
+        let mut repeated_unrecoverable: Option<String> = None;
         for (call, result) in tool_calls.iter().zip(individual_results.iter()) {
-            let success = !result.starts_with("Error");
+            let success = !(result.starts_with("Error") || result.starts_with("Denied"));
             hooks
                 .emit(
                     HookEvent::ToolCall,
@@ -5619,6 +6455,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
             }
             if !success {
                 hooks.emit(HookEvent::Error, payload_error("tool", result)).await;
+                if shared_unrecoverable_tool_error(result) {
+                    let signature = format!("{}:{}", call.name, result.to_ascii_lowercase());
+                    let count = unrecoverable_failures.entry(signature).or_insert(0);
+                    *count = count.saturating_add(1);
+                    if *count >= 2 {
+                        repeated_unrecoverable = Some(call.name.clone());
+                    }
+                }
             }
 
             // Track consecutive failures per tool for repeated-failure hints.
@@ -5725,6 +6569,11 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 before,
                 after = history.len(),
                 "Mid-turn count-based safety trim triggered",
+            );
+        }
+        if let Some(tool_name) = repeated_unrecoverable {
+            anyhow::bail!(
+                "stopped after a repeated unrecoverable tool failure ('{tool_name}' is blocked by policy/permissions); not retrying further"
             );
         }
     }
@@ -6074,7 +6923,7 @@ pub async fn run(
     }
 
     // ── Approval manager (supervised mode) ───────────────────────
-    let approval_manager = ApprovalManager::new();
+    let approval_manager = Arc::new(ApprovalManager::new());
 
     // ── Execute ──────────────────────────────────────────────────
     let start = Instant::now();
@@ -6218,14 +7067,14 @@ pub async fn run(
                     run_tool_call_loop(
                         provider.as_ref(),
                         &mut history,
-                        &tools_registry,
+                        Arc::clone(&tools_registry),
                         observer.as_ref(),
                         &hooks,
                         provider_name,
                         model_name,
                         temperature,
                         false,
-                        Some(&approval_manager),
+                        Some(Arc::clone(&approval_manager)),
                         "cli",
                         &config.multimodal,
                         config.agent.max_tool_iterations,
@@ -6532,14 +7381,14 @@ pub async fn run(
                     run_tool_call_loop(
                         provider.as_ref(),
                         &mut history,
-                        &tools_registry,
+                        Arc::clone(&tools_registry),
                         observer.as_ref(),
                         &hooks,
                         provider_name,
                         model_name,
                         temperature,
                         false,
-                        Some(&approval_manager),
+                        Some(Arc::clone(&approval_manager)),
                         "cli",
                         &config.multimodal,
                         config.agent.max_tool_iterations,
@@ -6686,7 +7535,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     } else {
         (None, None)
     };
-    let tools_registry = tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -6699,7 +7548,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &config.agents,
         config.api_key.as_deref(),
         &config,
-    );
+    ));
 
     let provider_name = config.default_provider.as_deref().unwrap_or("openrouter");
     let model_name = config
@@ -6742,7 +7591,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         &tool_descs,
         &selected_skills,
         native_tools,
-        &tools_registry,
+        tools_registry.as_ref(),
     );
 
     let runtime_envelope =
@@ -6784,7 +7633,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let response = agent_turn(
         provider.as_ref(),
         &mut history,
-        &tools_registry,
+        Arc::clone(&tools_registry),
         observer.as_ref(),
         &hooks,
         provider_name,
@@ -7535,7 +8384,7 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &NoopObserver,
             &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
             "mock-provider",
@@ -7746,7 +8595,7 @@ mod tests {
         let (text, trace) = run_tool_call_loop_traced(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &NoopObserver,
             &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
             routed_provider,
@@ -7849,7 +8698,7 @@ mod tests {
         let err = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
@@ -7907,7 +8756,7 @@ mod tests {
         let err = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
@@ -7957,7 +8806,7 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
@@ -8009,7 +8858,7 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
@@ -8193,14 +9042,14 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
             true,
-            Some(&approval_mgr),
+            Some(Arc::new(approval_mgr)),
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
@@ -8281,7 +9130,7 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &NoopObserver,
             &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
             "mock-provider",
@@ -8368,14 +9217,14 @@ mod tests {
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &crate::hooks::HookManager::new(std::env::temp_dir()),
             "mock-provider",
             "mock-model",
             0.0,
             true,
-            Some(&approval_mgr),
+            Some(Arc::new(approval_mgr)),
             "telegram",
             &crate::config::MultimodalConfig::default(),
             4,
@@ -11277,7 +12126,7 @@ Let me check the result."#;
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &hooks,
             "mock-provider",
@@ -11344,7 +12193,7 @@ Let me check the result."#;
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &hooks,
             "mock-provider",
@@ -11421,7 +12270,7 @@ Let me check the result."#;
         let result = run_tool_call_loop(
             &provider,
             &mut history,
-            &tools_registry,
+            Arc::new(tools_registry),
             &observer,
             &hooks,
             "mock-provider",
@@ -12113,7 +12962,7 @@ Let me check the result."#;
             let (outcome, _trace) = run_tool_call_loop_outcome(
                 &provider,
                 &mut history,
-                &tools_registry,
+                Arc::new(tools_registry),
                 &NoopObserver,
                 &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
                 "mock-provider",
@@ -12140,6 +12989,7 @@ Let me check the result."#;
                 ChatMode::default(),
                 None,
                 false,
+                None,
             )
             .await
             .expect("empty response turn should complete");
@@ -12160,7 +13010,7 @@ Let me check the result."#;
             let (outcome, _trace) = run_tool_call_loop_outcome(
                 &provider,
                 &mut history,
-                &tools_registry,
+                Arc::new(tools_registry),
                 &NoopObserver,
                 &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
                 "mock-provider",
@@ -12187,6 +13037,7 @@ Let me check the result."#;
                 ChatMode::default(),
                 None,
                 expose,
+                None,
             )
             .await
             .expect("loop should complete");
@@ -12238,7 +13089,7 @@ Let me check the result."#;
             let result = run_tool_call_loop_outcome(
                 &provider,
                 &mut history,
-                &tools_registry,
+                Arc::new(tools_registry),
                 &NoopObserver,
                 &crate::hooks::HookManager::new(tmp.path().to_path_buf()),
                 "mock-provider",
@@ -12265,6 +13116,7 @@ Let me check the result."#;
                 ChatMode::default(),
                 None,
                 false, // not exposed
+                None,
             )
             .await;
             // The single scripted response was consumed continuing the loop, so a

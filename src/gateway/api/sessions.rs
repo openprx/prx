@@ -296,7 +296,7 @@ async fn run_console_runtime_turn(
     run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
-        state.tools_registry.as_ref(),
+        std::sync::Arc::clone(&state.tools_registry),
         &noop_observer,
         state.hooks.as_ref(),
         &provider_label,

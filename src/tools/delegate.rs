@@ -832,7 +832,7 @@ impl DelegateTool {
             run_tool_call_loop(
                 provider,
                 &mut history,
-                &sub_tools,
+                Arc::new(sub_tools),
                 &noop_observer,
                 &hooks,
                 effective_provider,

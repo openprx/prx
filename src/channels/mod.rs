@@ -3327,7 +3327,7 @@ async fn process_channel_message(
                         crate::agent::loop_::run_tool_call_loop_outcome(
                     active_provider.as_ref(),
                     &mut history,
-                    ctx.tools_registry.as_ref(),
+                    Arc::clone(&ctx.tools_registry),
                     ctx.observer.as_ref(),
                     ctx.hooks.as_ref(),
                     route.provider.as_str(),
@@ -3356,6 +3356,7 @@ async fn process_channel_message(
                     // expose_stay_silent: ONLY on smart group turns. DMs / non-smart
                     // never see the tool, so they can never short-circuit to Silent.
                     smart_group,
+                    None,
                         ),
                     );
                     match turn_message_send_ctx.clone() {

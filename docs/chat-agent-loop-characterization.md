@@ -1,12 +1,12 @@
 # Chat and agent loop characterization
 
-Status: Step 7.1 characterization baseline
+Status: Step 7.2 routed baseline
 
-Baseline commit: `71842ea6eaa6848b560dd14b43ee7f8b1c09de0b`
+Step 7.1 baseline commit: `e0740a468961536185c8c1ffc2a2a6411ad35152`
 
-This document fixes the behavior boundary that Step 7.2 must preserve while
-Chat joins the existing `agent::loop_` turn owner. It does not authorize a new
-turn runtime and does not move production control flow by itself.
+Chat now joins the existing `agent::loop_::run_tool_call_loop_outcome` turn
+owner. Redux remains the TUI state and persistence projection, and the ordered
+Chat finalizer remains the terminal commit boundary until Step 7.3.
 
 ## Executable fixture
 
@@ -24,69 +24,78 @@ Three tests execute both real loops:
 2. `step_7_1_same_overflow_fixture_characterizes_recovery_signals`
 3. `step_7_1_same_blocking_fixture_characterizes_cancellation_terminals`
 
-The fixture is test-only. No production function was made public and no Chat
-or Agent routing changed in Step 7.1.
+The fixture remains test-only and now guards the routed production path.
 
 ## Current behavior matrix
 
-| Dimension | Shared invariant proven now | Chat Redux driver | `agent::loop_` | Step 7.2 preservation rule |
+| Dimension | Shared invariant proven now | Routed owner | Entry-specific projection | Remaining Step 7.3 boundary |
 | --- | --- | --- | --- | --- |
-| Provider execution | Same logical two-call script returns `final answer` | Calls `stream_chat_with_history` and forwards real deltas while the stream is open | Calls `chat_traced`; `on_delta` is synthesized only after the buffered final response exists | The shared owner must expose live delta and reasoning events for Chat without creating a second provider loop |
-| Tool calls | Same call ID/name/arguments executes exactly once and produces the same tool output | Executes sequentially through `ToolExecutionService`, emitting `ToolStarted`/`ToolFinished` actions | Parses native or text calls, then uses `execute_tools_with_policy`; read-only calls may run in bounded parallel batches and stateful calls remain serial | Keep `ToolExecutionService` as the execution contract and preserve Agent scheduling only behind that contract; do not restore Chat direct execution |
-| Recovery | Both retry one identical context-overflow fixture and return `recovered` on call two | Owns stream error classification, network backoff, overflow compaction, and UI retry/compaction actions | Owns overflow compaction around `chat_traced`; provider-level retry/failover is represented in `ChatTrace` | Choose one retry owner per failure class and project retry/compaction events to the reducer; never stack Chat and Agent retry loops |
-| Usage | Both aggregate the fixture's two reported calls to 20 total tokens | Emits one final `StreamUsageMetered` aggregate, later consumed by Chat finalization | Returns the aggregate in `ToolLoopTrace.tokens_used`, together with final provider/model and attempts | Carry one aggregate and one attribution trace through the shared result; reducer/finalizer may project it but must not re-sum it |
-| Provider-bound history | Before call two, both have roles `system,user,assistant,tool` | Assistant/tool payload is JSON and the tool result includes the Chat-only `success` projection | Native history preserves the provider call ID but its role-tool payload contains only canonical call ID/content | Select one provider-compatible wire projection. UI-only success/status fields belong in events/cards, not a second provider-history dialect |
-| Durable history commit | Final text is the same and one assistant result is produced | Sends `RecordAssistantTurn` before one terminal action; reducer and ordered commit/finalizer own persistence | Mutates the caller-owned history before returning; each ingress decides when/how to persist it | The shared loop must return or emit a neutral history delta; Chat's ordered commit remains the only Chat persistence boundary |
-| Cancellation | The same blocked provider call stops promptly and appends no false success | Emits exactly one `StreamCancelled` and no `StreamCompleted`/`StreamFailed` | Returns `ToolLoopCancelled` as an error; caller owns terminal projection | Map the shared cancelled outcome to exactly one Chat terminal action and do not append assistant/tool history after cancellation |
-| Finalization | One semantic terminal result per invocation | Has `StreamCompleted`/`StreamFailed`/`StreamCancelled`, task-scoped `ProviderTurnReadyForCommit`, and an ordered `ProviderTurnFinalizerEvent` queue | Returns `ToolLoopOutcome` plus `ToolLoopTrace`; terminal commit remains ingress-specific | Step 7.2 adapts the shared result to existing Chat finalization. Step 7.3, not 7.2, creates the cross-entry terminal commit owner |
+| Provider execution | Same logical two-call script returns `final answer` | `run_tool_call_loop_outcome` owns both real Chat streaming and buffered Agent calls | `ToolLoopRuntimeAdapter` maps live text, reasoning, retry, and compaction events to Redux actions | Terminal commit only; provider execution is already shared |
+| Tool calls | Same call ID/name/arguments executes exactly once and produces the same output | Every production path executes through `ToolExecutionService`; priority, bounded read-only concurrency, timeouts, serial stateful barriers, and rollback signals remain in the owner | Chat injects its TUI approval/sandbox service; other entries assemble the same service contract from their registry and policy | Do not introduce a terminal-time execution bypass |
+| Recovery | Both retry one identical context-overflow fixture and return `recovered` on call two | The shared owner classifies streaming network errors, owns backoff and overflow recovery, and emits neutral recovery events | Redux maps exact configured compaction patches and UI feedback; buffered callers retain `ChatTrace` failover attribution | Finalizer consumes the resulting terminal state once |
+| Usage | Both aggregate the fixture's two calls to 20 tokens | One `ProviderUsageAccumulator` in the shared owner produces the aggregate and attribution trace | Redux receives one `StreamUsageMetered`; other entries consume `ToolLoopTrace.tokens_used` | Settle that aggregate exactly once across entry points |
+| Provider-bound history | Before call two, both have roles `system,user,assistant,tool` | The shared owner writes one canonical native assistant/tool payload with call ID and content | UI success/status stays in `ToolFinished`, not provider history | Commit one canonical history projection |
+| Durable history commit | Final text is the same and one assistant result is produced | The shared owner mutates the turn-local history and returns the terminal outcome | Redux still emits `RecordAssistantTurn`; ordered Chat commit/finalizer still owns durable persistence | Replace ingress-specific terminal commit with one shared finalizer |
+| Cancellation | The same blocked call stops promptly and appends no false success | The shared owner returns `ToolLoopCancelled` | Redux maps it to exactly one `StreamCancelled`; no competing completion/failure action is emitted | Settle lease/attempt/telemetry once on cancellation |
+| Finalization | One semantic terminal result per invocation | `ToolLoopOutcome` plus `ToolLoopTrace` is the shared execution result | Chat still uses task-scoped `ProviderTurnReadyForCommit` and `ProviderTurnFinalizerEvent`; other entries finalize independently | Step 7.3 creates the cross-entry terminal commit owner |
 
-## Source ownership snapshot
+## Routed source ownership snapshot
 
-- Chat provider/tool loop: `drive_start_turn_stream` in
-  `src/chat/dispatcher.rs`.
-- Chat stream and retry boundary: `run_one_stream_pass_with_retry` and
-  `run_one_stream_pass` in `src/chat/dispatcher.rs`.
+- Shared provider/tool owner: `run_tool_call_loop_outcome` in
+  `src/agent/loop_.rs`.
+- Shared live event boundary: `ToolLoopEvent`, `ToolLoopEventSink`, and
+  `ToolLoopRuntimeAdapter` in `src/agent/loop_.rs`.
+- Shared streaming boundary: `run_streaming_provider_turn`; it aggregates
+  partial tool-call chunks, live text/reasoning, usage, and network retries.
+- Shared execution boundary: `execute_tools_with_service`; the former
+  `execute_tools_with_policy` path is compiled only for historical tests.
+- Chat adapter: production `drive_start_turn_stream` in
+  `src/chat/dispatcher.rs` calls the shared owner and only maps neutral events,
+  preflight state, and the result into existing Redux actions.
+- Historical duplicate Chat driver: `drive_start_turn_stream_legacy` is
+  `#[cfg(test)]`; production code cannot call it.
 - Chat terminal projection: `StreamUsageMetered`, `RecordAssistantTurn`, and
-  `StreamCompleted` or `ProviderTurnReadyForCommit` at the end of
-  `drive_start_turn_stream`.
+  exactly one `StreamCompleted`, `StreamFailed`, `StreamCancelled`, or
+  task-scoped `ProviderTurnReadyForCommit`.
 - Chat durable reducer boundary: `reduce_stream_completed` in
   `src/chat/state.rs`; task-scoped ordering/finalization is owned by
   `ProviderTurnTerminalPlan` and `ProviderTurnFinalizerEvent` in
   `src/chat/mod.rs`.
-- Existing shared Agent owner: `run_tool_call_loop_outcome` in
-  `src/agent/loop_.rs`.
-- Agent provider boundary: `Provider::chat_traced` inside that function.
-- Agent tool scheduling/execution boundary: `execute_tools_with_policy`.
-- Agent cancellation boundary: `ToolLoopCancelled`.
+- Buffered Agent/provider boundary: `Provider::chat_traced` inside the same
+  owner; Chat selects `Provider::stream_chat_with_history` through its adapter.
+- Shared cancellation boundary: `ToolLoopCancelled`.
 
-## Step 7.2 implementation constraints
+## Step 7.2 delivered boundary
 
-1. Extend the existing Agent owner; do not extract a replacement runtime.
-2. Introduce an event/output adapter for visible text deltas, reasoning,
-   tool-start/tool-finish/progress, recovery, usage, and one terminal result.
-3. Preserve actual streaming for Chat. Falling back to post-response synthetic
-   chunks is a user-visible regression even if final text is equal.
-4. Thread Chat's `ToolExecutionService`/approval/sandbox strategy through the
-   Agent owner, or migrate Agent execution to that service first. There must
-   not be one service path for Chat and a bypass path for Agent after routing.
-5. Preserve task IDs, operation IDs, cancellation tokens, runtime envelope,
-   scope, tool call IDs, and provider attribution without reconstructing them
-   from display strings.
-6. Emit a neutral history delta and keep the reducer/ordered gate as Chat's
-   state and persistence owner.
-7. Convert shared cancellation/failure/completion to exactly one existing Chat
-   terminal action. Do not finalize or settle usage inside both layers.
-8. Do not implement the Step 7.3 shared terminal transaction early.
+- Extended the existing Agent owner; no replacement runtime was introduced.
+- Preserved real Chat streaming through a neutral event sink and kept buffered
+  Agent behavior through the same owner.
+- Routed all production tool execution through `ToolExecutionService`, with
+  Chat's existing approval/sandbox service injected unchanged.
+- Preserved task IDs, cancellation, runtime envelopes, tool call IDs, exact
+  configured compaction patches, usage, and provider attribution.
+- Standardized provider-bound tool history on the Agent canonical payload;
+  Redux tool cards retain UI-only success state.
+- Kept Redux preflight, visual projection, command handling, reducer state,
+  ordered commit, and task-scoped finalization intact.
+- Left cross-entry terminal transaction ownership untouched for Step 7.3.
 
-## Acceptance boundary for Step 7.2
+## Step 7.2 acceptance evidence
 
-The three Step 7.1 fixtures must continue to pass after routing, with these
-intentional changes only:
+The final routed tree passes:
 
-- Chat and Agent provider execution are owned by the same loop.
-- Their provider-bound tool history uses one canonical payload.
-- Chat still observes real incremental deltas and exactly one terminal action.
-- Tool execution still goes through `ToolExecutionService`.
-- Usage remains 20 tokens for the success fixture and is settled once.
-- Overflow retries exactly once, cancellation appends no false terminal
-  history, and the fixture tool executes exactly once.
+- `step_7_1_same_`: 3 passed; same-fixture success, overflow, cancellation.
+- `run_tool_call_loop_`: 9 passed; multimodal, fallback aggregation, native
+  persistence, bounded read-only concurrency, serial stateful tools, large
+  output persistence.
+- `supervised_`: 29 passed; shared-service allow/deny/allowlist behavior plus
+  existing supervised policy coverage.
+- `driver_`: 27 passed; real streaming/tool protocol, registry handling,
+  approval, cancellation, compaction, network retry, usage/final actions, and
+  Redux preflight/history projections.
+- `cargo fmt --all`, `cargo fmt --all -- --check`,
+  `cargo check -p openprx --all-features`, and `git diff --check`: passed.
+
+Per the local verification policy, strict clippy, full suites, security audits,
+release builds, and live deployment validation remain GitHub delivery or
+release gates. They were not run for this local implementation step.

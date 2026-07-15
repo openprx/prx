@@ -2925,14 +2925,14 @@ async fn run_sub_agent_task(
             let loop_outcome = crate::agent::loop_::run_tool_call_loop_outcome(
                 provider_instance.as_ref(),
                 &mut task_history,
-                tools_registry_owned.as_slice(),
+                tools_registry_owned,
                 &observer,
                 &hooks,
                 &provider_name_owned,
                 &model_name,
                 temperature_value,
                 true, // silent — never print to the chat terminal (see note above)
-                approval_manager.as_ref(),
+                approval_manager.map(Arc::new),
                 "sessions_spawn",
                 &multimodal_config_owned,
                 max_iterations,
@@ -2959,6 +2959,7 @@ async fn run_sub_agent_task(
                 crate::agent::loop_::ChatMode::default(),
                 approval_resolver_iter,
                 false,
+                None,
             )
             .await;
             let result = loop_outcome.map(|(outcome, trace)| SubAgentTaskResult {

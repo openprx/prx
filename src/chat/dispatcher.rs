@@ -1158,6 +1158,8 @@ impl EffectExecutor {
                 let provider_turn_task_id_for_trace = provider_turn_task_id.map(|id| id.get());
                 let provider_turn_lifecycle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
+                let observer = Arc::clone(&deps.observer);
+                let hooks = Arc::clone(&deps.hooks);
                 let provider_turn_execution_lease_id =
                     provider_turn_task_id.map(|_| next_provider_turn_execution_lease_id());
                 let provider_task_handle = tokio::spawn(async move {
@@ -1207,6 +1209,8 @@ impl EffectExecutor {
                         tool_execution_context,
                         max_tool_iterations,
                         chat_mode,
+                        observer,
+                        hooks,
                     );
                     // D8-4 (redux path real fix): mirror the legacy
                     // `run_tool_call_loop_traced` wrapper in `chat::run` — seed the
@@ -2062,6 +2066,338 @@ fn chat_tool_execution_service(
     )
 }
 
+struct ReduxToolLoopEventSink {
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    draft_id: String,
+    action_tx: mpsc::Sender<Action>,
+    version: AtomicU64,
+    reasoning: Arc<ParkingMutex<String>>,
+}
+
+#[async_trait]
+impl crate::agent::loop_::ToolLoopEventSink for ReduxToolLoopEventSink {
+    async fn emit(&self, event: crate::agent::loop_::ToolLoopEvent) -> anyhow::Result<()> {
+        let action = match event {
+            crate::agent::loop_::ToolLoopEvent::TextDelta(delta) => Action::StreamChunkReceived {
+                draft_id: self.draft_id.clone(),
+                delta,
+                version: self.version.fetch_add(1, Ordering::Relaxed).saturating_add(1),
+            },
+            crate::agent::loop_::ToolLoopEvent::ReasoningDelta(delta) => {
+                self.reasoning.lock().push_str(&delta);
+                return Ok(());
+            }
+            crate::agent::loop_::ToolLoopEvent::RetryAttempt { attempt, reason } => {
+                Action::StreamRetryAttempt { attempt, reason }
+            }
+            crate::agent::loop_::ToolLoopEvent::ContextCompacted => Action::HistoryCompacted {
+                reason: crate::chat::action::CompactReason::ContextOverflow,
+            },
+            crate::agent::loop_::ToolLoopEvent::ContextCompactionPatch {
+                patch,
+                config,
+                turns_before,
+                tokens_before,
+                turns_after,
+                tokens_after,
+                used_context_tokens,
+            } => {
+                self.action_tx
+                    .send(Action::HistoryCompactionPatchApplied {
+                        reason: crate::chat::action::CompactReason::ContextOverflow,
+                        patch,
+                        compaction_config: config.clone(),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("chat action channel closed"))?;
+                self.action_tx
+                    .send(Action::ContextWindowUpdated {
+                        used_context_tokens: Some(used_context_tokens),
+                        max_context_tokens: Some(config.max_context_tokens),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("chat action channel closed"))?;
+                self.action_tx
+                    .send(Action::SystemMessageAdded {
+                        text: super::format_compact_feedback(
+                            turns_before,
+                            turns_after,
+                            tokens_before,
+                            tokens_after,
+                            config.max_context_tokens,
+                        ),
+                    })
+                    .await
+                    .map_err(|_| anyhow::anyhow!("chat action channel closed"))?;
+                return Ok(());
+            }
+            crate::agent::loop_::ToolLoopEvent::ToolStarted {
+                tool_call_id,
+                name,
+                args,
+            } => Action::ToolStarted {
+                task_id: self.provider_turn_task_id,
+                sequence: None,
+                tool_call_id: Some(tool_call_id),
+                name,
+                args,
+            },
+            crate::agent::loop_::ToolLoopEvent::ToolFinished {
+                tool_call_id,
+                name,
+                success,
+                duration_ms,
+                result,
+            } => Action::ToolFinished {
+                task_id: self.provider_turn_task_id,
+                sequence: None,
+                tool_call_id: Some(tool_call_id),
+                name,
+                success,
+                duration_ms,
+                result: Some(result),
+            },
+        };
+        self.action_tx
+            .send(action)
+            .await
+            .map_err(|_| anyhow::anyhow!("chat action channel closed"))
+    }
+}
+
+/// Chat adapter over the existing Agent turn owner.
+///
+/// Redux remains the UI/state/persistence owner. Provider iterations, provider
+/// streaming, overflow recovery, tool execution, usage aggregation, history
+/// mutation and cancellation are all delegated to `run_tool_call_loop_outcome`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_start_turn_stream(
+    provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    provider: Arc<dyn Provider>,
+    mut history: Vec<crate::providers::traits::ChatMessage>,
+    mut compaction_guard_history: Vec<crate::providers::traits::ChatMessage>,
+    model: String,
+    temperature: f64,
+    compaction_config: Option<crate::config::AgentCompactionConfig>,
+    cancel: CancellationToken,
+    draft_id: String,
+    action_tx: mpsc::Sender<Action>,
+    tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
+    tool_execution_service: Option<Arc<ToolExecutionService>>,
+    tool_execution_context: ToolExecutionContext,
+    max_tool_iterations: usize,
+    chat_mode: crate::agent::loop_::ChatMode,
+    observer: Arc<dyn Observer>,
+    hooks: Arc<HookManager>,
+) {
+    // Redux-specific preflight projection stays in the adapter because it must
+    // publish the exact compaction patch and injection diagnostic into reducer
+    // state before the shared owner starts the visible provider turn. The
+    // provider/tool iteration itself remains exclusively in agent::loop_.
+    if let Some(config) = compaction_config.as_ref() {
+        let budget =
+            crate::agent::loop_::plan_context_budget(&history, config, crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD);
+        if budget.over_hard_limit {
+            let turns_before = chat_history_turn_count(&history);
+            let tokens_before = super::estimate_chat_history_tokens(&history);
+            let injection_diagnostic =
+                redux_injection_overbudget_diagnostic_text(&history, &compaction_guard_history, config);
+            let compaction_off = matches!(config.mode, crate::config::AgentCompactionMode::Off);
+            let replacement_len = if compaction_off {
+                None
+            } else {
+                match apply_redux_summary_compaction(
+                    provider.as_ref(),
+                    &mut history,
+                    &mut compaction_guard_history,
+                    &model,
+                    config,
+                    &action_tx,
+                    crate::chat::action::CompactReason::ContextOverflow,
+                    "redux_preflight",
+                )
+                .await
+                {
+                    Ok(replacement_len) => replacement_len,
+                    Err(()) => return,
+                }
+            };
+            let after_compact = crate::agent::loop_::plan_context_budget(
+                &history,
+                config,
+                crate::agent::loop_::PRE_TURN_FLUSH_THRESHOLD,
+            );
+            if compaction_off || after_compact.over_hard_limit {
+                trim_redux_driver_context_budget_after_summary(
+                    &mut history,
+                    &mut compaction_guard_history,
+                    config,
+                    replacement_len,
+                );
+            }
+            let mut injection_feedback = None;
+            if send_redux_injection_overbudget_diagnostic(
+                &action_tx,
+                injection_diagnostic,
+                "redux_preflight_injection_overbudget_diagnostic",
+                &mut injection_feedback,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+            if send_redux_context_window_update(&action_tx, &history, config, "redux_preflight_context_window_updated")
+                .await
+                .is_err()
+            {
+                return;
+            }
+            let mut compaction_feedback = None;
+            if send_redux_compaction_feedback(
+                &action_tx,
+                turns_before,
+                tokens_before,
+                &history,
+                config,
+                "redux_preflight_compaction_feedback",
+                &mut compaction_feedback,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+    }
+
+    let reasoning = Arc::new(ParkingMutex::new(String::new()));
+    let events: Arc<dyn crate::agent::loop_::ToolLoopEventSink> = Arc::new(ReduxToolLoopEventSink {
+        provider_turn_task_id,
+        draft_id: draft_id.clone(),
+        action_tx: action_tx.clone(),
+        version: AtomicU64::new(0),
+        reasoning: Arc::clone(&reasoning),
+    });
+    let runtime_adapter = crate::agent::loop_::ToolLoopRuntimeAdapter {
+        events: Some(events),
+        stream_provider: true,
+        tool_execution_service,
+        tool_execution_context,
+    };
+    let tools = tools_registry.unwrap_or_else(|| Arc::new(Vec::new()));
+
+    let result = crate::agent::loop_::run_tool_call_loop_outcome(
+        provider.as_ref(),
+        &mut history,
+        tools,
+        observer.as_ref(),
+        hooks.as_ref(),
+        "chat",
+        &model,
+        temperature,
+        true,
+        None,
+        "terminal",
+        &crate::config::MultimodalConfig::default(),
+        max_tool_iterations,
+        false,
+        1,
+        30,
+        false,
+        Vec::new(),
+        crate::agent::loop_::ToolConcurrencyGovernanceConfig::default(),
+        compaction_config.as_ref(),
+        Some(cancel.clone()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        chat_mode,
+        None,
+        false,
+        Some(runtime_adapter),
+    )
+    .await;
+
+    let (outcome, trace) = match result {
+        Ok(result) => result,
+        Err(error) if crate::agent::loop_::is_tool_loop_event_sink_closed(&error) => return,
+        Err(error) if crate::agent::loop_::is_tool_loop_cancelled(&error) || cancel.is_cancelled() => {
+            let _ = action_tx.send(Action::StreamCancelled { draft_id }).await;
+            return;
+        }
+        Err(error) => {
+            let retryable = crate::agent::loop_::tool_loop_error_is_retryable(&error);
+            let _ = action_tx
+                .send(Action::StreamFailed {
+                    draft_id,
+                    err: error.to_string(),
+                    retryable,
+                })
+                .await;
+            return;
+        }
+    };
+
+    let final_text = outcome.into_text();
+    if trace.tokens_used.is_reported()
+        && action_tx
+            .send(Action::StreamUsageMetered {
+                draft_id: draft_id.clone(),
+                usage: trace.tokens_used,
+            })
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let empty_response = crate::agent::loop_::is_empty_assistant_response(&final_text, false);
+    if empty_response {
+        if action_tx
+            .send(Action::SystemMessageAdded {
+                text: crate::agent::loop_::EMPTY_ASSISTANT_RESPONSE_MESSAGE.to_string(),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    } else if provider_turn_task_id.is_none()
+        && action_tx
+            .send(Action::RecordAssistantTurn {
+                task_id: provider_turn_task_id,
+                content: final_text.clone(),
+            })
+            .await
+            .is_err()
+    {
+        return;
+    }
+    let reasoning = if empty_response {
+        String::new()
+    } else {
+        reasoning.lock().clone()
+    };
+    let terminal = if provider_turn_task_id.is_some() {
+        Action::ProviderTurnReadyForCommit {
+            draft_id,
+            final_text,
+            reasoning,
+        }
+    } else {
+        Action::StreamCompleted {
+            draft_id,
+            final_text,
+            reasoning,
+        }
+    };
+    let _ = action_tx.send(terminal).await;
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -2070,7 +2406,7 @@ fn chat_tool_execution_service(
         model = %model,
     )
 )]
-async fn drive_start_turn_stream(
+async fn drive_start_turn_stream_legacy(
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     provider: Arc<dyn Provider>,
     mut history: Vec<crate::providers::traits::ChatMessage>,
@@ -4098,6 +4434,8 @@ mod tests {
             tool_context,
             0,
             crate::agent::loop_::ChatMode::Edit,
+            Arc::new(crate::observability::noop::NoopObserver),
+            Arc::new(crate::hooks::HookManager::new(std::path::PathBuf::new())),
         )
         .await;
 
@@ -7443,7 +7781,9 @@ mod real_mode_tests {
             if let Action::StreamFailed { err, retryable, .. } = &action {
                 assert!(!retryable, "max-iter exceeded is permanent");
                 assert!(
-                    err.contains("max tool iterations") || err.contains("max_tool"),
+                    err.contains("max tool iterations")
+                        || err.contains("maximum tool iterations")
+                        || err.contains("max_tool"),
                     "err must mention max iterations (got: {err})"
                 );
                 got_failed = true;

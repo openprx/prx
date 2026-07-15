@@ -623,7 +623,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
         run_tool_call_loop_traced(
             provider.as_ref(),
             &mut history,
-            tools_registry.as_slice(),
+            Arc::new(tools_registry),
             &observer,
             &hooks,
             &manifest.provider_name,

@@ -1646,7 +1646,7 @@ async fn run_gateway_chat_with_multimodal(
     let response = run_tool_call_loop(
         state.provider.as_ref(),
         &mut history,
-        state.tools_registry.as_ref(),
+        Arc::clone(&state.tools_registry),
         &noop_observer,
         state.hooks.as_ref(),
         provider_label,

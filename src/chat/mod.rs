@@ -3613,7 +3613,7 @@ pub async fn run(
     let native_tools = provider.supports_native_tools();
 
     // ── Approval manager ─────────────────────────────────────────
-    let approval_manager = ApprovalManager::new();
+    let approval_manager = Arc::new(ApprovalManager::new());
 
     // ── Create TerminalChannel (Arc-wrapped for sharing with streaming tasks) ──
     let terminal: Arc<TerminalChannel> = Arc::new(TerminalChannel::new(plain_mode));
@@ -4661,7 +4661,7 @@ pub async fn run(
                             &turn_signal,
                             &mut provider_turn_completion_contexts,
                             &mut history,
-                            &tools_registry,
+                            tools_registry.as_ref(),
                             &mut provider_turn_finalizer_events,
                             &mut turn_scheduler,
                             &mut history_commit_coordinator,
@@ -7569,14 +7569,14 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         run_tool_call_loop_traced(
                             provider.as_ref(),
                             &mut history,
-                            &tools_registry,
+                            Arc::clone(&tools_registry),
                             observer.as_ref(),
                             &hooks,
                             provider_name,
                             model_name,
                             temperature,
                             false,
-                            Some(&approval_manager),
+                            Some(Arc::clone(&approval_manager)),
                             "terminal",
                             &config.multimodal,
                             config.agent.max_tool_iterations,
