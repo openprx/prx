@@ -10,6 +10,56 @@ use std::str::FromStr;
 const SERVICE_LABEL: &str = "com.prx.daemon";
 const WINDOWS_TASK_NAME: &str = "PRX Daemon";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceState {
+    Running,
+    Stopped,
+    NotInstalled,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceStatus {
+    pub state: ServiceState,
+    pub manager: &'static str,
+    pub unit: PathBuf,
+    pub detail: String,
+}
+
+impl ServiceStatus {
+    const fn state_label(&self) -> &'static str {
+        match self.state {
+            ServiceState::Running => "running",
+            ServiceState::Stopped => "stopped",
+            ServiceState::NotInstalled => "not-installed",
+            ServiceState::Unknown => "unknown",
+        }
+    }
+
+    fn print(&self) {
+        println!("Service state: {}", self.state_label());
+        println!("Manager: {}", self.manager);
+        println!("Unit: {}", self.unit.display());
+        if !self.detail.trim().is_empty() {
+            println!("Detail: {}", self.detail.trim());
+        }
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.state == ServiceState::Running {
+            return Ok(());
+        }
+        bail!("service is {} ({})", self.state_label(), self.detail.trim())
+    }
+}
+
+fn selected_config_dir(config: &Config) -> Result<&Path> {
+    config
+        .config_path
+        .parent()
+        .context("configured service config path must have a parent directory")
+}
+
 /// Supported init systems for service management
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum InitSystem {
@@ -151,8 +201,8 @@ fn start_linux(init_system: InitSystem) -> Result<()> {
 fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     if cfg!(target_os = "macos") {
         let plist = macos_service_file()?;
-        let _ = run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL));
-        let _ = run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&plist));
+        run_checked(Command::new("launchctl").arg("stop").arg(SERVICE_LABEL))?;
+        run_checked(Command::new("launchctl").arg("unload").arg("-w").arg(&plist))?;
         println!("✅ Service stopped");
         Ok(())
     } else if cfg!(target_os = "linux") {
@@ -161,7 +211,7 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
     } else if cfg!(target_os = "windows") {
         let _ = config;
         let task_name = windows_task_name();
-        let _ = run_checked(Command::new("schtasks").args(["/End", "/TN", task_name]));
+        run_checked(Command::new("schtasks").args(["/End", "/TN", task_name]))?;
         println!("✅ Service stopped");
         Ok(())
     } else {
@@ -173,10 +223,10 @@ fn stop(config: &Config, init_system: InitSystem) -> Result<()> {
 fn stop_linux(init_system: InitSystem) -> Result<()> {
     match init_system {
         InitSystem::Systemd => {
-            let _ = run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]));
+            run_checked(Command::new("systemctl").args(["--user", "stop", "prx.service"]))?;
         }
         InitSystem::Openrc => {
-            let _ = run_checked(Command::new("rc-service").args(["prx", "stop"]));
+            run_checked(Command::new("rc-service").args(["prx", "stop"]))?;
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
@@ -223,63 +273,116 @@ fn restart_linux(init_system: InitSystem) -> Result<()> {
 }
 
 fn status(config: &Config, init_system: InitSystem) -> Result<()> {
+    let report = query_status(config, init_system)?;
+    report.print();
+    report.ensure_running()
+}
+
+pub fn query_status(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
     if cfg!(target_os = "macos") {
-        let out = run_capture(Command::new("launchctl").arg("list"))?;
-        let running = out.lines().any(|line| line.contains(SERVICE_LABEL));
-        println!(
-            "Service: {}",
-            if running {
-                "✅ running/loaded"
+        let unit = macos_service_file()?;
+        let output = run_capture_status(Command::new("launchctl").arg("list"))?;
+        if !output.success {
+            bail!("launchctl list failed: {}", output.detail());
+        }
+        let running = output.stdout.lines().any(|line| line.contains(SERVICE_LABEL));
+        return Ok(ServiceStatus {
+            state: if running {
+                ServiceState::Running
+            } else if unit.is_file() {
+                ServiceState::Stopped
             } else {
-                "❌ not loaded"
-            }
-        );
-        println!("Unit: {}", macos_service_file()?.display());
-        return Ok(());
+                ServiceState::NotInstalled
+            },
+            manager: "launchd",
+            unit,
+            detail: output.detail(),
+        });
     }
 
     if cfg!(target_os = "linux") {
-        let resolved = init_system.resolve()?;
-        return status_linux(config, resolved);
+        return query_status_linux(config, init_system.resolve()?);
     }
 
     if cfg!(target_os = "windows") {
-        let _ = config;
-        let task_name = windows_task_name();
-        let out = run_capture(Command::new("schtasks").args(["/Query", "/TN", task_name, "/FO", "LIST"]));
-        match out {
-            Ok(text) => {
-                let running = text.contains("Running");
-                println!("Service: {}", if running { "✅ running" } else { "❌ not running" });
-                println!("Task: {}", task_name);
-            }
-            Err(_) => {
-                println!("Service: ❌ not installed");
-            }
-        }
-        return Ok(());
+        let output =
+            run_capture_status(Command::new("schtasks").args(["/Query", "/TN", windows_task_name(), "/FO", "LIST"]))?;
+        let detail = output.detail();
+        let state = if !output.success {
+            ServiceState::NotInstalled
+        } else if output.stdout.contains("Running") {
+            ServiceState::Running
+        } else {
+            ServiceState::Stopped
+        };
+        return Ok(ServiceStatus {
+            state,
+            manager: "windows-task-scheduler",
+            unit: PathBuf::from(windows_task_name()),
+            detail,
+        });
     }
 
     anyhow::bail!("Service management is supported on macOS and Linux only")
 }
 
-fn status_linux(config: &Config, init_system: InitSystem) -> Result<()> {
+fn query_status_linux(config: &Config, init_system: InitSystem) -> Result<ServiceStatus> {
     match init_system {
         InitSystem::Systemd => {
-            let out = run_capture(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))
-                .unwrap_or_else(|_| "unknown".into());
-            println!("Service state: {}", out.trim());
-            println!("Unit: {}", linux_service_file(config)?.display());
+            let unit = linux_service_file(config)?;
+            let output = run_capture_status(Command::new("systemctl").args(["--user", "is-active", "prx.service"]))?;
+            let state = classify_systemd_state(output.success, &output.stdout, unit.is_file());
+            Ok(ServiceStatus {
+                state,
+                manager: "systemd-user",
+                unit,
+                detail: output.detail(),
+            })
         }
         InitSystem::Openrc => {
-            let out =
-                run_capture(Command::new("rc-service").args(["prx", "status"])).unwrap_or_else(|_| "unknown".into());
-            println!("Service state: {}", out.trim());
-            println!("Unit: /etc/init.d/prx");
+            let unit = PathBuf::from("/etc/init.d/prx");
+            if !unit.is_file() {
+                return Ok(ServiceStatus {
+                    state: ServiceState::NotInstalled,
+                    manager: "openrc",
+                    unit,
+                    detail: "init script is missing".to_string(),
+                });
+            }
+            let output = run_capture_status(Command::new("rc-service").args(["prx", "status"]))?;
+            let normalized = output.detail().to_ascii_lowercase();
+            let state = if output.success && normalized.contains("started") {
+                ServiceState::Running
+            } else if normalized.contains("stopped") || normalized.contains("crashed") {
+                ServiceState::Stopped
+            } else {
+                ServiceState::Unknown
+            };
+            Ok(ServiceStatus {
+                state,
+                manager: "openrc",
+                unit,
+                detail: output.detail(),
+            })
         }
         InitSystem::Auto => anyhow::bail!("InitSystem::Auto should be resolved before this point"),
     }
-    Ok(())
+}
+
+fn classify_systemd_state(success: bool, stdout: &str, unit_exists: bool) -> ServiceState {
+    let normalized = stdout.trim().to_ascii_lowercase();
+    if success && normalized == "active" {
+        ServiceState::Running
+    } else if !unit_exists || normalized == "unknown" || normalized == "not-found" {
+        ServiceState::NotInstalled
+    } else if matches!(
+        normalized.as_str(),
+        "inactive" | "failed" | "activating" | "deactivating"
+    ) {
+        ServiceState::Stopped
+    } else {
+        ServiceState::Unknown
+    }
 }
 
 fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -301,7 +404,7 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
 
     if cfg!(target_os = "windows") {
         let task_name = windows_task_name();
-        let _ = run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]));
+        run_checked(Command::new("schtasks").args(["/Delete", "/TN", task_name, "/F"]))?;
         // Remove the wrapper script
         let wrapper = config
             .config_path
@@ -310,7 +413,7 @@ fn uninstall(config: &Config, init_system: InitSystem) -> Result<()> {
             .join("logs")
             .join("prx-daemon.cmd");
         if wrapper.exists() {
-            fs::remove_file(&wrapper).ok();
+            fs::remove_file(&wrapper).with_context(|| format!("Failed to remove {}", wrapper.display()))?;
         }
         println!("✅ Service uninstalled");
         return Ok(());
@@ -326,15 +429,13 @@ fn uninstall_linux(config: &Config, init_system: InitSystem) -> Result<()> {
             if file.exists() {
                 fs::remove_file(&file).with_context(|| format!("Failed to remove {}", file.display()))?;
             }
-            let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
+            run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
             println!("✅ Service uninstalled ({})", file.display());
         }
         InitSystem::Openrc => {
             let init_script = Path::new("/etc/init.d/prx");
             if init_script.exists() {
-                if let Err(err) = run_checked(Command::new("rc-update").args(["del", "prx", "default"])) {
-                    eprintln!("⚠️  Warning: Could not remove prx from OpenRC default runlevel: {err}");
-                }
+                run_checked(Command::new("rc-update").args(["del", "prx", "default"]))?;
                 fs::remove_file(init_script).with_context(|| format!("Failed to remove {}", init_script.display()))?;
             }
             println!("✅ Service uninstalled (/etc/init.d/prx)");
@@ -351,26 +452,34 @@ fn install_macos(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let logs_dir = config
-        .config_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("logs");
+    let config_dir = selected_config_dir(config)?;
+    let logs_dir = config_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
     let stdout = logs_dir.join("daemon.stdout.log");
     let stderr = logs_dir.join("daemon.stderr.log");
 
-    let plist = format!(
-        r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
-<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">
-<plist version=\"1.0\">
+    let plist = generate_launchd_plist(&exe, config_dir, &stdout, &stderr);
+
+    fs::write(&file, plist)?;
+    println!("✅ Installed launchd service: {}", file.display());
+    println!("   Start with: prx service start");
+    Ok(())
+}
+
+fn generate_launchd_plist(exe: &Path, config_dir: &Path, stdout: &Path, stderr: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
 <dict>
   <key>Label</key>
   <string>{label}</string>
   <key>ProgramArguments</key>
   <array>
     <string>{exe}</string>
+    <string>--config-dir</string>
+    <string>{config_dir}</string>
     <string>daemon</string>
   </array>
   <key>RunAtLoad</key>
@@ -386,14 +495,10 @@ fn install_macos(config: &Config) -> Result<()> {
 "#,
         label = SERVICE_LABEL,
         exe = xml_escape(&exe.display().to_string()),
+        config_dir = xml_escape(&config_dir.display().to_string()),
         stdout = xml_escape(&stdout.display().to_string()),
         stderr = xml_escape(&stderr.display().to_string())
-    );
-
-    fs::write(&file, plist)?;
-    println!("✅ Installed launchd service: {}", file.display());
-    println!("   Start with: prx service start");
-    Ok(())
+    )
 }
 
 fn install_linux(config: &Config, init_system: InitSystem) -> Result<()> {
@@ -411,21 +516,32 @@ fn install_linux_systemd(config: &Config) -> Result<()> {
     }
 
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let unit = generate_systemd_unit(&exe);
+    let unit = generate_systemd_unit(&exe, selected_config_dir(config)?);
 
     fs::write(&file, unit)?;
-    let _ = run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]));
-    let _ = run_checked(Command::new("systemctl").args(["--user", "enable", "prx.service"]));
+    run_checked(Command::new("systemctl").args(["--user", "daemon-reload"]))?;
+    run_checked(Command::new("systemctl").args(["--user", "enable", "prx.service"]))?;
     println!("✅ Installed systemd user service: {}", file.display());
     println!("   Start with: prx service start");
     Ok(())
 }
 
-fn generate_systemd_unit(exe: &Path) -> String {
+fn generate_systemd_unit(exe: &Path, config_dir: &Path) -> String {
     format!(
-        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=30s\nExecStart={} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
-        exe.display()
+        "[Unit]\nDescription=PRX daemon\nAfter=network.target\n\n[Service]\nType=notify\nNotifyAccess=main\nWatchdogSec=30s\nExecStart={} --config-dir {} daemon\nRestart=always\nRestartSec=3\n\n[Install]\nWantedBy=default.target\n",
+        systemd_quote_arg(exe),
+        systemd_quote_arg(config_dir),
     )
+}
+
+fn systemd_quote_arg(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%")
+        .replace('$', "$$");
+    format!("\"{escaped}\"")
 }
 
 /// Check if the current process is running as root (Unix only)
@@ -796,7 +912,7 @@ fn generate_openrc_script(exe_path: &Path, config_dir: &Path) -> String {
 name="prx"
 description="PRX daemon"
 
-command="{}"
+command={}
 command_args="--config-dir {} daemon"
 command_background="yes"
 command_user="prx:prx"
@@ -810,8 +926,8 @@ depend() {{
     after firewall
 }}
 "#,
-        exe_path.display(),
-        config_dir.display()
+        shell_single_quote(&exe_path.to_string_lossy()),
+        shell_single_quote(&config_dir.to_string_lossy())
     )
 }
 
@@ -933,11 +1049,8 @@ fn install_linux_openrc(config: &Config) -> Result<()> {
 
 fn install_windows(config: &Config) -> Result<()> {
     let exe = std::env::current_exe().context("Failed to resolve current executable")?;
-    let logs_dir = config
-        .config_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), PathBuf::from)
-        .join("logs");
+    let config_dir = selected_config_dir(config)?;
+    let logs_dir = config_dir.join("logs");
     fs::create_dir_all(&logs_dir)?;
 
     // Create a wrapper script that redirects output to log files
@@ -945,20 +1058,10 @@ fn install_windows(config: &Config) -> Result<()> {
     let stdout_log = logs_dir.join("daemon.stdout.log");
     let stderr_log = logs_dir.join("daemon.stderr.log");
 
-    let wrapper_content = format!(
-        "@echo off\r\n\"{}\" daemon >>\"{}\" 2>>\"{}\"",
-        exe.display(),
-        stdout_log.display(),
-        stderr_log.display()
-    );
+    let wrapper_content = generate_windows_wrapper(&exe, config_dir, &stdout_log, &stderr_log);
     fs::write(&wrapper, &wrapper_content)?;
 
     let task_name = windows_task_name();
-
-    // Remove any existing task first (ignore errors if it doesn't exist)
-    let _ = Command::new("schtasks")
-        .args(["/Delete", "/TN", task_name, "/F"])
-        .output();
 
     run_checked(Command::new("schtasks").args([
         "/Create",
@@ -980,6 +1083,16 @@ fn install_windows(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn generate_windows_wrapper(exe: &Path, config_dir: &Path, stdout_log: &Path, stderr_log: &Path) -> String {
+    format!(
+        "@echo off\r\n\"{}\" --config-dir \"{}\" daemon >>\"{}\" 2>>\"{}\"",
+        exe.display(),
+        config_dir.display(),
+        stdout_log.display(),
+        stderr_log.display()
+    )
+}
+
 fn macos_service_file() -> Result<PathBuf> {
     let home = directories::UserDirs::new()
         .map(|u| u.home_dir().to_path_buf())
@@ -999,21 +1112,76 @@ fn linux_service_file(config: &Config) -> Result<PathBuf> {
 }
 
 fn run_checked(command: &mut Command) -> Result<()> {
-    let output = command.output().context("Failed to spawn command")?;
+    let description = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("Failed to spawn command {description}"))?;
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("Command failed: {}", stderr.trim());
+        anyhow::bail!(
+            "Command failed ({description}, exit={}): stdout={} stderr={}",
+            output
+                .status
+                .code()
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            stdout.trim(),
+            stderr.trim()
+        );
     }
     Ok(())
 }
 
 fn run_capture(command: &mut Command) -> Result<String> {
-    let output = command.output().context("Failed to spawn command")?;
-    let mut text = String::from_utf8_lossy(&output.stdout).to_string();
-    if text.trim().is_empty() {
-        text = String::from_utf8_lossy(&output.stderr).to_string();
+    let output = run_capture_status(command)?;
+    if !output.success {
+        bail!(
+            "Command failed (exit={}): {}",
+            output
+                .exit_code
+                .map_or_else(|| "signal".to_string(), |code| code.to_string()),
+            output.detail()
+        );
     }
-    Ok(text)
+    Ok(output.detail())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapturedCommand {
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: String,
+    stderr: String,
+}
+
+impl CapturedCommand {
+    fn detail(&self) -> String {
+        let stdout = self.stdout.trim();
+        let stderr = self.stderr.trim();
+        match (stdout.is_empty(), stderr.is_empty()) {
+            (false, false) => format!("{stdout}; stderr: {stderr}"),
+            (false, true) => stdout.to_string(),
+            (true, false) => stderr.to_string(),
+            (true, true) => format!(
+                "exit={}",
+                self.exit_code
+                    .map_or_else(|| "signal".to_string(), |code| code.to_string())
+            ),
+        }
+    }
+}
+
+fn run_capture_status(command: &mut Command) -> Result<CapturedCommand> {
+    let description = format!("{command:?}");
+    let output = command
+        .output()
+        .with_context(|| format!("Failed to spawn command {description}"))?;
+    Ok(CapturedCommand {
+        success: output.status.success(),
+        exit_code: output.status.code(),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
 }
 
 fn xml_escape(raw: &str) -> String {
@@ -1067,12 +1235,88 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     #[test]
     fn systemd_unit_uses_notify_and_watchdog() {
-        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"));
+        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"), Path::new("/opt/prx-selected"));
         assert!(unit.contains("Type=notify"));
         assert!(unit.contains("NotifyAccess=main"));
         assert!(unit.contains("WatchdogSec=30s"));
-        assert!(unit.contains("ExecStart=/usr/local/bin/prx daemon"));
+        assert!(unit.contains("ExecStart=\"/usr/local/bin/prx\" --config-dir \"/opt/prx-selected\" daemon"));
         assert!(!unit.contains("Type=simple"));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn systemd_unit_preserves_selected_config_directory() {
+        let unit = generate_systemd_unit(Path::new("/usr/local/bin/prx"), Path::new("/opt/prx-selected"));
+        assert!(
+            unit.contains("--config-dir \"/opt/prx-selected\" daemon"),
+            "service definition must preserve the selected config directory"
+        );
+    }
+
+    #[test]
+    fn launchd_plist_is_valid_shape_and_preserves_config_directory() {
+        let plist = generate_launchd_plist(
+            Path::new("/Applications/PRX & Tools/prx"),
+            Path::new("/Users/example/PRX & Config"),
+            Path::new("/tmp/prx.stdout"),
+            Path::new("/tmp/prx.stderr"),
+        );
+        assert!(plist.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
+        assert!(
+            !plist.contains("\\\""),
+            "raw XML must not contain escaped quote literals"
+        );
+        assert!(plist.contains("<string>--config-dir</string>"));
+        assert!(plist.contains("<string>/Users/example/PRX &amp; Config</string>"));
+        assert!(plist.ends_with("</plist>\n"));
+    }
+
+    #[test]
+    fn windows_wrapper_preserves_selected_config_directory() {
+        let wrapper = generate_windows_wrapper(
+            Path::new(r"C:\Program Files\PRX\prx.exe"),
+            Path::new(r"C:\Users\example\PRX Config"),
+            Path::new(r"C:\logs\out.log"),
+            Path::new(r"C:\logs\err.log"),
+        );
+        assert!(wrapper.contains(r#"--config-dir "C:\Users\example\PRX Config" daemon"#));
+    }
+
+    #[test]
+    fn structured_status_requires_running_for_success() {
+        let stopped = ServiceStatus {
+            state: ServiceState::Stopped,
+            manager: "test",
+            unit: PathBuf::from("test.service"),
+            detail: "inactive".to_string(),
+        };
+        assert!(stopped.ensure_running().is_err());
+        let running = ServiceStatus {
+            state: ServiceState::Running,
+            ..stopped
+        };
+        assert!(running.ensure_running().is_ok());
+    }
+
+    #[test]
+    fn systemd_status_classification_is_typed() {
+        assert_eq!(classify_systemd_state(true, "active\n", true), ServiceState::Running);
+        assert_eq!(classify_systemd_state(false, "inactive\n", true), ServiceState::Stopped);
+        assert_eq!(
+            classify_systemd_state(false, "not-found\n", false),
+            ServiceState::NotInstalled
+        );
+        assert_eq!(classify_systemd_state(false, "garbled\n", true), ServiceState::Unknown);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn run_capture_rejects_non_zero_status() {
+        let result = run_capture(Command::new("sh").args(["-lc", "echo inactive; exit 3"]));
+        assert!(
+            result.is_err(),
+            "nonzero service status must not be reported as success"
+        );
     }
 
     #[test]
@@ -1134,8 +1378,8 @@ mod tests {
         assert!(script.starts_with("#!/sbin/openrc-run"));
         assert!(script.contains("name=\"prx\""));
         assert!(script.contains("description=\"PRX daemon\""));
-        assert!(script.contains("command=\"/usr/local/bin/prx\""));
-        assert!(script.contains("command_args=\"--config-dir /etc/prx daemon\""));
+        assert!(script.contains("command='/usr/local/bin/prx'"));
+        assert!(script.contains("command_args=\"--config-dir '/etc/prx' daemon\""));
         assert!(!script.contains("env ZEROCLAW_CONFIG_DIR"));
         assert!(!script.contains("env ZEROCLAW_WORKSPACE"));
         assert!(script.contains("command_background=\"yes\""));
