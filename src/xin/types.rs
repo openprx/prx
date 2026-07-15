@@ -345,6 +345,10 @@ pub struct XinStep {
     pub payload: String,
     /// Worker holding the current lease (format: `prx:{pid}:{host_hash}`).
     pub lease_owner: Option<String>,
+    /// Monotonic claim generation. Incremented on every successful claim and
+    /// unchanged by renewal, so a stale same-owner execution cannot commit.
+    #[serde(default)]
+    pub lease_epoch: u64,
     /// Lease expiry; once past, any worker may re-claim.
     pub lease_expires_at: Option<DateTime<Utc>>,
     /// Most recent heartbeat (liveness signal).

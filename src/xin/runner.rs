@@ -594,6 +594,8 @@ fn save_step_checkpoint(config: &Config, step: &XinStep, lease: &store::XinStepL
     let checkpoint = serde_json::json!({
         "sequence": step.sequence,
         "attempt": step.retry_count + 1,
+        "lease_owner": lease.worker_id,
+        "lease_epoch": lease.epoch,
         "succeeded": succeeded,
         "at": Utc::now().to_rfc3339(),
     })
@@ -1051,7 +1053,8 @@ mod tests {
     #[tokio::test]
     async fn execute_shell_task_blocks_medium_risk_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         let new = NewXinTask {
             owner_id: None,
             topic_id: None,
@@ -1081,7 +1084,8 @@ mod tests {
     #[tokio::test]
     async fn execute_shell_task_allows_medium_risk_with_persisted_runner_grant() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp);
+        let mut config = test_config(&tmp);
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         let command = "touch xin-persisted-approval";
 
         let new = NewXinTask {
@@ -1279,15 +1283,17 @@ mod tests {
         let registry = BuiltinRegistry::new();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let outcome = execute_step_with_heartbeat(&config, &security, &registry, &step, lease, 6).await;
-        assert!(matches!(
-            outcome,
-            StepExecutionOutcome::Authorized { success: true, .. }
-        ));
+        let completion_lease = match outcome {
+            StepExecutionOutcome::Authorized {
+                success: true, lease, ..
+            } => lease,
+            _ => panic!("heartbeat-managed step must retain lease authority"),
+        };
         // The step ran under a live lease (never marked stale during the run).
         let stale = store::mark_steps_stale(&config, Utc::now()).unwrap();
         assert!(stale.is_empty(), "running step must not be reaped: {stale:?}");
         // Completing the step transitions it out of running/claimed.
-        store::complete_step(&config, &step.id, "done").unwrap();
+        assert!(store::complete_step_with_lease(&config, &step.id, &completion_lease, "done").unwrap());
         assert_eq!(
             store::get_step(&config, &step.id).unwrap().status,
             StepStatus::Completed
@@ -1359,7 +1365,7 @@ mod tests {
             .unwrap()
             .expect("new lease claim");
         assert!(store::mark_step_running_with_lease(&config, &step_id, &new_lease).unwrap());
-        store::save_step_checkpoint(&config, &step_id, r#"{"owner":"new"}"#).unwrap();
+        assert!(store::save_step_checkpoint_with_lease(&config, &step_id, &new_lease, r#"{"owner":"new"}"#).unwrap());
 
         let outcome = execution.await.expect("lease-managed execution task");
         assert!(matches!(&outcome, StepExecutionOutcome::AuthorityLost));

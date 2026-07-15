@@ -582,7 +582,7 @@ const SELECT_GOAL_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id
      FROM xin_goals";
 
 const SELECT_STEP_COLUMNS: &str = "SELECT id, goal_id, sequence, name, description, status, execution_mode,
-            payload, lease_owner, lease_expires_at, last_heartbeat_at, checkpoint_json,
+            payload, lease_owner, lease_epoch, lease_expires_at, last_heartbeat_at, checkpoint_json,
             lease_ttl_secs, retry_count, max_retries, created_at, updated_at, started_at, completed_at,
             last_output, approval_grant_json
      FROM xin_steps";
@@ -782,11 +782,11 @@ const fn effective_lease_ttl(mode: &ExecutionMode, persisted_ttl: u64, ttl_secs:
 }
 
 /// Exact Xin lease generation. Reusing the same worker id after expiry creates
-/// a distinct token because the persisted expiry is part of every mutation
-/// fence.
+/// a distinct epoch; renewal extends expiry without changing that generation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct XinStepLease {
     pub(crate) worker_id: String,
+    pub(crate) epoch: u64,
     pub(crate) expires_at: DateTime<Utc>,
 }
 
@@ -829,8 +829,10 @@ pub(crate) fn claim_step_with_lease(
             .execute(
                 "UPDATE xin_steps
                  SET status = 'claimed', lease_owner = ?1, lease_expires_at = ?2,
+                     lease_epoch = lease_epoch + 1,
                      last_heartbeat_at = ?3, updated_at = ?3
                  WHERE id = ?4
+                   AND lease_epoch < 9223372036854775807
                    AND (
                      -- A free step (never started, or already reaped) is always claimable.
                      status IN ('pending', 'stale')
@@ -842,13 +844,21 @@ pub(crate) fn claim_step_with_lease(
             )
             .context("Failed to claim xin step")?;
 
-        if changed > 0 {
-            emit_step_event(conn, config, step_id, "xin.step.claimed", Some("claimed"))?;
+        if changed == 0 {
+            return Ok(None);
         }
-        Ok((changed > 0).then(|| XinStepLease {
+        let epoch = conn.query_row(
+            "SELECT lease_epoch FROM xin_steps WHERE id = ?1 AND lease_owner = ?2",
+            params![step_id, worker_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        let lease = XinStepLease {
             worker_id: worker_id.to_string(),
+            epoch: u64::try_from(epoch).unwrap_or(0),
             expires_at: expires,
-        }))
+        };
+        emit_step_event(conn, config, step_id, "xin.step.claimed", Some("claimed"), Some(&lease))?;
+        Ok(Some(lease))
     })
 }
 
@@ -868,18 +878,18 @@ pub(crate) fn mark_step_running_with_lease(config: &Config, step_id: &str, lease
                      started_at = COALESCE(started_at, ?1),
                      last_heartbeat_at = ?1,
                      updated_at = ?1
-                 WHERE id = ?2 AND lease_owner = ?3 AND lease_expires_at = ?4
+                 WHERE id = ?2 AND lease_owner = ?3 AND lease_epoch = ?4
                    AND status IN ('claimed', 'running') AND lease_expires_at >= ?1",
                 params![
                     now.to_rfc3339(),
                     step_id,
                     lease.worker_id,
-                    lease.expires_at.to_rfc3339()
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
                 ],
             )
             .context("Failed to mark xin step running")?;
         if changed > 0 {
-            emit_step_event(conn, config, step_id, "xin.step.running", Some("running"))?;
+            emit_step_event(conn, config, step_id, "xin.step.running", Some("running"), Some(lease))?;
         }
         Ok(changed)
     })?;
@@ -899,6 +909,7 @@ pub fn mark_step_running(config: &Config, step_id: &str, worker_id: &str) -> Res
         step_id,
         &XinStepLease {
             worker_id: worker_id.to_string(),
+            epoch: step.lease_epoch,
             expires_at,
         },
     )
@@ -912,8 +923,8 @@ pub fn renew_step_lease(config: &Config, step_id: &str, worker_id: &str, ttl_sec
     Ok(renew_step_lease_with_expiry(config, step_id, worker_id, ttl_secs)?.is_some())
 }
 
-/// Renew a lease and return the exact persisted expiry used for subsequent
-/// owner/expiry fences.
+/// Renew a lease and return the exact persisted expiry. The claim epoch stays
+/// unchanged and remains the mutation fence.
 #[cfg(test)]
 pub fn renew_step_lease_with_expiry(
     config: &Config,
@@ -932,6 +943,7 @@ pub fn renew_step_lease_with_expiry(
         step_id,
         &XinStepLease {
             worker_id: worker_id.to_string(),
+            epoch: step.lease_epoch,
             expires_at,
         },
         ttl_secs,
@@ -959,18 +971,19 @@ pub(crate) fn renew_step_lease_generation(
              SET lease_expires_at = ?1, last_heartbeat_at = ?2, updated_at = ?2
              WHERE id = ?3 AND lease_owner = ?4
                AND status IN ('claimed', 'running')
-               AND lease_expires_at = ?5 AND lease_expires_at >= ?2",
+               AND lease_epoch = ?5 AND lease_expires_at >= ?2",
                 params![
                     expires.to_rfc3339(),
                     now.to_rfc3339(),
                     step_id,
                     lease.worker_id,
-                    lease.expires_at.to_rfc3339()
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
                 ],
             )
             .context("Failed to renew xin step lease")?;
         Ok((changed > 0).then(|| XinStepLease {
             worker_id: lease.worker_id.clone(),
+            epoch: lease.epoch,
             expires_at: expires,
         }))
     })
@@ -987,37 +1000,18 @@ pub(crate) fn save_step_checkpoint_with_lease(
         let now = authoritative_now(conn)?;
         let changed = conn.execute(
             "UPDATE xin_steps SET checkpoint_json = ?1, updated_at = ?2
-             WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5
+             WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5
                AND lease_expires_at >= ?2 AND status IN ('claimed', 'running')",
             params![
                 checkpoint_json,
                 now.to_rfc3339(),
                 step_id,
                 lease.worker_id,
-                lease.expires_at.to_rfc3339()
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX)
             ],
         )?;
         Ok(changed > 0)
     })
-}
-
-#[cfg(test)]
-pub fn save_step_checkpoint_if_claim_current(
-    config: &Config,
-    step_id: &str,
-    worker_id: &str,
-    expected_expiry: DateTime<Utc>,
-    checkpoint_json: &str,
-) -> Result<bool> {
-    save_step_checkpoint_with_lease(
-        config,
-        step_id,
-        &XinStepLease {
-            worker_id: worker_id.to_string(),
-            expires_at: expected_expiry,
-        },
-        checkpoint_json,
-    )
 }
 
 /// Complete only the exact lease generation that performed the work.
@@ -1039,44 +1033,32 @@ pub(crate) fn complete_step_with_lease(
             "UPDATE xin_steps
              SET status = 'completed', completed_at = ?1, last_output = ?2,
                  lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
-             WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5
+             WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5
                AND lease_expires_at >= ?1 AND status IN ('claimed', 'running')",
             params![
                 now.to_rfc3339(),
                 bounded,
                 step_id,
                 lease.worker_id,
-                lease.expires_at.to_rfc3339()
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX)
             ],
         )?;
         if changed == 0 {
             return Ok(false);
         }
-        emit_step_event(conn, config, step_id, "xin.step.completed", Some("completed"))?;
+        emit_step_event(
+            conn,
+            config,
+            step_id,
+            "xin.step.completed",
+            Some("completed"),
+            Some(lease),
+        )?;
         if let Some(goal_id) = goal_id {
             recompute_goal_progress(conn, config, &goal_id, now)?;
         }
         Ok(true)
     })
-}
-
-#[cfg(test)]
-pub fn complete_step_if_claim_current(
-    config: &Config,
-    step_id: &str,
-    worker_id: &str,
-    expected_expiry: DateTime<Utc>,
-    output: &str,
-) -> Result<bool> {
-    complete_step_with_lease(
-        config,
-        step_id,
-        &XinStepLease {
-            worker_id: worker_id.to_string(),
-            expires_at: expected_expiry,
-        },
-        output,
-    )
 }
 
 /// Fail/retry only the exact lease generation that performed the work.
@@ -1087,12 +1069,12 @@ pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinSt
         let row: Option<(String, i64, i64)> = conn
             .query_row(
                 "SELECT goal_id, retry_count, max_retries FROM xin_steps
-                 WHERE id = ?1 AND lease_owner = ?2 AND lease_expires_at = ?3
+                 WHERE id = ?1 AND lease_owner = ?2 AND lease_epoch = ?3
                    AND lease_expires_at >= ?4 AND status IN ('claimed', 'running')",
                 params![
                     step_id,
                     lease.worker_id,
-                    lease.expires_at.to_rfc3339(),
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX),
                     now.to_rfc3339()
                 ],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
@@ -1106,31 +1088,31 @@ pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinSt
                 "UPDATE xin_steps
                  SET status = 'pending', retry_count = retry_count + 1, last_output = ?1,
                      lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5",
+                 WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5",
                 params![
                     bounded,
                     now.to_rfc3339(),
                     step_id,
                     lease.worker_id,
-                    lease.expires_at.to_rfc3339()
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
                 ],
             )?;
-            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"))?;
+            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), Some(lease))?;
         } else {
             conn.execute(
                 "UPDATE xin_steps
                  SET status = 'failed', retry_count = retry_count + 1, last_output = ?1,
                      completed_at = ?2, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?2
-                 WHERE id = ?3 AND lease_owner = ?4 AND lease_expires_at = ?5",
+                 WHERE id = ?3 AND lease_owner = ?4 AND lease_epoch = ?5",
                 params![
                     bounded,
                     now.to_rfc3339(),
                     step_id,
                     lease.worker_id,
-                    lease.expires_at.to_rfc3339()
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX)
                 ],
             )?;
-            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"))?;
+            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"), Some(lease))?;
             conn.execute(
                 "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
                 params![now.to_rfc3339(), goal_id],
@@ -1140,47 +1122,9 @@ pub(crate) fn fail_step_with_lease(config: &Config, step_id: &str, lease: &XinSt
     })
 }
 
-#[cfg(test)]
-#[allow(dead_code)]
-pub fn fail_step_if_claim_current(
-    config: &Config,
-    step_id: &str,
-    worker_id: &str,
-    expected_expiry: DateTime<Utc>,
-    output: &str,
-) -> Result<bool> {
-    fail_step_with_lease(
-        config,
-        step_id,
-        &XinStepLease {
-            worker_id: worker_id.to_string(),
-            expires_at: expected_expiry,
-        },
-        output,
-    )
-}
-
-/// Persist a checkpoint without changing status — replayed on crash recovery.
-#[allow(dead_code)]
-pub fn save_step_checkpoint(config: &Config, step_id: &str, checkpoint_json: &str) -> Result<()> {
-    let now = Utc::now();
-    with_connection(config, |conn| {
-        let changed = conn
-            .execute(
-                "UPDATE xin_steps SET checkpoint_json = ?1, updated_at = ?2 WHERE id = ?3",
-                params![checkpoint_json, now.to_rfc3339(), step_id],
-            )
-            .context("Failed to save xin step checkpoint")?;
-        if changed == 0 {
-            tracing::warn!(step_id = %step_id, "save_step_checkpoint: no rows affected");
-        }
-        Ok(())
-    })
-}
-
 /// Mark a step completed, recompute the goal's progress and roll the goal up to
 /// `completed` once every step is done.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -1203,7 +1147,7 @@ pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()>
             tracing::warn!(step_id = %step_id, "complete_step: no rows affected");
             return Ok(());
         }
-        emit_step_event(conn, config, step_id, "xin.step.completed", Some("completed"))?;
+        emit_step_event(conn, config, step_id, "xin.step.completed", Some("completed"), None)?;
         if let Some(goal_id) = goal_id {
             recompute_goal_progress(conn, config, &goal_id, now)?;
         }
@@ -1214,7 +1158,7 @@ pub fn complete_step(config: &Config, step_id: &str, output: &str) -> Result<()>
 /// Mark a step failed. If retries remain the step is reset to `pending` (lease
 /// released) for re-execution; otherwise it is terminally `failed` and the goal
 /// rolls up to `failed`.
-#[allow(dead_code)]
+#[cfg(test)]
 pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -1241,7 +1185,7 @@ pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
                 params![bounded, now.to_rfc3339(), step_id],
             )
             .context("Failed to reset xin step for retry")?;
-            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"))?;
+            emit_step_event(conn, config, step_id, "xin.step.retry", Some("pending"), None)?;
         } else {
             conn.execute(
                 "UPDATE xin_steps
@@ -1251,7 +1195,7 @@ pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
                 params![bounded, now.to_rfc3339(), step_id],
             )
             .context("Failed to fail xin step")?;
-            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"))?;
+            emit_step_event(conn, config, step_id, "xin.step.failed", Some("failed"), None)?;
             conn.execute(
                 "UPDATE xin_goals SET status = 'failed', updated_at = ?1 WHERE id = ?2",
                 params![now.to_rfc3339(), goal_id],
@@ -1288,7 +1232,7 @@ pub fn mark_steps_stale(config: &Config, now: DateTime<Utc>) -> Result<Vec<Strin
         )
         .context("Failed to mark xin steps stale")?;
         for id in &ids {
-            emit_step_event(conn, config, id, "xin.step.stale", Some("stale"))?;
+            emit_step_event(conn, config, id, "xin.step.stale", Some("stale"), None)?;
         }
         Ok(ids)
     })
@@ -1392,6 +1336,7 @@ fn emit_step_event(
     step_id: &str,
     event_type: &str,
     status: Option<&str>,
+    lease: Option<&XinStepLease>,
 ) -> Result<()> {
     let goal_id: Option<String> = conn
         .query_row("SELECT goal_id FROM xin_steps WHERE id = ?1", params![step_id], |row| {
@@ -1404,6 +1349,16 @@ fn emit_step_event(
     let Some(lineage) = load_goal_lineage(conn, &goal_id)? else {
         return Ok(());
     };
+    let payload = lease.map_or_else(
+        || serde_json::json!({ "step_id": step_id }),
+        |lease| {
+            serde_json::json!({
+                "step_id": step_id,
+                "lease_owner": lease.worker_id,
+                "lease_epoch": lease.epoch,
+            })
+        },
+    );
     insert_task_event(
         conn,
         &workspace_id(config),
@@ -1411,7 +1366,7 @@ fn emit_step_event(
         lineage,
         event_type,
         status,
-        Some(serde_json::json!({ "step_id": step_id }).to_string()).as_deref(),
+        Some(payload.to_string()).as_deref(),
     )
 }
 
@@ -1481,12 +1436,12 @@ fn map_goal_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinGoal> {
 }
 
 fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinStep> {
-    let created_at_raw: String = row.get(15)?;
-    let updated_at_raw: String = row.get(16)?;
-    let lease_raw: Option<String> = row.get(9)?;
-    let hb_raw: Option<String> = row.get(10)?;
-    let started_raw: Option<String> = row.get(17)?;
-    let completed_raw: Option<String> = row.get(18)?;
+    let created_at_raw: String = row.get(16)?;
+    let updated_at_raw: String = row.get(17)?;
+    let lease_raw: Option<String> = row.get(10)?;
+    let hb_raw: Option<String> = row.get(11)?;
+    let started_raw: Option<String> = row.get(18)?;
+    let completed_raw: Option<String> = row.get(19)?;
     Ok(XinStep {
         id: row.get(0)?,
         goal_id: row.get(1)?,
@@ -1497,6 +1452,7 @@ fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinStep> {
         execution_mode: ExecutionMode::from_str_lossy(&row.get::<_, String>(6)?),
         payload: row.get(7)?,
         lease_owner: row.get(8)?,
+        lease_epoch: u64::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
         lease_expires_at: match lease_raw {
             Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
             None => None,
@@ -1505,10 +1461,10 @@ fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinStep> {
             Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
             None => None,
         },
-        checkpoint_json: row.get(11)?,
-        lease_ttl_secs: u64::try_from(row.get::<_, i64>(12)?).unwrap_or(0),
-        retry_count: u32::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
-        max_retries: u32::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+        checkpoint_json: row.get(12)?,
+        lease_ttl_secs: u64::try_from(row.get::<_, i64>(13)?).unwrap_or(0),
+        retry_count: u32::try_from(row.get::<_, i64>(14)?).unwrap_or(0),
+        max_retries: u32::try_from(row.get::<_, i64>(15)?).unwrap_or(0),
         created_at: parse_rfc3339(&created_at_raw).map_err(sql_err)?,
         updated_at: parse_rfc3339(&updated_at_raw).map_err(sql_err)?,
         started_at: match started_raw {
@@ -1519,8 +1475,8 @@ fn map_step_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinStep> {
             Some(raw) => Some(parse_rfc3339(&raw).map_err(sql_err)?),
             None => None,
         },
-        last_output: row.get(19)?,
-        approval_grant_json: row.get(20)?,
+        last_output: row.get(20)?,
+        approval_grant_json: row.get(21)?,
     })
 }
 
@@ -1869,6 +1825,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             execution_mode       TEXT NOT NULL DEFAULT 'agent_session',
             payload              TEXT NOT NULL DEFAULT '',
             lease_owner          TEXT,
+            lease_epoch          INTEGER NOT NULL DEFAULT 0,
             lease_expires_at     TEXT,
             last_heartbeat_at    TEXT,
             checkpoint_json      TEXT,
@@ -1897,6 +1854,7 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
     // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
     add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "xin_steps", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_xin_tasks_owner ON xin_tasks(owner_id, status, next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_topic ON xin_tasks(topic_id, status, next_run_at);
@@ -2121,6 +2079,14 @@ mod tests {
             assert!(
                 event_names.iter().any(|existing| existing == "source_message_event_id"),
                 "missing xin_task_events.source_message_event_id"
+            );
+            let mut step_stmt = conn.prepare("PRAGMA table_info(xin_steps)")?;
+            let step_names = step_stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert!(
+                step_names.iter().any(|existing| existing == "lease_epoch"),
+                "missing xin_steps.lease_epoch"
             );
             Ok(())
         })
@@ -2445,9 +2411,15 @@ mod tests {
         assert_eq!(steps[0].sequence, 1);
         assert_eq!(steps[1].sequence, 2);
         assert_eq!(steps[0].status, StepStatus::Pending);
+        assert_eq!(steps[0].lease_epoch, 0);
 
         let one = get_step(&config, &steps[0].id).unwrap();
         assert_eq!(one.goal_id, goal.id);
+
+        let mut legacy_json = serde_json::to_value(&one).unwrap();
+        legacy_json.as_object_mut().unwrap().remove("lease_epoch");
+        let legacy: XinStep = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(legacy.lease_epoch, 0, "pre-epoch serialized steps must remain readable");
     }
 
     #[test]
@@ -2537,55 +2509,67 @@ mod tests {
         let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
         let step = list_steps(&config, &goal.id).unwrap().remove(0);
 
-        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
-        let before = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+        let lease = claim_step_with_lease(&config, &step.id, "prx:1:aaaa", 60)
+            .unwrap()
+            .expect("claim");
 
-        // Owner renews successfully and pushes the expiry forward.
-        assert!(renew_step_lease(&config, &step.id, "prx:1:aaaa", 120).unwrap());
-        let after = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
-        assert!(after >= before);
+        // Owner renews successfully and pushes the expiry forward without
+        // changing the claim generation.
+        let renewed = renew_step_lease_generation(&config, &step.id, &lease, 120)
+            .unwrap()
+            .expect("renew");
+        assert!(renewed.expires_at >= lease.expires_at);
+        assert_eq!(renewed.epoch, lease.epoch);
 
         // A different owner cannot renew.
         assert!(!renew_step_lease(&config, &step.id, "prx:2:bbbb", 120).unwrap());
     }
 
     #[test]
-    fn old_expiry_fence_rejects_same_worker_reclaim_generation() {
+    fn old_epoch_fence_rejects_same_worker_reclaim_generation() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
         let step = list_steps(&config, &goal.id).unwrap().remove(0);
         let worker = "prx:1:same";
-        assert!(claim_step(&config, &step.id, worker, 60).unwrap());
-        assert!(mark_step_running(&config, &step.id, worker).unwrap());
-        let old_expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
+        let old_lease = claim_step_with_lease(&config, &step.id, worker, 60)
+            .unwrap()
+            .expect("old claim");
+        assert_eq!(old_lease.epoch, 1);
+        assert!(mark_step_running_with_lease(&config, &step.id, &old_lease).unwrap());
 
-        let future = old_expiry + chrono::Duration::seconds(1);
+        let future = old_lease.expires_at + chrono::Duration::seconds(1);
         assert_eq!(mark_steps_stale(&config, future).unwrap(), vec![step.id.clone()]);
-        assert!(claim_step(&config, &step.id, worker, 120).unwrap());
-        assert!(mark_step_running(&config, &step.id, worker).unwrap());
-        let new_expiry = get_step(&config, &step.id).unwrap().lease_expires_at.unwrap();
-        assert_ne!(old_expiry, new_expiry);
-        save_step_checkpoint(&config, &step.id, r#"{"owner":"new-generation"}"#).unwrap();
+        let new_lease = claim_step_with_lease(&config, &step.id, worker, 120)
+            .unwrap()
+            .expect("new claim");
+        assert!(mark_step_running_with_lease(&config, &step.id, &new_lease).unwrap());
+        assert_eq!(new_lease.epoch, old_lease.epoch + 1);
+        assert!(
+            save_step_checkpoint_with_lease(&config, &step.id, &new_lease, r#"{"owner":"new-generation"}"#,).unwrap()
+        );
 
         assert!(
-            !save_step_checkpoint_if_claim_current(
-                &config,
-                &step.id,
-                worker,
-                old_expiry,
-                r#"{"owner":"old-generation"}"#,
-            )
-            .unwrap()
+            !save_step_checkpoint_with_lease(&config, &step.id, &old_lease, r#"{"owner":"old-generation"}"#,).unwrap()
         );
-        assert!(!complete_step_if_claim_current(&config, &step.id, worker, old_expiry, "old-output").unwrap());
+        assert!(!complete_step_with_lease(&config, &step.id, &old_lease, "old-output").unwrap());
+        assert!(!fail_step_with_lease(&config, &step.id, &old_lease, "old-failure").unwrap());
         let current = get_step(&config, &step.id).unwrap();
         assert_eq!(current.status, StepStatus::Running);
         assert_eq!(current.lease_owner.as_deref(), Some(worker));
-        assert_eq!(current.lease_expires_at, Some(new_expiry));
+        assert_eq!(current.lease_epoch, new_lease.epoch);
+        assert_eq!(current.lease_expires_at, Some(new_lease.expires_at));
         assert_eq!(
             current.checkpoint_json.as_deref(),
             Some(r#"{"owner":"new-generation"}"#)
+        );
+        let events = list_task_events(&config, &goal.id).unwrap();
+        assert!(
+            events.iter().all(|event| !matches!(
+                event.event_type.as_str(),
+                "xin.step.completed" | "xin.step.failed" | "xin.step.retry"
+            )),
+            "stale epoch must not append a terminal/retry event: {events:?}"
         );
     }
 
@@ -2605,7 +2589,7 @@ mod tests {
         let new_lease = claim_step_with_lease(&config, &step.id, worker, 120)
             .unwrap()
             .expect("same worker new generation claim");
-        assert_ne!(old_lease.expires_at, new_lease.expires_at);
+        assert_ne!(old_lease.epoch, new_lease.epoch);
 
         let marker = config.workspace_dir.join("old-generation-marker");
         if mark_step_running_with_lease(&config, &step.id, &old_lease).unwrap() {
@@ -2658,12 +2642,46 @@ mod tests {
         let config = test_config(&tmp);
         let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
         let step = list_steps(&config, &goal.id).unwrap().remove(0);
-        assert!(claim_step(&config, &step.id, "prx:1:aaaa", 60).unwrap());
+        let lease = claim_step_with_lease(&config, &step.id, "prx:1:aaaa", 60)
+            .unwrap()
+            .expect("claim");
 
-        save_step_checkpoint(&config, &step.id, r#"{"cursor":42}"#).unwrap();
+        assert!(save_step_checkpoint_with_lease(&config, &step.id, &lease, r#"{"cursor":42}"#).unwrap());
         let after = get_step(&config, &step.id).unwrap();
         assert_eq!(after.status, StepStatus::Claimed);
         assert_eq!(after.checkpoint_json.as_deref(), Some(r#"{"cursor":42}"#));
+    }
+
+    #[test]
+    fn terminal_event_carries_the_authorized_owner_and_epoch() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let lease = claim_step_with_lease(&config, &step.id, "prx:1:terminal", 60)
+            .unwrap()
+            .expect("claim");
+        assert!(mark_step_running_with_lease(&config, &step.id, &lease).unwrap());
+        assert!(complete_step_with_lease(&config, &step.id, &lease, "done").unwrap());
+
+        let terminal = list_task_events(&config, &goal.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.event_type == "xin.step.completed")
+            .expect("terminal step event");
+        let payload: serde_json::Value = serde_json::from_str(terminal.payload_json.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            payload.get("step_id").and_then(serde_json::Value::as_str),
+            Some(step.id.as_str())
+        );
+        assert_eq!(
+            payload.get("lease_owner").and_then(serde_json::Value::as_str),
+            Some("prx:1:terminal")
+        );
+        assert_eq!(
+            payload.get("lease_epoch").and_then(serde_json::Value::as_u64),
+            Some(lease.epoch)
+        );
     }
 
     #[test]
