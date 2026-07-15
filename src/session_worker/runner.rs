@@ -13,7 +13,7 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::ResourceRiskLevel;
-use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
+use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
 use crate::tools::sessions_spawn::{SPAWN_EXECUTION_CONTEXT, SpawnExecutionContext};
 use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
@@ -342,6 +342,19 @@ fn validate_worker_manifest_with_capability_env(manifest: &WorkerManifest, env_c
 
     ensure_clean_path(&manifest.workspace_dir, "workspace_dir")?;
     ensure_clean_path(&manifest.memory_db_path, "memory_db_path")?;
+    if !manifest.config_dir.is_absolute()
+        || manifest
+            .config_dir
+            .components()
+            .any(|component| matches!(component, Component::ParentDir))
+    {
+        anyhow::bail!("session-worker config_dir must be an absolute path without parent traversal");
+    }
+    if manifest.config_generation.len() != 64
+        || !manifest.config_generation.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        anyhow::bail!("session-worker config_generation must be a SHA-256 hex digest");
+    }
     if let Some(identity_dir) = manifest
         .identity_dir
         .as_deref()
@@ -398,6 +411,7 @@ fn validate_worker_cli_overrides(
     memory_db: Option<&str>,
     tools: Option<&[String]>,
     timeout: Option<u64>,
+    config_dir: Option<&str>,
 ) -> Result<()> {
     if let Some(task) = task {
         if task != manifest.task {
@@ -424,11 +438,42 @@ fn validate_worker_cli_overrides(
             anyhow::bail!("session-worker CLI timeout override must match sealed manifest");
         }
     }
+    let config_dir = config_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("session-worker requires the parent --config-dir")?;
+    if Path::new(config_dir) != manifest.config_dir {
+        anyhow::bail!("session-worker CLI config-dir must match sealed manifest");
+    }
     Ok(())
 }
 
 async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
-    let mut config = Config::load_or_init_with_config_dir(explicit_config_dir).await?;
+    let explicit_config_dir = explicit_config_dir
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .context("session-worker requires the parent --config-dir")?;
+    if Path::new(explicit_config_dir) != manifest.config_dir {
+        anyhow::bail!("session-worker config source does not match sealed manifest");
+    }
+
+    let generation_before = config_source_generation(&manifest.config_dir)?;
+    if generation_before != manifest.config_generation {
+        anyhow::bail!(
+            "session-worker config generation mismatch before load: expected {}, found {}",
+            manifest.config_generation,
+            generation_before
+        );
+    }
+    let mut config = Config::load_existing_read_only_with_config_dir(Some(explicit_config_dir)).await?;
+    let generation_after = config_source_generation(&manifest.config_dir)?;
+    if generation_after != manifest.config_generation {
+        anyhow::bail!(
+            "session-worker config generation changed during load: expected {}, found {}",
+            manifest.config_generation,
+            generation_after
+        );
+    }
     config.workspace_dir = manifest.workspace_dir.clone();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
@@ -689,14 +734,14 @@ async fn run_manifest_with_capability_env(
     run_validated_manifest(manifest, explicit_config_dir).await
 }
 
-async fn run_manifest(manifest: WorkerManifest) -> Result<WorkerResult> {
+async fn run_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
     let env_capability = std::env::var("OPENPRX_SESSION_WORKER_CAPABILITY").ok();
     // Validate up front, then scrub the capability material from the environment
     // so it cannot leak to any grandchild process or be re-read after boot.
     let validation = validate_worker_manifest_with_capability_env(&manifest, env_capability.as_deref());
     scrub_capability_env();
     validation?;
-    run_validated_manifest(manifest, None).await
+    run_validated_manifest(manifest, explicit_config_dir).await
 }
 
 /// Remove the capability-bearing environment variables after validation.
@@ -959,6 +1004,7 @@ pub async fn run_from_stdin(
     memory_db: Option<String>,
     tools: Option<String>,
     timeout: Option<u64>,
+    explicit_config_dir: Option<String>,
 ) -> Result<()> {
     let mut raw = String::new();
     std::io::stdin()
@@ -991,6 +1037,7 @@ pub async fn run_from_stdin(
         memory_db.as_deref(),
         parsed_tools.as_deref(),
         timeout,
+        explicit_config_dir.as_deref(),
     ) {
         let result = WorkerResult {
             success: false,
@@ -1002,7 +1049,7 @@ pub async fn run_from_stdin(
         return Ok(());
     }
 
-    let result = match run_manifest(manifest).await {
+    let result = match run_manifest(manifest, explicit_config_dir.as_deref()).await {
         Ok(result) => result,
         Err(error) => WorkerResult {
             success: false,
@@ -1028,6 +1075,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: workspace.join("config"),
+            config_generation: "0".repeat(64),
             workspace_dir: workspace.to_path_buf(),
             memory_db_path: workspace.join("memory").join("brain.db"),
             memory_workspace_id: Some(workspace.to_string_lossy().to_string()),
@@ -1200,6 +1249,19 @@ mod tests {
     }
 
     #[test]
+    fn tampered_config_generation_capability_rejected() {
+        let _g = CAP_ENV_GUARD.lock();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let expiry = cap_now() + 300;
+        let (mut manifest, cap, expiry) = seal(base_manifest(tmp.path(), ""), expiry);
+        manifest.config_generation = "f".repeat(64);
+        set_expiry_env(expiry);
+        let error = validate_worker_capability_with_env(&manifest, Some(&cap)).unwrap_err();
+        clear_expiry_env();
+        assert!(error.to_string().contains("signature mismatch"));
+    }
+
+    #[test]
     fn wrong_run_id_capability_rejected() {
         let _g = CAP_ENV_GUARD.lock();
         let tmp = tempfile::TempDir::new().unwrap();
@@ -1252,9 +1314,28 @@ mod tests {
             Some(&manifest.memory_db_path.to_string_lossy()),
             Some(&manifest.allowed_tools),
             Some(manifest.timeout_seconds),
+            Some(&manifest.config_dir.to_string_lossy()),
         )
         .unwrap_err();
         assert!(error.to_string().contains("task override"));
+    }
+
+    #[test]
+    fn worker_cli_config_dir_must_match_sealed_manifest() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let manifest = base_manifest(tmp.path(), "capability-a");
+
+        let error = validate_worker_cli_overrides(
+            &manifest,
+            Some(&manifest.task),
+            Some(&manifest.workspace_dir.to_string_lossy()),
+            Some(&manifest.memory_db_path.to_string_lossy()),
+            Some(&manifest.allowed_tools),
+            Some(manifest.timeout_seconds),
+            Some("/different/config"),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("config-dir"));
     }
 
     // The `CAP_ENV_GUARD` mutex intentionally stays locked across the awaited
@@ -1288,6 +1369,47 @@ mod tests {
         assert!(
             !memory_db.exists(),
             "invalid manifest must not initialize worker memory DB"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_missing_config_source_fails_without_initializing_defaults() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().join("missing-config");
+        let workspace = tmp.path().join("worker");
+        let config_dir_arg = config_dir.to_string_lossy().to_string();
+        let mut manifest = base_manifest(&workspace, "unused-for-direct-validation");
+        manifest.config_dir = config_dir.clone();
+
+        let result = run_validated_manifest(manifest, Some(&config_dir_arg)).await;
+
+        assert!(result.is_err());
+        assert!(
+            !config_dir.exists(),
+            "session-worker must not initialize a missing parent config source"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_rejects_changed_config_generation_before_workspace_side_effects() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_dir = tmp.path().join("config");
+        let workspace = tmp.path().join("worker");
+        std::fs::create_dir(&config_dir).unwrap();
+        std::fs::write(config_dir.join("config.toml"), "[modules]\nmemory = false\n").unwrap();
+        let config_dir_arg = config_dir.to_string_lossy().to_string();
+        let mut manifest = base_manifest(&workspace, "unused-for-direct-validation");
+        manifest.config_dir = config_dir;
+        manifest.config_generation = "0".repeat(64);
+
+        let error = run_validated_manifest(manifest, Some(&config_dir_arg))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("generation mismatch"));
+        assert!(
+            !workspace.exists(),
+            "generation mismatch must fail before worker side effects"
         );
     }
 
@@ -1329,6 +1451,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: parent.path().join("config"),
+            config_generation: "0".repeat(64),
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker.path().join("brain.db"),
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1397,6 +1521,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: parent.path().join("config"),
+            config_generation: "0".repeat(64),
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1524,6 +1650,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: parent.path().join("config"),
+            config_generation: "0".repeat(64),
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1597,6 +1725,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: std::path::PathBuf::from("/tmp/openprx"),
+            config_generation: "0".repeat(64),
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
@@ -1663,6 +1793,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: std::path::PathBuf::from("/tmp/openprx"),
+            config_generation: "0".repeat(64),
             workspace_dir: std::path::PathBuf::from("/tmp/worker"),
             memory_db_path: std::path::PathBuf::from("/tmp/parent/memory/brain.db"),
             memory_workspace_id: Some("/tmp/parent".to_string()),

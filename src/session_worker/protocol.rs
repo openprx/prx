@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 /// Manifest passed from parent `sessions_spawn` to `session-worker`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +13,12 @@ pub struct WorkerManifest {
     pub model: String,
     pub api_key: Option<String>,
     pub temperature: f64,
+    /// Canonical configuration directory selected by the parent process.
+    #[serde(default)]
+    pub config_dir: PathBuf,
+    /// SHA-256 generation of config.toml plus every config.d TOML fragment.
+    #[serde(default)]
+    pub config_generation: String,
     pub workspace_dir: PathBuf,
     pub memory_db_path: PathBuf,
     #[serde(default)]
@@ -55,6 +62,39 @@ pub struct WorkerManifest {
     pub compaction_config: Option<crate::config::AgentCompactionConfig>,
 }
 
+/// Compute a stable generation for the complete on-disk configuration source.
+///
+/// Both the parent and worker call this exact implementation. File names and
+/// lengths are framed before their bytes so distinct source layouts cannot hash
+/// as the same concatenated byte stream.
+pub fn config_source_generation(config_dir: &Path) -> anyhow::Result<String> {
+    let config_path = config_dir.join("config.toml");
+    if !config_path.is_file() {
+        anyhow::bail!("session-worker config source is missing: {}", config_path.display());
+    }
+
+    let mut source_paths = vec![config_path.clone()];
+    source_paths.extend(crate::config::files::list_config_fragment_paths(&config_path)?);
+    let mut hasher = Sha256::new();
+    for path in source_paths {
+        let relative = path.strip_prefix(config_dir).map_err(|error| {
+            anyhow::anyhow!(
+                "config source {} is outside {}: {error}",
+                path.display(),
+                config_dir.display()
+            )
+        })?;
+        let relative = relative.to_string_lossy();
+        let bytes = std::fs::read(&path)
+            .map_err(|error| anyhow::anyhow!("failed to read config source {}: {error}", path.display()))?;
+        hasher.update((relative.len() as u64).to_be_bytes());
+        hasher.update(relative.as_bytes());
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
 /// Result returned by `session-worker` on stdout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerResult {
@@ -79,6 +119,8 @@ mod tests {
             model: "anthropic/claude-sonnet-4.6".into(),
             api_key: None,
             temperature: 0.7,
+            config_dir: PathBuf::from("/tmp/openprx"),
+            config_generation: "a".repeat(64),
             workspace_dir: PathBuf::from("/tmp/ws"),
             memory_db_path: PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/parent-ws".into()),
@@ -116,6 +158,8 @@ mod tests {
         let parsed: WorkerManifest = serde_json::from_str(&json).expect("deserialize manifest");
 
         assert_eq!(parsed.run_id, "run-1");
+        assert_eq!(parsed.config_dir, PathBuf::from("/tmp/openprx"));
+        assert_eq!(parsed.config_generation, "a".repeat(64));
         assert_eq!(parsed.parent_capability.as_deref(), Some("capability"));
         assert_eq!(parsed.allowed_tools.len(), 2);
         assert_eq!(parsed.memory_workspace_id.as_deref(), Some("/tmp/parent-ws"));
@@ -156,5 +200,23 @@ mod tests {
 
         assert!(!parsed.success);
         assert_eq!(parsed.error.as_deref(), Some("timeout"));
+    }
+
+    #[test]
+    fn config_source_generation_tracks_main_and_fragments() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let config_dir = tmp.path();
+        std::fs::write(config_dir.join("config.toml"), "[modules]\nmemory = true\n").expect("write config.toml");
+        let fragments = config_dir.join("config.d");
+        std::fs::create_dir(&fragments).expect("create config.d");
+        std::fs::write(fragments.join("memory.toml"), "[memory]\nbackend = \"sqlite\"\n").expect("write fragment");
+
+        let first = config_source_generation(config_dir).expect("first generation");
+        let stable = config_source_generation(config_dir).expect("stable generation");
+        assert_eq!(first, stable);
+
+        std::fs::write(fragments.join("memory.toml"), "[memory]\nbackend = \"markdown\"\n").expect("rewrite fragment");
+        let changed = config_source_generation(config_dir).expect("changed generation");
+        assert_ne!(first, changed);
     }
 }

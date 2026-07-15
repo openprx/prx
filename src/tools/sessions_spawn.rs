@@ -23,7 +23,8 @@ use crate::router::CompactionResolver;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
-use crate::session_worker::protocol::{WorkerManifest, WorkerResult};
+use crate::session_worker::protocol::{WorkerManifest, WorkerResult, config_source_generation};
+use anyhow::Context as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::FutureExt;
@@ -538,6 +539,18 @@ pub struct SessionsSpawnTool {
 }
 
 impl SessionsSpawnTool {
+    fn resolved_process_config_source(&self) -> anyhow::Result<(PathBuf, String)> {
+        let configured_dir = self
+            .provider_runtime_options
+            .openprx_dir
+            .as_ref()
+            .context("sessions_spawn process mode requires the resolved parent config directory")?;
+        let config_dir = std::fs::canonicalize(configured_dir)
+            .with_context(|| format!("failed to resolve parent config directory {}", configured_dir.display()))?;
+        let generation = config_source_generation(&config_dir)?;
+        Ok((config_dir, generation))
+    }
+
     /// Create a new `SessionsSpawnTool` with the given channel and provider.
     ///
     /// Thin wrapper over [`Self::new_with_registry`] that mints a fresh, empty
@@ -1421,6 +1434,11 @@ impl Tool for SessionsSpawnTool {
             spawn_scope.as_ref(),
         );
         let run_lineage = spawn_lineage(&spawn_scope_for_event, parent_exec_ctx.as_ref(), spawn_scope.as_ref());
+        let process_config_source = if mode == "process" {
+            Some(self.resolved_process_config_source()?)
+        } else {
+            None
+        };
         record_spawn_request_event(
             memory_fabric.as_ref(),
             spawn_scope_for_event.clone(),
@@ -1434,6 +1452,8 @@ impl Tool for SessionsSpawnTool {
         .await;
 
         if mode == "process" {
+            let (process_config_dir, process_config_generation) =
+                process_config_source.ok_or_else(|| anyhow::anyhow!("process config source was not resolved"))?;
             let temperature = resolved_temperature;
             let history_arc: Arc<RwLock<Vec<HistoryEntry>>> = Arc::new(RwLock::new(Vec::new()));
             let process_control = ProcessRunControl::new();
@@ -1559,6 +1579,8 @@ impl Tool for SessionsSpawnTool {
                         process_agent_id.as_deref(),
                         &process_lineage,
                         &process_memory_strategy,
+                        &process_config_dir,
+                        &process_config_generation,
                         process_event_recording,
                         &process_compaction_config,
                         monitor_process_control.as_ref(),
@@ -3024,7 +3046,13 @@ fn copy_dir_recursive(source: &std::path::Path, destination: &std::path::Path) -
 
 fn build_session_worker_cli_args(manifest: &WorkerManifest) -> anyhow::Result<Vec<String>> {
     let tools_json = serde_json::to_string(&manifest.allowed_tools)?;
+    let config_dir = manifest
+        .config_dir
+        .to_str()
+        .context("session-worker config directory must be valid UTF-8")?;
     Ok(vec![
+        "--config-dir".to_string(),
+        config_dir.to_string(),
         "session-worker".to_string(),
         "--task".to_string(),
         manifest.task.clone(),
@@ -3072,6 +3100,8 @@ fn build_session_worker_manifest(
     normalized_memory_strategy: &str,
     shared_memory_db_path: std::path::PathBuf,
     worker_memory_db_path: std::path::PathBuf,
+    config_dir: std::path::PathBuf,
+    config_generation: &str,
     agent_id: Option<&str>,
     event_recording: MemoryEventRecording,
     allowed_tools: &[String],
@@ -3093,6 +3123,8 @@ fn build_session_worker_manifest(
         model: model.to_string(),
         api_key: api_key.map(str::to_string),
         temperature,
+        config_dir,
+        config_generation: config_generation.to_string(),
         workspace_dir: worker_workspace,
         memory_db_path,
         memory_workspace_id: Some(memory_workspace_id),
@@ -3622,6 +3654,8 @@ async fn run_sub_agent_process(
     agent_id: Option<&str>,
     lineage: &SpawnLineage,
     memory_strategy: &str,
+    config_dir: &std::path::Path,
+    config_generation: &str,
     event_recording: MemoryEventRecording,
     compaction_config: &AgentCompactionConfig,
     process_control: &ProcessRunControl,
@@ -3683,6 +3717,8 @@ async fn run_sub_agent_process(
         normalized_memory_strategy,
         shared_memory_db_path,
         worker_memory_db_path,
+        config_dir.to_path_buf(),
+        config_generation,
         agent_id,
         event_recording,
         allowed_tools,
@@ -4255,6 +4291,8 @@ mod tests {
             PROCESS_MEMORY_STRATEGY_SHARED,
             temp.path().join("memory").join("brain.db"),
             temp.path().join("worker").join("brain.db"),
+            temp.path().join("config"),
+            &"0".repeat(64),
             None,
             MemoryEventRecording::default(),
             &[],
@@ -5820,6 +5858,8 @@ mod tests {
             model: "model".to_string(),
             api_key: None,
             temperature: 0.7,
+            config_dir: std::path::PathBuf::from("/tmp/openprx"),
+            config_generation: "0".repeat(64),
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
@@ -5849,6 +5889,10 @@ mod tests {
         };
 
         let args = build_session_worker_cli_args(&manifest).unwrap();
+        assert!(
+            args.iter().any(|arg| arg == "--config-dir"),
+            "process worker must receive the resolved parent config directory"
+        );
         let task_index = args.iter().position(|arg| arg == "--task").unwrap();
         assert_eq!(args[task_index + 1], manifest.task);
     }

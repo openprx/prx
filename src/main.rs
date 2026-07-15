@@ -1192,6 +1192,7 @@ async fn async_main() -> Result<()> {
             memory_db.clone(),
             tools.clone(),
             *timeout,
+            cli.config_dir.clone(),
         )
         .await;
     }
