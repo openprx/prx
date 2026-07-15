@@ -7,6 +7,7 @@
 //! - Persist results and reschedule
 
 use crate::config::Config;
+use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
 use crate::security::policy::ApprovalGrant;
@@ -336,40 +337,29 @@ fn report_goal_progress(config: &Config) -> Result<()> {
 }
 
 /// Adopt orphaned, stale, non-recurring legacy `XinTask`s into goal/step
-/// records so they gain lease-based retry + crash recovery. The original task
-/// rows are left intact (zero-breakage). Returns the number adopted.
+/// records so they gain lease-based retry + crash recovery. Adoption and the
+/// legacy-task disable/link transition are atomic and idempotent.
 fn adopt_legacy_tasks(config: &Config) -> Result<usize> {
     let tasks = store::list_tasks(config)?;
     let mut adopted = 0usize;
     for task in tasks {
         // Only adopt stale, non-recurring tasks (the ones at risk of being
         // orphaned across a daemon restart). Recurring tasks stay legacy.
-        if task.recurring || task.status != crate::xin::types::TaskStatus::Stale {
+        if task.recurring || !task.enabled || task.status != crate::xin::types::TaskStatus::Stale {
             continue;
         }
-        let goal = match store::migrate_task_to_goal(config, &task.id) {
-            Ok(goal) => goal,
+        let adoption = match store::adopt_legacy_task(config, &task.id) {
+            Ok(Some(adoption)) => adoption,
+            Ok(None) => continue,
             Err(e) => {
                 tracing::warn!(target: "xin", task_id = %task.id, "failed to adopt legacy task: {e}");
                 continue;
             }
         };
-        // Append a terminal verification marker step so the adopted goal has a
-        // clean completion checkpoint after the migrated work runs.
-        let verify = crate::xin::types::NewXinStep {
-            sequence: 2,
-            name: format!("{}::verify", task.name),
-            description: Some("post-adoption completion marker".into()),
-            execution_mode: ExecutionMode::Internal,
-            payload: "xin:health_check".into(),
-            max_retries: 0,
-            approval_grant_json: None,
-            lease_ttl_secs: 0,
-        };
-        if let Err(e) = store::add_step(config, &goal.id, &verify) {
-            tracing::warn!(target: "xin", goal_id = %goal.id, "failed to append verify step: {e}");
+        if adoption.newly_adopted {
+            tracing::info!(target: "xin", task_id = %task.id, goal_id = %adoption.goal.id, "legacy task linked to goal");
+            adopted += 1;
         }
-        adopted += 1;
     }
     Ok(adopted)
 }
@@ -402,7 +392,7 @@ async fn advance_goal(
     // checkpoint state rather than the pre-claim snapshot.
     let step = store::get_step(config, &step.id)?;
 
-    let outcome = execute_step_with_heartbeat(config, security, registry, &step, lease, lease_ttl).await;
+    let outcome = execute_step_with_heartbeat(config, security, registry, &step, goal, lease, lease_ttl).await;
     persist_step_execution_outcome(config, &step, outcome);
     Ok(())
 }
@@ -462,6 +452,7 @@ async fn execute_step_with_heartbeat(
     security: &SecurityPolicy,
     registry: &BuiltinRegistry,
     step: &XinStep,
+    goal: &XinGoal,
     initial_lease: store::XinStepLease,
     lease_ttl_secs: u64,
 ) -> StepExecutionOutcome {
@@ -523,6 +514,7 @@ async fn execute_step_with_heartbeat(
         security,
         registry,
         step,
+        goal,
         Some(lease_lost.clone()),
     ));
     let result = tokio::select! {
@@ -567,10 +559,11 @@ async fn execute_step_inner(
     security: &SecurityPolicy,
     registry: &BuiltinRegistry,
     step: &XinStep,
+    goal: &XinGoal,
     cancellation: Option<CancellationToken>,
 ) -> (bool, String) {
     // Bridge the step into the existing XinTask-shaped execution backends.
-    let bridge = step_as_task(step);
+    let bridge = step_as_task(step, goal);
     match step.execution_mode {
         ExecutionMode::Internal => run_internal(config, registry, &bridge).await,
         ExecutionMode::AgentSession => run_agent(config, security, &bridge).await,
@@ -600,18 +593,18 @@ fn save_step_checkpoint(config: &Config, step: &XinStep, lease: &store::XinStepL
 }
 
 /// Adapt a `XinStep` into a `XinTask` view for the shared execution backends.
-fn step_as_task(step: &XinStep) -> XinTask {
+fn step_as_task(step: &XinStep, goal: &XinGoal) -> XinTask {
     XinTask {
         id: step.id.clone(),
-        owner_id: None,
-        topic_id: None,
-        parent_task_id: Some(step.goal_id.clone()),
-        source_message_event_id: None,
+        owner_id: goal.owner_id.clone(),
+        topic_id: goal.topic_id.clone(),
+        parent_task_id: goal.parent_task_id.clone().or_else(|| Some(step.goal_id.clone())),
+        source_message_event_id: goal.source_message_event_id.clone(),
         name: step.name.clone(),
         description: step.description.clone(),
-        kind: crate::xin::types::TaskKind::User,
+        kind: goal.kind.clone(),
         status: crate::xin::types::TaskStatus::Running,
-        priority: crate::xin::types::TaskPriority::Normal,
+        priority: goal.priority,
         execution_mode: step.execution_mode.clone(),
         payload: step.payload.clone(),
         recurring: false,
@@ -662,13 +655,14 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
 
     // Background xin runner: no cooperative shutdown signal of its own; the
     // runner drives this synchronously. See never_cancelled_shutdown docs.
-    match crate::agent::run(
+    match crate::agent::run_with_runtime_envelope(
         agent_config,
         Some(prompt),
         None,
         config.default_model.clone(),
         config.default_temperature,
         crate::runtime::shutdown::never_cancelled_shutdown(),
+        Some(xin_task_runtime_envelope(config, task)),
     )
     .await
     {
@@ -682,6 +676,27 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         ),
         Err(e) => (false, format!("agent task failed: {e}")),
     }
+}
+
+fn xin_task_runtime_envelope(config: &Config, task: &XinTask) -> RuntimeEnvelope {
+    let mut envelope = RuntimeEnvelope::agent(
+        config.workspace_dir.to_string_lossy().to_string(),
+        format!("xin:{}", task.id),
+    )
+    .with_channel("xin")
+    .with_sender("xin")
+    .with_recipient(format!("xin:goal:task:{}", task.id))
+    .with_task_id(task.id.clone());
+    if let Some(owner_id) = task.owner_id.as_deref() {
+        envelope = envelope.with_owner_id(owner_id);
+    }
+    if let Some(topic_id) = task.topic_id.as_deref() {
+        envelope = envelope.with_topic_id(topic_id);
+    }
+    if let Some(source_message_event_id) = task.source_message_event_id.as_deref() {
+        envelope = envelope.with_source_message_event_id(source_message_event_id);
+    }
+    envelope
 }
 
 async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
@@ -847,6 +862,46 @@ mod tests {
 
         let tasks = store::list_tasks(&config).unwrap();
         assert_eq!(tasks.len(), 5); // No duplicates
+    }
+
+    #[test]
+    fn startup_legacy_adoption_is_idempotent_and_disables_source_task() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let new = NewXinTask {
+            owner_id: Some("owner-a".to_string()),
+            topic_id: Some("topic-a".to_string()),
+            parent_task_id: Some("parent-a".to_string()),
+            source_message_event_id: Some("message-a".to_string()),
+            name: "legacy-stale".to_string(),
+            description: None,
+            kind: TaskKind::Agent,
+            priority: TaskPriority::High,
+            execution_mode: ExecutionMode::Internal,
+            payload: "xin:health_check".to_string(),
+            recurring: false,
+            interval_secs: 0,
+            max_failures: 1,
+            approval_grant_json: None,
+        };
+        let task = store::add_task(&config, &new).unwrap();
+        let db = rusqlite::Connection::open(config.workspace_dir.join("xin/tasks.db")).unwrap();
+        db.execute(
+            "UPDATE xin_tasks SET status = 'stale' WHERE id = ?1",
+            rusqlite::params![task.id],
+        )
+        .unwrap();
+        drop(db);
+
+        assert_eq!(adopt_legacy_tasks(&config).unwrap(), 1);
+        assert_eq!(adopt_legacy_tasks(&config).unwrap(), 0);
+        assert!(!store::get_task(&config, &task.id).unwrap().enabled);
+        let goals = store::list_goals(&config).unwrap();
+        assert_eq!(goals.len(), 1);
+        assert_eq!(goals[0].owner_id.as_deref(), Some("owner-a"));
+        assert_eq!(goals[0].topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(goals[0].source_message_event_id.as_deref(), Some("message-a"));
+        assert_eq!(store::list_steps(&config, &goals[0].id).unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -1181,6 +1236,54 @@ mod tests {
         assert_eq!(a.split(':').count(), 3, "{a}");
     }
 
+    #[test]
+    fn step_bridge_preserves_goal_runtime_lineage() {
+        use crate::xin::types::{NewXinGoal, NewXinStep};
+
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = store::add_goal(
+            &config,
+            &NewXinGoal {
+                owner_id: Some("owner-runtime".to_string()),
+                topic_id: Some("topic-runtime".to_string()),
+                parent_task_id: Some("parent-runtime".to_string()),
+                source_message_event_id: Some("source-runtime".to_string()),
+                name: "runtime-lineage".to_string(),
+                description: None,
+                kind: TaskKind::Agent,
+                priority: TaskPriority::Critical,
+                target_completion_at: None,
+                initial_steps: vec![NewXinStep {
+                    sequence: 1,
+                    name: "lineage-step".to_string(),
+                    description: None,
+                    execution_mode: ExecutionMode::Internal,
+                    payload: "xin:health_check".to_string(),
+                    max_retries: 1,
+                    approval_grant_json: None,
+                    lease_ttl_secs: 0,
+                }],
+            },
+        )
+        .unwrap();
+        let step = store::list_steps(&config, &goal.id).unwrap().remove(0);
+
+        let bridge = step_as_task(&step, &goal);
+        assert_eq!(bridge.owner_id.as_deref(), Some("owner-runtime"));
+        assert_eq!(bridge.topic_id.as_deref(), Some("topic-runtime"));
+        assert_eq!(bridge.parent_task_id.as_deref(), Some("parent-runtime"));
+        assert_eq!(bridge.source_message_event_id.as_deref(), Some("source-runtime"));
+        assert_eq!(bridge.kind, TaskKind::Agent);
+        assert_eq!(bridge.priority, TaskPriority::Critical);
+        let envelope = xin_task_runtime_envelope(&config, &bridge);
+        assert_eq!(envelope.owner_id.as_deref(), Some("owner-runtime"));
+        assert_eq!(envelope.topic_id.as_deref(), Some("topic-runtime"));
+        assert_eq!(envelope.task_id.as_deref(), Some(step.id.as_str()));
+        assert_eq!(envelope.source_message_event_id.as_deref(), Some("source-runtime"));
+        assert_eq!(envelope.channel.as_deref(), Some("xin"));
+    }
+
     #[tokio::test]
     async fn drive_goals_completes_a_two_step_internal_goal() {
         use crate::xin::types::{GoalStatus, NewXinGoal, NewXinStep};
@@ -1272,7 +1375,7 @@ mod tests {
         // alive for the duration so a concurrent stale sweep does not reap it.
         let registry = BuiltinRegistry::new();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let outcome = execute_step_with_heartbeat(&config, &security, &registry, &step, lease, 6).await;
+        let outcome = execute_step_with_heartbeat(&config, &security, &registry, &step, &goal, lease, 6).await;
         let completion_lease = match outcome {
             StepExecutionOutcome::Authorized {
                 success: true, lease, ..
@@ -1332,10 +1435,20 @@ mod tests {
 
         let execution_config = config.clone();
         let execution_step = step.clone();
+        let execution_goal = goal.clone();
         let execution = tokio::spawn(async move {
             let registry = BuiltinRegistry::new();
             let security = SecurityPolicy::from_config(&execution_config.autonomy, &execution_config.workspace_dir);
-            execute_step_with_heartbeat(&execution_config, &security, &registry, &execution_step, old_lease, 1).await
+            execute_step_with_heartbeat(
+                &execution_config,
+                &security,
+                &registry,
+                &execution_step,
+                &execution_goal,
+                old_lease,
+                1,
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(3), async {

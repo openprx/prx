@@ -6795,6 +6795,31 @@ pub async fn run(
     temperature: f64,
     shutdown: CancellationToken,
 ) -> Result<String> {
+    run_with_runtime_envelope(
+        config,
+        message,
+        provider_override,
+        model_override,
+        temperature,
+        shutdown,
+        None,
+    )
+    .await
+}
+
+/// Run the Agent entry with a caller-owned runtime envelope. This preserves
+/// owner/topic/task/source lineage for scheduler-driven single-shot turns while
+/// keeping the public CLI entrypoint's existing defaults.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn run_with_runtime_envelope(
+    config: Config,
+    message: Option<String>,
+    provider_override: Option<String>,
+    model_override: Option<String>,
+    temperature: f64,
+    shutdown: CancellationToken,
+    runtime_envelope_override: Option<RuntimeEnvelope>,
+) -> Result<String> {
     // ── Wire up subsystems via RuntimeBootstrap (D1 step 2) ──────
     // The CLI agent entry is always a full interactive/single-shot run with no
     // memory-only early-exit (unlike chat's `--list-sessions`), so it always
@@ -6974,8 +6999,11 @@ pub async fn run(
         // Keep the turn identity outside the raced future so a shutdown that
         // drops it can still close the shared terminal boundary as Cancelled.
         let turn_run_id = Uuid::new_v4().to_string();
-        let runtime_envelope = RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
-            .with_recipient("cli:local-user");
+        let runtime_envelope = resolve_agent_turn_envelope(
+            runtime_envelope_override.as_ref(),
+            memory_fabric.workspace_id(),
+            &turn_run_id,
+        );
         let fabric_scope = runtime_envelope
             .message_scope()
             .with_recipient(format!("{provider_name}/{model_name}"));
@@ -7716,6 +7744,20 @@ pub async fn run(
     Ok(final_output)
 }
 
+fn resolve_agent_turn_envelope(
+    override_envelope: Option<&RuntimeEnvelope>,
+    workspace_id: &str,
+    turn_run_id: &str,
+) -> RuntimeEnvelope {
+    let mut envelope = override_envelope
+        .cloned()
+        .unwrap_or_else(|| RuntimeEnvelope::agent(workspace_id.to_string(), turn_run_id.to_string()));
+    if envelope.recipient.is_none() {
+        envelope = envelope.with_recipient("cli:local-user");
+    }
+    envelope
+}
+
 /// Process a single message through the full agent (with tools and memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(config: Config, message: &str) -> Result<String> {
@@ -7995,6 +8037,31 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
+
+    #[test]
+    fn agent_turn_envelope_preserves_caller_scope_and_cli_defaults() {
+        let scoped = RuntimeEnvelope::agent("workspace-a", "xin:step-a")
+            .with_owner_id("owner-a")
+            .with_topic_id("topic-a")
+            .with_task_id("step-a")
+            .with_source_message_event_id("message-a")
+            .with_channel("xin")
+            .with_sender("xin");
+        let resolved = resolve_agent_turn_envelope(Some(&scoped), "ignored-workspace", "ignored-turn");
+        assert_eq!(resolved.owner_id.as_deref(), Some("owner-a"));
+        assert_eq!(resolved.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(resolved.task_id.as_deref(), Some("step-a"));
+        assert_eq!(resolved.source_message_event_id.as_deref(), Some("message-a"));
+        assert_eq!(resolved.channel.as_deref(), Some("xin"));
+        assert_eq!(resolved.recipient.as_deref(), Some("cli:local-user"));
+
+        let defaulted = resolve_agent_turn_envelope(None, "workspace-b", "turn-b");
+        assert_eq!(defaulted.workspace_id, "workspace-b");
+        assert_eq!(defaulted.run_id.as_deref(), Some("turn-b"));
+        assert_eq!(defaulted.channel.as_deref(), Some("cli"));
+        assert_eq!(defaulted.sender.as_deref(), Some("local-user"));
+        assert_eq!(defaulted.recipient.as_deref(), Some("cli:local-user"));
+    }
 
     #[test]
     fn grant_op_for_sessions_spawn_matches_tool_gate() {

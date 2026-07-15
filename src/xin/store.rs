@@ -727,14 +727,28 @@ const SELECT_STEP_COLUMNS: &str = "SELECT id, goal_id, sequence, name, descripti
      FROM xin_steps";
 
 /// Insert a goal and (optionally) its initial steps in a single transaction.
+#[allow(dead_code)] // Canonical crate API; adoption currently owns the production caller.
 pub fn add_goal(config: &Config, new: &NewXinGoal) -> Result<XinGoal> {
     let goal_id = Uuid::new_v4().to_string();
     let now = Utc::now();
-    let steps_total = u32::try_from(new.initial_steps.len()).unwrap_or(u32::MAX);
 
-    with_connection(config, |conn| {
-        conn.execute(
-            "INSERT INTO xin_goals (
+    with_immediate_connection(config, |conn| insert_goal_rows(conn, config, &goal_id, new, now))?;
+
+    get_goal(config, &goal_id)
+}
+
+/// Insert a goal, its initial steps, and its lifecycle event inside the
+/// caller's transaction.
+fn insert_goal_rows(
+    conn: &Connection,
+    config: &Config,
+    goal_id: &str,
+    new: &NewXinGoal,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let steps_total = u32::try_from(new.initial_steps.len()).unwrap_or(u32::MAX);
+    conn.execute(
+        "INSERT INTO xin_goals (
                 id, owner_id, topic_id, parent_task_id, source_message_event_id,
                 name, description, kind, status, priority, target_completion_at,
                 steps_completed, steps_total, created_at, updated_at, completed_at,
@@ -745,55 +759,52 @@ pub fn add_goal(config: &Config, new: &NewXinGoal) -> Result<XinGoal> {
                 0, ?11, ?12, ?13, NULL,
                 NULL, 1
              )",
-            params![
-                goal_id,
-                new.owner_id,
-                new.topic_id,
-                new.parent_task_id,
-                new.source_message_event_id,
-                new.name,
-                new.description,
-                new.kind.as_str(),
-                new.priority.as_i32(),
-                new.target_completion_at.map(|t| t.to_rfc3339()),
-                i64::from(steps_total),
-                now.to_rfc3339(),
-                now.to_rfc3339(),
-            ],
+        params![
+            goal_id,
+            new.owner_id,
+            new.topic_id,
+            new.parent_task_id,
+            new.source_message_event_id,
+            new.name,
+            new.description,
+            new.kind.as_str(),
+            new.priority.as_i32(),
+            new.target_completion_at.map(|t| t.to_rfc3339()),
+            i64::from(steps_total),
+            now.to_rfc3339(),
+            now.to_rfc3339(),
+        ],
+    )
+    .context("Failed to insert xin goal")?;
+
+    for step in &new.initial_steps {
+        insert_step_row(conn, goal_id, step, now)?;
+    }
+
+    insert_task_event(
+        conn,
+        &workspace_id(config),
+        goal_id,
+        TaskLineage {
+            owner_id: new.owner_id.clone(),
+            topic_id: new.topic_id.clone(),
+            parent_task_id: new.parent_task_id.clone(),
+            source_message_event_id: new.source_message_event_id.clone(),
+            status: Some("pending".to_string()),
+        },
+        "xin.goal.created",
+        Some("pending"),
+        Some(
+            serde_json::json!({
+                "name": new.name,
+                "kind": new.kind.as_str(),
+                "steps_total": steps_total,
+            })
+            .to_string(),
         )
-        .context("Failed to insert xin goal")?;
-
-        for step in &new.initial_steps {
-            insert_step_row(conn, &goal_id, step, now)?;
-        }
-
-        insert_task_event(
-            conn,
-            &workspace_id(config),
-            &goal_id,
-            TaskLineage {
-                owner_id: new.owner_id.clone(),
-                topic_id: new.topic_id.clone(),
-                parent_task_id: new.parent_task_id.clone(),
-                source_message_event_id: new.source_message_event_id.clone(),
-                status: Some("pending".to_string()),
-            },
-            "xin.goal.created",
-            Some("pending"),
-            Some(
-                serde_json::json!({
-                    "name": new.name,
-                    "kind": new.kind.as_str(),
-                    "steps_total": steps_total,
-                })
-                .to_string(),
-            )
-            .as_deref(),
-        )?;
-        Ok(())
-    })?;
-
-    get_goal(config, &goal_id)
+        .as_deref(),
+    )?;
+    Ok(())
 }
 
 /// Insert a step row inside an existing transaction/connection.
@@ -827,9 +838,10 @@ fn insert_step_row(conn: &Connection, goal_id: &str, step: &NewXinStep, now: Dat
 }
 
 /// Append a step to an existing goal and bump its `steps_total`.
+#[allow(dead_code)] // Canonical crate API for future interactive goal authoring.
 pub fn add_step(config: &Config, goal_id: &str, step: &NewXinStep) -> Result<XinStep> {
     let now = Utc::now();
-    let step_id = with_connection(config, |conn| {
+    let step_id = with_immediate_connection(config, |conn| {
         let id = insert_step_row(conn, goal_id, step, now)?;
         conn.execute(
             "UPDATE xin_goals SET steps_total = steps_total + 1, updated_at = ?1 WHERE id = ?2",
@@ -895,6 +907,12 @@ pub fn next_runnable_step(config: &Config, goal_id: &str) -> Result<Option<XinSt
     with_connection(config, |conn| {
         let sql = format!(
             "{SELECT_STEP_COLUMNS} WHERE goal_id = ?1 AND status IN ('pending', 'stale') \
+             AND NOT EXISTS (\
+                 SELECT 1 FROM xin_steps AS prior \
+                 WHERE prior.goal_id = xin_steps.goal_id \
+                   AND prior.sequence < xin_steps.sequence \
+                   AND prior.status != 'completed'\
+             ) \
              ORDER BY sequence ASC LIMIT 1"
         );
         let mut stmt = conn.prepare(&sql)?;
@@ -972,6 +990,12 @@ pub(crate) fn claim_step_with_lease(
                      last_heartbeat_at = ?3, updated_at = ?3
                  WHERE id = ?4
                    AND lease_epoch < 9223372036854775807
+                   AND NOT EXISTS (
+                     SELECT 1 FROM xin_steps AS prior
+                     WHERE prior.goal_id = xin_steps.goal_id
+                       AND prior.sequence < xin_steps.sequence
+                       AND prior.status != 'completed'
+                   )
                    AND (
                      -- A free step (never started, or already reaped) is always claimable.
                      status IN ('pending', 'stale')
@@ -1390,9 +1414,125 @@ pub fn expired_step_leases(config: &Config, now: DateTime<Utc>) -> Result<Vec<Xi
     })
 }
 
+/// Result of attempting to adopt one stale legacy task.
+pub(crate) struct LegacyTaskAdoption {
+    pub(crate) goal: XinGoal,
+    pub(crate) newly_adopted: bool,
+}
+
+/// Atomically adopt one enabled, stale, non-recurring legacy task into an
+/// ordered two-step goal. Replays return the existing linked goal.
+pub(crate) fn adopt_legacy_task(config: &Config, task_id: &str) -> Result<Option<LegacyTaskAdoption>> {
+    let outcome = with_immediate_connection(config, |conn| {
+        let existing_goal_id = conn
+            .query_row(
+                "SELECT goal_id FROM xin_task_adoptions WHERE legacy_task_id = ?1",
+                params![task_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(goal_id) = existing_goal_id {
+            conn.execute(
+                "UPDATE xin_tasks SET enabled = 0 WHERE id = ?1 AND enabled != 0",
+                params![task_id],
+            )?;
+            return Ok(Some((goal_id, false)));
+        }
+
+        let task = conn
+            .query_row(SELECT_ALL_COLUMNS, params![task_id], map_task_row)
+            .optional()?;
+        let Some(task) = task else {
+            return Ok(None);
+        };
+        if task.recurring || !task.enabled || task.status != TaskStatus::Stale {
+            return Ok(None);
+        }
+
+        let goal_id = Uuid::new_v4().to_string();
+        let now = authoritative_now(conn)?;
+        let migrated_step = NewXinStep {
+            sequence: 1,
+            name: task.name.clone(),
+            description: task.description.clone(),
+            execution_mode: task.execution_mode.clone(),
+            payload: task.payload.clone(),
+            max_retries: task.max_failures,
+            approval_grant_json: task.approval_grant_json.clone(),
+            lease_ttl_secs: 0,
+        };
+        let verification_step = NewXinStep {
+            sequence: 2,
+            name: format!("{}::verify", task.name),
+            description: Some("post-adoption completion marker".to_string()),
+            execution_mode: ExecutionMode::Internal,
+            payload: "xin:health_check".to_string(),
+            max_retries: 0,
+            approval_grant_json: None,
+            lease_ttl_secs: 0,
+        };
+        let goal = NewXinGoal {
+            owner_id: task.owner_id.clone(),
+            topic_id: task.topic_id.clone(),
+            parent_task_id: task.parent_task_id.clone(),
+            source_message_event_id: task.source_message_event_id.clone(),
+            name: task.name.clone(),
+            description: task.description.clone(),
+            kind: task.kind.clone(),
+            priority: task.priority,
+            target_completion_at: None,
+            initial_steps: vec![migrated_step, verification_step],
+        };
+        insert_goal_rows(conn, config, &goal_id, &goal, now)?;
+        conn.execute(
+            "INSERT INTO xin_task_adoptions (legacy_task_id, goal_id, adopted_at)
+             VALUES (?1, ?2, ?3)",
+            params![task_id, goal_id, now.to_rfc3339()],
+        )
+        .context("Failed to link adopted Xin task to goal")?;
+        conn.execute(
+            "UPDATE xin_tasks SET enabled = 0, updated_at = ?1 WHERE id = ?2",
+            params![now.to_rfc3339(), task_id],
+        )
+        .context("Failed to disable adopted Xin task")?;
+        insert_task_event(
+            conn,
+            &workspace_id(config),
+            task_id,
+            TaskLineage {
+                owner_id: task.owner_id,
+                topic_id: task.topic_id,
+                parent_task_id: task.parent_task_id,
+                source_message_event_id: task.source_message_event_id,
+                status: Some(task.status.as_str().to_string()),
+            },
+            "xin.task.adopted",
+            Some(task.status.as_str()),
+            Some(
+                serde_json::json!({
+                    "goal_id": goal_id,
+                    "legacy_task_disabled": true,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
+        Ok(Some((goal_id, true)))
+    })?;
+
+    let Some((goal_id, newly_adopted)) = outcome else {
+        return Ok(None);
+    };
+    Ok(Some(LegacyTaskAdoption {
+        goal: get_goal(config, &goal_id)?,
+        newly_adopted,
+    }))
+}
+
 /// Migrate a legacy non-recurring `XinTask` into a single-step `XinGoal`.
 ///
 /// The original `xin_tasks` row is left untouched (zero-breakage, d09 §4.2).
+#[cfg(test)]
 pub fn migrate_task_to_goal(config: &Config, task_id: &str) -> Result<XinGoal> {
     let task = get_task(config, task_id)?;
     if task.recurring {
@@ -2078,7 +2218,15 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
          );
          CREATE INDEX IF NOT EXISTS idx_xin_steps_goal  ON xin_steps(goal_id, sequence);
          CREATE INDEX IF NOT EXISTS idx_xin_steps_due   ON xin_steps(status, lease_expires_at);
-         CREATE INDEX IF NOT EXISTS idx_xin_steps_owner ON xin_steps(lease_owner, status);",
+         CREATE INDEX IF NOT EXISTS idx_xin_steps_owner ON xin_steps(lease_owner, status);
+
+         CREATE TABLE IF NOT EXISTS xin_task_adoptions (
+            legacy_task_id TEXT PRIMARY KEY REFERENCES xin_tasks(id) ON DELETE CASCADE,
+            goal_id        TEXT NOT NULL UNIQUE REFERENCES xin_goals(id) ON DELETE CASCADE,
+            adopted_at     TEXT NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_xin_task_adoptions_goal
+            ON xin_task_adoptions(goal_id);",
     )
     .context("Failed to initialize xin schema")?;
 
@@ -2328,6 +2476,12 @@ mod tests {
                 step_names.iter().any(|existing| existing == "lease_epoch"),
                 "missing xin_steps.lease_epoch"
             );
+            let adoption_tables: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'xin_task_adoptions'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(adoption_tables, 1);
             Ok(())
         })
         .unwrap();
@@ -3264,6 +3418,119 @@ mod tests {
         complete_step(&config, &first.id, "ok").unwrap();
         let second = next_runnable_step(&config, &goal.id).unwrap().unwrap();
         assert_eq!(second.sequence, 2);
+    }
+
+    #[test]
+    fn ordered_prerequisite_blocks_selection_and_direct_claim() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1), sample_step(2)])).unwrap();
+        let steps = list_steps(&config, &goal.id).unwrap();
+
+        assert!(!claim_step(&config, &steps[1].id, "prx:1:early", 60).unwrap());
+        assert_eq!(next_runnable_step(&config, &goal.id).unwrap().unwrap().id, steps[0].id);
+
+        complete_step(&config, &steps[0].id, "first done").unwrap();
+        assert!(claim_step(&config, &steps[1].id, "prx:1:ordered", 60).unwrap());
+    }
+
+    #[test]
+    fn failed_prior_step_blocks_all_later_steps() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut first = sample_step(1);
+        first.max_retries = 0;
+        let goal = add_goal(&config, &sample_goal(vec![first, sample_step(2)])).unwrap();
+        let steps = list_steps(&config, &goal.id).unwrap();
+
+        fail_step(&config, &steps[0].id, "terminal failure").unwrap();
+        assert_eq!(get_step(&config, &steps[0].id).unwrap().status, StepStatus::Failed);
+        assert!(next_runnable_step(&config, &goal.id).unwrap().is_none());
+        assert!(!claim_step(&config, &steps[1].id, "prx:1:bypass", 60).unwrap());
+    }
+
+    #[test]
+    fn legacy_task_adoption_is_atomic_linked_disabled_and_idempotent() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let mut new = sample_task();
+        new.owner_id = Some("owner:workspace:telegram:alice".to_string());
+        new.topic_id = Some("topic-adoption".to_string());
+        new.parent_task_id = Some("parent-task".to_string());
+        new.source_message_event_id = Some("source-message".to_string());
+        let task = add_task(&config, &new).unwrap();
+        assert!(claim_task(&config, &task.id).unwrap());
+        let conn = open_xin_test_connection(&config);
+        conn.execute(
+            "UPDATE xin_tasks SET updated_at = ?1 WHERE id = ?2",
+            params![(Utc::now() - chrono::Duration::hours(2)).to_rfc3339(), task.id],
+        )
+        .unwrap();
+        drop(conn);
+        assert_eq!(mark_stale(&config, 60).unwrap(), 1);
+
+        let first = adopt_legacy_task(&config, &task.id).unwrap().expect("adopted");
+        assert!(first.newly_adopted);
+        let replay = adopt_legacy_task(&config, &task.id)
+            .unwrap()
+            .expect("existing adoption");
+        assert!(!replay.newly_adopted);
+        assert_eq!(replay.goal.id, first.goal.id);
+        assert_eq!(list_goals(&config).unwrap().len(), 1);
+
+        let disabled = get_task(&config, &task.id).unwrap();
+        assert!(!disabled.enabled);
+        let steps = list_steps(&config, &first.goal.id).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert_eq!(steps[0].payload, task.payload);
+        assert_eq!(steps[1].payload, "xin:health_check");
+        assert_eq!(first.goal.owner_id, task.owner_id);
+        assert_eq!(first.goal.topic_id, task.topic_id);
+        assert_eq!(first.goal.parent_task_id, task.parent_task_id);
+        assert_eq!(first.goal.source_message_event_id, task.source_message_event_id);
+
+        let conn = open_xin_test_connection(&config);
+        let linked_goal: String = conn
+            .query_row(
+                "SELECT goal_id FROM xin_task_adoptions WHERE legacy_task_id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(linked_goal, first.goal.id);
+        let adoption_events = list_task_events(&config, &task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "xin.task.adopted")
+            .count();
+        assert_eq!(adoption_events, 1);
+    }
+
+    #[test]
+    fn legacy_task_adoption_rolls_back_when_link_write_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+        let conn = open_xin_test_connection(&config);
+        conn.execute("UPDATE xin_tasks SET status = 'stale' WHERE id = ?1", params![task.id])
+            .unwrap();
+        conn.execute_batch(
+            "CREATE TRIGGER fail_xin_adoption_link
+             BEFORE INSERT ON xin_task_adoptions
+             BEGIN SELECT RAISE(ABORT, 'injected adoption link failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(adopt_legacy_task(&config, &task.id).is_err());
+        assert!(get_task(&config, &task.id).unwrap().enabled);
+        assert!(list_goals(&config).unwrap().is_empty());
+        assert!(
+            list_task_events(&config, &task.id)
+                .unwrap()
+                .iter()
+                .all(|event| event.event_type != "xin.task.adopted")
+        );
     }
 
     #[test]

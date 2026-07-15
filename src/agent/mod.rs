@@ -13,3 +13,4 @@ pub mod terminal;
 mod tests;
 
 pub use loop_::run;
+pub(crate) use loop_::run_with_runtime_envelope;
