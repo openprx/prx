@@ -55,17 +55,6 @@ const POSTGRES_EMBEDDING_CACHE_MAX_ROWS: i64 = 10_000;
 /// `WHERE` filter, so a narrow scope keeps the scan small regardless.
 const POSTGRES_BYTEA_FALLBACK_CANDIDATE_CAP: i64 = 4_096;
 
-fn message_event_type_for(role: &str, content: &str) -> Option<String> {
-    if role != "event" {
-        return None;
-    }
-    content
-        .split_whitespace()
-        .next()
-        .filter(|event_type| event_type.contains('.'))
-        .map(str::to_string)
-}
-
 /// PostgreSQL-backed persistent memory.
 ///
 /// This backend focuses on reliable CRUD and keyword recall using SQL, without
@@ -517,7 +506,14 @@ impl PostgresMemory {
                 sender TEXT,
                 recipient TEXT,
                 role TEXT NOT NULL,
-                event_type TEXT,
+                event_type TEXT NOT NULL,
+                source_ref_json TEXT,
+                subject_ref_json TEXT,
+                goal_id TEXT,
+                causation_event_id TEXT,
+                correlation_id TEXT,
+                attempt_id TEXT,
+                lease_epoch BIGINT,
                 content TEXT NOT NULL,
                 content_hash TEXT,
                 raw_payload_json TEXT,
@@ -527,6 +523,14 @@ impl PostgresMemory {
             );
             ALTER TABLE {qualified_message_events_table}
                 ADD COLUMN IF NOT EXISTS event_type TEXT;
+            ALTER TABLE {qualified_message_events_table}
+                ADD COLUMN IF NOT EXISTS source_ref_json TEXT,
+                ADD COLUMN IF NOT EXISTS subject_ref_json TEXT,
+                ADD COLUMN IF NOT EXISTS goal_id TEXT,
+                ADD COLUMN IF NOT EXISTS causation_event_id TEXT,
+                ADD COLUMN IF NOT EXISTS correlation_id TEXT,
+                ADD COLUMN IF NOT EXISTS attempt_id TEXT,
+                ADD COLUMN IF NOT EXISTS lease_epoch BIGINT;
 
             CREATE INDEX IF NOT EXISTS idx_message_events_workspace_id
                 ON {qualified_message_events_table}(workspace_id, id);
@@ -542,6 +546,8 @@ impl PostgresMemory {
                 ON {qualified_message_events_table}(workspace_id, visibility, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_event_type
                 ON {qualified_message_events_table}(workspace_id, event_type, id);
+            CREATE INDEX IF NOT EXISTS idx_message_events_correlation
+                ON {qualified_message_events_table}(workspace_id, correlation_id, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_created_at
                 ON {qualified_message_events_table}(created_at);
 
@@ -951,7 +957,7 @@ impl PostgresMemory {
             (
                 5,
                 "message_events",
-                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,content,content_hash,raw_payload_json,visibility,created_at,updated_at)",
+                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,source_ref_json,subject_ref_json,goal_id,causation_event_id,correlation_id,attempt_id,lease_epoch,content,content_hash,raw_payload_json,visibility,created_at,updated_at)",
             ),
             (
                 6,
@@ -1731,10 +1737,20 @@ impl PostgresMemory {
     }
 
     fn row_to_message_event(row: &Row) -> Result<MessageEvent> {
-        let created_at: DateTime<Utc> = row.get(20);
-        let updated_at: DateTime<Utc> = row.get(21);
+        let source_legacy: String = row.get(5);
+        let source_ref_json: Option<String> = row.get(17);
+        let source = source_ref_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| source_legacy.into());
+        let subject_ref_json: Option<String> = row.get(18);
+        let subject = subject_ref_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let created_at: DateTime<Utc> = row.get(28);
+        let updated_at: DateTime<Utc> = row.get(29);
         let visibility = row
-            .get::<_, String>(19)
+            .get::<_, String>(27)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -1744,7 +1760,7 @@ impl PostgresMemory {
             idempotency_key: row.get(2),
             workspace_id: row.get(3),
             owner_id: row.get(4),
-            source: row.get(5),
+            source,
             channel: row.get(6),
             session_key: row.get(7),
             parent_session_key: row.get(8),
@@ -1755,9 +1771,18 @@ impl PostgresMemory {
             sender: row.get(13),
             recipient: row.get(14),
             role: row.get(15),
-            content: row.get(16),
-            content_hash: row.get(17),
-            raw_payload_json: row.get(18),
+            event_type: row
+                .get::<_, Option<String>>(16)
+                .unwrap_or_else(|| "message.legacy".to_string()),
+            subject,
+            goal_id: row.get(19),
+            causation_event_id: row.get(20),
+            correlation_id: row.get(21),
+            attempt_id: row.get(22),
+            lease_epoch: row.get(23),
+            content: row.get(24),
+            content_hash: row.get(25),
+            raw_payload_json: row.get(26),
             visibility,
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
@@ -3005,6 +3030,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn append_message_event(&self, input: MessageEventInput) -> Result<MessageEvent> {
+        input.validate()?;
         let client = self.client.clone();
         let qualified_message_events_table = self.qualified_message_events_table.clone();
         let qualified_memory_events_table = self.qualified_memory_events_table.clone();
@@ -3014,19 +3040,23 @@ impl Memory for PostgresMemory {
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let content_hash = Self::content_hash(&input.content);
             let visibility = input.visibility.as_str().to_string();
-            let event_type = message_event_type_for(&input.role, &input.content);
+            let source = input.source.as_str().to_string();
+            let source_ref_json = serde_json::to_string(&input.source)?;
+            let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
 
             let insert_stmt = format!(
                 "
                 INSERT INTO {qualified_message_events_table} (
                     event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, event_type, content, content_hash, raw_payload_json,
-                    visibility, created_at, updated_at
+                    sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                    content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
-                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+                    $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
+                    $21, $22, $23, $24, $25, $26, $27, $28, $29
                 )
                 ON CONFLICT DO NOTHING
                 "
@@ -3035,8 +3065,9 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, content, content_hash, raw_payload_json,
-                       visibility, created_at, updated_at
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE event_id = $1 OR ($2::TEXT IS NOT NULL AND idempotency_key = $2)
                 ORDER BY CASE WHEN event_id = $1 THEN 0 ELSE 1 END
@@ -3063,7 +3094,7 @@ impl Memory for PostgresMemory {
                         &input.idempotency_key,
                         &input.workspace_id,
                         &input.owner_id,
-                        &input.source,
+                        &source,
                         &input.channel,
                         &input.session_key,
                         &input.parent_session_key,
@@ -3074,7 +3105,14 @@ impl Memory for PostgresMemory {
                         &input.sender,
                         &input.recipient,
                         &input.role,
-                        &event_type,
+                        &input.event_type,
+                        &source_ref_json,
+                        &subject_ref_json,
+                        &input.goal_id,
+                        &input.causation_event_id,
+                        &input.correlation_id,
+                        &input.attempt_id,
+                        &input.lease_epoch,
                         &input.content,
                         &content_hash,
                         &input.raw_payload_json,
@@ -3086,18 +3124,12 @@ impl Memory for PostgresMemory {
                 let row = tx.query_one(&select_stmt, &[&event_id, &input.idempotency_key])?;
                 let event = Self::row_to_message_event(&row)?;
                 if inserted > 0 {
-                    let outbox_event_type = if event.role == "event" {
-                        message_event_type_for(&event.role, &event.content)
-                            .unwrap_or_else(|| "worker.result.created".to_string())
-                    } else {
-                        "message.created".to_string()
-                    };
                     tx.execute(
                         &outbox_stmt,
                         &[
                             &Uuid::new_v4().to_string(),
                             &event.workspace_id,
-                            &outbox_event_type,
+                            &event.event_type,
                             &event.event_id,
                             &event.session_key,
                             &event.agent_id,
@@ -3138,8 +3170,9 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, content, content_hash, raw_payload_json,
-                       visibility, created_at, updated_at
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
                   AND (
@@ -3209,8 +3242,9 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, content, content_hash, raw_payload_json,
-                       visibility, created_at, updated_at
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE (
                       visibility = 'global'
@@ -3285,8 +3319,9 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, content, content_hash, raw_payload_json,
-                       visibility, created_at, updated_at
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
                   AND (
@@ -3379,8 +3414,9 @@ impl Memory for PostgresMemory {
                 "
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                       sender, recipient, role, content, content_hash, raw_payload_json,
-                       visibility, created_at, updated_at
+                       sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
                   AND workspace_id = $2
@@ -4941,7 +4977,7 @@ mod tests {
                 idempotency_key: Some("idem-user-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
                 owner_id: Some("owner-a".to_string()),
-                source: "postgres-test".to_string(),
+                source: "postgres-test".into(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
                 parent_session_key: None,
@@ -4952,6 +4988,13 @@ mod tests {
                 sender: Some("sender-1".to_string()),
                 recipient: Some("prx".to_string()),
                 role: "user".to_string(),
+                event_type: "message.created".to_string(),
+                subject: Some(crate::memory::MessageEventSubject::Task("task-pg-1".to_string())),
+                goal_id: Some("goal-pg-1".to_string()),
+                causation_event_id: Some("event-parent-pg".to_string()),
+                correlation_id: Some("correlation-pg-1".to_string()),
+                attempt_id: Some("attempt-pg-2".to_string()),
+                lease_epoch: Some(3),
                 content: "hello from postgres".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,
@@ -4964,7 +5007,7 @@ mod tests {
                 idempotency_key: Some("idem-user-1".to_string()),
                 workspace_id: "workspace-a".to_string(),
                 owner_id: Some("owner-a".to_string()),
-                source: "postgres-test".to_string(),
+                source: "postgres-test".into(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
                 parent_session_key: None,
@@ -4975,6 +5018,13 @@ mod tests {
                 sender: Some("sender-1".to_string()),
                 recipient: Some("prx".to_string()),
                 role: "user".to_string(),
+                event_type: "message.created".to_string(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
                 content: "duplicate should not replace".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,
@@ -4983,6 +5033,17 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate.event_id, user.event_id);
         assert_eq!(duplicate.content, user.content);
+        assert_eq!(user.event_type, "message.created");
+        assert_eq!(user.source, "postgres-test");
+        assert_eq!(
+            user.subject,
+            Some(crate::memory::MessageEventSubject::Task("task-pg-1".to_string()))
+        );
+        assert_eq!(user.goal_id.as_deref(), Some("goal-pg-1"));
+        assert_eq!(user.causation_event_id.as_deref(), Some("event-parent-pg"));
+        assert_eq!(user.correlation_id.as_deref(), Some("correlation-pg-1"));
+        assert_eq!(user.attempt_id.as_deref(), Some("attempt-pg-2"));
+        assert_eq!(user.lease_epoch, Some(3));
 
         let assistant = mem
             .append_message_event(MessageEventInput {
@@ -4990,7 +5051,7 @@ mod tests {
                 idempotency_key: None,
                 workspace_id: "workspace-a".to_string(),
                 owner_id: Some("owner-a".to_string()),
-                source: "postgres-test".to_string(),
+                source: "postgres-test".into(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram_sender-1".to_string()),
                 parent_session_key: None,
@@ -5001,6 +5062,13 @@ mod tests {
                 sender: Some("prx".to_string()),
                 recipient: Some("sender-1".to_string()),
                 role: "assistant".to_string(),
+                event_type: "message.created".to_string(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
                 content: "postgres reply".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,

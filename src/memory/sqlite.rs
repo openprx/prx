@@ -37,17 +37,6 @@ const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
 const SQLITE_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
     crate::memory::session_predicate::PlaceholderDialect::Sqlite;
 
-fn message_event_type_for(role: &str, content: &str) -> Option<String> {
-    if role != "event" {
-        return None;
-    }
-    content
-        .split_whitespace()
-        .next()
-        .filter(|event_type| event_type.contains('.'))
-        .map(str::to_string)
-}
-
 pub struct SqliteTaskEventMirror<'a> {
     pub workspace_id: &'a str,
     pub task_id: &'a str,
@@ -780,7 +769,14 @@ impl SqliteMemory {
                 sender             TEXT,
                 recipient          TEXT,
                 role               TEXT NOT NULL,
-                event_type         TEXT,
+                event_type         TEXT NOT NULL,
+                source_ref_json    TEXT,
+                subject_ref_json   TEXT,
+                goal_id            TEXT,
+                causation_event_id TEXT,
+                correlation_id     TEXT,
+                attempt_id         TEXT,
+                lease_epoch        INTEGER,
                 content            TEXT NOT NULL,
                 content_hash       TEXT,
                 raw_payload_json   TEXT,
@@ -1252,9 +1248,32 @@ impl SqliteMemory {
                 Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.event_type: {e}")),
             }
         }
+        for (name, sql_type) in [
+            ("source_ref_json", "TEXT"),
+            ("subject_ref_json", "TEXT"),
+            ("goal_id", "TEXT"),
+            ("causation_event_id", "TEXT"),
+            ("correlation_id", "TEXT"),
+            ("attempt_id", "TEXT"),
+            ("lease_epoch", "INTEGER"),
+        ] {
+            if msg_names.contains(name) {
+                continue;
+            }
+            let alter_sql = format!("ALTER TABLE message_events ADD COLUMN {name} {sql_type}");
+            match conn.execute_batch(&alter_sql) {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+                    tracing::debug!("Column message_events.{name} already exists (concurrent migration): {err}");
+                }
+                Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.{name}: {e}")),
+            }
+        }
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_message_events_event_type
-                ON message_events(workspace_id, event_type, id);",
+                ON message_events(workspace_id, event_type, id);
+             CREATE INDEX IF NOT EXISTS idx_message_events_correlation
+                ON message_events(workspace_id, correlation_id, id);",
         )?;
 
         let mut session_column_stmt = conn.prepare("PRAGMA table_info(sessions)")?;
@@ -1612,7 +1631,7 @@ impl SqliteMemory {
             (
                 4,
                 "message_and_memory_events",
-                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,content,content_hash,raw_payload_json,visibility,created_at,updated_at) + memory_events(id,event_id,workspace_id,event_type,subject_table,subject_id,session_key,agent_id,persona_id,visibility,payload_json,created_at)",
+                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,source_ref_json,subject_ref_json,goal_id,causation_event_id,correlation_id,attempt_id,lease_epoch,content,content_hash,raw_payload_json,visibility,created_at,updated_at) + memory_events(id,event_id,workspace_id,event_type,subject_table,subject_id,session_key,agent_id,persona_id,visibility,payload_json,created_at)",
             ),
             (
                 5,
@@ -1683,14 +1702,24 @@ impl SqliteMemory {
     }
 
     fn message_event_from_row(row: &Row<'_>) -> rusqlite::Result<MessageEvent> {
-        let visibility_raw: String = row.get(19)?;
+        let source_legacy: String = row.get(5)?;
+        let source_ref_json: Option<String> = row.get(17)?;
+        let source = source_ref_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok())
+            .unwrap_or_else(|| source_legacy.into());
+        let subject_ref_json: Option<String> = row.get(18)?;
+        let subject = subject_ref_json
+            .as_deref()
+            .and_then(|json| serde_json::from_str(json).ok());
+        let visibility_raw: String = row.get(27)?;
         Ok(MessageEvent {
             id: row.get(0)?,
             event_id: row.get(1)?,
             idempotency_key: row.get(2)?,
             workspace_id: row.get(3)?,
             owner_id: row.get(4)?,
-            source: row.get(5)?,
+            source,
             channel: row.get(6)?,
             session_key: row.get(7)?,
             parent_session_key: row.get(8)?,
@@ -1701,12 +1730,21 @@ impl SqliteMemory {
             sender: row.get(13)?,
             recipient: row.get(14)?,
             role: row.get(15)?,
-            content: row.get(16)?,
-            content_hash: row.get(17)?,
-            raw_payload_json: row.get(18)?,
+            event_type: row
+                .get::<_, Option<String>>(16)?
+                .unwrap_or_else(|| "message.legacy".to_string()),
+            subject,
+            goal_id: row.get(19)?,
+            causation_event_id: row.get(20)?,
+            correlation_id: row.get(21)?,
+            attempt_id: row.get(22)?,
+            lease_epoch: row.get(23)?,
+            content: row.get(24)?,
+            content_hash: row.get(25)?,
+            raw_payload_json: row.get(26)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            created_at: row.get(20)?,
-            updated_at: row.get(21)?,
+            created_at: row.get(28)?,
+            updated_at: row.get(29)?,
         })
     }
 
@@ -3974,6 +4012,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+        input.validate()?;
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<MessageEvent> {
@@ -3983,22 +4022,26 @@ impl Memory for SqliteMemory {
             let event_id = input.event_id.unwrap_or_else(|| Uuid::new_v4().to_string());
             let content_hash = Self::content_hash(&input.content);
             let visibility = input.visibility.as_str().to_string();
-            let event_type = message_event_type_for(&input.role, &input.content);
+            let source = input.source.as_str().to_string();
+            let source_ref_json = serde_json::to_string(&input.source)?;
+            let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
 
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO message_events (
                     event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                    sender, recipient, role, event_type, content, content_hash, raw_payload_json,
-                    visibility, created_at, updated_at
+                    sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                    content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
                 params![
                     event_id,
                     input.idempotency_key,
                     input.workspace_id,
                     input.owner_id,
-                    input.source,
+                    source,
                     input.channel,
                     input.session_key,
                     input.parent_session_key,
@@ -4009,7 +4052,14 @@ impl Memory for SqliteMemory {
                     input.sender,
                     input.recipient,
                     input.role,
-                    event_type,
+                    input.event_type,
+                    source_ref_json,
+                    subject_ref_json,
+                    input.goal_id,
+                    input.causation_event_id,
+                    input.correlation_id,
+                    input.attempt_id,
+                    input.lease_epoch,
                     input.content,
                     content_hash,
                     input.raw_payload_json,
@@ -4023,8 +4073,9 @@ impl Memory for SqliteMemory {
                 tx.query_row(
                     "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                            sender, recipient, role, content, content_hash, raw_payload_json,
-                            visibility, created_at, updated_at
+                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
                      FROM message_events
                      WHERE event_id = ?1 OR idempotency_key = ?2
                      ORDER BY CASE WHEN event_id = ?1 THEN 0 ELSE 1 END
@@ -4036,8 +4087,9 @@ impl Memory for SqliteMemory {
                 tx.query_row(
                     "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                            sender, recipient, role, content, content_hash, raw_payload_json,
-                            visibility, created_at, updated_at
+                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
                      FROM message_events
                      WHERE event_id = ?1
                      LIMIT 1",
@@ -4047,12 +4099,6 @@ impl Memory for SqliteMemory {
             };
 
             if inserted > 0 {
-                let outbox_event_type = if event.role == "event" {
-                    message_event_type_for(&event.role, &event.content)
-                        .unwrap_or_else(|| "worker.result.created".to_string())
-                } else {
-                    "message.created".to_string()
-                };
                 tx.execute(
                     "INSERT INTO memory_events (
                         event_id, workspace_id, event_type, subject_table, subject_id, session_key,
@@ -4062,7 +4108,7 @@ impl Memory for SqliteMemory {
                     params![
                         Uuid::new_v4().to_string(),
                         event.workspace_id,
-                        outbox_event_type,
+                        event.event_type,
                         event.event_id,
                         event.session_key,
                         event.agent_id,
@@ -4102,8 +4148,9 @@ impl Memory for SqliteMemory {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                        sender, recipient, role, content, content_hash, raw_payload_json,
-                        visibility, created_at, updated_at
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
                    AND (
@@ -4172,8 +4219,9 @@ impl Memory for SqliteMemory {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                        sender, recipient, role, content, content_hash, raw_payload_json,
-                        visibility, created_at, updated_at
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE (
                        visibility = 'global'
@@ -4243,8 +4291,9 @@ impl Memory for SqliteMemory {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                        sender, recipient, role, content, content_hash, raw_payload_json,
-                        visibility, created_at, updated_at
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
                    AND (
@@ -4331,8 +4380,9 @@ impl Memory for SqliteMemory {
             let mut stmt = conn.prepare(&format!(
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
-                        sender, recipient, role, content, content_hash, raw_payload_json,
-                        visibility, created_at, updated_at
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
                    AND workspace_id = ?2
@@ -5479,7 +5529,7 @@ mod tests {
             idempotency_key: None,
             workspace_id: workspace_id.to_string(),
             owner_id: None,
-            source: "test".to_string(),
+            source: "test".into(),
             channel: Some("terminal".to_string()),
             session_key: session_key.map(str::to_string),
             parent_session_key: None,
@@ -5490,6 +5540,13 @@ mod tests {
             sender: sender.map(str::to_string),
             recipient: None,
             role: "user".to_string(),
+            event_type: "message.created".to_string(),
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
             content: content.to_string(),
             raw_payload_json: None,
             visibility,
@@ -5683,6 +5740,14 @@ mod tests {
             ("conversation_turns", "persona_id"),
             ("conversation_turns", "visibility"),
             ("message_events", "owner_id"),
+            ("message_events", "event_type"),
+            ("message_events", "source_ref_json"),
+            ("message_events", "subject_ref_json"),
+            ("message_events", "goal_id"),
+            ("message_events", "causation_event_id"),
+            ("message_events", "correlation_id"),
+            ("message_events", "attempt_id"),
+            ("message_events", "lease_epoch"),
             ("memory_drafts", "owner_id"),
             ("memory_drafts", "parent_run_id"),
             ("memory_drafts", "source_event_id"),
@@ -5728,6 +5793,95 @@ mod tests {
                 )
                 .unwrap();
             assert_eq!(count, 1, "missing {table}.{column}");
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_message_events_schema_adds_typed_lineage_columns() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("brain.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE message_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL UNIQUE,
+                    idempotency_key TEXT UNIQUE,
+                    workspace_id TEXT NOT NULL,
+                    owner_id TEXT,
+                    source TEXT NOT NULL,
+                    channel TEXT,
+                    session_key TEXT,
+                    parent_session_key TEXT,
+                    run_id TEXT,
+                    parent_run_id TEXT,
+                    agent_id TEXT,
+                    persona_id TEXT,
+                    sender TEXT,
+                    recipient TEXT,
+                    role TEXT NOT NULL,
+                    event_type TEXT,
+                    content TEXT NOT NULL,
+                    content_hash TEXT,
+                    raw_payload_json TEXT,
+                    visibility TEXT NOT NULL DEFAULT 'workspace',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 INSERT INTO message_events (
+                    event_id, workspace_id, source, role, content, visibility, created_at, updated_at
+                 ) VALUES (
+                    'legacy-event-1', 'workspace-a', 'legacy-adapter', 'user', 'legacy content',
+                    'workspace', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
+                 );",
+            )
+            .unwrap();
+        }
+
+        let mem = SqliteMemory::new_with_path(db_path).unwrap();
+        let events = mem
+            .list_message_events_since(
+                &MemoryPrincipal {
+                    workspace_id: "workspace-a".to_string(),
+                    agent_id: None,
+                    persona_id: None,
+                    session_key: None,
+                    channel: None,
+                    sender: None,
+                    owner_id: None,
+                    legacy_session_key: None,
+                },
+                0,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        if let Some(event) = events.first() {
+            assert_eq!(event.source, "legacy-adapter");
+            assert_eq!(event.event_type, "message.legacy");
+            assert!(event.subject.is_none());
+            assert!(event.correlation_id.is_none());
+        }
+
+        let conn = mem.conn.lock();
+        for column in [
+            "source_ref_json",
+            "subject_ref_json",
+            "goal_id",
+            "causation_event_id",
+            "correlation_id",
+            "attempt_id",
+            "lease_epoch",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info('message_events') WHERE name = ?1",
+                    [column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing upgraded message_events.{column}");
         }
     }
 
@@ -6377,15 +6531,33 @@ source: tool_output\n\
         let (_tmp, mem) = temp_sqlite();
         let mut input = message_input(
             "workspace-a",
-            "router.route_decision decision_id=decision-1",
+            "decision_id=decision-1",
             MemoryVisibility::Workspace,
             Some("llm-router"),
             Some("chat:1"),
             Some("router"),
         );
         input.role = "event".to_string();
+        input.event_type = "router.route_decision".to_string();
+        input.subject = Some(crate::memory::MessageEventSubject::Task("task-1".to_string()));
+        input.goal_id = Some("goal-1".to_string());
+        input.causation_event_id = Some("event-parent".to_string());
+        input.correlation_id = Some("correlation-1".to_string());
+        input.attempt_id = Some("attempt-2".to_string());
+        input.lease_epoch = Some(3);
 
         let event = mem.append_message_event(input).await.unwrap();
+        assert_eq!(event.event_type, "router.route_decision");
+        assert_eq!(event.source, "test");
+        assert_eq!(
+            event.subject,
+            Some(crate::memory::MessageEventSubject::Task("task-1".to_string()))
+        );
+        assert_eq!(event.goal_id.as_deref(), Some("goal-1"));
+        assert_eq!(event.causation_event_id.as_deref(), Some("event-parent"));
+        assert_eq!(event.correlation_id.as_deref(), Some("correlation-1"));
+        assert_eq!(event.attempt_id.as_deref(), Some("attempt-2"));
+        assert_eq!(event.lease_epoch, Some(3));
         let conn = mem.conn.lock();
         let event_type: String = conn
             .query_row(
@@ -6403,6 +6575,29 @@ source: tool_output\n\
             )
             .unwrap();
         assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn append_message_event_rejects_missing_explicit_event_type_before_transaction() {
+        let (_tmp, mem) = temp_sqlite();
+        let mut input = message_input(
+            "workspace-a",
+            "content cannot define its own type",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:1"),
+            Some("alice"),
+        );
+        input.event_type.clear();
+
+        let error = mem.append_message_event(input).await.unwrap_err();
+        assert!(error.to_string().contains("event type must not be empty"));
+        let count: i64 = mem
+            .conn
+            .lock()
+            .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
     }
 
     #[tokio::test]
@@ -6456,8 +6651,9 @@ source: tool_output\n\
             Some("session-a"),
             None,
         );
-        input.source = "sessions_spawn".to_string();
+        input.source = "sessions_spawn".into();
         input.role = "event".to_string();
+        input.event_type = "worker.result.created".to_string();
 
         let event = mem.append_message_event(input).await.unwrap();
         let outbox = mem

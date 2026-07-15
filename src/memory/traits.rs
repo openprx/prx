@@ -265,6 +265,130 @@ impl MemoryPrincipal {
     }
 }
 
+/// Typed origin for an event in the shared message fabric.
+///
+/// The string representation intentionally matches the legacy `source` column
+/// so existing rows and external JSON remain compatible while Rust callers no
+/// longer pass an unstructured source string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MessageEventSource {
+    Chat,
+    Agent,
+    Gateway,
+    Channel,
+    Console,
+    SessionWorker,
+    SessionsSpawn,
+    Delegate,
+    Cron,
+    Xin,
+    Heartbeat,
+    Webhook,
+    Other(String),
+}
+
+impl MessageEventSource {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Chat => "chat",
+            Self::Agent => "agent",
+            Self::Gateway => "gateway",
+            Self::Channel => "channel",
+            Self::Console => "console",
+            Self::SessionWorker => "session_worker",
+            Self::SessionsSpawn => "sessions_spawn",
+            Self::Delegate => "delegate",
+            Self::Cron => "cron",
+            Self::Xin => "xin",
+            Self::Heartbeat => "heartbeat",
+            Self::Webhook => "webhook",
+            Self::Other(source) => source,
+        }
+    }
+}
+
+impl std::fmt::Display for MessageEventSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl PartialEq<str> for MessageEventSource {
+    fn eq(&self, other: &str) -> bool {
+        self.as_str() == other
+    }
+}
+
+impl PartialEq<&str> for MessageEventSource {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
+impl From<&str> for MessageEventSource {
+    fn from(source: &str) -> Self {
+        match source.trim() {
+            "chat" => Self::Chat,
+            "agent" => Self::Agent,
+            "gateway" => Self::Gateway,
+            "channel" => Self::Channel,
+            "console" => Self::Console,
+            "session_worker" => Self::SessionWorker,
+            "sessions_spawn" => Self::SessionsSpawn,
+            "delegate" => Self::Delegate,
+            "cron" => Self::Cron,
+            "xin" => Self::Xin,
+            "heartbeat" => Self::Heartbeat,
+            "webhook" => Self::Webhook,
+            other => Self::Other(other.to_string()),
+        }
+    }
+}
+
+impl From<String> for MessageEventSource {
+    fn from(source: String) -> Self {
+        Self::from(source.as_str())
+    }
+}
+
+impl Serialize for MessageEventSource {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageEventSource {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+/// Typed subject associated with a message event.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
+pub enum MessageEventSubject {
+    Project(String),
+    Task(String),
+    Incident(String),
+    Customer(String),
+    Document(String),
+    Goal(String),
+    Topic(String),
+    Conversation(String),
+    Other { subject_type: String, id: String },
+}
+
+fn legacy_message_event_type() -> String {
+    "message.legacy".to_string()
+}
+
 /// Input used to append an event into the shared message fabric.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MessageEventInput {
@@ -272,7 +396,7 @@ pub struct MessageEventInput {
     pub idempotency_key: Option<String>,
     pub workspace_id: String,
     pub owner_id: Option<String>,
-    pub source: String,
+    pub source: MessageEventSource,
     pub channel: Option<String>,
     pub session_key: Option<String>,
     pub parent_session_key: Option<String>,
@@ -283,9 +407,38 @@ pub struct MessageEventInput {
     pub sender: Option<String>,
     pub recipient: Option<String>,
     pub role: String,
+    #[serde(default)]
+    pub event_type: String,
+    #[serde(default)]
+    pub subject: Option<MessageEventSubject>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    pub causation_event_id: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub lease_epoch: Option<i64>,
     pub content: String,
     pub raw_payload_json: Option<String>,
     pub visibility: MemoryVisibility,
+}
+
+impl MessageEventInput {
+    /// Validate the explicit typed metadata required by every backend.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.source.as_str().trim().is_empty(),
+            "message event source must not be empty"
+        );
+        anyhow::ensure!(
+            !self.event_type.trim().is_empty(),
+            "message event type must not be empty"
+        );
+        Ok(())
+    }
 }
 
 /// Persisted shared message event.
@@ -296,7 +449,7 @@ pub struct MessageEvent {
     pub idempotency_key: Option<String>,
     pub workspace_id: String,
     pub owner_id: Option<String>,
-    pub source: String,
+    pub source: MessageEventSource,
     pub channel: Option<String>,
     pub session_key: Option<String>,
     pub parent_session_key: Option<String>,
@@ -307,12 +460,82 @@ pub struct MessageEvent {
     pub sender: Option<String>,
     pub recipient: Option<String>,
     pub role: String,
+    #[serde(default = "legacy_message_event_type")]
+    pub event_type: String,
+    #[serde(default)]
+    pub subject: Option<MessageEventSubject>,
+    #[serde(default)]
+    pub goal_id: Option<String>,
+    #[serde(default)]
+    pub causation_event_id: Option<String>,
+    #[serde(default)]
+    pub correlation_id: Option<String>,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub lease_epoch: Option<i64>,
     pub content: String,
     pub content_hash: Option<String>,
     pub raw_payload_json: Option<String>,
     pub visibility: MemoryVisibility,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[cfg(test)]
+mod message_event_contract_tests {
+    use super::*;
+
+    #[test]
+    fn typed_source_and_subject_keep_stable_json_contracts() {
+        let known = MessageEventSource::Chat;
+        assert_eq!(serde_json::to_string(&known).unwrap(), "\"chat\"");
+        assert_eq!(serde_json::from_str::<MessageEventSource>("\"chat\"").unwrap(), known);
+
+        let custom = MessageEventSource::Other("custom-adapter".to_string());
+        assert_eq!(serde_json::to_string(&custom).unwrap(), "\"custom-adapter\"");
+        assert_eq!(
+            serde_json::from_str::<MessageEventSource>("\"custom-adapter\"").unwrap(),
+            custom
+        );
+
+        let subject = MessageEventSubject::Task("task-1".to_string());
+        assert_eq!(
+            serde_json::from_str::<MessageEventSubject>(&serde_json::to_string(&subject).unwrap()).unwrap(),
+            subject
+        );
+    }
+
+    #[test]
+    fn sqlite_and_postgres_append_paths_share_lineage_and_transaction_boundaries() {
+        let sqlite = include_str!("sqlite.rs");
+        let postgres = include_str!("postgres.rs");
+        let sqlite_append = sqlite
+            .split_once("async fn append_message_event")
+            .map_or("", |(_, body)| body);
+        let postgres_append = postgres
+            .split_once("async fn append_message_event")
+            .map_or("", |(_, body)| body);
+        for field in [
+            "event_type",
+            "source_ref_json",
+            "subject_ref_json",
+            "goal_id",
+            "causation_event_id",
+            "correlation_id",
+            "attempt_id",
+            "lease_epoch",
+        ] {
+            assert!(sqlite_append.contains(field), "SQLite append must carry {field}");
+            assert!(postgres_append.contains(field), "Postgres append must carry {field}");
+        }
+        assert!(sqlite_append.contains("let tx = conn.transaction()?"));
+        assert!(postgres_append.contains("let mut tx = client.transaction()?"));
+        assert!(sqlite_append.contains("tx.commit()?"));
+        assert!(postgres_append.contains("tx.commit()?"));
+        assert!(sqlite_append.contains("input.event_type"));
+        assert!(postgres_append.contains("input.event_type"));
+    }
 }
 
 /// Query for recent shared events visible to an agent turn.

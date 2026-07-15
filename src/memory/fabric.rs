@@ -89,7 +89,7 @@ pub struct MemoryEventWatcher {
 /// Common routing and ownership metadata for message-fabric writes.
 #[derive(Debug, Clone)]
 pub struct MessageEventScope {
-    pub source: String,
+    pub source: crate::memory::MessageEventSource,
     pub owner_id: Option<String>,
     pub channel: Option<String>,
     pub session_key: Option<String>,
@@ -100,12 +100,18 @@ pub struct MessageEventScope {
     pub persona_id: Option<String>,
     pub sender: Option<String>,
     pub recipient: Option<String>,
+    pub subject: Option<crate::memory::MessageEventSubject>,
+    pub goal_id: Option<String>,
+    pub causation_event_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub lease_epoch: Option<i64>,
     pub visibility: MemoryVisibility,
 }
 
 impl MessageEventScope {
     #[must_use]
-    pub fn new(source: impl Into<String>, visibility: MemoryVisibility) -> Self {
+    pub fn new(source: impl Into<crate::memory::MessageEventSource>, visibility: MemoryVisibility) -> Self {
         Self {
             source: source.into(),
             owner_id: None,
@@ -118,6 +124,12 @@ impl MessageEventScope {
             persona_id: None,
             sender: None,
             recipient: None,
+            subject: None,
+            goal_id: None,
+            causation_event_id: None,
+            correlation_id: None,
+            attempt_id: None,
+            lease_epoch: None,
             visibility,
         }
     }
@@ -210,8 +222,15 @@ impl MemoryFabric {
         idempotency_key: Option<String>,
         raw_payload_json: Option<String>,
     ) -> anyhow::Result<MessageEvent> {
-        self.record_message_event(scope, "user", content, idempotency_key, raw_payload_json)
-            .await
+        self.record_message_event(
+            scope,
+            "user",
+            "message.created",
+            content,
+            idempotency_key,
+            raw_payload_json,
+        )
+        .await
     }
 
     pub async fn record_assistant_message(
@@ -219,7 +238,8 @@ impl MemoryFabric {
         scope: MessageEventScope,
         content: impl Into<String>,
     ) -> anyhow::Result<MessageEvent> {
-        self.record_message_event(scope, "assistant", content, None, None).await
+        self.record_message_event(scope, "assistant", "message.created", content, None, None)
+            .await
     }
 
     pub async fn record_tool_event(
@@ -228,7 +248,7 @@ impl MemoryFabric {
         content: impl Into<String>,
         raw_payload_json: Option<String>,
     ) -> anyhow::Result<MessageEvent> {
-        self.record_message_event(scope, "tool", content, None, raw_payload_json)
+        self.record_message_event(scope, "tool", "message.created", content, None, raw_payload_json)
             .await
     }
 
@@ -238,7 +258,7 @@ impl MemoryFabric {
         content: impl Into<String>,
         raw_payload_json: Option<String>,
     ) -> anyhow::Result<MessageEvent> {
-        self.record_message_event(scope, "event", content, None, raw_payload_json)
+        self.record_message_event(scope, "event", "worker.result.created", content, None, raw_payload_json)
             .await
     }
 
@@ -256,7 +276,8 @@ impl MemoryFabric {
             Some,
         );
         let content = format!("{} {}", event_type, content.into());
-        self.record_message_event(scope, "event", content, None, payload).await
+        self.record_message_event(scope, "event", event_type, content, None, payload)
+            .await
     }
 
     pub async fn record_task_event(
@@ -520,13 +541,21 @@ impl MemoryFabric {
         &self,
         scope: MessageEventScope,
         role: &str,
+        event_type: &str,
         content: impl Into<String>,
         idempotency_key: Option<String>,
         raw_payload_json: Option<String>,
     ) -> anyhow::Result<MessageEvent> {
         let content = content.into();
         if !self.should_record_role(role) {
-            return Ok(self.synthetic_message_event(scope, role, content, idempotency_key, raw_payload_json));
+            return Ok(self.synthetic_message_event(
+                scope,
+                role,
+                event_type,
+                content,
+                idempotency_key,
+                raw_payload_json,
+            ));
         }
         self.memory
             .append_message_event(MessageEventInput {
@@ -545,6 +574,13 @@ impl MemoryFabric {
                 sender: scope.sender,
                 recipient: scope.recipient,
                 role: role.to_string(),
+                event_type: event_type.to_string(),
+                subject: scope.subject,
+                goal_id: scope.goal_id,
+                causation_event_id: scope.causation_event_id,
+                correlation_id: scope.correlation_id,
+                attempt_id: scope.attempt_id,
+                lease_epoch: scope.lease_epoch,
                 content,
                 raw_payload_json,
                 visibility: scope.visibility,
@@ -569,6 +605,7 @@ impl MemoryFabric {
         &self,
         scope: MessageEventScope,
         role: &str,
+        event_type: &str,
         content: String,
         idempotency_key: Option<String>,
         raw_payload_json: Option<String>,
@@ -591,6 +628,13 @@ impl MemoryFabric {
             sender: scope.sender,
             recipient: scope.recipient,
             role: role.to_string(),
+            event_type: event_type.to_string(),
+            subject: scope.subject,
+            goal_id: scope.goal_id,
+            causation_event_id: scope.causation_event_id,
+            correlation_id: scope.correlation_id,
+            attempt_id: scope.attempt_id,
+            lease_epoch: scope.lease_epoch,
             content,
             content_hash: None,
             raw_payload_json,

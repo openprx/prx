@@ -488,7 +488,7 @@ mod tests {
                 idempotency_key: None,
                 workspace_id: "/tmp".to_string(),
                 owner_id: Some("owner-a".to_string()),
-                source: "sessions_spawn".to_string(),
+                source: "sessions_spawn".into(),
                 channel: Some("telegram".to_string()),
                 session_key: Some("telegram:chat:alice".to_string()),
                 parent_session_key: None,
@@ -499,6 +499,13 @@ mod tests {
                 sender: Some("alice".to_string()),
                 recipient: None,
                 role: "user".to_string(),
+                event_type: "message.created".to_string(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
                 content: "message-only task".to_string(),
                 raw_payload_json: Some(
                     json!({

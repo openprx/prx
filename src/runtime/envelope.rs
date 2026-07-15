@@ -591,6 +591,16 @@ impl RuntimeEnvelope {
                 scope = scope.with_recipient(recipient.clone());
             }
         }
+        scope.subject = self
+            .task_id
+            .as_ref()
+            .map(|task_id| crate::memory::MessageEventSubject::Task(task_id.clone()))
+            .or_else(|| {
+                self.topic_id
+                    .as_ref()
+                    .map(|topic_id| crate::memory::MessageEventSubject::Topic(topic_id.clone()))
+            });
+        scope.causation_event_id = self.source_message_event_id.clone();
         scope
     }
 
@@ -688,6 +698,11 @@ mod tests {
 
         let scope = envelope.message_scope();
         assert_eq!(scope.owner_id.as_deref(), Some("owner:workspace:custom:alice"));
+        assert_eq!(
+            scope.subject,
+            Some(crate::memory::MessageEventSubject::Task("task-1".to_string()))
+        );
+        assert_eq!(scope.causation_event_id.as_deref(), Some("msg-1"));
     }
 
     #[test]

@@ -39,8 +39,8 @@ pub use traits::{
     ChatProfile, CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
     DocumentIngestInput, DocumentRecord, DocumentSearchResult, MemoryCategory, MemoryDraft, MemoryDraftInput,
     MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata,
-    MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, RetrievedContextItem,
-    SessionContextQuery, SharedContextQuery,
+    MemoryVisibility, MessageEvent, MessageEventInput, MessageEventSource, MessageEventSubject, RetrievalTrace,
+    RetrievalTraceInput, RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
 
 use crate::config::{
