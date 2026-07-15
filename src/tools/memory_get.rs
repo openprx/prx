@@ -1,22 +1,17 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::memory::Memory;
-use crate::memory::principal::{
-    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
-};
+use crate::memory::principal::MemoryWriteContext;
+use crate::memory::{Memory, MemoryReadMode};
 use async_trait::async_trait;
-use rusqlite::{Connection, params_from_iter, types::Value};
+#[cfg(test)]
+use rusqlite::Connection;
 use serde_json::json;
 use std::fmt::Write;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // Behavior-limits Phase 1: MAX 2000 -> 10000 (read more memory lines per key).
 const DEFAULT_LINE_COUNT: usize = 50;
 const MAX_LINE_COUNT: usize = 10_000;
-
-static OBSERVE_TOTAL_QUERIES: AtomicU64 = AtomicU64::new(0);
-static OBSERVE_WOULD_DENY_QUERIES: AtomicU64 = AtomicU64::new(0);
 
 fn requested_session_id(args: &serde_json::Value) -> Option<&str> {
     args.get("session_id")
@@ -35,7 +30,7 @@ fn validate_reserved_router_access(key: &str, session_id: Option<&str>) -> anyho
 /// Read selected lines from memory by key (ACL-aware), with file fallback.
 pub struct MemoryGetTool {
     workspace_dir: PathBuf,
-    _memory: Arc<dyn Memory>,
+    memory: Arc<dyn Memory>,
     acl_enabled: bool,
 }
 
@@ -43,13 +38,9 @@ impl MemoryGetTool {
     pub fn new(workspace_dir: PathBuf, memory: Arc<dyn Memory>, acl_enabled: bool) -> Self {
         Self {
             workspace_dir,
-            _memory: memory,
+            memory,
             acl_enabled,
         }
-    }
-
-    fn db_path(&self) -> PathBuf {
-        self.workspace_dir.join("memory").join("brain.db")
     }
 
     fn validate_memory_path(path: &str) -> anyhow::Result<()> {
@@ -115,13 +106,6 @@ impl MemoryGetTool {
     }
 }
 
-#[derive(Debug, Clone)]
-struct MemoryRow {
-    id: String,
-    key: String,
-    content: String,
-}
-
 fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     let trusted = args
         .get("_zc_scope_trusted")
@@ -159,78 +143,6 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     })
 }
 
-fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
-    Principal {
-        user_id: "anonymous:unknown:unknown".to_string(),
-        role: Role::Anonymous,
-        projects: Vec::new(),
-        visibility_ceiling: Visibility::Private,
-        blocked_patterns: Vec::new(),
-        current_channel: ctx.channel.clone().unwrap_or_default(),
-        current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
-        current_chat_type: ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm),
-        raw_sender: ctx.raw_sender.clone().unwrap_or_default(),
-        acl_enforced: true,
-    }
-}
-
-fn anonymous_principal() -> Principal {
-    Principal {
-        user_id: "anonymous:unknown:unknown".to_string(),
-        role: Role::Anonymous,
-        projects: Vec::new(),
-        visibility_ceiling: Visibility::Private,
-        blocked_patterns: Vec::new(),
-        current_channel: String::new(),
-        current_chat_id: String::new(),
-        current_chat_type: ChatType::Dm,
-        raw_sender: String::new(),
-        acl_enforced: true,
-    }
-}
-
-fn fetch_memory_by_key_with_scope(
-    conn: &Connection,
-    key: &str,
-    scope_sql: &str,
-    scope_params: &[Value],
-) -> anyhow::Result<Option<MemoryRow>> {
-    let sql = format!(
-        "SELECT id, key, content
-         FROM memories
-         WHERE key = ? AND ({scope_sql})
-         LIMIT 1"
-    );
-
-    let mut params = Vec::with_capacity(scope_params.len() + 1);
-    params.push(Value::from(key.to_string()));
-    params.extend(scope_params.iter().cloned());
-
-    let mut stmt = conn.prepare(&sql)?;
-    let mut rows = stmt.query(params_from_iter(params))?;
-    if let Some(row) = rows.next()? {
-        return Ok(Some(MemoryRow {
-            id: row.get(0)?,
-            key: row.get(1)?,
-            content: row.get(2)?,
-        }));
-    }
-    Ok(None)
-}
-
-fn observe_log_query(would_deny: bool) {
-    let total = OBSERVE_TOTAL_QUERIES.fetch_add(1, Ordering::Relaxed) + 1;
-    if would_deny {
-        OBSERVE_WOULD_DENY_QUERIES.fetch_add(1, Ordering::Relaxed);
-    }
-    let would_deny_count = OBSERVE_WOULD_DENY_QUERIES.load(Ordering::Relaxed);
-    tracing::info!(
-        total_queries = total,
-        would_deny_count,
-        "memory_get acl observe metrics"
-    );
-}
-
 #[async_trait]
 impl Tool for MemoryGetTool {
     fn name(&self) -> &str {
@@ -238,7 +150,7 @@ impl Tool for MemoryGetTool {
     }
 
     fn description(&self) -> &str {
-        "Read memory by key from SQLite with ACL observe/enforce mode; file fallback is only used when ACL is disabled."
+        "Read memory by key from the configured backend with ACL observe/enforce mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -300,108 +212,25 @@ impl Tool for MemoryGetTool {
             });
         }
 
-        let db_path = self.db_path();
-        if db_path.exists() {
-            let conn = match Connection::open(&db_path) {
-                Ok(conn) => conn,
-                Err(error) => {
-                    if self.acl_enabled {
-                        tracing::warn!("memory_get sqlite open failed while acl is enabled: {error}");
-                        return Ok(ToolResult {
-                            success: true,
-                            output: format!("No memory entry found for key: '{path}'"),
-                            error: None,
-                        });
-                    }
-                    tracing::warn!("memory_get sqlite open failed, using file fallback: {error}");
-                    return self.read_fallback_file(path, from, requested_lines);
-                }
-            };
-            let scope_ctx = parse_scope_ctx(&args);
-            let principal = scope_ctx.as_ref().map_or_else(anonymous_principal, |ctx| {
-                resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
-            });
-            let (scope_sql, scope_params) = principal.build_sql_scope();
-
-            if self.acl_enabled && principal.acl_enforced {
-                let scoped = fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
-                if let Some(row) = scoped {
-                    let filtered = post_filter(vec![row], &principal, |entry| entry.content.as_str());
-                    if let Some(entry) = filtered.into_iter().next() {
-                        log_access(
-                            &conn,
-                            &principal,
-                            "get",
-                            None,
-                            Some(&entry.id),
-                            Some("acl_enforced"),
-                            "allowed",
-                        );
-                        return Ok(ToolResult {
-                            success: true,
-                            output: render_range(&entry.key, &entry.content, from, requested_lines),
-                            error: None,
-                        });
-                    }
-                }
-
-                log_access(
-                    &conn,
-                    &principal,
-                    "get_denied",
-                    None,
-                    Some(path),
-                    Some("scope_or_post_filter"),
-                    "denied",
-                );
-                return Ok(ToolResult {
-                    success: true,
-                    output: format!("No memory entry found for key: '{path}'"),
-                    error: None,
-                });
-            }
-
-            // Observe mode: evaluate ACL but still return unrestricted result.
-            let scoped = fetch_memory_by_key_with_scope(&conn, path, &scope_sql, &scope_params)?;
-            let filtered = post_filter(scoped.clone().into_iter().collect::<Vec<_>>(), &principal, |entry| {
-                entry.content.as_str()
-            });
-            let unrestricted = fetch_memory_by_key_with_scope(&conn, path, "1=1", &[])?;
-
-            let would_deny = unrestricted.is_some() && (scoped.is_none() || filtered.is_empty());
-            observe_log_query(would_deny);
-            log_access(
-                &conn,
-                &principal,
-                "get",
-                None,
-                Some(path),
-                Some("observe_mode"),
-                if would_deny {
-                    "would_deny"
-                } else if unrestricted.is_some() {
-                    "allowed"
-                } else {
-                    "no_results"
-                },
-            );
-
-            if let Some(entry) = unrestricted {
-                return Ok(ToolResult {
-                    success: true,
-                    output: render_range(&entry.key, &entry.content, from, requested_lines),
-                    error: None,
-                });
-            }
-        } else if self.acl_enabled {
-            return Ok(ToolResult {
+        let scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
+        let mode = if self.acl_enabled {
+            MemoryReadMode::Enforce
+        } else {
+            MemoryReadMode::Observe
+        };
+        match self.memory.get_with_context_mode(path, Some(&scope_ctx), mode).await? {
+            Some(entry) => Ok(ToolResult {
+                success: true,
+                output: render_range(&entry.key, &entry.content, from, requested_lines),
+                error: None,
+            }),
+            None if !self.acl_enabled => self.read_fallback_file(path, from, requested_lines),
+            None => Ok(ToolResult {
                 success: true,
                 output: format!("No memory entry found for key: '{path}'"),
                 error: None,
-            });
+            }),
         }
-
-        self.read_fallback_file(path, from, requested_lines)
     }
 
     fn tier(&self) -> ToolTier {
@@ -755,6 +584,17 @@ mod tests {
         assert!(schema["properties"]["from"].is_object());
         assert!(schema["properties"]["lines"].is_object());
         assert!(schema["properties"]["session_id"].is_object());
+    }
+
+    #[test]
+    fn production_key_reads_do_not_open_sqlite_directly() {
+        let production = include_str!("memory_get.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        assert!(production.contains("get_with_context_mode"));
+        assert!(!production.contains("Connection::open"));
+        assert!(!production.contains("brain.db"));
     }
 
     #[tokio::test]

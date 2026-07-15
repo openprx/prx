@@ -2,9 +2,9 @@ use super::principal::{ChatType, MemoryWriteContext, Principal, Role, ScopeParam
 use super::traits::{
     ChatProfile, CompactionRun, CompactionRunInput, ConversationTurn, DocumentChunkRecord, DocumentIngestInput,
     DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput, MemoryEntry,
-    MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility,
-    MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery, SharedContextQuery,
-    validate_memory_write_target,
+    MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryReadMode, MemoryStoreMetadata,
+    MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery,
+    SharedContextQuery, validate_memory_write_target,
 };
 use super::{embeddings, vector};
 use anyhow::{Context, Result};
@@ -1977,7 +1977,7 @@ impl PostgresMemory {
     }
 }
 
-fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
+pub(crate) fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     // PostgreSQL identifiers: start with letter or underscore, followed by
     // letters, digits, or underscores.  Maximum length is 63 bytes (NAMEDATALEN-1).
     // We enforce the regex ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$ to prevent any
@@ -2009,7 +2009,7 @@ fn validate_identifier(value: &str, field_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn related_table_name(base: &str, suffix: &str) -> Result<String> {
+pub(crate) fn related_table_name(base: &str, suffix: &str) -> Result<String> {
     let max_base_len = 63usize
         .checked_sub(suffix.len())
         .context("related table suffix exceeds PostgreSQL identifier length")?;
@@ -2023,7 +2023,7 @@ fn related_table_name(base: &str, suffix: &str) -> Result<String> {
     Ok(name)
 }
 
-fn quote_identifier(value: &str) -> String {
+pub(crate) fn quote_identifier(value: &str) -> String {
     format!("\"{value}\"")
 }
 
@@ -2688,6 +2688,49 @@ impl Memory for PostgresMemory {
         Ok(visible)
     }
 
+    async fn recall_with_context_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> Result<Vec<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let scoped = self
+            .recall_with_context(query, limit, session_id, Some(&context))
+            .await?;
+        let unrestricted = self.recall(query, limit, session_id).await?;
+        let would_deny = unrestricted
+            .iter()
+            .any(|entry| !scoped.iter().any(|allowed| allowed.id == entry.id));
+        let selected = match mode {
+            MemoryReadMode::Enforce => scoped,
+            MemoryReadMode::Observe => unrestricted,
+        };
+        let principal = self.resolve_principal_from_context(&context).await;
+        Self::log_access_best_effort(
+            &self.client,
+            &self.qualified_access_audit_log_table(),
+            &principal,
+            "search",
+            Some(query),
+            None,
+            Some(match mode {
+                MemoryReadMode::Enforce => "acl_enforced",
+                MemoryReadMode::Observe => "observe_mode",
+            }),
+            if mode == MemoryReadMode::Observe && would_deny {
+                "would_deny"
+            } else if selected.is_empty() {
+                "no_results"
+            } else {
+                "allowed"
+            },
+        );
+        Ok(selected)
+    }
+
     async fn get(&self, key: &str) -> Result<Option<MemoryEntry>> {
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -2709,6 +2752,95 @@ impl Memory for PostgresMemory {
             row.as_ref().map(Self::row_to_entry).transpose()
         })
         .await?
+    }
+
+    async fn get_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> Result<Option<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let principal = self.resolve_principal_from_context(&context).await;
+        let sender_id = context.sender_id.clone().or_else(|| {
+            if context.channel.is_some() && context.raw_sender.is_some() {
+                Some(format!(
+                    "anonymous:{}:{}",
+                    context.channel.as_deref().unwrap_or("unknown"),
+                    context.raw_sender.as_deref().unwrap_or("unknown")
+                ))
+            } else {
+                None
+            }
+        });
+        let rls_system = super::principal::is_system_principal(&principal.user_id);
+        let rls_owner = sender_id
+            .as_deref()
+            .filter(|owner| !owner.trim().is_empty())
+            .map(str::to_string);
+        let (scope_sql, scope_params) = principal.build_sql_scope_pg(2);
+        let scope_values = scope_params_to_strings(scope_params);
+        let client = self.client.clone();
+        let qualified_table = self.qualified_table.clone();
+        let key = key.to_string();
+        let principal_for_filter = principal.clone();
+
+        tokio::task::spawn_blocking(move || -> Result<Option<MemoryEntry>> {
+            let stmt = format!(
+                "SELECT id, key, content, category, created_at, session_id,
+                        NULL::DOUBLE PRECISION AS score, useful_count
+                   FROM {qualified_table}
+                  WHERE key = $1 AND ({scope_sql})
+                  LIMIT 1"
+            );
+            let row = client.with_client(|client| {
+                Self::apply_rls_context_raw(client, rls_system, rls_owner.as_deref())?;
+                let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
+                for value in &scope_values {
+                    params.push(value);
+                }
+                Ok(client.query_opt(&stmt, &params)?)
+            })?;
+            let entry = row.as_ref().map(Self::row_to_entry).transpose()?;
+            let mut visible =
+                super::principal::post_filter(entry.into_iter().collect(), &principal_for_filter, |entry| {
+                    entry.content.as_str()
+                });
+            Ok(visible.pop())
+        })
+        .await?
+    }
+
+    async fn get_with_context_mode(
+        &self,
+        key: &str,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> Result<Option<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let scoped = self.get_with_context(key, Some(&context)).await?;
+        let unrestricted = self.get(key).await?;
+        let would_deny = unrestricted.is_some() && scoped.is_none();
+        let selected = match mode {
+            MemoryReadMode::Enforce => scoped,
+            MemoryReadMode::Observe => unrestricted,
+        };
+        let principal = self.resolve_principal_from_context(&context).await;
+        Self::log_access_best_effort(
+            &self.client,
+            &self.qualified_access_audit_log_table(),
+            &principal,
+            "get",
+            None,
+            selected.as_ref().map(|entry| entry.id.as_str()).or(Some(key)),
+            Some(match mode {
+                MemoryReadMode::Enforce => "acl_enforced",
+                MemoryReadMode::Observe => "observe_mode",
+            }),
+            if mode == MemoryReadMode::Observe && would_deny {
+                "would_deny"
+            } else if selected.is_some() {
+                "allowed"
+            } else {
+                "denied"
+            },
+        );
+        Ok(selected)
     }
 
     async fn list(&self, category: Option<&MemoryCategory>, session_id: Option<&str>) -> Result<Vec<MemoryEntry>> {

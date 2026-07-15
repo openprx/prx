@@ -304,7 +304,18 @@ async fn handle_trigger(as_json: bool, config: &Config, layer: Option<EvolutionL
 
     let report = match selected_layer {
         EvolutionLayer::Memory => {
-            let mut engine = MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer_for_engine.clone()))?;
+            let memory: Arc<dyn crate::memory::Memory> =
+                Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
+                    &config.memory,
+                    &config.embedding_routes,
+                    Some(&config.storage.provider.config),
+                    &config.workspace_dir,
+                    config.api_key.as_deref(),
+                    &config.identity_bindings,
+                    &config.user_policies,
+                )?);
+            let mut engine =
+                MemoryEvolutionEngine::new(shared, &cfg_path, Some(writer_for_engine.clone()))?.with_memory(memory);
             pipeline
                 .run_for_layer(
                     EvolutionTrigger::Manual,

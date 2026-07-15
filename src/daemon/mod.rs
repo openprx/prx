@@ -277,17 +277,19 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     if config.modules.integrations && config.webhook.enabled {
         register_optional_component("webhook_receiver", "webhook", true, OPTIONAL_HEALTH_TTL_SECONDS);
         let webhook_cfg = config.clone();
+        let webhook_repository = crate::webhook::repository_from_config(&webhook_cfg)?;
         handles.push(spawn_component_supervisor(
             "webhook_receiver",
             initial_backoff,
             max_backoff,
             move || {
                 let cfg = webhook_cfg.clone();
+                let repository = webhook_repository.clone();
                 async move {
                     // FIX-P1-03: pass the security policy so the standalone webhook
                     // server gates topic-store persistence on autonomy (ReadOnly = no write).
                     let webhook_security = crate::runtime::bootstrap::build_security_policy(&cfg);
-                    crate::webhook::run_configured(&cfg, webhook_security).await
+                    crate::webhook::run_configured_with_repository(&cfg, repository, webhook_security).await
                 }
             },
         ));
@@ -659,9 +661,20 @@ async fn build_evolution_scheduler(config: &Config) -> Result<(EvolutionSchedule
     )
     .with_security_policy(security_policy);
 
+    let evolution_memory: Arc<dyn crate::memory::Memory> =
+        Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
+            &config.memory,
+            &config.embedding_routes,
+            Some(&config.storage.provider.config),
+            &config.workspace_dir,
+            config.api_key.as_deref(),
+            &config.identity_bindings,
+            &config.user_policies,
+        )?);
     let memory_engine = Box::new(
         MemoryEvolutionEngine::new(shared.clone(), &cfg_path, Some(writer.clone()))
-            .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?,
+            .with_context(|| format!("failed to initialize memory evolution engine: {}", cfg_path.display()))?
+            .with_memory(evolution_memory),
     );
     let prompt_engine = Box::new(
         PromptEvolutionEngine::new(shared.clone(), &config.workspace_dir, Some(writer.clone()))

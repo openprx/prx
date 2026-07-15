@@ -8,9 +8,9 @@ use super::topic::resolve_topic;
 use super::traits::{
     ChatProfile, CompactionRun, CompactionRunInput, ConversationSessionSummary, ConversationTurn, DocumentChunkRecord,
     DocumentIngestInput, DocumentRecord, DocumentSearchResult, Memory, MemoryCategory, MemoryDraft, MemoryDraftInput,
-    MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryStoreMetadata,
-    MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput, SessionContextQuery,
-    SharedContextQuery, validate_memory_write_target,
+    MemoryEntry, MemoryEvent, MemoryEventInput, MemoryLink, MemoryLinkInput, MemoryPrincipal, MemoryReadMode,
+    MemoryStoreMetadata, MemoryVisibility, MessageEvent, MessageEventInput, RetrievalTrace, RetrievalTraceInput,
+    SessionContextQuery, SharedContextQuery, validate_memory_write_target,
 };
 use super::vector;
 use crate::self_system::evolution::record::Actor;
@@ -36,6 +36,45 @@ const MAX_CONVERSATION_QUERY_LIMIT: usize = 500;
 /// Placeholder dialect for D4 read-merge `session_key` predicate fragments.
 const SQLITE_DIALECT: crate::memory::session_predicate::PlaceholderDialect =
     crate::memory::session_predicate::PlaceholderDialect::Sqlite;
+
+fn sqlite_read_principal(conn: &Connection, context: &MemoryWriteContext) -> Principal {
+    let fallback = Principal {
+        user_id: "anonymous:unknown:unknown".to_string(),
+        role: Role::Anonymous,
+        projects: Vec::new(),
+        visibility_ceiling: Visibility::Private,
+        blocked_patterns: Vec::new(),
+        current_channel: context.channel.clone().unwrap_or_default(),
+        current_chat_id: context.chat_id.clone().unwrap_or_default(),
+        current_chat_type: context
+            .chat_type
+            .as_deref()
+            .map(ChatType::from_str)
+            .unwrap_or(ChatType::Dm),
+        raw_sender: context.raw_sender.clone().unwrap_or_default(),
+        acl_enforced: true,
+    };
+    if context.channel.is_some() && context.raw_sender.is_some() {
+        resolve_principal(conn, context).unwrap_or(fallback)
+    } else {
+        fallback
+    }
+}
+
+fn sqlite_owner_read_principal() -> Principal {
+    Principal {
+        user_id: "system:memory_backend".to_string(),
+        role: Role::Owner,
+        projects: Vec::new(),
+        visibility_ceiling: Visibility::Public,
+        blocked_patterns: Vec::new(),
+        current_channel: String::new(),
+        current_chat_id: String::new(),
+        current_chat_type: ChatType::Dm,
+        raw_sender: String::new(),
+        acl_enforced: false,
+    }
+}
 
 pub struct SqliteTaskEventMirror<'a> {
     pub workspace_id: &'a str,
@@ -3132,6 +3171,108 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn recall_with_context_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let unrestricted = self.recall(query, limit, session_id).await?;
+        let scoped = self
+            .recall_with_context(query, limit, session_id, Some(&context))
+            .await?;
+        let conn = self.conn.clone();
+        let query_owned = query.to_string();
+        let query_for_topics = query_owned.clone();
+        let mut selected = match mode {
+            MemoryReadMode::Enforce => scoped.clone(),
+            MemoryReadMode::Observe => unrestricted.clone(),
+        };
+        let mut selected_ids = selected
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect::<std::collections::HashSet<_>>();
+        let topic_rows = tokio::task::spawn_blocking(move || -> anyhow::Result<(Vec<MemoryEntry>, Principal)> {
+            let conn = conn.lock();
+            let principal = sqlite_read_principal(&conn, &context);
+            let topic_principal = match mode {
+                MemoryReadMode::Enforce => principal.clone(),
+                MemoryReadMode::Observe => sqlite_owner_read_principal(),
+            };
+            let mut rows = Vec::new();
+            for topic in super::topic::search_topics_fts(&conn, &query_for_topics, 3)? {
+                for entry in super::topic::query_topic_context(&conn, &topic.id, &topic_principal, limit.max(1))? {
+                    rows.push(MemoryEntry {
+                        id: entry.id,
+                        key: entry.key,
+                        content: entry.content,
+                        category: MemoryCategory::Conversation,
+                        timestamp: entry.created_at,
+                        session_id: None,
+                        score: Some(0.55),
+                        tags: None,
+                        access_count: None,
+                        useful_count: None,
+                        source: Some("topic_projection".to_string()),
+                        source_confidence: None,
+                        verification_status: None,
+                        lifecycle_state: None,
+                        compressed_from: None,
+                    });
+                }
+            }
+            Ok((rows, principal))
+        })
+        .await??;
+        for entry in topic_rows.0 {
+            if selected_ids.insert(entry.id.clone()) {
+                selected.push(entry);
+            }
+        }
+        selected.sort_by(|left, right| {
+            right
+                .score
+                .unwrap_or(0.0)
+                .partial_cmp(&left.score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        selected.truncate(limit.max(1));
+
+        let would_deny = unrestricted
+            .iter()
+            .any(|entry| !scoped.iter().any(|allowed| allowed.id == entry.id));
+        let conn = self.conn.clone();
+        let principal = topic_rows.1;
+        let selected_empty = selected.is_empty();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            log_access(
+                &conn,
+                &principal,
+                "search",
+                Some(&query_owned),
+                None,
+                Some(match mode {
+                    MemoryReadMode::Enforce => "acl_enforced",
+                    MemoryReadMode::Observe => "observe_mode",
+                }),
+                if mode == MemoryReadMode::Observe && would_deny {
+                    "would_deny"
+                } else if selected_empty {
+                    "no_results"
+                } else {
+                    "allowed"
+                },
+            );
+        })
+        .await?;
+        Ok(selected)
+    }
+
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>> {
         let conn = self.conn.clone();
         let key = key.to_string();
@@ -3168,6 +3309,96 @@ impl Memory for SqliteMemory {
             }
         })
         .await?
+    }
+
+    async fn get_with_context(
+        &self,
+        key: &str,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let conn = self.conn.clone();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<MemoryEntry>> {
+            let conn = conn.lock();
+            let principal = sqlite_read_principal(&conn, &context);
+            let (scope_sql, scope_params) = principal.build_sql_scope();
+            let mut query_params = Vec::with_capacity(scope_params.len() + 1);
+            query_params.push(Value::from(key.clone()));
+            query_params.extend(scope_params);
+            let sql = format!(
+                "SELECT id, key, content, category, created_at, session_id, useful_count
+                 FROM memories WHERE key = ?1 AND ({scope_sql}) LIMIT 1"
+            );
+            let entry = conn
+                .query_row(&sql, params_from_iter(query_params), |row| {
+                    Ok(MemoryEntry {
+                        id: row.get(0)?,
+                        key: row.get(1)?,
+                        content: row.get(2)?,
+                        category: Self::str_to_category(&row.get::<_, String>(3)?),
+                        timestamp: row.get(4)?,
+                        session_id: row.get(5)?,
+                        score: None,
+                        tags: None,
+                        access_count: None,
+                        useful_count: row.get(6)?,
+                        source: None,
+                        source_confidence: None,
+                        verification_status: None,
+                        lifecycle_state: None,
+                        compressed_from: None,
+                    })
+                })
+                .optional()?;
+            let mut visible = post_filter(entry.into_iter().collect(), &principal, |entry| entry.content.as_str());
+            Ok(visible.pop())
+        })
+        .await?
+    }
+
+    async fn get_with_context_mode(
+        &self,
+        key: &str,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let context = context.cloned().unwrap_or_default();
+        let scoped = self.get_with_context(key, Some(&context)).await?;
+        let unrestricted = self.get(key).await?;
+        let selected = match mode {
+            MemoryReadMode::Enforce => scoped.clone(),
+            MemoryReadMode::Observe => unrestricted.clone(),
+        };
+        let would_deny = unrestricted.is_some() && scoped.is_none();
+        let memory_id = selected.as_ref().map(|entry| entry.id.clone());
+        let selected_is_some = selected.is_some();
+        let key = key.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            let principal = sqlite_read_principal(&conn, &context);
+            log_access(
+                &conn,
+                &principal,
+                "get",
+                None,
+                memory_id.as_deref().or(Some(key.as_str())),
+                Some(match mode {
+                    MemoryReadMode::Enforce => "acl_enforced",
+                    MemoryReadMode::Observe => "observe_mode",
+                }),
+                if mode == MemoryReadMode::Observe && would_deny {
+                    "would_deny"
+                } else if selected_is_some {
+                    "allowed"
+                } else {
+                    "denied"
+                },
+            );
+        })
+        .await?;
+        Ok(selected)
     }
 
     async fn list(

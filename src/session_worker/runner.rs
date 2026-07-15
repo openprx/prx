@@ -19,7 +19,7 @@ use crate::tools::{self, Tool};
 use anyhow::{Context, Result};
 use std::future::Future;
 use std::io::Write;
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_SUB_AGENT_SYSTEM_PROMPT: &str = "\
@@ -448,6 +448,16 @@ fn validate_worker_cli_overrides(
     Ok(())
 }
 
+fn validate_parent_memory_backend(manifest: &WorkerManifest, configured_memory_backend: &str) -> Result<()> {
+    if manifest.memory_backend.trim() != configured_memory_backend {
+        anyhow::bail!(
+            "session-worker parent memory backend mismatch: manifest={}, config={configured_memory_backend}",
+            manifest.memory_backend
+        );
+    }
+    Ok(())
+}
+
 async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: Option<&str>) -> Result<WorkerResult> {
     let explicit_config_dir = explicit_config_dir
         .map(str::trim)
@@ -474,6 +484,9 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             generation_after
         );
     }
+    let configured_memory_backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    validate_parent_memory_backend(&manifest, &configured_memory_backend)?;
     config.workspace_dir = manifest.workspace_dir.clone();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
@@ -491,10 +504,29 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
         &provider_runtime_options,
     )?);
 
-    let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new_with_path_and_acl(
-        manifest.memory_db_path.clone(),
-        config.memory.acl_enabled,
-    )?);
+    let memory: Arc<dyn Memory> = if normalized_worker_memory_strategy(&manifest)? == "shared_fabric" {
+        let parent_workspace = manifest
+            .memory_workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .context("shared_fabric session-worker requires parent memory_workspace_id")?;
+        Arc::from(crate::memory::create_memory_with_storage_and_routes_with_acl(
+            &config.memory,
+            &config.embedding_routes,
+            Some(&config.storage.provider.config),
+            &parent_workspace,
+            manifest.api_key.as_deref().or(config.api_key.as_deref()),
+            &config.identity_bindings,
+            &config.user_policies,
+        )?)
+    } else {
+        Arc::new(crate::memory::SqliteMemory::new_with_path_and_acl(
+            manifest.memory_db_path.clone(),
+            config.memory.acl_enabled,
+        )?)
+    };
     let memory_workspace_id = manifest
         .memory_workspace_id
         .as_deref()
@@ -553,7 +585,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
 
     let tools_registry = select_tools_for_worker(full_tools, &manifest.allowed_tools)?;
     let system_prompt = resolve_system_prompt(&manifest);
-    let shared_context = load_worker_shared_context(&manifest, &config).await;
+    let shared_context = load_worker_shared_context(&manifest, &config, memory.as_ref()).await;
 
     let run_future = async {
         let user_task = if shared_context.trim().is_empty() {
@@ -852,21 +884,12 @@ fn shared_worker_workspace_id(manifest: &WorkerManifest) -> String {
         .unwrap_or_else(|| manifest.workspace_dir.to_string_lossy().to_string())
 }
 
-async fn load_worker_shared_context(manifest: &WorkerManifest, config: &Config) -> String {
+async fn load_worker_shared_context(manifest: &WorkerManifest, config: &Config, shared_memory: &dyn Memory) -> String {
     let strategy = manifest.memory_strategy.as_deref().unwrap_or("shared_fabric");
     if strategy == "isolated_private" {
         return String::new();
     }
 
-    let db_path = if strategy == "hybrid" {
-        manifest
-            .shared_memory_db_path
-            .as_ref()
-            .unwrap_or(&manifest.memory_db_path)
-            .clone()
-    } else {
-        manifest.memory_db_path.clone()
-    };
     let workspace_id = if strategy == "hybrid" {
         shared_worker_workspace_id(manifest)
     } else {
@@ -876,13 +899,6 @@ async fn load_worker_shared_context(manifest: &WorkerManifest, config: &Config) 
             .unwrap_or_else(|| manifest.workspace_dir.to_string_lossy().to_string())
     };
 
-    let shared_memory = match crate::memory::SqliteMemory::new_with_path_and_acl(db_path, config.memory.acl_enabled) {
-        Ok(memory) => memory,
-        Err(error) => {
-            tracing::warn!(run_id = %manifest.run_id, "failed to open shared worker context memory: {error}");
-            return String::new();
-        }
-    };
     let runtime_envelope = worker_runtime_envelope_for_workspace(manifest, workspace_id);
     let semantic_scope = match manifest.scope_chat_type.as_deref() {
         Some(chat_type)
@@ -897,7 +913,7 @@ async fn load_worker_shared_context(manifest: &WorkerManifest, config: &Config) 
     };
 
     build_context_with_shared_events_and_scope(
-        &shared_memory,
+        shared_memory,
         runtime_envelope.memory_principal(),
         &manifest.task,
         config.memory.min_relevance_score,
@@ -1081,6 +1097,7 @@ mod tests {
             memory_db_path: workspace.join("memory").join("brain.db"),
             memory_workspace_id: Some(workspace.to_string_lossy().to_string()),
             memory_strategy: Some("shared_fabric".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(workspace.join("memory").join("brain.db")),
             worker_memory_db_path: Some(workspace.join("worker.db")),
             agent_id: None,
@@ -1145,6 +1162,34 @@ mod tests {
             .to_string();
         clear_expiry_env();
         assert_eq!(error, crate::config::HYBRID_PROCESS_MEMORY_UNAVAILABLE);
+    }
+
+    #[test]
+    fn worker_manifest_rejects_parent_backend_drift() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mut manifest = base_manifest(tmp.path(), "capability-a");
+        manifest.memory_backend = "postgres".to_string();
+
+        let error = validate_parent_memory_backend(&manifest, "sqlite").unwrap_err();
+        assert!(error.to_string().contains("manifest=postgres, config=sqlite"));
+        validate_parent_memory_backend(&manifest, "postgres").unwrap();
+    }
+
+    #[test]
+    fn shared_worker_uses_configured_parent_memory_factory() {
+        let source = include_str!("runner.rs");
+        let shared_branch = source
+            .split_once(
+                "let memory: Arc<dyn Memory> = if normalized_worker_memory_strategy(&manifest)? == \"shared_fabric\"",
+            )
+            .unwrap()
+            .1
+            .split_once("} else {")
+            .unwrap()
+            .0;
+        assert!(shared_branch.contains("create_memory_with_storage_and_routes_with_acl"));
+        assert!(shared_branch.contains("Some(&config.storage.provider.config)"));
+        assert!(!shared_branch.contains("SqliteMemory"));
     }
 
     #[test]
@@ -1464,6 +1509,7 @@ mod tests {
             memory_db_path: worker.path().join("brain.db"),
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
             memory_strategy: Some("hybrid".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(shared_db),
             worker_memory_db_path: Some(worker.path().join("brain.db")),
             agent_id: None,
@@ -1487,7 +1533,7 @@ mod tests {
             parent_run_id: Some("run-parent".to_string()),
             compaction_config: None,
         };
-        let context = load_worker_shared_context(&manifest, &Config::default()).await;
+        let context = load_worker_shared_context(&manifest, &Config::default(), &shared_memory).await;
 
         assert!(context.contains("parent shared context"));
     }
@@ -1534,6 +1580,7 @@ mod tests {
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
             memory_strategy: Some("hybrid".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(shared_db.clone()),
             worker_memory_db_path: Some(worker.path().join("brain.db")),
             agent_id: Some("agent-a".to_string()),
@@ -1663,6 +1710,7 @@ mod tests {
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
             memory_strategy: Some("hybrid".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(shared_db),
             worker_memory_db_path: Some(worker.path().join("brain.db")),
             agent_id: None,
@@ -1738,6 +1786,7 @@ mod tests {
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
             memory_strategy: Some("shared_fabric".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(std::path::PathBuf::from("/tmp/ws/memory/brain.db")),
             worker_memory_db_path: Some(std::path::PathBuf::from("/tmp/worker/brain.db")),
             agent_id: Some("agent-a".to_string()),
@@ -1806,6 +1855,7 @@ mod tests {
             memory_db_path: std::path::PathBuf::from("/tmp/parent/memory/brain.db"),
             memory_workspace_id: Some("/tmp/parent".to_string()),
             memory_strategy: Some("shared_fabric".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(std::path::PathBuf::from("/tmp/parent/memory/brain.db")),
             worker_memory_db_path: Some(std::path::PathBuf::from("/tmp/worker/brain.db")),
             agent_id: Some("agent-a".to_string()),

@@ -5863,9 +5863,9 @@ impl Config {
                 .unwrap_or(self.storage.provider.config.provider.as_str())
                 .trim()
                 .to_ascii_lowercase();
-            if !matches!(webhook_backend.as_str(), "sqlite" | "lucid") {
+            if !matches!(webhook_backend.as_str(), "sqlite" | "lucid" | "postgres") {
                 anyhow::bail!(
-                    "standalone webhook durable ingestion requires memory backend 'sqlite' or 'lucid' (got '{webhook_backend}')"
+                    "standalone webhook durable ingestion requires memory backend 'sqlite', 'lucid', or 'postgres' (got '{webhook_backend}')"
                 );
             }
         }

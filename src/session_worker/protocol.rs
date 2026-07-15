@@ -25,6 +25,11 @@ pub struct WorkerManifest {
     pub memory_workspace_id: Option<String>,
     #[serde(default)]
     pub memory_strategy: Option<String>,
+    /// Effective parent memory backend selected by the parent process. The
+    /// worker verifies this against its sealed config generation before opening
+    /// shared memory, so shared mode cannot silently fall back to SQLite.
+    #[serde(default)]
+    pub memory_backend: String,
     #[serde(default)]
     pub shared_memory_db_path: Option<PathBuf>,
     #[serde(default)]
@@ -130,6 +135,7 @@ mod tests {
             memory_db_path: PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/parent-ws".into()),
             memory_strategy: Some("shared_fabric".into()),
+            memory_backend: "sqlite".into(),
             shared_memory_db_path: Some(PathBuf::from("/tmp/parent-ws/memory/brain.db")),
             worker_memory_db_path: Some(PathBuf::from("/tmp/ws/brain.db")),
             agent_id: Some("worker-agent".into()),
@@ -169,6 +175,7 @@ mod tests {
         assert_eq!(parsed.allowed_tools.len(), 2);
         assert_eq!(parsed.memory_workspace_id.as_deref(), Some("/tmp/parent-ws"));
         assert_eq!(parsed.memory_strategy.as_deref(), Some("shared_fabric"));
+        assert_eq!(parsed.memory_backend, "sqlite");
         assert_eq!(
             parsed.shared_memory_db_path.as_deref(),
             Some(PathBuf::from("/tmp/parent-ws/memory/brain.db").as_path())

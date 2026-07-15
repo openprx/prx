@@ -1,105 +1,26 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::memory::Memory;
-use crate::memory::principal::{
-    ChatType, MemoryWriteContext, Principal, Role, Visibility, log_access, post_filter, resolve_principal,
-};
-use crate::memory::topic;
+use crate::memory::principal::MemoryWriteContext;
+use crate::memory::{Memory, MemoryEntry, MemoryReadMode};
 use async_trait::async_trait;
-use rusqlite::{Connection, params_from_iter, types::Value};
+#[cfg(test)]
+use rusqlite::Connection;
 use serde_json::json;
-use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 // Behavior-limits Phase 1: DEFAULT 5 -> 10, MAX 100 -> 500 (fuller recall).
 const DEFAULT_MAX_RESULTS: usize = 10;
 const MAX_RESULTS_LIMIT: usize = 500;
 
-static OBSERVE_TOTAL_QUERIES: AtomicU64 = AtomicU64::new(0);
-static OBSERVE_WOULD_DENY_QUERIES: AtomicU64 = AtomicU64::new(0);
-
-/// Search workspace memory using SQLite (ACL-aware), with file fallback.
+/// Search the configured memory backend with ACL-aware read semantics.
 pub struct MemorySearchTool {
-    workspace_dir: PathBuf,
-    _memory: Arc<dyn Memory>,
+    memory: Arc<dyn Memory>,
     acl_enabled: bool,
 }
 
 impl MemorySearchTool {
-    pub fn new(workspace_dir: PathBuf, memory: Arc<dyn Memory>, acl_enabled: bool) -> Self {
-        Self {
-            workspace_dir,
-            _memory: memory,
-            acl_enabled,
-        }
+    pub fn new(_workspace_dir: std::path::PathBuf, memory: Arc<dyn Memory>, acl_enabled: bool) -> Self {
+        Self { memory, acl_enabled }
     }
-
-    fn db_path(&self) -> PathBuf {
-        self.workspace_dir.join("memory").join("brain.db")
-    }
-
-    fn memory_files(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
-        let workspace = std::fs::canonicalize(&self.workspace_dir)
-            .map_err(|e| anyhow::anyhow!("Failed to resolve workspace path: {e}"))?;
-
-        let mut files = Vec::new();
-        let memory_md = workspace.join("MEMORY.md");
-        if memory_md.exists() && memory_md.is_file() {
-            files.push(("MEMORY.md".to_string(), memory_md));
-        }
-
-        let memory_dir = workspace.join("memory");
-        if memory_dir.exists() && memory_dir.is_dir() {
-            for entry in
-                std::fs::read_dir(memory_dir).map_err(|e| anyhow::anyhow!("Failed to read memory directory: {e}"))?
-            {
-                let entry = entry.map_err(|e| anyhow::anyhow!("Failed to read memory entry: {e}"))?;
-                let path = entry.path();
-
-                if !path.is_file() {
-                    continue;
-                }
-
-                if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                    continue;
-                }
-
-                let file_name = match path.file_name().and_then(|n| n.to_str()) {
-                    Some(name) => name,
-                    None => continue,
-                };
-
-                let resolved = std::fs::canonicalize(&path)
-                    .map_err(|e| anyhow::anyhow!("Failed to resolve memory file '{}': {e}", path.display()))?;
-
-                if !resolved.starts_with(&workspace) {
-                    continue;
-                }
-
-                files.push((format!("memory/{file_name}"), resolved));
-            }
-        }
-
-        files.sort_by(|a, b| a.0.cmp(&b.0));
-        Ok(files)
-    }
-}
-
-#[derive(Debug, Clone)]
-struct MatchRow {
-    id: String,
-    key: String,
-    content: String,
-    score: f64,
-}
-
-#[derive(Debug)]
-struct FallbackMatchRow {
-    path: String,
-    line: usize,
-    score: f64,
-    snippet: String,
 }
 
 fn tokenize_query(query: &str) -> Vec<String> {
@@ -178,243 +99,6 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
     })
 }
 
-fn fallback_principal(ctx: &MemoryWriteContext) -> Principal {
-    Principal {
-        user_id: "anonymous:unknown:unknown".to_string(),
-        role: Role::Anonymous,
-        projects: Vec::new(),
-        visibility_ceiling: Visibility::Private,
-        blocked_patterns: Vec::new(),
-        current_channel: ctx.channel.clone().unwrap_or_default(),
-        current_chat_id: ctx.chat_id.clone().unwrap_or_default(),
-        current_chat_type: ctx.chat_type.as_deref().map(ChatType::from_str).unwrap_or(ChatType::Dm),
-        raw_sender: ctx.raw_sender.clone().unwrap_or_default(),
-        acl_enforced: true,
-    }
-}
-
-fn anonymous_principal() -> Principal {
-    Principal {
-        user_id: "anonymous:unknown:unknown".to_string(),
-        role: Role::Anonymous,
-        projects: Vec::new(),
-        visibility_ceiling: Visibility::Private,
-        blocked_patterns: Vec::new(),
-        current_channel: String::new(),
-        current_chat_id: String::new(),
-        current_chat_type: ChatType::Dm,
-        raw_sender: String::new(),
-        acl_enforced: true,
-    }
-}
-
-fn owner_principal() -> Principal {
-    Principal {
-        user_id: "system:tool".to_string(),
-        role: Role::Owner,
-        projects: Vec::new(),
-        visibility_ceiling: Visibility::Public,
-        blocked_patterns: Vec::new(),
-        current_channel: String::new(),
-        current_chat_id: String::new(),
-        current_chat_type: ChatType::Dm,
-        raw_sender: String::new(),
-        acl_enforced: false,
-    }
-}
-
-fn fetch_fts_with_scope(
-    conn: &Connection,
-    query: &str,
-    max_results: usize,
-    scope_sql: &str,
-    scope_params: &[Value],
-) -> anyhow::Result<Vec<MatchRow>> {
-    let fts_query: String = crate::memory::topic::build_safe_fts_query(query);
-
-    if fts_query.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let sql = format!(
-        "SELECT m.id, m.key, m.content, bm25(memories_fts) as bm25_score
-         FROM memories_fts f
-         JOIN memories m ON m.rowid = f.rowid
-         WHERE memories_fts MATCH ? AND ({scope_sql})
-         ORDER BY bm25_score ASC
-         LIMIT ?"
-    );
-
-    let mut params: Vec<Value> = Vec::with_capacity(scope_params.len() + 2);
-    params.push(Value::from(fts_query));
-    params.extend(scope_params.iter().cloned());
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        params.push(Value::from(max_results as i64));
-    }
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| {
-        let score: f64 = row.get(3)?;
-        Ok(MatchRow {
-            id: row.get(0)?,
-            key: row.get(1)?,
-            content: row.get(2)?,
-            score: -score,
-        })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn fetch_semantic_like_with_scope(
-    conn: &Connection,
-    query: &str,
-    max_results: usize,
-    scope_sql: &str,
-    scope_params: &[Value],
-) -> anyhow::Result<Vec<MatchRow>> {
-    let sql = format!(
-        "SELECT id, key, content, 
-                CASE
-                    WHEN lower(content) = lower(?) THEN 1.0
-                    WHEN lower(content) LIKE lower(?) THEN 0.8
-                    WHEN lower(key) LIKE lower(?) THEN 0.6
-                    ELSE 0.0
-                END as semantic_score
-         FROM memories
-         WHERE ({scope_sql})
-           AND (lower(content) LIKE lower(?) OR lower(key) LIKE lower(?))
-         ORDER BY semantic_score DESC, updated_at DESC
-         LIMIT ?"
-    );
-
-    let query_like = format!("%{query}%");
-    let mut params: Vec<Value> = Vec::with_capacity(scope_params.len() + 6);
-    params.push(Value::from(query.to_string()));
-    params.push(Value::from(query_like.clone()));
-    params.push(Value::from(query_like.clone()));
-    params.extend(scope_params.iter().cloned());
-    params.push(Value::from(query_like.clone()));
-    params.push(Value::from(query_like));
-    #[allow(clippy::cast_possible_wrap)]
-    {
-        params.push(Value::from(max_results as i64));
-    }
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params_from_iter(params), |row| {
-        Ok(MatchRow {
-            id: row.get(0)?,
-            key: row.get(1)?,
-            content: row.get(2)?,
-            score: row.get(3)?,
-        })
-    })?;
-
-    let mut out = Vec::new();
-    for row in rows {
-        out.push(row?);
-    }
-    Ok(out)
-}
-
-fn merge_results(
-    fts: Vec<MatchRow>,
-    semantic: Vec<MatchRow>,
-    terms: &[String],
-    min_score: f64,
-    max_results: usize,
-) -> Vec<MatchRow> {
-    let mut merged: HashMap<String, MatchRow> = HashMap::new();
-
-    for mut row in fts.into_iter().chain(semantic) {
-        let score = row.score.max(compute_score(&row.content, terms));
-        if score < min_score || score <= 0.0 {
-            continue;
-        }
-        row.score = score;
-
-        match merged.get_mut(&row.id) {
-            Some(existing) if row.score > existing.score => *existing = row,
-            None => {
-                merged.insert(row.id.clone(), row);
-            }
-            _ => {}
-        }
-    }
-
-    let mut out = merged.into_values().collect::<Vec<_>>();
-    out.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.key.cmp(&b.key))
-    });
-    out.truncate(max_results);
-    out
-}
-
-fn search_rows_with_scope(
-    conn: &Connection,
-    query: &str,
-    max_results: usize,
-    min_score: f64,
-    scope_sql: &str,
-    scope_params: &[Value],
-) -> anyhow::Result<Vec<MatchRow>> {
-    let terms = tokenize_query(query);
-    let fts_rows = fetch_fts_with_scope(conn, query, max_results, scope_sql, scope_params)?;
-    let semantic_rows = fetch_semantic_like_with_scope(conn, query, max_results, scope_sql, scope_params)?;
-    Ok(merge_results(fts_rows, semantic_rows, &terms, min_score, max_results))
-}
-
-fn search_topic_rows_with_scope(
-    conn: &Connection,
-    query: &str,
-    principal: &Principal,
-    max_results: usize,
-) -> anyhow::Result<Vec<MatchRow>> {
-    // Keep topic probing intentionally bounded to the top 3 topic hits.
-    // This caps query fan-out and keeps retrieval deterministic under load.
-    let topics = topic::search_topics_fts(conn, query, 3)?;
-    if topics.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut rows = Vec::new();
-    let per_topic_limit = max_results.max(1);
-    for hit in topics {
-        let scoped = topic::query_topic_context(conn, &hit.id, principal, per_topic_limit)?;
-        rows.extend(scoped.into_iter().map(|entry| MatchRow {
-            id: entry.id,
-            key: entry.key,
-            content: entry.content,
-            score: 0.55,
-        }));
-    }
-
-    Ok(rows)
-}
-
-fn observe_log_query(would_deny_count: usize) {
-    let total = OBSERVE_TOTAL_QUERIES.fetch_add(1, Ordering::Relaxed) + 1;
-    if would_deny_count > 0 {
-        OBSERVE_WOULD_DENY_QUERIES.fetch_add(1, Ordering::Relaxed);
-    }
-    let would_deny = OBSERVE_WOULD_DENY_QUERIES.load(Ordering::Relaxed);
-    tracing::info!(
-        would_deny_count,
-        total_queries = total,
-        would_deny_queries = would_deny,
-        "memory acl observe metrics"
-    );
-}
-
 #[async_trait]
 impl Tool for MemorySearchTool {
     fn name(&self) -> &str {
@@ -422,7 +106,7 @@ impl Tool for MemorySearchTool {
     }
 
     fn description(&self) -> &str {
-        "Search memories from SQLite with ACL observe/enforce mode; file fallback is only used when ACL is disabled."
+        "Search memories from the configured backend with ACL observe/enforce mode."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -468,97 +152,40 @@ impl Tool for MemorySearchTool {
         let max_results = parse_max_results(&args);
         let min_score = parse_min_score(&args);
 
-        let db_path = self.db_path();
-        if !db_path.exists() {
-            if self.acl_enabled {
-                return Ok(ToolResult {
-                    success: true,
-                    output: format!("No matches found for query: '{trimmed_query}'"),
-                    error: None,
-                });
-            }
-            return self.fallback_search_files(trimmed_query, max_results, min_score);
-        }
-
-        let conn = match Connection::open(&db_path) {
-            Ok(conn) => conn,
-            Err(error) => {
-                if self.acl_enabled {
-                    tracing::warn!("memory_search sqlite open failed while acl is enabled: {error}");
-                    return Ok(ToolResult {
-                        success: true,
-                        output: format!("No matches found for query: '{trimmed_query}'"),
-                        error: None,
-                    });
-                }
-                tracing::warn!("memory_search sqlite open failed, using file fallback: {error}");
-                return self.fallback_search_files(trimmed_query, max_results, min_score);
-            }
+        let scope_ctx = parse_scope_ctx(&args).unwrap_or_default();
+        let mode = if self.acl_enabled {
+            MemoryReadMode::Enforce
+        } else {
+            MemoryReadMode::Observe
         };
-
-        let scope_ctx = parse_scope_ctx(&args);
-        let principal = scope_ctx.as_ref().map_or_else(anonymous_principal, |ctx| {
-            resolve_principal(&conn, ctx).unwrap_or_else(|_| fallback_principal(ctx))
-        });
-        let (scope_sql, scope_params) = principal.build_sql_scope();
-
-        if self.acl_enabled && principal.acl_enforced {
-            let scoped =
-                search_rows_with_scope(&conn, trimmed_query, max_results, min_score, &scope_sql, &scope_params)?;
-            let scoped_topic = search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
-            let terms = tokenize_query(trimmed_query);
-            let merged = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
-            let filtered = post_filter(merged, &principal, |row| row.content.as_str());
-            log_access(
-                &conn,
-                &principal,
-                "search",
-                Some(trimmed_query),
-                None,
-                Some("acl_enforced"),
-                if filtered.is_empty() { "no_results" } else { "allowed" },
-            );
-            return Ok(render_search_result(trimmed_query, filtered));
-        }
-
-        // Observe mode: run ACL path for audit only, but return unfiltered results.
-        let scoped = search_rows_with_scope(&conn, trimmed_query, max_results, min_score, &scope_sql, &scope_params)?;
-        let scoped_topic = search_topic_rows_with_scope(&conn, trimmed_query, &principal, max_results)?;
         let terms = tokenize_query(trimmed_query);
-        let scoped_all = merge_results(scoped, scoped_topic, &terms, min_score, max_results);
-        let filtered = post_filter(scoped_all.clone(), &principal, |row| row.content.as_str());
-        let all_rows_base = search_rows_with_scope(&conn, trimmed_query, max_results, min_score, "1=1", &[])?;
-        let all_topic = search_topic_rows_with_scope(&conn, trimmed_query, &owner_principal(), max_results)?;
-        let all_rows = merge_results(all_rows_base, all_topic, &terms, min_score, max_results);
-
-        let denied_by_scope = all_rows
-            .iter()
-            .filter(|row| !scoped_all.iter().any(|allowed| allowed.id == row.id))
-            .count();
-        let denied_by_post = scoped_all
-            .iter()
-            .filter(|row| !filtered.iter().any(|allowed| allowed.id == row.id))
-            .count();
-        let would_deny_count = denied_by_scope + denied_by_post;
-
-        observe_log_query(would_deny_count);
-        log_access(
-            &conn,
-            &principal,
-            "search",
-            Some(trimmed_query),
-            None,
-            Some("observe_mode"),
-            if would_deny_count > 0 {
-                "would_deny"
-            } else if all_rows.is_empty() {
-                "no_results"
-            } else {
-                "allowed"
-            },
-        );
-
-        Ok(render_search_result(trimmed_query, all_rows))
+        let mut entries = self
+            .memory
+            .recall_with_context_mode(
+                trimmed_query,
+                max_results.saturating_mul(3),
+                None,
+                Some(&scope_ctx),
+                mode,
+            )
+            .await?;
+        entries.retain(|entry| {
+            let score = entry
+                .score
+                .unwrap_or_else(|| compute_score(&entry.content, &terms))
+                .max(compute_score(&entry.content, &terms));
+            score > 0.0 && score >= min_score
+        });
+        entries.sort_by(|left, right| {
+            right
+                .score
+                .unwrap_or_else(|| compute_score(&right.content, &terms))
+                .partial_cmp(&left.score.unwrap_or_else(|| compute_score(&left.content, &terms)))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.key.cmp(&right.key))
+        });
+        entries.truncate(max_results);
+        Ok(render_search_result(trimmed_query, entries))
     }
 
     fn tier(&self) -> ToolTier {
@@ -570,81 +197,7 @@ impl Tool for MemorySearchTool {
     }
 }
 
-impl MemorySearchTool {
-    fn fallback_search_files(
-        &self,
-        trimmed_query: &str,
-        max_results: usize,
-        min_score: f64,
-    ) -> anyhow::Result<ToolResult> {
-        let terms = tokenize_query(trimmed_query);
-        let files = self.memory_files()?;
-        if files.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: "No memory data found in SQLite or fallback files.".to_string(),
-                error: None,
-            });
-        }
-
-        let mut matches: Vec<FallbackMatchRow> = Vec::new();
-        for (relative_path, full_path) in files {
-            let contents = std::fs::read_to_string(&full_path)
-                .map_err(|e| anyhow::anyhow!("Failed to read memory file '{}': {e}", full_path.display()))?;
-            for (idx, line) in contents.lines().enumerate() {
-                let line_no = idx + 1;
-                let score = compute_score(line, &terms);
-                if score < min_score || score <= 0.0 {
-                    continue;
-                }
-                matches.push(FallbackMatchRow {
-                    path: relative_path.clone(),
-                    line: line_no,
-                    score,
-                    snippet: line.trim().to_string(),
-                });
-            }
-        }
-
-        if matches.is_empty() {
-            return Ok(ToolResult {
-                success: true,
-                output: format!("No matches found for query: '{trimmed_query}'"),
-                error: None,
-            });
-        }
-
-        matches.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.path.cmp(&b.path))
-                .then_with(|| a.line.cmp(&b.line))
-        });
-        matches.truncate(max_results);
-
-        let mut output = format!("Found {} matches:\n", matches.len());
-        for row in matches {
-            let snippet_text = if row.snippet.is_empty() {
-                "(blank line)"
-            } else {
-                &row.snippet
-            };
-            output.push_str(&format!(
-                "- key: {}:{}\n  content: {}\n  snippet: {}\n",
-                row.path, row.line, snippet_text, snippet_text
-            ));
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output,
-            error: None,
-        })
-    }
-}
-
-fn render_search_result(trimmed_query: &str, rows: Vec<MatchRow>) -> ToolResult {
+fn render_search_result(trimmed_query: &str, rows: Vec<MemoryEntry>) -> ToolResult {
     if rows.is_empty() {
         return ToolResult {
             success: true,
@@ -1167,5 +720,17 @@ mod tests {
         assert!(schema["properties"]["maxResults"].is_object());
         assert!(schema["properties"]["max_results"].is_object());
         assert!(schema["properties"]["minScore"].is_object());
+    }
+
+    #[test]
+    fn production_search_does_not_open_sqlite_or_scan_files() {
+        let production = include_str!("memory_search.rs")
+            .rsplit_once("\n#[cfg(test)]\nmod tests {")
+            .unwrap()
+            .0;
+        assert!(production.contains("recall_with_context_mode"));
+        assert!(!production.contains("Connection::open"));
+        assert!(!production.contains("brain.db"));
+        assert!(!production.contains("read_to_string"));
     }
 }

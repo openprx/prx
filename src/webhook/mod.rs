@@ -15,6 +15,7 @@ use axum::{
 };
 use chrono::Utc;
 use parking_lot::Mutex as ParkingMutex;
+use postgres::{Client as PostgresClient, NoTls};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -135,10 +136,26 @@ trait WebhookRepository: Send + Sync {
     async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()>;
 }
 
+#[derive(Clone)]
+pub(crate) struct WebhookRepositoryHandle {
+    repository: Arc<dyn WebhookRepository>,
+}
+
 #[derive(Debug)]
 struct SqliteWebhookRepository {
     conn: Arc<ParkingMutex<Connection>>,
     workspace_id: Arc<str>,
+}
+
+#[derive(Clone)]
+struct PostgresWebhookRepository {
+    client: Arc<ParkingMutex<PostgresClient>>,
+    workspace_id: Arc<str>,
+    qualified_memories: Arc<str>,
+    qualified_memory_events: Arc<str>,
+    qualified_topics: Arc<str>,
+    qualified_topic_participants: Arc<str>,
+    qualified_ingestions: Arc<str>,
 }
 
 #[derive(Debug)]
@@ -498,35 +515,536 @@ impl SqliteWebhookRepository {
     }
 }
 
+impl PostgresWebhookRepository {
+    fn new(
+        db_url: &str,
+        schema: &str,
+        memory_table: &str,
+        connect_timeout_secs: Option<u64>,
+        workspace_id: String,
+    ) -> Result<Self> {
+        crate::memory::postgres::validate_identifier(schema, "storage schema")?;
+        crate::memory::postgres::validate_identifier(memory_table, "storage table")?;
+
+        // Initialize the authoritative memory tables through the configured
+        // backend before attaching webhook-owned topic/ingestion projections.
+        let _memory = crate::memory::PostgresMemory::new(db_url, schema, memory_table, connect_timeout_secs)?;
+
+        let schema_ident = crate::memory::postgres::quote_identifier(schema);
+        let qualify_related = |suffix: &str| -> Result<String> {
+            let table = crate::memory::postgres::related_table_name(memory_table, suffix)?;
+            Ok(format!(
+                "{schema_ident}.{}",
+                crate::memory::postgres::quote_identifier(&table)
+            ))
+        };
+        let qualified_memories = format!(
+            "{schema_ident}.{}",
+            crate::memory::postgres::quote_identifier(memory_table)
+        );
+        let qualified_memory_events = qualify_related("_memory_events")?;
+        let qualified_topics = qualify_related("_topics")?;
+        let qualified_topic_participants = qualify_related("_topic_participants")?;
+        let qualified_ingestions = qualify_related("_webhook_ingestions")?;
+        let ingestion_status_index = qualify_related("_wh_ingest_status_idx")?;
+        let ingestion_external_index = qualify_related("_wh_ingest_external_idx")?;
+        let topics_external_index = qualify_related("_wh_topics_external_idx")?;
+
+        let mut postgres_config: postgres::Config = db_url
+            .parse()
+            .context("invalid PostgreSQL connection URL for webhook repository")?;
+        if let Some(timeout_secs) = connect_timeout_secs {
+            postgres_config.connect_timeout(Duration::from_secs(timeout_secs.min(300)));
+        }
+        let mut client = postgres_config
+            .connect(NoTls)
+            .context("failed to connect to PostgreSQL webhook repository")?;
+        client
+            .batch_execute(&format!(
+                "
+                CREATE TABLE IF NOT EXISTS {qualified_topics} (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    external_id TEXT,
+                    fingerprint TEXT NOT NULL UNIQUE,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    external_url TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL,
+                    resolved_at TIMESTAMPTZ
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS {topics_external_index}
+                    ON {qualified_topics}(project, external_id)
+                    WHERE external_id IS NOT NULL;
+
+                CREATE TABLE IF NOT EXISTS {qualified_topic_participants} (
+                    topic_id TEXT NOT NULL,
+                    user_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    joined_at TIMESTAMPTZ NOT NULL,
+                    PRIMARY KEY(topic_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS {qualified_ingestions} (
+                    ingestion_key TEXT PRIMARY KEY,
+                    event_identity TEXT NOT NULL UNIQUE,
+                    request_hash TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    project TEXT,
+                    external_id TEXT NOT NULL,
+                    event_type TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK(status IN ('pending', 'committed', 'failed')),
+                    generation BIGINT NOT NULL,
+                    lease_expires_at BIGINT,
+                    topic_id TEXT,
+                    memory_key TEXT,
+                    last_error TEXT,
+                    created_at TIMESTAMPTZ NOT NULL,
+                    updated_at TIMESTAMPTZ NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS {ingestion_status_index}
+                    ON {qualified_ingestions}(status, lease_expires_at);
+                CREATE INDEX IF NOT EXISTS {ingestion_external_index}
+                    ON {qualified_ingestions}(source, project, external_id, event_type);
+                "
+            ))
+            .context("failed to initialize PostgreSQL webhook repository schema")?;
+
+        Ok(Self {
+            client: Arc::new(ParkingMutex::new(client)),
+            workspace_id: Arc::from(workspace_id),
+            qualified_memories: Arc::from(qualified_memories),
+            qualified_memory_events: Arc::from(qualified_memory_events),
+            qualified_topics: Arc::from(qualified_topics),
+            qualified_topic_participants: Arc::from(qualified_topic_participants),
+            qualified_ingestions: Arc::from(qualified_ingestions),
+        })
+    }
+
+    fn existing_ingestion(
+        tx: &mut postgres::Transaction<'_>,
+        qualified_ingestions: &str,
+        ingestion_key: &str,
+        event_identity: &str,
+    ) -> Result<Option<ExistingIngestion>> {
+        let row = tx.query_opt(
+            &format!(
+                "SELECT ingestion_key, event_identity, request_hash, status, generation,
+                        lease_expires_at, topic_id
+                   FROM {qualified_ingestions}
+                  WHERE ingestion_key = $1 OR event_identity = $2
+                  ORDER BY CASE WHEN ingestion_key = $1 THEN 0 ELSE 1 END
+                  LIMIT 1
+                  FOR UPDATE"
+            ),
+            &[&ingestion_key, &event_identity],
+        )?;
+        Ok(row.map(|row| ExistingIngestion {
+            ingestion_key: row.get(0),
+            event_identity: row.get(1),
+            request_hash: row.get(2),
+            status: row.get(3),
+            generation: row.get(4),
+            lease_expires_at: row.get(5),
+            topic_id: row.get(6),
+        }))
+    }
+
+    fn claim_blocking(
+        &self,
+        ingestion_key: String,
+        event_identity: String,
+        request_hash: String,
+        event: &WebhookEvent,
+    ) -> Result<WebhookClaimOutcome> {
+        let mut client = self.client.lock();
+        let mut tx = client.transaction()?;
+        let now = Utc::now();
+        let now_unix = now.timestamp();
+        let lease_expires_at = now_unix.saturating_add(WEBHOOK_INGESTION_LEASE_SECS);
+
+        let outcome = if let Some(existing) =
+            Self::existing_ingestion(&mut tx, &self.qualified_ingestions, &ingestion_key, &event_identity)?
+        {
+            if existing.request_hash != request_hash || existing.event_identity != event_identity {
+                WebhookClaimOutcome::Conflict
+            } else if existing.status == "committed" {
+                WebhookClaimOutcome::Committed {
+                    topic_id: existing
+                        .topic_id
+                        .context("committed webhook ingestion is missing topic identity")?,
+                }
+            } else if existing.status == "pending" && existing.lease_expires_at.is_some_and(|lease| lease > now_unix) {
+                WebhookClaimOutcome::Processing
+            } else {
+                let generation = existing
+                    .generation
+                    .checked_add(1)
+                    .context("webhook ingestion generation exhausted")?;
+                tx.execute(
+                    &format!(
+                        "UPDATE {}
+                            SET status = 'pending', generation = $2, lease_expires_at = $3,
+                                topic_id = NULL, memory_key = NULL, last_error = NULL, updated_at = $4
+                          WHERE ingestion_key = $1",
+                        self.qualified_ingestions
+                    ),
+                    &[&existing.ingestion_key, &generation, &lease_expires_at, &now],
+                )?;
+                WebhookClaimOutcome::Acquired(WebhookIngestionClaim {
+                    ingestion_key: existing.ingestion_key,
+                    event_identity,
+                    request_hash,
+                    generation,
+                })
+            }
+        } else {
+            let generation = 1_i64;
+            tx.execute(
+                &format!(
+                    "INSERT INTO {} (
+                        ingestion_key, event_identity, request_hash, source, project, external_id,
+                        event_type, status, generation, lease_expires_at, created_at, updated_at
+                     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending', $8, $9, $10, $10)",
+                    self.qualified_ingestions
+                ),
+                &[
+                    &ingestion_key,
+                    &event_identity,
+                    &request_hash,
+                    &event.source,
+                    &event.project,
+                    &event.external_id,
+                    &event.event_type,
+                    &generation,
+                    &lease_expires_at,
+                    &now,
+                ],
+            )?;
+            WebhookClaimOutcome::Acquired(WebhookIngestionClaim {
+                ingestion_key,
+                event_identity,
+                request_hash,
+                generation,
+            })
+        };
+
+        tx.commit()?;
+        Ok(outcome)
+    }
+
+    fn commit_blocking(
+        &self,
+        claim: &WebhookIngestionClaim,
+        event: &WebhookEvent,
+        memory_content: &str,
+        memory_saved: bool,
+    ) -> Result<String> {
+        let mut client = self.client.lock();
+        let mut tx = client.transaction()?;
+        let now = Utc::now();
+        let owns_claim: bool = tx
+            .query_one(
+                &format!(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM {}
+                         WHERE ingestion_key = $1 AND generation = $2 AND status = 'pending'
+                           AND event_identity = $3 AND request_hash = $4
+                     )",
+                    self.qualified_ingestions
+                ),
+                &[
+                    &claim.ingestion_key,
+                    &claim.generation,
+                    &claim.event_identity,
+                    &claim.request_hash,
+                ],
+            )?
+            .get(0);
+        if !owns_claim {
+            anyhow::bail!("webhook ingestion ownership was lost before commit");
+        }
+
+        let project = crate::memory::topic::canonical_project_for_external(event.project.as_deref());
+        let topic_id = if let Some(row) = tx.query_opt(
+            &format!(
+                "SELECT id FROM {} WHERE project = $1 AND external_id = $2",
+                self.qualified_topics
+            ),
+            &[&project, &event.external_id],
+        )? {
+            row.get(0)
+        } else {
+            let candidate_id = Uuid::new_v4().to_string();
+            let fingerprint = webhook_topic_fingerprint(event.project.as_deref(), &event.external_id, &event.title);
+            tx.query_one(
+                &format!(
+                    "INSERT INTO {} (id, title, project, external_id, fingerprint, status, created_at, updated_at)
+                     VALUES ($1, $2, $3, $4, $5, 'open', $6, $6)
+                     ON CONFLICT (project, external_id) WHERE external_id IS NOT NULL
+                     DO UPDATE SET updated_at = EXCLUDED.updated_at
+                     RETURNING id",
+                    self.qualified_topics
+                ),
+                &[
+                    &candidate_id,
+                    &event.title,
+                    &project,
+                    &event.external_id,
+                    &fingerprint,
+                    &now,
+                ],
+            )?
+            .get(0)
+        };
+
+        if let Some(url) = event.external_url.as_deref() {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET external_url = COALESCE(external_url, $1), updated_at = $2 WHERE id = $3",
+                    self.qualified_topics
+                ),
+                &[&url, &now, &topic_id],
+            )?;
+        }
+
+        let system_sender = format!("system:{}", event.source);
+        tx.execute(
+            &format!(
+                "INSERT INTO {} (topic_id, user_id, role, joined_at)
+                 VALUES ($1, $2, 'observer', $3)
+                 ON CONFLICT(topic_id, user_id) DO NOTHING",
+                self.qualified_topic_participants
+            ),
+            &[&topic_id, &system_sender, &now],
+        )?;
+        let topic_status = match event.event_type.as_str() {
+            "issue.closed" => Some("resolved"),
+            "issue.reopened" => Some("open"),
+            _ => None,
+        };
+        if let Some(status) = topic_status {
+            tx.execute(
+                &format!(
+                    "UPDATE {} SET status = $1, updated_at = $2,
+                        resolved_at = CASE WHEN $1 = 'resolved' THEN $2 ELSE NULL END
+                      WHERE id = $3",
+                    self.qualified_topics
+                ),
+                &[&status, &now, &topic_id],
+            )?;
+        } else {
+            tx.execute(
+                &format!("UPDATE {} SET updated_at = $1 WHERE id = $2", self.qualified_topics),
+                &[&now, &topic_id],
+            )?;
+        }
+
+        let memory_key = format!("webhook:{}:{}:{}", event.source, event.external_id, claim.ingestion_key);
+        if memory_saved {
+            let memory_id = Uuid::new_v4().to_string();
+            let event_timestamp = chrono::DateTime::parse_from_rfc3339(&event.timestamp)
+                .map(|timestamp| timestamp.with_timezone(&Utc))
+                .unwrap_or(now);
+            let chat_id = format!("{}:{}", event.source, event.external_id);
+            tx.execute(
+                &format!(
+                    "INSERT INTO {} (
+                        id, key, content, category, created_at, updated_at, workspace_id,
+                        owner_id, source, channel, chat_type, chat_id, sender_id, raw_sender,
+                        topic_id, visibility, sensitivity, risk_signals, policy_version
+                     ) VALUES (
+                        $1, $2, $3, 'conversation', $4, $4, $5,
+                        $6, 'webhook', 'webhook', 'dm', $7, $6, $6,
+                        $8, 'owner', 'normal', '[]', 1
+                     )
+                     ON CONFLICT(key) DO UPDATE SET
+                        content = EXCLUDED.content,
+                        updated_at = EXCLUDED.updated_at,
+                        topic_id = EXCLUDED.topic_id",
+                    self.qualified_memories
+                ),
+                &[
+                    &memory_id,
+                    &memory_key,
+                    &memory_content,
+                    &event_timestamp,
+                    &self.workspace_id.as_ref(),
+                    &system_sender,
+                    &chat_id,
+                    &topic_id,
+                ],
+            )?;
+        }
+
+        let payload_json = serde_json::json!({
+            "source": event.source,
+            "project": event.project,
+            "external_id": event.external_id,
+            "event_type": event.event_type,
+            "topic_id": topic_id,
+            "memory_saved": memory_saved,
+        })
+        .to_string();
+        let event_id = Uuid::new_v4().to_string();
+        tx.execute(
+            &format!(
+                "INSERT INTO {} (
+                    event_id, workspace_id, event_type, subject_table, subject_id,
+                    visibility, payload_json, created_at
+                 ) VALUES ($1, $2, 'webhook.event.committed', 'webhook_ingestions', $3,
+                           'owner', $4, $5)",
+                self.qualified_memory_events
+            ),
+            &[
+                &event_id,
+                &self.workspace_id.as_ref(),
+                &claim.ingestion_key,
+                &payload_json,
+                &now,
+            ],
+        )?;
+
+        let memory_key_value = memory_saved.then_some(memory_key);
+        let updated = tx.execute(
+            &format!(
+                "UPDATE {} SET status = 'committed', lease_expires_at = NULL, topic_id = $3,
+                    memory_key = $4, last_error = NULL, updated_at = $5
+                  WHERE ingestion_key = $1 AND generation = $2 AND status = 'pending'
+                    AND event_identity = $6 AND request_hash = $7",
+                self.qualified_ingestions
+            ),
+            &[
+                &claim.ingestion_key,
+                &claim.generation,
+                &topic_id,
+                &memory_key_value,
+                &now,
+                &claim.event_identity,
+                &claim.request_hash,
+            ],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("webhook ingestion ownership was lost before commit");
+        }
+        tx.commit()?;
+        Ok(topic_id)
+    }
+
+    fn fail_blocking(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
+        let error = error.chars().take(1024).collect::<String>();
+        let now = Utc::now();
+        let mut client = self.client.lock();
+        client.execute(
+            &format!(
+                "UPDATE {} SET status = 'failed', lease_expires_at = NULL,
+                    last_error = $3, updated_at = $4
+                  WHERE ingestion_key = $1 AND generation = $2 AND status = 'pending'",
+                self.qualified_ingestions
+            ),
+            &[&claim.ingestion_key, &claim.generation, &error, &now],
+        )?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl WebhookRepository for PostgresWebhookRepository {
+    async fn claim(
+        &self,
+        ingestion_key: String,
+        event_identity: String,
+        request_hash: String,
+        event: &WebhookEvent,
+    ) -> Result<WebhookClaimOutcome> {
+        let repository = self.clone();
+        let event = event.clone();
+        tokio::task::spawn_blocking(move || {
+            repository.claim_blocking(ingestion_key, event_identity, request_hash, &event)
+        })
+        .await
+        .context("PostgreSQL webhook claim worker panicked")?
+    }
+
+    async fn commit(
+        &self,
+        claim: &WebhookIngestionClaim,
+        event: &WebhookEvent,
+        memory_content: &str,
+        memory_saved: bool,
+    ) -> Result<String> {
+        let repository = self.clone();
+        let claim = claim.clone();
+        let event = event.clone();
+        let memory_content = memory_content.to_string();
+        tokio::task::spawn_blocking(move || repository.commit_blocking(&claim, &event, &memory_content, memory_saved))
+            .await
+            .context("PostgreSQL webhook commit worker panicked")?
+    }
+
+    async fn fail(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
+        let repository = self.clone();
+        let claim = claim.clone();
+        let error = error.to_string();
+        tokio::task::spawn_blocking(move || repository.fail_blocking(&claim, &error))
+            .await
+            .context("PostgreSQL webhook failure worker panicked")?
+    }
+}
+
 /// Run the standalone webhook receiver from the authoritative application
-/// configuration. The configured memory backend selects the durable repository;
-/// unsupported backends fail closed instead of silently writing `brain.db`.
-pub async fn run_configured(config: &Config, security: Arc<SecurityPolicy>) -> Result<()> {
+/// configuration with the durable repository injected by the daemon assembly
+/// boundary. This keeps backend selection out of the standalone HTTP service.
+pub(crate) async fn run_configured_with_repository(
+    config: &Config,
+    repository: WebhookRepositoryHandle,
+    security: Arc<SecurityPolicy>,
+) -> Result<()> {
     let token = config
         .webhook
         .token
         .as_deref()
         .context("webhook.token must be configured when webhook.enabled=true")?;
-    let repository = repository_from_config(config)?;
     run_with_repository(
         &config.webhook.bind,
         token,
         config.webhook.signing_secret.as_deref(),
-        repository,
+        repository.repository,
         security,
     )
     .await
 }
 
-fn repository_from_config(config: &Config) -> Result<Arc<dyn WebhookRepository>> {
+pub(crate) fn repository_from_config(config: &Config) -> Result<WebhookRepositoryHandle> {
     let backend_name = effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match classify_memory_backend(&backend_name) {
         MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid => {
             let db_path = config.workspace_dir.join("memory").join("brain.db");
-            Ok(Arc::new(SqliteWebhookRepository::new(
-                db_path,
-                config.workspace_dir.to_string_lossy().to_string(),
-            )?))
+            Ok(WebhookRepositoryHandle {
+                repository: Arc::new(SqliteWebhookRepository::new(
+                    db_path,
+                    config.workspace_dir.to_string_lossy().to_string(),
+                )?),
+            })
+        }
+        MemoryBackendKind::Postgres => {
+            let storage = &config.storage.provider.config;
+            let db_url = storage
+                .db_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .context("standalone webhook PostgreSQL repository requires storage.provider.config.db_url")?;
+            Ok(WebhookRepositoryHandle {
+                repository: Arc::new(PostgresWebhookRepository::new(
+                    db_url,
+                    &storage.schema,
+                    &storage.table,
+                    storage.connect_timeout_secs,
+                    config.workspace_dir.to_string_lossy().to_string(),
+                )?),
+            })
         }
         _ => anyhow::bail!(
             "standalone webhook durable ingestion does not support configured memory backend '{backend_name}'"
@@ -1536,7 +2054,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_non_sqlite_webhook_backend_fails_closed() {
+    fn configured_unsupported_webhook_backend_fails_closed() {
         let tmp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
@@ -1552,7 +2070,7 @@ mod tests {
             .validate()
             .err()
             .map_or_else(String::new, |error| error.to_string());
-        assert!(validation_error.contains("requires memory backend 'sqlite' or 'lucid'"));
+        assert!(validation_error.contains("requires memory backend 'sqlite', 'lucid', or 'postgres'"));
     }
 
     #[tokio::test]
@@ -1828,5 +2346,132 @@ mod tests {
 
         let second = app.oneshot(make_req()).await.unwrap();
         assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn standalone_repository_is_injected_at_daemon_boundary() {
+        let webhook_source = include_str!("mod.rs");
+        let runner = webhook_source
+            .split_once("pub(crate) async fn run_configured_with_repository(")
+            .unwrap()
+            .1
+            .split_once("pub(crate) fn repository_from_config(")
+            .unwrap()
+            .0;
+        assert!(runner.contains("repository: WebhookRepositoryHandle"));
+        assert!(!runner.contains("repository_from_config(config)"));
+
+        let daemon_source = include_str!("../daemon/mod.rs");
+        let webhook_supervisor = daemon_source
+            .split_once("if config.modules.integrations && config.webhook.enabled")
+            .unwrap()
+            .1
+            .split_once("println!(\"🧠 OpenPRX daemon started\")")
+            .unwrap()
+            .0;
+        assert!(webhook_supervisor.contains("repository_from_config(&webhook_cfg)"));
+        assert!(webhook_supervisor.contains("run_configured_with_repository(&cfg, repository"));
+    }
+
+    #[tokio::test]
+    async fn postgres_webhook_repository_conformance_from_env() {
+        let Some(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return;
+        };
+
+        let schema = format!("openprx_wh_{}", Uuid::new_v4().simple());
+        let repository = PostgresWebhookRepository::new(
+            &db_url,
+            &schema,
+            "memories",
+            Some(5),
+            "postgres-webhook-conformance".to_string(),
+        )
+        .unwrap();
+        let event = WebhookEvent {
+            source: "custom".to_string(),
+            event_type: "issue.created".to_string(),
+            project: Some("openpr".to_string()),
+            external_id: "issue#postgres-conformance".to_string(),
+            external_url: Some("https://example.invalid/issues/1".to_string()),
+            title: "PostgreSQL webhook conformance".to_string(),
+            content: "configured PostgreSQL webhook repository stores an atomic projection".to_string(),
+            actor: Some("project_bot".to_string()),
+            timestamp: "2026-07-15T14:00:00Z".to_string(),
+        };
+        let request_hash = webhook_request_hash(b"postgres-webhook-conformance");
+        let event_identity = webhook_event_identity(&event, &request_hash);
+        let claim = match repository
+            .claim(
+                "event:postgres-conformance".to_string(),
+                event_identity.clone(),
+                request_hash.clone(),
+                &event,
+            )
+            .await
+            .unwrap()
+        {
+            WebhookClaimOutcome::Acquired(claim) => claim,
+            outcome => panic!("expected acquired PostgreSQL claim, got {outcome:?}"),
+        };
+        let topic_id = repository.commit(&claim, &event, &event.content, true).await.unwrap();
+        assert!(!topic_id.is_empty());
+
+        assert!(matches!(
+            repository
+                .claim(
+                    "event:postgres-conformance".to_string(),
+                    event_identity,
+                    request_hash,
+                    &event,
+                )
+                .await
+                .unwrap(),
+            WebhookClaimOutcome::Committed { topic_id: replayed } if replayed == topic_id
+        ));
+
+        let mut client = PostgresClient::connect(&db_url, NoTls).unwrap();
+        let ingestion_count: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE status = 'committed'",
+                    repository.qualified_ingestions
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let memory_count: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE key LIKE 'webhook:custom:issue#postgres-conformance:%'",
+                    repository.qualified_memories
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        let event_count: i64 = client
+            .query_one(
+                &format!(
+                    "SELECT COUNT(*) FROM {} WHERE event_type = 'webhook.event.committed'",
+                    repository.qualified_memory_events
+                ),
+                &[],
+            )
+            .unwrap()
+            .get(0);
+        assert_eq!((ingestion_count, memory_count, event_count), (1, 1, 1));
+
+        drop(repository);
+        client
+            .batch_execute(&format!(
+                "DROP SCHEMA {} CASCADE",
+                crate::memory::postgres::quote_identifier(&schema)
+            ))
+            .unwrap();
     }
 }

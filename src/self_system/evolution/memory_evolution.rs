@@ -1,4 +1,4 @@
-use crate::memory::{Memory, MemoryCategory, SqliteMemory};
+use crate::memory::{Memory, MemoryCategory};
 use crate::self_system::evolution::analyzer::{CandidatePriority, EvolutionCandidate};
 use crate::self_system::evolution::config::{EvolutionConfig, EvolutionMode, SharedEvolutionConfig};
 use crate::self_system::evolution::engine::{CycleResult, EngineCycleInput, EvolutionEngine};
@@ -44,6 +44,7 @@ pub struct MemoryEvolutionEngine {
     writer: Option<Arc<AsyncJsonlWriter>>,
     judge: JudgeEngine,
     rollback: RollbackManager,
+    memory: Option<Arc<dyn Memory>>,
 }
 
 impl MemoryEvolutionEngine {
@@ -67,7 +68,16 @@ impl MemoryEvolutionEngine {
             writer,
             judge: JudgeEngine::new(JudgeConfig::default(), std::sync::Arc::new(MockJudgeModel)),
             rollback: RollbackManager::new(workspace_root, &config_path, rollback_dir, max_versions)?,
+            memory: None,
         })
+    }
+
+    /// Inject the configured application memory backend. Production callers
+    /// must use this instead of letting the evolution layer own a local backend.
+    #[must_use]
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
     }
 
     fn select_candidate(&self, candidates: &[EvolutionCandidate]) -> Option<EvolutionCandidate> {
@@ -159,12 +169,9 @@ impl MemoryEvolutionEngine {
     }
 
     async fn prune_redundant_conversation_memories(&self) -> Result<u32> {
-        let db_path = self.workspace_root.join("memory").join("brain.db");
-        if !db_path.exists() {
+        let Some(memory) = self.memory.as_ref() else {
             return Ok(0);
-        }
-
-        let memory = SqliteMemory::new_with_path(db_path)?;
+        };
         let entries = memory.list(Some(&MemoryCategory::Conversation), None).await?;
         if entries.len() < 2 {
             return Ok(0);
@@ -191,7 +198,7 @@ impl MemoryEvolutionEngine {
             // into trash with a 14-day grace window so the change is reversible
             // and auditable instead of an irreversible `forget`.
             if let Err(error) = self
-                .record_forget_proposal(&memory, &workspace_id, key, redundant_id)
+                .record_forget_proposal(memory.as_ref(), &workspace_id, key, redundant_id)
                 .await
             {
                 tracing::warn!(
@@ -225,7 +232,7 @@ impl MemoryEvolutionEngine {
     /// raw SQL so the proposal is type-checked and auditable.
     async fn record_forget_proposal(
         &self,
-        memory: &SqliteMemory,
+        memory: &dyn Memory,
         workspace_id: &str,
         memory_key: &str,
         memory_event_id: String,
@@ -548,5 +555,23 @@ mod tests {
             result.cycle.outcome,
             CycleOutcome::Applied | CycleOutcome::Failed
         ));
+    }
+
+    #[test]
+    fn production_memory_evolution_uses_injected_backend() {
+        let engine_source = include_str!("memory_evolution.rs");
+        let production = engine_source.split_once("#[cfg(test)]").unwrap().0;
+        assert!(production.contains("memory: Option<Arc<dyn Memory>>"));
+        assert!(production.contains("move_to_trash"));
+        assert!(!production.contains("SqliteMemory"));
+        assert!(!production.contains("brain.db"));
+
+        let daemon_source = include_str!("../../daemon/mod.rs");
+        let scheduler_builder = daemon_source
+            .split_once("async fn build_evolution_scheduler")
+            .unwrap()
+            .1;
+        assert!(scheduler_builder.contains("create_memory_with_storage_and_routes_with_acl"));
+        assert!(scheduler_builder.contains("with_memory(evolution_memory)"));
     }
 }

@@ -1740,9 +1740,9 @@ pub(crate) struct MirrorLineage<'a> {
     pub status: Option<&'a str>,
 }
 
-/// Mirror a cron lifecycle event into the shared `memory_events` fabric. This is
-/// workspace-file-based (writes `brain.db` under `workspace_id`) and therefore
-/// backend-agnostic: the Postgres cron store reuses it for parity with SQLite.
+/// Mirror a SQLite cron lifecycle event into the colocated SQLite
+/// `memory_events` fabric. The Postgres store writes its configured Postgres
+/// event table transactionally and only reuses the payload builder below.
 pub(crate) fn mirror_cron_job_event(
     workspace_id: &str,
     job_id: &str,
@@ -1751,6 +1751,27 @@ pub(crate) fn mirror_cron_job_event(
     status: Option<&str>,
     payload_json: Option<&str>,
 ) -> Result<i64> {
+    let payload_json = cron_job_event_payload(job_id, lineage, status, payload_json);
+    crate::memory::sqlite::append_task_event_mirror(
+        std::path::Path::new(workspace_id),
+        crate::memory::sqlite::SqliteTaskEventMirror {
+            workspace_id,
+            task_id: job_id,
+            event_type,
+            session_key: None,
+            agent_id: None,
+            persona_id: None,
+            payload_json: Some(&payload_json),
+        },
+    )
+}
+
+pub(crate) fn cron_job_event_payload(
+    job_id: &str,
+    lineage: MirrorLineage<'_>,
+    status: Option<&str>,
+    payload_json: Option<&str>,
+) -> String {
     let mut payload = payload_json
         .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
         .and_then(|value| value.as_object().cloned())
@@ -1775,19 +1796,7 @@ pub(crate) fn mirror_cron_job_event(
             payload.insert("task".to_string(), name.to_string().into());
         }
     }
-    let payload_json = serde_json::Value::Object(payload).to_string();
-    crate::memory::sqlite::append_task_event_mirror(
-        std::path::Path::new(workspace_id),
-        crate::memory::sqlite::SqliteTaskEventMirror {
-            workspace_id,
-            task_id: job_id,
-            event_type,
-            session_key: None,
-            agent_id: None,
-            persona_id: None,
-            payload_json: Some(&payload_json),
-        },
-    )
+    serde_json::Value::Object(payload).to_string()
 }
 
 fn map_job_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CronJobEvent> {

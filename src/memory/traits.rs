@@ -32,6 +32,17 @@ pub struct MemoryEntry {
     pub compressed_from: Option<Vec<String>>,
 }
 
+/// ACL behavior requested by a backend-neutral memory reader.
+///
+/// `Enforce` returns only entries visible to the runtime principal. `Observe`
+/// returns the backend's unrestricted compatibility result while still letting
+/// ACL-aware backends evaluate and audit what enforcement would have removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemoryReadMode {
+    Enforce,
+    Observe,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatProfile {
     pub id: String,
@@ -1078,8 +1089,47 @@ pub trait Memory: Send + Sync {
         self.recall(query, limit, session_id).await
     }
 
+    /// Backend-neutral recall for user-facing readers with ACL
+    /// enforcement/observation modes.
+    async fn recall_with_context_mode(
+        &self,
+        query: &str,
+        limit: usize,
+        session_id: Option<&str>,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> anyhow::Result<Vec<MemoryEntry>> {
+        match mode {
+            MemoryReadMode::Enforce => self.recall_with_context(query, limit, session_id, context).await,
+            MemoryReadMode::Observe => self.recall(query, limit, session_id).await,
+        }
+    }
+
     /// Get a specific memory by key
     async fn get(&self, key: &str) -> anyhow::Result<Option<MemoryEntry>>;
+
+    /// Get a specific memory by key under an optional runtime ACL context.
+    async fn get_with_context(
+        &self,
+        key: &str,
+        context: Option<&MemoryWriteContext>,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        let _ = context;
+        self.get(key).await
+    }
+
+    /// Backend-neutral keyed read for ACL enforcement/observation modes.
+    async fn get_with_context_mode(
+        &self,
+        key: &str,
+        context: Option<&MemoryWriteContext>,
+        mode: MemoryReadMode,
+    ) -> anyhow::Result<Option<MemoryEntry>> {
+        match mode {
+            MemoryReadMode::Enforce => self.get_with_context(key, context).await,
+            MemoryReadMode::Observe => self.get(key).await,
+        }
+    }
 
     /// List all memory keys, optionally filtered by category and/or session
     async fn list(
@@ -1523,7 +1573,7 @@ pub trait Memory: Send + Sync {
 
 #[cfg(test)]
 pub(crate) mod conformance {
-    use super::{Memory, MemoryCategory};
+    use super::{Memory, MemoryCategory, MemoryReadMode};
     use crate::memory::principal::MemoryWriteContext;
 
     pub(crate) async fn assert_scoped_memory_acl_conformance(mem: &dyn Memory, key_prefix: &str) {
@@ -1570,6 +1620,43 @@ pub(crate) mod conformance {
         let alice_keys = alice_results.iter().map(|entry| entry.key.as_str()).collect::<Vec<_>>();
         assert!(alice_keys.contains(&alice_key.as_str()), "{alice_keys:?}");
         assert!(!alice_keys.contains(&bob_key.as_str()), "{alice_keys:?}");
+
+        assert!(
+            mem.get_with_context_mode(&bob_key, Some(&alice_ctx), MemoryReadMode::Enforce)
+                .await
+                .expect("enforced keyed read")
+                .is_none(),
+            "enforce mode must hide another sender's private memory"
+        );
+        assert!(
+            mem.get_with_context_mode(&bob_key, Some(&alice_ctx), MemoryReadMode::Observe)
+                .await
+                .expect("observed keyed read")
+                .is_some(),
+            "observe mode must preserve legacy visibility while recording the would-deny decision"
+        );
+        let enforced_search = mem
+            .recall_with_context_mode(
+                "shared conformance keyword bob private",
+                10,
+                None,
+                Some(&alice_ctx),
+                MemoryReadMode::Enforce,
+            )
+            .await
+            .expect("enforced scoped search");
+        assert!(!enforced_search.iter().any(|entry| entry.key == bob_key));
+        let observed_search = mem
+            .recall_with_context_mode(
+                "shared conformance keyword bob private",
+                10,
+                None,
+                Some(&alice_ctx),
+                MemoryReadMode::Observe,
+            )
+            .await
+            .expect("observed scoped search");
+        assert!(observed_search.iter().any(|entry| entry.key == bob_key));
 
         assert!(
             !mem.forget_with_context(&bob_key, Some(&alice_ctx))

@@ -9,7 +9,9 @@
 //! All SQL is parameterized (`$N` placeholders). Identifiers are never
 //! interpolated. The atomic `claim_job` guard mirrors the SQLite semantics so
 //! multiple scheduler instances polling the same database cannot double-execute
-//! a job.
+//! a job. Lifecycle mirrors are appended to the configured Postgres
+//! memory-events table inside the same transaction as the cron event; this
+//! module never opens the workspace's local `brain.db`.
 
 use crate::config::Config;
 use crate::cron::store::{decode_delivery, decode_schedule, format_claim_time, truncate_cron_output};
@@ -48,14 +50,36 @@ const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT
 /// memory backend's `PostgresClientSlot` pattern.
 pub struct PostgresCronStore {
     client: Mutex<Client>,
+    qualified_memory_events_table: String,
 }
 
 impl PostgresCronStore {
     /// Connect, ensure the schema, and return a ready store. The connection is
     /// established on a dedicated thread so a slow/hung TCP connect cannot block
     /// an async runtime worker (the caller may be inside a Tokio context).
+    #[cfg(test)]
     pub fn connect(db_url: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
+        Self::connect_with_memory_storage(db_url, "public", "memories", connect_timeout_secs)
+    }
+
+    fn connect_with_memory_storage(
+        db_url: &str,
+        memory_schema: &str,
+        memory_table: &str,
+        connect_timeout_secs: Option<u64>,
+    ) -> Result<Self> {
+        crate::memory::postgres::validate_identifier(memory_schema, "storage schema")?;
+        crate::memory::postgres::validate_identifier(memory_table, "storage table")?;
+        let memory_events_table = crate::memory::postgres::related_table_name(memory_table, "_memory_events")?;
+        let memory_schema_ident = crate::memory::postgres::quote_identifier(memory_schema);
+        let qualified_memory_events_table = format!(
+            "{}.{}",
+            memory_schema_ident,
+            crate::memory::postgres::quote_identifier(&memory_events_table)
+        );
         let db_url = db_url.to_string();
+        let event_table_for_init = qualified_memory_events_table.clone();
+        let event_schema_for_init = memory_schema_ident;
         let handle = std::thread::Builder::new()
             .name("cron-postgres-init".to_string())
             .spawn(move || -> Result<Client> {
@@ -69,6 +93,7 @@ impl PostgresCronStore {
                     .connect(NoTls)
                     .context("failed to connect to PostgreSQL cron backend")?;
                 init_schema(&mut client)?;
+                init_memory_event_schema(&mut client, &event_schema_for_init, &event_table_for_init)?;
                 Ok(client)
             })
             .context("failed to spawn cron postgres initializer thread")?;
@@ -79,7 +104,31 @@ impl PostgresCronStore {
 
         Ok(Self {
             client: Mutex::new(client),
+            qualified_memory_events_table,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_job_event(
+        &self,
+        tx: &mut postgres::Transaction<'_>,
+        workspace_id: &str,
+        job_id: &str,
+        lineage: &JobLineage,
+        event_type: &str,
+        status: Option<&str>,
+        payload_json: Option<&str>,
+    ) -> Result<()> {
+        insert_job_event(
+            tx,
+            &self.qualified_memory_events_table,
+            workspace_id,
+            job_id,
+            lineage,
+            event_type,
+            status,
+            payload_json,
+        )
     }
 
     fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
@@ -133,7 +182,7 @@ impl PostgresCronStore {
                 ],
             )
             .context("Failed to insert cron shell job")?;
-            insert_job_event(
+            self.insert_job_event(
                 &mut tx,
                 workspace_id,
                 &id,
@@ -209,7 +258,7 @@ impl PostgresCronStore {
                 ],
             )
             .context("Failed to insert cron agent job")?;
-            insert_job_event(
+            self.insert_job_event(
                 &mut tx,
                 workspace_id,
                 &id,
@@ -260,7 +309,7 @@ impl PostgresCronStore {
         let changed = self.with_client(|client| {
             let mut tx = client.transaction().context("failed to open cron remove transaction")?;
             if let Some(lineage) = load_job_lineage(&mut tx, id)? {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     id,
@@ -298,7 +347,7 @@ impl PostgresCronStore {
             if changed > 0
                 && let Some(lineage) = load_job_lineage(&mut tx, job_id)?
             {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     job_id,
@@ -386,7 +435,7 @@ impl PostgresCronStore {
                     "claimed_at": now.to_rfc3339(), "expires_at": expires_at.to_rfc3339(),
                     "previous_worker_id": previous_worker_id, "previous_attempt_id": previous_attempt_id,
                     "previous_expires_at": previous_expires_at}).to_string();
-                insert_job_event(&mut tx, workspace_id, &job.id, &lineage,
+                self.insert_job_event(&mut tx, workspace_id, &job.id, &lineage,
                     if recovered { "cron.job.claim_recovered" } else { "cron.job.claimed" },
                     Some("running"), Some(&payload))?;
             }
@@ -464,7 +513,7 @@ impl PostgresCronStore {
                         "reason": reason,
                     })
                     .to_string();
-                    insert_job_event(
+                    self.insert_job_event(
                         &mut tx,
                         workspace_id,
                         job_id,
@@ -523,7 +572,7 @@ impl PostgresCronStore {
                 let payload = serde_json::json!({"worker_id": worker_id, "attempt_id": attempt_id,
                     "claimed_at": now.to_rfc3339(), "expires_at": expires_at.to_rfc3339()})
                 .to_string();
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -565,7 +614,7 @@ impl PostgresCronStore {
                     "reason": reason,
                 })
                 .to_string();
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     job_id,
@@ -738,7 +787,7 @@ impl PostgresCronStore {
                 _ => "cron.job.updated",
             };
             if let Some(lineage) = load_job_lineage(&mut tx, &job.id)? {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -788,7 +837,7 @@ impl PostgresCronStore {
             )
             .context("Failed to update cron job run state")?;
             if let Some(lineage) = load_job_lineage(&mut tx, &job.id)? {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -894,11 +943,11 @@ impl PostgresCronStore {
                 let run_payload = serde_json::json!({"started_at": started_at.to_rfc3339(),
                     "finished_at": finished_at.to_rfc3339(), "duration_ms": duration_ms,
                     "attempt_id": claim.attempt_id, "worker_id": claim.worker_id}).to_string();
-                insert_job_event(&mut tx, workspace_id, &job.id, &lineage, "cron.job.run_recorded",
+                self.insert_job_event(&mut tx, workspace_id, &job.id, &lineage, "cron.job.run_recorded",
                     Some(status), Some(&run_payload))?;
                 let finish_payload = serde_json::json!({"next_run": next_run.to_rfc3339(),
                     "success": success, "attempt_id": claim.attempt_id, "worker_id": claim.worker_id}).to_string();
-                insert_job_event(&mut tx, workspace_id, &job.id, &lineage,
+                self.insert_job_event(&mut tx, workspace_id, &job.id, &lineage,
                     if disable_after { "cron.job.disabled" } else { "cron.job.rescheduled" },
                     Some(status), Some(&finish_payload))?;
             }
@@ -994,7 +1043,7 @@ impl PostgresCronStore {
                 &[&job.id, &keep],
             )?;
             if let Some(lineage) = load_job_lineage(&mut tx, &job.id)? {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -1013,7 +1062,7 @@ impl PostgresCronStore {
                     )
                     .as_deref(),
                 )?;
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -1124,7 +1173,7 @@ impl PostgresCronStore {
                     "success": success, "attempt_id": claim.attempt_id,
                     "worker_id": claim.worker_id})
                 .to_string();
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     &job.id,
@@ -1169,7 +1218,7 @@ impl PostgresCronStore {
             )
             .context("Failed to insert cron run")?;
             if let Some(lineage) = load_job_lineage(&mut tx, job_id)? {
-                insert_job_event(
+                self.insert_job_event(
                     &mut tx,
                     workspace_id,
                     job_id,
@@ -1381,6 +1430,7 @@ fn load_job_lineage(tx: &mut postgres::Transaction<'_>, job_id: &str) -> Result<
 
 fn insert_job_event(
     tx: &mut postgres::Transaction<'_>,
+    qualified_memory_events_table: &str,
     workspace_id: &str,
     job_id: &str,
     lineage: &JobLineage,
@@ -1411,10 +1461,7 @@ fn insert_job_event(
         &params,
     )
     .context("Failed to insert cron job event")?;
-    // Mirror into the shared (workspace-file-based) memory_events fabric for
-    // cross-instance observability, matching the SQLite backend's behavior.
-    if let Err(error) = crate::cron::store::mirror_cron_job_event(
-        workspace_id,
+    let mirror_payload = crate::cron::store::cron_job_event_payload(
         job_id,
         crate::cron::store::MirrorLineage {
             owner_id: lineage.owner_id.as_deref(),
@@ -1423,12 +1470,57 @@ fn insert_job_event(
             source_message_event_id: lineage.source_message_event_id.as_deref(),
             status: lineage.status.as_deref(),
         },
-        event_type,
         status,
         payload_json,
-    ) {
-        tracing::warn!(job_id = %job_id, event_type, "failed to mirror cron job event into memory_events: {error}");
-    }
+    );
+    let mirror_event_id = Uuid::new_v4().to_string();
+    let mirror_stmt = format!(
+        "INSERT INTO {qualified_memory_events_table} (
+            event_id, workspace_id, event_type, subject_table, subject_id,
+            visibility, payload_json, created_at
+         ) VALUES ($1, $2, $3, 'tasks', $4, 'workspace', $5, $6)"
+    );
+    tx.execute(
+        &mirror_stmt,
+        &[
+            &mirror_event_id,
+            &workspace_id,
+            &event_type,
+            &job_id,
+            &mirror_payload,
+            &Utc::now(),
+        ],
+    )
+    .context("Failed to append cron event to configured memory event storage")?;
+    Ok(())
+}
+
+fn init_memory_event_schema(
+    client: &mut Client,
+    memory_schema_ident: &str,
+    qualified_memory_events_table: &str,
+) -> Result<()> {
+    client
+        .batch_execute(&format!(
+            "CREATE SCHEMA IF NOT EXISTS {memory_schema_ident};
+             CREATE TABLE IF NOT EXISTS {qualified_memory_events_table} (
+                id BIGSERIAL PRIMARY KEY,
+                event_id TEXT UNIQUE NOT NULL,
+                workspace_id TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                subject_table TEXT NOT NULL,
+                subject_id TEXT NOT NULL,
+                session_key TEXT,
+                run_id TEXT,
+                parent_run_id TEXT,
+                agent_id TEXT,
+                persona_id TEXT,
+                visibility TEXT NOT NULL DEFAULT 'workspace',
+                payload_json TEXT,
+                created_at TIMESTAMPTZ NOT NULL
+            );"
+        ))
+        .context("Failed to initialize configured Postgres memory event storage")?;
     Ok(())
 }
 
@@ -1529,7 +1621,12 @@ pub fn resolve(config: &Config) -> Result<Option<PostgresCronStore>> {
     else {
         return Ok(None);
     };
-    let store = PostgresCronStore::connect(db_url, provider.connect_timeout_secs)?;
+    let store = PostgresCronStore::connect_with_memory_storage(
+        db_url,
+        &provider.schema,
+        &provider.table,
+        provider.connect_timeout_secs,
+    )?;
     Ok(Some(store))
 }
 
@@ -1571,6 +1668,13 @@ mod tests {
             CronJobTerminalState::parse(CronJobTerminalState::Failed.as_str()).unwrap(),
             CronJobTerminalState::Failed
         );
+        assert!(source.contains("self.qualified_memory_events_table"));
+        assert!(source.contains("Failed to append cron event to configured memory event storage"));
+        let postgres_insert = source
+            .split_once("fn insert_job_event(")
+            .and_then(|(_, rest)| rest.split_once("fn init_memory_event_schema"))
+            .map_or("", |(body, _)| body);
+        assert!(!postgres_insert.contains("mirror_cron_job_event("));
     }
 
     /// End-to-end cron lifecycle against a real PostgreSQL instance. Gated on
@@ -1740,6 +1844,28 @@ mod tests {
         assert!(types.contains(&"cron.job.rescheduled"));
         assert!(types.contains(&"cron.job.disabled"));
         assert!(events.iter().all(|e| e.owner_id.as_deref() == Some("owner-pg")));
+        store
+            .with_client(|client| {
+                let stmt = format!(
+                    "SELECT event_type FROM {} WHERE workspace_id = $1 AND subject_table = 'tasks' AND subject_id = $2",
+                    store.qualified_memory_events_table
+                );
+                let mirrored = client.query(&stmt, &[&ws, &job.id])?;
+                let mirrored_types = mirrored.iter().map(|row| row.get::<_, String>(0)).collect::<Vec<_>>();
+                assert!(mirrored_types.iter().any(|event_type| event_type == "cron.job.created"));
+                assert!(
+                    mirrored_types
+                        .iter()
+                        .any(|event_type| event_type == "cron.job.run_recorded")
+                );
+                assert!(
+                    mirrored_types
+                        .iter()
+                        .any(|event_type| event_type == "cron.job.disabled")
+                );
+                Ok(())
+            })
+            .expect("test: configured Postgres memory event mirror");
 
         // due_jobs excludes a disabled job even far in the future.
         let far_future = Utc::now() + chrono::Duration::days(365);

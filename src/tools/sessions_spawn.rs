@@ -1195,6 +1195,10 @@ impl Tool for SessionsSpawnTool {
         } else {
             String::new()
         };
+        let process_memory_backend = self
+            .memory
+            .as_ref()
+            .map_or_else(|| "none".to_string(), |memory| memory.name().to_string());
 
         let model_override = args
             .get("model")
@@ -1579,6 +1583,7 @@ impl Tool for SessionsSpawnTool {
                         process_agent_id.as_deref(),
                         &process_lineage,
                         &process_memory_strategy,
+                        &process_memory_backend,
                         &process_config_dir,
                         &process_config_generation,
                         process_event_recording,
@@ -3098,6 +3103,7 @@ fn build_session_worker_manifest(
     memory_db_path: std::path::PathBuf,
     memory_workspace_id: String,
     normalized_memory_strategy: &str,
+    memory_backend: &str,
     shared_memory_db_path: std::path::PathBuf,
     worker_memory_db_path: std::path::PathBuf,
     config_dir: std::path::PathBuf,
@@ -3129,6 +3135,7 @@ fn build_session_worker_manifest(
         memory_db_path,
         memory_workspace_id: Some(memory_workspace_id),
         memory_strategy: Some(normalized_memory_strategy.to_string()),
+        memory_backend: memory_backend.to_string(),
         shared_memory_db_path: Some(shared_memory_db_path),
         worker_memory_db_path: Some(worker_memory_db_path),
         agent_id: agent_id.map(str::to_string),
@@ -3654,6 +3661,7 @@ async fn run_sub_agent_process(
     agent_id: Option<&str>,
     lineage: &SpawnLineage,
     memory_strategy: &str,
+    memory_backend: &str,
     config_dir: &std::path::Path,
     config_generation: &str,
     event_recording: MemoryEventRecording,
@@ -3715,6 +3723,7 @@ async fn run_sub_agent_process(
         memory_db_path,
         memory_workspace_id,
         normalized_memory_strategy,
+        memory_backend,
         shared_memory_db_path,
         worker_memory_db_path,
         config_dir.to_path_buf(),
@@ -4289,6 +4298,7 @@ mod tests {
             temp.path().join("brain.db"),
             temp.path().display().to_string(),
             PROCESS_MEMORY_STRATEGY_SHARED,
+            "sqlite",
             temp.path().join("memory").join("brain.db"),
             temp.path().join("worker").join("brain.db"),
             temp.path().join("config"),
@@ -5864,6 +5874,7 @@ mod tests {
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
             memory_strategy: Some("shared_fabric".to_string()),
+            memory_backend: "sqlite".to_string(),
             shared_memory_db_path: Some(std::path::PathBuf::from("/tmp/ws/memory/brain.db")),
             worker_memory_db_path: Some(std::path::PathBuf::from("/tmp/worker/brain.db")),
             agent_id: Some("agent-a".to_string()),

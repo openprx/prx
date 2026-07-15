@@ -372,7 +372,7 @@ fn topic_fingerprint(project: Option<&str>, title: &str) -> String {
     format!("{digest:x}")
 }
 
-fn canonical_project_for_external(project: Option<&str>) -> String {
+pub(crate) fn canonical_project_for_external(project: Option<&str>) -> String {
     project
         .map(str::trim)
         .filter(|value| !value.is_empty())
