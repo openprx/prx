@@ -793,6 +793,13 @@ pub async fn run_gateway(
     shutdown: CancellationToken,
 ) -> Result<()> {
     let start_time = Instant::now();
+    crate::health::register_component(
+        "gateway",
+        "gateway",
+        true,
+        Duration::from_secs(60),
+        crate::health::ComponentState::Starting,
+    );
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind {
         anyhow::bail!(
@@ -1176,8 +1183,6 @@ pub async fn run_gateway(
     }
     println!("  Press Ctrl+C to stop.\n");
 
-    crate::health::mark_component_ok("gateway");
-
     // Build shared state
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
@@ -1276,6 +1281,11 @@ pub async fn run_gateway(
             Duration::from_secs(config.gateway.request_timeout_secs.max(1)),
         ));
 
+    // The listener is bound and every route/state dependency is now constructed.
+    // This explicit acknowledgement, rather than supervisor task survival, is the
+    // gateway readiness boundary.
+    crate::health::mark_component_ok("gateway");
+
     // Run the server with graceful shutdown (D5/D9 step 3, DEV-02). On root token
     // cancellation axum stops accepting and drains in-flight requests. The drain
     // bound must only start counting *after* shutdown is requested — never while
@@ -1300,6 +1310,8 @@ pub async fn run_gateway(
         }
     }
 
+    crate::health::mark_component_stopping("gateway");
+    crate::health::mark_component_stopped("gateway");
     Ok(())
 }
 
@@ -1309,12 +1321,27 @@ pub async fn run_gateway(
 
 /// GET /health — always public (no secrets leaked)
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
+    // A successfully dispatched health request is also an explicit freshness
+    // acknowledgement from the gateway owner.
+    crate::health::mark_component_ok("gateway");
+    let runtime = crate::health::snapshot();
+    health_response(state.pairing.is_paired(), runtime)
+}
+
+fn health_response(paired: bool, runtime: crate::health::HealthSnapshot) -> (StatusCode, Json<serde_json::Value>) {
+    let readiness = crate::health::readiness_from_snapshot(&runtime);
+    let status = if readiness.ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
     let body = serde_json::json!({
-        "status": "ok",
-        "paired": state.pairing.is_paired(),
-        "runtime": crate::health::snapshot_json(),
+        "status": readiness.status,
+        "paired": paired,
+        "readiness": readiness,
+        "runtime": runtime,
     });
-    Json(body)
+    (status, Json(body))
 }
 
 /// Prometheus content type for text exposition format.
@@ -4854,5 +4881,20 @@ mod tests {
             text.contains("prx_chat_dispatch_drops_total"),
             "chat dispatch drops counter missing with noop observer"
         );
+    }
+
+    #[test]
+    fn readiness_http_is_non_success_without_ready_required_components() {
+        let runtime = crate::health::HealthSnapshot {
+            pid: 1,
+            updated_at: chrono::Utc::now().to_rfc3339(),
+            uptime_seconds: 1,
+            components: std::collections::BTreeMap::new(),
+        };
+
+        let (status, Json(body)) = health_response(false, runtime);
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(body["status"], "not_ready");
     }
 }

@@ -17,9 +17,19 @@ use tokio_util::sync::CancellationToken;
 
 const STATUS_FLUSH_SECONDS: u64 = 5;
 const MANUAL_DAEMON_STALE_SECONDS: i64 = 30;
+const CORE_HEALTH_TTL_SECONDS: u64 = 60;
+const OPTIONAL_HEALTH_TTL_SECONDS: u64 = 300;
 
 pub async fn run(config: Config, host: String, port: u16, shutdown: CancellationToken) -> Result<()> {
     ensure_manual_daemon_start_allowed(&config)?;
+
+    crate::health::register_component(
+        "daemon",
+        "daemon",
+        true,
+        Duration::from_secs(CORE_HEALTH_TTL_SECONDS),
+        crate::health::ComponentState::Starting,
+    );
 
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config.reliability.channel_max_backoff_secs.max(initial_backoff);
@@ -34,7 +44,6 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         HotReloadManager::spawn(config_path, Arc::clone(&shared_config))
     };
 
-    crate::health::mark_component_ok("daemon");
     let startup_trace =
         crate::runtime::control_ladder::ControlLadderSnapshot::from_config(&config).build_trace("daemon.start", None);
     if let Err(error) =
@@ -52,6 +61,13 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     // Gateway always starts — modules.network only controls whether network.toml
     // is loaded, not the gateway itself.
     {
+        crate::health::register_component(
+            "gateway",
+            "gateway",
+            true,
+            Duration::from_secs(CORE_HEALTH_TTL_SECONDS),
+            crate::health::ComponentState::Starting,
+        );
         let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_shared = Arc::clone(&shared_config);
@@ -81,6 +97,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
 
     if config.modules.channels {
         if has_supervised_channels(&config) {
+            register_optional_component("channels", "channels", true, OPTIONAL_HEALTH_TTL_SECONDS);
             let channels_cfg = config.clone();
             handles.push(spawn_component_supervisor(
                 "channels",
@@ -96,15 +113,19 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
                 },
             ));
         } else {
-            crate::health::mark_component_ok("channels");
+            register_optional_component("channels", "channels", false, OPTIONAL_HEALTH_TTL_SECONDS);
             tracing::info!("No real-time channels configured; channel supervisor disabled");
         }
     } else {
-        crate::health::mark_component_ok("channels");
+        register_optional_component("channels", "channels", false, OPTIONAL_HEALTH_TTL_SECONDS);
         tracing::debug!("Channels module disabled, skipping channel supervisor startup");
     }
 
     if config.modules.scheduler && config.heartbeat.enabled {
+        let heartbeat_ttl = u64::from(config.heartbeat.interval_minutes)
+            .saturating_mul(120)
+            .max(OPTIONAL_HEALTH_TTL_SECONDS);
+        register_optional_component("heartbeat", "heartbeat", true, heartbeat_ttl);
         let heartbeat_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "heartbeat",
@@ -115,12 +136,22 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
                 async move { run_heartbeat_worker(cfg).await }
             },
         ));
-    } else if !config.modules.scheduler {
-        crate::health::mark_component_ok("heartbeat");
-        tracing::debug!("Scheduler module disabled, skipping heartbeat startup");
+    } else {
+        register_optional_component("heartbeat", "heartbeat", false, OPTIONAL_HEALTH_TTL_SECONDS);
+        if !config.modules.scheduler {
+            tracing::debug!("Scheduler module disabled, skipping heartbeat startup");
+        } else {
+            tracing::debug!("Heartbeat disabled, skipping heartbeat startup");
+        }
     }
 
     if config.modules.scheduler && config.cron.enabled {
+        let scheduler_ttl = config
+            .reliability
+            .scheduler_poll_secs
+            .saturating_mul(3)
+            .max(OPTIONAL_HEALTH_TTL_SECONDS);
+        register_optional_component("scheduler", "cron", true, scheduler_ttl);
         let scheduler_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "scheduler",
@@ -132,7 +163,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             },
         ));
     } else {
-        crate::health::mark_component_ok("scheduler");
+        register_optional_component("scheduler", "cron", false, OPTIONAL_HEALTH_TTL_SECONDS);
         if !config.modules.scheduler {
             tracing::debug!("Scheduler module disabled, skipping cron startup");
         } else {
@@ -142,6 +173,10 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
 
     // ── Xin (心) autonomous task engine ──
     if config.modules.scheduler && config.xin.enabled {
+        let xin_ttl = u64::from(config.xin.interval_minutes)
+            .saturating_mul(120)
+            .max(OPTIONAL_HEALTH_TTL_SECONDS);
+        register_optional_component("xin", "xin", true, xin_ttl);
         let xin_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "xin",
@@ -153,7 +188,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             },
         ));
     } else {
-        crate::health::mark_component_ok("xin");
+        register_optional_component("xin", "xin", false, OPTIONAL_HEALTH_TTL_SECONDS);
         if !config.modules.scheduler {
             tracing::debug!("Scheduler module disabled, skipping xin startup");
         } else {
@@ -171,6 +206,12 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         config.modules.scheduler && config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
     let spawn_fitness = config.self_system.enabled && !xin_manages_evolution;
     if spawn_fitness {
+        let fitness_ttl = config
+            .self_system
+            .fitness_interval_hours
+            .saturating_mul(7200)
+            .max(OPTIONAL_HEALTH_TTL_SECONDS);
+        register_optional_component("self_system_fitness", "self-system", true, fitness_ttl);
         let fitness_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "self_system_fitness",
@@ -182,7 +223,12 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             },
         ));
     } else {
-        crate::health::mark_component_ok("self_system_fitness");
+        register_optional_component(
+            "self_system_fitness",
+            if xin_manages_evolution { "xin" } else { "self-system" },
+            false,
+            OPTIONAL_HEALTH_TTL_SECONDS,
+        );
         if xin_manages_evolution {
             tracing::info!("Fitness managed by xin; standalone fitness supervisor not started");
         } else {
@@ -194,6 +240,16 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     // Same guard: xin takes over evolution only when all three flags are on.
     let spawn_evolution = config.self_system.evolution_enabled && !xin_manages_evolution;
     if spawn_evolution {
+        register_optional_component(
+            "evolution_scheduler",
+            "self-system",
+            true,
+            config
+                .self_system
+                .fitness_interval_hours
+                .saturating_mul(7200)
+                .max(OPTIONAL_HEALTH_TTL_SECONDS),
+        );
         let evolution_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "evolution_scheduler",
@@ -205,7 +261,12 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             },
         ));
     } else {
-        crate::health::mark_component_ok("evolution_scheduler");
+        register_optional_component(
+            "evolution_scheduler",
+            if xin_manages_evolution { "xin" } else { "self-system" },
+            false,
+            OPTIONAL_HEALTH_TTL_SECONDS,
+        );
         if xin_manages_evolution {
             tracing::info!("Evolution managed by xin; standalone evolution supervisor not started");
         } else {
@@ -214,6 +275,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     }
 
     if config.modules.integrations && config.webhook.enabled {
+        register_optional_component("webhook_receiver", "webhook", true, OPTIONAL_HEALTH_TTL_SECONDS);
         let webhook_cfg = config.clone();
         handles.push(spawn_component_supervisor(
             "webhook_receiver",
@@ -230,7 +292,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             },
         ));
     } else {
-        crate::health::mark_component_ok("webhook_receiver");
+        register_optional_component("webhook_receiver", "webhook", false, OPTIONAL_HEALTH_TTL_SECONDS);
         if !config.modules.integrations {
             tracing::debug!("Integrations module disabled, skipping webhook receiver startup");
         } else {
@@ -244,17 +306,29 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         "   Components: gateway, channels, heartbeat, scheduler, xin, self_system_fitness, evolution_scheduler, webhook_receiver"
     );
     println!("   Ctrl+C to stop");
-    systemd_notify::ready();
+    crate::health::mark_component_ok("daemon");
 
-    // D5/D9 step 4: wait for either the external root shutdown token (e.g. the
-    // dispatch-owned signal task wired in A6) or a direct ctrl_c as a fallback.
-    // The abort-based teardown below is preserved verbatim: the daemon performs
-    // a stateless exit and must not be turned into a graceful child-await.
-    tokio::select! {
-        () = shutdown.cancelled() => {}
-        res = tokio::signal::ctrl_c() => res?,
+    let stopped_during_startup = tokio::select! {
+        () = crate::health::wait_until_ready() => false,
+        () = shutdown.cancelled() => true,
+        res = tokio::signal::ctrl_c() => {
+            res?;
+            true
+        },
+    };
+    if !stopped_during_startup {
+        systemd_notify::ready();
+
+        // D5/D9 step 4: wait for either the external root shutdown token (e.g. the
+        // dispatch-owned signal task wired in A6) or a direct ctrl_c as a fallback.
+        // The abort-based teardown below is preserved verbatim: the daemon performs
+        // a stateless exit and must not be turned into a graceful child-await.
+        tokio::select! {
+            () = shutdown.cancelled() => {}
+            res = tokio::signal::ctrl_c() => res?,
+        }
     }
-    crate::health::mark_component_error("daemon", "shutdown requested");
+    crate::health::mark_component_stopping("daemon");
     systemd_notify::stopping();
 
     for handle in &handles {
@@ -263,8 +337,25 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     for handle in handles {
         let _ = handle.await;
     }
+    crate::health::mark_component_stopped("daemon");
 
     Ok(())
+}
+
+fn register_optional_component(component: &str, owner: &str, enabled: bool, freshness_ttl_seconds: u64) {
+    // Background capabilities are observable but not core ingress prerequisites:
+    // their failure degrades the snapshot without preventing gateway readiness.
+    crate::health::register_component(
+        component,
+        owner,
+        false,
+        Duration::from_secs(freshness_ttl_seconds.max(1)),
+        if enabled {
+            crate::health::ComponentState::Starting
+        } else {
+            crate::health::ComponentState::Disabled
+        },
+    );
 }
 
 pub fn state_file_path(config: &Config) -> PathBuf {
@@ -287,7 +378,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
         let mut interval = tokio::time::interval(Duration::from_secs(STATUS_FLUSH_SECONDS));
         loop {
             interval.tick().await;
-            crate::health::mark_component_ok("daemon");
+            crate::health::touch_component("daemon");
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
@@ -393,7 +484,7 @@ where
         let max_backoff = max_backoff_secs.max(backoff);
 
         loop {
-            crate::health::mark_component_ok(name);
+            crate::health::mark_component_starting(name);
             match run_component().await {
                 Ok(()) => {
                     crate::health::mark_component_error(name, "component exited unexpectedly");
@@ -426,9 +517,11 @@ async fn run_heartbeat_worker(config: Config) -> Result<()> {
 
     let interval_mins = config.heartbeat.interval_minutes.max(5);
     let mut interval = tokio::time::interval(Duration::from_secs(u64::from(interval_mins) * 60));
+    crate::health::mark_component_ok("heartbeat");
 
     loop {
         interval.tick().await;
+        crate::health::mark_component_ok("heartbeat");
         let local_hour = chrono::Local::now().hour() as u8;
         if !crate::heartbeat::engine::HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour) {
             continue;
@@ -1047,6 +1140,23 @@ mod tests {
                 .as_str()
                 .unwrap_or("")
                 .contains("component exited unexpectedly")
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_does_not_treat_task_survival_as_readiness() {
+        let handle = spawn_component_supervisor("daemon-test-pending", 1, 1, || async {
+            std::future::pending::<Result<()>>().await
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = crate::health::snapshot_json();
+        handle.abort();
+        let _ = handle.await;
+
+        assert_ne!(
+            snapshot["components"]["daemon-test-pending"]["status"], "ok",
+            "a pending task has not acknowledged readiness"
         );
     }
 

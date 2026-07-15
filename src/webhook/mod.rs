@@ -552,6 +552,7 @@ async fn run_with_repository(
     let addr = listener.local_addr()?;
 
     tracing::info!("Webhook server listening on {}", addr);
+    crate::health::mark_component_ok("webhook_receiver");
 
     let state = WebhookState {
         token: Arc::<str>::from(trimmed_token.to_string()),
