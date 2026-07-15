@@ -87,6 +87,16 @@ pub struct SqliteTaskEventMirror<'a> {
 }
 
 pub fn append_task_event_mirror(workspace_dir: &Path, input: SqliteTaskEventMirror<'_>) -> anyhow::Result<i64> {
+    append_task_event_mirror_idempotent(workspace_dir, &Uuid::new_v4().to_string(), input)
+}
+
+/// Append a task event mirror with a caller-owned stable event id. Replaying
+/// the same outbox row returns the existing mirror instead of duplicating it.
+pub fn append_task_event_mirror_idempotent(
+    workspace_dir: &Path,
+    event_id: &str,
+    input: SqliteTaskEventMirror<'_>,
+) -> anyhow::Result<i64> {
     let db_path = workspace_dir.join("memory").join("brain.db");
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)
@@ -118,9 +128,8 @@ pub fn append_task_event_mirror(workspace_dir: &Path, input: SqliteTaskEventMirr
             ON memory_events(workspace_id, session_key, id);",
     )?;
 
-    let event_id = Uuid::new_v4().to_string();
     conn.execute(
-        "INSERT INTO memory_events (
+        "INSERT OR IGNORE INTO memory_events (
             event_id, workspace_id, event_type, subject_table, subject_id,
             session_key, agent_id, persona_id, visibility, payload_json, created_at
          )
@@ -137,7 +146,12 @@ pub fn append_task_event_mirror(workspace_dir: &Path, input: SqliteTaskEventMirr
             Utc::now().to_rfc3339(),
         ],
     )?;
-    Ok(conn.last_insert_rowid())
+    conn.query_row(
+        "SELECT id FROM memory_events WHERE event_id = ?1",
+        params![event_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
 }
 
 pub fn init_approval_grant_schema(conn: &Connection) -> anyhow::Result<()> {

@@ -245,37 +245,27 @@ async fn execute_single_task(
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
 
-    // Persist result
-    if success {
-        if let Err(e) = store::mark_completed(config, &task_id, &output) {
-            tracing::warn!(target: "xin", task_id = %task_id, "failed to mark completed: {e}");
-        }
-    } else if let Err(e) = store::mark_failed(config, &task_id, &output) {
-        tracing::warn!(target: "xin", task_id = %task_id, "failed to mark failed: {e}");
-    }
-
-    // Record run history
-    let status = if success { "ok" } else { "error" };
-    if let Err(e) = store::record_run(
+    let committed = match store::commit_task_execution(
         config,
         &task_id,
+        success,
+        &output,
         started_at,
         finished_at,
-        status,
-        Some(&output),
         duration_ms,
     ) {
-        tracing::warn!(target: "xin", task_id = %task_id, "failed to record run: {e}");
-    }
-
-    // Reschedule if recurring and still enabled
-    if task.recurring {
-        if let Err(e) = store::reschedule_recurring(config, &task_id) {
-            tracing::warn!(target: "xin", task_id = %task_id, "failed to reschedule: {e}");
+        Ok(true) => true,
+        Ok(false) => {
+            tracing::warn!(target: "xin", task_id = %task_id, "task result lost its running-state commit authority");
+            false
         }
-    }
+        Err(e) => {
+            tracing::warn!(target: "xin", task_id = %task_id, "failed to commit task result transaction: {e}");
+            false
+        }
+    };
 
-    (success, task_id)
+    (success && committed, task_id)
 }
 
 // ── Goal / Step execution (FIX-P2-16, d09) ──────────────────────────────

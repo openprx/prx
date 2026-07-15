@@ -10,7 +10,7 @@ use crate::xin::types::{
 };
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
@@ -283,6 +283,7 @@ pub fn claim_task(config: &Config, task_id: &str) -> Result<bool> {
 }
 
 /// Mark a task as completed after successful execution.
+#[cfg(test)]
 pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -314,6 +315,7 @@ pub fn mark_completed(config: &Config, task_id: &str, output: &str) -> Result<()
 }
 
 /// Mark a task as failed. If `fail_count >= max_failures` (and max_failures > 0), disables it.
+#[cfg(test)]
 pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
     let now = Utc::now();
     let bounded = truncate_output(output);
@@ -357,6 +359,7 @@ pub fn mark_failed(config: &Config, task_id: &str, output: &str) -> Result<()> {
 }
 
 /// Reschedule a recurring task after completion/failure.
+#[cfg(test)]
 pub fn reschedule_recurring(config: &Config, task_id: &str) -> Result<()> {
     let now = Utc::now();
     with_connection(config, |conn| {
@@ -492,8 +495,123 @@ pub fn ensure_system_task(config: &Config, new: &NewXinTask) -> Result<XinTask> 
     )
 }
 
-/// Record a completed run in the `xin_runs` history table.
-pub fn record_run(
+/// Commit one legacy Xin task execution as a single local transaction.
+///
+/// Result state, run history, failure disabling, recurring reschedule, local
+/// lifecycle events, and their outbox rows either commit together or roll back
+/// together. Cross-database delivery is recovered from the committed outbox.
+pub fn commit_task_execution(
+    config: &Config,
+    task_id: &str,
+    success: bool,
+    output: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    duration_ms: i64,
+) -> Result<bool> {
+    let bounded = truncate_output(output);
+    with_immediate_connection(config, |conn| {
+        let task: Option<(bool, i64)> = conn
+            .query_row(
+                "SELECT recurring, interval_secs FROM xin_tasks WHERE id = ?1",
+                params![task_id],
+                |row| Ok((row.get::<_, i64>(0)? != 0, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((recurring, interval_secs)) = task else {
+            return Ok(false);
+        };
+
+        let changed = if success {
+            conn.execute(
+                "UPDATE xin_tasks
+                 SET status = 'completed', last_run_at = ?1, last_status = 'ok',
+                     last_output = ?2, run_count = run_count + 1, updated_at = ?1
+                 WHERE id = ?3 AND status = 'running'",
+                params![finished_at.to_rfc3339(), bounded, task_id],
+            )?
+        } else {
+            conn.execute(
+                "UPDATE xin_tasks
+                 SET status = 'failed', last_run_at = ?1, last_status = 'error',
+                     last_output = ?2, run_count = run_count + 1,
+                     fail_count = fail_count + 1, updated_at = ?1
+                 WHERE id = ?3 AND status = 'running'",
+                params![finished_at.to_rfc3339(), bounded, task_id],
+            )?
+        };
+        if changed == 0 {
+            return Ok(false);
+        }
+
+        let result_event_type = if success {
+            "xin.task.completed"
+        } else {
+            "xin.task.failed"
+        };
+        let result_status = if success { "completed" } else { "failed" };
+        if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                result_event_type,
+                Some(result_status),
+                Some(serde_json::json!({ "output": bounded }).to_string()).as_deref(),
+            )?;
+        }
+
+        if !success {
+            conn.execute(
+                "UPDATE xin_tasks
+                 SET enabled = 0
+                 WHERE id = ?1 AND max_failures > 0 AND fail_count >= max_failures",
+                params![task_id],
+            )?;
+        }
+
+        insert_run_record(
+            conn,
+            config,
+            task_id,
+            started_at,
+            finished_at,
+            if success { "ok" } else { "error" },
+            Some(&bounded),
+            duration_ms,
+        )?;
+
+        let enabled = conn.query_row("SELECT enabled FROM xin_tasks WHERE id = ?1", params![task_id], |row| {
+            Ok(row.get::<_, i64>(0)? != 0)
+        })?;
+        if recurring && enabled {
+            let next_run = finished_at + chrono::Duration::seconds(interval_secs.max(0));
+            conn.execute(
+                "UPDATE xin_tasks
+                 SET status = 'pending', next_run_at = ?1, updated_at = ?2
+                 WHERE id = ?3 AND recurring = 1 AND enabled = 1",
+                params![next_run.to_rfc3339(), finished_at.to_rfc3339(), task_id],
+            )?;
+            if let Some(lineage) = load_task_lineage(conn, task_id)? {
+                insert_task_event(
+                    conn,
+                    &workspace_id(config),
+                    task_id,
+                    lineage,
+                    "xin.task.rescheduled",
+                    Some("pending"),
+                    Some(serde_json::json!({ "next_run_at": next_run.to_rfc3339() }).to_string()).as_deref(),
+                )?;
+            }
+        }
+
+        Ok(true)
+    })
+}
+
+fn insert_run_record(
+    conn: &Connection,
     config: &Config,
     task_id: &str,
     started_at: DateTime<Utc>,
@@ -503,45 +621,43 @@ pub fn record_run(
     duration_ms: i64,
 ) -> Result<()> {
     let bounded = output.map(truncate_output);
-    with_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
 
-        tx.execute(
-            "INSERT INTO xin_runs (task_id, started_at, finished_at, status, output, duration_ms)
+    conn.execute(
+        "INSERT INTO xin_runs (task_id, started_at, finished_at, status, output, duration_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                task_id,
-                started_at.to_rfc3339(),
-                finished_at.to_rfc3339(),
-                status,
-                bounded.as_deref(),
-                duration_ms,
-            ],
-        )
-        .context("Failed to insert xin run")?;
-        if let Some(lineage) = load_task_lineage(&tx, task_id)? {
-            insert_task_event(
-                &tx,
-                &workspace_id(config),
-                task_id,
-                lineage,
-                "xin.task.run_recorded",
-                Some(status),
-                Some(
-                    serde_json::json!({
-                        "started_at": started_at.to_rfc3339(),
-                        "finished_at": finished_at.to_rfc3339(),
-                        "duration_ms": duration_ms,
-                    })
-                    .to_string(),
-                )
-                .as_deref(),
-            )?;
-        }
+        params![
+            task_id,
+            started_at.to_rfc3339(),
+            finished_at.to_rfc3339(),
+            status,
+            bounded.as_deref(),
+            duration_ms,
+        ],
+    )
+    .context("Failed to insert xin run")?;
+    if let Some(lineage) = load_task_lineage(conn, task_id)? {
+        insert_task_event(
+            conn,
+            &workspace_id(config),
+            task_id,
+            lineage,
+            "xin.task.run_recorded",
+            Some(status),
+            Some(
+                serde_json::json!({
+                    "started_at": started_at.to_rfc3339(),
+                    "finished_at": finished_at.to_rfc3339(),
+                    "duration_ms": duration_ms,
+                })
+                .to_string(),
+            )
+            .as_deref(),
+        )?;
+    }
 
-        // Prune old runs — keep last 50 per task
-        tx.execute(
-            "DELETE FROM xin_runs
+    // Prune old runs — keep last 50 per task
+    conn.execute(
+        "DELETE FROM xin_runs
              WHERE task_id = ?1
                AND id NOT IN (
                  SELECT id FROM xin_runs
@@ -549,12 +665,35 @@ pub fn record_run(
                  ORDER BY started_at DESC, id DESC
                  LIMIT 50
                )",
-            params![task_id],
-        )
-        .context("Failed to prune xin run history")?;
+        params![task_id],
+    )
+    .context("Failed to prune xin run history")?;
 
-        tx.commit().context("Failed to commit xin run transaction")?;
-        Ok(())
+    Ok(())
+}
+
+/// Record a completed run in the `xin_runs` history table.
+#[cfg(test)]
+pub fn record_run(
+    config: &Config,
+    task_id: &str,
+    started_at: DateTime<Utc>,
+    finished_at: DateTime<Utc>,
+    status: &str,
+    output: Option<&str>,
+    duration_ms: i64,
+) -> Result<()> {
+    with_immediate_connection(config, |conn| {
+        insert_run_record(
+            conn,
+            config,
+            task_id,
+            started_at,
+            finished_at,
+            status,
+            output,
+            duration_ms,
+        )
     })
 }
 
@@ -1556,40 +1695,70 @@ fn insert_task_event(
     status: Option<&str>,
     payload_json: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO xin_task_events (
+    let event_id = Uuid::new_v4().to_string();
+    let created_at = Utc::now().to_rfc3339();
+    conn.execute_batch("SAVEPOINT xin_task_event_append")?;
+    let append = (|| -> Result<()> {
+        conn.execute(
+            "INSERT INTO xin_task_events (
             event_id, task_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
             event_type, status, payload_json, created_at
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            Uuid::new_v4().to_string(),
-            task_id,
-            workspace_id,
-            lineage.owner_id.as_deref(),
-            lineage.topic_id.as_deref(),
-            lineage.parent_task_id.as_deref(),
-            lineage.source_message_event_id.as_deref(),
-            event_type,
-            status,
-            payload_json,
-            Utc::now().to_rfc3339(),
-        ],
-    )
-    .context("Failed to insert xin task event")?;
-    if let Err(error) = mirror_xin_task_event(workspace_id, task_id, &lineage, event_type, status, payload_json) {
-        tracing::warn!(task_id = %task_id, event_type, "failed to mirror xin task event into memory_events: {error}");
+            params![
+                event_id,
+                task_id,
+                workspace_id,
+                lineage.owner_id.as_deref(),
+                lineage.topic_id.as_deref(),
+                lineage.parent_task_id.as_deref(),
+                lineage.source_message_event_id.as_deref(),
+                event_type,
+                status,
+                payload_json,
+                created_at,
+            ],
+        )
+        .context("Failed to insert xin task event")?;
+        let (mirror_event_type, mirror_payload_json) =
+            build_xin_task_event_mirror(task_id, &lineage, event_type, status, payload_json);
+        conn.execute(
+            "INSERT INTO xin_event_outbox (
+            event_id, workspace_id, task_id, event_type, payload_json, created_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event_id,
+                workspace_id,
+                task_id,
+                mirror_event_type,
+                mirror_payload_json,
+                created_at,
+            ],
+        )
+        .context("Failed to enqueue xin task event mirror")?;
+        Ok(())
+    })();
+    match append {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT xin_task_event_append")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT xin_task_event_append;
+                 RELEASE SAVEPOINT xin_task_event_append;",
+            );
+            Err(error)
+        }
     }
-    Ok(())
 }
 
-fn mirror_xin_task_event(
-    workspace_id: &str,
+fn build_xin_task_event_mirror(
     task_id: &str,
     lineage: &TaskLineage,
     event_type: &str,
     status: Option<&str>,
     payload_json: Option<&str>,
-) -> Result<i64> {
+) -> (String, String) {
     let mirrored_event_type = if event_type == "xin.task.created" {
         "xin.task.spawned"
     } else {
@@ -1617,18 +1786,71 @@ fn mirror_xin_task_event(
         }
     }
     let payload_json = serde_json::Value::Object(payload).to_string();
-    crate::memory::sqlite::append_task_event_mirror(
-        std::path::Path::new(workspace_id),
-        crate::memory::sqlite::SqliteTaskEventMirror {
-            workspace_id,
-            task_id,
-            event_type: mirrored_event_type,
-            session_key: None,
-            agent_id: None,
-            persona_id: None,
-            payload_json: Some(&payload_json),
-        },
-    )
+    (mirrored_event_type.to_string(), payload_json)
+}
+
+/// Deliver committed Xin event-outbox rows into the shared memory event spine.
+/// The outbox event id is reused as the mirror event id, so a crash after the
+/// external insert but before `delivered_at` is safe to replay.
+fn deliver_pending_xin_event_outbox(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id, workspace_id, task_id, event_type, payload_json
+         FROM xin_event_outbox
+         WHERE delivered_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT 100",
+    )?;
+    let pending = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut delivered = 0;
+    for (event_id, workspace_id, task_id, event_type, payload_json) in pending {
+        let result = crate::memory::sqlite::append_task_event_mirror_idempotent(
+            std::path::Path::new(&workspace_id),
+            &event_id,
+            crate::memory::sqlite::SqliteTaskEventMirror {
+                workspace_id: &workspace_id,
+                task_id: &task_id,
+                event_type: &event_type,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
+                payload_json: Some(&payload_json),
+            },
+        );
+        match result {
+            Ok(_) => {
+                conn.execute(
+                    "UPDATE xin_event_outbox
+                     SET delivered_at = ?1, attempt_count = attempt_count + 1, last_error = NULL
+                     WHERE event_id = ?2 AND delivered_at IS NULL",
+                    params![Utc::now().to_rfc3339(), event_id],
+                )?;
+                delivered += 1;
+            }
+            Err(error) => {
+                let error = truncate_output(&error.to_string());
+                conn.execute(
+                    "UPDATE xin_event_outbox
+                     SET attempt_count = attempt_count + 1, last_error = ?1
+                     WHERE event_id = ?2 AND delivered_at IS NULL",
+                    params![error, event_id],
+                )?;
+                tracing::warn!(task_id, event_type, "failed to deliver Xin event outbox row: {error}");
+            }
+        }
+    }
+    Ok(delivered)
 }
 
 fn map_task_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<XinTaskEvent> {
@@ -1791,6 +2013,20 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
          CREATE INDEX IF NOT EXISTS idx_xin_task_events_topic ON xin_task_events(workspace_id, topic_id, id);
          CREATE INDEX IF NOT EXISTS idx_xin_task_events_type ON xin_task_events(event_type, id);
 
+         CREATE TABLE IF NOT EXISTS xin_event_outbox (
+            event_id       TEXT PRIMARY KEY,
+            workspace_id   TEXT NOT NULL,
+            task_id        TEXT NOT NULL,
+            event_type     TEXT NOT NULL,
+            payload_json   TEXT NOT NULL,
+            created_at     TEXT NOT NULL,
+            delivered_at   TEXT,
+            attempt_count  INTEGER NOT NULL DEFAULT 0,
+            last_error     TEXT
+         );
+         CREATE INDEX IF NOT EXISTS idx_xin_event_outbox_pending
+            ON xin_event_outbox(delivered_at, created_at);
+
          CREATE TABLE IF NOT EXISTS xin_goals (
             id                      TEXT PRIMARY KEY,
             owner_id                TEXT,
@@ -1862,7 +2098,11 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     )
     .context("Failed to initialize xin lineage indexes")?;
 
-    f(&conn)
+    let result = f(&conn);
+    if let Err(error) = deliver_pending_xin_event_outbox(&conn) {
+        tracing::warn!("failed to drain Xin event outbox: {error}");
+    }
+    result
 }
 
 fn with_immediate_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
@@ -2123,6 +2363,216 @@ mod tests {
                 .iter()
                 .all(|event| event.source_message_event_id.as_deref() == Some("msg-a"))
         );
+    }
+
+    #[test]
+    fn recurring_execution_commits_result_run_reschedule_and_events_together() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &recurring_task()).unwrap();
+        assert!(claim_task(&config, &task.id).unwrap());
+
+        let started_at = Utc::now();
+        let finished_at = started_at + chrono::Duration::seconds(2);
+        assert!(commit_task_execution(&config, &task.id, true, "healthy", started_at, finished_at, 2_000,).unwrap());
+
+        let committed = get_task(&config, &task.id).unwrap();
+        assert_eq!(committed.status, TaskStatus::Pending);
+        assert_eq!(committed.run_count, 1);
+        assert_eq!(committed.fail_count, 0);
+        assert_eq!(committed.last_output.as_deref(), Some("healthy"));
+        assert_eq!(committed.next_run_at, finished_at + chrono::Duration::seconds(300));
+
+        let conn = open_xin_test_connection(&config);
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM xin_runs WHERE task_id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 1);
+        let undelivered: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM xin_event_outbox WHERE task_id = ?1 AND delivered_at IS NULL",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(undelivered, 0);
+
+        let event_types = list_task_events(&config, &task.id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(event_types.ends_with(&[
+            "xin.task.completed".to_string(),
+            "xin.task.run_recorded".to_string(),
+            "xin.task.rescheduled".to_string(),
+        ]));
+    }
+
+    #[test]
+    fn recurring_execution_rolls_back_when_event_outbox_enqueue_fails() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &recurring_task()).unwrap();
+        assert!(claim_task(&config, &task.id).unwrap());
+        let conn = open_xin_test_connection(&config);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_xin_outbox
+             BEFORE INSERT ON xin_event_outbox
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let started_at = Utc::now();
+        let result = commit_task_execution(
+            &config,
+            &task.id,
+            true,
+            "must roll back",
+            started_at,
+            started_at + chrono::Duration::seconds(1),
+            1_000,
+        );
+        assert!(result.is_err());
+
+        let rolled_back = get_task(&config, &task.id).unwrap();
+        assert_eq!(rolled_back.status, TaskStatus::Running);
+        assert_eq!(rolled_back.run_count, 0);
+        assert_eq!(rolled_back.fail_count, 0);
+        assert!(rolled_back.last_output.is_none());
+        let conn = open_xin_test_connection(&config);
+        let runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM xin_runs WHERE task_id = ?1",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(runs, 0);
+        let event_types = list_task_events(&config, &task.id)
+            .unwrap()
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert!(!event_types.iter().any(|event| {
+            matches!(
+                event.as_str(),
+                "xin.task.completed" | "xin.task.run_recorded" | "xin.task.rescheduled"
+            )
+        }));
+    }
+
+    #[test]
+    fn event_outbox_recovers_cross_database_delivery_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let memory_path = config.workspace_dir.join("memory");
+        std::fs::write(&memory_path, "block memory directory creation").unwrap();
+
+        let task = add_task(&config, &sample_task()).unwrap();
+        let conn = open_xin_test_connection(&config);
+        let (event_id, attempts, delivered_at): (String, i64, Option<String>) = conn
+            .query_row(
+                "SELECT event_id, attempt_count, delivered_at
+                 FROM xin_event_outbox WHERE task_id = ?1",
+                params![task.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(attempts >= 1);
+        assert!(delivered_at.is_none());
+        drop(conn);
+
+        std::fs::remove_file(&memory_path).unwrap();
+        std::fs::create_dir_all(&memory_path).unwrap();
+        list_task_events(&config, &task.id).unwrap();
+
+        let conn = open_xin_test_connection(&config);
+        let delivered_at: Option<String> = conn
+            .query_row(
+                "SELECT delivered_at FROM xin_event_outbox WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivered_at.is_some());
+        drop(conn);
+
+        let brain = Connection::open(memory_path.join("brain.db")).unwrap();
+        let mirrored: i64 = brain
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirrored, 1);
+        drop(brain);
+
+        list_task_events(&config, &task.id).unwrap();
+        let brain = Connection::open(memory_path.join("brain.db")).unwrap();
+        let mirrored_after_replay: i64 = brain
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events WHERE event_id = ?1",
+                params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirrored_after_replay, 1);
+    }
+
+    #[test]
+    fn local_event_and_outbox_enqueue_are_an_atomic_pair() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+        let conn = open_xin_test_connection(&config);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_xin_outbox
+             BEFORE INSERT ON xin_event_outbox
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        let append = with_connection(&config, |conn| {
+            let lineage = load_task_lineage(conn, &task.id)?.expect("task lineage");
+            insert_task_event(
+                conn,
+                &workspace_id(&config),
+                &task.id,
+                lineage,
+                "xin.task.injected",
+                Some("test"),
+                None,
+            )
+        });
+        assert!(append.is_err());
+
+        let conn = open_xin_test_connection(&config);
+        let local_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM xin_task_events
+                 WHERE task_id = ?1 AND event_type = 'xin.task.injected'",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let outbox_events: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM xin_event_outbox
+                 WHERE task_id = ?1 AND event_type = 'xin.task.injected'",
+                params![task.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(local_events, 0);
+        assert_eq!(outbox_events, 0);
     }
 
     #[test]
@@ -2681,6 +3131,42 @@ mod tests {
         assert_eq!(
             payload.get("lease_epoch").and_then(serde_json::Value::as_u64),
             Some(lease.epoch)
+        );
+    }
+
+    #[test]
+    fn step_completion_goal_progress_and_outbox_roll_back_together() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let goal = add_goal(&config, &sample_goal(vec![sample_step(1)])).unwrap();
+        let step = list_steps(&config, &goal.id).unwrap().remove(0);
+        let lease = claim_step_with_lease(&config, &step.id, "prx:1:rollback", 60)
+            .unwrap()
+            .expect("claim");
+        assert!(mark_step_running_with_lease(&config, &step.id, &lease).unwrap());
+        let goal_before_completion = get_goal(&config, &goal.id).unwrap();
+
+        let conn = open_xin_test_connection(&config);
+        conn.execute_batch(
+            "CREATE TRIGGER fail_xin_outbox
+             BEFORE INSERT ON xin_event_outbox
+             BEGIN SELECT RAISE(ABORT, 'injected outbox failure'); END;",
+        )
+        .unwrap();
+        drop(conn);
+
+        assert!(complete_step_with_lease(&config, &step.id, &lease, "must roll back").is_err());
+        let rolled_back_step = get_step(&config, &step.id).unwrap();
+        let rolled_back_goal = get_goal(&config, &goal.id).unwrap();
+        assert_eq!(rolled_back_step.status, StepStatus::Running);
+        assert_eq!(rolled_back_step.lease_owner.as_deref(), Some("prx:1:rollback"));
+        assert_eq!(rolled_back_goal.status, goal_before_completion.status);
+        assert_eq!(rolled_back_goal.steps_completed, goal_before_completion.steps_completed);
+        assert!(
+            list_task_events(&config, &goal.id)
+                .unwrap()
+                .iter()
+                .all(|event| event.event_type != "xin.step.completed")
         );
     }
 
