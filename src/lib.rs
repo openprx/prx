@@ -89,6 +89,7 @@ pub mod acl;
 pub mod agent;
 pub mod approval;
 pub mod auth;
+pub mod capability;
 pub(crate) mod causal_tree;
 pub mod channels;
 #[allow(dead_code, private_interfaces)]

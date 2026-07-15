@@ -6,6 +6,7 @@
 //! resolving and invoking adapters directly.
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};
+use crate::capability::CapabilityAvailability;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::{RUNTIME_APPROVAL_GRANT_ARG, RUNTIME_APPROVAL_GRANTED_ARG, ToolDecision};
@@ -180,6 +181,9 @@ pub struct ToolDescriptor {
     pub categories: Vec<ToolCategory>,
     pub effect: ToolEffect,
     pub adapter: ToolAdapterKind,
+    /// Evidence-backed runtime availability. Registered executable tools are
+    /// `Ready`; `Healthy` is reserved for a positive runtime probe.
+    pub availability: CapabilityAvailability,
 }
 
 /// One normalized execution request.
@@ -467,9 +471,150 @@ struct ResolvedTool {
     descriptor: ToolDescriptor,
 }
 
+/// Immutable descriptor snapshot shared by discovery and execution.
+///
+/// The catalog is assembled from the exact finalized backend registry received
+/// by an entry point. It never infers executable readiness from configuration.
+#[derive(Debug, Clone)]
+pub struct ToolCatalog {
+    descriptors: Arc<[ToolDescriptor]>,
+}
+
+impl ToolCatalog {
+    fn from_backends(backends: &[Arc<dyn ToolBackend>]) -> Self {
+        let descriptors = backends
+            .iter()
+            .flat_map(|backend| {
+                backend.specs().into_iter().map(|spec| {
+                    tool_descriptor(
+                        backend.root_name(),
+                        spec,
+                        backend.tier(),
+                        backend.categories(),
+                        |public_name| backend.adapter_kind(public_name),
+                    )
+                })
+            })
+            .collect();
+        Self::from_descriptors(descriptors)
+    }
+
+    /// Snapshot a legacy boxed registry for user-facing discovery. This uses
+    /// the same descriptor construction as [`ToolExecutionService`].
+    #[must_use]
+    pub fn from_boxed_registry(registry: &[Box<dyn Tool>]) -> Self {
+        Self::from_tools(registry.iter().map(Box::as_ref))
+    }
+
+    /// Snapshot any selected set of legacy tools. Entry-point-specific tiering
+    /// may choose a subset, but descriptor and availability semantics remain
+    /// identical everywhere.
+    #[must_use]
+    pub fn from_tools<'a>(tools: impl IntoIterator<Item = &'a dyn Tool>) -> Self {
+        let descriptors = tools
+            .into_iter()
+            .flat_map(|tool| {
+                tool.specs().into_iter().map(|spec| {
+                    let root_name = tool.name();
+                    tool_descriptor(
+                        root_name,
+                        spec,
+                        tool.tier(),
+                        tool.categories().to_vec(),
+                        |public_name| {
+                            if root_name == "mcp_call" && public_name != root_name {
+                                ToolAdapterKind::McpAlias
+                            } else {
+                                ToolAdapterKind::Native
+                            }
+                        },
+                    )
+                })
+            })
+            .collect();
+        Self::from_descriptors(descriptors)
+    }
+
+    fn from_descriptors(descriptors: Vec<ToolDescriptor>) -> Self {
+        // Preserve registry/spec order so adopting the catalog does not reorder
+        // provider prompts. The first executable registration owns a duplicate
+        // public name, matching execution resolution's first-match semantics.
+        let mut unique = Vec::with_capacity(descriptors.len());
+        for descriptor in descriptors {
+            if !unique
+                .iter()
+                .any(|registered: &ToolDescriptor| registered.public_name == descriptor.public_name)
+            {
+                unique.push(descriptor);
+            }
+        }
+        Self {
+            descriptors: unique.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn descriptors(&self) -> &[ToolDescriptor] {
+        &self.descriptors
+    }
+
+    /// Provider-facing projection of the canonical descriptors.
+    #[must_use]
+    pub fn tool_specs(&self) -> Vec<ToolSpec> {
+        self.descriptors
+            .iter()
+            .map(|descriptor| ToolSpec {
+                name: descriptor.public_name.clone(),
+                description: descriptor.description.clone(),
+                parameters: descriptor.parameters.clone(),
+            })
+            .collect()
+    }
+
+    #[must_use]
+    pub fn descriptor(&self, public_name: &str) -> Option<&ToolDescriptor> {
+        self.descriptors
+            .iter()
+            .find(|descriptor| descriptor.public_name == public_name)
+    }
+}
+
+fn tool_descriptor(
+    backend_name: &str,
+    spec: ToolSpec,
+    tier: ToolTier,
+    categories: Vec<ToolCategory>,
+    adapter_kind: impl FnOnce(&str) -> ToolAdapterKind,
+) -> ToolDescriptor {
+    let adapter = adapter_kind(&spec.name);
+    let effect = if crate::security::policy::is_read_only_tool(&spec.name) {
+        ToolEffect::Read
+    } else {
+        ToolEffect::Act
+    };
+    let adapter_label = match adapter {
+        ToolAdapterKind::Native => "native",
+        ToolAdapterKind::McpAlias => "MCP alias",
+    };
+    ToolDescriptor {
+        public_name: spec.name,
+        backend_name: backend_name.to_string(),
+        description: spec.description,
+        parameters: spec.parameters,
+        tier,
+        categories,
+        effect,
+        adapter,
+        availability: CapabilityAvailability::ready(format!(
+            "executable {adapter_label} backend '{backend_name}' is registered"
+        )),
+    }
+}
+
 /// Mandatory application pipeline for native tools and MCP aliases.
 pub struct ToolExecutionService {
     backends: Arc<[Arc<dyn ToolBackend>]>,
+    catalog: ToolCatalog,
     policy: Arc<dyn EffectPolicy>,
     approval: Arc<dyn ApprovalStrategy>,
     sandbox: Arc<dyn ToolSandboxStrategy>,
@@ -501,8 +646,10 @@ impl ToolExecutionService {
         sandbox: Arc<dyn ToolSandboxStrategy>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
+        let catalog = ToolCatalog::from_backends(&backends);
         Self {
             backends: backends.into(),
+            catalog,
             policy,
             approval,
             sandbox,
@@ -559,58 +706,23 @@ impl ToolExecutionService {
     }
 
     fn resolve(&self, public_name: &str) -> Option<ResolvedTool> {
+        let descriptor = self.catalog.descriptor(public_name)?.clone();
         let backend = self
             .backends
             .iter()
-            .find(|backend| backend.supports_name(public_name))?
+            .find(|backend| backend.root_name() == descriptor.backend_name && backend.supports_name(public_name))?
             .clone();
-        let mut spec = backend
-            .specs()
-            .into_iter()
-            .find(|spec| spec.name == public_name)
-            .unwrap_or_else(|| {
-                let mut root = backend.specs().into_iter().next().unwrap_or_else(|| ToolSpec {
-                    name: backend.root_name().to_string(),
-                    description: backend.root_name().to_string(),
-                    parameters: serde_json::json!({"type": "object"}),
-                });
-                root.name = public_name.to_string();
-                root
-            });
-        spec.name = public_name.to_string();
-        let adapter = backend.adapter_kind(public_name);
-        let effect = if crate::security::policy::is_read_only_tool(public_name) {
-            ToolEffect::Read
-        } else {
-            ToolEffect::Act
-        };
-        Some(ResolvedTool {
-            descriptor: ToolDescriptor {
-                public_name: spec.name,
-                backend_name: backend.root_name().to_string(),
-                description: spec.description,
-                parameters: spec.parameters,
-                tier: backend.tier(),
-                categories: backend.categories(),
-                effect,
-                adapter,
-            },
-            backend,
-        })
+        Some(ResolvedTool { descriptor, backend })
     }
 
     #[must_use]
     pub fn descriptors(&self) -> Vec<ToolDescriptor> {
-        let mut descriptors = self
-            .backends
-            .iter()
-            .flat_map(|backend| backend.specs())
-            .filter_map(|spec| self.resolve(&spec.name))
-            .map(|resolved| resolved.descriptor)
-            .collect::<Vec<_>>();
-        descriptors.sort_by(|left, right| left.public_name.cmp(&right.public_name));
-        descriptors.dedup_by(|left, right| left.public_name == right.public_name);
-        descriptors
+        self.catalog.descriptors().to_vec()
+    }
+
+    #[must_use]
+    pub const fn catalog(&self) -> &ToolCatalog {
+        &self.catalog
     }
 
     /// Run the fixed descriptor -> effect -> policy -> approval -> sandbox ->
@@ -1176,6 +1288,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn catalog_is_the_execution_snapshot_and_reports_registered_backends_ready() {
+        let fixture = fixture();
+        let service = fixture.service(
+            "mcp_call",
+            vec!["mcp__demo__echo"],
+            ToolExecutionDecision::Allow,
+            approved(),
+            true,
+        );
+
+        assert_eq!(service.catalog().descriptors(), service.descriptors());
+        let root = service.catalog().descriptor("mcp_call").expect("root descriptor");
+        let alias = service
+            .catalog()
+            .descriptor("mcp__demo__echo")
+            .expect("MCP alias descriptor");
+        assert_eq!(
+            root.availability.level,
+            crate::capability::CapabilityAvailabilityLevel::Ready
+        );
+        assert_eq!(
+            alias.availability.level,
+            crate::capability::CapabilityAvailabilityLevel::Ready
+        );
+        assert_eq!(root.adapter, ToolAdapterKind::Native);
+        assert_eq!(alias.adapter, ToolAdapterKind::McpAlias);
+        assert!(alias.availability.reason.contains("backend 'mcp_call' is registered"));
+    }
+
     #[tokio::test]
     async fn native_pipeline_is_ordered_and_injects_only_trusted_runtime_fields() {
         let fixture = fixture();
@@ -1391,6 +1533,7 @@ mod tests {
                 ToolEffect::Act
             },
             adapter: ToolAdapterKind::Native,
+            availability: CapabilityAvailability::ready("test backend is registered"),
         };
         let policy = |autonomy| {
             SecurityEffectPolicy::new(Arc::new(SecurityPolicy {

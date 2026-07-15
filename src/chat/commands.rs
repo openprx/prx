@@ -636,9 +636,16 @@ fn format_model_feedback(model_name: &str) -> String {
 }
 
 fn format_tools_feedback(tools_registry: &[Box<dyn Tool>]) -> String {
-    let mut out = format!("Available tools ({}):\n", tools_registry.len());
-    for tool in tools_registry {
-        out.push_str(&format!("  {:<20} {}\n", tool.name(), tool.description()));
+    let catalog = crate::tools::ToolCatalog::from_boxed_registry(tools_registry);
+    let mut out = format!("Ready tool capabilities ({}):\n", catalog.descriptors().len());
+    for descriptor in catalog.descriptors() {
+        out.push_str(&format!(
+            "  {:<20} {} [{}: {}]\n",
+            descriptor.public_name,
+            descriptor.description,
+            descriptor.availability.level.label(),
+            descriptor.availability.reason,
+        ));
     }
     out
 }
@@ -1287,10 +1294,11 @@ mod mode_tests {
 
         let text = command_output(super::dispatch("/tools", &ctx).await);
 
-        assert!(text.contains("Available tools (1):"));
+        assert!(text.contains("Ready tool capabilities (1):"));
         assert!(text.contains("test_tool"));
         assert!(text.contains("Test tool description"));
-        assert_system_message_added(text, "Available tools (1):");
+        assert!(text.contains("Ready: executable native backend 'test_tool' is registered"));
+        assert_system_message_added(text, "Ready tool capabilities (1):");
     }
 
     /// BUG-08 round-2: `/export md` must contain the actual conversation bodies,

@@ -906,9 +906,9 @@ impl Agent {
                     &self.tool_tiering.always_include,
                     &self.tool_tiering.always_exclude,
                 );
-                filtered.iter().flat_map(|tool| tool.specs()).collect()
+                crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
             } else {
-                self.tools.iter().flat_map(|tool| tool.specs()).collect()
+                crate::tools::ToolCatalog::from_boxed_registry(&self.tools).tool_specs()
             };
             // Agent::turn is never a smart-group-reply turn; stay_silent must not be
             // advertised to the model on this path (expose_stay_silent = false).

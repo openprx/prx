@@ -5073,7 +5073,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     let mut any_turn_had_fallback = false;
 
     let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
-        || tools_registry.iter().flat_map(|tool| tool.specs()).collect(),
+        || crate::tools::ToolCatalog::from_boxed_registry(tools_registry).tool_specs(),
         |cfg| {
             let last_user_msg = history
                 .iter()
@@ -5092,7 +5092,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                 filtered = filtered.len(),
                 "tool tiering applied"
             );
-            filtered.iter().flat_map(|tool| tool.specs()).collect()
+            crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
         },
     );
     // `stay_silent` is registered globally so the loop can always resolve a call,

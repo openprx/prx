@@ -71,10 +71,10 @@ pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_search::DocumentSearchTool;
 pub use execution::{
     AdapterOwnedSandboxStrategy, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
-    SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolDescriptor,
-    ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand, ToolExecutionContext,
-    ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionService, ToolExecutionStatus, ToolSandboxPermit,
-    ToolSandboxStrategy, TracingToolExecutionAudit,
+    SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolCatalog,
+    ToolDescriptor, ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand,
+    ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionService, ToolExecutionStatus,
+    ToolSandboxPermit, ToolSandboxStrategy, TracingToolExecutionAudit,
 };
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;

@@ -2,18 +2,24 @@
 
 pub mod registry;
 
+use crate::capability::{CapabilityAvailability, CapabilityAvailabilityLevel};
 use crate::config::Config;
 use anyhow::Result;
 
-/// Integration status
+/// Evidence available to the configuration-only integration catalog.
+///
+/// This is deliberately not runtime health. A configured adapter remains
+/// `Configured` until an executable registry or health probe establishes more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IntegrationStatus {
-    /// Fully implemented and ready to use
-    Available,
-    /// Configured and active
-    Active,
-    /// Planned but not yet implemented
-    ComingSoon,
+    /// Adapter is known, but required configuration was not detected.
+    Unconfigured,
+    /// Required configuration was detected; readiness is unproven.
+    Configured,
+    /// A built-in executable backend is registered without external setup.
+    Ready,
+    /// Catalog declaration has no executable backend.
+    Planned,
 }
 
 /// Integration category
@@ -68,6 +74,29 @@ pub struct IntegrationEntry {
     pub status_fn: fn(&Config) -> IntegrationStatus,
 }
 
+impl IntegrationEntry {
+    #[must_use]
+    pub fn availability(&self, config: &Config) -> CapabilityAvailability {
+        match (self.status_fn)(config) {
+            IntegrationStatus::Unconfigured => CapabilityAvailability::declared(format!(
+                "{} is declared, but required configuration was not detected",
+                self.name
+            )),
+            IntegrationStatus::Configured => CapabilityAvailability::configured(format!(
+                "{} configuration was detected; runtime readiness has not been probed",
+                self.name
+            )),
+            IntegrationStatus::Ready => {
+                CapabilityAvailability::ready(format!("{} has an executable built-in backend registered", self.name))
+            }
+            IntegrationStatus::Planned => CapabilityAvailability::declared(format!(
+                "{} is catalog-only; no executable backend is registered",
+                self.name
+            )),
+        }
+    }
+}
+
 /// Handle the `integrations` CLI command
 pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> Result<()> {
     match command {
@@ -81,21 +110,21 @@ pub fn handle_command(command: crate::IntegrationCommands, config: &Config) -> R
 
 fn list_integrations(config: &Config) {
     let entries = registry::all_integrations();
-    let active = entries
-        .iter()
-        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::Active)
-        .count();
-    let available = entries
-        .iter()
-        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::Available)
-        .count();
-    let coming_soon = entries
-        .iter()
-        .filter(|entry| (entry.status_fn)(config) == IntegrationStatus::ComingSoon)
-        .count();
+    let count = |level| {
+        entries
+            .iter()
+            .filter(|entry| entry.availability(config).level == level)
+            .count()
+    };
 
     println!("Integrations ({} total):", entries.len());
-    println!("  Active: {active}  Available: {available}  Coming soon: {coming_soon}");
+    println!(
+        "  Declared: {}  Configured: {}  Ready: {}  Healthy: {}",
+        count(CapabilityAvailabilityLevel::Declared),
+        count(CapabilityAvailabilityLevel::Configured),
+        count(CapabilityAvailabilityLevel::Ready),
+        count(CapabilityAvailabilityLevel::Healthy),
+    );
     println!();
 
     for category in IntegrationCategory::all() {
@@ -106,13 +135,14 @@ fn list_integrations(config: &Config) {
 
         println!("{}:", category.label());
         for entry in category_entries {
-            let status = (entry.status_fn)(config);
-            let label = match status {
-                IntegrationStatus::Active => "active",
-                IntegrationStatus::Available => "available",
-                IntegrationStatus::ComingSoon => "coming-soon",
-            };
-            println!("  {:<18} {:<12} {}", entry.name, label, entry.description);
+            let availability = entry.availability(config);
+            println!(
+                "  {:<18} {:<12} {} — {}",
+                entry.name,
+                availability.level.label().to_lowercase(),
+                entry.description,
+                availability.reason,
+            );
         }
         println!();
     }
@@ -128,11 +158,13 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
         );
     };
 
-    let status = (entry.status_fn)(config);
-    let (icon, label) = match status {
-        IntegrationStatus::Active => ("✅", "Active"),
-        IntegrationStatus::Available => ("⚪", "Available"),
-        IntegrationStatus::ComingSoon => ("🔜", "Coming Soon"),
+    let catalog_state = (entry.status_fn)(config);
+    let availability = entry.availability(config);
+    let (icon, label) = match availability.level {
+        CapabilityAvailabilityLevel::Declared => ("⚪", "Declared"),
+        CapabilityAvailabilityLevel::Configured => ("🟡", "Configured"),
+        CapabilityAvailabilityLevel::Ready => ("✅", "Ready"),
+        CapabilityAvailabilityLevel::Healthy => ("💚", "Healthy"),
     };
 
     println!();
@@ -144,6 +176,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
     );
     println!("  Category: {}", entry.category.label());
     println!("  Status:   {label}");
+    println!("  Reason:   {}", availability.reason);
     println!();
 
     // Show setup hints based on integration
@@ -206,7 +239,7 @@ fn show_integration_info(config: &Config, name: &str) -> Result<()> {
             println!("    Run: prx gateway");
         }
         _ => {
-            if status == IntegrationStatus::ComingSoon {
+            if catalog_state == IntegrationStatus::Planned {
                 println!("  This integration is planned. Stay tuned!");
                 println!("  Track progress: https://github.com/openprx/prx");
             }

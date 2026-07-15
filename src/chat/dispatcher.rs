@@ -1769,7 +1769,7 @@ fn build_dispatcher_tool_specs(
     tools_registry: Option<&Vec<Box<dyn crate::tools::Tool>>>,
 ) -> Vec<crate::tools::ToolSpec> {
     let mut specs: Vec<crate::tools::ToolSpec> = tools_registry.map_or_else(Vec::new, |registry| {
-        registry.iter().flat_map(|tool| tool.specs()).collect()
+        crate::tools::ToolCatalog::from_boxed_registry(registry).tool_specs()
     });
     crate::tools::filter_tool_specs_for_exposure(&mut specs, false);
     specs

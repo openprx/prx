@@ -78,7 +78,7 @@ impl XmlToolDispatcher {
     }
 
     pub fn tool_specs(tools: &[Box<dyn Tool>]) -> Vec<ToolSpec> {
-        tools.iter().flat_map(|tool| tool.specs()).collect()
+        crate::tools::ToolCatalog::from_boxed_registry(tools).tool_specs()
     }
 }
 
