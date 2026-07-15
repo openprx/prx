@@ -11,6 +11,7 @@ use tokio::time::sleep;
 use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
+const MAX_RPC_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct TransportRequest {
@@ -106,13 +107,13 @@ impl NodeTransport for H2Transport {
             match req.send().await {
                 Ok(response) => {
                     let status = response.status();
-                    let payload = response.text().await.context("failed reading JSON-RPC response body")?;
+                    let payload = read_bounded_response(response, MAX_RPC_RESPONSE_BYTES).await?;
 
                     if !status.is_success() {
-                        last_err = Some(anyhow!("remote status {status}: {payload}"));
+                        last_err = Some(anyhow!("remote node returned HTTP status {status}"));
                     } else {
                         let rpc_response: JsonRpcResponse =
-                            serde_json::from_str(&payload).context("invalid JSON-RPC response")?;
+                            serde_json::from_slice(&payload).context("invalid JSON-RPC response")?;
 
                         if let Some(error) = rpc_response.error {
                             return Err(anyhow!("JSON-RPC error {}: {}", error.code, error.message));
@@ -136,6 +137,26 @@ impl NodeTransport for H2Transport {
 
         Err(last_err.unwrap_or_else(|| anyhow!("remote transport request failed")))
     }
+}
+
+async fn read_bounded_response(mut response: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>> {
+    let mut payload = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .context("failed reading JSON-RPC response body")?
+    {
+        append_bounded_response_chunk(&mut payload, &chunk, max_bytes)?;
+    }
+    Ok(payload)
+}
+
+fn append_bounded_response_chunk(payload: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<()> {
+    if payload.len().saturating_add(chunk.len()) > max_bytes {
+        return Err(anyhow!("JSON-RPC response exceeds {max_bytes} byte limit"));
+    }
+    payload.extend_from_slice(chunk);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -166,5 +187,14 @@ mod tests {
     #[test]
     fn endpoint_validation_rejects_plain_remote_http() {
         assert!(H2Transport::validate_endpoint("http://10.0.0.2:8787").is_err());
+    }
+
+    #[test]
+    fn response_chunks_are_rejected_before_exceeding_bound() {
+        let mut payload = Vec::new();
+        append_bounded_response_chunk(&mut payload, b"1234", 6).unwrap();
+        let error = append_bounded_response_chunk(&mut payload, b"789", 6).unwrap_err();
+        assert!(error.to_string().contains("exceeds 6 byte limit"));
+        assert_eq!(payload, b"1234");
     }
 }

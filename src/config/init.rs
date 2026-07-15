@@ -1215,11 +1215,12 @@ fn nodes_template(spec: Spec) -> String {
 enabled = false
 
 # Remote node connections
-# [[nodes.servers]]
-# name = "worker-1"
-# url = "https://worker-1.example.com:3120"
-# api_key = ""
-# weight = 1
+# [[nodes.nodes]]
+# id = "prx-node-1"
+# endpoint = "https://node.example.com:8787"
+# bearer_token = ""
+# hmac_secret = ""
+# enabled = true
 "#
         .into(),
     }

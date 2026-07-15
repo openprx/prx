@@ -839,7 +839,8 @@ pub struct NodeServerConfig {
     /// Default command timeout in milliseconds.
     #[serde(default = "default_node_server_exec_timeout_ms")]
     pub exec_timeout_ms: u64,
-    /// Maximum combined stdout/stderr bytes captured per command.
+    /// Maximum combined stdout/stderr bytes captured per command and maximum
+    /// file read/write payload accepted by the node RPC server.
     #[serde(default = "default_node_server_max_output_bytes")]
     pub max_output_bytes: usize,
     /// Maximum number of concurrent async command tasks.

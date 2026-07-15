@@ -227,6 +227,7 @@ landlock = { version = "0.4", optional = true }
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+rustix = { version = "1.1", features = ["fs"] }
 
 [features]
 default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock", "terminal-tui"]

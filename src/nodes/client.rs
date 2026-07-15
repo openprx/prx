@@ -3,15 +3,107 @@ use crate::nodes::protocol::{
     AsyncTaskAccepted, CancelParams, ExecShellParams, ExecShellResult, MetricsResult, PingResult, ReadFileParams,
     ReadFileResult, TaskListResult, TaskStatusParams, TaskStatusResult, WriteFileParams, WriteFileResult,
 };
-use crate::nodes::transport::{NodeTransport, TransportRequest};
+use crate::nodes::transport::{H2Transport, NodeTransport, TransportRequest};
 use anyhow::{Context, Result, anyhow, bail};
+use parking_lot::RwLock;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const FAILURE_THRESHOLD: u8 = 3;
 const UNHEALTHY_COOLDOWN: Duration = Duration::from_secs(60);
+static PROCESS_NODE_MANAGERS: LazyLock<RwLock<HashMap<PathBuf, Arc<NodeManager>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
+
+pub fn process_node_manager(workspace_dir: &Path) -> Arc<NodeManager> {
+    if let Some(manager) = PROCESS_NODE_MANAGERS.read().get(workspace_dir) {
+        return Arc::clone(manager);
+    }
+    let mut managers = PROCESS_NODE_MANAGERS.write();
+    Arc::clone(
+        managers
+            .entry(workspace_dir.to_path_buf())
+            .or_insert_with(|| Arc::new(NodeManager::default())),
+    )
+}
+
+struct ManagedNodeClient {
+    node: RemoteNodeConfig,
+    timeout: Duration,
+    retry_max: u8,
+    client: Arc<RemoteNodeClient>,
+}
+
+/// Long-lived owner for remote node clients. Reusing a client preserves its
+/// circuit-breaker state and the underlying HTTP/2 connection pool across tool
+/// calls. A changed endpoint/credential/transport setting replaces only that
+/// node's cached client.
+#[derive(Default)]
+pub struct NodeManager {
+    clients: RwLock<HashMap<String, ManagedNodeClient>>,
+}
+
+impl NodeManager {
+    pub fn client_for(
+        &self,
+        node: &RemoteNodeConfig,
+        default_timeout_ms: u64,
+        default_retry_max: u8,
+    ) -> Result<Arc<RemoteNodeClient>> {
+        let timeout = Duration::from_millis(node.timeout_ms.unwrap_or(default_timeout_ms).max(100));
+        let retry_max = node.retry_max.unwrap_or(default_retry_max);
+
+        if let Some(managed) = self.clients.read().get(&node.id) {
+            if same_node_config(&managed.node, node) && managed.timeout == timeout && managed.retry_max == retry_max {
+                return Ok(Arc::clone(&managed.client));
+            }
+        }
+
+        H2Transport::validate_endpoint(&node.endpoint)?;
+        let transport = Arc::new(H2Transport::new(timeout, retry_max)?);
+        let client = Arc::new(RemoteNodeClient::new(node.clone(), transport));
+        let mut clients = self.clients.write();
+        if let Some(managed) = clients.get(&node.id) {
+            if same_node_config(&managed.node, node) && managed.timeout == timeout && managed.retry_max == retry_max {
+                return Ok(Arc::clone(&managed.client));
+            }
+        }
+        clients.insert(
+            node.id.clone(),
+            ManagedNodeClient {
+                node: node.clone(),
+                timeout,
+                retry_max,
+                client: Arc::clone(&client),
+            },
+        );
+        Ok(client)
+    }
+
+    pub fn retain_configured(&self, nodes: &[RemoteNodeConfig]) {
+        self.clients
+            .write()
+            .retain(|node_id, _| nodes.iter().any(|node| node.enabled && node.id == node_id.as_str()));
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.clients.read().len()
+    }
+}
+
+fn same_node_config(left: &RemoteNodeConfig, right: &RemoteNodeConfig) -> bool {
+    left.id == right.id
+        && left.endpoint == right.endpoint
+        && left.bearer_token == right.bearer_token
+        && left.hmac_secret == right.hmac_secret
+        && left.enabled == right.enabled
+        && left.timeout_ms == right.timeout_ms
+        && left.retry_max == right.retry_max
+}
 
 #[derive(Debug)]
 struct CircuitBreakerState {
@@ -316,6 +408,33 @@ mod tests {
         let (transport, _) = EchoTransport::new();
         let client = RemoteNodeClient::new(mock_node(), transport);
         assert_eq!(client.node_id(), "n1");
+    }
+
+    #[test]
+    fn node_manager_reuses_client_and_replaces_changed_config() {
+        let manager = NodeManager::default();
+        let node = mock_node();
+        let first = manager.client_for(&node, 15_000, 2).unwrap();
+        let replay = manager.client_for(&node, 15_000, 2).unwrap();
+        assert!(Arc::ptr_eq(&first, &replay));
+        assert_eq!(manager.len(), 1);
+
+        let mut changed = node;
+        changed.bearer_token = "rotated-token".to_string();
+        let replaced = manager.client_for(&changed, 15_000, 2).unwrap();
+        assert!(!Arc::ptr_eq(&first, &replaced));
+        assert_eq!(manager.len(), 1);
+    }
+
+    #[test]
+    fn process_node_manager_is_stable_per_workspace() {
+        let workspace_a = tempfile::tempdir().unwrap();
+        let workspace_b = tempfile::tempdir().unwrap();
+        let first = process_node_manager(workspace_a.path());
+        let replay = process_node_manager(workspace_a.path());
+        let other = process_node_manager(workspace_b.path());
+        assert!(Arc::ptr_eq(&first, &replay));
+        assert!(!Arc::ptr_eq(&first, &other));
     }
 
     // ── is_healthy ──────────────────────────────────────────────

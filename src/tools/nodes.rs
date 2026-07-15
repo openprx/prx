@@ -1,8 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{RemoteNodeConfig, SharedConfig};
 use crate::memory::{Memory, MemoryEventRecording, MemoryFabric, MessageEventScope};
-use crate::nodes::client::RemoteNodeClient;
-use crate::nodes::transport::H2Transport;
+use crate::nodes::client::{NodeManager, RemoteNodeClient, process_node_manager};
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -10,13 +9,13 @@ use anyhow::{Context, anyhow, bail};
 use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::sync::Arc;
-use std::time::Duration;
 
 pub struct NodesTool {
     config: SharedConfig,
     security: Arc<SecurityPolicy>,
     memory: Option<Arc<dyn Memory>>,
     event_recording: MemoryEventRecording,
+    node_manager: Arc<NodeManager>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -29,11 +28,13 @@ struct NodeLineage {
 
 impl NodesTool {
     pub fn new(config: SharedConfig, security: Arc<SecurityPolicy>) -> Self {
+        let node_manager = process_node_manager(&security.workspace_dir);
         Self {
             config,
             security,
             memory: None,
             event_recording: MemoryEventRecording::default(),
+            node_manager,
         }
     }
 
@@ -91,28 +92,27 @@ impl NodesTool {
     }
 
     fn load_nodes(&self) -> Vec<RemoteNodeConfig> {
-        self.config
+        let nodes = self
+            .config
             .load_full()
             .nodes
             .nodes
             .iter()
             .filter(|node| node.enabled)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        self.node_manager.retain_configured(&nodes);
+        nodes
     }
 
     fn resolve_node<'a>(nodes: &'a [RemoteNodeConfig], id: &str) -> Option<&'a RemoteNodeConfig> {
         nodes.iter().find(|node| node.id == id)
     }
 
-    fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<RemoteNodeClient> {
+    fn make_client(&self, node: &RemoteNodeConfig) -> anyhow::Result<Arc<RemoteNodeClient>> {
         let cfg = self.config.load_full();
-        let timeout_ms = node.timeout_ms.unwrap_or(cfg.nodes.request_timeout_ms).max(100);
-        let retry_max = node.retry_max.unwrap_or(cfg.nodes.retry_max);
-
-        let transport = Arc::new(H2Transport::new(Duration::from_millis(timeout_ms), retry_max)?);
-
-        Ok(RemoteNodeClient::new(node.clone(), transport))
+        self.node_manager
+            .client_for(node, cfg.nodes.request_timeout_ms, cfg.nodes.retry_max)
     }
 
     fn require_string_arg<'a>(args: &'a Value, key: &str) -> anyhow::Result<&'a str> {
