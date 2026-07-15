@@ -11370,6 +11370,9 @@ mod real_mode_tests {
     }
 }
 
+#[cfg(test)]
+mod turn_characterization_tests;
+
 // ─── S4-A Commit 3: dispatcher snapshot 推送 ────────────────────────────────
 
 #[cfg(test)]
