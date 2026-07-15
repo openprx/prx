@@ -3954,7 +3954,7 @@ pub async fn run(
                 config.agent.max_tool_iterations,
             )),
             approval_router: Arc::new(dispatcher::ApprovalRouter::new()),
-            approval_manager: Some(Arc::new(ApprovalManager::from_config(&config.autonomy))),
+            tool_security_policy: Arc::clone(&security),
         };
         tracing::info!(mode = ?mode, "chat EffectExecutor in Pure real-deps mode");
         dispatcher::EffectExecutor::new_with_deps(deps)
@@ -7057,10 +7057,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // travel with the effect. Same `turn_run_id` + `chat_session_key`
             // source as the legacy path (single source of truth) so a sub-agent
             // spawned inside this turn inherits `parent_run_id = turn_run_id`.
-            let redux_turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
+            let mut redux_turn_spawn_ctx = crate::tools::sessions_spawn::SpawnExecutionContext::seed_turn_context(
                 turn_run_id.clone(),
                 chat_session_key.clone(),
             );
+            redux_turn_spawn_ctx.owner_id = Some(runtime_envelope.resolved_owner_id());
+            redux_turn_spawn_ctx.topic_id = runtime_envelope.topic_id.clone();
+            redux_turn_spawn_ctx.source_message_event_id = runtime_envelope.source_message_event_id.clone();
             let redux_turn_message_send_ctx = crate::tools::message_send::MessageSendExecutionContext::new(
                 Some("user".to_string()),
                 Arc::clone(&terminal) as Arc<dyn Channel>,

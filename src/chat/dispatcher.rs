@@ -30,6 +30,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use async_trait::async_trait;
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio_util::sync::CancellationToken;
@@ -42,6 +43,11 @@ use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
 use crate::memory::Memory;
 use crate::observability::Observer;
 use crate::providers::Provider;
+use crate::tools::{
+    ApprovalStrategy, SecurityEffectPolicy, ToolApprovalDecision, ToolApprovalRequest, ToolExecutionCommand,
+    ToolExecutionContext, ToolExecutionService, ToolExecutionStatus, ToolSandboxPermit, ToolSandboxStrategy,
+    TracingToolExecutionAudit,
+};
 
 /// Action channel 容量上限（Codex P0-3）.
 ///
@@ -140,6 +146,124 @@ impl ApprovalRouter {
                 true
             },
         )
+    }
+}
+
+/// TUI bridge for the common tool-execution approval stage.
+struct ChatTuiApprovalStrategy {
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    router: Arc<ApprovalRouter>,
+    action_tx: mpsc::Sender<Action>,
+    cancellation: CancellationToken,
+    policy: Arc<crate::security::SecurityPolicy>,
+}
+
+#[async_trait]
+impl ApprovalStrategy for ChatTuiApprovalStrategy {
+    async fn resolve(&self, request: ToolApprovalRequest) -> ToolApprovalDecision {
+        let tool_id = request.command.operation_id.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let registered = self.router.register(tool_id.clone(), tx);
+        if registered
+            && self
+                .action_tx
+                .send(Action::ToolApprovalRequested {
+                    task_id: self.task_id,
+                    tool_id: tool_id.clone(),
+                    name: request.descriptor.public_name.clone(),
+                    args: request.command.arguments.to_string(),
+                })
+                .await
+                .is_err()
+        {
+            let _ = self.router.resolve(&tool_id, false);
+            return ToolApprovalDecision::Denied {
+                reason: "approval request channel is unavailable; tool rejected for safety".to_string(),
+            };
+        }
+
+        let approved = tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => {
+                let _ = self.router.resolve(&tool_id, false);
+                return ToolApprovalDecision::Cancelled {
+                    reason: "tool approval cancelled with the active turn".to_string(),
+                };
+            }
+            result = rx => result.unwrap_or(false),
+        };
+        if !approved {
+            return ToolApprovalDecision::Denied {
+                reason: if registered {
+                    "User rejected tool approval".to_string()
+                } else {
+                    "Another tool approval is already pending; this tool was rejected for safety".to_string()
+                },
+            };
+        }
+
+        let envelope = &request.context.envelope;
+        let sender = envelope.sender.as_deref().unwrap_or("unknown");
+        let channel = envelope.channel.as_deref().unwrap_or("unknown");
+        let scope = crate::agent::loop_::ScopeContext {
+            policy: self.policy.as_ref(),
+            sender,
+            channel,
+            chat_type: &request.context.chat_type,
+            chat_id: &request.context.chat_id,
+            owner_id: envelope.owner_id.as_deref(),
+            topic_id: envelope.topic_id.as_deref(),
+            task_id: envelope.task_id.as_deref(),
+            source_message_event_id: envelope.source_message_event_id.as_deref(),
+        };
+        let runtime_grant = crate::agent::loop_::runtime_approval_grant_for_call(
+            &request.descriptor.public_name,
+            &request.command.arguments,
+            Some(&scope),
+        )
+        .and_then(|grant| match serde_json::to_value(grant) {
+            Ok(value) => Some(value),
+            Err(error) => {
+                tracing::error!(tool = %request.descriptor.public_name, %error, "failed to serialize runtime approval grant");
+                None
+            }
+        });
+        ToolApprovalDecision::Approved {
+            runtime_approval_granted: true,
+            runtime_grant,
+        }
+    }
+}
+
+/// Chat's UI readiness check is the concrete sandbox-preparation adapter. It
+/// preserves the existing invariant that `ToolStarted` is visible only after
+/// policy/approval and before the raw tool future begins.
+struct ChatToolSandboxStrategy {
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    action_tx: mpsc::Sender<Action>,
+}
+
+#[async_trait]
+impl ToolSandboxStrategy for ChatToolSandboxStrategy {
+    async fn prepare(
+        &self,
+        descriptor: &crate::tools::ToolDescriptor,
+        command: &ToolExecutionCommand,
+        _context: &ToolExecutionContext,
+    ) -> Result<ToolSandboxPermit, String> {
+        self.action_tx
+            .send(Action::ToolStarted {
+                task_id: self.task_id,
+                sequence: None,
+                tool_call_id: Some(command.operation_id.clone()),
+                name: descriptor.public_name.clone(),
+                args: command.arguments.to_string(),
+            })
+            .await
+            .map_err(|_| "chat action channel closed before tool execution".to_string())?;
+        Ok(ToolSandboxPermit {
+            strategy: "adapter_owned_chat_dispatch".to_string(),
+        })
     }
 }
 
@@ -809,11 +933,10 @@ pub struct EffectDeps {
     /// reducer 处理完 `Action::ToolApprovalReceived` 之后调用 `resolve()` 把决策
     /// 回投。`Arc` 跨 spawn 边界共享所有权。
     pub approval_router: Arc<ApprovalRouter>,
-    /// **S3 T3-1**: 危险 tool approval 管理器 — driver 据此判断是否要 prompt.
-    ///
-    /// 来自 `chat::run` 构造的 `ApprovalManager::from_config(&config.autonomy)`。
-    /// `None` 时 driver 不做任何 approval 检查（兼容现有未接入 approval 的测试）。
-    pub approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
+    /// Authoritative tool authorization policy used by ToolExecutionService.
+    /// The TUI router above is only the human confirmation adapter; it cannot
+    /// widen ACL or autonomy decisions.
+    pub tool_security_policy: Arc<crate::security::SecurityPolicy>,
 }
 
 // ─── EffectExecutor (5a-1: real-mode + shadow-mode) ───────────────────────────
@@ -1015,9 +1138,23 @@ impl EffectExecutor {
                 let tools_registry = deps.tools_registry.as_ref().map(Arc::clone);
                 let max_tool_iterations = deps.max_tool_iterations;
                 let turn_timeout_budget = deps.turn_timeout_budget;
-                // S3 T3-1: approval 桥接 — router + manager 句柄一起透传给 driver.
-                let approval_router = Some(Arc::clone(&deps.approval_router));
-                let approval_manager = deps.approval_manager.as_ref().map(Arc::clone);
+                let tool_security_policy = Arc::clone(&deps.tool_security_policy);
+                let tool_execution_context = chat_tool_execution_context(
+                    tool_security_policy.as_ref(),
+                    turn_spawn_ctx.as_ref(),
+                    provider_turn_task_id,
+                    &draft_id,
+                );
+                let tool_execution_service = tools_registry.as_ref().map(|registry| {
+                    Arc::new(chat_tool_execution_service(
+                        Arc::clone(registry),
+                        Arc::clone(&tool_security_policy),
+                        Arc::clone(&deps.approval_router),
+                        action_tx.clone(),
+                        cancel.clone(),
+                        provider_turn_task_id,
+                    ))
+                });
                 let provider_turn_task_id_for_trace = provider_turn_task_id.map(|id| id.get());
                 let provider_turn_lifecycle_tx = deps.provider_turn_lifecycle_tx.clone();
                 let provider_turn_handle_tx = deps.provider_turn_lifecycle_tx.clone();
@@ -1066,9 +1203,9 @@ impl EffectExecutor {
                         draft_id.clone(),
                         action_tx.clone(),
                         tools_registry,
+                        tool_execution_service,
+                        tool_execution_context,
                         max_tool_iterations,
-                        approval_router,
-                        approval_manager,
                         chat_mode,
                     );
                     // D8-4 (redux path real fix): mirror the legacy
@@ -1866,6 +2003,65 @@ fn trim_redux_driver_context_budget_after_summary(
     trimmed
 }
 
+fn chat_tool_execution_context(
+    policy: &crate::security::SecurityPolicy,
+    turn_spawn_ctx: Option<&crate::tools::sessions_spawn::SpawnExecutionContext>,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+    draft_id: &str,
+) -> ToolExecutionContext {
+    let workspace_id = policy.workspace_dir.to_string_lossy().to_string();
+    let session_key = turn_spawn_ctx.map_or_else(
+        || format!("chat:redux:{draft_id}"),
+        |context| context.session_scope_key.clone(),
+    );
+    let mut envelope = crate::runtime::envelope::RuntimeEnvelope::chat_terminal(
+        workspace_id,
+        session_key,
+        crate::memory::MemoryVisibility::Workspace,
+    )
+    .with_sender("user")
+    .with_channel("terminal");
+    if let Some(context) = turn_spawn_ctx {
+        envelope = envelope.with_run_id(context.run_id.clone());
+        if let Some(owner_id) = &context.owner_id {
+            envelope = envelope.with_owner_id(owner_id.clone());
+        }
+        if let Some(topic_id) = &context.topic_id {
+            envelope = envelope.with_topic_id(topic_id.clone());
+        }
+        if let Some(event_id) = &context.source_message_event_id {
+            envelope = envelope.with_source_message_event_id(event_id.clone());
+        }
+    }
+    if let Some(task_id) = task_id {
+        envelope = envelope.with_task_id(task_id.get().to_string());
+    }
+    ToolExecutionContext::new(envelope, "private").with_chat_id("terminal:user")
+}
+
+fn chat_tool_execution_service(
+    registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    policy: Arc<crate::security::SecurityPolicy>,
+    approval_router: Arc<ApprovalRouter>,
+    action_tx: mpsc::Sender<Action>,
+    cancellation: CancellationToken,
+    task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
+) -> ToolExecutionService {
+    ToolExecutionService::from_shared_boxed_registry(
+        registry,
+        Arc::new(SecurityEffectPolicy::new(Arc::clone(&policy))),
+        Arc::new(ChatTuiApprovalStrategy {
+            task_id,
+            router: approval_router,
+            action_tx: action_tx.clone(),
+            cancellation,
+            policy,
+        }),
+        Arc::new(ChatToolSandboxStrategy { task_id, action_tx }),
+        Arc::new(TracingToolExecutionAudit),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
@@ -1886,9 +2082,9 @@ async fn drive_start_turn_stream(
     draft_id: String,
     action_tx: mpsc::Sender<Action>,
     tools_registry: Option<Arc<Vec<Box<dyn crate::tools::Tool>>>>,
+    tool_execution_service: Option<Arc<ToolExecutionService>>,
+    tool_execution_context: ToolExecutionContext,
     max_tool_iterations: usize,
-    approval_router: Option<Arc<ApprovalRouter>>,
-    approval_manager: Option<Arc<crate::approval::ApprovalManager>>,
     chat_mode: crate::agent::loop_::ChatMode,
 ) {
     let max_iterations = resolve_driver_max_iterations(max_tool_iterations);
@@ -2176,22 +2372,19 @@ async fn drive_start_turn_stream(
                 usage,
             } => {
                 usage_accumulator.record(usage);
-                // 进入 tool 回合：需要 registry.
-                let registry = match tools_registry.as_ref() {
-                    Some(r) => r,
-                    None => {
-                        let action = Action::StreamFailed {
-                            draft_id: draft_id.clone(),
-                            err: "redux driver: tool_calls received but no tools_registry available (route should have stayed on legacy path)"
-                                .to_string(),
-                            retryable: false,
-                        };
-                        if let Err(e) = action_tx.send(action).await {
-                            tracing::debug!(error = %e, "StartTurn: action_tx closed on missing-registry");
-                        }
-                        return;
+                // Entering a tool round requires the canonical execution
+                // service assembled from the same registry advertised above.
+                if tool_execution_service.is_none() {
+                    let action = Action::StreamFailed {
+                        draft_id: draft_id.clone(),
+                        err: "redux driver: tool_calls received but no ToolExecutionService is available".to_string(),
+                        retryable: false,
+                    };
+                    if let Err(e) = action_tx.send(action).await {
+                        tracing::debug!(error = %e, "StartTurn: action_tx closed on missing tool service");
                     }
-                };
+                    return;
+                }
 
                 // 1) 把 assistant 的 tool_call 追加到 history. OpenAI 协议把 assistant 的 tool_call
                 //    序列化为 JSON, content 为空; 我们用更紧凑的 marker 字符串表示, 兼容 ChatMessage
@@ -2227,13 +2420,12 @@ async fn drive_start_turn_stream(
                     let call_name = call.name.clone();
                     let outcome = execute_single_tool_call(
                         provider_turn_task_id,
-                        registry,
+                        tool_execution_service.as_deref(),
+                        &tool_execution_context,
                         &call,
                         &cancel,
                         &action_tx,
                         &draft_id,
-                        approval_router.as_ref(),
-                        approval_manager.as_ref(),
                         &mut history,
                         compaction_config.as_ref(),
                         chat_mode,
@@ -2476,13 +2668,12 @@ fn plan_preview_args(raw_args: &str) -> String {
 #[allow(clippy::too_many_arguments)]
 async fn execute_single_tool_call(
     provider_turn_task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
-    registry: &Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    service: Option<&ToolExecutionService>,
+    context: &ToolExecutionContext,
     call: &ResolvedToolCall,
     cancel: &CancellationToken,
     action_tx: &mpsc::Sender<Action>,
     draft_id: &str,
-    approval_router: Option<&Arc<ApprovalRouter>>,
-    approval_manager: Option<&Arc<crate::approval::ApprovalManager>>,
     history: &mut Vec<crate::providers::traits::ChatMessage>,
     compaction_config: Option<&crate::config::AgentCompactionConfig>,
     chat_mode: crate::agent::loop_::ChatMode,
@@ -2521,123 +2712,8 @@ async fn execute_single_tool_call(
         return ToolExecOutcome::Done { unrecoverable: None };
     }
 
-    // 1) Approval — supervised mode 走 oneshot 等响应.
-    let needs_approval = approval_manager.is_some_and(|mgr| mgr.needs_approval(&call.name));
-    if needs_approval {
-        if let Some(router) = approval_router {
-            let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
-            let registered = router.register(call.id.clone(), tx);
-            // 通知 reducer / UI 请求 approval.
-            if registered {
-                if let Err(e) = action_tx
-                    .send(Action::ToolApprovalRequested {
-                        task_id: provider_turn_task_id,
-                        tool_id: call.id.clone(),
-                        name: call.name.clone(),
-                        args: call.args.clone(),
-                    })
-                    .await
-                {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on approval-request");
-                    return ToolExecOutcome::SenderClosed;
-                }
-            }
-            // 等响应（与 cancel 竞速；cancel 时清理 pending router）.
-            let approved = tokio::select! {
-                biased;
-                () = cancel.cancelled() => {
-                    // 主动 take 出 router 内的 entry（即便 dispatcher 还未 resolve）.
-                    let _ = router.resolve(&call.id, false);
-                    if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
-                        tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel-mid-approval");
-                    }
-                    return ToolExecOutcome::Cancelled;
-                }
-                res = rx => res.unwrap_or(false),
-            };
-            if !approved {
-                let err_msg = if registered {
-                    "User rejected tool approval".to_string()
-                } else {
-                    "Another tool approval is already pending; this tool was rejected for safety".to_string()
-                };
-                let tool_payload = serde_json::json!({
-                    "tool_call_id": call.id,
-                    "content": err_msg,
-                    "success": false,
-                });
-                history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-                if let Err(e) = action_tx
-                    .send(Action::ToolFinished {
-                        task_id: provider_turn_task_id,
-                        sequence: None,
-                        tool_call_id: Some(call.id.clone()),
-                        name: call.name.clone(),
-                        success: false,
-                        duration_ms: 0,
-                        result: Some(err_msg.clone()),
-                    })
-                    .await
-                {
-                    tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected");
-                    return ToolExecOutcome::SenderClosed;
-                }
-                // BUG-03: a rejected approval will reject again on identical retry.
-                return ToolExecOutcome::Done {
-                    unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
-                };
-            }
-        } else {
-            tracing::error!(
-                tool = %call.name,
-                tool_id = %call.id,
-                "tool needs_approval=true but no approval_router wired; rejecting (fail-CLOSED)"
-            );
-            let err_msg = "approval system not available; tool rejected for safety".to_string();
-            let tool_payload = serde_json::json!({
-                "tool_call_id": call.id,
-                "content": err_msg,
-                "success": false,
-            });
-            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-            if let Err(e) = action_tx
-                .send(Action::ToolFinished {
-                    task_id: provider_turn_task_id,
-                    sequence: None,
-                    tool_call_id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    success: false,
-                    duration_ms: 0,
-                    result: Some(err_msg.clone()),
-                })
-                .await
-            {
-                tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-rejected-fail-closed");
-                return ToolExecOutcome::SenderClosed;
-            }
-            // BUG-03: fail-closed rejection is permanent for this session.
-            return ToolExecOutcome::Done {
-                unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
-            };
-        }
-    }
-
-    // 2) 发 ToolStarted（reducer/UI 感知）.
-    if let Err(e) = action_tx
-        .send(Action::ToolStarted {
-            task_id: provider_turn_task_id,
-            sequence: None,
-            tool_call_id: Some(call.id.clone()),
-            name: call.name.clone(),
-            args: call.args.clone(),
-        })
-        .await
-    {
-        tracing::debug!(error = %e, "StartTurn: action_tx closed on tool-started");
-        return ToolExecOutcome::SenderClosed;
-    }
-
-    // 3) 解析 args JSON. 失败 → 把错误回填给 LLM 让它自己修正.
+    // Transport-level JSON decoding happens before the typed service command.
+    // Descriptor schema validation remains service-owned.
     let args_value: serde_json::Value = match serde_json::from_str(&call.args) {
         Ok(v) => v,
         Err(parse_err) => {
@@ -2664,56 +2740,36 @@ async fn execute_single_tool_call(
         }
     };
 
-    // 4) 查找 tool. 未找到也走"回填给 LLM"路径.
-    let tool_match = registry.iter().find(|t| t.supports_name(&call.name));
-    let tool = match tool_match {
-        Some(t) => t,
-        None => {
-            let err_msg = format!("tool not found: {}", call.name);
-            let tool_payload = serde_json::json!({
-                "tool_call_id": call.id,
-                "content": err_msg,
-                "success": false,
-            });
-            history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
-            let _ = action_tx
-                .send(Action::ToolFinished {
-                    task_id: provider_turn_task_id,
-                    sequence: None,
-                    tool_call_id: Some(call.id.clone()),
-                    name: call.name.clone(),
-                    success: false,
-                    duration_ms: 0,
-                    result: Some(err_msg.clone()),
-                })
-                .await;
-            // BUG-03: a nonexistent tool will never exist on retry of the same name.
-            return ToolExecOutcome::Done {
-                unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
-            };
-        }
+    let Some(service) = service else {
+        let err_msg = "ToolExecutionService is unavailable; tool rejected for safety".to_string();
+        let tool_payload = serde_json::json!({
+            "tool_call_id": call.id,
+            "content": err_msg,
+            "success": false,
+        });
+        history.push(crate::providers::traits::ChatMessage::tool(tool_payload.to_string()));
+        let _ = action_tx
+            .send(Action::ToolFinished {
+                task_id: provider_turn_task_id,
+                sequence: None,
+                tool_call_id: Some(call.id.clone()),
+                name: call.name.clone(),
+                success: false,
+                duration_ms: 0,
+                result: Some(err_msg.clone()),
+            })
+            .await;
+        return ToolExecOutcome::Done {
+            unrecoverable: Some(unrecoverable_signature(&call.name, &err_msg)),
+        };
     };
+    let command = ToolExecutionCommand::new(&call.name, args_value)
+        .with_operation_id(&call.id)
+        .with_idempotency_key(&call.id);
+    let outcome = service.execute(command, context.clone(), Some(cancel.clone())).await;
+    let duration_ms = outcome.duration_ms;
 
-    // 5) 执行 tool, 与 cancel 竞速. Tools that own subprocesses can observe the
-    // same token and terminate their OS work before returning the cancelled
-    // sentinel result.
-    let start = std::time::Instant::now();
-    let exec_result = tokio::select! {
-        biased;
-        () = cancel.cancelled() => {
-            if let Err(e) = action_tx.send(Action::StreamCancelled { draft_id: draft_id.to_string() }).await {
-                tracing::debug!(error = %e, "StartTurn: action_tx closed on cancel mid-tool");
-            }
-            return ToolExecOutcome::Cancelled;
-        }
-        res = tool.execute_named_with_cancellation(&call.name, args_value, Some(cancel.clone())) => res,
-    };
-    let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    if exec_result
-        .as_ref()
-        .is_ok_and(crate::tools::traits::is_tool_cancelled_result)
-    {
+    if outcome.status == ToolExecutionStatus::Cancelled {
         if let Err(e) = action_tx
             .send(Action::StreamCancelled {
                 draft_id: draft_id.to_string(),
@@ -2725,8 +2781,13 @@ async fn execute_single_tool_call(
         return ToolExecOutcome::Cancelled;
     }
 
-    let (tool_payload, ok_flag, summary) = match exec_result {
-        Ok(tool_result) => {
+    if action_tx.is_closed() {
+        return ToolExecOutcome::SenderClosed;
+    }
+
+    let status = outcome.status;
+    let (tool_payload, ok_flag, summary) = match outcome.result {
+        Some(tool_result) => {
             // BUG-05: when a tool fails (e.g. file_write rejected by the path
             // security policy) the human-readable reason lives in `error`, and
             // `output` is usually empty. The LLM keys off `content`, so an empty
@@ -2757,8 +2818,8 @@ async fn execute_single_tool_call(
             };
             (payload, tool_result.success, summary)
         }
-        Err(e) => {
-            let err_str = e.to_string();
+        None => {
+            let err_str = outcome.error.unwrap_or_else(|| outcome.model_content.clone());
             let payload = serde_json::json!({
                 "tool_call_id": call.id,
                 "content": err_str,
@@ -2771,7 +2832,14 @@ async fn execute_single_tool_call(
     // BUG-03: a real tool failure whose message names a permanent block
     // (permission denied / command not allowed / path not allowed …) is
     // unrecoverable — surface a signature so the driver can stop a retry spin.
-    let unrecoverable = if !ok_flag && is_unrecoverable_tool_error(&summary) {
+    let terminal_block = matches!(
+        status,
+        ToolExecutionStatus::Denied
+            | ToolExecutionStatus::ApprovalDenied
+            | ToolExecutionStatus::SandboxDenied
+            | ToolExecutionStatus::UnknownTool
+    );
+    let unrecoverable = if !ok_flag && (terminal_block || is_unrecoverable_tool_error(&summary)) {
         Some(unrecoverable_signature(&call.name, &summary))
     } else {
         None
@@ -3419,6 +3487,41 @@ impl StreamChunkCoalescer {
     }
 }
 
+#[cfg(test)]
+fn tool_security_policy(level: crate::security::AutonomyLevel) -> Arc<crate::security::SecurityPolicy> {
+    Arc::new(crate::security::SecurityPolicy {
+        autonomy: level,
+        workspace_dir: std::path::PathBuf::from("/tmp/prx-chat-tool-tests"),
+        ..crate::security::SecurityPolicy::default()
+    })
+}
+
+#[cfg(test)]
+fn full_tool_security_policy() -> Arc<crate::security::SecurityPolicy> {
+    tool_security_policy(crate::security::AutonomyLevel::Full)
+}
+
+#[cfg(test)]
+fn tool_service_for_test(
+    registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    action_tx: &mpsc::Sender<Action>,
+    draft_id: &str,
+    level: crate::security::AutonomyLevel,
+) -> (ToolExecutionService, ToolExecutionContext, CancellationToken) {
+    let policy = tool_security_policy(level);
+    let cancellation = CancellationToken::new();
+    let context = chat_tool_execution_context(policy.as_ref(), None, None, draft_id);
+    let service = chat_tool_execution_service(
+        registry,
+        policy,
+        Arc::new(ApprovalRouter::new()),
+        action_tx.clone(),
+        cancellation.clone(),
+        None,
+    );
+    (service, context, cancellation)
+}
+
 // ─── 单元测试 ─────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -3976,6 +4079,8 @@ mod tests {
             ..crate::config::AgentCompactionConfig::default()
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(16);
+        let policy = full_tool_security_policy();
+        let tool_context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-injection-diagnostic");
 
         drive_start_turn_stream(
             None,
@@ -3989,9 +4094,9 @@ mod tests {
             "draft-injection-diagnostic".to_string(),
             action_tx,
             None,
+            None,
+            tool_context,
             0,
-            None,
-            None,
             crate::agent::loop_::ChatMode::Edit,
         )
         .await;
@@ -4550,6 +4655,35 @@ mod real_mode_tests {
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
 
+    struct FlagTool {
+        name: &'static str,
+        executed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for FlagTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "records execution"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object"})
+        }
+
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            self.executed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(crate::tools::ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
     /// 记录 memory.store 次数的 wrapper（NoneMemory 不会真存，只 trace 调用）.
     struct CountingMemory {
         inner: NoneMemory,
@@ -4645,7 +4779,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
         (deps, action_rx, hooks, temp)
     }
@@ -5093,7 +5227,7 @@ mod real_mode_tests {
                 max_tool_iterations: 0,
                 turn_timeout_budget: None,
                 approval_router: Arc::new(ApprovalRouter::new()),
-                approval_manager: None,
+                tool_security_policy: full_tool_security_policy(),
             };
             let executor = EffectExecutor::new_with_deps(deps);
 
@@ -5163,7 +5297,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
         executor.execute(Effect::RequestRedraw).await;
@@ -6133,7 +6267,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
         (deps, action_rx, temp)
     }
@@ -6284,7 +6418,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -6439,7 +6573,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
 
         let executor = EffectExecutor::new_with_deps(deps);
@@ -10101,7 +10235,9 @@ mod real_mode_tests {
         use futures::stream::{self, BoxStream, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-        struct ShellTool;
+        struct ShellTool {
+            arguments: Arc<parking_lot::Mutex<Option<serde_json::Value>>>,
+        }
         #[async_trait]
         impl crate::tools::Tool for ShellTool {
             fn name(&self) -> &str {
@@ -10113,7 +10249,8 @@ mod real_mode_tests {
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({})
             }
-            async fn execute(&self, _: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<crate::tools::ToolResult> {
+                *self.arguments.lock() = Some(args);
                 Ok(crate::tools::ToolResult {
                     success: true,
                     output: "ran".into(),
@@ -10152,7 +10289,7 @@ mod real_mode_tests {
             ) -> BoxStream<'static, StreamResult<StreamChunk>> {
                 let n = self.counter.fetch_add(1, AtomicOrdering::SeqCst);
                 if n == 0 {
-                    let c = ToolCallChunk::new("call-shell", "shell", "{}", 0);
+                    let c = ToolCallChunk::new("call-shell", "shell", r#"{"command":"echo ok"}"#, 0);
                     stream::iter(vec![
                         Ok(StreamChunk::tool_call_chunk(vec![c])),
                         Ok(StreamChunk::final_chunk()),
@@ -10167,24 +10304,18 @@ mod real_mode_tests {
             }
         }
 
-        // ApprovalManager 配置：Supervised + 非只读工具 `shell` → needs_approval(shell)=true.
-        // Phase 1: per-tool auto_approve/always_ask lists were removed; the gate now
-        // keys off the read-only classification + autonomy level.
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Supervised,
-            ..Default::default()
-        };
-        let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
-
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
         deps.provider = Arc::new(ToolThenText {
             counter: Arc::new(AtomicUsize::new(0)),
         });
-        deps.tools_registry = Some(Arc::new(vec![Box::new(ShellTool) as Box<dyn crate::tools::Tool>]));
+        let approved_arguments = Arc::new(parking_lot::Mutex::new(None));
+        deps.tools_registry = Some(Arc::new(vec![Box::new(ShellTool {
+            arguments: Arc::clone(&approved_arguments),
+        }) as Box<dyn crate::tools::Tool>]));
         deps.max_tool_iterations = 4;
-        deps.approval_manager = Some(mgr);
+        deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         // 测试拦截器：当看到 `Action::ToolApprovalRequested` 时主动 router.resolve(true)
         // 模拟 dispatcher_task + EffectExecutor stub 的端到端 auto-approve 行为。
         let router_for_resolve = Arc::clone(&deps.approval_router);
@@ -10278,6 +10409,15 @@ mod real_mode_tests {
         assert!(saw_tool_started, "must see ToolStarted after approval");
         assert!(saw_tool_finished, "must see ToolFinished after approval");
         assert!(saw_completion, "must see StreamCompleted after approval");
+        let args = approved_arguments.lock().clone().unwrap_or_default();
+        assert_eq!(
+            args.get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG),
+            Some(&serde_json::Value::Bool(true))
+        );
+        assert!(
+            args.get(crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG).is_some(),
+            "TUI approval strategy must inject the trusted command-bound grant"
+        );
     }
 
     /// **S3 T3-1 Step 4**: approval rejected → tool 不执行 + ToolFinished(success=false, "User rejected").
@@ -10361,14 +10501,6 @@ mod real_mode_tests {
             }
         }
 
-        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
-        // Supervised the non-read-only `danger` tool still triggers needs_approval.
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Supervised,
-            ..Default::default()
-        };
-        let mgr = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
-
         let memory: Arc<dyn Memory> = Arc::new(NoneMemory::new());
         let shutdown = CancellationToken::new();
         let (mut deps, mut action_rx, _hooks, _temp) = build_deps(memory, shutdown);
@@ -10379,7 +10511,7 @@ mod real_mode_tests {
             executed: Arc::clone(&exec_counter),
         }) as Box<dyn crate::tools::Tool>]));
         deps.max_tool_iterations = 4;
-        deps.approval_manager = Some(mgr);
+        deps.tool_security_policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         let router_for_resolve = Arc::clone(&deps.approval_router);
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -10531,13 +10663,7 @@ mod real_mode_tests {
             }
         }
 
-        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
-        // Supervised the non-read-only `danger` tool still triggers needs_approval.
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Supervised,
-            ..Default::default()
-        };
-        let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         let executed = Arc::new(AtomicBool::new(false));
         let registry = Arc::new(vec![Box::new(DangerousTool {
             executed: Arc::clone(&executed),
@@ -10549,16 +10675,26 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
+        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-missing-router");
+        let service = ToolExecutionService::from_shared_boxed_registry(
+            Arc::clone(&registry),
+            Arc::new(SecurityEffectPolicy::new(policy)),
+            Arc::new(crate::tools::DenyApprovalStrategy),
+            Arc::new(ChatToolSandboxStrategy {
+                task_id: None,
+                action_tx: action_tx.clone(),
+            }),
+            Arc::new(TracingToolExecutionAudit),
+        );
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
             &CancellationToken::new(),
             &action_tx,
             "draft-missing-router",
-            None,
-            Some(&approval_manager),
             &mut history,
             None,
             crate::agent::loop_::ChatMode::Edit,
@@ -10583,7 +10719,7 @@ mod real_mode_tests {
                 assert!(
                     result
                         .as_deref()
-                        .is_some_and(|value| value.contains("approval system not available")),
+                        .is_some_and(|value| value.contains("no approval resolver")),
                     "unexpected result: {result:?}"
                 );
             }
@@ -10605,7 +10741,7 @@ mod real_mode_tests {
             payload
                 .get("content")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|value| value.contains("approval system not available"))
+                .is_some_and(|value| value.contains("no approval resolver"))
         );
     }
 
@@ -10637,13 +10773,7 @@ mod real_mode_tests {
             }
         }
 
-        // Phase 1: per-tool auto_approve/always_ask lists were removed; under
-        // Supervised the non-read-only `danger` tool still triggers needs_approval.
-        let approval_cfg = crate::config::AutonomyConfig {
-            level: crate::security::AutonomyLevel::Supervised,
-            ..Default::default()
-        };
-        let approval_manager = Arc::new(crate::approval::ApprovalManager::from_config(&approval_cfg));
+        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
         let approval_router = Arc::new(ApprovalRouter::new());
         let executed = Arc::new(AtomicBool::new(false));
         let registry = Arc::new(vec![Box::new(DangerousTool {
@@ -10656,6 +10786,16 @@ mod real_mode_tests {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
+        let cancellation = CancellationToken::new();
+        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-router");
+        let service = chat_tool_execution_service(
+            Arc::clone(&registry),
+            policy,
+            Arc::clone(&approval_router),
+            action_tx.clone(),
+            cancellation.clone(),
+            None,
+        );
 
         let router_handle = Arc::clone(&approval_router);
         let executed_before_approval = Arc::clone(&executed);
@@ -10688,13 +10828,12 @@ mod real_mode_tests {
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
-            &CancellationToken::new(),
+            &cancellation,
             &action_tx,
             "draft-router",
-            Some(&approval_router),
-            Some(&approval_manager),
             &mut history,
             None,
             crate::agent::loop_::ChatMode::Edit,
@@ -10712,6 +10851,109 @@ mod real_mode_tests {
             Some("call-danger")
         );
         assert_eq!(payload.get("success").and_then(serde_json::Value::as_bool), Some(true));
+    }
+
+    #[tokio::test]
+    async fn read_only_policy_denies_act_tool_without_prompt_or_execution() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = Arc::new(vec![Box::new(FlagTool {
+            name: "danger",
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-read-only".to_string(),
+            name: "danger".to_string(),
+            args: "{}".to_string(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let (service, context, cancellation) = tool_service_for_test(
+            registry,
+            &action_tx,
+            "draft-read-only",
+            crate::security::AutonomyLevel::ReadOnly,
+        );
+        let mut history = Vec::new();
+
+        let outcome = execute_single_tool_call(
+            None,
+            Some(&service),
+            &context,
+            &call,
+            &cancellation,
+            &action_tx,
+            "draft-read-only",
+            &mut history,
+            None,
+            crate::agent::loop_::ChatMode::Edit,
+        )
+        .await;
+
+        assert!(matches!(outcome, ToolExecOutcome::Done { unrecoverable: Some(_) }));
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            action_rx.recv().await,
+            Some(Action::ToolFinished { success: false, .. })
+        ));
+        assert!(action_rx.try_recv().is_err(), "deny must not prompt or start the tool");
+    }
+
+    #[tokio::test]
+    async fn cancelling_pending_tui_approval_cancels_service_and_clears_router() {
+        let executed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let registry = Arc::new(vec![Box::new(FlagTool {
+            name: "danger",
+            executed: Arc::clone(&executed),
+        }) as Box<dyn crate::tools::Tool>]);
+        let call = ResolvedToolCall {
+            id: "call-cancel-approval".to_string(),
+            name: "danger".to_string(),
+            args: "{}".to_string(),
+        };
+        let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
+        let policy = tool_security_policy(crate::security::AutonomyLevel::Supervised);
+        let cancellation = CancellationToken::new();
+        let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-cancel-approval");
+        let approval_router = Arc::new(ApprovalRouter::new());
+        let service = chat_tool_execution_service(
+            registry,
+            policy,
+            Arc::clone(&approval_router),
+            action_tx.clone(),
+            cancellation.clone(),
+            None,
+        );
+        let cancellation_for_task = cancellation.clone();
+        let task = tokio::spawn(async move {
+            let mut history = Vec::new();
+            execute_single_tool_call(
+                None,
+                Some(&service),
+                &context,
+                &call,
+                &cancellation_for_task,
+                &action_tx,
+                "draft-cancel-approval",
+                &mut history,
+                None,
+                crate::agent::loop_::ChatMode::Edit,
+            )
+            .await
+        });
+
+        assert!(matches!(
+            action_rx.recv().await,
+            Some(Action::ToolApprovalRequested { .. })
+        ));
+        assert!(approval_router.has_pending());
+        cancellation.cancel();
+        assert!(matches!(task.await.expect("tool task"), ToolExecOutcome::Cancelled));
+        assert!(!approval_router.has_pending());
+        assert!(!executed.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(action_rx.recv().await, Some(Action::StreamCancelled { .. })));
+        assert!(
+            action_rx.try_recv().is_err(),
+            "cancelled approval must not start the tool"
+        );
     }
 
     /// **S3 T3-1 Step 5**: stream_error_is_network_timeout 正确识别 reqwest 错误.
@@ -11033,7 +11275,7 @@ mod real_mode_tests {
             max_tool_iterations: 0,
             turn_timeout_budget: None,
             approval_router: Arc::new(ApprovalRouter::new()),
-            approval_manager: None,
+            tool_security_policy: full_tool_security_policy(),
         };
         let executor = EffectExecutor::new_with_deps(deps);
 
@@ -11406,16 +11648,21 @@ mod s4_a_3 {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
+        let (service, context, cancellation) = tool_service_for_test(
+            Arc::clone(&registry),
+            &action_tx,
+            "draft-plan",
+            crate::security::AutonomyLevel::Full,
+        );
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
-            &CancellationToken::new(),
+            &cancellation,
             &action_tx,
             "draft-plan",
-            None,
-            None,
             &mut history,
             None,
             crate::agent::loop_::ChatMode::Plan,
@@ -11493,16 +11740,21 @@ mod s4_a_3 {
             crate::providers::traits::ChatMessage::system("sys"),
             crate::providers::traits::ChatMessage::user("run the large command"),
         ];
+        let (service, context, cancellation) = tool_service_for_test(
+            Arc::clone(&registry),
+            &action_tx,
+            "draft-large",
+            crate::security::AutonomyLevel::Full,
+        );
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
-            &CancellationToken::new(),
+            &cancellation,
             &action_tx,
             "draft-large",
-            None,
-            None,
             &mut history,
             Some(&config),
             crate::agent::loop_::ChatMode::Edit,
@@ -11565,16 +11817,21 @@ mod s4_a_3 {
         };
         let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
+        let (service, context, cancellation) = tool_service_for_test(
+            Arc::clone(&registry),
+            &action_tx,
+            "draft-rej",
+            crate::security::AutonomyLevel::Full,
+        );
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
-            &CancellationToken::new(),
+            &cancellation,
             &action_tx,
             "draft-rej",
-            None,
-            None,
             &mut history,
             None,
             crate::agent::loop_::ChatMode::Edit,
@@ -11634,16 +11891,21 @@ mod s4_a_3 {
         };
         let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
+        let (service, context, cancellation) = tool_service_for_test(
+            Arc::clone(&registry),
+            &action_tx,
+            "draft-flaky",
+            crate::security::AutonomyLevel::Full,
+        );
 
         let outcome = execute_single_tool_call(
             None,
-            &registry,
+            Some(&service),
+            &context,
             &call,
-            &CancellationToken::new(),
+            &cancellation,
             &action_tx,
             "draft-flaky",
-            None,
-            None,
             &mut history,
             None,
             crate::agent::loop_::ChatMode::Edit,

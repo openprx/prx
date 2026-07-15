@@ -3819,7 +3819,7 @@ fn grant_op_for_call(tool_name: &str, args: &serde_json::Value) -> Option<GrantO
 /// glob), and a short single-use validity window. Shell/cron commands stay on the
 /// v1 command-hash path so persisted runner grants (cron/xin, executed in a later
 /// process with the scheduler — not the chat principal — as caller) keep working.
-fn runtime_approval_grant_for_call(
+pub(crate) fn runtime_approval_grant_for_call(
     tool_name: &str,
     args: &serde_json::Value,
     scope_ctx: Option<&ScopeContext<'_>>,

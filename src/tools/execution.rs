@@ -59,6 +59,67 @@ pub struct LegacyToolAdapter {
     tool: Arc<dyn Tool>,
 }
 
+/// Named adapter over a shared boxed registry. Chat Redux keeps this legacy
+/// registry alive across provider turns, so migration must borrow it rather
+/// than consume or duplicate stateful tool instances.
+struct SharedRegistryToolAdapter {
+    registry: Arc<Vec<Box<dyn Tool>>>,
+    root_name: String,
+}
+
+impl SharedRegistryToolAdapter {
+    fn tool(&self) -> Option<&dyn Tool> {
+        self.registry
+            .iter()
+            .find(|tool| tool.name() == self.root_name)
+            .map(Box::as_ref)
+    }
+}
+
+#[async_trait]
+impl ToolBackend for SharedRegistryToolAdapter {
+    fn root_name(&self) -> &str {
+        &self.root_name
+    }
+
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.tool().map_or_else(Vec::new, Tool::specs)
+    }
+
+    fn supports_name(&self, public_name: &str) -> bool {
+        self.tool().is_some_and(|tool| tool.supports_name(public_name))
+    }
+
+    fn tier(&self) -> ToolTier {
+        self.tool().map_or(ToolTier::Standard, Tool::tier)
+    }
+
+    fn categories(&self) -> Vec<ToolCategory> {
+        self.tool().map_or_else(Vec::new, |tool| tool.categories().to_vec())
+    }
+
+    fn adapter_kind(&self, public_name: &str) -> ToolAdapterKind {
+        if self.root_name == "mcp_call" && public_name != self.root_name {
+            ToolAdapterKind::McpAlias
+        } else {
+            ToolAdapterKind::Native
+        }
+    }
+
+    async fn invoke(
+        &self,
+        public_name: &str,
+        arguments: serde_json::Value,
+        cancellation: Option<CancellationToken>,
+    ) -> anyhow::Result<ToolResult> {
+        let Some(tool) = self.tool() else {
+            anyhow::bail!("shared tool '{}' is no longer registered", self.root_name);
+        };
+        tool.execute_named_with_cancellation(public_name, arguments, cancellation)
+            .await
+    }
+}
+
 impl LegacyToolAdapter {
     #[must_use]
     pub fn new(tool: Arc<dyn Tool>) -> Self {
@@ -144,6 +205,12 @@ impl ToolExecutionCommand {
     #[must_use]
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_operation_id(mut self, operation_id: impl Into<String>) -> Self {
+        self.operation_id = operation_id.into();
         self
     }
 }
@@ -240,6 +307,9 @@ pub enum ToolApprovalDecision {
         runtime_grant: Option<serde_json::Value>,
     },
     Denied {
+        reason: String,
+    },
+    Cancelled {
         reason: String,
     },
 }
@@ -453,6 +523,29 @@ impl ToolExecutionService {
         Self::new(tools, policy, approval, sandbox, audit)
     }
 
+    /// Adapt a shared boxed registry without cloning or consuming stateful
+    /// tools. This is the compatibility assembly used by Chat Redux.
+    #[must_use]
+    pub fn from_shared_boxed_registry(
+        registry: Arc<Vec<Box<dyn Tool>>>,
+        policy: Arc<dyn EffectPolicy>,
+        approval: Arc<dyn ApprovalStrategy>,
+        sandbox: Arc<dyn ToolSandboxStrategy>,
+        audit: Arc<dyn ToolExecutionAuditSink>,
+    ) -> Self {
+        let root_names = registry.iter().map(|tool| tool.name().to_string()).collect::<Vec<_>>();
+        let backends = root_names
+            .into_iter()
+            .map(|root_name| {
+                Arc::new(SharedRegistryToolAdapter {
+                    registry: Arc::clone(&registry),
+                    root_name,
+                }) as Arc<dyn ToolBackend>
+            })
+            .collect();
+        Self::from_backends(backends, policy, approval, sandbox, audit)
+    }
+
     /// Fail-closed convenience assembly for non-interactive callers.
     #[must_use]
     pub fn with_security_policy(tools: Vec<Box<dyn Tool>>, policy: Arc<SecurityPolicy>) -> Self {
@@ -605,6 +698,21 @@ impl ToolExecutionService {
                         Some(decision),
                         ToolExecutionStatus::ApprovalDenied,
                         format!("Denied: {reason}"),
+                        None,
+                        Some(reason),
+                        None,
+                        started,
+                    );
+                }
+                ToolApprovalDecision::Cancelled { reason } => {
+                    return self.finish(
+                        &command,
+                        &context,
+                        input_sha256,
+                        Some(descriptor),
+                        Some(decision),
+                        ToolExecutionStatus::Cancelled,
+                        format!("Error: {reason}"),
                         None,
                         Some(reason),
                         None,
@@ -1175,12 +1283,31 @@ mod tests {
     #[tokio::test]
     async fn mcp_alias_resolves_one_adapter_and_preserves_public_descriptor() {
         let fixture = fixture();
-        let service = fixture.service(
-            "mcp_call",
-            vec!["mcp__docs__search"],
-            ToolExecutionDecision::Allow,
-            approved(),
-            true,
+        let tool = RecordingTool {
+            root_name: "mcp_call",
+            aliases: vec!["mcp__docs__search"],
+            calls: Arc::clone(&fixture.calls),
+            arguments: Arc::clone(&fixture.arguments),
+            stages: Arc::clone(&fixture.stages),
+        };
+        let service = ToolExecutionService::from_shared_boxed_registry(
+            Arc::new(vec![Box::new(tool) as Box<dyn Tool>]),
+            Arc::new(FixedPolicy {
+                decision: ToolExecutionDecision::Allow,
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(FixedApproval {
+                decision: approved(),
+                stages: Arc::clone(&fixture.stages),
+            }),
+            Arc::new(RecordingSandbox {
+                stages: Arc::clone(&fixture.stages),
+                allowed: true,
+            }),
+            Arc::new(RecordingAudit {
+                records: Arc::clone(&fixture.records),
+                stages: Arc::clone(&fixture.stages),
+            }),
         );
         let outcome = service
             .execute(
