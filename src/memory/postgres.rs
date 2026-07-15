@@ -730,11 +730,14 @@ impl PostgresMemory {
                 summary TEXT NOT NULL,
                 summary_memory_key TEXT,
                 source_event_ids_json TEXT,
+                source_event_range_json TEXT,
                 source_document_refs_json TEXT,
                 fidelity_status TEXT NOT NULL,
                 payload_json TEXT,
                 created_at TIMESTAMPTZ NOT NULL
             );
+            ALTER TABLE {qualified_compaction_runs_table}
+                ADD COLUMN IF NOT EXISTS source_event_range_json TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_documents_workspace
                 ON {qualified_documents_table}(workspace_id, id);
@@ -1013,6 +1016,11 @@ impl PostgresMemory {
                 16,
                 "memories_row_level_security",
                 "memories ENABLE+FORCE ROW LEVEL SECURITY + POLICY memories_owner_isolation(USING/WITH CHECK: current_setting('prx.rls_bypass', true)='on' OR current_setting('prx.current_owner', true) IS NULL OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true))",
+            ),
+            (
+                17,
+                "compaction_source_event_range",
+                "compaction_runs.source_event_ids_json contains only real MessageEvent event_id strings + source_event_range_json(first_event_id,last_event_id,first_row_id,last_row_id,source_event_count)",
             ),
         ]
     }
@@ -1942,7 +1950,7 @@ impl PostgresMemory {
     }
 
     fn row_to_compaction_run(row: &Row) -> Result<CompactionRun> {
-        let created_at: DateTime<Utc> = row.get(17);
+        let created_at: DateTime<Utc> = row.get(18);
         let source_message_count: i64 = row.get(9);
         let source_token_estimate: i64 = row.get(10);
         Ok(CompactionRun {
@@ -1960,9 +1968,10 @@ impl PostgresMemory {
             summary: row.get(11),
             summary_memory_key: row.get(12),
             source_event_ids_json: row.get(13),
-            source_document_refs_json: row.get(14),
-            fidelity_status: row.get(15),
-            payload_json: row.get(16),
+            source_event_range_json: row.get(14),
+            source_document_refs_json: row.get(15),
+            fidelity_status: row.get(16),
+            payload_json: row.get(17),
             created_at: created_at.to_rfc3339(),
         })
     }
@@ -4602,6 +4611,7 @@ impl Memory for PostgresMemory {
     }
 
     async fn append_compaction_run(&self, input: CompactionRunInput) -> Result<CompactionRun> {
+        input.validate_source_event_provenance()?;
         let client = self.client.clone();
         let qualified_compaction_runs_table = self.qualified_compaction_runs_table.clone();
         let run_id = input.run_id.unwrap_or_else(|| Uuid::new_v4().to_string());
@@ -4616,9 +4626,10 @@ impl Memory for PostgresMemory {
                     run_id, workspace_id, owner_id, session_key, agent_id, persona_id,
                     trigger, mode, source_message_count, source_token_estimate,
                     summary, summary_memory_key, source_event_ids_json,
-                    source_document_refs_json, fidelity_status, payload_json, created_at
+                    source_event_range_json, source_document_refs_json,
+                    fidelity_status, payload_json, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 ON CONFLICT (run_id) DO UPDATE SET
                     workspace_id = EXCLUDED.workspace_id,
                     owner_id = EXCLUDED.owner_id,
@@ -4632,6 +4643,7 @@ impl Memory for PostgresMemory {
                     summary = EXCLUDED.summary,
                     summary_memory_key = EXCLUDED.summary_memory_key,
                     source_event_ids_json = EXCLUDED.source_event_ids_json,
+                    source_event_range_json = EXCLUDED.source_event_range_json,
                     source_document_refs_json = EXCLUDED.source_document_refs_json,
                     fidelity_status = EXCLUDED.fidelity_status,
                     payload_json = EXCLUDED.payload_json
@@ -4642,8 +4654,9 @@ impl Memory for PostgresMemory {
                 SELECT id, run_id, workspace_id, owner_id, session_key, agent_id,
                        persona_id, trigger, mode, source_message_count,
                        source_token_estimate, summary, summary_memory_key,
-                       source_event_ids_json, source_document_refs_json,
-                       fidelity_status, payload_json, created_at
+                       source_event_ids_json, source_event_range_json,
+                       source_document_refs_json, fidelity_status, payload_json,
+                       created_at
                 FROM {qualified_compaction_runs_table}
                 WHERE run_id = $1
                 LIMIT 1
@@ -4666,6 +4679,7 @@ impl Memory for PostgresMemory {
                         &input.summary,
                         &input.summary_memory_key,
                         &input.source_event_ids_json,
+                        &input.source_event_range_json,
                         &input.source_document_refs_json,
                         &input.fidelity_status,
                         &input.payload_json,
@@ -5339,6 +5353,16 @@ mod tests {
                 summary: "## Decisions\n- preserve source anchors".to_string(),
                 summary_memory_key: Some("compaction_summary_pg".to_string()),
                 source_event_ids_json: Some(format!(r#"["{}"]"#, user.event_id)),
+                source_event_range_json: Some(
+                    serde_json::json!({
+                        "first_event_id": user.event_id,
+                        "last_event_id": user.event_id,
+                        "first_row_id": user.id,
+                        "last_row_id": user.id,
+                        "source_event_count": 1
+                    })
+                    .to_string(),
+                ),
                 source_document_refs_json: Some(format!(r#"[{{"chunk_id":"{}"}}]"#, chunk.chunk_id)),
                 fidelity_status: "accepted".to_string(),
                 payload_json: Some(r#"{"phase":"postgres_conformance"}"#.to_string()),
@@ -5347,6 +5371,12 @@ mod tests {
             .unwrap();
         assert_eq!(compaction.run_id, "compact-postgres-1");
         assert_eq!(compaction.summary_memory_key.as_deref(), Some("compaction_summary_pg"));
+        assert!(
+            compaction
+                .source_event_range_json
+                .as_deref()
+                .is_some_and(|json| json.contains(&user.event_id))
+        );
         assert_eq!(compaction.fidelity_status, "accepted");
 
         crate::memory::traits::conformance::assert_scoped_memory_acl_conformance(&mem, "postgres-scoped-conformance")

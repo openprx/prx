@@ -217,6 +217,7 @@ mod tests {
                 summary: "summary".to_string(),
                 summary_memory_key: None,
                 source_event_ids_json: None,
+                source_event_range_json: None,
                 source_document_refs_json: None,
                 fidelity_status: "unchecked".to_string(),
                 payload_json: None,

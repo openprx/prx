@@ -102,7 +102,6 @@ use crate::runtime::envelope::RuntimeEnvelope;
 use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
-use sha2::Digest;
 #[cfg(feature = "terminal-tui")]
 use std::collections::VecDeque;
 use std::io::{IsTerminal as _, Write as _};
@@ -908,21 +907,26 @@ async fn persist_legacy_chat_compaction_audit(
     let run_id = uuid::Uuid::new_v4().to_string();
     let summary_memory_key = format!("compaction_summary_{}", run_id.replace('-', "_"));
     let source_message_count = source_history.len();
-    let source_refs: Vec<serde_json::Value> = source_history
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(message.role.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(message.content.as_bytes());
-            serde_json::json!({
-                "index": index,
-                "role": message.role,
-                "content_hash": hex::encode(hasher.finalize())
-            })
-        })
-        .collect();
+    let provenance = match crate::agent::loop_::resolve_compaction_event_provenance(
+        mem,
+        envelope.memory_principal(),
+        source_history,
+    )
+    .await
+    {
+        Ok(provenance) => provenance,
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to resolve legacy chat compaction MessageEvent provenance");
+            None
+        }
+    };
+    let provenance_status = if provenance.is_some() { "exact" } else { "unavailable" };
+    let source_event_ids_json = provenance
+        .as_ref()
+        .and_then(|provenance| serde_json::to_string(&provenance.source_event_ids).ok());
+    let source_event_range_json = provenance
+        .as_ref()
+        .and_then(|provenance| serde_json::to_string(&provenance.covered_range).ok());
     let summary = format!(
         "Legacy chat context overflow compaction preserved the system prompt, kept the last {COMPACT_KEEP_MESSAGES} non-system messages, truncated turns to {COMPACT_CONTENT_CHARS} chars, and capped retained chat context at {COMPACT_TOTAL_CHARS} chars."
     );
@@ -932,7 +936,9 @@ async fn persist_legacy_chat_compaction_audit(
         owner_id: Some(owner.owner_id.clone()),
         agent_id: envelope.agent_id.clone(),
         persona_id: envelope.persona_id.clone(),
-        source_event_id: None,
+        source_event_id: provenance
+            .as_ref()
+            .map(|provenance| provenance.covered_range.last_event_id.clone()),
         source: Some("legacy_chat_compaction_summary".to_string()),
         topic_id: None,
         channel: None,
@@ -949,6 +955,57 @@ async fn persist_legacy_chat_compaction_audit(
     {
         tracing::debug!(error = %error, "failed to persist legacy chat compaction summary memory");
     }
+    let summary_message_event_id = if let Some(provenance) = provenance.as_ref() {
+        let raw_payload_json = serde_json::json!({
+            "compaction_run_id": run_id,
+            "trigger": trigger,
+            "mode": "legacy_chat_overflow",
+            "fidelity_status": "accepted_legacy_deterministic",
+            "source_event_ids": provenance.source_event_ids,
+            "covered_event_range": provenance.covered_range
+        })
+        .to_string();
+        match mem
+            .append_message_event(crate::memory::MessageEventInput {
+                event_id: None,
+                idempotency_key: Some(format!("compaction:{run_id}:summary")),
+                workspace_id: envelope.workspace_id.clone(),
+                owner_id: Some(owner.owner_id.clone()),
+                source: "compaction".into(),
+                channel: envelope.channel.clone(),
+                session_key: Some(envelope.session_key.clone()),
+                parent_session_key: None,
+                run_id: Some(run_id.clone()),
+                parent_run_id: None,
+                agent_id: envelope.agent_id.clone(),
+                persona_id: envelope.persona_id.clone(),
+                sender: Some("compaction".to_string()),
+                recipient: envelope.sender.clone(),
+                role: "event".to_string(),
+                event_type: "compaction.summary.created".to_string(),
+                subject: Some(crate::memory::MessageEventSubject::Conversation(
+                    envelope.session_key.clone(),
+                )),
+                goal_id: None,
+                causation_event_id: Some(provenance.covered_range.last_event_id.clone()),
+                correlation_id: Some(run_id.clone()),
+                attempt_id: None,
+                lease_epoch: None,
+                content: sanitize::sanitize_for_persistence(&summary),
+                raw_payload_json: Some(raw_payload_json),
+                visibility: envelope.visibility.clone(),
+            })
+            .await
+        {
+            Ok(event) => Some(event.event_id),
+            Err(error) => {
+                tracing::debug!(error = %error, "failed to append legacy chat compaction summary MessageEvent");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = mem
         .append_compaction_run(CompactionRunInput {
             run_id: Some(run_id),
@@ -963,8 +1020,9 @@ async fn persist_legacy_chat_compaction_audit(
             source_token_estimate: estimate_chat_history_tokens(source_history),
             summary,
             summary_memory_key: Some(summary_memory_key),
-            source_event_ids_json: None,
-            source_document_refs_json: Some(serde_json::to_string(&source_refs).unwrap_or_else(|_| "[]".to_string())),
+            source_event_ids_json,
+            source_event_range_json,
+            source_document_refs_json: None,
             fidelity_status: "accepted_legacy_deterministic".to_string(),
             payload_json: Some(
                 serde_json::json!({
@@ -975,7 +1033,9 @@ async fn persist_legacy_chat_compaction_audit(
                     "summary_projection_token_estimate": estimate_chat_history_tokens(summary_projection),
                     "provider_token_estimate": token_metadata.provider_token_estimate,
                     "persisted_token_estimate": token_metadata.persisted_token_estimate,
-                    "enrichment_token_delta": token_metadata.enrichment_token_delta
+                    "enrichment_token_delta": token_metadata.enrichment_token_delta,
+                    "source_event_provenance_status": provenance_status,
+                    "summary_message_event_id": summary_message_event_id
                 })
                 .to_string(),
             ),
@@ -14093,7 +14153,7 @@ mod legacy_chat_compaction_audit_tests {
     #[tokio::test]
     async fn legacy_chat_compaction_persists_run_and_summary_memory() {
         let tmp = TempDir::new().unwrap();
-        let mem = SqliteMemory::new(tmp.path()).unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let envelope = RuntimeEnvelope::chat("workspace-a", "session-a");
         let mut source_history = vec![ChatMessage::system("system rules")];
         for idx in 0..12 {
@@ -14104,12 +14164,20 @@ mod legacy_chat_compaction_audit_tests {
         }
         let audit_source = original_legacy_chat_compaction_audit_source(&source_history);
         let summary_projection = bounded_legacy_chat_compaction_audit_source(&source_history);
-        let mut hasher = sha2::Sha256::new();
-        let first_audit_source = audit_source.first().expect("fixture must include evicted source");
-        hasher.update(first_audit_source.role.as_bytes());
-        hasher.update(b"\0");
-        hasher.update(first_audit_source.content.as_bytes());
-        let first_original_hash = hex::encode(hasher.finalize());
+        let fabric = MemoryFabric::new(mem.clone(), "workspace-a");
+        let mut expected_source_event_ids = Vec::new();
+        for (index, message) in audit_source.iter().enumerate() {
+            let event = fabric
+                .record_inbound_user_message(
+                    envelope.message_scope(),
+                    message.content.clone(),
+                    Some(format!("legacy-compaction-source-{index}")),
+                    None,
+                )
+                .await
+                .unwrap();
+            expected_source_event_ids.push(event.event_id);
+        }
         let expected_source_tokens = estimate_chat_history_tokens(&audit_source);
         let provider_history = {
             let mut history = source_history.clone();
@@ -14122,7 +14190,7 @@ mod legacy_chat_compaction_audit_tests {
         let token_metadata = legacy_compaction_token_metadata(&provider_history, &source_history);
 
         persist_legacy_chat_compaction_audit(
-            &mem,
+            mem.as_ref(),
             &envelope,
             &audit_source,
             &summary_projection,
@@ -14138,11 +14206,15 @@ mod legacy_chat_compaction_audit_tests {
             fidelity_status,
             source_message_count,
             source_token_estimate,
-            source_refs,
+            source_event_ids_json,
+            source_event_range_json,
+            source_document_refs_json,
             payload_json,
-        ): (String, String, String, i64, i64, String, String) = conn
+        ): (String, String, String, i64, i64, String, String, Option<String>, String) = conn
             .query_row(
-                "SELECT summary_memory_key, mode, fidelity_status, source_message_count, source_token_estimate, source_document_refs_json, payload_json
+                "SELECT summary_memory_key, mode, fidelity_status, source_message_count,
+                        source_token_estimate, source_event_ids_json,
+                        source_event_range_json, source_document_refs_json, payload_json
                  FROM compaction_runs
                  WHERE workspace_id = 'workspace-a'
                  ORDER BY id DESC
@@ -14157,6 +14229,8 @@ mod legacy_chat_compaction_audit_tests {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -14166,11 +14240,14 @@ mod legacy_chat_compaction_audit_tests {
         assert_eq!(fidelity_status, "accepted_legacy_deterministic");
         assert_eq!(source_message_count, 4);
         assert_eq!(source_token_estimate, expected_source_tokens as i64);
-        assert!(source_refs.contains(&first_original_hash));
-        assert!(
-            !source_refs.contains("evicted-source-0"),
-            "audit refs must store hashes, not raw evicted content"
-        );
+        let source_event_ids: Vec<String> = serde_json::from_str(&source_event_ids_json).unwrap();
+        assert_eq!(source_event_ids, expected_source_event_ids);
+        let covered_range: crate::memory::CompactionSourceEventRange =
+            serde_json::from_str(&source_event_range_json).unwrap();
+        assert_eq!(covered_range.first_event_id, expected_source_event_ids[0]);
+        assert_eq!(covered_range.last_event_id, expected_source_event_ids[3]);
+        assert_eq!(covered_range.source_event_count, 4);
+        assert!(source_document_refs_json.is_none());
         let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
         assert_eq!(
             payload
@@ -14190,6 +14267,33 @@ mod legacy_chat_compaction_audit_tests {
                 .and_then(serde_json::Value::as_i64)
                 .is_some_and(|delta| delta > 0),
             "legacy audit metadata must expose non-empty provider enrichment overhead"
+        );
+
+        let (summary_event_id, summary_causation, summary_payload): (String, String, String) = conn
+            .query_row(
+                "SELECT event_id, causation_event_id, raw_payload_json
+                 FROM message_events
+                 WHERE event_type = 'compaction.summary.created'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(summary_causation, expected_source_event_ids[3]);
+        let summary_payload: serde_json::Value = serde_json::from_str(&summary_payload).unwrap();
+        assert_eq!(
+            summary_payload
+                .get("covered_event_range")
+                .and_then(|range| range.get("last_event_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(expected_source_event_ids[3].as_str())
+        );
+        assert_eq!(
+            payload
+                .get("summary_message_event_id")
+                .and_then(serde_json::Value::as_str),
+            Some(summary_event_id.as_str())
         );
 
         let stored_summary_count: i64 = conn

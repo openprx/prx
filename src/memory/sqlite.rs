@@ -1017,6 +1017,7 @@ impl SqliteMemory {
                 summary                   TEXT NOT NULL,
                 summary_memory_key        TEXT,
                 source_event_ids_json     TEXT,
+                source_event_range_json   TEXT,
                 source_document_refs_json TEXT,
                 fidelity_status           TEXT NOT NULL,
                 payload_json              TEXT,
@@ -1372,6 +1373,28 @@ impl SqliteMemory {
             }
         }
 
+        let mut compaction_column_stmt = conn.prepare("PRAGMA table_info(compaction_runs)")?;
+        let existing_compaction_columns = compaction_column_stmt.query_map([], |row| row.get::<_, String>(1))?;
+        let mut compaction_names = std::collections::HashSet::new();
+        for column in existing_compaction_columns {
+            compaction_names.insert(column?);
+        }
+        if !compaction_names.contains("source_event_range_json") {
+            match conn.execute_batch("ALTER TABLE compaction_runs ADD COLUMN source_event_range_json TEXT") {
+                Ok(()) => {}
+                Err(rusqlite::Error::SqliteFailure(err, Some(ref msg))) if msg.contains("duplicate column name") => {
+                    tracing::debug!(
+                        "Column compaction_runs.source_event_range_json already exists (concurrent migration): {err}"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "Failed to add compaction_runs.source_event_range_json: {e}"
+                    ));
+                }
+            }
+        }
+
         // Schema v7 (`memory_events_run_lineage`) added `run_id` / `parent_run_id`
         // to `memory_events`. A legacy table created under v4 lacks these columns,
         // and the checksum-anchor registry alone never alters an existing table, so
@@ -1680,6 +1703,11 @@ impl SqliteMemory {
                 // `revoked_at` field. Created by `init_approval_grant_schema`.
                 "approval_grant_revocations(grant_id,revoked_at,reason) + idx_approval_grant_revocations_revoked_at",
             ),
+            (
+                12,
+                "compaction_source_event_range",
+                "compaction_runs.source_event_ids_json contains only real MessageEvent event_id strings + source_event_range_json(first_event_id,last_event_id,first_row_id,last_row_id,source_event_count)",
+            ),
         ]
     }
 
@@ -1972,10 +2000,11 @@ impl SqliteMemory {
             summary: row.get(11)?,
             summary_memory_key: row.get(12)?,
             source_event_ids_json: row.get(13)?,
-            source_document_refs_json: row.get(14)?,
-            fidelity_status: row.get(15)?,
-            payload_json: row.get(16)?,
-            created_at: row.get(17)?,
+            source_event_range_json: row.get(14)?,
+            source_document_refs_json: row.get(15)?,
+            fidelity_status: row.get(16)?,
+            payload_json: row.get(17)?,
+            created_at: row.get(18)?,
         })
     }
 
@@ -5362,6 +5391,7 @@ impl Memory for SqliteMemory {
     }
 
     async fn append_compaction_run(&self, input: CompactionRunInput) -> anyhow::Result<CompactionRun> {
+        input.validate_source_event_provenance()?;
         let conn = self.conn.clone();
 
         tokio::task::spawn_blocking(move || -> anyhow::Result<CompactionRun> {
@@ -5375,9 +5405,10 @@ impl Memory for SqliteMemory {
                     run_id, workspace_id, owner_id, session_key, agent_id, persona_id,
                     \"trigger\", mode, source_message_count, source_token_estimate,
                     summary, summary_memory_key, source_event_ids_json,
-                    source_document_refs_json, fidelity_status, payload_json, created_at
+                    source_event_range_json, source_document_refs_json,
+                    fidelity_status, payload_json, created_at
                  )
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)
                  ON CONFLICT(run_id) DO UPDATE SET
                     workspace_id = excluded.workspace_id,
                     owner_id = excluded.owner_id,
@@ -5391,6 +5422,7 @@ impl Memory for SqliteMemory {
                     summary = excluded.summary,
                     summary_memory_key = excluded.summary_memory_key,
                     source_event_ids_json = excluded.source_event_ids_json,
+                    source_event_range_json = excluded.source_event_range_json,
                     source_document_refs_json = excluded.source_document_refs_json,
                     fidelity_status = excluded.fidelity_status,
                     payload_json = excluded.payload_json",
@@ -5408,6 +5440,7 @@ impl Memory for SqliteMemory {
                     input.summary,
                     input.summary_memory_key,
                     input.source_event_ids_json,
+                    input.source_event_range_json,
                     input.source_document_refs_json,
                     input.fidelity_status,
                     input.payload_json,
@@ -5418,7 +5451,8 @@ impl Memory for SqliteMemory {
                 "SELECT id, run_id, workspace_id, owner_id, session_key, agent_id,
                         persona_id, \"trigger\", mode, source_message_count, source_token_estimate,
                         summary, summary_memory_key, source_event_ids_json,
-                        source_document_refs_json, fidelity_status, payload_json, created_at
+                        source_event_range_json, source_document_refs_json,
+                        fidelity_status, payload_json, created_at
                  FROM compaction_runs
                  WHERE run_id = ?1
                  LIMIT 1",
@@ -5772,6 +5806,7 @@ mod tests {
             ("retrieval_traces", "dropped_json"),
             ("compaction_runs", "owner_id"),
             ("compaction_runs", "summary_memory_key"),
+            ("compaction_runs", "source_event_range_json"),
             ("compaction_runs", "fidelity_status"),
             ("embedding_cache", "provider"),
             ("embedding_cache", "model"),
@@ -5883,6 +5918,57 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing upgraded message_events.{column}");
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_compaction_runs_schema_adds_source_event_range() {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("brain.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE compaction_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    run_id TEXT NOT NULL UNIQUE,
+                    workspace_id TEXT NOT NULL,
+                    owner_id TEXT,
+                    session_key TEXT,
+                    agent_id TEXT,
+                    persona_id TEXT,
+                    trigger TEXT NOT NULL,
+                    mode TEXT NOT NULL,
+                    source_message_count INTEGER NOT NULL,
+                    source_token_estimate INTEGER NOT NULL,
+                    summary TEXT NOT NULL,
+                    summary_memory_key TEXT,
+                    source_event_ids_json TEXT,
+                    source_document_refs_json TEXT,
+                    fidelity_status TEXT NOT NULL,
+                    payload_json TEXT,
+                    created_at TEXT NOT NULL
+                 );",
+            )
+            .unwrap();
+        }
+
+        let mem = SqliteMemory::new_with_path(db_path).unwrap();
+        let conn = mem.conn.lock();
+        let column_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('compaction_runs') WHERE name = 'source_event_range_json'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(column_count, 1);
+        let migration_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_schema_migrations WHERE version = 12 AND name = 'compaction_source_event_range'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(migration_count, 1);
     }
 
     #[tokio::test]
@@ -6015,6 +6101,9 @@ mod tests {
                 summary: "## Decisions\n- keep source anchors".to_string(),
                 summary_memory_key: Some("compaction_summary_1".to_string()),
                 source_event_ids_json: Some(r#"["event-1"]"#.to_string()),
+                source_event_range_json: Some(
+                    r#"{"first_event_id":"event-1","last_event_id":"event-1","first_row_id":1,"last_row_id":1,"source_event_count":1}"#.to_string(),
+                ),
                 source_document_refs_json: Some(r#"[{"chunk_id":"doc-1:chunk:0"}]"#.to_string()),
                 fidelity_status: "accepted".to_string(),
                 payload_json: Some(r#"{"phase":"test"}"#.to_string()),
@@ -6025,6 +6114,11 @@ mod tests {
         assert_eq!(run.run_id, "compact-sqlite-1");
         assert_eq!(run.source_message_count, 4);
         assert_eq!(run.summary_memory_key.as_deref(), Some("compaction_summary_1"));
+        assert!(
+            run.source_event_range_json
+                .as_deref()
+                .is_some_and(|json| json.contains("event-1"))
+        );
         assert_eq!(run.fidelity_status, "accepted");
     }
 

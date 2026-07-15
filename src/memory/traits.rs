@@ -536,6 +536,93 @@ mod message_event_contract_tests {
         assert!(sqlite_append.contains("input.event_type"));
         assert!(postgres_append.contains("input.event_type"));
     }
+
+    fn compaction_input(
+        source_event_ids_json: Option<String>,
+        source_event_range_json: Option<String>,
+    ) -> CompactionRunInput {
+        CompactionRunInput {
+            run_id: Some("compact-contract".to_string()),
+            workspace_id: "workspace".to_string(),
+            owner_id: None,
+            session_key: Some("chat:session".to_string()),
+            agent_id: None,
+            persona_id: None,
+            trigger: "test".to_string(),
+            mode: "safeguard".to_string(),
+            source_message_count: 1,
+            source_token_estimate: 1,
+            summary: "summary".to_string(),
+            summary_memory_key: None,
+            source_event_ids_json,
+            source_event_range_json,
+            source_document_refs_json: None,
+            fidelity_status: "accepted".to_string(),
+            payload_json: None,
+        }
+    }
+
+    #[test]
+    fn compaction_provenance_rejects_hash_objects_masquerading_as_event_ids() {
+        let input = compaction_input(
+            Some(r#"[{"index":0,"role":"user","content_hash":"fake"}]"#.to_string()),
+            Some(
+                serde_json::to_string(&CompactionSourceEventRange {
+                    first_event_id: "fake".to_string(),
+                    last_event_id: "fake".to_string(),
+                    first_row_id: 1,
+                    last_row_id: 1,
+                    source_event_count: 1,
+                })
+                .unwrap(),
+            ),
+        );
+        let error = input.validate_source_event_provenance().unwrap_err();
+        assert!(error.to_string().contains("string array"));
+    }
+
+    #[test]
+    fn compaction_provenance_requires_matching_ids_and_covered_range() {
+        let range = CompactionSourceEventRange {
+            first_event_id: "event-1".to_string(),
+            last_event_id: "event-2".to_string(),
+            first_row_id: 11,
+            last_row_id: 12,
+            source_event_count: 2,
+        };
+        let valid = compaction_input(
+            Some(r#"["event-1","event-2"]"#.to_string()),
+            Some(serde_json::to_string(&range).unwrap()),
+        );
+        valid.validate_source_event_provenance().unwrap();
+
+        let missing_range = compaction_input(Some(r#"["event-1"]"#.to_string()), None);
+        assert!(missing_range.validate_source_event_provenance().is_err());
+    }
+
+    #[test]
+    fn sqlite_and_postgres_compaction_paths_persist_ids_and_covered_range() {
+        let sqlite = include_str!("sqlite.rs");
+        let postgres = include_str!("postgres.rs");
+        let sqlite_append = sqlite
+            .split_once("async fn append_compaction_run")
+            .map_or("", |(_, body)| body);
+        let postgres_append = postgres
+            .split_once("async fn append_compaction_run")
+            .map_or("", |(_, body)| body);
+        for field in ["source_event_ids_json", "source_event_range_json"] {
+            assert!(
+                sqlite_append.contains(field),
+                "SQLite compaction append must carry {field}"
+            );
+            assert!(
+                postgres_append.contains(field),
+                "Postgres compaction append must carry {field}"
+            );
+        }
+        assert!(sqlite_append.contains("validate_source_event_provenance"));
+        assert!(postgres_append.contains("validate_source_event_provenance"));
+    }
 }
 
 /// Query for recent shared events visible to an agent turn.
@@ -808,6 +895,15 @@ pub struct RetrievalTrace {
     pub created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CompactionSourceEventRange {
+    pub first_event_id: String,
+    pub last_event_id: String,
+    pub first_row_id: i64,
+    pub last_row_id: i64,
+    pub source_event_count: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactionRunInput {
     pub run_id: Option<String>,
@@ -823,9 +919,59 @@ pub struct CompactionRunInput {
     pub summary: String,
     pub summary_memory_key: Option<String>,
     pub source_event_ids_json: Option<String>,
+    #[serde(default)]
+    pub source_event_range_json: Option<String>,
     pub source_document_refs_json: Option<String>,
     pub fidelity_status: String,
     pub payload_json: Option<String>,
+}
+
+impl CompactionRunInput {
+    pub fn validate_source_event_provenance(&self) -> anyhow::Result<()> {
+        let (Some(ids_json), Some(range_json)) = (
+            self.source_event_ids_json.as_deref(),
+            self.source_event_range_json.as_deref(),
+        ) else {
+            anyhow::ensure!(
+                self.source_event_ids_json.is_none() && self.source_event_range_json.is_none(),
+                "compaction source event IDs and covered range must be supplied together"
+            );
+            return Ok(());
+        };
+
+        let ids: Vec<String> = serde_json::from_str(ids_json)
+            .map_err(|error| anyhow::anyhow!("compaction source_event_ids_json must be a string array: {error}"))?;
+        anyhow::ensure!(!ids.is_empty(), "compaction source event IDs must not be empty");
+        anyhow::ensure!(
+            ids.iter().all(|id| !id.trim().is_empty()),
+            "compaction source event IDs must not contain blank values"
+        );
+        let unique = ids.iter().collect::<std::collections::HashSet<_>>();
+        anyhow::ensure!(
+            unique.len() == ids.len(),
+            "compaction source event IDs must not contain duplicates"
+        );
+
+        let range: CompactionSourceEventRange = serde_json::from_str(range_json)
+            .map_err(|error| anyhow::anyhow!("invalid compaction source event range: {error}"))?;
+        anyhow::ensure!(
+            range.first_row_id > 0,
+            "compaction source event range must start after row zero"
+        );
+        anyhow::ensure!(
+            range.last_row_id >= range.first_row_id,
+            "compaction source event range rows are reversed"
+        );
+        anyhow::ensure!(
+            ids.first() == Some(&range.first_event_id) && ids.last() == Some(&range.last_event_id),
+            "compaction covered range endpoints must match the source event ID list"
+        );
+        anyhow::ensure!(
+            range.source_event_count == ids.len(),
+            "compaction covered range count must match the source event ID list"
+        );
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -844,6 +990,8 @@ pub struct CompactionRun {
     pub summary: String,
     pub summary_memory_key: Option<String>,
     pub source_event_ids_json: Option<String>,
+    #[serde(default)]
+    pub source_event_range_json: Option<String>,
     pub source_document_refs_json: Option<String>,
     pub fidelity_status: String,
     pub payload_json: Option<String>,

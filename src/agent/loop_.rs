@@ -6,9 +6,9 @@ use crate::hooks::{HookEvent, HookManager, payload_error};
 use crate::llm::route_decision::{ProviderUsageAccumulator, TokenUsage};
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
 use crate::memory::{
-    self, CompactionRunInput, ConversationTurn, DocumentIngestInput, DocumentSearchResult, Memory, MemoryCategory,
-    MemoryFabric, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent, RetrievalTraceInput,
-    RetrievedContextItem, SessionContextQuery, SharedContextQuery,
+    self, CompactionRunInput, CompactionSourceEventRange, ConversationTurn, DocumentIngestInput, DocumentSearchResult,
+    Memory, MemoryCategory, MemoryFabric, MemoryPrincipal, MemoryStoreMetadata, MemoryVisibility, MessageEvent,
+    RetrievalTraceInput, RetrievedContextItem, SessionContextQuery, SharedContextQuery,
 };
 use crate::multimodal;
 use crate::observability::{self, Observer, ObserverEvent};
@@ -234,6 +234,7 @@ pub(crate) struct DocumentIngestRuntime {
     task_id: Option<String>,
     source_message_event_id: Option<String>,
     session_key: Option<String>,
+    legacy_session_key: Option<String>,
     agent_id: Option<String>,
     persona_id: Option<String>,
     channel: Option<String>,
@@ -253,6 +254,7 @@ impl DocumentIngestRuntime {
             task_id: envelope.resolved_task_id().map(ToString::to_string),
             source_message_event_id: envelope.source_message_event_id.clone(),
             session_key: Some(envelope.session_key.clone()),
+            legacy_session_key: envelope.legacy_session_key.clone(),
             agent_id: envelope.agent_id.clone(),
             persona_id: envelope.persona_id.clone(),
             channel: envelope.channel.clone(),
@@ -281,6 +283,7 @@ impl DocumentIngestRuntime {
             task_id: scope.task_id.map(ToString::to_string),
             source_message_event_id: scope.source_message_event_id.map(ToString::to_string),
             session_key: Some(scope.chat_id.to_string()),
+            legacy_session_key: None,
             agent_id: None,
             persona_id: None,
             // Persist the originating channel so anonymous principals can
@@ -295,6 +298,19 @@ impl DocumentIngestRuntime {
     pub(crate) fn with_source_message_event_id(mut self, source_message_event_id: Option<String>) -> Self {
         self.source_message_event_id = source_message_event_id;
         self
+    }
+
+    fn memory_principal(&self) -> MemoryPrincipal {
+        MemoryPrincipal {
+            workspace_id: self.workspace_id.clone(),
+            agent_id: self.agent_id.clone(),
+            persona_id: self.persona_id.clone(),
+            session_key: self.session_key.clone(),
+            channel: self.channel.clone(),
+            sender: self.sender.clone(),
+            owner_id: self.owner_id.clone(),
+            legacy_session_key: self.legacy_session_key.clone(),
+        }
     }
 }
 
@@ -1213,37 +1229,134 @@ fn extract_document_ingest_refs(source_messages: &[ChatMessage]) -> Vec<serde_js
     refs
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CompactionAuditSource {
     message_count: usize,
     token_estimate: usize,
-    message_refs: Vec<serde_json::Value>,
+    source_event_ids: Vec<String>,
+    source_event_range: Option<CompactionSourceEventRange>,
+    source_event_provenance_status: String,
     document_refs: Vec<serde_json::Value>,
 }
 
-fn build_compaction_audit_source(source_messages: &[ChatMessage]) -> CompactionAuditSource {
-    let message_refs = source_messages
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            let mut hasher = sha2::Sha256::new();
-            hasher.update(message.role.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(message.content.as_bytes());
-            let content_hash = hex::encode(hasher.finalize());
-            serde_json::json!({
-                "index": index,
-                "role": message.role,
-                "content_hash": content_hash
-            })
-        })
-        .collect();
+impl Default for CompactionAuditSource {
+    fn default() -> Self {
+        Self {
+            message_count: 0,
+            token_estimate: 0,
+            source_event_ids: Vec::new(),
+            source_event_range: None,
+            source_event_provenance_status: "unavailable".to_string(),
+            document_refs: Vec::new(),
+        }
+    }
+}
 
+fn build_compaction_audit_source(source_messages: &[ChatMessage]) -> CompactionAuditSource {
     CompactionAuditSource {
         message_count: source_messages.len(),
         token_estimate: estimate_history_tokens(source_messages),
-        message_refs,
+        source_event_ids: Vec::new(),
+        source_event_range: None,
+        source_event_provenance_status: "unavailable".to_string(),
         document_refs: extract_document_ingest_refs(source_messages),
+    }
+}
+
+const COMPACTION_SOURCE_EVENT_WINDOW: usize = 500;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionEventProvenance {
+    pub(crate) source_event_ids: Vec<String>,
+    pub(crate) covered_range: CompactionSourceEventRange,
+}
+
+fn source_message_matches_event(message: &ChatMessage, event: &MessageEvent) -> bool {
+    message.role == event.role
+        && (message.content == event.content
+            || crate::chat::sanitize::sanitize_for_persistence(&message.content) == event.content)
+}
+
+pub(crate) async fn resolve_compaction_event_provenance(
+    mem: &dyn Memory,
+    principal: MemoryPrincipal,
+    source_messages: &[ChatMessage],
+) -> anyhow::Result<Option<CompactionEventProvenance>> {
+    if principal.session_key.is_none()
+        || source_messages.is_empty()
+        || source_messages
+            .iter()
+            .any(|message| !matches!(message.role.as_str(), "user" | "assistant"))
+    {
+        return Ok(None);
+    }
+
+    let mut events = mem
+        .load_recent_session_context(SessionContextQuery {
+            principal,
+            since_event_id: None,
+            limit: COMPACTION_SOURCE_EVENT_WINDOW,
+            include_roles: vec!["user".to_string(), "assistant".to_string()],
+        })
+        .await?;
+    events.sort_by_key(|event| event.id);
+    let message_events = events
+        .iter()
+        .filter(|event| event.event_type == "message.created")
+        .collect::<Vec<_>>();
+    if source_messages.len() > message_events.len() {
+        return Ok(None);
+    }
+
+    let matching_windows = message_events
+        .windows(source_messages.len())
+        .filter(|window| {
+            source_messages
+                .iter()
+                .zip(window.iter())
+                .all(|(message, event)| source_message_matches_event(message, event))
+        })
+        .collect::<Vec<_>>();
+    let [matched] = matching_windows.as_slice() else {
+        // No match means the bounded event window cannot prove coverage;
+        // multiple matches are ambiguous and must not pick arbitrary IDs.
+        return Ok(None);
+    };
+    let Some(first) = matched.first() else {
+        return Ok(None);
+    };
+    let Some(last) = matched.last() else {
+        return Ok(None);
+    };
+    let source_event_ids = matched.iter().map(|event| event.event_id.clone()).collect::<Vec<_>>();
+    Ok(Some(CompactionEventProvenance {
+        covered_range: CompactionSourceEventRange {
+            first_event_id: first.event_id.clone(),
+            last_event_id: last.event_id.clone(),
+            first_row_id: first.id,
+            last_row_id: last.id,
+            source_event_count: source_event_ids.len(),
+        },
+        source_event_ids,
+    }))
+}
+
+async fn attach_compaction_event_provenance(
+    audit: &DocumentIngestRuntime,
+    source_messages: &[ChatMessage],
+    source: &mut CompactionAuditSource,
+) {
+    match resolve_compaction_event_provenance(&*audit.memory, audit.memory_principal(), source_messages).await {
+        Ok(Some(provenance)) => {
+            source.source_event_ids = provenance.source_event_ids;
+            source.source_event_range = Some(provenance.covered_range);
+            source.source_event_provenance_status = "exact".to_string();
+        }
+        Ok(None) => {}
+        Err(error) => {
+            source.source_event_provenance_status = "read_error".to_string();
+            tracing::debug!(error = %error, "failed to resolve compaction MessageEvent provenance");
+        }
     }
 }
 
@@ -1287,6 +1400,59 @@ async fn persist_compaction_audit(
     {
         tracing::debug!(error = %error, "failed to persist compaction summary memory");
     }
+    let summary_message_event_id = if let Some(range) = source.source_event_range.as_ref() {
+        let raw_payload_json = serde_json::json!({
+            "compaction_run_id": run_id,
+            "trigger": trigger,
+            "mode": format!("{mode:?}"),
+            "fidelity_status": fidelity_status,
+            "source_event_ids": source.source_event_ids,
+            "covered_event_range": range
+        })
+        .to_string();
+        match audit
+            .memory
+            .append_message_event(crate::memory::MessageEventInput {
+                event_id: None,
+                idempotency_key: Some(format!("compaction:{run_id}:summary")),
+                workspace_id: audit.workspace_id.clone(),
+                owner_id: audit.owner_id.clone(),
+                source: "compaction".into(),
+                channel: audit.channel.clone(),
+                session_key: audit.session_key.clone(),
+                parent_session_key: None,
+                run_id: Some(run_id.clone()),
+                parent_run_id: None,
+                agent_id: audit.agent_id.clone(),
+                persona_id: audit.persona_id.clone(),
+                sender: Some("compaction".to_string()),
+                recipient: audit.sender.clone(),
+                role: "event".to_string(),
+                event_type: "compaction.summary.created".to_string(),
+                subject: audit
+                    .session_key
+                    .as_ref()
+                    .map(|session_key| crate::memory::MessageEventSubject::Conversation(session_key.clone())),
+                goal_id: None,
+                causation_event_id: Some(range.last_event_id.clone()),
+                correlation_id: Some(run_id.clone()),
+                attempt_id: None,
+                lease_epoch: None,
+                content: crate::chat::sanitize::sanitize_for_persistence(summary),
+                raw_payload_json: Some(raw_payload_json),
+                visibility: audit.visibility.clone(),
+            })
+            .await
+        {
+            Ok(event) => Some(event.event_id),
+            Err(error) => {
+                tracing::debug!(error = %error, "failed to append compaction summary MessageEvent");
+                None
+            }
+        }
+    } else {
+        None
+    };
     if let Err(error) = audit
         .memory
         .append_compaction_run(CompactionRunInput {
@@ -1302,9 +1468,15 @@ async fn persist_compaction_audit(
             source_token_estimate: source.token_estimate,
             summary: summary.to_string(),
             summary_memory_key: Some(summary_memory_key),
-            source_event_ids_json: Some(
-                serde_json::to_string(&source.message_refs).unwrap_or_else(|_| "[]".to_string()),
-            ),
+            source_event_ids_json: if source.source_event_ids.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&source.source_event_ids).ok()
+            },
+            source_event_range_json: source
+                .source_event_range
+                .as_ref()
+                .and_then(|range| serde_json::to_string(range).ok()),
             source_document_refs_json: Some(
                 serde_json::to_string(&source.document_refs).unwrap_or_else(|_| "[]".to_string()),
             ),
@@ -1313,7 +1485,9 @@ async fn persist_compaction_audit(
                 serde_json::json!({
                     "task_id": audit.task_id,
                     "topic_id": audit.topic_id,
-                    "source_message_event_id": audit.source_message_event_id
+                    "source_message_event_id": audit.source_message_event_id,
+                    "source_event_provenance_status": source.source_event_provenance_status,
+                    "summary_message_event_id": summary_message_event_id
                 })
                 .to_string(),
             ),
@@ -1377,11 +1551,13 @@ pub(crate) async fn build_configurable_compaction_patch_with_source_history(
         return Ok(None);
     }
     let compact_end = start + compact_count;
-    let audit_source = audit.and_then(|_| {
-        source_history
-            .get(start..compact_end)
-            .map(build_compaction_audit_source)
-    });
+    let compacted_source_messages = source_history.get(start..compact_end);
+    let mut audit_source = audit.and_then(|_| compacted_source_messages.map(build_compaction_audit_source));
+    if let (Some(audit), Some(source_messages), Some(source)) =
+        (audit, compacted_source_messages, audit_source.as_mut())
+    {
+        attach_compaction_event_provenance(audit, source_messages, source).await;
+    }
     let source_projection = source_history
         .get(start..compact_end)
         .map(bounded_compaction_projection)
@@ -9603,7 +9779,8 @@ ls -la
         let tmp = TempDir::new().unwrap();
         let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let envelope = RuntimeEnvelope::agent("workspace-a", "run-compact-1");
-        let audit = DocumentIngestRuntime::from_envelope(mem, &envelope);
+        let audit = DocumentIngestRuntime::from_envelope(mem.clone(), &envelope);
+        let fabric = MemoryFabric::new(mem.clone(), "workspace-a");
         let provider = SystemSummaryProvider {
             response: "## Decisions\n- keep source anchors\n## Open TODOs\n- verify compaction\n## Critical Context\n- path /tmp/a and task run-compact-1".to_string(),
         };
@@ -9630,6 +9807,26 @@ ls -la
             ChatMessage::user("Please compact soon. ".repeat(120)),
             ChatMessage::assistant("Will preserve identifiers. ".repeat(120)),
         ];
+        let mut source_event_ids = Vec::new();
+        for (index, message) in history.iter().skip(1).enumerate() {
+            let event = if message.role == "user" {
+                fabric
+                    .record_inbound_user_message(
+                        envelope.message_scope(),
+                        message.content.clone(),
+                        Some(format!("compaction-source-{index}")),
+                        None,
+                    )
+                    .await
+                    .unwrap()
+            } else {
+                fabric
+                    .record_assistant_message(envelope.message_scope(), message.content.clone())
+                    .await
+                    .unwrap()
+            };
+            source_event_ids.push(event.event_id);
+        }
         let config = crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 1,
@@ -9647,23 +9844,70 @@ ls -la
 
         assert!(compacted);
         let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
-        let (summary_memory_key, fidelity_status, source_events, source_refs): (String, String, String, String) = conn
+        let (summary_memory_key, fidelity_status, source_events, source_range, source_refs): (
+            String,
+            String,
+            String,
+            String,
+            String,
+        ) = conn
             .query_row(
-                "SELECT summary_memory_key, fidelity_status, source_event_ids_json, source_document_refs_json
+                "SELECT summary_memory_key, fidelity_status, source_event_ids_json,
+                        source_event_range_json, source_document_refs_json
                  FROM compaction_runs
                  WHERE workspace_id = 'workspace-a'
                  ORDER BY id DESC
                  LIMIT 1",
                 [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )
             .unwrap();
         assert!(summary_memory_key.starts_with("compaction_summary_"));
         assert_eq!(fidelity_status, "accepted");
-        assert!(source_events.contains("content_hash"));
+        let recorded_source_ids: Vec<String> = serde_json::from_str(&source_events).unwrap();
+        assert_eq!(recorded_source_ids, source_event_ids[..3]);
+        let covered_range: CompactionSourceEventRange = serde_json::from_str(&source_range).unwrap();
+        assert_eq!(covered_range.first_event_id, source_event_ids[0]);
+        assert_eq!(covered_range.last_event_id, source_event_ids[2]);
+        assert_eq!(covered_range.source_event_count, 3);
         assert!(source_refs.contains("document_id"));
         assert!(source_refs.contains("tool-output:shell:"));
         assert!(source_refs.contains("persisted_document_backend"));
+
+        let (summary_event_id, summary_causation, summary_payload): (String, String, String) = conn
+            .query_row(
+                "SELECT event_id, causation_event_id, raw_payload_json
+                 FROM message_events
+                 WHERE event_type = 'compaction.summary.created'
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(summary_causation, source_event_ids[2]);
+        let summary_payload: serde_json::Value = serde_json::from_str(&summary_payload).unwrap();
+        assert_eq!(
+            summary_payload
+                .get("covered_event_range")
+                .and_then(|range| range.get("last_event_id"))
+                .and_then(serde_json::Value::as_str),
+            Some(source_event_ids[2].as_str())
+        );
+        let compaction_payload: String = conn
+            .query_row(
+                "SELECT payload_json FROM compaction_runs WHERE workspace_id = 'workspace-a' ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let compaction_payload: serde_json::Value = serde_json::from_str(&compaction_payload).unwrap();
+        assert_eq!(
+            compaction_payload
+                .get("summary_message_event_id")
+                .and_then(serde_json::Value::as_str),
+            Some(summary_event_id.as_str())
+        );
 
         let stored_summary_count: i64 = conn
             .query_row(
@@ -9673,6 +9917,37 @@ ls -la
             )
             .unwrap();
         assert_eq!(stored_summary_count, 1);
+    }
+
+    #[tokio::test]
+    async fn compaction_provenance_refuses_ambiguous_repeated_event_sequences() {
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::agent("workspace-a", "ambiguous-compaction");
+        let fabric = MemoryFabric::new(mem.clone(), "workspace-a");
+        for index in 0..2 {
+            fabric
+                .record_inbound_user_message(
+                    envelope.message_scope(),
+                    "same repeated turn",
+                    Some(format!("ambiguous-{index}")),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+
+        let provenance = resolve_compaction_event_provenance(
+            mem.as_ref(),
+            envelope.memory_principal(),
+            &[ChatMessage::user("same repeated turn")],
+        )
+        .await
+        .unwrap();
+        assert!(
+            provenance.is_none(),
+            "ambiguous matches must not select arbitrary event IDs"
+        );
     }
 
     #[test]
@@ -11334,6 +11609,7 @@ Let me check the result."#;
             task_id: None,
             source_message_event_id: None,
             session_key: Some("chat-1".to_string()),
+            legacy_session_key: None,
             agent_id: None,
             persona_id: None,
             channel: Some("terminal".to_string()),
