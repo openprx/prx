@@ -3690,36 +3690,44 @@ pub async fn run(
         // silently starting fresh on a transient DB error would fork the
         // conversation and bury the original context (session-loss illusion),
         // not "overwrite the same key".
-        Some("last") => match load_latest_session(mem.as_ref()).await {
-            Ok(Some(s)) => {
-                info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
-                s
+        Some("last") => {
+            match load_latest_session_with_message_events(mem.as_ref(), memory_fabric.workspace_id(), &config.cost)
+                .await
+            {
+                Ok(Some(s)) => {
+                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                    s
+                }
+                Ok(None) => {
+                    info!("No previous session found, starting new");
+                    session::ChatSession::new(provider_name, model_name)
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "failed to load the most recent session: {e}; refusing to start a fresh session that would bury it"
+                    );
+                }
             }
-            Ok(None) => {
-                info!("No previous session found, starting new");
-                session::ChatSession::new(provider_name, model_name)
+        }
+        Some(id) => {
+            match load_session_by_id_with_message_events(mem.as_ref(), memory_fabric.workspace_id(), id, &config.cost)
+                .await
+            {
+                Ok(Some(s)) => {
+                    info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
+                    s
+                }
+                Ok(None) => {
+                    eprintln!("Session '{id}' not found, starting new session.");
+                    session::ChatSession::new(provider_name, model_name)
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "failed to load session '{id}': {e}; refusing to start a fresh session that would bury it"
+                    );
+                }
             }
-            Err(e) => {
-                anyhow::bail!(
-                    "failed to load the most recent session: {e}; refusing to start a fresh session that would bury it"
-                );
-            }
-        },
-        Some(id) => match load_session_by_id(mem.as_ref(), id).await {
-            Ok(Some(s)) => {
-                info!(id = %s.id, title = %s.title, turns = s.turn_count(), "Resumed session");
-                s
-            }
-            Ok(None) => {
-                eprintln!("Session '{id}' not found, starting new session.");
-                session::ChatSession::new(provider_name, model_name)
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "failed to load session '{id}': {e}; refusing to start a fresh session that would bury it"
-                );
-            }
-        },
+        }
         None => session::ChatSession::new(provider_name, model_name),
     };
     bind_session_to_runtime_provider_model(&mut chat_session, provider_name, model_name);
@@ -5590,7 +5598,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                                 );
                             }
 
-                            let loaded = match load_latest_session(mem.as_ref()).await {
+                            let loaded = match load_latest_session_with_message_events(
+                                mem.as_ref(),
+                                memory_fabric.workspace_id(),
+                                &config.cost,
+                            )
+                            .await
+                            {
                                 Ok(Some(session)) => Some(session),
                                 Ok(None) => {
                                     emit_chat_output("No saved chat sessions to resume.");
@@ -12643,6 +12657,162 @@ async fn load_session_by_id(mem: &dyn Memory, id: &str) -> Result<Option<session
     Ok(Some(session))
 }
 
+const CHAT_MESSAGE_EVENT_REPLAY_WINDOW: usize = 500;
+
+#[derive(Debug)]
+struct ChatMessageEventProjection {
+    session: session::ChatSession,
+    turns_from_events: bool,
+    usage_from_events: bool,
+}
+
+/// Read the backend's session-key-filtered replay window. The query hard-filters
+/// canonical + legacy keys before applying its bound, so unrelated workspace
+/// traffic cannot evict this chat's events. A longer/incomplete replay simply
+/// fails the exact parity test and retains the blob compatibility snapshot.
+async fn load_chat_session_message_event_window(
+    mem: &dyn Memory,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<Vec<crate::memory::MessageEvent>> {
+    let legacy_session_key = format!("chat:{session_id}");
+    let principal = chat_runtime_envelope(workspace_id, &legacy_session_key).memory_principal();
+    let mut events = mem
+        .load_recent_session_context(crate::memory::SessionContextQuery {
+            principal,
+            since_event_id: None,
+            limit: CHAT_MESSAGE_EVENT_REPLAY_WINDOW,
+            include_roles: Vec::new(),
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("failed to read MessageEvent replay window: {error}"))?;
+    events.sort_by_key(|event| event.id);
+    Ok(events)
+}
+
+fn apply_chat_message_event_projection(
+    mut snapshot: session::ChatSession,
+    events: &[crate::memory::MessageEvent],
+    cost_config: &crate::config::schema::CostConfig,
+) -> ChatMessageEventProjection {
+    let message_events = events
+        .iter()
+        .filter(|event| {
+            event.source == "chat"
+                && event.event_type == "message.created"
+                && matches!(event.role.as_str(), "user" | "assistant")
+        })
+        .collect::<Vec<_>>();
+    let snapshot_turn_indices = snapshot
+        .turns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, turn)| matches!(turn.role.as_str(), "user" | "assistant").then_some(index))
+        .collect::<Vec<_>>();
+    let turns_from_events = !message_events.is_empty()
+        && message_events.len() == snapshot_turn_indices.len()
+        && message_events.iter().zip(&snapshot_turn_indices).all(|(event, index)| {
+            let turn = &snapshot.turns[*index];
+            event.role == turn.role && event.content == turn.content
+        });
+    if turns_from_events {
+        for (event, index) in message_events.iter().zip(snapshot_turn_indices) {
+            // MessageEvent owns replay role/content. Blob-only timestamp and
+            // tool-call summaries remain compatibility metadata until the event
+            // contract can reproduce them as well.
+            snapshot.turns[index].role.clone_from(&event.role);
+            snapshot.turns[index].content.clone_from(&event.content);
+        }
+    }
+
+    let final_outcome_events = events
+        .iter()
+        .filter(|event| event.source == "chat" && event.event_type == "provider.final_outcome")
+        .collect::<Vec<_>>();
+    let mut malformed_outcome = false;
+    let mut projected_usage = Vec::new();
+    for event in &final_outcome_events {
+        let Some(payload) = event.raw_payload_json.as_deref() else {
+            malformed_outcome = true;
+            break;
+        };
+        let outcome = match serde_json::from_str::<ProviderExecutionOutcome>(payload) {
+            Ok(outcome) => outcome,
+            Err(_) => {
+                malformed_outcome = true;
+                break;
+            }
+        };
+        if let Some(record) =
+            crate::llm::route_decision::MeteredTokenUsageRecord::from_provider_outcome(&outcome, cost_config)
+        {
+            projected_usage.push(record);
+        }
+    }
+    let usage_from_events =
+        !final_outcome_events.is_empty() && !malformed_outcome && projected_usage == snapshot.token_usage_records;
+    if usage_from_events {
+        snapshot.token_usage_records = projected_usage;
+    }
+
+    ChatMessageEventProjection {
+        session: snapshot,
+        turns_from_events,
+        usage_from_events,
+    }
+}
+
+/// Project resume/export/cost state from MessageEvent only after exact parity
+/// with the persisted blob. Event read failures and partial/mismatched replay
+/// retain the blob as the compatibility snapshot.
+async fn project_chat_session_from_message_events(
+    mem: &dyn Memory,
+    workspace_id: &str,
+    snapshot: session::ChatSession,
+    cost_config: &crate::config::schema::CostConfig,
+) -> ChatMessageEventProjection {
+    let session_id = snapshot.id.clone();
+    let events = match load_chat_session_message_event_window(mem, workspace_id, &session_id).await {
+        Ok(events) => events,
+        Err(error) => {
+            tracing::warn!(
+                session_id,
+                error = %error,
+                "MessageEvent projection unavailable; retaining chat blob compatibility snapshot"
+            );
+            return ChatMessageEventProjection {
+                session: snapshot,
+                turns_from_events: false,
+                usage_from_events: false,
+            };
+        }
+    };
+    let projection = apply_chat_message_event_projection(snapshot, &events, cost_config);
+    tracing::debug!(
+        session_id,
+        turns_from_events = projection.turns_from_events,
+        usage_from_events = projection.usage_from_events,
+        "evaluated chat MessageEvent projection parity"
+    );
+    projection
+}
+
+async fn load_session_by_id_with_message_events(
+    mem: &dyn Memory,
+    workspace_id: &str,
+    id: &str,
+    cost_config: &crate::config::schema::CostConfig,
+) -> Result<Option<session::ChatSession>> {
+    let Some(snapshot) = load_session_by_id(mem, id).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        project_chat_session_from_message_events(mem, workspace_id, snapshot, cost_config)
+            .await
+            .session,
+    ))
+}
+
 /// Load the most recent session.
 ///
 /// Returns `Ok(None)` when no saved session exists. A storage error (D10/C3) or
@@ -12657,6 +12827,21 @@ async fn load_latest_session(mem: &dyn Memory) -> Result<Option<session::ChatSes
     let mut sessions: Vec<session::ChatSession> = collect_valid_sessions(&entries)?;
     sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     Ok(sessions.into_iter().next())
+}
+
+async fn load_latest_session_with_message_events(
+    mem: &dyn Memory,
+    workspace_id: &str,
+    cost_config: &crate::config::schema::CostConfig,
+) -> Result<Option<session::ChatSession>> {
+    let Some(snapshot) = load_latest_session(mem).await? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        project_chat_session_from_message_events(mem, workspace_id, snapshot, cost_config)
+            .await
+            .session,
+    ))
 }
 
 /// Parse session entries, distinguishing corruption from non-session entries.
@@ -13069,11 +13254,13 @@ async fn resume_saved_session_by_id(mem: &dyn Memory, target_id: &str, ctx: Chat
         );
     }
 
-    let loaded_session = match load_session_by_id(mem, target_id).await {
-        Ok(Some(session)) => session,
-        Ok(None) => anyhow::bail!("Saved chat session '{target_id}' not found."),
-        Err(e) => anyhow::bail!("Resume aborted: failed to load saved chat session '{target_id}': {e}"),
-    };
+    let workspace_id = ctx.config.workspace_dir.to_string_lossy();
+    let loaded_session =
+        match load_session_by_id_with_message_events(mem, workspace_id.as_ref(), target_id, &ctx.config.cost).await {
+            Ok(Some(session)) => session,
+            Ok(None) => anyhow::bail!("Saved chat session '{target_id}' not found."),
+            Err(e) => anyhow::bail!("Resume aborted: failed to load saved chat session '{target_id}': {e}"),
+        };
     let loaded_id = loaded_session.id.clone();
     let loaded_turns = loaded_session.turn_count();
     let loaded_title = if loaded_session.title.is_empty() {
@@ -13647,6 +13834,166 @@ mod session_runtime_binding_tests {
             !single.iter().any(|event| event.content == "legacy pre-cutover turn"),
             "single-key path must NOT see legacy history"
         );
+    }
+}
+
+#[cfg(test)]
+mod chat_message_event_projection_tests {
+    use super::*;
+    use crate::llm::route_decision::TokenUsage;
+    use crate::memory::SqliteMemory;
+    use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn equivalent_events_drive_resume_export_and_cost_without_output_drift() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), workspace_id.clone());
+        let cost_config = crate::config::schema::CostConfig::default();
+
+        let mut snapshot = session::ChatSession::new("anthropic", "claude-sonnet-4");
+        snapshot.id = "event-projection-session".to_string();
+        snapshot.add_user_turn("hello from the blob");
+        snapshot.add_assistant_turn("hello from the event log", Vec::new());
+        let decision = RouteDecision::single_candidate("anthropic", "claude-sonnet-4");
+        let outcome = ProviderExecutionOutcome::success_for_decision_with_usage(
+            &decision,
+            chrono::Utc::now(),
+            TokenUsage::reported(Some(120), Some(30), Some(150)),
+        );
+        snapshot.record_provider_usage(&outcome, &cost_config).unwrap();
+        save_session(memory.as_ref(), &snapshot).await.unwrap();
+
+        let session_key = format!("chat:{}", snapshot.id);
+        record_chat_user_message_event(
+            &fabric,
+            &snapshot,
+            &session_key,
+            "turn-1",
+            "anthropic",
+            "claude-sonnet-4",
+            1,
+            "hello from the blob",
+        )
+        .await
+        .unwrap();
+        record_provider_outcome_events(
+            &fabric,
+            route_event_scope(
+                "chat",
+                None,
+                Some(session_key.clone()),
+                Some("turn-1".to_string()),
+                Some("local-user".to_string()),
+                Some("anthropic/claude-sonnet-4".to_string()),
+            ),
+            &outcome,
+        )
+        .await
+        .unwrap();
+        record_chat_assistant_message_event(
+            &fabric,
+            &session_key,
+            "turn-1",
+            "anthropic",
+            "claude-sonnet-4",
+            "hello from the event log",
+        )
+        .await
+        .unwrap();
+
+        // Workspace-visible noise from another chat must never enter this projection.
+        let noise = session::ChatSession::new("other", "model");
+        record_chat_user_message_event(
+            &fabric,
+            &noise,
+            &format!("chat:{}", noise.id),
+            "noise-turn",
+            "other",
+            "model",
+            1,
+            "unrelated workspace event",
+        )
+        .await
+        .unwrap();
+
+        let before_json = snapshot.to_json().unwrap();
+        let before_cost = commands::format_cost_feedback(&snapshot);
+        let projected =
+            project_chat_session_from_message_events(memory.as_ref(), &workspace_id, snapshot.clone(), &cost_config)
+                .await;
+
+        assert!(projected.turns_from_events, "equivalent turns must use MessageEvent");
+        assert!(
+            projected.usage_from_events,
+            "equivalent usage must use provider outcome events"
+        );
+        assert_eq!(
+            projected.session.to_json().unwrap(),
+            before_json,
+            "export projection drifted"
+        );
+        assert_eq!(commands::format_cost_feedback(&projected.session), before_cost);
+
+        let resumed =
+            load_session_by_id_with_message_events(memory.as_ref(), &workspace_id, &snapshot.id, &cost_config)
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(resumed.to_json().unwrap(), before_json, "resume projection drifted");
+    }
+
+    #[tokio::test]
+    async fn non_equivalent_events_keep_the_blob_compatibility_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let workspace_id = tmp.path().to_string_lossy().to_string();
+        let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let fabric = MemoryFabric::new(memory.clone(), workspace_id.clone());
+        let cost_config = crate::config::schema::CostConfig::default();
+        let mut snapshot = session::ChatSession::new("provider", "model");
+        snapshot.id = "event-fallback-session".to_string();
+        snapshot.add_user_turn("blob is authoritative until parity");
+        let before = snapshot.to_json().unwrap();
+
+        record_chat_user_message_event(
+            &fabric,
+            &snapshot,
+            &format!("chat:{}", snapshot.id),
+            "turn-1",
+            "provider",
+            "model",
+            1,
+            "different event content",
+        )
+        .await
+        .unwrap();
+
+        let projected =
+            project_chat_session_from_message_events(memory.as_ref(), &workspace_id, snapshot, &cost_config).await;
+        assert!(!projected.turns_from_events);
+        assert!(!projected.usage_from_events);
+        assert_eq!(projected.session.to_json().unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn unsupported_event_reader_keeps_the_blob_compatibility_snapshot() {
+        let mut snapshot = session::ChatSession::new("provider", "model");
+        snapshot.id = "blob-only-session".to_string();
+        snapshot.add_user_turn("backend has no event log");
+        let before = snapshot.to_json().unwrap();
+
+        let projected = project_chat_session_from_message_events(
+            &crate::memory::NoneMemory::new(),
+            "workspace",
+            snapshot,
+            &crate::config::schema::CostConfig::default(),
+        )
+        .await;
+
+        assert!(!projected.turns_from_events);
+        assert!(!projected.usage_from_events);
+        assert_eq!(projected.session.to_json().unwrap(), before);
     }
 }
 
