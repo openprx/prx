@@ -4,7 +4,6 @@ use crate::config::Config;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::collections::HashSet;
-use std::io::Write;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
@@ -17,39 +16,65 @@ const COMMAND_VERSION_PREVIEW_CHARS: usize = 60;
 // ── Diagnostic item ──────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Severity {
+pub enum Severity {
     Ok,
     Warn,
     Error,
 }
 
-struct DiagItem {
-    severity: Severity,
-    category: &'static str,
-    message: String,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DiagnosticState {
+    Declared,
+    Configured,
+    Ready,
+    Healthy,
+    Disabled,
+    Unknown,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiagItem {
+    pub severity: Severity,
+    pub state: DiagnosticState,
+    pub category: &'static str,
+    pub message: String,
 }
 
 impl DiagItem {
     fn ok(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Ok, DiagnosticState::Healthy, category, msg)
+    }
+    fn healthy(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::ok(category, msg)
+    }
+    fn declared(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Ok, DiagnosticState::Declared, category, msg)
+    }
+    fn configured(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Ok, DiagnosticState::Configured, category, msg)
+    }
+    fn ready(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Ok, DiagnosticState::Ready, category, msg)
+    }
+    fn disabled(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Ok, DiagnosticState::Disabled, category, msg)
+    }
+    fn unknown(category: &'static str, msg: impl Into<String>) -> Self {
+        Self::with_state(Severity::Warn, DiagnosticState::Unknown, category, msg)
+    }
+    fn with_state(severity: Severity, state: DiagnosticState, category: &'static str, msg: impl Into<String>) -> Self {
         Self {
-            severity: Severity::Ok,
+            severity,
+            state,
             category,
             message: msg.into(),
         }
     }
     fn warn(category: &'static str, msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Warn,
-            category,
-            message: msg.into(),
-        }
+        Self::with_state(Severity::Warn, DiagnosticState::Unknown, category, msg)
     }
     fn error(category: &'static str, msg: impl Into<String>) -> Self {
-        Self {
-            severity: Severity::Error,
-            category,
-            message: msg.into(),
-        }
+        Self::with_state(Severity::Error, DiagnosticState::Unknown, category, msg)
     }
 
     const fn icon(&self) -> &'static str {
@@ -59,11 +84,86 @@ impl DiagItem {
             Severity::Error => "❌",
         }
     }
+
+    const fn state_label(&self) -> &'static str {
+        match self.state {
+            DiagnosticState::Declared => "DECLARED",
+            DiagnosticState::Configured => "CONFIGURED",
+            DiagnosticState::Ready => "READY",
+            DiagnosticState::Healthy => "HEALTHY",
+            DiagnosticState::Disabled => "DISABLED",
+            DiagnosticState::Unknown => "UNKNOWN",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct DoctorReport {
+    pub title: &'static str,
+    pub items: Vec<DiagItem>,
+    pub ok_count: usize,
+    pub warning_count: usize,
+    pub error_count: usize,
+}
+
+impl DoctorReport {
+    fn new(title: &'static str, items: Vec<DiagItem>) -> Self {
+        let ok_count = items.iter().filter(|item| item.severity == Severity::Ok).count();
+        let warning_count = items.iter().filter(|item| item.severity == Severity::Warn).count();
+        let error_count = items.iter().filter(|item| item.severity == Severity::Error).count();
+        Self {
+            title,
+            items,
+            ok_count,
+            warning_count,
+            error_count,
+        }
+    }
+
+    pub const fn has_errors(&self) -> bool {
+        self.error_count > 0
+    }
+
+    fn print(&self) {
+        println!("🩺 {}", self.title);
+        println!();
+
+        let mut current_cat = "";
+        for item in &self.items {
+            if item.category != current_cat {
+                current_cat = item.category;
+                println!("  [{current_cat}]");
+            }
+            println!("    {} [{}] {}", item.icon(), item.state_label(), item.message);
+        }
+
+        println!();
+        println!(
+            "  Summary: {} ok, {} warnings, {} errors",
+            self.ok_count, self.warning_count, self.error_count
+        );
+        if self.has_errors() {
+            println!("  💡 Fix the errors above, then run `prx doctor` again.");
+        }
+    }
+
+    fn ensure_success(&self) -> Result<()> {
+        if self.has_errors() {
+            anyhow::bail!("doctor found {} error(s)", self.error_count);
+        }
+        Ok(())
+    }
 }
 
 // ── Public entry point ───────────────────────────────────────────
 
 pub fn run(config: &Config) -> Result<()> {
+    let report = diagnose(config);
+    report.print();
+    report.ensure_success()
+}
+
+pub fn diagnose(config: &Config) -> DoctorReport {
     let mut items: Vec<DiagItem> = Vec::new();
 
     check_config_semantics(config, &mut items);
@@ -71,41 +171,28 @@ pub fn run(config: &Config) -> Result<()> {
     check_daemon_state(config, &mut items);
     check_environment(&mut items);
 
-    // Print report
-    println!("🩺 OpenPRX Doctor (enhanced)");
-    println!();
-
-    let mut current_cat = "";
-    for item in &items {
-        if item.category != current_cat {
-            current_cat = item.category;
-            println!("  [{current_cat}]");
-        }
-        println!("    {} {}", item.icon(), item.message);
-    }
-
-    let errors = items.iter().filter(|i| i.severity == Severity::Error).count();
-    let warns = items.iter().filter(|i| i.severity == Severity::Warn).count();
-    let oks = items.iter().filter(|i| i.severity == Severity::Ok).count();
-
-    println!();
-    println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
-
-    if errors > 0 {
-        println!("  💡 Fix the errors above, then run `prx doctor` again.");
-    }
-
-    Ok(())
+    DoctorReport::new("OpenPRX Doctor", items)
 }
 
 pub fn run_memory(config: &Config) -> Result<()> {
+    let report = diagnose_memory(config);
+    report.print();
+    report.ensure_success()
+}
+
+pub fn diagnose_memory(config: &Config) -> DoctorReport {
     let mut items: Vec<DiagItem> = Vec::new();
     check_memory_diagnostics(config, &mut items);
-    print_report("OpenPRX Doctor - Memory", &items);
-    Ok(())
+    DoctorReport::new("OpenPRX Doctor - Memory", items)
 }
 
 pub async fn run_runtime(config: &Config) -> Result<()> {
+    let report = diagnose_runtime(config).await;
+    report.print();
+    report.ensure_success()
+}
+
+pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
     let mut items: Vec<DiagItem> = Vec::new();
     check_deployed_binary(&mut items);
     check_runtime_config(config, &mut items);
@@ -117,29 +204,7 @@ pub async fn run_runtime(config: &Config) -> Result<()> {
     check_runtime_readiness(config, &mut items);
     check_postgres_health(config, &mut items).await;
     check_embedding_endpoint(config, &mut items).await;
-    print_report("OpenPRX Doctor - Runtime Matrix", &items);
-    Ok(())
-}
-
-fn print_report(title: &str, items: &[DiagItem]) {
-    println!("🩺 {title}");
-    println!();
-
-    let mut current_cat = "";
-    for item in items {
-        if item.category != current_cat {
-            current_cat = item.category;
-            println!("  [{current_cat}]");
-        }
-        println!("    {} {}", item.icon(), item.message);
-    }
-
-    let errors = items.iter().filter(|i| i.severity == Severity::Error).count();
-    let warns = items.iter().filter(|i| i.severity == Severity::Warn).count();
-    let oks = items.iter().filter(|i| i.severity == Severity::Ok).count();
-
-    println!();
-    println!("  Summary: {oks} ok, {warns} warnings, {errors} errors");
+    DoctorReport::new("OpenPRX Doctor - Runtime Matrix", items)
 }
 
 fn check_deployed_binary(items: &mut Vec<DiagItem>) {
@@ -173,7 +238,7 @@ fn check_deployed_binary(items: &mut Vec<DiagItem>) {
 fn check_runtime_config(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
     if config.config_path.exists() {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("config path exists: {}", config.config_path.display()),
         ));
@@ -184,7 +249,7 @@ fn check_runtime_config(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
     if config.workspace_dir.exists() {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("workspace exists: {}", config.workspace_dir.display()),
         ));
@@ -199,13 +264,14 @@ fn check_runtime_config(config: &Config, items: &mut Vec<DiagItem>) {
 fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "gateway";
     if !config.modules.network {
-        items.push(DiagItem::warn(
+        items.push(DiagItem::disabled(
             cat,
-            "network module disabled in config; probing gateway port anyway because daemon may still expose it",
+            "network module disabled; gateway probe skipped",
         ));
+        return;
     }
 
-    items.push(DiagItem::ok(
+    items.push(DiagItem::configured(
         cat,
         format!(
             "configured bind {}:{} (pairing required: {})",
@@ -232,7 +298,7 @@ fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
 fn check_channel_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "channels";
     if !config.modules.channels {
-        items.push(DiagItem::warn(
+        items.push(DiagItem::disabled(
             cat,
             "channels module disabled; IM live path is not expected",
         ));
@@ -246,7 +312,7 @@ fn check_channel_runtime(config: &Config, items: &mut Vec<DiagItem>) {
             "channels module enabled but no IM channels are configured",
         ));
     } else {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("configured channels: {}", configured.join(", ")),
         ));
@@ -293,60 +359,128 @@ fn configured_channel_names(config: &Config) -> Vec<&'static str> {
 
 async fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "console";
-    let Ok(memory) = crate::memory::create_memory_with_storage_and_routes_with_acl(
-        &config.memory,
-        &config.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-        &config.identity_bindings,
-        &config.user_policies,
-    ) else {
-        items.push(DiagItem::warn(
+    if !config.modules.memory {
+        items.push(DiagItem::disabled(
             cat,
-            "cannot open memory backend to inspect console sessions",
+            "memory module disabled; console session probe skipped",
         ));
         return;
-    };
+    }
 
-    match memory.list_conversation_sessions(5, 0, None).await {
-        Ok(sessions) if sessions.is_empty() => {
-            items.push(DiagItem::warn(cat, "no persisted console/channel sessions found"))
+    let backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    match crate::memory::classify_memory_backend(&backend) {
+        crate::memory::MemoryBackendKind::Sqlite | crate::memory::MemoryBackendKind::Lucid => {
+            let db_path = crate::schema_migration::memory_db_path(config);
+            match read_only_sqlite_session_count(&db_path) {
+                Ok(Some(0)) => items.push(DiagItem::ready(cat, "no persisted console/channel sessions found")),
+                Ok(Some(count)) => items.push(DiagItem::healthy(
+                    cat,
+                    format!("persisted conversation sessions visible: {count}"),
+                )),
+                Ok(None) => items.push(DiagItem::unknown(
+                    cat,
+                    "sessions table is not present; session visibility is unknown",
+                )),
+                Err(error) => items.push(DiagItem::error(
+                    cat,
+                    format!("read-only console session probe failed: {error}"),
+                )),
+            }
         }
-        Ok(sessions) => items.push(DiagItem::ok(
+        crate::memory::MemoryBackendKind::Postgres => items.push(DiagItem::unknown(
             cat,
-            format!("persisted conversation sessions visible: {}", sessions.len()),
+            "PostgreSQL console session count is not inferred; backend health is probed separately",
         )),
-        Err(error) => items.push(DiagItem::warn(
+        crate::memory::MemoryBackendKind::Markdown | crate::memory::MemoryBackendKind::None => {
+            items.push(DiagItem::disabled(
+                cat,
+                format!("backend '{backend}' does not provide durable conversation sessions"),
+            ));
+        }
+        crate::memory::MemoryBackendKind::Unknown => items.push(DiagItem::error(
             cat,
-            format!("failed to list persisted conversation sessions: {error}"),
+            format!("unknown configured memory backend '{backend}'"),
         )),
     }
 }
 
 async fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "memory";
-    match crate::memory::create_memory_with_storage_and_routes_with_acl(
-        &config.memory,
-        &config.embedding_routes,
-        Some(&config.storage.provider.config),
-        &config.workspace_dir,
-        config.api_key.as_deref(),
-        &config.identity_bindings,
-        &config.user_policies,
-    ) {
-        Ok(memory) => {
-            if memory.health_check().await {
-                items.push(DiagItem::ok(cat, format!("memory backend healthy: {}", memory.name())));
-            } else {
-                items.push(DiagItem::error(
+    if !config.modules.memory {
+        items.push(DiagItem::disabled(cat, "memory module disabled"));
+        return;
+    }
+
+    let backend =
+        crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
+    match crate::memory::classify_memory_backend(&backend) {
+        crate::memory::MemoryBackendKind::None => {
+            items.push(DiagItem::disabled(cat, "memory backend explicitly disabled"));
+        }
+        crate::memory::MemoryBackendKind::Markdown => {
+            if config.workspace_dir.is_dir() {
+                items.push(DiagItem::ready(
                     cat,
-                    format!("memory backend health check failed: {}", memory.name()),
+                    "markdown memory workspace is readable; no write probe performed",
                 ));
+            } else {
+                items.push(DiagItem::error(cat, "markdown memory workspace is missing"));
             }
         }
-        Err(error) => items.push(DiagItem::error(cat, format!("failed to open memory backend: {error}"))),
+        crate::memory::MemoryBackendKind::Sqlite
+        | crate::memory::MemoryBackendKind::Lucid
+        | crate::memory::MemoryBackendKind::Postgres => {
+            match crate::schema_migration::inspect_configured_backend(config) {
+                Ok(report) if report.status.pending.is_empty() => items.push(DiagItem::healthy(
+                    cat,
+                    format!(
+                        "{} backend authoritative ledger verified ({} migrations)",
+                        report.backend,
+                        report.status.applied.len()
+                    ),
+                )),
+                Ok(report) => items.push(DiagItem::with_state(
+                    Severity::Warn,
+                    DiagnosticState::Ready,
+                    cat,
+                    format!(
+                        "{} backend ledger is readable with {} pending migration(s)",
+                        report.backend,
+                        report.status.pending.len()
+                    ),
+                )),
+                Err(error) => items.push(DiagItem::error(
+                    cat,
+                    format!("read-only {backend} backend probe failed: {error}"),
+                )),
+            }
+        }
+        crate::memory::MemoryBackendKind::Unknown => {
+            items.push(DiagItem::error(
+                cat,
+                format!("unknown configured memory backend '{backend}'"),
+            ));
+        }
     }
+}
+
+fn read_only_sqlite_session_count(db_path: &Path) -> Result<Option<i64>> {
+    if !db_path.is_file() {
+        anyhow::bail!("memory database is missing at {}", db_path.display());
+    }
+    let conn = rusqlite::Connection::open_with_flags(db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sessions')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
+        .map(Some)
+        .map_err(Into::into)
 }
 
 /// FIX-P2-06: Read-only runtime readiness sub-checks.
@@ -370,7 +504,7 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
             "owner: memory.acl_enabled is false; owner/topic scoping is not enforced",
         ));
     } else if persistent {
-        items.push(DiagItem::ok(cat, "owner: ACL enforced on a persistent backend"));
+        items.push(DiagItem::ready(cat, "owner: ACL enforced on a persistent backend"));
     } else {
         items.push(DiagItem::warn(
             cat,
@@ -380,7 +514,7 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
 
     // 2. topic readiness: topic/semantic scoping needs embeddings enabled.
     if embeddings_enabled && mem.embedding_dimensions > 0 {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::ready(
             cat,
             format!("topic: semantic topic scoping ready (dim {})", mem.embedding_dimensions),
         ));
@@ -393,7 +527,7 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
 
     // 3. task readiness: task lineage events need event recording enabled.
     if mem.events.enabled {
-        items.push(DiagItem::ok(cat, "task: lifecycle/task event recording enabled"));
+        items.push(DiagItem::ready(cat, "task: lifecycle/task event recording enabled"));
     } else {
         items.push(DiagItem::warn(
             cat,
@@ -403,7 +537,7 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
 
     // 4. document readiness: document ingest needs a persistent backend.
     if persistent {
-        items.push(DiagItem::ok(cat, "document: ingest backed by a persistent store"));
+        items.push(DiagItem::ready(cat, "document: ingest backed by a persistent store"));
     } else {
         items.push(DiagItem::warn(
             cat,
@@ -423,14 +557,14 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
             "vector: embedding_dimensions is zero while embeddings are enabled",
         ));
     } else {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::ready(
             cat,
             format!("vector: index ready (dim {})", mem.embedding_dimensions),
         ));
     }
 
     // 6. runtime-control readiness: autonomy posture is resolvable.
-    items.push(DiagItem::ok(
+    items.push(DiagItem::ready(
         cat,
         format!(
             "runtime-control: control ladder ready (autonomy {:?})",
@@ -616,9 +750,9 @@ async fn check_embedding_endpoint(config: &Config, items: &mut Vec<DiagItem>) {
 fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "memory";
     if config.modules.memory {
-        items.push(DiagItem::ok(cat, "memory module enabled"));
+        items.push(DiagItem::declared(cat, "memory module enabled"));
     } else {
-        items.push(DiagItem::warn(
+        items.push(DiagItem::disabled(
             cat,
             "memory module disabled; memory tools and maintenance commands are gated off",
         ));
@@ -626,8 +760,8 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
 
     let backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
-    items.push(DiagItem::ok(cat, format!("backend configured as {backend}")));
-    items.push(DiagItem::ok(
+    items.push(DiagItem::configured(cat, format!("backend configured as {backend}")));
+    items.push(DiagItem::configured(
         cat,
         format!("workspace path {}", config.workspace_dir.display()),
     ));
@@ -639,7 +773,7 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
             "embedding provider disabled or unresolved; keyword/FTS search remains the fallback",
         ));
     } else {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             "embedding",
             format!(
                 "embedding provider={} model={} dimensions={}",
@@ -655,7 +789,10 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
         let url = provider.strip_prefix("custom:").unwrap_or("").trim();
         match reqwest::Url::parse(url) {
             Ok(parsed) if matches!(parsed.scheme(), "http" | "https") => {
-                items.push(DiagItem::ok("embedding", format!("custom embedding endpoint {url}")));
+                items.push(DiagItem::configured(
+                    "embedding",
+                    format!("custom embedding endpoint {url}"),
+                ));
             }
             _ => items.push(DiagItem::error(
                 "embedding",
@@ -671,7 +808,7 @@ fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    items.push(DiagItem::ok(
+    items.push(DiagItem::declared(
         "maintenance",
         "run `prx memory reindex` to rebuild SQLite/Lucid memory and document chunk vectors",
     ));
@@ -747,7 +884,7 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
     for provider_name in &targets {
         println!("  [{}]", provider_name);
 
-        match crate::onboard::run_models_refresh(config, Some(provider_name), !use_cache) {
+        match crate::onboard::run_models_probe_read_only(config, Some(provider_name), use_cache) {
             Ok(()) => {
                 ok_count += 1;
                 println!("    ✅ model catalog check passed");
@@ -787,6 +924,10 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
         anyhow::bail!("Model probe failed for target provider")
     }
 
+    if error_count > 0 {
+        anyhow::bail!("Model probe found {error_count} provider error(s)")
+    }
+
     Ok(())
 }
 
@@ -797,7 +938,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Config file exists
     if config.config_path.exists() {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("config file: {}", config.config_path.display()),
         ));
@@ -816,7 +957,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                 format!("default provider \"{provider}\" is invalid: {reason}"),
             ));
         } else {
-            items.push(DiagItem::ok(cat, format!("provider \"{provider}\" is valid")));
+            items.push(DiagItem::configured(cat, format!("provider \"{provider}\" is valid")));
         }
     } else {
         items.push(DiagItem::error(cat, "no default_provider configured"));
@@ -825,11 +966,11 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     // API key / auth profile presence
     if config.default_provider.as_deref() != Some("ollama") {
         if config.api_key.is_some() {
-            items.push(DiagItem::ok(cat, "API key configured"));
+            items.push(DiagItem::configured(cat, "API key configured"));
         } else if let Some(provider) = config.default_provider.as_deref() {
             match active_auth_profile_credential_status(config, provider) {
                 AuthProfileCredentialStatus::Present { profile_id } => {
-                    items.push(DiagItem::ok(
+                    items.push(DiagItem::configured(
                         cat,
                         format!("auth profile credential configured for \"{provider}\" ({profile_id})"),
                     ));
@@ -851,7 +992,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Model configured
     if config.default_model.is_some() {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("default model: {}", config.default_model.as_deref().unwrap_or("?")),
         ));
@@ -861,7 +1002,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Temperature range
     if config.default_temperature >= 0.0 && config.default_temperature <= 2.0 {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::configured(
             cat,
             format!("temperature {:.1} (valid range 0.0–2.0)", config.default_temperature),
         ));
@@ -878,7 +1019,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     // Gateway port range
     let port = config.gateway.port;
     if port > 0 {
-        items.push(DiagItem::ok(cat, format!("gateway port: {port}")));
+        items.push(DiagItem::configured(cat, format!("gateway port: {port}")));
     } else {
         items.push(DiagItem::error(cat, "gateway port is 0 (invalid)"));
     }
@@ -942,7 +1083,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
             ),
         ));
     } else {
-        items.push(DiagItem::ok(
+        items.push(DiagItem::ready(
             cat,
             format!(
                 "provider resilience ready: {} configured+available providers [{}]",
@@ -1048,7 +1189,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         || cc.webhook.is_some();
 
     if has_channel {
-        items.push(DiagItem::ok(cat, "at least one channel configured"));
+        items.push(DiagItem::configured(cat, "at least one channel configured"));
     } else {
         items.push(DiagItem::warn(
             cat,
@@ -1179,20 +1320,27 @@ fn check_workspace(config: &Config, items: &mut Vec<DiagItem>) {
         return;
     }
 
-    // Writable check
-    let probe = workspace_probe_path(ws);
-    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
-        Ok(mut probe_file) => {
-            let write_result = probe_file.write_all(b"probe");
-            drop(probe_file);
-            let _ = std::fs::remove_file(&probe);
-            match write_result {
-                Ok(()) => items.push(DiagItem::ok(cat, "directory is writable")),
-                Err(e) => items.push(DiagItem::error(cat, format!("directory write probe failed: {e}"))),
-            }
-        }
-        Err(e) => {
-            items.push(DiagItem::error(cat, format!("directory is not writable: {e}")));
+    // Doctor is diagnostic-only: prove readability and report declared write
+    // permission without creating a probe file.
+    match std::fs::read_dir(ws) {
+        Ok(_) => items.push(DiagItem::ready(cat, "directory is readable; no write probe performed")),
+        Err(error) => items.push(DiagItem::error(cat, format!("directory is not readable: {error}"))),
+    }
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::metadata(ws) {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o222 == 0 {
+            items.push(DiagItem::with_state(
+                Severity::Warn,
+                DiagnosticState::Configured,
+                cat,
+                "directory has no declared write permission bits; write capability was not exercised",
+            ));
+        } else {
+            items.push(DiagItem::configured(
+                cat,
+                "directory declares write permission; capability was not exercised",
+            ));
         }
     }
 
@@ -1237,13 +1385,6 @@ fn parse_df_available_mb(stdout: &str) -> Option<u64> {
     let line = stdout.lines().rev().find(|line| !line.trim().is_empty())?;
     let avail = line.split_whitespace().nth(3)?;
     avail.parse::<u64>().ok()
-}
-
-fn workspace_probe_path(workspace_dir: &Path) -> std::path::PathBuf {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    workspace_dir.join(format!(".openprx_doctor_probe_{}_{}", std::process::id(), nanos))
 }
 
 // ── Daemon state (original logic, preserved) ─────────────────────
@@ -1301,7 +1442,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         // Scheduler
         if let Some(scheduler) = components.get("scheduler") {
             if !config.modules.scheduler {
-                items.push(DiagItem::ok(cat, "scheduler module disabled"));
+                items.push(DiagItem::disabled(cat, "scheduler module disabled"));
             } else {
                 let scheduler_ok = scheduler
                     .get("status")
@@ -1326,7 +1467,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
                 }
             }
         } else {
-            items.push(DiagItem::warn(cat, "scheduler component not tracked yet"));
+            items.push(DiagItem::unknown(cat, "scheduler component not tracked yet"));
         }
 
         // Channels
@@ -1359,7 +1500,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         }
 
         if channel_count == 0 {
-            items.push(DiagItem::warn(cat, "no channel components tracked yet"));
+            items.push(DiagItem::unknown(cat, "no channel components tracked yet"));
         } else if stale > 0 {
             items.push(DiagItem::warn(cat, format!("{channel_count} channels, {stale} stale")));
         }
@@ -1523,6 +1664,35 @@ mod tests {
         assert_eq!(DiagItem::error("t", "m").icon(), "❌");
     }
 
+    #[tokio::test]
+    async fn diagnostic_states_are_emitted_by_real_checks() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("config.toml");
+        config.workspace_dir = temp.path().to_path_buf();
+        std::fs::write(&config.config_path, "configured").unwrap();
+
+        let mut items = Vec::new();
+        check_memory_diagnostics(&config, &mut items);
+        check_runtime_readiness(&config, &mut items);
+        check_environment(&mut items);
+        check_daemon_state(&config, &mut items);
+        config.modules.memory = false;
+        check_runtime_memory_health(&config, &mut items).await;
+
+        let states: std::collections::HashSet<_> = items.iter().map(|item| item.state).collect();
+        for expected in [
+            DiagnosticState::Declared,
+            DiagnosticState::Configured,
+            DiagnosticState::Ready,
+            DiagnosticState::Healthy,
+            DiagnosticState::Disabled,
+            DiagnosticState::Unknown,
+        ] {
+            assert!(states.contains(&expected), "missing diagnostic state {expected:?}");
+        }
+    }
+
     #[test]
     fn classify_model_probe_error_marks_unsupported_as_skipped() {
         let outcome = classify_model_probe_error("Provider 'copilot' does not support live model discovery yet");
@@ -1605,6 +1775,7 @@ mod tests {
             .find(|item| item.message == "scheduler module disabled")
             .expect("disabled scheduler should be reported");
         assert_eq!(scheduler_item.severity, Severity::Ok);
+        assert_eq!(scheduler_item.state, DiagnosticState::Disabled);
         assert!(items.iter().all(|item| !item.message.contains("scheduler unhealthy")));
     }
 
@@ -1879,18 +2050,57 @@ mod tests {
     }
 
     #[test]
-    fn workspace_probe_path_is_hidden_and_unique() {
+    fn workspace_check_does_not_create_probe_files() {
         let tmp = TempDir::new().unwrap();
-        let first = workspace_probe_path(tmp.path());
-        let second = workspace_probe_path(tmp.path());
+        let marker = tmp.path().join("marker.txt");
+        std::fs::write(&marker, "existing").unwrap();
+        let before: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        let mut items = Vec::new();
 
-        assert_ne!(first, second);
+        check_workspace(&config, &mut items);
+
+        let after: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(before, after);
         assert!(
-            first
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(".openprx_doctor_probe_"))
+            items
+                .iter()
+                .any(|item| item.message.contains("no write probe performed"))
         );
+    }
+
+    #[test]
+    fn doctor_run_returns_error_when_report_contains_errors() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.config_path = temp.path().join("missing-config.toml");
+        config.workspace_dir = temp.path().join("missing-workspace");
+
+        assert!(
+            run(&config).is_err(),
+            "doctor must return nonzero semantics for ERROR findings"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_memory_probe_does_not_create_missing_sqlite_database() {
+        let temp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = temp.path().join("workspace");
+        std::fs::create_dir_all(&config.workspace_dir).unwrap();
+        let db_path = config.workspace_dir.join("memory").join("brain.db");
+
+        let mut items = Vec::new();
+        check_runtime_memory_health(&config, &mut items).await;
+
+        assert!(!db_path.exists(), "doctor memory probe must not create brain.db");
     }
 
     #[test]

@@ -1372,10 +1372,10 @@ async fn async_main() -> Result<()> {
         return result;
     }
 
-    // Schema inspection must not initialize config/workspace state. Baseline is
-    // routed through the same read-only loader because it is retained only as
-    // an explicit compatibility error, never as a write operation.
-    let read_only_schema_inspection = matches!(
+    // Diagnostic/schema inspection must not initialize config/workspace state.
+    // Baseline is routed through the same read-only loader because it is
+    // retained only as an explicit compatibility error, never as a write.
+    let read_only_config_command = matches!(
         &cli.command,
         Commands::Migrate {
             migrate_command: MigrateCommands::Status
@@ -1384,8 +1384,8 @@ async fn async_main() -> Result<()> {
                 | MigrateCommands::Plan { .. }
                 | MigrateCommands::Baseline
         }
-    );
-    let config = if read_only_schema_inspection {
+    ) || matches!(&cli.command, Commands::Doctor { .. });
+    let config = if read_only_config_command {
         Config::load_existing_read_only_with_config_dir(cli.config_dir.as_deref()).await?
     } else {
         Config::load_or_init_with_config_dir(cli.config_dir.as_deref()).await?

@@ -1592,6 +1592,60 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
     }
 }
 
+/// Probe a provider model catalog without creating or updating the workspace
+/// cache. A fresh or stale cache may be read as fallback evidence only.
+pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&str>, prefer_cache: bool) -> Result<()> {
+    let provider_name = provider_override
+        .or(config.default_provider.as_deref())
+        .unwrap_or("openrouter")
+        .trim()
+        .to_string();
+    if provider_name.is_empty() {
+        anyhow::bail!("Provider name cannot be empty");
+    }
+    if !supports_live_model_fetch(&provider_name) {
+        anyhow::bail!("Provider '{provider_name}' does not support live model discovery yet");
+    }
+
+    if prefer_cache
+        && let Some(cached) =
+            load_cached_models_for_provider(&config.workspace_dir, &provider_name, MODEL_CACHE_TTL_SECS)?
+    {
+        println!(
+            "Using cached model list for '{}' as read-only evidence (updated {} ago):",
+            provider_name,
+            humanize_age(cached.age_secs)
+        );
+        print_model_preview(&cached.models);
+        return Ok(());
+    }
+
+    let api_key = config.api_key.clone().unwrap_or_default();
+    match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
+        Ok(models) if !models.is_empty() => {
+            println!(
+                "Read-only live probe returned {} model(s) for '{}'; cache was not updated.",
+                models.len(),
+                provider_name
+            );
+            print_model_preview(&models);
+            Ok(())
+        }
+        Ok(_) => anyhow::bail!("Provider '{provider_name}' returned an empty model list"),
+        Err(error) => {
+            if let Some(stale_cache) = load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)? {
+                println!(
+                    "Live read-only probe failed ({error}); stale cache exists as evidence (updated {} ago):",
+                    humanize_age(stale_cache.age_secs)
+                );
+                print_model_preview(&stale_cache.models);
+                return Ok(());
+            }
+            Err(error).with_context(|| format!("failed to probe models for provider '{provider_name}'"))
+        }
+    }
+}
+
 // ── Step helpers ─────────────────────────────────────────────────
 
 fn print_step(current: u8, total: u8, title: &str) {
@@ -5389,6 +5443,23 @@ mod tests {
         };
 
         run_models_refresh(&config, None, false).unwrap();
+    }
+
+    #[test]
+    fn run_models_probe_read_only_uses_cache_without_mutation() {
+        let tmp = TempDir::new().unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+        let cache_path = model_cache_path(tmp.path());
+        let before = std::fs::read(&cache_path).unwrap();
+        let config = Config {
+            workspace_dir: tmp.path().to_path_buf(),
+            default_provider: Some("openai".to_string()),
+            ..Config::default()
+        };
+
+        run_models_probe_read_only(&config, None, true).unwrap();
+
+        assert_eq!(before, std::fs::read(cache_path).unwrap());
     }
 
     #[test]
