@@ -12,7 +12,7 @@ use tokio::sync::{Mutex, RwLock};
 
 use crate::memory::traits::Memory;
 #[cfg(feature = "wasm-plugins")]
-use crate::plugins::event_bus::EventBus;
+use crate::plugins::event_bus::{EventBus, EventMessage};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 #[cfg(feature = "wasm-plugins")]
@@ -141,6 +141,10 @@ pub struct HostState {
     /// Event bus reference for prx:host/events host functions.
     #[cfg(feature = "wasm-plugins")]
     pub event_bus: Option<Arc<EventBus>>,
+    /// Bounded delivery path into a guest event handler. Only hook-capable
+    /// instances install this sink; other capabilities cannot claim subscriptions.
+    #[cfg(feature = "wasm-plugins")]
+    pub event_sink: Option<tokio::sync::mpsc::Sender<EventMessage>>,
     /// WASI resource table (required by WasiView).
     #[cfg(feature = "wasm-plugins")]
     pub wasi_table: ResourceTable,
@@ -177,6 +181,8 @@ impl HostState {
             #[cfg(feature = "wasm-plugins")]
             event_bus: None,
             #[cfg(feature = "wasm-plugins")]
+            event_sink: None,
+            #[cfg(feature = "wasm-plugins")]
             wasi_table: ResourceTable::new(),
             #[cfg(feature = "wasm-plugins")]
             wasi_ctx: WasiCtxBuilder::new().build(),
@@ -199,6 +205,13 @@ impl HostState {
     #[cfg(feature = "wasm-plugins")]
     pub fn with_event_bus(mut self, bus: Arc<EventBus>) -> Self {
         self.event_bus = Some(bus);
+        self
+    }
+
+    /// Install the bounded sink consumed by this plugin instance's guest pump.
+    #[cfg(feature = "wasm-plugins")]
+    pub fn with_event_sink(mut self, sink: tokio::sync::mpsc::Sender<EventMessage>) -> Self {
+        self.event_sink = Some(sink);
         self
     }
 

@@ -8,6 +8,8 @@ use std::path::Path;
 
 use super::error::{PluginError, PluginResult};
 
+pub const MAX_PLUGIN_MANIFEST_BYTES: u64 = 256 * 1024;
+
 /// Top-level plugin manifest parsed from `plugin.toml`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PluginManifest {
@@ -149,7 +151,28 @@ const fn default_max_kv_storage_mb() -> u64 {
 impl PluginManifest {
     /// Parse a `plugin.toml` from a file path.
     pub fn from_file(path: &Path) -> PluginResult<Self> {
-        let content = std::fs::read_to_string(path).map_err(PluginError::Io)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(PluginError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(PluginError::Manifest(format!(
+                "plugin manifest must not be a symlink: {}",
+                path.display()
+            )));
+        }
+        if metadata.len() > MAX_PLUGIN_MANIFEST_BYTES {
+            return Err(PluginError::ResourceLimit(format!(
+                "plugin manifest {} exceeds {MAX_PLUGIN_MANIFEST_BYTES} bytes",
+                path.display()
+            )));
+        }
+        let bytes = std::fs::read(path).map_err(PluginError::Io)?;
+        if bytes.len() as u64 > MAX_PLUGIN_MANIFEST_BYTES {
+            return Err(PluginError::ResourceLimit(format!(
+                "plugin manifest {} exceeds {MAX_PLUGIN_MANIFEST_BYTES} bytes",
+                path.display()
+            )));
+        }
+        let content = std::str::from_utf8(&bytes)
+            .map_err(|error| PluginError::Manifest(format!("plugin manifest is not UTF-8: {error}")))?;
         let manifest: Self = toml::from_str(&content).map_err(|e| PluginError::ManifestParse {
             path: path.display().to_string(),
             source: e,
@@ -458,5 +481,26 @@ events = ["message.received", "message.sent"]
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].events.len(), 2);
         assert!(hooks[0].events.contains(&"message.received".to_string()));
+    }
+
+    #[test]
+    fn from_file_rejects_oversized_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("plugin.toml");
+        std::fs::write(&path, vec![b' '; MAX_PLUGIN_MANIFEST_BYTES as usize + 1]).unwrap();
+        let error = PluginManifest::from_file(&path).unwrap_err();
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn from_file_rejects_symlink_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.toml");
+        let link = temp.path().join("plugin.toml");
+        std::fs::write(&target, "[plugin]\nname = \"x\"\nversion = \"1\"\n").unwrap();
+        std::os::unix::fs::symlink(target, &link).unwrap();
+        let error = PluginManifest::from_file(&link).unwrap_err();
+        assert!(error.to_string().contains("symlink"));
     }
 }

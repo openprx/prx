@@ -10,6 +10,8 @@ interface events {
 
     /// Subscribe to a topic pattern.
     /// Supports exact match ("weather.update") and wildcard ("weather.*").
+    /// Requires a hook-capable world exporting hook-exports.on-event; other
+    /// plugin worlds receive an explicit unsupported error.
     /// Returns a subscription ID for later unsubscription.
     subscribe: func(topic-pattern: string) -> result<u64, string>;
 

@@ -80,9 +80,15 @@ impl LoadedPlugin {
             );
         }
 
+        let status = if denied.is_empty() {
+            PluginStatus::Active
+        } else {
+            PluginStatus::Error(format!("required permissions not granted: {}", denied.join(", ")))
+        };
+
         Self {
             manifest,
-            status: PluginStatus::Active,
+            status,
             source_dir,
             component,
             granted_permissions: granted,
@@ -331,6 +337,15 @@ mod tests {
         assert_eq!(info.status, PluginStatus::Active);
         assert!(info.permissions_required.contains(&"log".to_string()));
         assert!(info.permissions_granted.contains(&"log".to_string()));
+    }
+
+    #[test]
+    fn denied_required_permission_is_not_active() {
+        let mut manifest = test_manifest("untrusted");
+        manifest.permissions.required = vec!["shell".to_string()];
+        let plugin = LoadedPlugin::new(manifest, "/tmp".into(), None);
+        assert!(matches!(plugin.status, PluginStatus::Error(_)));
+        assert!(plugin.granted_permissions.is_empty());
     }
 
     #[tokio::test]

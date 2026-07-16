@@ -95,6 +95,7 @@ Or download pre-built binaries from [Releases](https://github.com/openprx/prx/re
 | [Causal Tree Engine](docs/causal-tree.md) | CTE pipeline, branch prediction, rehearsal, scoring |
 | [WASM Plugins](docs/plugin-developer-guide.md) | Plugin developer guide (Rust/Python/JS/Go) |
 | [Host Function Reference](docs/host-function-reference.md) | WASM plugin host API reference |
+| [Plugin Runtime Lifecycle](docs/plugin-runtime-lifecycle.md) | Atomic generations, subscriber pumps, trust and hook bounds |
 
 ## Links
 

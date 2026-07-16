@@ -17,13 +17,14 @@ use crate::security::policy::ResourceRiskLevel;
 pub async fn list_plugins(State(state): State<AppState>) -> impl IntoResponse {
     #[cfg(feature = "wasm-plugins")]
     {
-        if let Some(ref pm) = state.plugin_manager {
-            let plugins = pm.list_plugins().await;
+        if let Some(ref runtime) = state.plugin_runtime {
+            let plugins = runtime.list_plugins().await;
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "plugins": plugins,
                     "count": plugins.len(),
+                    "generation": runtime.generation_id(),
                 })),
             );
         }
@@ -50,13 +51,14 @@ pub async fn reload_plugin(State(state): State<AppState>, Path(name): Path<Strin
 
     #[cfg(feature = "wasm-plugins")]
     {
-        if let Some(ref pm) = state.plugin_manager {
-            return match pm.reload_plugin(&name).await {
-                Ok(()) => (
+        if let Some(ref runtime) = state.plugin_runtime {
+            return match runtime.reload_plugin(&name).await {
+                Ok(generation) => (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "success": true,
                         "message": format!("plugin '{name}' reloaded"),
+                        "generation": generation,
                     })),
                 ),
                 Err(e) => (

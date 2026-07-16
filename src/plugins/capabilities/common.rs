@@ -220,19 +220,18 @@ pub fn register_event_host_functions(linker: &mut wasmtime::component::Linker<Ho
                         tracing::warn!("{e}");
                         return Ok((Err::<u64, String>(e),));
                     }
+                    let Some(event_sink) = store.data().event_sink.clone() else {
+                        return Ok((Err(
+                            "event subscriptions require a hook-capable plugin event handler".to_string()
+                        ),));
+                    };
                     match &store.data().event_bus {
-                        None => {
-                            tracing::debug!(pattern = %pattern, "event bus not configured, subscribe no-op");
-                            Ok((Ok(0u64),))
-                        }
+                        None => Ok((Err("event bus is not configured".to_string()),)),
                         Some(bus) => {
                             let plugin_name = store.data().plugin_name.clone();
                             let bus = bus.clone();
-                            match bus.subscribe(&plugin_name, &pattern).await {
-                                Ok((id, _rx)) => {
-                                    // Note: the receiver is intentionally dropped here for the
-                                    // host-function path. Full receiver wiring (dispatching back
-                                    // into guest on-event) is deferred to the PDK integration layer.
+                            match bus.subscribe_pump(&plugin_name, &pattern, event_sink).await {
+                                Ok(id) => {
                                     tracing::debug!(
                                         plugin = %plugin_name,
                                         pattern = %pattern,

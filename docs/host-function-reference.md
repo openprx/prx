@@ -728,7 +728,7 @@ for _, e := range entries {
 **WIT file:** `wit/host/event.wit`  
 **Permission required:** `"events"`
 
-Fire-and-forget publish/subscribe event bus for inter-plugin communication and integration with PRX lifecycle events. All events flow through the host for auditing and access control.
+Bounded fire-and-forget publish/subscribe event bus for inter-plugin communication and PRX lifecycle events. Each subscriber has a 1,024-event host queue; a slow consumer drops new events instead of growing process memory.
 
 ### WIT Definition
 
@@ -754,7 +754,6 @@ Publish an event to a topic.
 **Returns:** `result<_, string>` — `ok(())` on success, `err(message)` on failure
 
 **Failure reasons:**
-- Payload is not valid JSON
 - Payload exceeds 64 KB
 - Recursion limit reached (plugin publishing to itself)
 
@@ -770,7 +769,7 @@ Subscribe to a topic pattern.
 
 **Returns:** `result<u64, string>` — subscription ID on success (use with `unsubscribe`), error message on failure
 
-Subscriptions are active for the lifetime of the plugin invocation or until `unsubscribe` is called.
+Subscriptions are supported only by hook-capable plugins, because those plugins export the `on-event` delivery contract. A real subscriber pump forwards bus messages into that export. Other plugin worlds receive an explicit error instead of a successful subscription that discards events. Subscriptions remain active until `unsubscribe`, plugin-generation replacement, or instance shutdown.
 
 ---
 
@@ -870,7 +869,7 @@ err = events.Unsubscribe(id)
 
 ### Hook Integration
 
-Hook plugins receive events via the `on-event` export rather than `subscribe`. Use `subscribe` for in-plugin dynamic subscriptions during a single invocation.
+Hook plugins receive declared lifecycle events and dynamic `subscribe` deliveries through the same `on-event` export. Dynamic deliveries use the topic as the event name.
 
 ```rust
 // Hook plugin: event patterns are declared in plugin.toml

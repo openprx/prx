@@ -1,7 +1,7 @@
 //! In-process Event Bus for WASM plugin inter-plugin communication.
 //!
-//! Provides fire-and-forget publish/subscribe messaging. Events are dispatched
-//! asynchronously via `tokio::spawn` so publishers are never blocked.
+//! Provides bounded fire-and-forget publish/subscribe messaging. Each registered
+//! receiver must be owned by a subscriber pump; publishers never wait on consumers.
 //!
 //! # Safety
 //!
@@ -13,7 +13,7 @@
 #[cfg(feature = "wasm-plugins")]
 use std::collections::HashMap;
 #[cfg(feature = "wasm-plugins")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 #[cfg(feature = "wasm-plugins")]
 use tokio::sync::{RwLock, mpsc};
 
@@ -25,13 +25,21 @@ pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 #[cfg(feature = "wasm-plugins")]
 pub const MAX_RECURSION_DEPTH: u32 = 8;
 
+/// Per-subscriber queue bound. Slow consumers drop new events instead of growing memory.
+#[cfg(feature = "wasm-plugins")]
+pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 1024;
+#[cfg(feature = "wasm-plugins")]
+pub const MAX_SUBSCRIPTIONS: usize = 4096;
+#[cfg(feature = "wasm-plugins")]
+pub const MAX_TOPIC_BYTES: usize = 256;
+
 /// A registered subscription (exact-topic match).
 #[cfg(feature = "wasm-plugins")]
 #[derive(Clone, Debug)]
 pub struct Subscription {
     pub id: u64,
     pub plugin_name: String,
-    pub sender: mpsc::UnboundedSender<EventMessage>,
+    pub sender: mpsc::Sender<EventMessage>,
 }
 
 /// A registered wildcard subscription (prefix match: `topic.*`).
@@ -44,7 +52,7 @@ pub struct WildcardSubscription {
     pub pattern: String,
     /// Derived prefix, e.g. `"weather."`.
     pub prefix: String,
-    pub sender: mpsc::UnboundedSender<EventMessage>,
+    pub sender: mpsc::Sender<EventMessage>,
 }
 
 /// An event message delivered to a subscriber.
@@ -66,6 +74,7 @@ pub struct EventBus {
     wildcard_subscriptions: RwLock<Vec<WildcardSubscription>>,
     /// Monotonically increasing subscription ID counter.
     next_id: AtomicU64,
+    active_subscriptions: AtomicUsize,
 }
 
 #[cfg(feature = "wasm-plugins")]
@@ -76,6 +85,7 @@ impl EventBus {
             subscriptions: RwLock::new(HashMap::new()),
             wildcard_subscriptions: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(1),
+            active_subscriptions: AtomicUsize::new(0),
         }
     }
 
@@ -94,6 +104,9 @@ impl EventBus {
 
     /// Internal publish with recursion depth tracking.
     pub async fn publish_with_depth(&self, topic: &str, payload: &str, depth: u32) -> Result<(), String> {
+        if topic.is_empty() || topic.len() > MAX_TOPIC_BYTES {
+            return Err(format!("event bus: topic must contain 1..={MAX_TOPIC_BYTES} bytes"));
+        }
         if depth > MAX_RECURSION_DEPTH {
             return Err(format!(
                 "event bus: recursion depth limit ({MAX_RECURSION_DEPTH}) exceeded for topic '{topic}'"
@@ -122,7 +135,7 @@ impl EventBus {
         };
 
         // Collect all matching senders (deduplicated by subscription ID).
-        let mut to_notify: Vec<(u64, mpsc::UnboundedSender<EventMessage>)> = Vec::new();
+        let mut to_notify: Vec<(u64, mpsc::Sender<EventMessage>)> = Vec::new();
         let mut seen_ids = std::collections::HashSet::new();
 
         // Exact matches.
@@ -153,9 +166,20 @@ impl EventBus {
             "event bus: dispatching"
         );
 
-        // Fire-and-forget dispatch.
-        for (_id, sender) in to_notify {
-            let _ = sender.send(msg.clone());
+        // Bounded fire-and-forget dispatch. Closed receivers are removed eagerly;
+        // full queues drop this event so one slow plugin cannot grow host memory.
+        let mut closed = Vec::new();
+        for (id, sender) in to_notify {
+            match sender.try_send(msg.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    tracing::warn!(subscription_id = id, topic = %topic, "event bus: subscriber queue full; event dropped");
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => closed.push(id),
+            }
+        }
+        for id in closed {
+            let _ = self.unsubscribe(id).await;
         }
 
         Ok(())
@@ -171,9 +195,19 @@ impl EventBus {
         &self,
         plugin_name: &str,
         topic_pattern: &str,
-    ) -> Result<(u64, mpsc::UnboundedReceiver<EventMessage>), String> {
+    ) -> Result<(u64, mpsc::Receiver<EventMessage>), String> {
+        if topic_pattern.is_empty() || topic_pattern.len() > MAX_TOPIC_BYTES {
+            return Err(format!(
+                "event bus: topic pattern must contain 1..={MAX_TOPIC_BYTES} bytes"
+            ));
+        }
+        self.active_subscriptions
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_SUBSCRIPTIONS).then_some(count + 1)
+            })
+            .map_err(|_| format!("event bus: subscription limit ({MAX_SUBSCRIPTIONS}) reached"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(SUBSCRIBER_QUEUE_CAPACITY);
 
         tracing::debug!(
             plugin = %plugin_name,
@@ -182,8 +216,12 @@ impl EventBus {
             "event bus: subscribe"
         );
 
-        if topic_pattern.ends_with(".*") {
-            let prefix = topic_pattern[..topic_pattern.len() - 1].to_string(); // strip `*`
+        if topic_pattern == "*" || topic_pattern.ends_with(".*") {
+            let prefix = if topic_pattern == "*" {
+                String::new()
+            } else {
+                topic_pattern[..topic_pattern.len() - 1].to_string()
+            }; // strip `*`
             let wc = WildcardSubscription {
                 id,
                 plugin_name: plugin_name.to_string(),
@@ -209,6 +247,27 @@ impl EventBus {
         Ok((id, rx))
     }
 
+    /// Register a subscription whose receiver is continuously consumed by a
+    /// bounded subscriber pump. The subscription is removed when the sink closes.
+    pub async fn subscribe_pump(
+        self: &std::sync::Arc<Self>,
+        plugin_name: &str,
+        topic_pattern: &str,
+        sink: mpsc::Sender<EventMessage>,
+    ) -> Result<u64, String> {
+        let (id, mut receiver) = self.subscribe(plugin_name, topic_pattern).await?;
+        let bus = std::sync::Arc::clone(self);
+        tokio::spawn(async move {
+            while let Some(message) = receiver.recv().await {
+                if sink.send(message).await.is_err() {
+                    break;
+                }
+            }
+            let _ = bus.unsubscribe(id).await;
+        });
+        Ok(id)
+    }
+
     /// Remove a subscription by ID.
     ///
     /// Returns an error if the ID was not found.
@@ -227,6 +286,7 @@ impl EventBus {
                 }
             }
             if found {
+                self.active_subscriptions.fetch_sub(1, Ordering::AcqRel);
                 return Ok(());
             }
         }
@@ -237,6 +297,7 @@ impl EventBus {
             let before = wildcards.len();
             wildcards.retain(|w| w.id != subscription_id);
             if wildcards.len() < before {
+                self.active_subscriptions.fetch_sub(1, Ordering::AcqRel);
                 return Ok(());
             }
         }
@@ -246,9 +307,7 @@ impl EventBus {
 
     /// Returns the number of active subscriptions (exact + wildcard).
     pub async fn subscription_count(&self) -> usize {
-        let exact: usize = self.subscriptions.read().await.values().map(|v| v.len()).sum();
-        let wildcard = self.wildcard_subscriptions.read().await.len();
-        exact + wildcard
+        self.active_subscriptions.load(Ordering::Acquire)
     }
 }
 
@@ -268,7 +327,7 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     /// Helper: receive one message from `rx` with a short timeout.
-    async fn recv_one(rx: &mut mpsc::UnboundedReceiver<EventMessage>) -> Option<EventMessage> {
+    async fn recv_one(rx: &mut mpsc::Receiver<EventMessage>) -> Option<EventMessage> {
         timeout(Duration::from_millis(100), rx.recv()).await.ok().flatten()
     }
 
@@ -314,6 +373,16 @@ mod tests {
         // No third message.
         let msg3 = recv_one(&mut rx).await;
         assert!(msg3.is_none(), "non-matching topic should not be received");
+    }
+
+    #[tokio::test]
+    async fn global_wildcard_subscribe_matches_every_topic() {
+        let bus = Arc::new(EventBus::new());
+        let (_id, mut rx) = bus.subscribe("audit", "*").await.unwrap();
+        bus.publish("weather.update", "one").await.unwrap();
+        bus.publish("runtime.ready", "two").await.unwrap();
+        assert_eq!(recv_one(&mut rx).await.unwrap().payload, "one");
+        assert_eq!(recv_one(&mut rx).await.unwrap().payload, "two");
     }
 
     // 4. Unsubscribe — after unsubscribe, no more events.
@@ -465,5 +534,31 @@ mod tests {
         let bus = EventBus::new();
         let result = bus.unsubscribe(99999).await;
         assert!(result.is_err(), "unknown subscription ID should return error");
+    }
+
+    #[tokio::test]
+    async fn subscriber_pump_forwards_and_cleans_up_when_sink_closes() {
+        let bus = Arc::new(EventBus::new());
+        let (sink, mut inbox) = mpsc::channel(1);
+        let id = bus.subscribe_pump("hook-plugin", "runtime.*", sink).await.unwrap();
+
+        bus.publish("runtime.ready", "payload").await.unwrap();
+        let message = timeout(Duration::from_millis(100), inbox.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(message.topic, "runtime.ready");
+        assert_eq!(message.payload, "payload");
+
+        drop(inbox);
+        bus.publish("runtime.ready", "cleanup").await.unwrap();
+        timeout(Duration::from_millis(100), async {
+            while bus.subscription_count().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(bus.unsubscribe(id).await.is_err());
     }
 }

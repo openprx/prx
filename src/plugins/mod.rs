@@ -32,6 +32,9 @@ pub mod host;
 pub mod manifest;
 pub mod precompile;
 pub mod registry;
+pub mod runtime;
+
+pub use runtime::{PluginRuntime, init_plugin_runtime};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -44,6 +47,9 @@ use precompile::PrecompileCache;
 use registry::{LoadedPlugin, PluginInfo, PluginRegistry};
 
 use crate::tools::Tool;
+
+const MAX_PLUGIN_WASM_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_PLUGIN_COUNT: usize = 256;
 
 /// Aggregated performance metrics for the plugin system.
 #[derive(Debug, Default)]
@@ -177,10 +183,19 @@ impl PluginManager {
         let mut loaded = 0;
         let entries = std::fs::read_dir(&self.plugins_dir).map_err(PluginError::Io)?;
 
-        for entry in entries {
-            let entry = entry.map_err(PluginError::Io)?;
-            let path = entry.path();
+        let mut paths = entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PluginError::Io)?;
+        paths.sort();
+        if paths.len() > MAX_PLUGIN_COUNT {
+            return Err(PluginError::ResourceLimit(format!(
+                "plugins directory contains {} entries; limit is {MAX_PLUGIN_COUNT}",
+                paths.len()
+            )));
+        }
 
+        for path in paths {
             if !path.is_dir() {
                 continue;
             }
@@ -215,61 +230,15 @@ impl PluginManager {
     /// 2. Compile the WASM component (if present)
     /// 3. Register in the plugin registry
     pub async fn load_plugin(&self, plugin_dir: &Path) -> PluginResult<()> {
-        let manifest_path = plugin_dir.join("plugin.toml");
-        let manifest = PluginManifest::from_file(&manifest_path)?;
-        let plugin_name = manifest.plugin.name.clone();
+        let loaded = self.prepare_plugin(plugin_dir)?;
+        let plugin_name = loaded.manifest.plugin.name.clone();
 
         // Check for duplicates
         if self.registry.contains(&plugin_name).await {
             return Err(PluginError::AlreadyLoaded { name: plugin_name });
         }
 
-        // Compile WASM if file exists (using precompile cache to skip Cranelift
-        // on unchanged plugins).
-        let wasm_path = plugin_dir.join(&manifest.plugin.wasm);
-        let component = if wasm_path.exists() {
-            let wasm_bytes = std::fs::read(&wasm_path).map_err(PluginError::Io)?;
-            let comp = self
-                .precompile_cache
-                .get_or_compile(&self.engine, &wasm_bytes)
-                .map_err(|e| PluginError::Compilation(format!("failed to compile '{}': {e}", wasm_path.display())))?;
-            // Mirror running totals from the precompile cache into aggregated
-            // PluginMetrics so callers can read one place for all stats.
-            // Using .store() is correct here because the precompile cache
-            // already keeps a cumulative total; we just project it into the
-            // outer PluginMetrics on each load.
-            let cm = &self.precompile_cache.metrics;
-            let misses = cm.misses();
-            self.metrics
-                .cache_hits
-                .store(cm.hits(), std::sync::atomic::Ordering::Relaxed);
-            self.metrics
-                .cache_misses
-                .store(misses, std::sync::atomic::Ordering::Relaxed);
-            // `compilations` == cache misses: every miss is one Cranelift run.
-            self.metrics
-                .compilations
-                .store(misses, std::sync::atomic::Ordering::Relaxed);
-            self.metrics
-                .total_compile_ms
-                .store(cm.total_compile_ms(), std::sync::atomic::Ordering::Relaxed);
-            tracing::info!(
-                plugin = %plugin_name,
-                wasm = %wasm_path.display(),
-                "WASM component ready"
-            );
-            Some(comp)
-        } else {
-            tracing::debug!(
-                plugin = %plugin_name,
-                wasm = %wasm_path.display(),
-                "WASM file not found — manifest-only load"
-            );
-            None
-        };
-
         // Register the plugin
-        let loaded = LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component);
         self.registry
             .register(loaded)
             .await
@@ -279,7 +248,8 @@ impl PluginManager {
         Ok(())
     }
 
-    /// Reload a plugin by name (unload + load from its original directory).
+    /// Reload a plugin by name. Preparation completes before one registry replace,
+    /// so a failed candidate never creates an unload gap.
     pub async fn reload_plugin(&self, name: &str) -> PluginResult<()> {
         let source_dir = self
             .registry
@@ -287,8 +257,77 @@ impl PluginManager {
             .await
             .ok_or_else(|| PluginError::NotFound { name: name.to_string() })?;
 
-        self.registry.unregister(name).await;
-        self.load_plugin(&source_dir).await
+        let loaded = self.prepare_plugin(&source_dir)?;
+        if loaded.manifest.plugin.name != name {
+            return Err(PluginError::Manifest(format!(
+                "reload manifest renamed plugin '{name}' to '{}'",
+                loaded.manifest.plugin.name
+            )));
+        }
+        self.registry.replace(loaded).await;
+        Ok(())
+    }
+
+    fn prepare_plugin(&self, plugin_dir: &Path) -> PluginResult<LoadedPlugin> {
+        let manifest_path = plugin_dir.join("plugin.toml");
+        let manifest = PluginManifest::from_file(&manifest_path)?;
+        let plugin_name = manifest.plugin.name.clone();
+        let wasm_relative = Path::new(&manifest.plugin.wasm);
+        if wasm_relative.is_absolute()
+            || wasm_relative
+                .components()
+                .any(|component| !matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(PluginError::Manifest(format!(
+                "plugin '{plugin_name}' wasm path must stay within its plugin directory"
+            )));
+        }
+
+        let wasm_path = plugin_dir.join(wasm_relative);
+        let component = if wasm_path.exists() {
+            let metadata = std::fs::symlink_metadata(&wasm_path).map_err(PluginError::Io)?;
+            if metadata.file_type().is_symlink() {
+                return Err(PluginError::Manifest(format!(
+                    "plugin '{plugin_name}' wasm file must not be a symlink"
+                )));
+            }
+            if metadata.len() > MAX_PLUGIN_WASM_BYTES {
+                return Err(PluginError::ResourceLimit(format!(
+                    "plugin '{plugin_name}' WASM exceeds {MAX_PLUGIN_WASM_BYTES} bytes"
+                )));
+            }
+            let wasm_bytes = std::fs::read(&wasm_path).map_err(PluginError::Io)?;
+            if wasm_bytes.len() as u64 > MAX_PLUGIN_WASM_BYTES {
+                return Err(PluginError::ResourceLimit(format!(
+                    "plugin '{plugin_name}' WASM exceeds {MAX_PLUGIN_WASM_BYTES} bytes"
+                )));
+            }
+            let compiled = self
+                .precompile_cache
+                .get_or_compile(&self.engine, &wasm_bytes)
+                .map_err(|error| {
+                    PluginError::Compilation(format!("failed to compile '{}': {error}", wasm_path.display()))
+                })?;
+            self.update_cache_metrics();
+            tracing::info!(plugin = %plugin_name, wasm = %wasm_path.display(), "WASM component ready");
+            Some(compiled)
+        } else {
+            tracing::debug!(plugin = %plugin_name, wasm = %wasm_path.display(), "WASM file not found — manifest-only load");
+            None
+        };
+
+        Ok(LoadedPlugin::new(manifest, plugin_dir.to_path_buf(), component))
+    }
+
+    fn update_cache_metrics(&self) {
+        let cache = &self.precompile_cache.metrics;
+        let misses = cache.misses();
+        self.metrics.cache_hits.store(cache.hits(), Ordering::Relaxed);
+        self.metrics.cache_misses.store(misses, Ordering::Relaxed);
+        self.metrics.compilations.store(misses, Ordering::Relaxed);
+        self.metrics
+            .total_compile_ms
+            .store(cache.total_compile_ms(), Ordering::Relaxed);
     }
 
     /// Unload a plugin by name.
@@ -330,6 +369,9 @@ impl PluginManager {
         let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             // Check if this plugin has tool capabilities
             if !info.capabilities.iter().any(|c| c.starts_with("tool:")) {
                 continue;
@@ -399,6 +441,9 @@ impl PluginManager {
         let mut chain = capabilities::middleware::MiddlewareChain::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             if !info.capabilities.iter().any(|c| c.starts_with("middleware")) {
                 continue;
             }
@@ -469,6 +514,9 @@ impl PluginManager {
         let mut executor = capabilities::hook::WasmHookExecutor::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             if !info.capabilities.iter().any(|c| c.starts_with("hook")) {
                 continue;
             }
@@ -535,6 +583,9 @@ impl PluginManager {
         let mut manager = capabilities::cron::WasmCronManager::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             if !info.capabilities.iter().any(|c| c.starts_with("cron")) {
                 continue;
             }
@@ -609,6 +660,9 @@ impl PluginManager {
         let mut providers = Vec::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             if !info.capabilities.iter().any(|c| c.starts_with("provider")) {
                 continue;
             }
@@ -674,6 +728,9 @@ impl PluginManager {
         let mut storages = Vec::new();
 
         for info in &plugins {
+            if !matches!(info.status, registry::PluginStatus::Active) {
+                continue;
+            }
             if !info.capabilities.iter().any(|c| c.starts_with("storage")) {
                 continue;
             }
@@ -973,6 +1030,41 @@ mod tests {
         let manager = PluginManager::new(tmp.path().to_path_buf()).expect("test: new");
         let result = manager.reload_plugin("nonexistent").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_prepares_before_atomic_registry_replace() {
+        let tmp = tempfile::tempdir().expect("test: tempdir");
+        let plugin_dir = tmp.path().join("atomic");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        let manifest =
+            |version: &str| format!("[plugin]\nname = \"atomic\"\nversion = \"{version}\"\nwasm = \"missing.wasm\"\n");
+        std::fs::write(plugin_dir.join("plugin.toml"), manifest("1.0.0")).unwrap();
+        let manager = PluginManager::new(tmp.path().to_path_buf()).unwrap();
+        manager.load_plugin(&plugin_dir).await.unwrap();
+
+        std::fs::write(plugin_dir.join("plugin.toml"), manifest("2.0.0")).unwrap();
+        manager.reload_plugin("atomic").await.unwrap();
+        assert_eq!(manager.get_plugin("atomic").await.unwrap().version, "2.0.0");
+
+        std::fs::write(plugin_dir.join("plugin.toml"), "invalid = [").unwrap();
+        assert!(manager.reload_plugin("atomic").await.is_err());
+        assert_eq!(manager.get_plugin("atomic").await.unwrap().version, "2.0.0");
+    }
+
+    #[tokio::test]
+    async fn load_rejects_wasm_path_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        let plugin_dir = tmp.path().join("escape");
+        std::fs::create_dir(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("plugin.toml"),
+            "[plugin]\nname = \"escape\"\nversion = \"1.0.0\"\nwasm = \"../outside.wasm\"\n",
+        )
+        .unwrap();
+        let manager = PluginManager::new(tmp.path().to_path_buf()).unwrap();
+        let error = manager.load_plugin(&plugin_dir).await.unwrap_err();
+        assert!(error.to_string().contains("stay within"));
     }
 
     // ── init_plugin_manager ─────────────────────────────────────

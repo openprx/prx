@@ -64,8 +64,10 @@ Create `hooks.json` in the workspace directory:
 ```
 
 - `command` + `args` — executed directly, not via shell (no injection risk)
-- `timeout_ms` — per-hook timeout, default 5000ms
-- `hooks.json` is hot-reloaded on change (no restart required)
+- `timeout_ms` — per-hook timeout, default 5000ms; valid range 1–300000ms
+- `hooks.json` is capped at 256 KiB and hot-reloaded by content generation; an invalid candidate leaves the active generation unchanged
+- payloads are capped at 4 MiB and passed through a restrictive temporary file plus optional stdin
+- timeout covers stdin and process execution; timed-out children are killed and reaped, and temporary payload files are removed on every exit path
 - WASM plugins with the `hook` capability also receive these events
 
 ## Webhook Receiver

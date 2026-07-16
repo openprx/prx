@@ -1,15 +1,24 @@
 use parking_lot::RwLock;
 use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime};
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 const HOOKS_JSON_FILE: &str = "hooks.json";
 const DEFAULT_TIMEOUT_MS: u64 = 5_000;
+const MAX_TIMEOUT_MS: u64 = 300_000;
+const MAX_HOOKS_FILE_BYTES: u64 = 256 * 1024;
+const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STDERR_BYTES: u64 = 16 * 1024;
 const MAX_STDERR_CHARS: usize = 400;
+const MAX_ACTIONS: usize = 256;
+const MAX_ARGS_PER_ACTION: usize = 128;
+const MAX_ENV_PER_ACTION: usize = 128;
 
 #[derive(Debug, Clone, Copy)]
 pub enum HookEvent {
@@ -87,19 +96,16 @@ impl Default for HookConfig {
 #[derive(Debug, Clone, Default)]
 struct RuntimeState {
     config: HookConfig,
-    hooks_json_mtime: Option<SystemTime>,
+    hooks_json_digest: Option<[u8; 32]>,
 }
 
 pub struct HookManager {
     workspace_dir: PathBuf,
     hooks_json_path: PathBuf,
     state: RwLock<RuntimeState>,
-    /// Optional WASM hook executor for plugins with hook capability.
+    /// Process-level WASM plugin runtime; it is the sole generation owner.
     #[cfg(feature = "wasm-plugins")]
-    wasm_executor: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>>,
-    /// Optional event bus for bridging lifecycle events to inter-plugin messaging.
-    #[cfg(feature = "wasm-plugins")]
-    event_bus: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::event_bus::EventBus>>>,
+    plugin_runtime: tokio::sync::RwLock<Option<std::sync::Arc<crate::plugins::PluginRuntime>>>,
 }
 
 impl HookManager {
@@ -109,25 +115,14 @@ impl HookManager {
             workspace_dir,
             state: RwLock::new(RuntimeState::default()),
             #[cfg(feature = "wasm-plugins")]
-            wasm_executor: tokio::sync::RwLock::new(None),
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: tokio::sync::RwLock::new(None),
+            plugin_runtime: tokio::sync::RwLock::new(None),
         }
     }
 
-    /// Set the WASM hook executor for lifecycle event observation.
+    /// Attach the sole process-level plugin runtime for lifecycle observation.
     #[cfg(feature = "wasm-plugins")]
-    pub async fn set_wasm_executor(
-        &self,
-        executor: std::sync::Arc<crate::plugins::capabilities::hook::WasmHookExecutor>,
-    ) {
-        *self.wasm_executor.write().await = Some(executor);
-    }
-
-    /// Set the event bus to bridge lifecycle events into inter-plugin topics.
-    #[cfg(feature = "wasm-plugins")]
-    pub async fn set_event_bus(&self, bus: std::sync::Arc<crate::plugins::event_bus::EventBus>) {
-        *self.event_bus.write().await = Some(bus);
+    pub async fn set_plugin_runtime(&self, runtime: std::sync::Arc<crate::plugins::PluginRuntime>) {
+        *self.plugin_runtime.write().await = Some(runtime);
     }
 
     pub async fn emit(&self, event: HookEvent, payload: serde_json::Value) {
@@ -157,52 +152,40 @@ impl HookManager {
             }
         }
 
-        // Also fire WASM hook plugins (if feature enabled and executor configured).
+        // Fire WASM hooks and bridge the lifecycle topic through the same process runtime.
         #[cfg(feature = "wasm-plugins")]
         {
-            let executor = self.wasm_executor.read().await;
-            if let Some(ref exec) = *executor {
+            let runtime = self.plugin_runtime.read().await.clone();
+            if let Some(runtime) = runtime {
                 let payload_str = payload.to_string();
-                exec.emit(event.as_str(), &payload_str).await;
-            }
-        }
-
-        // Bridge lifecycle event to the event bus under `prx.lifecycle.<event>`.
-        #[cfg(feature = "wasm-plugins")]
-        {
-            let bus_guard = self.event_bus.read().await;
-            if let Some(ref bus) = *bus_guard {
+                runtime.emit_hook(event.as_str(), &payload_str).await;
                 let topic = format!("prx.lifecycle.{}", event.as_str());
-                let payload_str = payload.to_string();
-                let bus = bus.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = bus.publish(&topic, &payload_str).await {
-                        tracing::debug!(topic = %topic, error = %e, "event bus lifecycle bridge error");
-                    }
-                });
+                if let Err(error) = runtime.event_bus().publish(&topic, &payload_str).await {
+                    tracing::debug!(topic = %topic, error = %error, "event bus lifecycle bridge error");
+                }
             }
         }
     }
 
     fn refresh_if_changed(&self) -> anyhow::Result<()> {
-        let latest_mtime = file_mtime(&self.hooks_json_path)?;
-        let current_mtime = self.state.read().hooks_json_mtime;
-        if latest_mtime == current_mtime {
-            return Ok(());
-        }
-
-        if latest_mtime.is_none() {
+        let Some(raw) = read_bounded_file(&self.hooks_json_path, MAX_HOOKS_FILE_BYTES)? else {
             let mut state = self.state.write();
-            state.config = HookConfig::default();
-            state.hooks_json_mtime = None;
+            if state.hooks_json_digest.is_some() {
+                *state = RuntimeState::default();
+            }
+            return Ok(());
+        };
+
+        let digest: [u8; 32] = Sha256::digest(&raw).into();
+        if self.state.read().hooks_json_digest == Some(digest) {
             return Ok(());
         }
 
-        let raw = std::fs::read_to_string(&self.hooks_json_path)?;
-        let parsed: HooksFile = serde_json::from_str(&raw)?;
+        let parsed: HooksFile = serde_json::from_slice(&raw)?;
+        validate_hooks_file(&parsed)?;
         let config = HookConfig {
             enabled: parsed.enabled.unwrap_or(true),
-            timeout_ms: parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS),
+            timeout_ms: bounded_timeout(parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))?,
             hooks: parsed
                 .hooks
                 .into_iter()
@@ -210,9 +193,11 @@ impl HookManager {
                 .collect(),
         };
 
-        let mut state = self.state.write();
-        state.config = config;
-        state.hooks_json_mtime = latest_mtime;
+        // Candidate parsing and validation finish before this single generation swap.
+        *self.state.write() = RuntimeState {
+            config,
+            hooks_json_digest: Some(digest),
+        };
         Ok(())
     }
 
@@ -227,8 +212,15 @@ impl HookManager {
         if command.is_empty() {
             anyhow::bail!("hook command is empty");
         }
+        let timeout_ms = bounded_timeout(action.timeout_ms.unwrap_or(default_timeout_ms))?;
 
         let payload_json = payload.to_string();
+        if payload_json.len() > MAX_PAYLOAD_BYTES {
+            anyhow::bail!(
+                "hook payload is {} bytes; limit is {MAX_PAYLOAD_BYTES}",
+                payload_json.len()
+            );
+        }
         let mut cmd = Command::new(command);
         cmd.args(&action.args);
         cmd.env("ZERO_HOOK_EVENT", event.as_str());
@@ -242,17 +234,14 @@ impl HookManager {
             cmd.env("ZERO_HOOK_PAYLOAD_TRUNCATED", "1");
         }
 
-        // Always provide a temp payload file path as a stable fallback channel.
-        let payload_file_path = std::env::temp_dir().join(format!(
-            "openprx-hook-payload-{}-{}.json",
-            std::process::id(),
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        if let Err(e) = std::fs::write(&payload_file_path, payload_json.as_bytes()) {
-            tracing::warn!("Failed to write hook payload temp file {:?}: {e}", payload_file_path);
-        } else {
-            cmd.env("ZERO_HOOK_PAYLOAD_FILE", &payload_file_path);
-        }
+        // NamedTempFile is created with restrictive permissions and removes itself on every exit.
+        let mut payload_file = tempfile::Builder::new()
+            .prefix("openprx-hook-payload-")
+            .suffix(".json")
+            .tempfile()?;
+        payload_file.write_all(payload_json.as_bytes())?;
+        payload_file.flush()?;
+        cmd.env("ZERO_HOOK_PAYLOAD_FILE", payload_file.path());
 
         if !action.env.is_empty() {
             // Block env vars that could hijack the process (e.g., LD_PRELOAD, PATH).
@@ -295,35 +284,68 @@ impl HookManager {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
 
+        cmd.kill_on_drop(true);
         let mut child = cmd.spawn()?;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+
+        let stderr = child.stderr.take();
+        let stderr_reader = tokio::spawn(async move {
+            let Some(stderr) = stderr else {
+                return std::io::Result::Ok(Vec::new());
+            };
+            let mut bytes = Vec::new();
+            stderr.take(MAX_STDERR_BYTES + 1).read_to_end(&mut bytes).await?;
+            Ok(bytes)
+        });
 
         if action.stdin_json {
             if let Some(mut stdin) = child.stdin.take() {
-                if let Err(e) = stdin.write_all(payload_json.as_bytes()).await {
+                let write_result = tokio::time::timeout_at(deadline, stdin.write_all(payload_json.as_bytes())).await;
+                if write_result.is_err() {
+                    terminate_and_reap(&mut child).await;
+                    let _ = stderr_reader.await;
+                    anyhow::bail!("hook timed out while writing stdin");
+                }
+                if let Err(e) = write_result.expect("timeout checked") {
                     // Hook command may not consume stdin; fallback file path is still available.
                     if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        terminate_and_reap(&mut child).await;
+                        let _ = stderr_reader.await;
                         return Err(e.into());
                     }
                 }
             }
         }
 
-        let timeout_ms = action.timeout_ms.unwrap_or(default_timeout_ms);
-        let output = tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait_with_output())
-            .await
-            .map_err(|_| anyhow::anyhow!("hook timed out after {timeout_ms} ms"))??;
+        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(error)) => {
+                terminate_and_reap(&mut child).await;
+                let _ = stderr_reader.await;
+                return Err(error.into());
+            }
+            Err(_) => {
+                terminate_and_reap(&mut child).await;
+                let _ = stderr_reader.await;
+                anyhow::bail!("hook timed out after {timeout_ms} ms");
+            }
+        };
+        let mut stderr = stderr_reader.await??;
+        let stderr_truncated = stderr.len() > MAX_STDERR_BYTES as usize;
+        stderr.truncate(MAX_STDERR_BYTES as usize);
 
-        let _ = std::fs::remove_file(&payload_file_path);
-
-        if output.status.success() {
+        if status.success() {
             return Ok(());
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr = truncate_for_log(stderr.as_ref(), MAX_STDERR_CHARS);
+        let stderr = String::from_utf8_lossy(&stderr);
+        let mut stderr = truncate_for_log(stderr.as_ref(), MAX_STDERR_CHARS);
+        if stderr_truncated {
+            stderr.push_str(" [truncated]");
+        }
         anyhow::bail!(
             "hook exited with status {}{}",
-            output.status,
+            status,
             if stderr.is_empty() {
                 String::new()
             } else {
@@ -333,16 +355,64 @@ impl HookManager {
     }
 }
 
+async fn terminate_and_reap(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+}
+
+fn bounded_timeout(timeout_ms: u64) -> anyhow::Result<u64> {
+    if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+        anyhow::bail!("hook timeout_ms must be between 1 and {MAX_TIMEOUT_MS}");
+    }
+    Ok(timeout_ms)
+}
+
+fn validate_hooks_file(file: &HooksFile) -> anyhow::Result<()> {
+    if let Some(timeout_ms) = file.timeout_ms {
+        bounded_timeout(timeout_ms)?;
+    }
+    let action_count = file.hooks.values().map(Vec::len).sum::<usize>();
+    if action_count > MAX_ACTIONS {
+        anyhow::bail!("hooks.json has {action_count} actions; limit is {MAX_ACTIONS}");
+    }
+    for actions in file.hooks.values() {
+        for action in actions {
+            if action.args.len() > MAX_ARGS_PER_ACTION {
+                anyhow::bail!("hook action has too many arguments");
+            }
+            if action.env.len() > MAX_ENV_PER_ACTION {
+                anyhow::bail!("hook action has too many environment entries");
+            }
+            if let Some(timeout_ms) = action.timeout_ms {
+                bounded_timeout(timeout_ms)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn normalize_event_name(name: &str) -> String {
     name.trim().to_ascii_lowercase().replace('-', "_")
 }
 
-fn file_mtime(path: &Path) -> anyhow::Result<Option<SystemTime>> {
-    if !path.exists() {
-        return Ok(None);
+fn read_bounded_file(path: &Path, max_bytes: u64) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let metadata = file.metadata()?;
+    if metadata.len() > max_bytes {
+        anyhow::bail!("{} exceeds {max_bytes} byte limit", path.display());
     }
-    let metadata = std::fs::metadata(path)?;
-    Ok(metadata.modified().ok())
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    std::io::Read::by_ref(&mut file)
+        .take(max_bytes + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max_bytes {
+        anyhow::bail!("{} exceeds {max_bytes} byte limit", path.display());
+    }
+    Ok(Some(bytes))
 }
 
 fn truncate_for_log(input: &str, max_chars: usize) -> String {
@@ -516,6 +586,52 @@ mod tests {
     }
 
     #[test]
+    fn refresh_invalid_candidate_preserves_active_generation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON_FILE);
+        std::fs::write(&path, r#"{"enabled": false, "timeout_ms": 1200, "hooks": {}}"#).unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager.refresh_if_changed().unwrap();
+        let active_digest = manager.state.read().hooks_json_digest;
+
+        std::fs::write(&path, "not json").unwrap();
+        assert!(manager.refresh_if_changed().is_err());
+        let state = manager.state.read();
+        assert!(!state.config.enabled);
+        assert_eq!(state.config.timeout_ms, 1200);
+        assert_eq!(state.hooks_json_digest, active_digest);
+    }
+
+    #[test]
+    fn refresh_uses_content_generation_not_mtime_only() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON_FILE);
+        std::fs::write(&path, r#"{"enabled": true, "hooks": {}}"#).unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager.refresh_if_changed().unwrap();
+        let first_digest = manager.state.read().hooks_json_digest;
+
+        std::fs::write(&path, r#"{"enabled": false, "hooks": {}}"#).unwrap();
+        manager.refresh_if_changed().unwrap();
+        let state = manager.state.read();
+        assert!(!state.config.enabled);
+        assert_ne!(state.hooks_json_digest, first_digest);
+    }
+
+    #[test]
+    fn refresh_rejects_oversized_file_without_replacing_generation() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join(HOOKS_JSON_FILE);
+        std::fs::write(&path, r#"{"enabled": false, "hooks": {}}"#).unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        manager.refresh_if_changed().unwrap();
+
+        std::fs::write(&path, vec![b' '; MAX_HOOKS_FILE_BYTES as usize + 1]).unwrap();
+        assert!(manager.refresh_if_changed().is_err());
+        assert!(!manager.state.read().config.enabled);
+    }
+
+    #[test]
     fn refresh_disabled_flag() {
         let temp = TempDir::new().unwrap();
         std::fs::write(temp.path().join(HOOKS_JSON_FILE), r#"{"enabled": false, "hooks": {}}"#).unwrap();
@@ -594,6 +710,38 @@ mod tests {
         let result = manager.run_action(HookEvent::ToolCall, &json!({}), 100, &action).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_action_timeout_kills_reaps_and_removes_payload_file() {
+        let temp = TempDir::new().unwrap();
+        let manager = HookManager::new(temp.path().to_path_buf());
+        let action = HookAction {
+            command: "sh".into(),
+            args: vec![
+                "-c".into(),
+                "echo $$ > hook.pid; echo \"$ZERO_HOOK_PAYLOAD_FILE\" > payload.path; exec sleep 10".into(),
+            ],
+            env: HashMap::new(),
+            cwd: None,
+            timeout_ms: Some(250),
+            stdin_json: false,
+        };
+
+        let result = manager.run_action(HookEvent::ToolCall, &json!({}), 250, &action).await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+
+        let pid = std::fs::read_to_string(temp.path().join("hook.pid"))
+            .unwrap()
+            .trim()
+            .to_string();
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "hook child was not reaped"
+        );
+        let payload_path = std::fs::read_to_string(temp.path().join("payload.path")).unwrap();
+        assert!(!Path::new(payload_path.trim()).exists(), "payload temp file leaked");
     }
 
     // ── emit with no hooks ──────────────────────────────────────

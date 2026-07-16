@@ -216,41 +216,36 @@ impl WasmCronManager {
                 ticker.tick().await;
                 let now = chrono::Utc::now();
 
-                for job in &manager.jobs {
-                    let name = job.plugin_name().to_string();
-                    let schedule_str = job.schedule();
-
-                    if schedule_str.is_empty() {
-                        continue;
-                    }
-
-                    let due = is_cron_due(schedule_str, last_triggered.get(&name).copied(), now);
-                    if !due {
-                        continue;
-                    }
-
-                    last_triggered.insert(name.clone(), now);
-                    tracing::debug!(plugin = %name, "firing WASM cron job");
-
-                    match job.run().await {
-                        Ok(output) => {
-                            tracing::info!(
-                                plugin = %name,
-                                output = %output,
-                                "WASM cron job completed"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                plugin = %name,
-                                error = %e,
-                                "WASM cron job failed"
-                            );
-                        }
-                    }
-                }
+                manager.run_due_jobs(&mut last_triggered, now).await;
             }
         })
+    }
+
+    /// Execute jobs due at `now`, preserving trigger history outside the adapter
+    /// generation so an atomic reload cannot double-fire schedules.
+    pub(crate) async fn run_due_jobs(
+        &self,
+        last_triggered: &mut HashMap<String, chrono::DateTime<chrono::Utc>>,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        for job in &self.jobs {
+            let name = job.plugin_name().to_string();
+            let schedule_str = job.schedule();
+            if schedule_str.is_empty() || !is_cron_due(schedule_str, last_triggered.get(&name).copied(), now) {
+                continue;
+            }
+
+            last_triggered.insert(name.clone(), now);
+            tracing::debug!(plugin = %name, "firing WASM cron job");
+            match job.run().await {
+                Ok(output) => {
+                    tracing::info!(plugin = %name, output = %output, "WASM cron job completed");
+                }
+                Err(error) => {
+                    tracing::warn!(plugin = %name, error = %error, "WASM cron job failed");
+                }
+            }
+        }
     }
 }
 

@@ -1125,15 +1125,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         }
     }
 

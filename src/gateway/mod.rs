@@ -758,21 +758,9 @@ pub struct AppState {
     pub gateway_port: u16,
     /// Web Console log stream broadcast channel.
     pub logs_broadcast_tx: broadcast::Sender<String>,
-    /// WASM plugin manager (optional, enabled with `--features wasm-plugins`).
+    /// Sole process-level owner of the WASM registry and every derived adapter.
     #[cfg(feature = "wasm-plugins")]
-    pub plugin_manager: Option<Arc<crate::plugins::PluginManager>>,
-    /// WASM middleware chain for message pipeline interception.
-    #[cfg(feature = "wasm-plugins")]
-    pub wasm_middleware: Option<Arc<crate::plugins::capabilities::middleware::MiddlewareChain>>,
-    /// WASM hook executor for lifecycle event observation.
-    #[cfg(feature = "wasm-plugins")]
-    pub wasm_hook_executor: Option<Arc<crate::plugins::capabilities::hook::WasmHookExecutor>>,
-    /// WASM cron manager for scheduled plugin tasks.
-    #[cfg(feature = "wasm-plugins")]
-    pub wasm_cron_manager: Option<Arc<crate::plugins::capabilities::cron::WasmCronManager>>,
-    /// Shared event bus for inter-plugin communication.
-    #[cfg(feature = "wasm-plugins")]
-    pub event_bus: Option<Arc<crate::plugins::event_bus::EventBus>>,
+    pub plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -1020,49 +1008,17 @@ pub async fn run_gateway(
         security.clone(),
     )));
 
-    // ── Register WASM plugin tools and create plugin manager (if feature enabled) ──
+    // ── Register the stable router backed by the sole process-level plugin runtime ──
     #[cfg(feature = "wasm-plugins")]
-    let (wasm_plugin_manager, wasm_mw_chain, wasm_hook_exec, wasm_cron_mgr, wasm_event_bus) = {
-        let pm = crate::plugins::init_plugin_manager(&config.workspace_dir).await;
-        let mut mw = None;
-        let mut he = None;
-        let mut cm = None;
-        // Always create an event bus when the wasm-plugins feature is active.
-        let bus = Arc::new(crate::plugins::event_bus::EventBus::new());
-        if let Some(ref pm) = pm {
-            // Tool adapters
-            let wasm_tools = pm
-                .create_tool_adapters_with_memory(Some(Arc::clone(&mem)), Some(Arc::clone(&bus)))
-                .await;
-            if !wasm_tools.is_empty() {
-                tracing::info!(
-                    count = wasm_tools.len(),
-                    "registering WASM plugin tools in tools_registry"
-                );
-                tools_list.extend(wasm_tools);
-            }
-            // Middleware chain
-            let chain = pm.create_middleware_chain(Some(Arc::clone(&bus))).await;
-            if !chain.is_empty() {
-                tracing::info!(count = chain.len(), "WASM middleware chain ready");
-                mw = Some(Arc::new(chain));
-            }
-            // Hook executor
-            let executor = pm.create_hook_executor(Some(Arc::clone(&bus))).await;
-            if !executor.is_empty() {
-                tracing::info!("WASM hook executor ready");
-                he = Some(Arc::new(executor));
-            }
-            // Cron manager
-            let cron = pm.create_cron_manager(Some(Arc::clone(&bus))).await;
-            if !cron.is_empty() {
-                tracing::info!(count = cron.jobs().len(), "WASM cron manager ready");
-                cm = Some(Arc::new(cron));
-            }
-        }
-        tracing::debug!("WASM event bus ready");
-        (pm, mw, he, cm, Some(bus))
-    };
+    let wasm_plugin_runtime = crate::plugins::init_plugin_runtime(&config.workspace_dir, Some(Arc::clone(&mem))).await;
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &wasm_plugin_runtime {
+        let router = runtime.tool_router();
+        let tool_count = router.specs().len();
+        tracing::info!(count = tool_count, "registering dynamic WASM plugin tool router");
+        tools_list.push(router);
+        tracing::debug!(generation = runtime.generation_id(), "WASM plugin runtime ready");
+    }
 
     let tools_registry = Arc::new(tools_list);
 
@@ -1217,27 +1173,13 @@ pub async fn run_gateway(
         gateway_port: actual_port,
         logs_broadcast_tx,
         #[cfg(feature = "wasm-plugins")]
-        plugin_manager: wasm_plugin_manager,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_middleware: wasm_mw_chain,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_hook_executor: wasm_hook_exec,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_cron_manager: wasm_cron_mgr,
-        #[cfg(feature = "wasm-plugins")]
-        event_bus: wasm_event_bus,
+        plugin_runtime: wasm_plugin_runtime,
     };
 
-    // Inject WASM hook executor into HookManager so .emit() triggers WASM hooks too.
+    // HookManager resolves hooks and event delivery from this same generation owner.
     #[cfg(feature = "wasm-plugins")]
-    if let Some(ref exec) = state.wasm_hook_executor {
-        state.hooks.set_wasm_executor(Arc::clone(exec)).await;
-    }
-
-    // Inject event bus into HookManager so lifecycle events bridge to inter-plugin topics.
-    #[cfg(feature = "wasm-plugins")]
-    if let Some(ref bus) = state.event_bus {
-        state.hooks.set_event_bus(Arc::clone(bus)).await;
+    if let Some(ref runtime) = state.plugin_runtime {
+        state.hooks.set_plugin_runtime(Arc::clone(runtime)).await;
     }
 
     let limited_public_routes = Router::new()
@@ -2705,15 +2647,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         }
     }
 
@@ -2782,15 +2716,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -2846,15 +2772,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -3413,15 +3331,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         }
     }
 
@@ -3796,15 +3706,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -3946,15 +3848,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let headers = HeaderMap::new();
@@ -4024,15 +3918,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_webhook(
@@ -4098,15 +3984,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_webhook(
@@ -4159,15 +4037,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4222,15 +4092,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4285,15 +4147,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_webhook(
@@ -4346,15 +4200,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4415,15 +4261,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -4484,15 +4322,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let mut headers = HeaderMap::new();
@@ -4881,15 +4711,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -4952,15 +4774,7 @@ mod tests {
             gateway_port: 0,
             logs_broadcast_tx: broadcast::channel(16).0,
             #[cfg(feature = "wasm-plugins")]
-            plugin_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_middleware: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_hook_executor: None,
-            #[cfg(feature = "wasm-plugins")]
-            wasm_cron_manager: None,
-            #[cfg(feature = "wasm-plugins")]
-            event_bus: None,
+            plugin_runtime: None,
         };
 
         let response = handle_metrics(State(state)).await.into_response();
