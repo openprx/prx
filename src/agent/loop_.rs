@@ -5976,7 +5976,9 @@ pub(crate) async fn run_tool_call_loop_outcome(
             .into());
         }
 
-        let prepared_messages = multimodal::prepare_messages_for_provider(history, multimodal_config).await?;
+        let media_artifacts = hooks.media_artifacts();
+        let prepared_messages =
+            multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
         for tool in tools_registry.iter() {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());

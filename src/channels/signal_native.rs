@@ -98,6 +98,11 @@ impl SignalNativeChannel {
         }
     }
 
+    pub fn with_artifact_owner(mut self, owner: std::sync::Arc<crate::media::MediaArtifactOwner>) -> Self {
+        self.inner = self.inner.with_artifact_owner(owner);
+        self
+    }
+
     /// Poll the daemon's JSON-RPC endpoint until it responds or we time out.
     async fn wait_for_ready(&self) -> Result<()> {
         let client = reqwest::Client::new();

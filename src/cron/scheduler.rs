@@ -715,7 +715,8 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
                 sg.is_native_mode(),
                 sg.data_dir.clone(),
                 sg.storm_protection.clone(),
-            );
+            )
+            .with_artifact_owner(crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir));
             channel.send(&SendMessage::new(output, target)).await?;
         }
         other => anyhow::bail!("unsupported delivery channel: {other}"),

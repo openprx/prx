@@ -901,18 +901,21 @@ pub async fn run_gateway(
         });
     let signal_media_config = config.media.clone();
     let signal_channel: Option<Arc<SignalChannel>> = config.channels_config.signal.as_ref().map(|sg| {
-        Arc::new(SignalChannel::new_with_mode(
-            sg.effective_http_url(),
-            sg.account.clone(),
-            sg.group_id.clone(),
-            sg.allowed_from.clone(),
-            sg.ignore_attachments,
-            sg.ignore_stories,
-            signal_media_config.clone(),
-            sg.is_native_mode(),
-            sg.data_dir.clone(),
-            sg.storm_protection.clone(),
-        ))
+        Arc::new(
+            SignalChannel::new_with_mode(
+                sg.effective_http_url(),
+                sg.account.clone(),
+                sg.group_id.clone(),
+                sg.allowed_from.clone(),
+                sg.ignore_attachments,
+                sg.ignore_stories,
+                signal_media_config.clone(),
+                sg.is_native_mode(),
+                sg.data_dir.clone(),
+                sg.storm_protection.clone(),
+            )
+            .with_artifact_owner(crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir)),
+        )
     });
 
     // Register message_send tool backed by Signal when the channel is configured.

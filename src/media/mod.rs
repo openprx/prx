@@ -1,266 +1,406 @@
-//! Media understanding engine — processes incoming attachments
-//!
-//! Routes:
-//! - Image  → already handled by multimodal.rs \[IMAGE:\] markers
-//! - Audio  → STT transcription (Ollama whisper / local CLI)
-//! - Video  → Frame extraction (ffmpeg) → \[IMAGE:\] markers for vision LLM
-//!
-//! This mirrors OpenClaw's `media-understanding` module architecture:
-//! provider registry, config-driven routing, CLI fallback.
+//! Workspace-owned, bounded media understanding.
+
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::time::Duration;
+
+use base64::Engine as _;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::config::MediaConfig;
-use base64::Engine as _;
 
-/// Process a media attachment and return enriched text.
-///
-/// Returns `None` if the media type is unsupported or processing fails.
-/// The caller should fall back to a raw `<media:…>` marker in that case.
-pub async fn process_media_attachment(path: &str, content_type: &str, config: &MediaConfig) -> Option<String> {
+pub mod artifact;
+pub use artifact::{ArtifactError, LoadedArtifact, ManagedArtifact, MediaArtifactOwner};
+
+const AUDIO_TIMEOUT: Duration = Duration::from_secs(60);
+const VIDEO_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;
+const MAX_FRAME_TOTAL_BYTES: usize = 20 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MediaProcessingOutcome {
+    AudioTranscription { text: String },
+    VideoFrames { markers: String, frame_count: usize },
+    Unsupported { reason: String },
+    Rejected { reason: String },
+    Failed { stage: &'static str, reason: String },
+}
+
+pub async fn process_media_attachment(
+    path: &str,
+    content_type: &str,
+    config: &MediaConfig,
+    artifacts: &MediaArtifactOwner,
+) -> MediaProcessingOutcome {
     if content_type.starts_with("audio/") {
-        process_audio(path, config).await
-    } else if content_type.starts_with("video/") {
-        process_video(path, config).await
-    } else {
-        // Images are handled by the existing [IMAGE:] marker system
-        None
+        let max_bytes = effective_mebibytes(config.max_audio_size_mb, 20, 100);
+        let path = match artifacts.admit_workspace_file(path, max_bytes).await {
+            Ok(path) => path,
+            Err(error) => {
+                return MediaProcessingOutcome::Rejected {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        return process_audio(&path, config, max_bytes).await;
+    }
+    if content_type.starts_with("video/") {
+        let max_bytes = effective_mebibytes(config.max_video_size_mb, 50, 500);
+        let path = match artifacts.admit_workspace_file(path, max_bytes).await {
+            Ok(path) => path,
+            Err(error) => {
+                return MediaProcessingOutcome::Rejected {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        return process_video(&path, config).await;
+    }
+    MediaProcessingOutcome::Unsupported {
+        reason: format!("unsupported media content type: {content_type}"),
     }
 }
 
-// ── Audio ──────────────────────────────────────────────────────────
+fn effective_mebibytes(configured: usize, default: usize, maximum: usize) -> usize {
+    configured
+        .clamp(1, maximum)
+        .checked_mul(1024 * 1024)
+        .unwrap_or(default * 1024 * 1024)
+}
 
-/// Transcribe audio using the configured provider.
-async fn process_audio(path: &str, config: &MediaConfig) -> Option<String> {
-    match config.audio_provider.as_str() {
-        "ollama" => transcribe_ollama(path, config).await,
+async fn process_audio(path: &Path, config: &MediaConfig, max_bytes: usize) -> MediaProcessingOutcome {
+    let result = match config.audio_provider.as_str() {
+        "ollama" => transcribe_ollama(path, config, max_bytes).await,
         "cli" => transcribe_cli(path).await,
-        "none" => None,
-        other => {
-            tracing::warn!("media: unknown audio provider: {other}");
-            None
+        "none" => {
+            return MediaProcessingOutcome::Unsupported {
+                reason: "audio processing is disabled".to_string(),
+            };
         }
+        other => {
+            return MediaProcessingOutcome::Unsupported {
+                reason: format!("unknown audio provider: {other}"),
+            };
+        }
+    };
+    match result {
+        Ok(Some(text)) => MediaProcessingOutcome::AudioTranscription { text },
+        Ok(None) => MediaProcessingOutcome::Failed {
+            stage: "audio-transcription",
+            reason: "transcription returned no text".to_string(),
+        },
+        Err(reason) => MediaProcessingOutcome::Failed {
+            stage: "audio-transcription",
+            reason,
+        },
     }
 }
 
-/// Transcribe audio via Ollama API.
-///
-/// Ollama doesn't have a dedicated `/v1/audio/transcriptions` endpoint yet.
-/// Strategy:
-///   1. Try local whisper CLI (most reliable for local STT)
-///   2. Fallback: send raw bytes via Ollama `/api/chat` (newer model versions)
-async fn transcribe_ollama(path: &str, config: &MediaConfig) -> Option<String> {
-    // First try whisper CLI — most reliable for local STT
-    if let Some(result) = transcribe_cli(path).await {
-        return Some(result);
+async fn transcribe_ollama(path: &Path, config: &MediaConfig, max_bytes: usize) -> Result<Option<String>, String> {
+    if let Ok(Some(result)) = transcribe_cli(path).await {
+        return Ok(Some(result));
     }
 
-    // Fallback: try Ollama's audio capability (newer versions that support it)
-    let url = format!("{}/api/chat", config.audio_ollama_url);
-    let file_bytes = std::fs::read(path).ok()?;
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&file_bytes);
-
+    let file_bytes = artifact::read_file_bounded(path, max_bytes)
+        .await
+        .map_err(|error| error.to_string())?;
     let body = serde_json::json!({
         "model": config.audio_model,
         "messages": [{
             "role": "user",
             "content": "Transcribe this audio accurately. Output only the transcription text, nothing else.",
-            "images": [b64]
+            "images": [base64::engine::general_purpose::STANDARD.encode(file_bytes)]
         }],
         "stream": false
     });
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(&url)
-        .timeout(std::time::Duration::from_secs(60))
+    let response = reqwest::Client::builder()
+        .timeout(AUDIO_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|error| error.to_string())?
+        .post(format!("{}/api/chat", config.audio_ollama_url.trim_end_matches('/')))
         .json(&body)
         .send()
         .await
-        .ok()?;
-
-    if !resp.status().is_success() {
-        tracing::warn!("media: Ollama audio transcription failed: {}", resp.status());
-        return None;
+        .map_err(|error| error.to_string())?;
+    if !response.status().is_success() {
+        return Err(format!("Ollama returned HTTP {}", response.status()));
     }
-
-    let json: serde_json::Value = resp.json().await.ok()?;
-    let text = json
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(|v| v.as_str())?
-        .trim()
-        .to_string();
-    if text.is_empty() { None } else { Some(text) }
-}
-
-/// Transcribe audio using a local whisper CLI tool.
-///
-/// Checks for: `whisper-cli` (whisper.cpp), `whisper` (openai-whisper),
-/// `faster-whisper`.
-async fn transcribe_cli(path: &str) -> Option<String> {
-    let whisper_cmd = if which_bin("whisper-cli") {
-        "whisper-cli"
-    } else if which_bin("whisper") {
-        "whisper"
-    } else if which_bin("faster-whisper") {
-        "faster-whisper"
-    } else {
-        tracing::debug!("media: no whisper CLI found; skipping audio transcription");
-        return None;
-    };
-
-    // Convert to 16kHz mono wav (whisper prefers this format)
-    let wav_path = format!("{path}.wav");
-    if which_bin("ffmpeg") {
-        let ffmpeg_ok = tokio::process::Command::new("ffmpeg")
-            .args(["-y", "-i", path, "-ar", "16000", "-ac", "1", &wav_path])
-            .output()
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
-        if !ffmpeg_ok {
-            tracing::debug!("media: ffmpeg wav conversion failed for {path}");
-        }
-    }
-
-    let input_path = if std::path::Path::new(&wav_path).exists() {
-        wav_path.as_str()
-    } else {
-        path
-    };
-
-    let output = tokio::process::Command::new(whisper_cmd)
-        .args(["--output-format", "txt", "--language", "auto", input_path])
-        .output()
+    let bytes = artifact::read_response_bounded(response, "Ollama audio response", MAX_COMMAND_OUTPUT_BYTES)
         .await
-        .ok()?;
-
-    // Clean up temp wav
-    let _ = std::fs::remove_file(&wav_path);
-
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if stdout.is_empty() { None } else { Some(stdout) }
+        .map_err(|error| error.to_string())?;
+    let json: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    Ok(json
+        .get("message")
+        .and_then(|value| value.get("content"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string))
 }
 
-// ── Video ──────────────────────────────────────────────────────────
-
-/// Extract frames from a video using ffmpeg and return `[IMAGE:]` data-URI markers.
-async fn process_video(path: &str, config: &MediaConfig) -> Option<String> {
-    if config.video_provider == "none" {
-        return None;
-    }
-
-    if !which_bin("ffmpeg") {
-        tracing::warn!("media: ffmpeg not found; cannot extract video frames");
-        return None;
-    }
-
-    let max_frames = config.video_max_frames.clamp(1, 10);
-    let output_dir = tempfile::Builder::new().prefix("openprx-video-").tempdir().ok()?;
-
-    // Get video duration via ffprobe
-    let duration: f64 = if which_bin("ffprobe") {
-        let probe = tokio::process::Command::new("ffprobe")
-            .args([
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "csv=p=0",
-                path,
-            ])
-            .output()
-            .await
-            .ok()?;
-        String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(10.0)
-    } else {
-        10.0 // fallback: assume 10 seconds
+async fn transcribe_cli(path: &Path) -> Result<Option<String>, String> {
+    let whisper_cmd = ["whisper-cli", "whisper", "faster-whisper"]
+        .into_iter()
+        .find(|command| which_bin(command));
+    let Some(whisper_cmd) = whisper_cmd else {
+        return Ok(None);
     };
 
-    let interval = duration / (max_frames as f64 + 1.0);
-
-    // Extract frames at evenly spaced intervals
-    for i in 0..max_frames {
-        let timestamp = interval * (i as f64 + 1.0);
-        let frame_path = output_dir.path().join(format!("frame_{i:03}.jpg"));
-        let frame_path_str = frame_path.to_string_lossy().to_string();
-
-        let Ok(result) = tokio::process::Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-ss",
-                &format!("{timestamp:.2}"),
-                "-i",
-                path,
-                "-vframes",
-                "1",
-                "-q:v",
-                "2",
-                &frame_path_str,
-            ])
-            .output()
-            .await
-        else {
-            tracing::warn!("media: failed to spawn ffmpeg for frame {i} from {path}");
-            continue;
-        };
-
-        if !result.status.success() {
-            tracing::warn!("media: failed to extract frame {i} from {path}");
+    let temp = tempfile::Builder::new()
+        .prefix("openprx-audio-")
+        .tempdir()
+        .map_err(|error| error.to_string())?;
+    let wav_path = temp.path().join("input.wav");
+    let mut input_path = path.to_path_buf();
+    if which_bin("ffmpeg") {
+        let args = vec![
+            "-y".to_string(),
+            "-i".to_string(),
+            path.to_string_lossy().to_string(),
+            "-ar".to_string(),
+            "16000".to_string(),
+            "-ac".to_string(),
+            "1".to_string(),
+            wav_path.to_string_lossy().to_string(),
+        ];
+        if run_command_bounded("ffmpeg", &args, VIDEO_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT_BYTES)
+            .await?
+            .success
+        {
+            input_path = wav_path;
         }
     }
-
-    collect_video_frame_markers(output_dir.path(), duration)
+    let args = vec![
+        "--output-format".to_string(),
+        "txt".to_string(),
+        "--language".to_string(),
+        "auto".to_string(),
+        input_path.to_string_lossy().to_string(),
+    ];
+    let output = run_command_bounded(whisper_cmd, &args, AUDIO_TIMEOUT, MAX_COMMAND_OUTPUT_BYTES).await?;
+    if !output.success {
+        return Err(format!(
+            "{whisper_cmd} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8(output.stdout)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
 }
 
-fn collect_video_frame_markers(output_dir: &std::path::Path, duration: f64) -> Option<String> {
-    let mut frame_paths: Vec<std::path::PathBuf> = std::fs::read_dir(output_dir)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| p.extension().and_then(|value| value.to_str()) == Some("jpg"))
-        .collect();
-    frame_paths.sort();
-
-    if frame_paths.is_empty() {
-        return None;
+async fn process_video(path: &Path, config: &MediaConfig) -> MediaProcessingOutcome {
+    if config.video_provider == "none" {
+        return MediaProcessingOutcome::Unsupported {
+            reason: "video processing is disabled".to_string(),
+        };
+    }
+    if config.video_provider != "frames" {
+        return MediaProcessingOutcome::Unsupported {
+            reason: format!("unknown video provider: {}", config.video_provider),
+        };
+    }
+    if !which_bin("ffmpeg") {
+        return MediaProcessingOutcome::Failed {
+            stage: "video-frame-extraction",
+            reason: "ffmpeg is not installed".to_string(),
+        };
     }
 
-    let mut markers = String::new();
-    markers.push_str(&format!(
+    match extract_video_frames(path, config.video_max_frames.clamp(1, 10)).await {
+        Ok((markers, frame_count)) => MediaProcessingOutcome::VideoFrames { markers, frame_count },
+        Err(reason) => MediaProcessingOutcome::Failed {
+            stage: "video-frame-extraction",
+            reason,
+        },
+    }
+}
+
+async fn extract_video_frames(path: &Path, max_frames: usize) -> Result<(String, usize), String> {
+    let output_dir = tempfile::Builder::new()
+        .prefix("openprx-video-")
+        .tempdir()
+        .map_err(|error| error.to_string())?;
+    let duration = if which_bin("ffprobe") {
+        let args = vec![
+            "-v".to_string(),
+            "error".to_string(),
+            "-show_entries".to_string(),
+            "format=duration".to_string(),
+            "-of".to_string(),
+            "csv=p=0".to_string(),
+            path.to_string_lossy().to_string(),
+        ];
+        let output = run_command_bounded("ffprobe", &args, VIDEO_COMMAND_TIMEOUT, 4096).await?;
+        String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<f64>()
+            .unwrap_or(10.0)
+    } else {
+        10.0
+    };
+    let interval = duration / (max_frames as f64 + 1.0);
+    for index in 0..max_frames {
+        let frame_path = output_dir.path().join(format!("frame_{index:03}.jpg"));
+        let args = vec![
+            "-y".to_string(),
+            "-ss".to_string(),
+            format!("{:.2}", interval * (index as f64 + 1.0)),
+            "-i".to_string(),
+            path.to_string_lossy().to_string(),
+            "-vframes".to_string(),
+            "1".to_string(),
+            "-q:v".to_string(),
+            "2".to_string(),
+            frame_path.to_string_lossy().to_string(),
+        ];
+        let output = run_command_bounded("ffmpeg", &args, VIDEO_COMMAND_TIMEOUT, MAX_COMMAND_OUTPUT_BYTES).await?;
+        if !output.success {
+            tracing::warn!(frame = index, "media: ffmpeg frame extraction failed");
+        }
+    }
+    collect_video_frame_markers(output_dir.path(), duration).await
+}
+
+async fn collect_video_frame_markers(output_dir: &Path, duration: f64) -> Result<(String, usize), String> {
+    let mut entries = tokio::fs::read_dir(output_dir)
+        .await
+        .map_err(|error| error.to_string())?;
+    let mut paths = Vec::<PathBuf>::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|error| error.to_string())? {
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("jpg") {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    if paths.is_empty() {
+        return Err("ffmpeg produced no usable frames".to_string());
+    }
+
+    let mut total_bytes = 0usize;
+    let mut encoded = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let bytes = artifact::read_file_bounded(path, MAX_FRAME_BYTES)
+            .await
+            .map_err(|error| error.to_string())?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_FRAME_TOTAL_BYTES {
+            return Err(format!("video frame output exceeds {MAX_FRAME_TOTAL_BYTES} bytes"));
+        }
+        encoded.push(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    let mut markers = format!(
         "[Video: {} frames extracted from {:.0}s video]\n",
-        frame_paths.len(),
+        encoded.len(),
         duration
-    ));
-    for fp in &frame_paths {
-        let bytes = std::fs::read(fp).ok()?;
-        let payload = base64::engine::general_purpose::STANDARD.encode(bytes);
+    );
+    for payload in encoded {
         markers.push_str(&format!("[IMAGE:data:image/jpeg;base64,{payload}]\n"));
     }
-
-    Some(markers.trim_end().to_string())
+    Ok((markers.trim_end().to_string(), paths.len()))
 }
 
-// ── Utilities ──────────────────────────────────────────────────────
+struct BoundedCommandOutput {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
 
-/// Return `true` if `cmd` is available somewhere on `$PATH`.
-fn which_bin(cmd: &str) -> bool {
-    which::which(cmd).is_ok()
+async fn run_command_bounded(
+    command: &str,
+    args: &[String],
+    timeout: Duration,
+    max_output_bytes: usize,
+) -> Result<BoundedCommandOutput, String> {
+    let mut child = tokio::process::Command::new(command)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|error| error.to_string())?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "stdout pipe unavailable".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "stderr pipe unavailable".to_string())?;
+    let stdout_task = tokio::spawn(read_stream_bounded(stdout, max_output_bytes));
+    let stderr_task = tokio::spawn(read_stream_bounded(stderr, max_output_bytes));
+    let status = match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(result) => result.map_err(|error| error.to_string())?,
+        Err(_) => {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(format!("{command} timed out after {}s", timeout.as_secs()));
+        }
+    };
+    let stdout = stdout_task.await.map_err(|error| error.to_string())??;
+    let stderr = stderr_task.await.map_err(|error| error.to_string())??;
+    Ok(BoundedCommandOutput {
+        success: status.success(),
+        stdout,
+        stderr,
+    })
+}
+
+async fn read_stream_bounded<R: AsyncRead + Unpin>(stream: R, max_bytes: usize) -> Result<Vec<u8>, String> {
+    let mut bytes = Vec::new();
+    stream
+        .take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err(format!("subprocess output exceeds {max_bytes} bytes"));
+    }
+    Ok(bytes)
+}
+
+fn which_bin(command: &str) -> bool {
+    which::which(command).is_ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn video_frame_markers_embed_data_uris_without_temp_paths() {
+    #[tokio::test]
+    async fn video_frame_markers_embed_bounded_data_uris_without_temp_paths() {
         let dir = tempfile::tempdir().expect("test: tempdir");
         std::fs::write(dir.path().join("frame_001.jpg"), [0xff, 0xd8, 0xff]).expect("test: write frame");
 
-        let markers = collect_video_frame_markers(dir.path(), 12.0).expect("test: frame markers");
+        let (markers, count) = collect_video_frame_markers(dir.path(), 12.0)
+            .await
+            .expect("test: frame markers");
 
+        assert_eq!(count, 1);
         assert!(markers.contains("[Video: 1 frames extracted from 12s video]"));
         assert!(markers.contains("[IMAGE:data:image/jpeg;base64,"));
         assert!(!markers.contains(dir.path().to_string_lossy().as_ref()));
+    }
+
+    #[tokio::test]
+    async fn typed_outcome_rejects_outside_workspace_media() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let owner = MediaArtifactOwner::for_workspace(workspace.path());
+
+        let outcome = process_media_attachment(
+            outside.path().to_str().unwrap(),
+            "audio/wav",
+            &MediaConfig::default(),
+            owner.as_ref(),
+        )
+        .await;
+
+        assert!(matches!(outcome, MediaProcessingOutcome::Rejected { .. }));
     }
 }

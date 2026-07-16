@@ -102,6 +102,7 @@ struct RuntimeState {
 pub struct HookManager {
     workspace_dir: PathBuf,
     hooks_json_path: PathBuf,
+    media_artifacts: std::sync::Arc<crate::media::MediaArtifactOwner>,
     state: RwLock<RuntimeState>,
     /// Process-level WASM plugin runtime; it is the sole generation owner.
     #[cfg(feature = "wasm-plugins")]
@@ -110,13 +111,19 @@ pub struct HookManager {
 
 impl HookManager {
     pub fn new(workspace_dir: PathBuf) -> Self {
+        let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&workspace_dir);
         Self {
             hooks_json_path: workspace_dir.join(HOOKS_JSON_FILE),
             workspace_dir,
+            media_artifacts,
             state: RwLock::new(RuntimeState::default()),
             #[cfg(feature = "wasm-plugins")]
             plugin_runtime: tokio::sync::RwLock::new(None),
         }
+    }
+
+    pub fn media_artifacts(&self) -> std::sync::Arc<crate::media::MediaArtifactOwner> {
+        self.media_artifacts.clone()
     }
 
     /// Attach the sole process-level plugin runtime for lifecycle observation.

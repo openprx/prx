@@ -2095,6 +2095,7 @@ async fn run_signal_vision_preflight(
     temperature: f64,
     msg: &traits::ChannelMessage,
     multimodal_config: &crate::config::MultimodalConfig,
+    media_artifacts: &crate::media::MediaArtifactOwner,
 ) -> SignalVisionPreflightOutcome {
     if !is_signal_image_message(msg) {
         return SignalVisionPreflightOutcome::NotRequired;
@@ -2136,14 +2137,16 @@ Never guess brand, dosage, specification, or product identity.",
         ChatMessage::user(user_prompt),
     ];
 
-    let prepared = match crate::multimodal::prepare_messages_for_provider(&preflight_messages, multimodal_config).await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            tracing::warn!("Signal image guard: multimodal preflight normalization failed: {error}");
-            return SignalVisionPreflightOutcome::Fallback;
-        }
-    };
+    let prepared =
+        match crate::multimodal::prepare_messages_for_provider(&preflight_messages, multimodal_config, media_artifacts)
+            .await
+        {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!("Signal image guard: multimodal preflight normalization failed: {error}");
+                return SignalVisionPreflightOutcome::Fallback;
+            }
+        };
 
     if !prepared.contains_images {
         tracing::warn!("Signal image guard: preflight request did not retain image payloads after normalization");
@@ -2955,6 +2958,7 @@ async fn process_channel_message(
         runtime_defaults.temperature,
         &msg,
         &ctx.multimodal,
+        ctx.hooks.media_artifacts().as_ref(),
     )
     .await
     {
@@ -4678,31 +4682,38 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
     }
 
     if let Some(ref sig) = config.channels_config.signal {
+        let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir);
         let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
-            Arc::new(SignalNativeChannel::new(
-                sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
-                sig.account.clone(),
-                sig.data_dir.clone(),
-                sig.daemon_http_port.unwrap_or(16866),
-                sig.startup_timeout_ms,
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-                config.media.clone(),
-                sig.storm_protection.clone(),
-            ))
+            Arc::new(
+                SignalNativeChannel::new(
+                    sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
+                    sig.account.clone(),
+                    sig.data_dir.clone(),
+                    sig.daemon_http_port.unwrap_or(16866),
+                    sig.startup_timeout_ms,
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                    config.media.clone(),
+                    sig.storm_protection.clone(),
+                )
+                .with_artifact_owner(media_artifacts.clone()),
+            )
         } else {
-            Arc::new(SignalChannel::new_with_storm_protection(
-                sig.effective_http_url(),
-                sig.account.clone(),
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-                config.media.clone(),
-                sig.storm_protection.clone(),
-            ))
+            Arc::new(
+                SignalChannel::new_with_storm_protection(
+                    sig.effective_http_url(),
+                    sig.account.clone(),
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                    config.media.clone(),
+                    sig.storm_protection.clone(),
+                )
+                .with_artifact_owner(media_artifacts.clone()),
+            )
         };
         channels.push(("Signal", signal_channel));
     }
@@ -5156,35 +5167,42 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     }
 
     if let Some(ref sig) = config.channels_config.signal {
+        let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir);
         let signal_channel: Arc<dyn Channel + Send + Sync> = if sig.is_native_mode() {
             tracing::info!(
                 "Signal: native mode — will spawn signal-cli daemon on port {}",
                 sig.daemon_http_port.unwrap_or(16866)
             );
-            Arc::new(SignalNativeChannel::new(
-                sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
-                sig.account.clone(),
-                sig.data_dir.clone(),
-                sig.daemon_http_port.unwrap_or(16866),
-                sig.startup_timeout_ms,
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-                config.media.clone(),
-                sig.storm_protection.clone(),
-            ))
+            Arc::new(
+                SignalNativeChannel::new(
+                    sig.cli_path.clone().unwrap_or_else(|| "signal-cli".to_string()),
+                    sig.account.clone(),
+                    sig.data_dir.clone(),
+                    sig.daemon_http_port.unwrap_or(16866),
+                    sig.startup_timeout_ms,
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                    config.media.clone(),
+                    sig.storm_protection.clone(),
+                )
+                .with_artifact_owner(media_artifacts.clone()),
+            )
         } else {
-            Arc::new(SignalChannel::new_with_storm_protection(
-                sig.effective_http_url(),
-                sig.account.clone(),
-                sig.group_id.clone(),
-                sig.allowed_from.clone(),
-                sig.ignore_attachments,
-                sig.ignore_stories,
-                config.media.clone(),
-                sig.storm_protection.clone(),
-            ))
+            Arc::new(
+                SignalChannel::new_with_storm_protection(
+                    sig.effective_http_url(),
+                    sig.account.clone(),
+                    sig.group_id.clone(),
+                    sig.allowed_from.clone(),
+                    sig.ignore_attachments,
+                    sig.ignore_stories,
+                    config.media.clone(),
+                    sig.storm_protection.clone(),
+                )
+                .with_artifact_owner(media_artifacts.clone()),
+            )
         };
         channels.push(signal_channel);
     }
@@ -5332,18 +5350,21 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
             "message_send tool: is_native={is_native} url={effective_url} mode={:?}",
             sig.mode
         );
-        let sig_chan = Arc::new(SignalChannel::new_with_mode(
-            effective_url,
-            sig.account.clone(),
-            sig.group_id.clone(),
-            sig.allowed_from.clone(),
-            sig.ignore_attachments,
-            sig.ignore_stories,
-            config.media.clone(),
-            is_native,
-            sig.data_dir.clone(),
-            sig.storm_protection.clone(),
-        ));
+        let sig_chan = Arc::new(
+            SignalChannel::new_with_mode(
+                effective_url,
+                sig.account.clone(),
+                sig.group_id.clone(),
+                sig.allowed_from.clone(),
+                sig.ignore_attachments,
+                sig.ignore_stories,
+                config.media.clone(),
+                is_native,
+                sig.data_dir.clone(),
+                sig.storm_protection.clone(),
+            )
+            .with_artifact_owner(crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir)),
+        );
         let msg_send_tool = tools::MessageSendTool::new_signal(sig_chan, security.clone());
         tools_list.push(Box::new(msg_send_tool));
     } else if let Some(first_channel) = channels.first().cloned() {

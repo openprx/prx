@@ -49,6 +49,17 @@ fn mime_to_extension(mime: &str) -> &str {
     }
 }
 
+fn attachment_max_bytes(content_type: &str, config: &crate::config::MediaConfig) -> usize {
+    let mebibytes = if content_type.starts_with("audio/") {
+        config.max_audio_size_mb.clamp(1, 100)
+    } else if content_type.starts_with("video/") {
+        config.max_video_size_mb.clamp(1, 500)
+    } else {
+        20
+    };
+    mebibytes.saturating_mul(1024 * 1024)
+}
+
 /// Run an external command and return its stdout as a string (if successful and non-empty).
 async fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
     let output = tokio::process::Command::new(cmd).args(args).output().await.ok()?;
@@ -194,6 +205,8 @@ pub struct SignalChannel {
     ignore_stories: bool,
     /// Media understanding config for audio STT and video frame extraction.
     media_config: crate::config::MediaConfig,
+    /// Shared workspace owner for bounded attachment admission and cleanup.
+    artifact_owner: Option<Arc<crate::media::MediaArtifactOwner>>,
     /// When true, use native signal-cli daemon JSON-RPC API (`/api/v1/rpc`)
     /// instead of the Docker signal-cli-rest-api REST endpoints.
     is_native: bool,
@@ -521,10 +534,16 @@ impl SignalChannel {
             ignore_attachments,
             ignore_stories,
             media_config,
+            artifact_owner: None,
             is_native,
             data_dir,
             storm_guard: Arc::new(Mutex::new(SignalStormGuard::new(storm_protection))),
         }
+    }
+
+    pub fn with_artifact_owner(mut self, owner: Arc<crate::media::MediaArtifactOwner>) -> Self {
+        self.artifact_owner = Some(owner);
+        self
     }
 
     fn http_client(&self) -> Client {
@@ -1593,25 +1612,33 @@ impl SignalChannel {
                 return None;
             }
 
-            let bytes = tokio::fs::read(&path).await.ok()?;
-            // Copy to a temp path with a proper extension so media pipelines
-            // can identify the format by filename.
-            let id = attachment_id().unwrap_or_else(|| "0".to_string());
-            // Avoid double extension: if id already has the right extension, use it as-is
+            let owner = self.artifact_owner.as_ref().or_else(|| {
+                tracing::error!("Signal attachment rejected: no workspace media artifact owner configured");
+                None
+            })?;
             let ext = mime_to_extension(content_type);
-            let temp_path = if id.ends_with(&format!(".{ext}")) {
-                format!("/tmp/openprx-att-{id}")
-            } else {
-                format!("/tmp/openprx-att-{id}.{ext}")
+            let max_bytes = attachment_max_bytes(content_type, &self.media_config);
+            let artifact = match owner.import_channel_file(&path, ext, max_bytes).await {
+                Ok(artifact) => artifact,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), error = %error, "Signal attachment admission rejected");
+                    return None;
+                }
             };
-            tokio::fs::write(&temp_path, &bytes).await.ok()?;
 
             tracing::info!(
-                "Signal native: attachment {file_path} ({} bytes) → {temp_path}",
-                bytes.len()
+                "Signal native: attachment {file_path} ({} bytes) admitted",
+                artifact.size_bytes
             );
 
-            return Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await;
+            return Self::make_attachment_marker(
+                &artifact.path,
+                content_type,
+                filename,
+                &self.media_config,
+                owner.as_ref(),
+            )
+            .await;
         }
 
         // ── REST mode: download via signal-cli-rest-api ───────────────────────
@@ -1630,56 +1657,90 @@ impl SignalChannel {
             return None;
         }
 
-        let bytes = response.bytes().await.ok()?;
+        let owner = self.artifact_owner.as_ref().or_else(|| {
+            tracing::error!("Signal attachment rejected: no workspace media artifact owner configured");
+            None
+        })?;
         let ext = mime_to_extension(content_type);
-        let temp_path = format!("/tmp/openprx-att-{id}.{ext}");
-        tokio::fs::write(&temp_path, &bytes).await.ok()?;
+        let max_bytes = attachment_max_bytes(content_type, &self.media_config);
+        let artifact = match owner
+            .import_channel_response(response, &format!("Signal attachment {id}"), ext, max_bytes)
+            .await
+        {
+            Ok(artifact) => artifact,
+            Err(error) => {
+                tracing::warn!(attachment_id = %id, error = %error, "Signal attachment admission rejected");
+                return None;
+            }
+        };
 
         tracing::info!(
-            "Signal: downloaded attachment {id} ({} bytes) → {}",
-            bytes.len(),
-            temp_path
+            "Signal: downloaded attachment {id} ({} bytes) admitted",
+            artifact.size_bytes
         );
 
-        Self::make_attachment_marker(&temp_path, content_type, filename, &self.media_config).await
+        Self::make_attachment_marker(
+            &artifact.path,
+            content_type,
+            filename,
+            &self.media_config,
+            owner.as_ref(),
+        )
+        .await
     }
 
     /// Convert a locally-stored attachment file into the appropriate content marker.
     async fn make_attachment_marker(
-        temp_path: &str,
+        artifact_path: &std::path::Path,
         content_type: &str,
         filename: &str,
         media_config: &crate::config::MediaConfig,
+        artifacts: &crate::media::MediaArtifactOwner,
     ) -> Option<String> {
+        let path = artifact_path.to_string_lossy();
         // Images: keep raw [IMAGE:] marker for the existing multimodal pipeline
         if content_type.starts_with("image/") {
-            return Some(format!("[IMAGE:{temp_path}]"));
+            return Some(format!("[IMAGE:{path}]"));
         }
 
         // Audio: attempt STT transcription via media engine
         if content_type.starts_with("audio/") {
-            if let Some(transcription) =
-                crate::media::process_media_attachment(temp_path, content_type, media_config).await
-            {
-                return Some(format!("[Voice message transcription: \"{transcription}\"]"));
+            match crate::media::process_media_attachment(&path, content_type, media_config, artifacts).await {
+                crate::media::MediaProcessingOutcome::AudioTranscription { text } => {
+                    return Some(format!("[Voice message transcription: \"{text}\"]"));
+                }
+                crate::media::MediaProcessingOutcome::Rejected { reason } => {
+                    return Some(format!("[Audio attachment rejected: {reason}]"));
+                }
+                crate::media::MediaProcessingOutcome::Failed { stage, reason } => {
+                    tracing::warn!(stage, reason, "Signal audio processing failed");
+                }
+                _ => {}
             }
             return Some(format!(
-                "<media:audio path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+                "<media:audio path=\"{path}\" type=\"{content_type}\" name=\"{filename}\">"
             ));
         }
 
         // Video: attempt frame extraction via media engine
         if content_type.starts_with("video/") {
-            if let Some(frames) = crate::media::process_media_attachment(temp_path, content_type, media_config).await {
-                return Some(frames);
+            match crate::media::process_media_attachment(&path, content_type, media_config, artifacts).await {
+                crate::media::MediaProcessingOutcome::VideoFrames { markers, .. } => return Some(markers),
+                crate::media::MediaProcessingOutcome::Rejected { reason } => {
+                    return Some(format!("[Video attachment rejected: {reason}]"));
+                }
+                crate::media::MediaProcessingOutcome::Failed { stage, reason } => {
+                    tracing::warn!(stage, reason, "Signal video processing failed");
+                }
+                _ => {}
             }
             return Some(format!(
-                "<media:video path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+                "<media:video path=\"{path}\" type=\"{content_type}\" name=\"{filename}\">"
             ));
         }
 
         // Documents: attempt text extraction
-        if let Some(text) = extract_document_text(temp_path, content_type, filename).await {
+        if let Some(text) = extract_document_text(&path, content_type, filename).await {
             let truncated = if text.len() > 8000 {
                 let mut boundary = 8000;
                 while !text.is_char_boundary(boundary) {
@@ -1694,7 +1755,7 @@ impl SignalChannel {
 
         // Unrecognised file types: pass as media marker
         Some(format!(
-            "<media:file path=\"{temp_path}\" type=\"{content_type}\" name=\"{filename}\">"
+            "<media:file path=\"{path}\" type=\"{content_type}\" name=\"{filename}\">"
         ))
     }
 

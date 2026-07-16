@@ -1,7 +1,7 @@
-use crate::config::{MultimodalConfig, build_runtime_proxy_client_with_timeouts};
+use crate::config::MultimodalConfig;
+use crate::media::{ArtifactError, MediaArtifactOwner};
 use crate::providers::ChatMessage;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use reqwest::Client;
 use std::path::Path;
 
 const IMAGE_MARKER_PREFIX: &str = "[IMAGE:";
@@ -45,6 +45,9 @@ pub enum MultimodalError {
 
     #[error("failed to read local image '{input}': {reason}")]
     LocalReadFailed { input: String, reason: String },
+
+    #[error("multimodal image path is outside the active workspace: '{input}'")]
+    WorkspacePathDenied { input: String },
 }
 
 pub fn parse_image_markers(content: &str) -> (String, Vec<String>) {
@@ -108,6 +111,7 @@ pub fn extract_ollama_image_payload(image_ref: &str) -> Option<String> {
 pub async fn prepare_messages_for_provider(
     messages: &[ChatMessage],
     config: &MultimodalConfig,
+    artifacts: &MediaArtifactOwner,
 ) -> anyhow::Result<PreparedMessages> {
     let (max_images, max_image_size_mb) = config.effective_limits();
     let max_bytes = max_image_size_mb.saturating_mul(1024 * 1024);
@@ -128,8 +132,6 @@ pub async fn prepare_messages_for_provider(
         });
     }
 
-    let remote_client = build_runtime_proxy_client_with_timeouts("provider.ollama", 30, 10)?;
-
     let mut normalized_messages = Vec::with_capacity(messages.len());
     for message in messages {
         if message.role != "user" {
@@ -145,7 +147,7 @@ pub async fn prepare_messages_for_provider(
 
         let mut normalized_refs = Vec::with_capacity(refs.len());
         for reference in refs {
-            let data_uri = normalize_image_reference(&reference, config, max_bytes, &remote_client).await?;
+            let data_uri = normalize_image_reference(&reference, config, max_bytes, artifacts).await?;
             normalized_refs.push(data_uri);
         }
 
@@ -187,177 +189,62 @@ async fn normalize_image_reference(
     source: &str,
     config: &MultimodalConfig,
     max_bytes: usize,
-    remote_client: &Client,
+    artifacts: &MediaArtifactOwner,
 ) -> anyhow::Result<String> {
-    if source.starts_with("data:") {
-        return normalize_data_uri(source, max_bytes);
-    }
-
-    if source.starts_with("http://") || source.starts_with("https://") {
-        if !config.allow_remote_fetch {
-            return Err(MultimodalError::RemoteFetchDisabled {
-                input: source.to_string(),
-            }
-            .into());
-        }
-
-        return normalize_remote_image(source, max_bytes, remote_client).await;
-    }
-
-    normalize_local_image(source, max_bytes).await
-}
-
-fn normalize_data_uri(source: &str, max_bytes: usize) -> anyhow::Result<String> {
-    let Some(comma_idx) = source.find(',') else {
-        return Err(MultimodalError::InvalidMarker {
-            input: source.to_string(),
-            reason: "expected data URI payload".to_string(),
-        }
-        .into());
-    };
-
-    let header = &source[..comma_idx];
-    let payload = source[comma_idx + 1..].trim();
-
-    if !header.contains(";base64") {
-        return Err(MultimodalError::InvalidMarker {
-            input: source.to_string(),
-            reason: "only base64 data URIs are supported".to_string(),
-        }
-        .into());
-    }
-
-    let mime = header
-        .trim_start_matches("data:")
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_ascii_lowercase();
-
-    validate_mime(source, &mime)?;
-
-    let decoded = STANDARD
-        .decode(payload)
-        .map_err(|error| MultimodalError::InvalidMarker {
-            input: source.to_string(),
-            reason: format!("invalid base64 payload: {error}"),
-        })?;
-
-    validate_size(source, decoded.len(), max_bytes)?;
-
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(decoded)))
-}
-
-async fn normalize_remote_image(source: &str, max_bytes: usize, remote_client: &Client) -> anyhow::Result<String> {
-    // SSRF protection: block requests to private/local addresses
-    let host = crate::tools::http_request::extract_host(source)?;
-    if crate::tools::http_request::is_private_or_local_host(&host) {
-        return Err(MultimodalError::SsrfBlocked {
-            input: source.to_string(),
-            host,
-        }
-        .into());
-    }
-
-    let response = remote_client
-        .get(source)
-        .send()
+    let loaded = artifacts
+        .load(source, max_bytes, config.allow_remote_fetch)
         .await
-        .map_err(|error| MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        })?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: format!("HTTP {status}"),
-        }
-        .into());
-    }
-
-    if let Some(content_length) = response.content_length() {
-        let content_length = content_length as usize;
-        validate_size(source, content_length, max_bytes)?;
-    }
-
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .map(ToString::to_string);
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|error| MultimodalError::RemoteFetchFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        })?;
-
-    validate_size(source, bytes.len(), max_bytes)?;
-
-    let mime =
-        detect_mime(None, bytes.as_ref(), content_type.as_deref()).ok_or_else(|| MultimodalError::UnsupportedMime {
-            input: source.to_string(),
-            mime: "unknown".to_string(),
-        })?;
-
-    validate_mime(source, &mime)?;
-
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
-}
-
-async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
-    let path = Path::new(source);
-    if !path.exists() || !path.is_file() {
-        return Err(MultimodalError::ImageSourceNotFound {
-            input: source.to_string(),
-        }
-        .into());
-    }
-
-    let metadata = tokio::fs::metadata(path)
-        .await
-        .map_err(|error| MultimodalError::LocalReadFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        })?;
-
-    validate_size(source, metadata.len() as usize, max_bytes)?;
-
-    let bytes = tokio::fs::read(path)
-        .await
-        .map_err(|error| MultimodalError::LocalReadFailed {
-            input: source.to_string(),
-            reason: error.to_string(),
-        })?;
-
-    validate_size(source, bytes.len(), max_bytes)?;
-
-    let mime = detect_mime(Some(path), &bytes, None).ok_or_else(|| MultimodalError::UnsupportedMime {
+        .map_err(|error| map_artifact_error(source, error))?;
+    let mime = detect_mime(
+        loaded.path_hint.as_deref(),
+        &loaded.bytes,
+        loaded.content_type_hint.as_deref(),
+    )
+    .ok_or_else(|| MultimodalError::UnsupportedMime {
         input: source.to_string(),
         mime: "unknown".to_string(),
     })?;
-
     validate_mime(source, &mime)?;
-
-    Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
+    Ok(format!("data:{mime};base64,{}", STANDARD.encode(loaded.bytes)))
 }
 
-fn validate_size(source: &str, size_bytes: usize, max_bytes: usize) -> anyhow::Result<()> {
-    if size_bytes > max_bytes {
-        return Err(MultimodalError::ImageTooLarge {
-            input: source.to_string(),
-            size_bytes,
+fn map_artifact_error(source: &str, error: ArtifactError) -> MultimodalError {
+    match error {
+        ArtifactError::TooLarge {
+            actual_bytes,
             max_bytes,
-        }
-        .into());
+            ..
+        } => MultimodalError::ImageTooLarge {
+            input: source.to_string(),
+            size_bytes: usize::try_from(actual_bytes).unwrap_or(usize::MAX),
+            max_bytes: usize::try_from(max_bytes).unwrap_or(usize::MAX),
+        },
+        ArtifactError::RemoteDisabled(_) => MultimodalError::RemoteFetchDisabled {
+            input: source.to_string(),
+        },
+        ArtifactError::SsrfBlocked { host, .. } => MultimodalError::SsrfBlocked {
+            input: source.to_string(),
+            host,
+        },
+        ArtifactError::OutsideWorkspace(_) => MultimodalError::WorkspacePathDenied {
+            input: source.to_string(),
+        },
+        ArtifactError::InvalidLocalFile(_) => MultimodalError::ImageSourceNotFound {
+            input: source.to_string(),
+        },
+        ArtifactError::InvalidDataUri(reason) => MultimodalError::InvalidMarker {
+            input: source.to_string(),
+            reason,
+        },
+        ArtifactError::Io { reason, .. } => MultimodalError::LocalReadFailed {
+            input: source.to_string(),
+            reason,
+        },
+        other => MultimodalError::RemoteFetchFailed {
+            input: source.to_string(),
+            reason: other.to_string(),
+        },
     }
-
-    Ok(())
 }
 
 fn validate_mime(source: &str, mime: &str) -> anyhow::Result<()> {
@@ -499,8 +386,9 @@ mod tests {
             "Please inspect this screenshot [IMAGE:{}]",
             image_path.display()
         ))];
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
 
-        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let prepared = prepare_messages_for_provider(&messages, &MultimodalConfig::default(), artifacts.as_ref())
             .await
             .unwrap();
 
@@ -522,8 +410,10 @@ mod tests {
             max_image_size_mb: 5,
             allow_remote_fetch: false,
         };
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let error = prepare_messages_for_provider(&messages, &config, artifacts.as_ref())
             .await
             .expect_err("should reject image count overflow");
 
@@ -535,8 +425,10 @@ mod tests {
         let messages = vec![ChatMessage::user(
             "Look [IMAGE:https://example.com/img.png]".to_string(),
         )];
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
 
-        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default())
+        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default(), artifacts.as_ref())
             .await
             .expect_err("should reject remote image URL when fetch is disabled");
 
@@ -557,8 +449,9 @@ mod tests {
             max_image_size_mb: 1,
             allow_remote_fetch: false,
         };
+        let artifacts = MediaArtifactOwner::for_workspace(temp.path());
 
-        let error = prepare_messages_for_provider(&messages, &config)
+        let error = prepare_messages_for_provider(&messages, &config, artifacts.as_ref())
             .await
             .expect_err("should reject oversized local image");
 
@@ -573,74 +466,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ssrf_blocks_localhost_image_url() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://localhost/evil.png", 1024 * 1024, &client)
-            .await
-            .expect_err("should block localhost SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
+    async fn prepare_messages_rejects_workspace_escape() {
+        let workspace = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), [0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']).unwrap();
+        let messages = vec![ChatMessage::user(format!("[IMAGE:{}]", outside.path().display()))];
+        let artifacts = MediaArtifactOwner::for_workspace(workspace.path());
 
-    #[tokio::test]
-    async fn ssrf_blocks_private_ipv4_10_x() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://10.0.0.1/secret.png", 1024 * 1024, &client)
+        let error = prepare_messages_for_provider(&messages, &MultimodalConfig::default(), artifacts.as_ref())
             .await
-            .expect_err("should block 10.x.x.x SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
+            .expect_err("outside-workspace image must be rejected");
 
-    #[tokio::test]
-    async fn ssrf_blocks_private_ipv4_192_168() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://192.168.1.1/admin.png", 1024 * 1024, &client)
-            .await
-            .expect_err("should block 192.168.x.x SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn ssrf_blocks_cloud_metadata_endpoint() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://169.254.169.254/latest/meta-data/", 1024 * 1024, &client)
-            .await
-            .expect_err("should block cloud metadata SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn ssrf_blocks_private_ipv4_172_16() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://172.16.0.1/img.png", 1024 * 1024, &client)
-            .await
-            .expect_err("should block 172.16.x.x SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn ssrf_blocks_loopback_127_0_0_1() {
-        let client = Client::new();
-        let err = normalize_remote_image("http://127.0.0.1:8080/img.png", 1024 * 1024, &client)
-            .await
-            .expect_err("should block 127.0.0.1 SSRF");
-        assert!(err.to_string().contains("SSRF blocked"), "unexpected error: {err}");
-    }
-
-    #[tokio::test]
-    async fn ssrf_allows_public_url() {
-        // A public URL should NOT be blocked by SSRF check.
-        // It will fail at the HTTP fetch stage (connection error or non-image),
-        // but that error should NOT be "SSRF blocked".
-        let client = Client::new();
-        let result = normalize_remote_image("https://example.com/image.png", 1024 * 1024, &client).await;
-        match result {
-            Ok(_) => {} // unlikely but acceptable
-            Err(err) => {
-                assert!(
-                    !err.to_string().contains("SSRF blocked"),
-                    "public URL should not trigger SSRF block: {err}"
-                );
-            }
-        }
+        assert!(error.to_string().contains("outside the active workspace"));
     }
 }

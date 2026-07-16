@@ -22,6 +22,7 @@ pub struct ImageTool {
     temperature: f64,
     security: Arc<SecurityPolicy>,
     multimodal_config: MultimodalConfig,
+    media_artifacts: Arc<crate::media::MediaArtifactOwner>,
 }
 
 impl ImageTool {
@@ -32,12 +33,14 @@ impl ImageTool {
         security: Arc<SecurityPolicy>,
         multimodal_config: MultimodalConfig,
     ) -> Self {
+        let media_artifacts = crate::media::MediaArtifactOwner::for_workspace(&security.workspace_dir);
         Self {
             provider,
             model: model.into(),
             temperature,
             security,
             multimodal_config,
+            media_artifacts,
         }
     }
 
@@ -186,9 +189,13 @@ impl Tool for ImageTool {
         let messages = vec![ChatMessage::user(content)];
 
         // Normalize image references (local → base64 data URI, remote → validated data URI)
-        let prepared = multimodal::prepare_messages_for_provider(&messages, &self.multimodal_config)
-            .await
-            .map_err(|e| anyhow::anyhow!("Image preparation failed: {e}"))?;
+        let prepared = multimodal::prepare_messages_for_provider(
+            &messages,
+            &self.multimodal_config,
+            self.media_artifacts.as_ref(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("Image preparation failed: {e}"))?;
 
         if !prepared.contains_images {
             return Ok(ToolResult {
