@@ -165,6 +165,18 @@ Audit-driven boundaries introduced with Router rollout:
 - Reserved `router/` namespace ACL:
   reads/writes for reserved `router/` memory require `session_id="self_system"`.
   Non-`self_system` access is denied at memory backend/tool validation layers.
+- Route capability truth:
+  the explicit route owner reports capabilities for the resolved provider and
+  request mode. A reliability chain reports the safe intersection across all
+  compatible candidates.
+- Credential isolation:
+  each routed provider resolves its own credential through the shared provider
+  resolver. Credentials supplied for the primary provider are not copied into
+  another provider's route.
+- Attempt attribution:
+  both non-streaming and streaming fallback retain ordered attempts, including
+  failures before content. The successful attempt determines the final
+  provider/model recorded at the terminal boundary.
 
 ## Operations Guidance
 

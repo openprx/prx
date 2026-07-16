@@ -1261,6 +1261,68 @@ fn resolve_provider_credential_with_options(
     None
 }
 
+#[derive(Clone, Default)]
+struct ResolvedProviderCredentials {
+    credential: Option<String>,
+    qwen_base_url: Option<String>,
+    claude_refresh_token: Option<String>,
+    claude_expires_at: Option<i64>,
+}
+
+impl ResolvedProviderCredentials {
+    fn is_usable_for(&self, provider: &str) -> bool {
+        if matches!(provider, "bedrock" | "aws-bedrock") {
+            return true;
+        }
+        if matches!(provider, "gemini" | "google" | "google-gemini") {
+            return self.credential.is_some() || gemini::GeminiProvider::has_any_auth();
+        }
+        self.credential.as_deref().is_some_and(|credential| {
+            !is_claude_code_oauth_setup_token(credential) || self.claude_refresh_token.is_some()
+        })
+    }
+}
+
+/// Sole provider credential resolver used by construction and availability.
+/// It preserves provider-specific OAuth metadata while applying the common
+/// explicit/config-profile precedence exactly once.
+fn resolve_provider_credentials(
+    name: &str,
+    credential_override: Option<&str>,
+    options: &ProviderRuntimeOptions,
+) -> ResolvedProviderCredentials {
+    if is_qwen_oauth_alias(name) {
+        let context = resolve_qwen_oauth_context(credential_override);
+        return ResolvedProviderCredentials {
+            credential: context.credential,
+            qwen_base_url: context.base_url,
+            ..ResolvedProviderCredentials::default()
+        };
+    }
+
+    let placeholder_requested = credential_override
+        .map(str::trim)
+        .is_some_and(is_claude_code_oauth_placeholder);
+    if is_claude_code_alias(name) || (name == "anthropic" && (credential_override.is_none() || placeholder_requested)) {
+        let context = resolve_claude_code_context(credential_override);
+        let fallback_override = (!placeholder_requested).then_some(credential_override).flatten();
+        let fallback_name = if is_claude_code_alias(name) { "anthropic" } else { name };
+        return ResolvedProviderCredentials {
+            credential: context
+                .credential
+                .or_else(|| resolve_provider_credential_with_options(fallback_name, fallback_override, options)),
+            claude_refresh_token: context.refresh_token,
+            claude_expires_at: context.expires_at,
+            ..ResolvedProviderCredentials::default()
+        };
+    }
+
+    ResolvedProviderCredentials {
+        credential: resolve_provider_credential_with_options(name, credential_override, options),
+        ..ResolvedProviderCredentials::default()
+    }
+}
+
 fn resolve_auth_profile_credential(name: &str, options: &ProviderRuntimeOptions) -> Option<String> {
     let openprx_dir = options.openprx_dir.as_ref()?;
     let provider = canonical_auth_profile_provider(name);
@@ -1339,47 +1401,12 @@ fn create_provider_with_url_and_options(
     api_url: Option<&str>,
     options: &ProviderRuntimeOptions,
 ) -> anyhow::Result<Box<dyn Provider>> {
-    let qwen_oauth_context = is_qwen_oauth_alias(name).then(|| resolve_qwen_oauth_context(api_key));
-    let claude_code_placeholder_requested = api_key.map(str::trim).is_some_and(is_claude_code_oauth_placeholder);
-    let claude_code_context = if is_claude_code_alias(name) {
-        Some(resolve_claude_code_context(api_key))
-    } else if name == "anthropic" {
-        if api_key.is_none() || claude_code_placeholder_requested {
-            Some(resolve_claude_code_context(api_key))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    // Resolve credential and break static-analysis taint chain from the
-    // `api_key` parameter so that downstream provider storage of the value
-    // is not linked to the original sensitive-named source.
-    let resolved_credential = qwen_oauth_context
-        .as_ref()
-        .map_or_else(
-            || {
-                claude_code_context.as_ref().map_or_else(
-                    || resolve_provider_credential_with_options(name, api_key, options),
-                    |context| {
-                        let fallback_override = if claude_code_placeholder_requested {
-                            None
-                        } else {
-                            api_key
-                        };
-                        context.credential.clone().or_else(|| {
-                            if is_claude_code_alias(name) {
-                                resolve_provider_credential_with_options("anthropic", fallback_override, options)
-                            } else {
-                                resolve_provider_credential_with_options(name, fallback_override, options)
-                            }
-                        })
-                    },
-                )
-            },
-            |context| context.credential.clone(),
-        )
+    let resolved = resolve_provider_credentials(name, api_key, options);
+    // Break static-analysis taint chain from the sensitive-named input before
+    // downstream provider storage.
+    let resolved_credential = resolved
+        .credential
+        .clone()
         .map(|v| String::from_utf8(v.into_bytes()).unwrap_or_default());
     #[allow(clippy::option_as_ref_deref)]
     let key = resolved_credential.as_ref().map(String::as_str);
@@ -1393,14 +1420,12 @@ fn create_provider_with_url_and_options(
         // ── Primary providers (custom implementations) ───────
         "openrouter" => Ok(Box::new(openrouter::OpenRouterProvider::new(key))),
         "anthropic" => {
-            if let Some(ctx) = claude_code_context.as_ref() {
-                if ctx.refresh_token.is_some() {
-                    return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
-                        key,
-                        ctx.refresh_token.clone(),
-                        ctx.expires_at,
-                    )));
-                }
+            if resolved.claude_refresh_token.is_some() {
+                return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
+                    key,
+                    resolved.claude_refresh_token.clone(),
+                    resolved.claude_expires_at,
+                )));
             }
             // OAuth setup tokens (sk-ant-oat01-) require Bearer auth + refresh_token.
             // Without a refresh_token they cannot be used as plain x-api-key credentials.
@@ -1414,14 +1439,12 @@ fn create_provider_with_url_and_options(
             Ok(Box::new(anthropic::AnthropicProvider::new(effective_key)))
         }
         name if is_claude_code_alias(name) => {
-            if let Some(ctx) = claude_code_context.as_ref() {
-                if ctx.refresh_token.is_some() {
-                    return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
-                        key,
-                        ctx.refresh_token.clone(),
-                        ctx.expires_at,
-                    )));
-                }
+            if resolved.claude_refresh_token.is_some() {
+                return Ok(Box::new(anthropic::AnthropicProvider::with_oauth(
+                    key,
+                    resolved.claude_refresh_token.clone(),
+                    resolved.claude_expires_at,
+                )));
             }
             // Same guard as the "anthropic" arm above.
             let effective_key = key.filter(|k| !is_claude_code_oauth_setup_token(k));
@@ -1524,7 +1547,7 @@ fn create_provider_with_url_and_options(
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
-                .or_else(|| qwen_oauth_context.as_ref().and_then(|context| context.base_url.clone()))
+                .or_else(|| resolved.qwen_base_url.clone())
                 .unwrap_or_else(|| QWEN_OAUTH_BASE_FALLBACK_URL.to_string());
 
             Ok(Box::new(OpenAiCompatibleProvider::new_with_user_agent(
@@ -1906,7 +1929,10 @@ pub fn create_routed_provider_with_options(
                 (!trimmed_key.is_empty()).then_some(trimmed_key)
             })
         });
-        let key = routed_credential.or(api_key);
+        // A route-specific provider must never inherit the primary provider's
+        // secret. Its own explicit key or canonical profile/OAuth resolver is
+        // the only valid source.
+        let key = select_routed_credential(name, primary_name, routed_credential, api_key);
         // Only use api_url for the primary provider
         let url = if name == primary_name { api_url } else { None };
         match create_resilient_provider_with_options(name, key, url, reliability, options) {
@@ -1942,6 +1968,15 @@ pub fn create_routed_provider_with_options(
         routes,
         default_model.to_string(),
     )))
+}
+
+fn select_routed_credential<'a>(
+    provider_name: &str,
+    primary_name: &str,
+    routed_credential: Option<&'a str>,
+    primary_credential: Option<&'a str>,
+) -> Option<&'a str> {
+    routed_credential.or_else(|| (provider_name == primary_name).then_some(primary_credential).flatten())
 }
 
 /// Information about a supported provider for display purposes.
@@ -2139,7 +2174,7 @@ pub fn summarize_provider_availability(
     let mut unavailable = Vec::new();
 
     for provider in &configured {
-        if let Err(error) = create_provider(provider, None) {
+        if let Err(error) = create_provider_with_options(provider, None, options) {
             unavailable.push((provider.clone(), format!("invalid provider: {error}")));
             continue;
         }
@@ -2153,33 +2188,9 @@ pub fn summarize_provider_availability(
             continue;
         }
 
-        let explicit_for_provider = if provider == primary_name { api_key } else { None };
-        if provider_requires_explicit_credential(provider)
-            && resolve_provider_credential_with_options(provider, explicit_for_provider, options).is_none()
-        {
-            // For anthropic (and its claude-code / claude-cli aliases), also check Claude Code
-            // OAuth credentials from ~/.claude/.credentials.json.
-            // OAuth setup tokens (sk-ant-oat01-) are only usable when paired with a refresh_token
-            // for the full OAuth flow; without one they cannot serve as a plain API key.
-            if provider == "anthropic" || is_claude_code_alias(provider) {
-                let ctx = resolve_claude_code_context(None);
-                let has_usable_credential = ctx
-                    .credential
-                    .as_deref()
-                    .is_some_and(|token| !is_claude_code_oauth_setup_token(token) || ctx.refresh_token.is_some());
-                if has_usable_credential {
-                    available.push(provider.clone());
-                    continue;
-                }
-            }
-            // For Gemini, also check env vars (GEMINI_API_KEY / GOOGLE_API_KEY) and CLI OAuth tokens,
-            // because GeminiProvider::new() reads those independently of resolve_provider_credential().
-            if matches!(provider.as_str(), "gemini" | "google" | "google-gemini")
-                && gemini::GeminiProvider::has_any_auth()
-            {
-                available.push(provider.clone());
-                continue;
-            }
+        let explicit_for_provider = (provider == primary_name).then_some(api_key).flatten();
+        let resolved = resolve_provider_credentials(provider, explicit_for_provider, options);
+        if provider_requires_explicit_credential(provider) && !resolved.is_usable_for(provider) {
             unavailable.push((provider.clone(), "missing credential/api key".to_string()));
             continue;
         }
@@ -2547,6 +2558,22 @@ mod tests {
     fn resolve_provider_credential_prefers_explicit_argument() {
         let resolved = resolve_provider_credential("openrouter", Some("  explicit-key  "));
         assert_eq!(resolved, Some("explicit-key".to_string()));
+    }
+
+    #[test]
+    fn routed_provider_never_inherits_primary_credential() {
+        assert_eq!(
+            select_routed_credential("anthropic", "openai", None, Some("openai-secret")),
+            None
+        );
+        assert_eq!(
+            select_routed_credential("openai", "openai", None, Some("openai-secret")),
+            Some("openai-secret")
+        );
+        assert_eq!(
+            select_routed_credential("anthropic", "openai", Some("anthropic-secret"), Some("openai-secret")),
+            Some("anthropic-secret")
+        );
     }
 
     #[test]

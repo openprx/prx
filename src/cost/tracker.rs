@@ -1,23 +1,40 @@
-use super::types::{BudgetCheck, CostRecord, CostSummary, ModelStats, TokenUsage, UsagePeriod};
+use super::types::{BudgetCheck, CostRecord, CostSettlement, CostSummary, ModelStats, TokenUsage, UsagePeriod};
 use crate::config::schema::CostConfig;
 use anyhow::{Context, Result, anyhow};
 use chrono::{Datelike, NaiveDate, Utc};
 use parking_lot::{Mutex, MutexGuard};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
-    config: CostConfig,
+    config: Arc<Mutex<CostConfig>>,
     storage: Arc<Mutex<CostStorage>>,
     session_id: String,
     session_costs: Arc<Mutex<Vec<CostRecord>>>,
 }
 
 impl CostTracker {
+    /// Return the sole process-level cost authority for a canonical workspace.
+    pub fn for_workspace(config: CostConfig, workspace_dir: &Path) -> Result<Arc<Self>> {
+        static TRACKERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
+        let workspace_dir = workspace_dir
+            .canonicalize()
+            .unwrap_or_else(|_| workspace_dir.to_path_buf());
+        let trackers = TRACKERS.get_or_init(|| StdMutex::new(HashMap::new()));
+        let mut trackers = trackers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(tracker) = trackers.get(&workspace_dir) {
+            *tracker.config.lock() = config;
+            return Ok(Arc::clone(tracker));
+        }
+        let tracker = Arc::new(Self::new(config, &workspace_dir)?);
+        trackers.insert(workspace_dir, Arc::clone(&tracker));
+        Ok(tracker)
+    }
+
     /// Create a new cost tracker.
     pub fn new(config: CostConfig, workspace_dir: &Path) -> Result<Self> {
         let storage_path = resolve_storage_path(workspace_dir)?;
@@ -26,7 +43,7 @@ impl CostTracker {
             .with_context(|| format!("Failed to open cost storage at {}", storage_path.display()))?;
 
         Ok(Self {
-            config,
+            config: Arc::new(Mutex::new(config)),
             storage: Arc::new(Mutex::new(storage)),
             session_id: uuid::Uuid::new_v4().to_string(),
             session_costs: Arc::new(Mutex::new(Vec::new())),
@@ -48,7 +65,8 @@ impl CostTracker {
 
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
-        if !self.config.enabled {
+        let config = self.config.lock().clone();
+        if !config.enabled {
             return Ok(BudgetCheck::Allowed);
         }
 
@@ -59,53 +77,12 @@ impl CostTracker {
         let mut storage = self.lock_storage();
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
 
-        // Check daily limit
-        let projected_daily = daily_cost + estimated_cost_usd;
-        if projected_daily > self.config.daily_limit_usd {
-            return Ok(BudgetCheck::Exceeded {
-                current_usd: daily_cost,
-                limit_usd: self.config.daily_limit_usd,
-                period: UsagePeriod::Day,
-            });
-        }
-
-        // Check monthly limit
-        let projected_monthly = monthly_cost + estimated_cost_usd;
-        if projected_monthly > self.config.monthly_limit_usd {
-            return Ok(BudgetCheck::Exceeded {
-                current_usd: monthly_cost,
-                limit_usd: self.config.monthly_limit_usd,
-                period: UsagePeriod::Month,
-            });
-        }
-
-        // Check warning thresholds
-        let warn_threshold = f64::from(self.config.warn_at_percent.min(100)) / 100.0;
-        let daily_warn_threshold = self.config.daily_limit_usd * warn_threshold;
-        let monthly_warn_threshold = self.config.monthly_limit_usd * warn_threshold;
-
-        if projected_daily >= daily_warn_threshold {
-            return Ok(BudgetCheck::Warning {
-                current_usd: daily_cost,
-                limit_usd: self.config.daily_limit_usd,
-                period: UsagePeriod::Day,
-            });
-        }
-
-        if projected_monthly >= monthly_warn_threshold {
-            return Ok(BudgetCheck::Warning {
-                current_usd: monthly_cost,
-                limit_usd: self.config.monthly_limit_usd,
-                period: UsagePeriod::Month,
-            });
-        }
-
-        Ok(BudgetCheck::Allowed)
+        Ok(budget_check(&config, daily_cost, monthly_cost, estimated_cost_usd))
     }
 
     /// Record a usage event.
     pub fn record_usage(&self, usage: TokenUsage) -> Result<()> {
-        if !self.config.enabled {
+        if !self.config.lock().enabled {
             return Ok(());
         }
 
@@ -126,6 +103,48 @@ impl CostTracker {
         session_costs.push(record);
 
         Ok(())
+    }
+
+    /// Idempotently project a canonical terminal usage settlement into the
+    /// persistent cost ledger. Unknown price remains explicit, never zero.
+    pub fn settle_metered(
+        &self,
+        record: &crate::llm::route_decision::MeteredTokenUsageRecord,
+    ) -> Result<CostSettlement> {
+        let config = self.config.lock().clone();
+        if !config.enabled {
+            return Ok(CostSettlement::Disabled);
+        }
+        let settlement_id = record
+            .settlement_id
+            .as_deref()
+            .ok_or_else(|| anyhow!("Metered usage settlement is missing settlement_id"))?;
+        let Some(cost_usd) = record.cost_usd else {
+            return Ok(CostSettlement::UnknownPricing);
+        };
+        if !cost_usd.is_finite() || cost_usd < 0.0 {
+            return Err(anyhow!("Metered usage cost must be a finite, non-negative value"));
+        }
+
+        let mut storage = self.lock_storage();
+        if storage.has_settlement(settlement_id) {
+            return Ok(CostSettlement::Replayed);
+        }
+        let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
+        let budget = budget_check(&config, daily_cost, monthly_cost, cost_usd);
+        let usage = TokenUsage {
+            model: format!("{}/{}", record.provider, record.model),
+            input_tokens: record.prompt_tokens,
+            output_tokens: record.completion_tokens,
+            total_tokens: record.total_tokens,
+            cost_usd,
+            timestamp: Utc::now(),
+        };
+        let cost_record = CostRecord::from_settlement(&self.session_id, settlement_id, usage);
+        storage.add_record(cost_record.clone())?;
+        drop(storage);
+        self.lock_session_costs().push(cost_record);
+        Ok(CostSettlement::Recorded { budget })
     }
 
     /// Get the current cost summary.
@@ -162,6 +181,41 @@ impl CostTracker {
         let storage = self.lock_storage();
         storage.get_cost_for_month(year, month)
     }
+}
+
+fn budget_check(config: &CostConfig, daily_cost: f64, monthly_cost: f64, estimated_cost_usd: f64) -> BudgetCheck {
+    let projected_daily = daily_cost + estimated_cost_usd;
+    if projected_daily > config.daily_limit_usd {
+        return BudgetCheck::Exceeded {
+            current_usd: daily_cost,
+            limit_usd: config.daily_limit_usd,
+            period: UsagePeriod::Day,
+        };
+    }
+    let projected_monthly = monthly_cost + estimated_cost_usd;
+    if projected_monthly > config.monthly_limit_usd {
+        return BudgetCheck::Exceeded {
+            current_usd: monthly_cost,
+            limit_usd: config.monthly_limit_usd,
+            period: UsagePeriod::Month,
+        };
+    }
+    let warn_threshold = f64::from(config.warn_at_percent.min(100)) / 100.0;
+    if projected_daily >= config.daily_limit_usd * warn_threshold {
+        return BudgetCheck::Warning {
+            current_usd: daily_cost,
+            limit_usd: config.daily_limit_usd,
+            period: UsagePeriod::Day,
+        };
+    }
+    if projected_monthly >= config.monthly_limit_usd * warn_threshold {
+        return BudgetCheck::Warning {
+            current_usd: monthly_cost,
+            limit_usd: config.monthly_limit_usd,
+            period: UsagePeriod::Month,
+        };
+    }
+    BudgetCheck::Allowed
 }
 
 fn resolve_storage_path(workspace_dir: &Path) -> Result<PathBuf> {
@@ -221,6 +275,7 @@ struct CostStorage {
     cached_day: NaiveDate,
     cached_year: i32,
     cached_month: u32,
+    settlement_ids: HashSet<String>,
 }
 
 impl CostStorage {
@@ -238,11 +293,28 @@ impl CostStorage {
             cached_day: now.date_naive(),
             cached_year: now.year(),
             cached_month: now.month(),
+            settlement_ids: HashSet::new(),
         };
 
         storage.rebuild_aggregates(storage.cached_day, storage.cached_year, storage.cached_month)?;
+        storage.load_settlement_ids()?;
 
         Ok(storage)
+    }
+
+    fn load_settlement_ids(&mut self) -> Result<()> {
+        let mut ids = HashSet::new();
+        self.for_each_record(|record| {
+            if let Some(settlement_id) = record.settlement_id {
+                ids.insert(settlement_id);
+            }
+        })?;
+        self.settlement_ids = ids;
+        Ok(())
+    }
+
+    fn has_settlement(&self, settlement_id: &str) -> bool {
+        self.settlement_ids.contains(settlement_id)
     }
 
     fn for_each_record<F>(&self, mut on_record: F) -> Result<()>
@@ -338,6 +410,9 @@ impl CostStorage {
             .with_context(|| format!("Failed to sync cost storage at {}", self.path.display()))?;
 
         self.ensure_period_cache_current()?;
+        if let Some(settlement_id) = record.settlement_id.as_ref() {
+            self.settlement_ids.insert(settlement_id.clone());
+        }
 
         let timestamp = record.usage.timestamp.naive_utc();
         if timestamp.date() == self.cached_day {
@@ -505,5 +580,57 @@ mod tests {
             err.to_string()
                 .contains("Estimated cost must be a finite, non-negative value")
         );
+    }
+
+    fn metered_record(
+        settlement_id: &str,
+        cost_usd: Option<f64>,
+    ) -> crate::llm::route_decision::MeteredTokenUsageRecord {
+        crate::llm::route_decision::MeteredTokenUsageRecord {
+            settlement_id: Some(settlement_id.to_string()),
+            provider: "provider-a".to_string(),
+            model: "model-a".to_string(),
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+            source: crate::llm::route_decision::TokenUsageSource::Reported,
+            cost_usd,
+        }
+    }
+
+    #[test]
+    fn canonical_settlement_is_process_owned_idempotent_and_budgeted() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: true,
+            daily_limit_usd: 0.001,
+            monthly_limit_usd: 1.0,
+            ..Default::default()
+        };
+        let first = CostTracker::for_workspace(config.clone(), tmp.path()).unwrap();
+        let second = CostTracker::for_workspace(config, tmp.path()).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+
+        let record = metered_record("turn-1", Some(0.002));
+        let settled = first.settle_metered(&record).unwrap();
+        assert!(matches!(
+            settled,
+            CostSettlement::Recorded {
+                budget: BudgetCheck::Exceeded { .. }
+            }
+        ));
+        assert_eq!(second.settle_metered(&record).unwrap(), CostSettlement::Replayed);
+        assert_eq!(first.get_summary().unwrap().request_count, 1);
+    }
+
+    #[test]
+    fn unknown_price_is_not_recorded_as_zero_cost() {
+        let tmp = TempDir::new().unwrap();
+        let tracker = CostTracker::for_workspace(enabled_config(), tmp.path()).unwrap();
+        let settlement = tracker.settle_metered(&metered_record("turn-unknown", None)).unwrap();
+        assert_eq!(settlement, CostSettlement::UnknownPricing);
+        assert_eq!(tracker.get_summary().unwrap().request_count, 0);
     }
 }

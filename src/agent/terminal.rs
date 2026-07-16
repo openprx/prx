@@ -6,6 +6,7 @@
 //! computes one usage settlement, and appends one `turn.finalized` commit marker.
 
 use crate::config::schema::CostConfig;
+use crate::cost::types::CostSettlement;
 use crate::llm::route_decision::{MeteredTokenUsageRecord, ProviderExecutionOutcome};
 use crate::memory::{MemoryFabric, MessageEvent, MessageEventScope};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ pub struct TurnTerminalReceipt {
     pub terminal_event: MessageEvent,
     pub assistant_event: Option<MessageEvent>,
     pub usage_settlement: Option<MeteredTokenUsageRecord>,
+    pub cost_settlement: Option<CostSettlement>,
     pub delivery_intent: TurnDeliveryIntent,
 }
 
@@ -111,6 +113,7 @@ struct TurnTerminalPayload<'a> {
     assistant_event_id: Option<&'a str>,
     provider_outcome: &'a Option<ProviderExecutionOutcome>,
     usage_settlement: &'a Option<MeteredTokenUsageRecord>,
+    cost_settlement: &'a Option<CostSettlement>,
     telemetry: &'a TurnTerminalTelemetry,
     delivery_intent: &'a TurnDeliveryIntent,
     attempt_id: Option<&'a str>,
@@ -151,6 +154,32 @@ pub async fn finalize_turn(
         .provider_outcome
         .as_ref()
         .and_then(|outcome| usage_settlement(&commit.terminal_id, outcome, cost_config));
+    let cost_settlement = if let Some(usage) = usage_settlement.as_ref() {
+        let usage_json = serde_json::to_string(usage)?;
+        fabric
+            .record_runtime_event_idempotent(
+                commit.scope.clone(),
+                "usage.settled",
+                format!("settlement_id={}", commit.terminal_id),
+                Some(usage_json),
+                format!("turn:{}:usage", commit.terminal_id),
+            )
+            .await?;
+        if cost_config.enabled {
+            let workspace_dir = std::path::Path::new(fabric.workspace_id());
+            anyhow::ensure!(
+                workspace_dir.is_absolute(),
+                "cost settlement requires an absolute workspace id, got {}",
+                fabric.workspace_id()
+            );
+            let tracker = crate::cost::tracker::CostTracker::for_workspace(cost_config.clone(), workspace_dir)?;
+            Some(tracker.settle_metered(usage)?)
+        } else {
+            Some(CostSettlement::Disabled)
+        }
+    } else {
+        None
+    };
     let payload = TurnTerminalPayload {
         terminal_id: &commit.terminal_id,
         status: commit.status,
@@ -158,6 +187,7 @@ pub async fn finalize_turn(
         assistant_event_id: assistant_event.as_ref().map(|event| event.event_id.as_str()),
         provider_outcome: &commit.provider_outcome,
         usage_settlement: &usage_settlement,
+        cost_settlement: &cost_settlement,
         telemetry: &commit.telemetry,
         delivery_intent: &commit.delivery_intent,
         attempt_id: commit.scope.attempt_id.as_deref(),
@@ -179,6 +209,7 @@ pub async fn finalize_turn(
         terminal_event,
         assistant_event,
         usage_settlement,
+        cost_settlement,
         delivery_intent: commit.delivery_intent,
     })
 }
@@ -236,6 +267,7 @@ mod tests {
                 .and_then(|usage| usage.settlement_id.as_deref()),
             Some("run-a")
         );
+        assert_eq!(first.cost_settlement, Some(CostSettlement::Disabled));
         let principal = MemoryPrincipal {
             workspace_id: "workspace-a".to_string(),
             agent_id: None,
@@ -251,6 +283,13 @@ mod tests {
             events
                 .iter()
                 .filter(|event| event.event_type == "turn.finalized")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "usage.settled")
                 .count(),
             1
         );
@@ -335,7 +374,7 @@ mod tests {
                 owner_id: None,
                 legacy_session_key: None,
             };
-            let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+            let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
             assert_eq!(
                 events
                     .iter()
@@ -424,7 +463,7 @@ mod tests {
                 owner_id: None,
                 legacy_session_key: None,
             };
-            let events = memory.list_message_events_since(&principal, 0, 32).await.unwrap();
+            let events = memory.list_message_events_since(&principal, 0, 128).await.unwrap();
             assert_eq!(
                 events
                     .iter()

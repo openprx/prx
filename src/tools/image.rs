@@ -159,7 +159,11 @@ impl Tool for ImageTool {
         }
 
         // Check that the provider supports vision
-        if !self.provider.supports_vision() {
+        if !self
+            .provider
+            .capabilities_for(&self.model, crate::providers::traits::ProviderRequestMode::NonStreaming)
+            .vision
+        {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),

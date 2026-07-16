@@ -33,3 +33,23 @@ OpenPRX supports 14 LLM providers with automatic fallback chains, model routing,
 
 - OpenAI Codex response parsing now fails fast with structured errors for malformed/unexpected payloads (`provider_response_parse_error`), instead of waiting on long tail body decode.
 - Stream idle timeout is controlled by `ZEROCLAW_CODEX_STREAM_IDLE_TIMEOUT_SECS` (default: `45` seconds, minimum: `5` seconds).
+
+## Runtime truth boundaries
+
+- Capability checks are model- and request-mode-specific. A streaming request is
+  not allowed to inherit a capability advertised only by a non-streaming path.
+- Router capabilities describe the provider selected for the resolved route.
+  Reliable failover advertises only the capability intersection of every
+  compatible candidate, so a later fallback cannot invalidate the request.
+- Gemini currently reports native tool calling as unavailable because its
+  generate-content requests do not yet send tool schemas. Parsing a function
+  call response alone is not treated as end-to-end support.
+- Provider construction and availability checks use the same credential
+  resolver. A route receives only its own resolved credential; a primary
+  provider credential is never inherited by a different routed provider.
+- Non-streaming and streaming execution both retain the ordered provider/model
+  attempt trace. The successful attempt is the source of final provider and
+  model attribution.
+
+The canonical routing, usage, and cost settlement boundary is described in
+`provider-routing-cost-lifecycle.md`.

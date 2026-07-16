@@ -269,6 +269,10 @@ pub struct StreamChunk {
     /// Provider 负责把所有 SSE event 累积成完整 tool_call (id + name + args)
     /// 再 emit 单个 chunk；driver 不做增量解析。
     pub tool_calls: Vec<ToolCallChunk>,
+    /// Reliable/router wrappers attach one completed network-attempt event here.
+    /// Content adapters leave it `None`; callers then synthesize one direct
+    /// attempt for backward compatibility.
+    pub route_attempt: Option<ProviderAttempt>,
 }
 
 impl StreamChunk {
@@ -281,6 +285,7 @@ impl StreamChunk {
             token_count: 0,
             usage: None,
             tool_calls: Vec::new(),
+            route_attempt: None,
         }
     }
 
@@ -295,6 +300,7 @@ impl StreamChunk {
             token_count: 0,
             usage: None,
             tool_calls: Vec::new(),
+            route_attempt: None,
         }
     }
 
@@ -311,6 +317,7 @@ impl StreamChunk {
             token_count: 0,
             usage: None,
             tool_calls: calls,
+            route_attempt: None,
         }
     }
 
@@ -323,6 +330,7 @@ impl StreamChunk {
             token_count: 0,
             usage: Some(usage),
             tool_calls: Vec::new(),
+            route_attempt: None,
         }
     }
 
@@ -335,6 +343,7 @@ impl StreamChunk {
             token_count: 0,
             usage: None,
             tool_calls: Vec::new(),
+            route_attempt: None,
         }
     }
 
@@ -347,6 +356,14 @@ impl StreamChunk {
             token_count: 0,
             usage: None,
             tool_calls: Vec::new(),
+            route_attempt: None,
+        }
+    }
+
+    pub fn route_attempt(attempt: ProviderAttempt) -> Self {
+        Self {
+            route_attempt: Some(attempt),
+            ..Self::default()
         }
     }
 
@@ -496,6 +513,12 @@ pub struct ProviderCapabilities {
     pub vision: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderRequestMode {
+    NonStreaming,
+    Streaming,
+}
+
 /// Provider-specific tool payload formats.
 ///
 /// Different LLM providers require different formats for tool definitions.
@@ -523,6 +546,18 @@ pub trait Provider: Send + Sync {
     /// Providers should override this to declare their actual capabilities.
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities::default()
+    }
+
+    /// Capabilities for the concrete model and invocation mode that will run.
+    /// Wrappers must override this when routing/fallback can change the backend.
+    fn capabilities_for(&self, _model: &str, mode: ProviderRequestMode) -> ProviderCapabilities {
+        if mode == ProviderRequestMode::Streaming && !self.supports_streaming() {
+            return ProviderCapabilities::default();
+        }
+        ProviderCapabilities {
+            native_tool_calling: self.supports_native_tools(),
+            vision: self.supports_vision(),
+        }
     }
 
     /// Convert tool specifications to provider-native format.

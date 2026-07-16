@@ -2101,7 +2101,10 @@ async fn run_signal_vision_preflight(
         return SignalVisionPreflightOutcome::NotRequired;
     }
 
-    if !provider.supports_vision() {
+    if !provider
+        .capabilities_for(model, crate::providers::traits::ProviderRequestMode::NonStreaming)
+        .vision
+    {
         tracing::warn!("Signal image guard: provider does not support vision, forcing uncertainty fallback");
         return SignalVisionPreflightOutcome::Fallback;
     }
@@ -5052,7 +5055,9 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     ));
 
     let bootstrap_max_chars = if config.agent.compact_context { Some(6000) } else { None };
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider
+        .capabilities_for(&model, crate::providers::traits::ProviderRequestMode::NonStreaming)
+        .native_tool_calling;
     let mut system_prompt = build_system_prompt_with_mode(
         &workspace,
         &model,

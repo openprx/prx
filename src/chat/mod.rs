@@ -3692,7 +3692,9 @@ pub async fn run(
             "Schedule a future message back into the current chat main session for dispatcher self-wake observation.",
         ),
     ];
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider
+        .capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::Streaming)
+        .native_tool_calling;
 
     // ── Approval manager ─────────────────────────────────────────
     let approval_manager = Arc::new(ApprovalManager::new());

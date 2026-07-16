@@ -5207,6 +5207,7 @@ async fn run_streaming_provider_turn(
         let mut calls = Vec::new();
         let mut call_aggregator = SharedToolCallAggregator::default();
         let mut usage = ProviderUsageAccumulator::new();
+        let mut route_attempts = Vec::new();
 
         let stream_result: Result<()> = loop {
             let next = if let Some(token) = cancellation {
@@ -5225,8 +5226,12 @@ async fn run_streaming_provider_turn(
                     is_final,
                     usage: chunk_usage,
                     tool_calls,
+                    route_attempt,
                     ..
                 })) => {
+                    if let Some(route_attempt) = route_attempt {
+                        route_attempts.push(route_attempt);
+                    }
                     if let Some(chunk_usage) = chunk_usage {
                         usage.record(chunk_usage);
                     }
@@ -5260,24 +5265,34 @@ async fn run_streaming_provider_turn(
                 let tokens_used = usage.finish_or_estimate_completion_chars(
                     text.chars().count().saturating_add(reasoning.chars().count()),
                 );
+                let successful_attempt = route_attempts
+                    .iter()
+                    .rev()
+                    .find(|attempt| attempt.status == crate::llm::route_decision::AttemptStatus::Success);
+                let final_provider =
+                    successful_attempt.map_or_else(|| provider_name.to_string(), |attempt| attempt.provider.clone());
+                let final_model = successful_attempt.map_or_else(|| model.to_string(), |attempt| attempt.model.clone());
+                if route_attempts.is_empty() {
+                    route_attempts.push(crate::llm::route_decision::ProviderAttempt {
+                        seq: 1,
+                        provider: final_provider.clone(),
+                        model: final_model.clone(),
+                        started_at,
+                        finished_at,
+                        status: crate::llm::route_decision::AttemptStatus::Success,
+                        error_class: None,
+                        error_message: None,
+                    });
+                }
                 return Ok(crate::providers::traits::ChatTrace {
                     response: ChatResponse {
                         text: Some(text),
                         tool_calls: calls,
                         reasoning_content: (!reasoning.is_empty()).then_some(reasoning),
                     },
-                    attempts: vec![crate::llm::route_decision::ProviderAttempt {
-                        seq: 1,
-                        provider: provider_name.to_string(),
-                        model: model.to_string(),
-                        started_at,
-                        finished_at,
-                        status: crate::llm::route_decision::AttemptStatus::Success,
-                        error_class: None,
-                        error_message: None,
-                    }],
-                    final_provider: provider_name.to_string(),
-                    final_model: model.to_string(),
+                    attempts: route_attempts,
+                    final_provider,
+                    final_model,
                     tokens_used,
                 });
             }
@@ -5873,8 +5888,13 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // and custom providers do not override `supports_native_tools()`, so using
     // that buffered-path capability gate here silently drops real Chat tools.
     // Buffered Agent callers keep the provider capability gate unchanged.
-    let use_native_tools =
-        (runtime_adapter.stream_provider || provider.supports_native_tools()) && !tool_specs.is_empty();
+    let provider_mode = if runtime_adapter.stream_provider {
+        crate::providers::traits::ProviderRequestMode::Streaming
+    } else {
+        crate::providers::traits::ProviderRequestMode::NonStreaming
+    };
+    let mode_capabilities = provider.capabilities_for(model, provider_mode);
+    let use_native_tools = mode_capabilities.native_tool_calling && !tool_specs.is_empty();
 
     // FIX-P3-05: Letta/MemGPT-style OS-paging. Opt-in (`os_paging.enabled`);
     // when off this whole block is a no-op and the legacy compaction path below
@@ -5965,7 +5985,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
         }
 
         let image_marker_count = multimodal::count_image_markers(history);
-        if image_marker_count > 0 && !provider.supports_vision() {
+        if image_marker_count > 0 && !mode_capabilities.vision {
             return Err(ProviderCapabilityError {
                 provider: provider_name.to_string(),
                 capability: "vision".to_string(),
@@ -6975,7 +6995,9 @@ pub(crate) async fn run_with_runtime_envelope(
             "Delegate a sub-task to a specialized agent. Use when: task needs different model/capability, or to parallelize work.",
         ));
     }
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider
+        .capabilities_for(model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
+        .native_tool_calling;
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
     let skills =
         crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;
@@ -7834,7 +7856,9 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     if config.composio.enabled {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
-    let native_tools = provider.supports_native_tools();
+    let native_tools = provider
+        .capabilities_for(&model_name, crate::providers::traits::ProviderRequestMode::NonStreaming)
+        .native_tool_calling;
     let skill_embedder = memory::create_embedder_from_config(&config, config.api_key.as_deref());
     let skills =
         crate::skills::load_skills_with_embeddings(&config.workspace_dir, &config, skill_embedder.as_ref()).await?;

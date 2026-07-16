@@ -647,7 +647,9 @@ fn drain_gemini_chunk(
 impl Provider for GeminiProvider {
     fn capabilities(&self) -> crate::providers::traits::ProviderCapabilities {
         crate::providers::traits::ProviderCapabilities {
-            native_tool_calling: true,
+            // The current generateContent adapters do not send tool schemas.
+            // Function-call response parsing alone is not native tool support.
+            native_tool_calling: false,
             vision: true,
         }
     }
@@ -948,6 +950,13 @@ mod tests {
     fn provider_rejects_empty_key() {
         let provider = GeminiProvider::new(Some(""));
         assert!(!matches!(provider.auth, Some(GeminiAuth::ExplicitKey(_))));
+    }
+
+    #[test]
+    fn capabilities_do_not_claim_unsent_native_tool_schemas() {
+        let provider = GeminiProvider::new(Some("test-api-key"));
+        assert!(!provider.capabilities().native_tool_calling);
+        assert!(provider.capabilities().vision);
     }
 
     #[test]

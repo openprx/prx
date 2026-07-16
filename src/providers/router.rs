@@ -1,5 +1,8 @@
 use super::Provider;
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, ProviderCapabilities, ProviderRequestMode, StreamChunk, StreamOptions,
+    StreamResult,
+};
 use crate::llm::route_decision::{ProviderExecutionOutcome, RouteDecision, validate_user_route_hint};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -95,6 +98,17 @@ impl RouterProvider {
 
 #[async_trait]
 impl Provider for RouterProvider {
+    fn capabilities_for(&self, model: &str, mode: ProviderRequestMode) -> ProviderCapabilities {
+        let Ok((provider_idx, resolved_model)) = self.resolve(model) else {
+            return ProviderCapabilities::default();
+        };
+        self.providers
+            .get(provider_idx)
+            .map_or_else(ProviderCapabilities::default, |(_, provider)| {
+                provider.capabilities_for(&resolved_model, mode)
+            })
+    }
+
     async fn chat_with_system(
         &self,
         system_prompt: Option<&str>,
@@ -630,6 +644,7 @@ impl Provider for MockEnvProvider {
                     token_count: 0,
                     usage: None,
                     tool_calls: Vec::new(),
+                    route_attempt: None,
                 }),
                 Ok(StreamChunk::final_chunk()),
             ],
@@ -1183,5 +1198,40 @@ mod tests {
         );
 
         assert!(router.supports_native_tools());
+    }
+
+    #[test]
+    fn mode_capabilities_follow_the_resolved_route_not_any_provider() {
+        let router = RouterProvider::new(
+            vec![
+                (
+                    "default".into(),
+                    Box::new(NativeCapabilityMock { native_tools: false }) as Box<dyn Provider>,
+                ),
+                (
+                    "alternate".into(),
+                    Box::new(NativeCapabilityMock { native_tools: true }) as Box<dyn Provider>,
+                ),
+            ],
+            vec![(
+                "tools".into(),
+                Route {
+                    provider_name: "alternate".into(),
+                    model: "tool-model".into(),
+                },
+            )],
+            "default-model".into(),
+        );
+
+        assert!(
+            !router
+                .capabilities_for("plain-model", ProviderRequestMode::NonStreaming)
+                .native_tool_calling
+        );
+        assert!(
+            router
+                .capabilities_for("hint:tools", ProviderRequestMode::NonStreaming)
+                .native_tool_calling
+        );
     }
 }

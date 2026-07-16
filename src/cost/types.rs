@@ -69,6 +69,9 @@ pub enum UsagePeriod {
 pub struct CostRecord {
     /// Unique identifier
     pub id: String,
+    /// Stable terminal settlement identifier. Legacy/manual records omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settlement_id: Option<String>,
     /// Token usage details
     pub usage: TokenUsage,
     /// Session identifier (for grouping)
@@ -80,6 +83,17 @@ impl CostRecord {
     pub fn new(session_id: impl Into<String>, usage: TokenUsage) -> Self {
         Self {
             id: uuid::Uuid::new_v4().to_string(),
+            settlement_id: None,
+            usage,
+            session_id: session_id.into(),
+        }
+    }
+
+    pub fn from_settlement(session_id: impl Into<String>, settlement_id: impl Into<String>, usage: TokenUsage) -> Self {
+        let settlement_id = settlement_id.into();
+        Self {
+            id: settlement_id.clone(),
+            settlement_id: Some(settlement_id),
             usage,
             session_id: session_id.into(),
         }
@@ -87,7 +101,7 @@ impl CostRecord {
 }
 
 /// Budget enforcement result.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum BudgetCheck {
     /// Within budget, request can proceed
     Allowed,
@@ -103,6 +117,15 @@ pub enum BudgetCheck {
         limit_usd: f64,
         period: UsagePeriod,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CostSettlement {
+    Disabled,
+    UnknownPricing,
+    Replayed,
+    Recorded { budget: BudgetCheck },
 }
 
 /// Cost summary for reporting.

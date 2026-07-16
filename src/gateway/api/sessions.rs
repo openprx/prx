@@ -244,7 +244,13 @@ async fn run_console_runtime_turn(
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
-    let native_tools = state.provider.supports_native_tools();
+    let native_tools = state
+        .provider
+        .capabilities_for(
+            &state.model,
+            crate::providers::traits::ProviderRequestMode::NonStreaming,
+        )
+        .native_tool_calling;
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
     let skills = crate::skills::load_skills_with_embeddings(

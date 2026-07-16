@@ -1496,7 +1496,11 @@ async fn run_gateway_chat_with_multimodal(
 
     let user_messages = vec![ChatMessage::user(&enriched_message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    if image_marker_count > 0 && !state.provider.supports_vision() {
+    let mode_capabilities = state.provider.capabilities_for(
+        &state.model,
+        crate::providers::traits::ProviderRequestMode::NonStreaming,
+    );
+    if image_marker_count > 0 && !mode_capabilities.vision {
         return Err(ProviderCapabilityError {
             provider: provider_label.to_string(),
             capability: "vision".to_string(),
@@ -1517,7 +1521,7 @@ async fn run_gateway_chat_with_multimodal(
             config_guard.agent.max_tool_iterations,
         )
     };
-    let native_tools = state.provider.supports_native_tools();
+    let native_tools = mode_capabilities.native_tool_calling;
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
     let skills = crate::skills::load_skills_with_embeddings(

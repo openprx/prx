@@ -1,5 +1,8 @@
 use super::Provider;
-use super::traits::{ChatMessage, ChatRequest, ChatResponse, ChatTrace, StreamChunk, StreamOptions, StreamResult};
+use super::traits::{
+    ChatMessage, ChatRequest, ChatResponse, ChatTrace, ProviderCapabilities, ProviderRequestMode, StreamChunk,
+    StreamOptions, StreamResult,
+};
 use crate::llm::route_decision::{AttemptStatus, ProviderAttempt, ProviderExecutionOutcome, RouteDecision};
 use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
@@ -389,6 +392,26 @@ impl ReliableProvider {
 
 #[async_trait]
 impl Provider for ReliableProvider {
+    fn capabilities_for(&self, model: &str, mode: ProviderRequestMode) -> ProviderCapabilities {
+        let mut matched = self
+            .providers
+            .iter()
+            .filter(|(name, provider)| {
+                self.provider_model_compatible(name, model)
+                    && (mode == ProviderRequestMode::NonStreaming || provider.supports_streaming())
+            })
+            .map(|(_, provider)| provider.capabilities_for(model, mode));
+        let Some(first) = matched.next() else {
+            return ProviderCapabilities::default();
+        };
+        // A failover chain may land on any viable provider. Advertise only the
+        // intersection so a later fallback cannot silently lose a requirement.
+        matched.fold(first, |current, next| ProviderCapabilities {
+            native_tool_calling: current.native_tool_calling && next.native_tool_calling,
+            vision: current.vision && next.vision,
+        })
+    }
+
     async fn warmup(&self) -> anyhow::Result<()> {
         for (name, provider) in &self.providers {
             tracing::info!(provider = %name, "Warming up provider connection pool");
@@ -1156,6 +1179,7 @@ where
     tokio::spawn(async move {
         let total = attempts.len();
         let mut last_error: Option<super::traits::StreamError> = None;
+        let mut attempt_seq = 0_u32;
 
         for (index, attempt) in attempts.iter().enumerate() {
             let is_last = index + 1 == total;
@@ -1169,13 +1193,29 @@ where
             let mut pre_content_retries = 0u32;
 
             'candidate: loop {
+                attempt_seq = attempt_seq.saturating_add(1);
+                let attempt_started_at = chrono::Utc::now();
                 let mut stream = build_stream(&attempt.provider, &attempt.model, temperature, options.clone());
                 let mut emitted_content = false;
+                let mut success_reported = false;
 
                 while let Some(chunk) = stream.next().await {
                     match chunk {
-                        Ok(content) => {
+                        Ok(mut content) => {
                             emitted_content = true;
+                            if content.is_final {
+                                content.route_attempt = Some(ProviderAttempt {
+                                    seq: attempt_seq,
+                                    provider: attempt.provider_name.to_string(),
+                                    model: attempt.model.clone(),
+                                    started_at: attempt_started_at,
+                                    finished_at: chrono::Utc::now(),
+                                    status: AttemptStatus::Success,
+                                    error_class: None,
+                                    error_message: None,
+                                });
+                                success_reported = true;
+                            }
                             if tx.send(Ok(content)).await.is_err() {
                                 return; // Receiver dropped.
                             }
@@ -1208,6 +1248,19 @@ where
 
                             // Pre-content failure: classify and decide.
                             let class = classify_stream_error(&err);
+                            let failed_attempt = ProviderAttempt {
+                                seq: attempt_seq,
+                                provider: attempt.provider_name.to_string(),
+                                model: attempt.model.clone(),
+                                started_at: attempt_started_at,
+                                finished_at: chrono::Utc::now(),
+                                status: AttemptStatus::Failed,
+                                error_class: Some(format!("{class:?}").to_ascii_lowercase()),
+                                error_message: Some(err.to_string()),
+                            };
+                            if tx.send(Ok(StreamChunk::route_attempt(failed_attempt))).await.is_err() {
+                                return;
+                            }
 
                             // FIX-P0-33 (#3): honor a structured Retry-After hint
                             // before falling back, regardless of failure class.
@@ -1276,11 +1329,37 @@ where
 
                 // Stream ended. If it produced content, we are done.
                 if emitted_content {
+                    if !success_reported {
+                        let success = ProviderAttempt {
+                            seq: attempt_seq,
+                            provider: attempt.provider_name.to_string(),
+                            model: attempt.model.clone(),
+                            started_at: attempt_started_at,
+                            finished_at: chrono::Utc::now(),
+                            status: AttemptStatus::Success,
+                            error_class: None,
+                            error_message: None,
+                        };
+                        let _ = tx.send(Ok(StreamChunk::route_attempt(success))).await;
+                    }
                     return;
                 }
                 // Empty, error-free stream: treat as a transient failure and try
                 // the next candidate (parity with non-streaming "exhausted, try
                 // next"). Break the per-candidate retry loop either way.
+                let empty_attempt = ProviderAttempt {
+                    seq: attempt_seq,
+                    provider: attempt.provider_name.to_string(),
+                    model: attempt.model.clone(),
+                    started_at: attempt_started_at,
+                    finished_at: chrono::Utc::now(),
+                    status: AttemptStatus::Failed,
+                    error_class: Some("empty_stream".to_string()),
+                    error_message: Some("provider stream ended before emitting content".to_string()),
+                };
+                if tx.send(Ok(StreamChunk::route_attempt(empty_attempt))).await.is_err() {
+                    return;
+                }
                 break 'candidate;
             }
         }
@@ -2606,6 +2685,27 @@ mod tests {
         assert!(provider.supports_native_tools());
     }
 
+    #[test]
+    fn failover_mode_capabilities_are_the_safe_intersection() {
+        let provider = ReliableProvider::new(
+            vec![
+                ("primary".into(), Box::new(NativeCapabilityMock { native_tools: true })),
+                (
+                    "fallback".into(),
+                    Box::new(NativeCapabilityMock { native_tools: false }),
+                ),
+            ],
+            0,
+            1,
+        );
+
+        assert!(
+            !provider
+                .capabilities_for("model", ProviderRequestMode::NonStreaming)
+                .native_tool_calling
+        );
+    }
+
     // ── Arc<ModelAwareMock> Provider impl for test ──
 
     #[async_trait]
@@ -2766,6 +2866,46 @@ mod tests {
         assert_eq!(text, "hello from fallback");
         assert_eq!(primary_calls.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_fallback_emits_complete_attempt_trace() {
+        let provider = ReliableProvider::new(
+            vec![
+                (
+                    "primary".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        outcome: Err("500 transient server error"),
+                    }),
+                ),
+                (
+                    "fallback".into(),
+                    Box::new(StreamMock {
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        outcome: Ok("served by fallback"),
+                    }),
+                ),
+            ],
+            0,
+            1,
+        );
+        let messages = vec![ChatMessage::user("hi")];
+        let mut stream = provider.stream_chat_with_history(&messages, "model", 0.0, enabled_options());
+        let mut attempts = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            if let Some(attempt) = chunk.unwrap().route_attempt {
+                attempts.push(attempt);
+            }
+        }
+
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].provider, "primary");
+        assert_eq!(attempts[0].status, AttemptStatus::Failed);
+        assert_eq!(attempts[1].provider, "fallback");
+        assert_eq!(attempts[1].status, AttemptStatus::Success);
+        assert_eq!(attempts[0].seq, 1);
+        assert_eq!(attempts[1].seq, 2);
     }
 
     #[tokio::test]
