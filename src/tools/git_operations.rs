@@ -985,21 +985,23 @@ mod tests {
     #[tokio::test]
     async fn allows_readonly_ops_in_readonly_mode() {
         let tmp = TempDir::new().unwrap();
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
         let tool = GitOperationsTool::new(security, tmp.path().to_path_buf());
 
-        // This will fail because there's no git repo, but it shouldn't be blocked by autonomy
         let result = tool.execute(json!({"operation": "status"})).await.unwrap();
-        // The error should be about git (not about autonomy/read-only mode)
-        assert!(!result.success, "Expected failure due to missing git repo");
-        let error_msg = result.error.as_deref().unwrap_or("");
-        assert!(!error_msg.is_empty(), "Expected a git-related error message");
         assert!(
-            !error_msg.contains("read-only") && !error_msg.contains("autonomy"),
-            "Error should be about git, not about autonomy restrictions: {error_msg}"
+            result.success,
+            "read-only git status should be allowed: {:?}",
+            result.error
         );
     }
 
