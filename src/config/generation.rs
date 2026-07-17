@@ -841,6 +841,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn one_operation_keeps_pinned_generation_after_reload() {
         let manager = ConfigGenerationManager::new(Config::default());
         let pinned = manager.pin();
@@ -861,6 +862,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn restart_only_fields_update_desired_but_not_active() {
         let manager = ConfigGenerationManager::new(Config::default());
         let old_active = manager.load_full();
@@ -878,6 +880,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn reload_report_classifies_runtime_changes() {
         let manager = ConfigGenerationManager::new(Config::default());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -953,6 +956,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn participant_prepare_failure_rolls_back_and_keeps_active_generation() {
         let manager = ConfigGenerationManager::new(Config::default());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -981,6 +985,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn participant_commit_failure_rolls_every_candidate_back_before_publish() {
         let manager = ConfigGenerationManager::new(Config::default());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1010,6 +1015,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn successful_participants_finalize_only_after_publication() {
         let manager = ConfigGenerationManager::new(Config::default());
         let events = Arc::new(Mutex::new(Vec::new()));
@@ -1031,6 +1037,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn concurrent_reload_attempts_are_serialized_into_distinct_generations() {
         let manager = Arc::new(ConfigGenerationManager::new(Config::default()));
         let mut handles = Vec::new();
@@ -1056,6 +1063,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn reload_and_supervisor_lifecycle_use_the_shared_audit_sink() {
         let manager = ConfigGenerationManager::new(Config::default());
         let participant_events = Arc::new(Mutex::new(Vec::new()));

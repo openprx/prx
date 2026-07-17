@@ -8344,6 +8344,7 @@ default_model = "legacy-model"
     static PROXY_CACHE_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
+    #[serial_test::serial]
     async fn runtime_proxy_client_cache_reuses_default_profile_key() {
         let _guard = PROXY_CACHE_TEST_MUTEX
             .lock()
@@ -8368,6 +8369,7 @@ default_model = "legacy-model"
     }
 
     #[test]
+    #[serial_test::serial]
     async fn set_runtime_proxy_config_clears_runtime_proxy_client_cache() {
         let _guard = PROXY_CACHE_TEST_MUTEX
             .lock()
