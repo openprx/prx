@@ -2399,8 +2399,12 @@ mod tests {
 
         let job = add_job(&config, "* * * * *", "echo due").unwrap();
 
-        let due_now = due_jobs(&config, Utc::now()).unwrap();
-        assert!(due_now.is_empty(), "new job should not be due immediately");
+        let before_next_run = job.next_run - ChronoDuration::milliseconds(1);
+        let due_before_next_run = due_jobs(&config, before_next_run).unwrap();
+        assert!(
+            due_before_next_run.is_empty(),
+            "job should not be due before its stored next_run"
+        );
 
         let far_future = Utc::now() + ChronoDuration::days(365);
         let due_future = due_jobs(&config, far_future).unwrap();

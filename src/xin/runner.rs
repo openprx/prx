@@ -1789,17 +1789,17 @@ mod tests {
                     name: "lost-shell".into(),
                     description: None,
                     execution_mode: ExecutionMode::Shell,
-                    payload: "sleep 3; touch old-owner-marker".into(),
+                    payload: "touch old-owner-started; sleep 30; touch old-owner-marker".into(),
                     max_retries: 1,
                     approval_grant_json: None,
-                    lease_ttl_secs: 1,
+                    lease_ttl_secs: 2,
                 }],
             },
         )
         .unwrap();
         let step_id = store::list_steps(&config, &goal.id).unwrap().remove(0).id;
         let old_owner = "prx:test:old";
-        let old_lease = store::claim_step_with_lease(&config, &step_id, old_owner, 1)
+        let old_lease = store::claim_step_with_lease(&config, &step_id, old_owner, 2)
             .unwrap()
             .expect("old lease claim");
         assert!(store::mark_step_running_with_lease(&config, &step_id, &old_lease).unwrap());
@@ -1818,12 +1818,21 @@ mod tests {
                 &execution_step,
                 &execution_goal,
                 old_lease,
-                1,
+                2,
             )
             .await
         });
 
-        tokio::time::timeout(Duration::from_secs(3), async {
+        let started_marker = config.workspace_dir.join("old-owner-started");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !started_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("old owner's process should start before lease loss");
+
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let stale = store::mark_steps_stale(&config, Utc::now()).unwrap();
                 if stale.iter().any(|id| id == &step_id) {

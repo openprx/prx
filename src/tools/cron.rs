@@ -1835,12 +1835,12 @@ mod tests {
         let cfg_snap = Arc::new(config.clone());
         let cfg = new_shared(config);
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo budget-preserved").unwrap();
-        cron::claim_job_if_current_for_manual_run(
+        let blocking_claim = cron::claim_job_if_current_for_manual_run(
             &cfg_snap,
             &job,
             "blocking-manual-run",
             Utc::now(),
-            ChronoDuration::milliseconds(250),
+            ChronoDuration::seconds(90),
         )
         .unwrap()
         .unwrap();
@@ -1850,7 +1850,16 @@ mod tests {
         assert!(!conflict.success);
         assert!(conflict.error.unwrap_or_default().contains("already running"));
 
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(
+            cron::abandon_job_claim(
+                &cfg_snap,
+                &job.id,
+                &blocking_claim,
+                job.last_status.as_deref(),
+                "test releases blocking manual claim",
+            )
+            .unwrap()
+        );
         let retry = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
         assert!(
             retry.success,
