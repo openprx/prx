@@ -558,6 +558,46 @@ mod tests {
         assert_eq!(report.status.applied.len(), 1);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_postgres_inspection_isolated_from_tokio_runtime() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_schema_inspect_runtime_{}", std::process::id());
+        let setup_url = db_url.clone();
+        let setup_schema = schema.clone();
+        tokio::task::spawn_blocking(move || {
+            let config = setup_url.parse::<postgres::Config>().unwrap();
+            let mut client = config.connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!(
+                    "CREATE SCHEMA \"{setup_schema}\"; CREATE TABLE \"{setup_schema}\".memory_schema_migrations (version BIGINT NOT NULL, name TEXT NOT NULL, checksum TEXT NOT NULL, applied_at TEXT NOT NULL);"
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+
+        let mut config = Config::default();
+        config.memory.backend = "postgres".to_string();
+        config.storage.provider.config.db_url = Some(db_url);
+        config.storage.provider.config.schema = schema.clone();
+        let report = inspect_configured_backend(&config).expect("postgres inspection must hop off Tokio");
+        assert_eq!(report.backend, "postgres");
+
+        let cleanup_url = config.storage.provider.config.db_url.clone().unwrap();
+        let cleanup_schema = schema;
+        tokio::task::spawn_blocking(move || {
+            let postgres_config = cleanup_url.parse::<postgres::Config>().unwrap();
+            let mut client = postgres_config.connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA \"{cleanup_schema}\" CASCADE;"))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
     #[test]
     fn configured_unsupported_backend_is_explicit_non_success() {
         let mut config = Config::default();
