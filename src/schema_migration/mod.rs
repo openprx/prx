@@ -58,6 +58,21 @@ pub fn memory_db_path(config: &Config) -> PathBuf {
 /// This function is deliberately read-only: it does not create a workspace,
 /// database, schema, table, baseline, or migration row.
 pub fn inspect_configured_backend(config: &Config) -> Result<MigrationReport> {
+    // The postgres crate owns a synchronous Tokio runtime. Keep all configured
+    // backend inspection off an already-running Tokio thread (CLI migrate and
+    // doctor commands are async) so connect/query/drop cannot nest runtimes.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        return std::thread::scope(|scope| {
+            scope
+                .spawn(|| inspect_configured_backend_direct(config))
+                .join()
+                .map_err(|_| anyhow::anyhow!("schema migration inspection thread panicked"))?
+        });
+    }
+    inspect_configured_backend_direct(config)
+}
+
+fn inspect_configured_backend_direct(config: &Config) -> Result<MigrationReport> {
     let backend = effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match classify_memory_backend(&backend) {
         MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid => inspect_sqlite_path(memory_db_path(config), backend),
@@ -524,6 +539,23 @@ mod tests {
         let after = std::fs::read(&db_path).unwrap();
         assert_eq!(report.status.applied.len(), 1);
         assert_eq!(before, after, "inspection must not mutate the database file");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn configured_inspection_isolated_from_tokio_runtime() {
+        let temp = TempDir::new().unwrap();
+        let workspace = temp.path().join("workspace");
+        let db_path = workspace.join("memory").join("brain.db");
+        std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = Connection::open(&db_path).unwrap();
+        create_authoritative_table(&conn);
+        insert_sqlite_registry_row(&conn, 1);
+
+        let mut config = Config::default();
+        config.workspace_dir = workspace;
+        config.memory.backend = "sqlite".to_string();
+        let report = inspect_configured_backend(&config).expect("inspection must hop off Tokio");
+        assert_eq!(report.status.applied.len(), 1);
     }
 
     #[test]
