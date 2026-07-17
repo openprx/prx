@@ -149,13 +149,42 @@ struct SqliteWebhookRepository {
 
 #[derive(Clone)]
 struct PostgresWebhookRepository {
-    client: Arc<ParkingMutex<PostgresClient>>,
+    client: Arc<PostgresWebhookClientSlot>,
     workspace_id: Arc<str>,
     qualified_memories: Arc<str>,
     qualified_memory_events: Arc<str>,
     qualified_topics: Arc<str>,
     qualified_topic_participants: Arc<str>,
     qualified_ingestions: Arc<str>,
+}
+
+struct PostgresWebhookClientSlot {
+    client: ParkingMutex<Option<PostgresClient>>,
+}
+
+impl PostgresWebhookClientSlot {
+    const fn new(client: PostgresClient) -> Self {
+        Self {
+            client: ParkingMutex::new(Some(client)),
+        }
+    }
+}
+
+impl Drop for PostgresWebhookClientSlot {
+    fn drop(&mut self) {
+        let Some(client) = self.client.get_mut().take() else {
+            return;
+        };
+
+        // postgres::Client closes through its own synchronous Tokio runtime.
+        // Dropping it on an async runtime worker would try to nest runtimes.
+        let handle = std::thread::Builder::new()
+            .name("postgres-webhook-drop".to_string())
+            .spawn(move || drop(client));
+        if let Ok(handle) = handle {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -546,22 +575,18 @@ impl PostgresWebhookRepository {
         let qualified_topics = qualify_related("_topics")?;
         let qualified_topic_participants = qualify_related("_topic_participants")?;
         let qualified_ingestions = qualify_related("_webhook_ingestions")?;
-        let ingestion_status_index = qualify_related("_wh_ingest_status_idx")?;
-        let ingestion_external_index = qualify_related("_wh_ingest_external_idx")?;
-        let topics_external_index = qualify_related("_wh_topics_external_idx")?;
+        // PostgreSQL derives an index's schema from its target table and does
+        // not accept a schema-qualified index name in CREATE INDEX.
+        let related_index = |suffix: &str| -> Result<String> {
+            let index = crate::memory::postgres::related_table_name(memory_table, suffix)?;
+            Ok(crate::memory::postgres::quote_identifier(&index))
+        };
+        let ingestion_status_index = related_index("_wh_ingest_status_idx")?;
+        let ingestion_external_index = related_index("_wh_ingest_external_idx")?;
+        let topics_external_index = related_index("_wh_topics_external_idx")?;
 
-        let mut postgres_config: postgres::Config = db_url
-            .parse()
-            .context("invalid PostgreSQL connection URL for webhook repository")?;
-        if let Some(timeout_secs) = connect_timeout_secs {
-            postgres_config.connect_timeout(Duration::from_secs(timeout_secs.min(300)));
-        }
-        let mut client = postgres_config
-            .connect(NoTls)
-            .context("failed to connect to PostgreSQL webhook repository")?;
-        client
-            .batch_execute(&format!(
-                "
+        let schema_sql = format!(
+            "
                 CREATE TABLE IF NOT EXISTS {qualified_topics} (
                     id TEXT PRIMARY KEY,
                     title TEXT NOT NULL,
@@ -608,11 +633,32 @@ impl PostgresWebhookRepository {
                 CREATE INDEX IF NOT EXISTS {ingestion_external_index}
                     ON {qualified_ingestions}(source, project, external_id, event_type);
                 "
-            ))
-            .context("failed to initialize PostgreSQL webhook repository schema")?;
+        );
+        let db_url = db_url.to_string();
+        let init_handle = std::thread::Builder::new()
+            .name("postgres-webhook-init".to_string())
+            .spawn(move || -> Result<PostgresClient> {
+                let mut postgres_config: postgres::Config = db_url
+                    .parse()
+                    .context("invalid PostgreSQL connection URL for webhook repository")?;
+                if let Some(timeout_secs) = connect_timeout_secs {
+                    postgres_config.connect_timeout(Duration::from_secs(timeout_secs.min(300)));
+                }
+                let mut client = postgres_config
+                    .connect(NoTls)
+                    .context("failed to connect to PostgreSQL webhook repository")?;
+                client
+                    .batch_execute(&schema_sql)
+                    .context("failed to initialize PostgreSQL webhook repository schema")?;
+                Ok(client)
+            })
+            .context("failed to spawn PostgreSQL webhook initializer thread")?;
+        let client = init_handle
+            .join()
+            .map_err(|_| anyhow::anyhow!("PostgreSQL webhook initializer thread panicked"))??;
 
         Ok(Self {
-            client: Arc::new(ParkingMutex::new(client)),
+            client: Arc::new(PostgresWebhookClientSlot::new(client)),
             workspace_id: Arc::from(workspace_id),
             qualified_memories: Arc::from(qualified_memories),
             qualified_memory_events: Arc::from(qualified_memory_events),
@@ -658,7 +704,10 @@ impl PostgresWebhookRepository {
         request_hash: String,
         event: &WebhookEvent,
     ) -> Result<WebhookClaimOutcome> {
-        let mut client = self.client.lock();
+        let mut client_guard = self.client.client.lock();
+        let client = client_guard
+            .as_mut()
+            .context("PostgreSQL webhook repository client is closed")?;
         let mut tx = client.transaction()?;
         let now = Utc::now();
         let now_unix = now.timestamp();
@@ -741,7 +790,10 @@ impl PostgresWebhookRepository {
         memory_content: &str,
         memory_saved: bool,
     ) -> Result<String> {
-        let mut client = self.client.lock();
+        let mut client_guard = self.client.client.lock();
+        let client = client_guard
+            .as_mut()
+            .context("PostgreSQL webhook repository client is closed")?;
         let mut tx = client.transaction()?;
         let now = Utc::now();
         let owns_claim: bool = tx
@@ -935,7 +987,10 @@ impl PostgresWebhookRepository {
     fn fail_blocking(&self, claim: &WebhookIngestionClaim, error: &str) -> Result<()> {
         let error = error.chars().take(1024).collect::<String>();
         let now = Utc::now();
-        let mut client = self.client.lock();
+        let mut client_guard = self.client.client.lock();
+        let client = client_guard
+            .as_mut()
+            .context("PostgreSQL webhook repository client is closed")?;
         client.execute(
             &format!(
                 "UPDATE {} SET status = 'failed', lease_expires_at = NULL,
@@ -2464,45 +2519,56 @@ mod tests {
             WebhookClaimOutcome::Committed { topic_id: replayed } if replayed == topic_id
         ));
 
-        let mut client = PostgresClient::connect(&db_url, NoTls).unwrap();
-        let ingestion_count: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM {} WHERE status = 'committed'",
-                    repository.qualified_ingestions
-                ),
-                &[],
-            )
-            .unwrap()
-            .get(0);
-        let memory_count: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM {} WHERE key LIKE 'webhook:custom:issue#postgres-conformance:%'",
-                    repository.qualified_memories
-                ),
-                &[],
-            )
-            .unwrap()
-            .get(0);
-        let event_count: i64 = client
-            .query_one(
-                &format!(
-                    "SELECT COUNT(*) FROM {} WHERE event_type = 'webhook.event.committed'",
-                    repository.qualified_memory_events
-                ),
-                &[],
-            )
-            .unwrap()
-            .get(0);
+        let query_url = db_url.clone();
+        let qualified_ingestions = repository.qualified_ingestions.to_string();
+        let qualified_memories = repository.qualified_memories.to_string();
+        let qualified_memory_events = repository.qualified_memory_events.to_string();
+        let (ingestion_count, memory_count, event_count) = tokio::task::spawn_blocking(move || {
+            let mut client = PostgresClient::connect(&query_url, NoTls).unwrap();
+            let ingestion_count: i64 = client
+                .query_one(
+                    &format!("SELECT COUNT(*) FROM {qualified_ingestions} WHERE status = 'committed'"),
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            let memory_count: i64 = client
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {qualified_memories} \
+                         WHERE key LIKE 'webhook:custom:issue#postgres-conformance:%'"
+                    ),
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            let event_count: i64 = client
+                .query_one(
+                    &format!(
+                        "SELECT COUNT(*) FROM {qualified_memory_events} \
+                         WHERE event_type = 'webhook.event.committed'"
+                    ),
+                    &[],
+                )
+                .unwrap()
+                .get(0);
+            (ingestion_count, memory_count, event_count)
+        })
+        .await
+        .unwrap();
         assert_eq!((ingestion_count, memory_count, event_count), (1, 1, 1));
 
         drop(repository);
-        client
-            .batch_execute(&format!(
-                "DROP SCHEMA {} CASCADE",
-                crate::memory::postgres::quote_identifier(&schema)
-            ))
-            .unwrap();
+        tokio::task::spawn_blocking(move || {
+            let mut client = PostgresClient::connect(&db_url, NoTls).unwrap();
+            client
+                .batch_execute(&format!(
+                    "DROP SCHEMA {} CASCADE",
+                    crate::memory::postgres::quote_identifier(&schema)
+                ))
+                .unwrap();
+        })
+        .await
+        .unwrap();
     }
 }

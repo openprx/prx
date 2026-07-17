@@ -918,7 +918,7 @@ impl PostgresCronStore {
             }
             let lease_valid: bool = tx
                 .query_one(
-                    "SELECT clock_timestamp() < $1::timestamptz",
+                    "SELECT clock_timestamp() < $1::text::timestamptz",
                     &[&format_claim_time(claim.expires_at)],
                 )?
                 .get(0);
@@ -1009,7 +1009,7 @@ impl PostgresCronStore {
             }
             let lease_valid: bool = tx
                 .query_one(
-                    "SELECT clock_timestamp() < $1::timestamptz",
+                    "SELECT clock_timestamp() < $1::text::timestamptz",
                     &[&format_claim_time(claim.expires_at)],
                 )?
                 .get(0);
@@ -1131,7 +1131,7 @@ impl PostgresCronStore {
             }
             let lease_valid: bool = tx
                 .query_one(
-                    "SELECT clock_timestamp() < $1::timestamptz",
+                    "SELECT clock_timestamp() < $1::text::timestamptz",
                     &[&format_claim_time(claim.expires_at)],
                 )?
                 .get(0);
