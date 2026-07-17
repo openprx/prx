@@ -415,6 +415,29 @@ mod tests {
     }
 
     #[test]
+    fn published_message_event_migration_checksums_remain_immutable() {
+        let sqlite_descriptor = SqliteMemory::memory_schema_migration_registry()
+            .iter()
+            .find(|(version, _, _)| *version == 4)
+            .map(|(_, _, descriptor)| *descriptor)
+            .expect("SQLite migration version 4 must remain registered");
+        assert_eq!(
+            SqliteMemory::schema_migration_checksum(sqlite_descriptor),
+            "bdad698e4effe70b7fa2669fc8659812ea1a50f932fe3d57b36ed5a5f6c057fa"
+        );
+
+        let postgres_descriptor = PostgresMemory::memory_schema_migration_registry()
+            .iter()
+            .find(|(version, _, _)| *version == 5)
+            .map(|(_, _, descriptor)| *descriptor)
+            .expect("PostgreSQL migration version 5 must remain registered");
+        assert_eq!(
+            PostgresMemory::schema_migration_checksum(postgres_descriptor),
+            "e2ca9c6d52fb6dd154df545b1f67d979aac716eeb3e22c4f78cdccda484eebac"
+        );
+    }
+
+    #[test]
     fn authoritative_unknown_version_is_non_success() {
         let conn = Connection::open_in_memory().unwrap();
         create_authoritative_table(&conn);

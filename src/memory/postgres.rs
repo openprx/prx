@@ -974,7 +974,7 @@ impl PostgresMemory {
             (
                 5,
                 "message_events",
-                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,source_ref_json,subject_ref_json,goal_id,causation_event_id,correlation_id,attempt_id,lease_epoch,content,content_hash,raw_payload_json,visibility,created_at,updated_at)",
+                "message_events(id,event_id,idempotency_key,workspace_id,owner_id,source,channel,session_key,parent_session_key,run_id,parent_run_id,agent_id,persona_id,sender,recipient,role,event_type,content,content_hash,raw_payload_json,visibility,created_at,updated_at)",
             ),
             (
                 6,
@@ -1045,6 +1045,11 @@ impl PostgresMemory {
                 19,
                 "message_event_config_generation",
                 "message_events + config_generation_id + config_source_revision + idx_message_events_config_generation",
+            ),
+            (
+                20,
+                "message_event_execution_metadata",
+                "message_events + source_ref_json + subject_ref_json + goal_id + causation_event_id + correlation_id + attempt_id + lease_epoch",
             ),
         ]
     }

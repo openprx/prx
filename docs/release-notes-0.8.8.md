@@ -52,7 +52,7 @@ In-flight work never changes generation mid-operation.
    prx migrate status
    prx migrate verify
    prx migrate dry-run
-   prx migrate plan
+   prx migrate plan --target-version 14
    ```
 
 4. Review the SQLite/PostgreSQL MessageEvent and configuration-generation

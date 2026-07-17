@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.9] - 2026-07-17
+
+### Fixed
+
+- Preserved the immutable SQLite version-4 and PostgreSQL version-5 migration
+  checksum anchors published by 0.8.7. New MessageEvent execution-metadata
+  columns now have new migration registry versions instead of rewriting
+  previously applied history, so read-only preflight and startup accept an
+  existing 0.8.7 ledger.
+
+### Release status
+
+- `v0.8.8` was stopped before deployment after its production-ledger preflight
+  found the checksum regression. Upgrade directly from 0.8.7 to 0.8.9.
+
 ## [0.8.8] - 2026-07-16
 
 ### Added
