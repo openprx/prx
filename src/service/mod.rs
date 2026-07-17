@@ -817,7 +817,6 @@ fn migrate_openrc_runtime_state_if_needed(config_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn shell_single_quote(raw: &str) -> String {
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
@@ -1409,7 +1408,6 @@ mod tests {
         assert!(!system_path.to_string_lossy().contains(".cargo/bin"));
     }
 
-    #[cfg(unix)]
     #[test]
     fn shell_single_quote_escapes_single_quotes() {
         assert_eq!(shell_single_quote("/tmp/weird'path"), "'/tmp/weird'\"'\"'path'");

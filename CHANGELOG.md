@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-07-17
+
+### Fixed
+
+- Restored the Windows release build by making the OpenRC shell-quoting helper
+  available to the platform-independent script renderer.
+- Prevented the release job from publishing incomplete assets when a required
+  platform build fails.
+
+### Release status
+
+- `v0.8.10` was stopped before deployment after its Windows build failed. Its
+  incomplete GitHub Release was removed and its immutable tag retained. Upgrade
+  directly from the deployed 0.8.7 baseline to 0.8.11.
+
 ## [0.8.10] - 2026-07-17
 
 ### Fixed
@@ -17,10 +32,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Release status
 
-- `v0.8.8` and `v0.8.9` were both stopped before deployment. The latter exposed
+- `v0.8.8`, `v0.8.9`, and `v0.8.10` were stopped before deployment. 0.8.9 exposed
   this legacy Cron upgrade-order defect during Stage 5 local-binary deployment;
-  production was rolled back atomically and remained on 0.8.7. Upgrade directly
-  from 0.8.7 to 0.8.10.
+  production was rolled back atomically and remained on 0.8.7. The 0.8.10
+  Windows release build later failed, so its incomplete GitHub Release was
+  removed without moving its tag. Upgrade directly from 0.8.7 to 0.8.11.
 
 ## [0.8.9] - 2026-07-17
 

@@ -2,6 +2,10 @@
 
 Release date: 2026-07-17
 
+Release status: stopped before deployment. The Windows build failed, the
+incomplete GitHub Release was removed, and the immutable tag was retained.
+Use 0.8.11 instead.
+
 PRX 0.8.10 supersedes the undeployed 0.8.8 and 0.8.9 tags. It contains the
 runtime, persistence, ConfigGeneration, Stage 9, and migration-history repairs
 from those candidates, plus the Cron legacy-schema upgrade fix discovered by
@@ -26,10 +30,10 @@ workspace snapshot before this candidate was prepared.
    pointer, and user-service units.
 2. Do not run `prx init` or `prx migrate baseline`.
 3. Run the old binary's read-only migration checks.
-4. Run the 0.8.10 binary's read-only migration checks against an isolated copy
+4. Run the 0.8.11 binary's read-only migration checks against an isolated copy
    of the deployed workspace, then exercise `cron list` on that copy.
-5. Install the exact audited 0.8.10 binary atomically, restart PRX and wacli,
+5. Install the exact audited 0.8.11 binary atomically, restart PRX and wacli,
    and complete the Stage 5 and Stage 6 acceptance matrices.
 
 The complete feature notes remain in `docs/release-notes-0.8.8.md`; the 0.8.9
-and 0.8.10 notes document the two release-candidate compatibility repairs.
+through 0.8.11 notes document the release-candidate compatibility repairs.
