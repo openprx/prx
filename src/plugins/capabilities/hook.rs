@@ -51,6 +51,7 @@ impl WasmHook {
             optional,
             manifest.permissions.http_allowlist.clone(),
             timeout_ms,
+            manifest.resources.max_kv_storage_mb,
         )
         .with_event_sink(event_sink);
         if let Some(bus) = event_bus {

@@ -16,7 +16,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::{Child, ChildStderr, ChildStdout};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -122,6 +122,11 @@ impl ShellProcessAdapter {
         self.sandbox
             .wrap_command(command.as_std_mut())
             .map_err(ShellProcessError::Sandbox)?;
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         if request
             .cancellation
             .as_ref()
@@ -411,7 +416,7 @@ impl Drop for DrainAbortGuard {
     }
 }
 
-struct ManagedShellChild {
+pub(crate) struct ManagedShellChild {
     child: Option<Child>,
     #[cfg(unix)]
     pgid: Option<i32>,
@@ -420,15 +425,19 @@ struct ManagedShellChild {
 }
 
 impl ManagedShellChild {
-    fn take_stdout(&mut self) -> Option<ChildStdout> {
+    pub(crate) fn take_stdout(&mut self) -> Option<ChildStdout> {
         self.child.as_mut().and_then(|child| child.stdout.take())
     }
 
-    fn take_stderr(&mut self) -> Option<ChildStderr> {
+    pub(crate) fn take_stdin(&mut self) -> Option<ChildStdin> {
+        self.child.as_mut().and_then(|child| child.stdin.take())
+    }
+
+    pub(crate) fn take_stderr(&mut self) -> Option<ChildStderr> {
         self.child.as_mut().and_then(|child| child.stderr.take())
     }
 
-    async fn wait(&mut self) -> io::Result<ExitStatus> {
+    pub(crate) async fn wait(&mut self) -> io::Result<ExitStatus> {
         let child = self
             .child
             .as_mut()
@@ -438,7 +447,7 @@ impl ManagedShellChild {
         Ok(status)
     }
 
-    async fn terminate_and_reap(&mut self) -> bool {
+    pub(crate) async fn terminate_and_reap(&mut self) -> bool {
         self.kill_process_tree();
         if !self.leader_reaped {
             if let Some(child) = &mut self.child {
@@ -465,7 +474,7 @@ impl ManagedShellChild {
         }
     }
 
-    const fn mark_complete(&mut self) {
+    pub(crate) const fn mark_complete(&mut self) {
         self.complete = true;
         #[cfg(unix)]
         {
@@ -495,11 +504,8 @@ impl Drop for ManagedShellChild {
     }
 }
 
-fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io::Result<ManagedShellChild> {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
+pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io::Result<ManagedShellChild> {
+    cmd.kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
 

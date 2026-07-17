@@ -1,23 +1,24 @@
 //! Configuration hot-reload infrastructure.
 //!
-//! Provides [`SharedConfig`] — a lock-free, atomically-swappable config handle —
-//! and [`HotReloadManager`] which watches the config file for changes and
-//! atomically replaces the stored [`Config`] on success.
+//! Provides the shared process-level [`ConfigGenerationManager`] handle and a
+//! file watcher that routes every reload through that sole owner.
 //!
 //! # Design
 //!
-//! - `SharedConfig = Arc<ArcSwap<Config>>` — readers call `.load_full()` for a
-//!   snapshot `Arc<Config>` with no locks, no contention.
-//! - The manager spawns a Tokio task that runs a `notify` debouncer (1 s
-//!   window). On each confirmed write it parses the file and, if valid, calls
-//!   `.store()` to atomically publish the new config.
+//! - Readers call `.load_full()` for an immutable `Arc<Config>` or `.pin()` for
+//!   the complete generation.
+//! - The watcher runs a `notify` debouncer and calls the generation manager's
+//!   single reload entry point.
 //! - On parse failure the old config is kept and a warning is logged.
 //! - A monotonic `reload_version` counter is bumped only when file content
 //!   changes and reload succeeds.
 
-use super::{files, schema::Config};
+use super::{
+    files,
+    generation::{ConfigGenerationManager, ConfigReloadTrigger},
+    schema::Config,
+};
 use crate::config::files::compute_config_fingerprint_gated;
-use arc_swap::ArcSwap;
 use std::{
     path::PathBuf,
     sync::{
@@ -26,17 +27,15 @@ use std::{
     },
 };
 
-/// Lock-free, hot-swappable configuration handle.
-///
-/// Clone cheaply — all clones point to the same `ArcSwap` cell.
-pub type SharedConfig = Arc<ArcSwap<Config>>;
+/// Shared read handle and sole runtime configuration publisher.
+pub type SharedConfig = Arc<ConfigGenerationManager>;
 
 /// Create a new [`SharedConfig`] pre-loaded with `initial`.
 pub fn new_shared(initial: Config) -> SharedConfig {
-    Arc::new(ArcSwap::from_pointee(initial))
+    Arc::new(ConfigGenerationManager::new(initial))
 }
 
-/// Watches `config.toml` and atomically swaps [`SharedConfig`] on change.
+/// Watches `config.toml` and submits stable candidates to [`SharedConfig`].
 pub struct HotReloadManager {
     _handle: tokio::task::JoinHandle<()>,
     reload_version: Arc<AtomicU64>,
@@ -46,8 +45,7 @@ impl HotReloadManager {
     /// Spawn the file watcher task.
     ///
     /// `config_path` must be the path to `config.toml`.
-    /// `shared` is the live config handle — the manager will call `.store()` on
-    /// every successful reload.
+    /// `shared` is the sole process generation owner.
     pub fn spawn(config_path: PathBuf, shared: SharedConfig) -> Self {
         let reload_version = Arc::new(AtomicU64::new(0));
         let rv_clone = Arc::clone(&reload_version);
@@ -125,13 +123,18 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
                     continue;
                 }
 
-                match try_reload(&config_path, &shared) {
-                    Ok(()) => {
+                let previous = shared.load_full();
+                match shared.reload_from_disk(ConfigReloadTrigger::FileWatcher) {
+                    Ok(report) => {
+                        log_diff(&previous, &shared.load_full());
                         last_content_hash = Some(content_hash);
                         let version = reload_version.fetch_add(1, Ordering::Relaxed) + 1;
                         tracing::info!(
                             path = %config_path.display(),
                             version,
+                            active_generation = report.active_generation.0,
+                            status = report.status(),
+                            restart_required = ?report.restart_required,
                             "Config hot-reloaded (version {version})"
                         );
                     }
@@ -151,56 +154,6 @@ fn run_watcher(config_path: PathBuf, shared: SharedConfig, reload_version: Arc<A
     }
 
     Ok(())
-}
-
-/// Parse config file and atomically store it.
-fn try_reload(config_path: &std::path::Path, shared: &SharedConfig) -> anyhow::Result<()> {
-    let old = shared.load_full();
-    let mut fresh = load_stable_config_snapshot(config_path, old.workspace_dir.clone())?;
-    // ACL mode is not hot-reloadable for already-initialized tool instances.
-    // Keep runtime behavior deterministic until restart.
-    if fresh.memory.acl_enabled != old.memory.acl_enabled {
-        tracing::warn!(
-            old = old.memory.acl_enabled,
-            new = fresh.memory.acl_enabled,
-            "memory.acl_enabled change detected but requires restart; keeping current runtime value"
-        );
-        fresh.memory.acl_enabled = old.memory.acl_enabled;
-    }
-
-    // Check if modules config changed (requires restart)
-    if fresh.modules != old.modules {
-        tracing::warn!("Module configuration changed — restart required for changes to take effect");
-    }
-
-    // Log diff of key hot-reloadable fields
-    log_diff(&old, &fresh);
-
-    // Atomically publish new config
-    shared.store(Arc::new(fresh));
-    Ok(())
-}
-
-fn load_stable_config_snapshot(config_path: &std::path::Path, workspace_dir: PathBuf) -> anyhow::Result<Config> {
-    const MAX_ATTEMPTS: usize = 3;
-
-    for attempt in 1..=MAX_ATTEMPTS {
-        let before = compute_config_fingerprint_gated(config_path)?;
-        let fresh = Config::load_from_path(config_path, workspace_dir.clone())?;
-        let after = compute_config_fingerprint_gated(config_path)?;
-        if before == after {
-            return Ok(fresh);
-        }
-
-        tracing::debug!(
-            path = %config_path.display(),
-            attempt,
-            "Config changed during hot-reload snapshot; retrying"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-
-    anyhow::bail!("Config changed repeatedly while reloading: {}", config_path.display());
 }
 
 fn log_diff(old: &Config, fresh: &Config) {
@@ -331,14 +284,6 @@ fn log_diff(old: &Config, fresh: &Config) {
             tracing::info!("  • {change}");
         }
     }
-
-    // Warn about fields that require a restart to take effect
-    if old.default_provider != fresh.default_provider || old.default_model != fresh.default_model {
-        tracing::warn!(
-            "default_provider/default_model changed in config — \
-             restart the daemon to apply (TODO P3: live provider rebuild)"
-        );
-    }
 }
 
 #[cfg(test)]
@@ -347,7 +292,7 @@ mod tests {
     use crate::config::schema::Config;
 
     #[test]
-    fn new_shared_creates_arc_arcswap() {
+    fn new_shared_creates_generation_manager() {
         let cfg = Config::default();
         let shared = new_shared(cfg);
         let loaded = shared.load_full();
@@ -355,11 +300,13 @@ mod tests {
     }
 
     #[test]
-    fn store_replaces_config() {
+    fn manager_replaces_runtime_config() {
         let shared = new_shared(Config::default());
         let mut new_cfg = Config::default();
         new_cfg.default_temperature = 0.42;
-        shared.store(Arc::new(new_cfg));
+        shared
+            .apply_runtime_config(new_cfg, ConfigReloadTrigger::Test)
+            .expect("apply runtime config");
         assert!((shared.load_full().default_temperature - 0.42).abs() < 1e-9);
     }
 

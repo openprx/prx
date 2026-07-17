@@ -129,8 +129,10 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 }
 
 fn console_runtime_envelope(state: &AppState, session_id: &str, channel: &str, sender: &str) -> RuntimeEnvelope {
-    let workspace_id = state.config.lock().workspace_dir.to_string_lossy().to_string();
+    let generation = state.config.pin();
+    let workspace_id = generation.effective.workspace_dir.to_string_lossy().to_string();
     console_runtime_envelope_for_workspace(workspace_id, session_id, channel, sender)
+        .with_config_generation(&generation)
 }
 
 /// Build the console runtime envelope for a session.
@@ -234,20 +236,21 @@ async fn run_console_runtime_turn(
 ) -> anyhow::Result<ConsoleTurnResult> {
     // D2: this runtime turn rebuilds a `SecurityPolicy` (below) that gates tool
     // side-effects for the turn, so the config snapshot it derives from MUST be the
-    // hot SharedConfig (D), not the cached `state.config` Mutex (C). Reading D here
+    // pinned TurnRuntimeGeneration, not an independently cached config owner. This
     // makes a reloaded autonomy / security.audit take effect for console-driven
     // turns without a restart; all non-security fields used for the prompt come from
     // the same snapshot, so the turn stays internally consistent.
-    let config_snapshot = (*state.shared_config.load_full()).clone();
+    let turn_runtime = state.pin_turn_runtime();
+    let config_snapshot = (*turn_runtime.config_generation.effective).clone();
     let provider_label = config_snapshot
         .default_provider
         .as_deref()
         .unwrap_or("openrouter")
         .to_string();
-    let native_tools = state
+    let native_tools = turn_runtime
         .provider
         .capabilities_for(
-            &state.model,
+            &turn_runtime.model,
             crate::providers::traits::ProviderRequestMode::NonStreaming,
         )
         .native_tool_calling;
@@ -264,14 +267,17 @@ async fn run_console_runtime_turn(
     let tool_descs = console_tool_descriptions(&config_snapshot);
     let system_prompt = build_runtime_system_prompt(
         &config_snapshot,
-        &state.model,
+        &turn_runtime.model,
         &tool_descs,
         &selected_skills,
         native_tools,
-        state.tools_registry.as_ref(),
+        turn_runtime.tools_registry.as_ref(),
     );
 
-    let mut turn_envelope = envelope.clone().with_run_id(uuid::Uuid::new_v4().to_string());
+    let mut turn_envelope = envelope
+        .clone()
+        .with_run_id(uuid::Uuid::new_v4().to_string())
+        .with_config_generation(&turn_runtime.config_generation);
     if let Some(event_id) = source_message_event_id.as_ref() {
         turn_envelope = turn_envelope.with_source_message_event_id(event_id.clone());
     }
@@ -316,31 +322,33 @@ async fn run_console_runtime_turn(
         topic_id: turn_envelope.topic_id.as_deref(),
         task_id: turn_envelope.resolved_task_id(),
         source_message_event_id: turn_envelope.source_message_event_id.as_deref(),
+        config_generation_id: turn_envelope.config_generation_id,
+        config_source_revision: turn_envelope.config_source_revision.as_deref(),
     };
     let noop_observer = NoopObserver;
 
     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
         provider_label.clone(),
-        state.model.clone(),
+        turn_runtime.model.clone(),
         scope_owner_id.clone(),
         turn_envelope.session_key.clone(),
         source_message_event_id.clone(),
         None,
         "console_message",
         u32::try_from(visible_message.chars().count() / 4).unwrap_or(u32::MAX),
-        !state.tools_registry.is_empty(),
+        !turn_runtime.tools_registry.is_empty(),
         false,
     );
     let provider_started_at = chrono::Utc::now();
     let loop_result = run_tool_call_loop_traced(
-        state.provider.as_ref(),
+        turn_runtime.provider.as_ref(),
         &mut history,
-        std::sync::Arc::clone(&state.tools_registry),
+        std::sync::Arc::clone(&turn_runtime.tools_registry),
         &noop_observer,
         state.hooks.as_ref(),
         &provider_label,
-        &state.model,
-        state.temperature,
+        &turn_runtime.model,
+        turn_runtime.temperature,
         true,
         None,
         "console",
@@ -404,6 +412,7 @@ async fn run_console_runtime_turn(
                     delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                 },
                 &config_snapshot.cost,
+                &config_snapshot.workspace_dir,
             )
             .await
             {
@@ -518,7 +527,7 @@ async fn parse_multipart_message(state: &AppState, request: Request) -> Result<S
         .map_err(|_| json_error(StatusCode::BAD_REQUEST, "Invalid multipart payload"))?;
 
     let uploads_root = {
-        let config = state.config.lock();
+        let config = state.config.load_full();
         config.workspace_dir.join(UPLOADS_DIR_NAME)
     };
     let mut uploads_root_prepared = false;
@@ -855,7 +864,10 @@ pub async fn post_session_message(
         .clone()
         .unwrap_or_else(|| provider_outcome.decision_id.clone());
     let terminal_fabric = MemoryFabric::new(state.mem.clone(), turn.envelope.workspace_id.clone());
-    let cost_config = state.shared_config.load().cost.clone();
+    let (cost_config, workspace_dir) = {
+        let config = state.config.load();
+        (config.cost.clone(), config.workspace_dir.clone())
+    };
     let terminal_committed = match crate::agent::terminal::finalize_turn(
         &terminal_fabric,
         crate::agent::terminal::TurnTerminalCommit {
@@ -876,6 +888,7 @@ pub async fn post_session_message(
             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
         },
         &cost_config,
+        &workspace_dir,
     )
     .await
     {
@@ -921,7 +934,7 @@ pub async fn get_session_media(
     }
 
     let uploads_root = {
-        let config = state.config.lock();
+        let config = state.config.load_full();
         config.workspace_dir.join(UPLOADS_DIR_NAME)
     };
 
@@ -1101,10 +1114,50 @@ mod tests {
         }
     }
 
+    struct TestConfigParticipant;
+    struct TestPreparedConfig;
+
+    impl crate::config::ConfigGenerationParticipant for TestConfigParticipant {
+        fn name(&self) -> &'static str {
+            "gateway_sessions_test_runtime"
+        }
+
+        fn supports_rebuild_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn supports_controlled_restart_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn prepares_for_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn prepare(
+            &self,
+            _generation: Arc<crate::config::ConfigGeneration>,
+            _changed_fields: &[String],
+        ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+            Ok(Box::new(TestPreparedConfig))
+        }
+    }
+
+    impl crate::config::PreparedConfigGeneration for TestPreparedConfig {
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
+
     fn test_app_state(config: Config, provider: Arc<dyn Provider>) -> AppState {
+        static PARTICIPANT: std::sync::OnceLock<Arc<dyn crate::config::ConfigGenerationParticipant>> =
+            std::sync::OnceLock::new();
+        let config = crate::config::new_shared(config);
+        config.register_participant(PARTICIPANT.get_or_init(|| Arc::new(TestConfigParticipant)));
         AppState {
-            config: Arc::new(parking_lot::Mutex::new(config.clone())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            config,
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -1112,6 +1165,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -1181,10 +1235,9 @@ mod tests {
         assert!(history.last().is_some_and(|m| m.content.contains("current question")));
     }
 
-    /// D2 / T1: gateway authorization reads the hot SharedConfig (D), so a config
+    /// Gateway authorization reads the active ConfigGeneration, so a config
     /// reload that lowers autonomy to ReadOnly flips a previously-allowed mutation
-    /// to denied — WITHOUT any restart and WITHOUT touching the cached `state.config`
-    /// (C). This is the load-bearing behavior of the hot-reload-takes-effect fix.
+    /// to denied without a process restart or a second cached config owner.
     #[test]
     fn authz_reads_hot_shared_config_after_reload() {
         use crate::security::policy::{AutonomyLevel, ResourceRiskLevel};
@@ -1212,7 +1265,10 @@ mod tests {
             },
             ..Config::default()
         };
-        state.shared_config.store(Arc::new(read_only));
+        state
+            .config
+            .apply_runtime_config(read_only, crate::config::ConfigReloadTrigger::Test)
+            .expect("apply read-only config");
 
         // Same call, same risk — now denied because the authz path reads D.
         let denied = crate::gateway::api::authorize_resource_mutation(
@@ -1261,7 +1317,10 @@ mod tests {
         hot.config_path = config_path.clone();
         hot.workspace_dir = workspace;
         hot.default_temperature = 0.42;
-        state.shared_config.store(Arc::new(hot));
+        state
+            .config
+            .apply_runtime_config(hot, crate::config::ConfigReloadTrigger::Test)
+            .expect("apply hot config");
 
         // POST a delta that does NOT touch default_temperature.
         let resp = post_config(
@@ -1272,14 +1331,14 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
 
         // The hot value from D survived the merge (would be 0.0 if C were the base).
-        let after = state.shared_config.load_full();
+        let after = state.config.load_full();
         assert!(
             (after.default_temperature - 0.42).abs() < 1e-9,
             "merge base must be D: hot default_temperature should be preserved, got {}",
             after.default_temperature
         );
         // C is re-synced to D (C == D invariant restored).
-        assert!((state.config.lock().default_temperature - 0.42).abs() < 1e-9);
+        assert!((state.config.load_full().default_temperature - 0.42).abs() < 1e-9);
     }
 
     /// D2 / 修1: the `/api/config/reload` route builds its OWN authorization gate from
@@ -1324,7 +1383,10 @@ mod tests {
         supervised.config_path = config_path.clone();
         supervised.workspace_dir = workspace.clone();
         supervised.autonomy.level = crate::security::policy::AutonomyLevel::Supervised;
-        allow_state.shared_config.store(Arc::new(supervised));
+        allow_state
+            .config
+            .apply_runtime_config(supervised, crate::config::ConfigReloadTrigger::Test)
+            .expect("apply supervised config");
 
         let allow_resp = post_config_reload(axum::extract::State(allow_state)).await;
         assert_eq!(
@@ -1341,7 +1403,10 @@ mod tests {
         read_only.config_path = config_path;
         read_only.workspace_dir = workspace;
         read_only.autonomy.level = crate::security::policy::AutonomyLevel::ReadOnly;
-        state.shared_config.store(Arc::new(read_only));
+        state
+            .config
+            .apply_runtime_config(read_only, crate::config::ConfigReloadTrigger::Test)
+            .expect("apply read-only config");
 
         let resp = post_config_reload(axum::extract::State(state)).await;
         // ReadOnly gate denial surfaces as INTERNAL_SERVER_ERROR carrying the gate error.

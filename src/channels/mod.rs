@@ -96,8 +96,8 @@ use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -192,20 +192,17 @@ struct ChannelRuntimeDefaults {
     reliability: crate::config::ReliabilityConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ConfigFileStamp {
-    fingerprint: Vec<u8>,
-}
-
-#[derive(Debug, Clone)]
-struct RuntimeConfigState {
-    defaults: ChannelRuntimeDefaults,
-    last_applied_stamp: Option<ConfigFileStamp>,
-}
-
-fn runtime_config_store() -> &'static Mutex<HashMap<PathBuf, RuntimeConfigState>> {
-    static STORE: OnceLock<Mutex<HashMap<PathBuf, RuntimeConfigState>>> = OnceLock::new();
-    STORE.get_or_init(|| Mutex::new(HashMap::new()))
+#[derive(Clone)]
+struct ChannelMessageRuntimeSnapshot {
+    multimodal: crate::config::MultimodalConfig,
+    max_tool_iterations: usize,
+    read_only_tool_concurrency_window: usize,
+    read_only_tool_timeout_secs: u64,
+    priority_scheduling_enabled: bool,
+    low_priority_tools: Vec<String>,
+    min_relevance_score: f64,
+    agent_compaction: crate::config::AgentCompactionConfig,
+    tool_tiering: crate::config::ToolTieringConfig,
 }
 
 const SYSTEMD_STATUS_ARGS: [&str; 3] = ["--user", "is-active", "prx.service"];
@@ -213,14 +210,8 @@ const SYSTEMD_RESTART_ARGS: [&str; 3] = ["--user", "restart", "prx.service"];
 const OPENRC_STATUS_ARGS: [&str; 2] = ["prx", "status"];
 const OPENRC_RESTART_ARGS: [&str; 2] = ["prx", "restart"];
 
-/// D2-2: one coherent "security generation".
-///
-/// The live security generation, swapped in atomically by
-/// `maybe_apply_runtime_config_update`. Permission-model Phase 1 collapsed the
-/// former `(security, pipeline)` pair to a single policy: tool authorization is
-/// now driven entirely by `[autonomy]` via `SecurityPolicy::decide`, so the
-/// PolicyPipeline is gone. The struct is retained as the `ArcSwap` payload so a
-/// reader always sees a whole, coherent generation.
+/// Legacy test fixture for the pre-ConfigGeneration channel security swap.
+#[cfg(test)]
 #[derive(Clone)]
 struct SecurityGen {
     /// Security policy consulted by the channel side-effect gates and scope.
@@ -229,6 +220,9 @@ struct SecurityGen {
 
 #[derive(Clone)]
 struct ChannelRuntimeContext {
+    config: crate::config::SharedConfig,
+    #[cfg(test)]
+    config_generation: Arc<crate::config::ConfigGeneration>,
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
     provider: Arc<dyn Provider>,
     default_provider: Arc<String>,
@@ -237,42 +231,45 @@ struct ChannelRuntimeContext {
     observer: Arc<dyn Observer>,
     hooks: Arc<HookManager>,
     system_prompt: Arc<String>,
+    #[cfg(test)]
     model: Arc<String>,
+    #[cfg(test)]
     temperature: f64,
     auto_save_memory: bool,
     memory_event_recording: MemoryEventRecording,
     max_tool_iterations: usize,
+    #[cfg(test)]
     read_only_tool_concurrency_window: usize,
+    #[cfg(test)]
     read_only_tool_timeout_secs: u64,
+    #[cfg(test)]
     priority_scheduling_enabled: bool,
+    #[cfg(test)]
     low_priority_tools: Vec<String>,
+    #[cfg(test)]
     min_relevance_score: f64,
     conversation_histories: ConversationHistoryMap,
     provider_cache: ProviderCacheMap,
     route_overrides: RouteSelectionMap,
+    #[cfg(test)]
     api_key: Option<String>,
+    #[cfg(test)]
     api_url: Option<String>,
+    #[cfg(test)]
     reliability: Arc<crate::config::ReliabilityConfig>,
     provider_runtime_options: providers::ProviderRuntimeOptions,
     workspace_dir: Arc<PathBuf>,
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
+    #[cfg(test)]
     multimodal: crate::config::MultimodalConfig,
-    /// Security generation: the [`SecurityPolicy`] that the channel's own
-    /// side-effect gates (inbound/autosave/outbound/scope) consult.
-    ///
-    /// D2-2: hot-reloadable. The policy lives inside a single
-    /// [`SecurityGen`] behind ONE `ArcSwap`, so a reader always observes a whole,
-    /// coherent generation (never a torn read). The rebuild (`store`)
-    /// happens only at the end of the stamp-change branch of
-    /// `maybe_apply_runtime_config_update`, after every fallible construction has
-    /// succeeded (all-or-nothing apply). Per-message paths `load_full()` exactly
-    /// once at the top of `process_channel_message` and reuse that single snapshot
-    /// for the whole message, so one message always sees one coherent generation.
-    /// The `Arc` wrapper is shared across all dispatch worker tasks (JoinSet);
-    /// `ArcSwap` load/store is lock-free.
+    /// Legacy test-only security fixture. Production derives one policy from the
+    /// ConfigGeneration pinned at message admission.
+    #[cfg(test)]
     security: Arc<arc_swap::ArcSwap<SecurityGen>>,
+    #[cfg(test)]
     agent_compaction: crate::config::AgentCompactionConfig,
+    #[cfg(test)]
     tool_tiering: crate::config::ToolTieringConfig,
     signal_inbound_policy: Option<InboundPolicyConfig>,
     whatsapp_inbound_policy: Option<InboundPolicyConfig>,
@@ -1108,158 +1105,71 @@ fn runtime_defaults_from_config(config: &Config) -> ChannelRuntimeDefaults {
     }
 }
 
-fn runtime_config_path(ctx: &ChannelRuntimeContext) -> Option<PathBuf> {
-    ctx.provider_runtime_options
-        .openprx_dir
-        .as_ref()
-        .map(|dir| dir.join("config.toml"))
+fn runtime_defaults_for_generation(
+    ctx: &ChannelRuntimeContext,
+    generation: &Arc<crate::config::ConfigGeneration>,
+) -> ChannelRuntimeDefaults {
+    #[cfg(test)]
+    if !Arc::ptr_eq(&ctx.config.pin(), &ctx.config_generation) {
+        // Legacy unit fixtures historically constructed `config` and
+        // `config_generation` from two independent managers, then injected
+        // explicit provider/model/runtime fields on the context. Preserve those
+        // fixture semantics while dedicated generation tests use a same-owner
+        // pair and therefore exercise the production path below.
+        return ChannelRuntimeDefaults {
+            default_provider: ctx.default_provider.as_str().to_string(),
+            model: ctx.model.as_str().to_string(),
+            temperature: ctx.temperature,
+            api_key: ctx.api_key.clone(),
+            api_url: ctx.api_url.clone(),
+            reliability: ctx.reliability.as_ref().clone(),
+        };
+    }
+    #[cfg(not(test))]
+    let _ = ctx;
+    runtime_defaults_from_config(&generation.effective)
 }
 
-fn runtime_defaults_snapshot(ctx: &ChannelRuntimeContext) -> ChannelRuntimeDefaults {
-    if let Some(config_path) = runtime_config_path(ctx) {
-        let store = runtime_config_store().lock();
-        if let Some(state) = store.get(&config_path) {
-            return state.defaults.clone();
-        }
+fn message_runtime_snapshot(
+    ctx: &ChannelRuntimeContext,
+    generation: &Arc<crate::config::ConfigGeneration>,
+) -> ChannelMessageRuntimeSnapshot {
+    #[cfg(test)]
+    if !Arc::ptr_eq(&ctx.config.pin(), &ctx.config_generation) {
+        return ChannelMessageRuntimeSnapshot {
+            multimodal: ctx.multimodal.clone(),
+            max_tool_iterations: ctx.max_tool_iterations,
+            read_only_tool_concurrency_window: ctx.read_only_tool_concurrency_window,
+            read_only_tool_timeout_secs: ctx.read_only_tool_timeout_secs,
+            priority_scheduling_enabled: ctx.priority_scheduling_enabled,
+            low_priority_tools: ctx.low_priority_tools.clone(),
+            min_relevance_score: ctx.min_relevance_score,
+            agent_compaction: ctx.agent_compaction.clone(),
+            tool_tiering: ctx.tool_tiering.clone(),
+        };
     }
+    #[cfg(not(test))]
+    let _ = ctx;
 
-    ChannelRuntimeDefaults {
-        default_provider: ctx.default_provider.as_str().to_string(),
-        model: ctx.model.as_str().to_string(),
-        temperature: ctx.temperature,
-        api_key: ctx.api_key.clone(),
-        api_url: ctx.api_url.clone(),
-        reliability: (*ctx.reliability).clone(),
+    let config = generation.effective.as_ref();
+    ChannelMessageRuntimeSnapshot {
+        multimodal: config.multimodal.clone(),
+        max_tool_iterations: config.agent.max_tool_iterations,
+        read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
+        read_only_tool_timeout_secs: config.agent.read_only_tool_timeout_secs,
+        priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
+        low_priority_tools: config.agent.low_priority_tools.clone(),
+        min_relevance_score: config.memory.min_relevance_score,
+        agent_compaction: config.agent.compaction.clone(),
+        tool_tiering: config.tool_tiering.clone(),
     }
 }
 
-async fn config_file_stamp(path: &Path) -> Option<ConfigFileStamp> {
-    let path = path.to_path_buf();
-    let fingerprint =
-        tokio::task::spawn_blocking(move || crate::config::files::compute_config_fingerprint_gated(&path).ok())
-            .await
-            .ok()??;
-    Some(ConfigFileStamp { fingerprint })
-}
-
-/// D2-2: load the full on-disk `Config` so the stamp-change branch can rebuild
-/// both the channel runtime defaults *and* the security policy / tool policy
-/// pipeline from a single coherent parse. Returns the parsed `Config` so the
-/// caller can derive everything it needs without re-reading the file.
-fn load_full_config_from_file(path: &Path, workspace_dir: &Path) -> Result<Config> {
-    Config::load_from_path(path, workspace_dir.to_path_buf())
-}
-
-async fn maybe_apply_runtime_config_update(ctx: &ChannelRuntimeContext) -> Result<()> {
-    let Some(config_path) = runtime_config_path(ctx) else {
-        return Ok(());
-    };
-
-    let Some(stamp) = config_file_stamp(&config_path).await else {
-        return Ok(());
-    };
-
-    {
-        let store = runtime_config_store().lock();
-        if let Some(state) = store.get(&config_path) {
-            if state.last_applied_stamp == Some(stamp.clone()) {
-                return Ok(());
-            }
-        }
-    }
-
-    // ── stamp-change branch ────────────────────────────────────────────────
-    // Reached only when the on-disk config fingerprint differs from the last
-    // applied stamp (the equality short-circuit above returns early otherwise).
-    // D2-2: this is the ONLY place the security generation (policy + pipeline) is
-    // rebuilt. Per-message paths merely `load_full()` the current snapshot — they
-    // never rebuild — so the expensive parse+construct cost is paid once per real
-    // config change, not per message.
-    //
-    // ── All-or-nothing apply (necessary security property) ──────────────────
-    // Every fallible step (config parse, provider construction) runs BEFORE any
-    // observable state is mutated. We construct the new security generation,
-    // provider, and defaults entirely up front; only after all of them succeed do
-    // we `store()` the security generation, swap the provider cache, and commit
-    // the stamp — all at the very end of this function. If any fallible step
-    // returns `Err`, we early-return with `?` having stored NOTHING: the old
-    // security generation, provider cache, and stamp all remain in force, so a
-    // reload is never partially applied (no "security hot-swapped but defaults /
-    // provider / stamp not committed" window).
-    //
-    // Load the full Config once so defaults, security policy, and tool policy
-    // pipeline all derive from the same coherent parse.
-    let next_config = load_full_config_from_file(&config_path, ctx.workspace_dir.as_path())?;
-    let next_defaults = runtime_defaults_from_config(&next_config);
-
-    // D2-2: build the new security generation up front (no store yet). The
-    // security policy is built via the shared bootstrap helper so the channel
-    // gates (inbound/autosave/outbound/scope) honour autonomy/workspace/audit
-    // changes; allow/deny logic is identical to startup construction.
-    let next_gen = SecurityGen {
-        security: crate::runtime::bootstrap::build_security_policy(&next_config),
-    };
-
-    // Fallible: provider construction. If this errors we early-return having
-    // stored nothing — the old security generation / provider / stamp survive.
-    let next_default_provider = providers::create_resilient_provider_with_options(
-        &next_defaults.default_provider,
-        next_defaults.api_key.as_deref(),
-        next_defaults.api_url.as_deref(),
-        &next_defaults.reliability,
-        &ctx.provider_runtime_options,
-    )?;
-    let next_default_provider: Arc<dyn Provider> = Arc::from(next_default_provider);
-
-    // warmup() is best-effort and non-fatal (logged, not propagated), so it is
-    // intentionally allowed to run before the commit — a failed warmup does not
-    // invalidate the constructed generation.
-    if let Err(err) = next_default_provider.warmup().await {
-        tracing::warn!(
-            provider = %next_defaults.default_provider,
-            "Provider warmup failed after config reload: {err}"
-        );
-    }
-
-    // ── Commit point (all fallible steps succeeded) ─────────────────────────
-    // From here on nothing can fail, so the apply is atomic in effect: the
-    // security generation, provider cache, and stamp are all committed together.
-    // D2-2: store the new security generation in a single atomic swap.
-    ctx.security.store(Arc::new(next_gen));
-
-    {
-        let mut cache = ctx.provider_cache.lock();
-        cache.clear();
-        cache.insert(
-            next_defaults.default_provider.clone(),
-            Arc::clone(&next_default_provider),
-        );
-    }
-
-    {
-        let mut store = runtime_config_store().lock();
-        store.insert(
-            config_path.clone(),
-            RuntimeConfigState {
-                defaults: next_defaults.clone(),
-                last_applied_stamp: Some(stamp),
-            },
-        );
-    }
-
-    tracing::info!(
-        path = %config_path.display(),
-        provider = %next_defaults.default_provider,
-        model = %next_defaults.model,
-        temperature = next_defaults.temperature,
-        "Applied updated channel runtime config from disk"
-    );
-
-    Ok(())
-}
-
-fn default_route_selection(ctx: &ChannelRuntimeContext) -> ChannelRouteSelection {
-    let defaults = runtime_defaults_snapshot(ctx);
+fn default_route_selection_for_generation(
+    ctx: &ChannelRuntimeContext,
+    generation: &Arc<crate::config::ConfigGeneration>,
+) -> ChannelRouteSelection {
+    let defaults = runtime_defaults_for_generation(ctx, generation);
     ChannelRouteSelection {
         provider: defaults.default_provider,
         model: defaults.model,
@@ -1321,7 +1231,11 @@ fn merged_history(
     merged
 }
 
-fn get_route_selection(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> ChannelRouteSelection {
+fn get_route_selection_for_generation(
+    ctx: &ChannelRuntimeContext,
+    key: &ConversationKey,
+    generation: &Arc<crate::config::ConfigGeneration>,
+) -> ChannelRouteSelection {
     let routes = ctx.route_overrides.lock();
     // Read-merge for the single-value route map: prefer the canonical override,
     // fall back to the legacy (sender-scoped) override as read-only pre-history
@@ -1337,11 +1251,16 @@ fn get_route_selection(ctx: &ChannelRuntimeContext, key: &ConversationKey) -> Ch
             }
         })
         .cloned()
-        .unwrap_or_else(|| default_route_selection(ctx))
+        .unwrap_or_else(|| default_route_selection_for_generation(ctx, generation))
 }
 
-fn set_route_selection(ctx: &ChannelRuntimeContext, key: &ConversationKey, next: ChannelRouteSelection) {
-    let default_route = default_route_selection(ctx);
+fn set_route_selection(
+    ctx: &ChannelRuntimeContext,
+    generation: &Arc<crate::config::ConfigGeneration>,
+    key: &ConversationKey,
+    next: ChannelRouteSelection,
+) {
+    let default_route = default_route_selection_for_generation(ctx, generation);
     let mut routes = ctx.route_overrides.lock();
     if next == default_route {
         routes.remove(&key.canonical);
@@ -1489,6 +1408,7 @@ fn authorize_channel_outbound(
 #[allow(clippy::too_many_arguments)]
 async fn append_sender_turn(
     ctx: &ChannelRuntimeContext,
+    config_generation: &Arc<crate::config::ConfigGeneration>,
     key: &ConversationKey,
     channel: &str,
     sender: &str,
@@ -1533,7 +1453,8 @@ async fn append_sender_turn(
         recipient.unwrap_or(sender).to_string(),
         visibility,
     )
-    .with_run_id(run_id);
+    .with_run_id(run_id)
+    .with_config_generation(config_generation);
     let owner_id = envelope.resolved_owner_id();
 
     if let Err(error) = ctx
@@ -1707,16 +1628,19 @@ fn load_cached_model_preview(workspace_dir: &Path, provider_name: &str) -> Vec<S
         .unwrap_or_default()
 }
 
-async fn get_or_create_provider(ctx: &ChannelRuntimeContext, provider_name: &str) -> anyhow::Result<Arc<dyn Provider>> {
+async fn get_or_create_provider_for_generation(
+    ctx: &ChannelRuntimeContext,
+    provider_name: &str,
+    generation: &Arc<crate::config::ConfigGeneration>,
+) -> anyhow::Result<Arc<dyn Provider>> {
     if let Some(existing) = ctx.provider_cache.lock().get(provider_name).cloned() {
         return Ok(existing);
     }
-
     if provider_name == ctx.default_provider.as_str() {
         return Ok(Arc::clone(&ctx.provider));
     }
 
-    let defaults = runtime_defaults_snapshot(ctx);
+    let defaults = runtime_defaults_for_generation(ctx, generation);
     let api_url = if provider_name == defaults.default_provider.as_str() {
         defaults.api_url.as_deref()
     } else {
@@ -1736,11 +1660,10 @@ async fn get_or_create_provider(ctx: &ChannelRuntimeContext, provider_name: &str
         tracing::warn!(provider = provider_name, "Provider warmup failed: {err}");
     }
 
-    let mut cache = ctx.provider_cache.lock();
-    let cached = cache
-        .entry(provider_name.to_string())
-        .or_insert_with(|| Arc::clone(&provider));
-    Ok(Arc::clone(cached))
+    ctx.provider_cache
+        .lock()
+        .insert(provider_name.to_string(), Arc::clone(&provider));
+    Ok(provider)
 }
 
 fn build_models_help_response(current: &ChannelRouteSelection, workspace_dir: &Path) -> String {
@@ -1796,6 +1719,7 @@ fn build_providers_help_response(current: &ChannelRouteSelection) -> String {
 
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
+    config_generation: &Arc<crate::config::ConfigGeneration>,
     msg: &traits::ChannelMessage,
     target_channel: Option<&Arc<dyn Channel>>,
 ) -> bool {
@@ -1808,29 +1732,33 @@ async fn handle_runtime_command_if_needed(
     };
 
     let sender_key = ConversationKey::from_message(msg);
-    let mut current = get_route_selection(ctx, &sender_key);
+    let mut current = get_route_selection_for_generation(ctx, &sender_key, config_generation);
 
     let response = match command {
         ChannelRuntimeCommand::ShowProviders => build_providers_help_response(&current),
         ChannelRuntimeCommand::SetProvider(raw_provider) => match resolve_provider_alias(&raw_provider) {
-            Some(provider_name) => match get_or_create_provider(ctx, &provider_name).await {
-                Ok(_) => {
-                    if provider_name != current.provider {
-                        current.provider = provider_name.clone();
-                        set_route_selection(ctx, &sender_key, current.clone());
-                        clear_sender_history(ctx, &sender_key);
-                    }
+            Some(provider_name) => {
+                match get_or_create_provider_for_generation(ctx, &provider_name, config_generation).await {
+                    Ok(_) => {
+                        if provider_name != current.provider {
+                            current.provider = provider_name.clone();
+                            set_route_selection(ctx, config_generation, &sender_key, current.clone());
+                            clear_sender_history(ctx, &sender_key);
+                        }
 
-                    format!(
-                        "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
-                        current.model
-                    )
+                        format!(
+                            "Provider switched to `{provider_name}` for this sender session. Current model is `{}`.\nUse `/model <model-id>` to set a provider-compatible model.",
+                            current.model
+                        )
+                    }
+                    Err(err) => {
+                        let safe_err = providers::sanitize_api_error(&err.to_string());
+                        format!(
+                            "Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}"
+                        )
+                    }
                 }
-                Err(err) => {
-                    let safe_err = providers::sanitize_api_error(&err.to_string());
-                    format!("Failed to initialize provider `{provider_name}`. Route unchanged.\nDetails: {safe_err}")
-                }
-            },
+            }
             None => format!("Unknown provider `{raw_provider}`. Use `/models` to list valid providers."),
         },
         ChannelRuntimeCommand::ShowModel => build_models_help_response(&current, ctx.workspace_dir.as_path()),
@@ -1840,7 +1768,7 @@ async fn handle_runtime_command_if_needed(
                 "Model ID cannot be empty. Use `/model <model-id>`.".to_string()
             } else {
                 current.model = model.clone();
-                set_route_selection(ctx, &sender_key, current.clone());
+                set_route_selection(ctx, config_generation, &sender_key, current.clone());
                 clear_sender_history(ctx, &sender_key);
 
                 format!(
@@ -2693,19 +2621,20 @@ async fn process_channel_message(
     );
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
-    if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
-        tracing::warn!("Failed to apply runtime config update: {err}");
-    }
-    // D2-2: load the current security generation ONCE, immediately after the
-    // (possibly applied) config reload, and reuse this single snapshot for the
-    // entire message — inbound, autosave, outbound, and the scope/tool-call loop.
-    // This guarantees "one message = one coherent security generation": no path
-    // can observe a "new security + old pipeline" mix, and a hot-reload that lands
-    // mid-message can never split the message across two generations (outbound and
-    // scope run after the agent loop but still use this fixed start-of-message
-    // snapshot). The next message will pick up the new generation.
-    let security_gen = ctx.security.load_full();
-    if handle_runtime_command_if_needed(ctx.as_ref(), &msg, target_channel.as_ref()).await {
+    // Pin exactly one process-owned generation at message admission. Snapshot-hot
+    // fields are read from this immutable value for the whole message, while
+    // rebuild fields are switched by the channel supervisor before publication.
+    let config_generation = ctx.config.pin();
+    let message_runtime = message_runtime_snapshot(ctx.as_ref(), &config_generation);
+    #[cfg(not(test))]
+    let security = crate::runtime::bootstrap::build_security_policy(&config_generation.effective);
+    #[cfg(test)]
+    let security = if Arc::ptr_eq(&ctx.config.pin(), &ctx.config_generation) {
+        crate::runtime::bootstrap::build_security_policy(&config_generation.effective)
+    } else {
+        Arc::clone(&ctx.security.load_full().security)
+    };
+    if handle_runtime_command_if_needed(ctx.as_ref(), &config_generation, &msg, target_channel.as_ref()).await {
         return;
     }
     if !should_process_inbound_message(ctx.as_ref(), &msg) {
@@ -2714,9 +2643,11 @@ async fn process_channel_message(
 
     let history_key = ConversationKey::from_message(&msg);
     let message_visibility = channel_message_visibility(&msg);
-    let route = get_route_selection(ctx.as_ref(), &history_key);
-    let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let active_provider = match get_or_create_provider(ctx.as_ref(), &route.provider).await {
+    let route = get_route_selection_for_generation(ctx.as_ref(), &history_key, &config_generation);
+    let runtime_defaults = runtime_defaults_for_generation(ctx.as_ref(), &config_generation);
+    let active_provider = match get_or_create_provider_for_generation(ctx.as_ref(), &route.provider, &config_generation)
+        .await
+    {
         Ok(provider) => provider,
         Err(err) => {
             let safe_err = providers::sanitize_api_error(&err.to_string());
@@ -2764,12 +2695,10 @@ async fn process_channel_message(
     // abort before the first history mutation; Supervised/Full keep normal
     // traffic flowing untouched (Low risk + grant=None is allowed there).
     // D2-2: use the per-message security generation captured at the top of this
-    // function; rebuild only happens in the stamp-change branch of
-    // maybe_apply_runtime_config_update, never here. D6: the operation name
-    // (`channel:{channel}:inbound:{sender}`) is now owned by `InboundGate`.
-    if let Err(reason) =
-        authorize_channel_inbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel, &msg.sender)
-    {
+    // function; the policy comes from the generation pinned at admission and is
+    // never replaced mid-message. D6: the operation name
+    // (`channel:{channel}:inbound:{sender}`) is owned by `InboundGate`.
+    if let Err(reason) = authorize_channel_inbound(ctx.as_ref(), security.as_ref(), &msg.channel, &msg.sender) {
         tracing::warn!(
             channel = %msg.channel,
             sender = %msg.sender,
@@ -2806,6 +2735,7 @@ async fn process_channel_message(
     let inbound_timestamp = to_rfc3339_timestamp(msg.timestamp);
     let inbound_event = append_sender_turn(
         ctx.as_ref(),
+        &config_generation,
         &history_key,
         &msg.channel,
         &msg.sender,
@@ -2825,7 +2755,7 @@ async fn process_channel_message(
     // budget); a deny skips the autosave and logs, never aborting the turn.
     // D2-2: reuse the per-message security generation so inbound+autosave for one
     // message see one coherent policy view (no re-poll happens between them).
-    let autosave_allowed = authorize_channel_autosave(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel)
+    let autosave_allowed = authorize_channel_autosave(ctx.as_ref(), security.as_ref(), &msg.channel)
         .map_err(|reason| {
             tracing::warn!(
                 channel = %msg.channel,
@@ -2930,6 +2860,7 @@ async fn process_channel_message(
         // any classifier fault enters the loop.
         let pre_gate_outcome = run_smart_pre_gate(
             ctx.as_ref(),
+            &config_generation,
             &history_key,
             &user_text_for_mention,
             route.provider.as_str(),
@@ -2960,7 +2891,7 @@ async fn process_channel_message(
         route.model.as_str(),
         runtime_defaults.temperature,
         &msg,
-        &ctx.multimodal,
+        &message_runtime.multimodal,
         ctx.hooks.media_artifacts().as_ref(),
     )
     .await
@@ -2977,8 +2908,7 @@ async fn process_channel_message(
             // owned by `InboundGate`). Deny semantics are identical to the normal
             // outbound deny below: the inbound user turn (already persisted above)
             // stays, but no assistant turn is persisted and nothing is sent.
-            if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel)
-            {
+            if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel) {
                 tracing::warn!(
                     channel = %msg.channel,
                     sender = %msg.sender,
@@ -2989,6 +2919,7 @@ async fn process_channel_message(
             let fallback = SIGNAL_IMAGE_UNCERTAINTY_FALLBACK.to_string();
             let _ = append_sender_turn(
                 ctx.as_ref(),
+                &config_generation,
                 &history_key,
                 &msg.channel,
                 &msg.sender,
@@ -3029,7 +2960,8 @@ async fn process_channel_message(
         msg.sender.clone(),
         Some(msg.reply_target.clone()),
     )
-    .with_run_id(turn_run_id.clone());
+    .with_run_id(turn_run_id.clone())
+    .with_config_generation(&config_generation);
     if let Some(event) = &inbound_event {
         runtime_envelope = runtime_envelope.with_source_message_event_id(event.event_id.clone());
     }
@@ -3050,7 +2982,7 @@ async fn process_channel_message(
         ctx.memory.as_ref(),
         runtime_envelope.memory_principal(),
         &msg.content,
-        ctx.min_relevance_score,
+        message_runtime.min_relevance_score,
         Some(&semantic_scope),
     )
     .await
@@ -3084,7 +3016,7 @@ async fn process_channel_message(
             .collect();
         let mut prompt = build_system_prompt_with_mode(
             &ctx.workspace_dir,
-            &ctx.model,
+            &runtime_defaults.model,
             &tool_descs_ref,
             &selected,
             rag_ctx.identity_config.as_ref(),
@@ -3160,7 +3092,7 @@ async fn process_channel_message(
     // agent loop, but deliberately uses the start-of-message snapshot so the whole
     // message stays within a single coherent generation. D6: the operation name
     // (`channel:{channel}:outbound`) is now owned by `InboundGate`.
-    if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security_gen.security.as_ref(), &msg.channel) {
+    if let Err(reason) = authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel) {
         tracing::warn!(
             channel = %msg.channel,
             sender = %msg.sender,
@@ -3300,18 +3232,14 @@ async fn process_channel_message(
 
     const MAX_CONTEXT_OVERFLOW_RETRIES: usize = 2;
 
-    let timeout_budget_secs = channel_message_timeout_budget_secs(ctx.message_timeout_secs, ctx.max_tool_iterations);
+    let timeout_budget_secs =
+        channel_message_timeout_budget_secs(ctx.message_timeout_secs, message_runtime.max_tool_iterations);
 
     let scope_owner_id = runtime_envelope.resolved_owner_id();
-    // D2-2: borrow the per-message security generation for the whole tool-call
-    // loop. ScopeContext takes `security_gen.security` from the SAME generation,
-    // so every tool-authorization decision in the loop is driven by one coherent
-    // `SecurityPolicy` (never a mid-loop reload).
-    // `security_gen` lives until the end of process_channel_message, covering the
-    // entire loop. Rebuild only happens in the stamp-change branch of
-    // maybe_apply_runtime_config_update.
+    // Borrow the policy derived from this message's pinned ConfigGeneration for
+    // the entire tool-call loop.
     let scope_ctx = ScopeContext {
-        policy: security_gen.security.as_ref(),
+        policy: security.as_ref(),
         sender: &msg.sender,
         channel: &msg.channel,
         chat_type: inferred_chat_type,
@@ -3320,6 +3248,8 @@ async fn process_channel_message(
         topic_id: runtime_envelope.topic_id.as_deref(),
         task_id: runtime_envelope.resolved_task_id(),
         source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
+        config_generation_id: runtime_envelope.config_generation_id,
+        config_source_revision: runtime_envelope.config_source_revision.as_deref(),
     };
 
     // D8-4: seed a turn-root spawn execution context so any sub-agent spawned
@@ -3364,20 +3294,20 @@ async fn process_channel_message(
                     true,
                     None,
                     msg.channel.as_str(),
-                    &ctx.multimodal,
-                    ctx.max_tool_iterations,
+                    &message_runtime.multimodal,
+                    message_runtime.max_tool_iterations,
                     true,
-                    ctx.read_only_tool_concurrency_window,
-                    ctx.read_only_tool_timeout_secs,
-                    ctx.priority_scheduling_enabled,
-                    ctx.low_priority_tools.clone(),
+                    message_runtime.read_only_tool_concurrency_window,
+                    message_runtime.read_only_tool_timeout_secs,
+                    message_runtime.priority_scheduling_enabled,
+                    message_runtime.low_priority_tools.clone(),
                     ToolConcurrencyGovernanceConfig::default(),
-                    Some(&ctx.agent_compaction),
+                    Some(&message_runtime.agent_compaction),
                     Some(cancellation_token.clone()),
                     delta_tx.clone(),
                     Some(&scope_ctx),
                     Some(tool_event_tx.clone()),
-                    Some(&ctx.tool_tiering),
+                    Some(&message_runtime.tool_tiering),
                     Some(DocumentIngestRuntime::from_scope(ctx.memory.clone(), &scope_ctx)),
                     crate::agent::loop_::ChatMode::default(),
                     None,
@@ -3517,6 +3447,7 @@ async fn process_channel_message(
                     },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3580,6 +3511,7 @@ async fn process_channel_message(
                     },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3592,6 +3524,7 @@ async fn process_channel_message(
 
             let _ = append_sender_turn(
                 ctx.as_ref(),
+                &config_generation,
                 &history_key,
                 &msg.channel,
                 &msg.sender,
@@ -3656,6 +3589,7 @@ async fn process_channel_message(
                     delivery_intent: crate::agent::terminal::TurnDeliveryIntent::Suppress { reason: reason.clone() },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3711,6 +3645,7 @@ async fn process_channel_message(
                     },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3766,6 +3701,7 @@ async fn process_channel_message(
                     },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3810,6 +3746,7 @@ async fn process_channel_message(
                     },
                 },
                 &crate::config::schema::CostConfig::default(),
+                ctx.workspace_dir.as_path(),
             )
             .await
             {
@@ -3936,6 +3873,7 @@ fn gather_pre_gate_history(
 /// Returns the shared provider `Arc` plus the model id to use.
 async fn resolve_pre_gate_classifier(
     ctx: &ChannelRuntimeContext,
+    config_generation: &Arc<crate::config::ConfigGeneration>,
     route_provider: &str,
     route_model: &str,
     fallback_provider: &Arc<dyn Provider>,
@@ -3952,7 +3890,7 @@ async fn resolve_pre_gate_classifier(
         return (Arc::clone(fallback_provider), model);
     }
 
-    match get_or_create_provider(ctx, cfg.classifier_provider.trim()).await {
+    match get_or_create_provider_for_generation(ctx, cfg.classifier_provider.trim(), config_generation).await {
         Ok(provider) => (provider, model),
         Err(err) => {
             tracing::warn!(
@@ -3972,6 +3910,7 @@ async fn resolve_pre_gate_classifier(
 /// 🔴 Fail-open: any classifier fault enters the loop (see `pre_gate` module).
 async fn run_smart_pre_gate(
     ctx: &ChannelRuntimeContext,
+    config_generation: &Arc<crate::config::ConfigGeneration>,
     history_key: &ConversationKey,
     user_text: &str,
     route_provider: &str,
@@ -4000,7 +3939,7 @@ async fn run_smart_pre_gate(
                 return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen);
             }
             let (provider, model) =
-                resolve_pre_gate_classifier(ctx, route_provider, route_model, active_provider).await;
+                resolve_pre_gate_classifier(ctx, config_generation, route_provider, route_model, active_provider).await;
             pre_gate::classify_with_model(
                 provider.as_ref(),
                 &model,
@@ -4701,7 +4640,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     config.media.clone(),
                     sig.storm_protection.clone(),
                 )
-                .with_artifact_owner(media_artifacts.clone()),
+                .with_artifact_owner(media_artifacts),
             )
         } else {
             Arc::new(
@@ -4715,7 +4654,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
                     config.media.clone(),
                     sig.storm_protection.clone(),
                 )
-                .with_artifact_owner(media_artifacts.clone()),
+                .with_artifact_owner(media_artifacts),
             )
         };
         channels.push(("Signal", signal_channel));
@@ -4893,8 +4832,21 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 }
 
 /// Start all configured channels and route messages to the agent
-#[allow(clippy::too_many_lines)]
 pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Result<()> {
+    let shared_config = crate::config::new_shared(config.clone());
+    let generation = shared_config.pin();
+    start_channels_with_config(config, shared_config, generation, shutdown).await
+}
+
+#[allow(clippy::too_many_lines)]
+pub async fn start_channels_with_config(
+    config: Config,
+    shared_config: crate::config::SharedConfig,
+    config_generation: Arc<crate::config::ConfigGeneration>,
+    shutdown: CancellationToken,
+) -> Result<()> {
+    #[cfg(not(test))]
+    let _ = &config_generation;
     let provider_name = resolved_default_provider(&config);
     let provider_runtime_options = providers::provider_runtime_options_from_config(&config);
     let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
@@ -4911,18 +4863,6 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         tracing::warn!("Provider warmup failed (non-fatal): {e}");
     }
 
-    let initial_stamp = config_file_stamp(&config.config_path).await;
-    {
-        let mut store = runtime_config_store().lock();
-        store.insert(
-            config.config_path.clone(),
-            RuntimeConfigState {
-                defaults: runtime_defaults_from_config(&config),
-                last_applied_stamp: initial_stamp,
-            },
-        );
-    }
-
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = Arc::new(HookManager::new(config.workspace_dir.clone()));
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
@@ -4932,14 +4872,10 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     // no mode can forget `with_audit_config`. Wiring is verbatim-identical to the
     // former local construction (gateway uses the same helper).
     //
-    // D2-2 boundary: this startup `Arc<SecurityPolicy>` is the snapshot captured by
-    // channel-aware tools (message_send/sessions_spawn/sessions_send/subagents/
-    // gateway via `security.clone()` below). Those tools remain **restart-only** in
-    // this increment — they keep this fixed snapshot and do NOT observe config
-    // hot-reload, matching the gateway D2-1 boundary. Only the channel's own gates
-    // (inbound/autosave/outbound/scope) are made hot, via the `ArcSwap`-wrapped copy
-    // stored in `ctx.security`, which `maybe_apply_runtime_config_update` swaps on a
-    // config stamp change.
+    // Channel-aware tools built for this component generation retain this policy
+    // until the daemon supervisor replaces the component. Per-message channel
+    // gates independently derive their policy from the generation pinned at
+    // admission, so one turn never mixes security generations.
     let security = crate::runtime::bootstrap::build_security_policy(&config);
     let model = resolved_default_model(&config);
     let temperature = config.default_temperature;
@@ -4966,6 +4902,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     // before wrapping in Arc below.
     let mut tools_list = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
+        Arc::clone(&shared_config),
         &security,
         runtime,
         Arc::clone(&mem),
@@ -5192,7 +5129,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
                     config.media.clone(),
                     sig.storm_protection.clone(),
                 )
-                .with_artifact_owner(media_artifacts.clone()),
+                .with_artifact_owner(media_artifacts),
             )
         } else {
             Arc::new(
@@ -5206,7 +5143,7 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
                     config.media.clone(),
                     sig.storm_protection.clone(),
                 )
-                .with_artifact_owner(media_artifacts.clone()),
+                .with_artifact_owner(media_artifacts),
             )
         };
         channels.push(signal_channel);
@@ -5452,13 +5389,8 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         ));
         // gateway: daemon management (OpenClaw alignment)
         tools_list.push(Box::new(
-            tools::GatewayTool::new(
-                Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())),
-                &provider_name,
-                &model,
-                channel_names,
-            )
-            .with_security(security.clone()),
+            tools::GatewayTool::new(Arc::clone(&shared_config), &provider_name, &model, channel_names)
+                .with_security(security.clone()),
         ));
 
         // image: vision tool backed by the active provider (OpenClaw alignment)
@@ -5478,9 +5410,8 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
 
     // Register config_reload tool (allows AI to manually trigger hot-reload).
     {
-        let shared_config_for_reload = Arc::new(arc_swap::ArcSwap::from_pointee(config.clone()));
         tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
-            shared_config_for_reload,
+            Arc::clone(&shared_config),
             security.clone(),
         )));
     }
@@ -5618,6 +5549,9 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
     let group_reply_mode_by_channel = collect_group_reply_mode_by_channel(&config);
 
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
+        config: shared_config,
+        #[cfg(test)]
+        config_generation,
         channels_by_name,
         provider: Arc::clone(&provider),
         default_provider: Arc::new(provider_name),
@@ -5626,38 +5560,47 @@ pub async fn start_channels(config: Config, shutdown: CancellationToken) -> Resu
         observer,
         hooks,
         system_prompt: Arc::new(system_prompt),
+        #[cfg(test)]
         model: Arc::new(model.clone()),
+        #[cfg(test)]
         temperature,
         auto_save_memory: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
         memory_event_recording: config.memory.event_recording_config(),
         max_tool_iterations: config.agent.max_tool_iterations,
+        #[cfg(test)]
         read_only_tool_concurrency_window: config.agent.read_only_tool_concurrency_window,
+        #[cfg(test)]
         read_only_tool_timeout_secs: config.agent.read_only_tool_timeout_secs,
+        #[cfg(test)]
         priority_scheduling_enabled: config.agent.priority_scheduling_enabled,
+        #[cfg(test)]
         low_priority_tools: config.agent.low_priority_tools.clone(),
+        #[cfg(test)]
         min_relevance_score: config.memory.min_relevance_score,
         conversation_histories,
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
+        #[cfg(test)]
         api_key: config.api_key.clone(),
+        #[cfg(test)]
         api_url: config.api_url.clone(),
+        #[cfg(test)]
         reliability: Arc::new(config.reliability.clone()),
         provider_runtime_options,
         workspace_dir: Arc::new(config.workspace_dir.clone()),
         message_timeout_secs,
         interrupt_on_new_message,
+        #[cfg(test)]
         multimodal: config.multimodal.clone(),
-        // D2-2: wrap the startup security generation (policy + pipeline) in a single
-        // ArcSwap so the stamp-change branch of maybe_apply_runtime_config_update can
-        // hot-swap it atomically for the channel gates. Both halves come from the
-        // same startup `config` parse, so they form one coherent generation.
-        // Channel-aware tools (message_send/sessions_*) keep their own restart-
-        // only `security` snapshot (captured above), matching the gateway D2-1
-        // boundary — this increment only makes the channel's own gates hot.
+        // Preserve the legacy fixture only in unit-test builds. Production
+        // authorization derives security from the per-message generation.
+        #[cfg(test)]
         security: Arc::new(arc_swap::ArcSwap::from_pointee(SecurityGen {
             security: Arc::clone(&security),
         })),
+        #[cfg(test)]
         agent_compaction: config.agent.compaction.clone(),
+        #[cfg(test)]
         tool_tiering: config.tool_tiering.clone(),
         signal_inbound_policy,
         whatsapp_inbound_policy,
@@ -6011,9 +5954,11 @@ mod tests {
             answer: "NO".into(),
             calls: AtomicUsize::new(0),
         });
+        let generation = ctx.config.pin();
         // Even obvious noise enters the loop when the pre-gate is off.
         let outcome = run_smart_pre_gate(
             &ctx,
+            &generation,
             &pre_gate_history_key(),
             "lol",
             "test-provider",
@@ -6035,8 +5980,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let provider: Arc<dyn Provider> = counting.clone();
+        let generation = ctx.config.pin();
         let outcome = run_smart_pre_gate(
             &ctx,
+            &generation,
             &pre_gate_history_key(),
             "😂😂",
             "test-provider",
@@ -6063,8 +6010,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let provider: Arc<dyn Provider> = counting.clone();
+        let generation = ctx.config.pin();
         let outcome = run_smart_pre_gate(
             &ctx,
+            &generation,
             &pre_gate_history_key(),
             "what is the deploy status?",
             "test-provider",
@@ -6090,8 +6039,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let provider: Arc<dyn Provider> = counting.clone();
+        let generation = ctx.config.pin();
         let outcome = run_smart_pre_gate(
             &ctx,
+            &generation,
             &pre_gate_history_key(),
             "the deploy went out an hour ago to all prod servers",
             "test-provider",
@@ -6118,8 +6069,10 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
         let provider: Arc<dyn Provider> = counting.clone();
+        let generation = ctx.config.pin();
         let outcome = run_smart_pre_gate(
             &ctx,
+            &generation,
             &pre_gate_history_key(),
             "the deploy went out an hour ago to all prod servers",
             "test-provider",
@@ -6257,6 +6210,8 @@ mod tests {
         );
 
         let ctx = ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -6328,6 +6283,8 @@ mod tests {
     /// seeded with `histories`, for exercising compact/clear in isolation.
     fn ctx_with_histories(histories: HashMap<String, Vec<ChatMessage>>) -> ChannelRuntimeContext {
         ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -6374,6 +6331,38 @@ mod tests {
             skill_rag_ctx: None,
             test_inbound_authorizer: None,
         }
+    }
+
+    #[test]
+    fn channel_message_admission_pins_the_current_manager_generation() {
+        let manager = crate::config::new_shared(Config::default());
+        let initial_generation = manager.pin();
+        let mut ctx = ctx_with_histories(HashMap::new());
+        ctx.config = Arc::clone(&manager);
+        ctx.config_generation = Arc::clone(&initial_generation);
+
+        let mut desired = (*initial_generation.effective).clone();
+        desired.default_temperature = 0.42;
+        desired.agent.max_tool_iterations = 17;
+        desired.agent.read_only_tool_concurrency_window = 7;
+        manager
+            .apply_runtime_config(desired, crate::config::ConfigReloadTrigger::Test)
+            .expect("snapshot-hot channel fields must publish");
+
+        let current_generation = manager.pin();
+        ctx.config_generation = Arc::clone(&current_generation);
+        let current_defaults = runtime_defaults_for_generation(&ctx, &current_generation);
+        let current_message = message_runtime_snapshot(&ctx, &current_generation);
+        let pinned_before_reload = message_runtime_snapshot(&ctx, &initial_generation);
+
+        assert_ne!(current_generation.id, initial_generation.id);
+        assert_eq!(current_defaults.temperature, 0.42);
+        assert_eq!(current_message.max_tool_iterations, 17);
+        assert_eq!(current_message.read_only_tool_concurrency_window, 7);
+        assert_ne!(
+            current_message.max_tool_iterations,
+            pinned_before_reload.max_tool_iterations
+        );
     }
 
     #[test]
@@ -6703,6 +6692,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let ctx = ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(HashMap::new()),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -6750,8 +6741,10 @@ mod tests {
             test_inbound_authorizer: None,
         };
 
+        let test_generation = Arc::clone(&ctx.config_generation);
         let _ = append_sender_turn(
             &ctx,
+            &test_generation,
             &ConversationKey {
                 canonical: "channel:telegram:sender-1:sender-1".to_string(),
                 legacy: "telegram_sender-1".to_string(),
@@ -7471,6 +7464,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7557,6 +7552,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(RawToolArtifactProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7643,6 +7640,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(ToolCallingAliasProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7731,6 +7730,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(SignalVisionNoResultProvider::default());
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7818,6 +7819,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(SignalTextOnlyProvider::default());
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -7911,6 +7914,8 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("openrouter".to_string(), fallback_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -8032,6 +8037,8 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&default_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -8126,6 +8133,8 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), reloaded_provider);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&startup_provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -8213,27 +8222,16 @@ BTC is currently around $65,000 based on latest tool output."#
         provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
 
         let temp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-
-        {
-            let mut store = runtime_config_store().lock();
-            store.insert(
-                config_path.clone(),
-                RuntimeConfigState {
-                    defaults: ChannelRuntimeDefaults {
-                        default_provider: "test-provider".to_string(),
-                        model: "hot-reloaded-model".to_string(),
-                        temperature: 0.5,
-                        api_key: None,
-                        api_url: None,
-                        reliability: crate::config::ReliabilityConfig::default(),
-                    },
-                    last_applied_stamp: None,
-                },
-            );
-        }
+        let mut live_config = Config::default();
+        live_config.default_provider = Some("test-provider".to_string());
+        live_config.default_model = Some("hot-reloaded-model".to_string());
+        live_config.default_temperature = 0.5;
+        let config_manager = crate::config::new_shared(live_config);
+        let config_generation = config_manager.pin();
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: config_manager,
+            config_generation,
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::clone(&provider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -8306,59 +8304,11 @@ BTC is currently around $65,000 based on latest tool output."#
         )
         .await;
 
-        {
-            let mut store = runtime_config_store().lock();
-            store.remove(&config_path);
-        }
-
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
         assert_eq!(
             provider_impl.models.lock().as_slice(),
             &["hot-reloaded-model".to_string()]
         );
-    }
-
-    #[tokio::test]
-    async fn config_file_stamp_changes_when_config_fragment_changes() {
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        let config_dir = temp.path().join("config.d");
-        std::fs::create_dir_all(&config_dir).expect("create config.d");
-
-        std::fs::write(&config_path, "default_provider = \"openrouter\"\n").expect("write config.toml");
-        std::fs::write(config_dir.join("memory.toml"), "[memory]\nbackend = \"sqlite\"\n").expect("write fragment");
-
-        let before = config_file_stamp(&config_path).await.expect("stamp before");
-
-        std::fs::write(config_dir.join("memory.toml"), "[memory]\nbackend = \"markdown\"\n").expect("rewrite fragment");
-
-        let after = config_file_stamp(&config_path).await.expect("stamp after");
-        assert_ne!(before, after);
-    }
-
-    #[tokio::test]
-    async fn load_runtime_defaults_merges_config_and_fragments() {
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let config_path = temp.path().join("config.toml");
-        let config_dir = temp.path().join("config.d");
-        std::fs::create_dir_all(&config_dir).expect("create config.d");
-
-        std::fs::write(
-            &config_path,
-            "default_provider = \"openrouter\"\ndefault_model = \"base-model\"\ndefault_temperature = 0.7\n",
-        )
-        .expect("write config.toml");
-        std::fs::write(
-            config_dir.join("agent.toml"),
-            "default_model = \"fragment-model\"\ndefault_temperature = 0.42\n",
-        )
-        .expect("write fragment");
-
-        let merged = load_full_config_from_file(&config_path, temp.path()).expect("load merged config");
-        let defaults = runtime_defaults_from_config(&merged);
-        assert_eq!(defaults.default_provider, "openrouter");
-        assert_eq!(defaults.model, "fragment-model");
-        assert!((defaults.temperature - 0.42).abs() < f64::EPSILON);
     }
 
     #[tokio::test]
@@ -8370,6 +8320,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
                 required_tool_iterations: 11,
@@ -8457,6 +8409,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(IterativeToolProvider {
                 required_tool_iterations: 20,
@@ -8713,6 +8667,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
         Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -9114,7 +9070,14 @@ BTC is currently around $65,000 based on latest tool output."#
         let channel: Arc<dyn Channel> = channel_impl.clone();
         let mut channels_by_name = HashMap::new();
         channels_by_name.insert(channel.name().to_string(), channel);
+        let mut runtime_config = Config::default();
+        runtime_config.autonomy.level = crate::security::AutonomyLevel::Supervised;
+        runtime_config.default_provider = Some("test-provider".to_string());
+        runtime_config.default_model = Some("test-model".to_string());
+        let config_manager = crate::config::new_shared(runtime_config);
         let ctx = Arc::new(ChannelRuntimeContext {
+            config: Arc::clone(&config_manager),
+            config_generation: config_manager.pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(DummyProvider),
             default_provider: Arc::new("test-provider".to_string()),
@@ -9237,6 +9200,23 @@ BTC is currently around $65,000 based on latest tool output."#
             user_event.parent_run_id.is_none() && assistant_event.parent_run_id.is_none(),
             "a turn with no spawn lineage must not set parent_run_id"
         );
+        for event in std::iter::once(user_event)
+            .chain(std::iter::once(assistant_event))
+            .chain(terminal_events.iter().copied())
+        {
+            assert_eq!(
+                event.config_generation_id,
+                Some(0),
+                "every event in one channel turn must retain its pinned config generation"
+            );
+            assert!(
+                event
+                    .config_source_revision
+                    .as_deref()
+                    .is_some_and(|revision| !revision.is_empty()),
+                "every event in one channel turn must retain its config source revision"
+            );
+        }
     }
 
     // ── D2-2: channels security hot-reload ──────────────────────────────────
@@ -9261,60 +9241,6 @@ BTC is currently around $65,000 based on latest tool output."#
                 autonomy,
                 ..crate::security::SecurityPolicy::default()
             }),
-        })
-    }
-
-    /// Minimal channel runtime context whose config reload path points at
-    /// `openprx_dir/config.toml`, seeded with `start_gen` as the live security
-    /// generation. Used to drive `maybe_apply_runtime_config_update` end-to-end.
-    fn reload_test_ctx(openprx_dir: &std::path::Path, start_gen: Arc<SecurityGen>) -> Arc<ChannelRuntimeContext> {
-        Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(HashMap::new()),
-            provider: Arc::new(DummyProvider),
-            default_provider: Arc::new("openrouter".to_string()),
-            memory: Arc::new(NoopMemory),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            hooks: Arc::new(crate::hooks::HookManager::new(std::env::temp_dir())),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("startup-model".to_string()),
-            temperature: 0.0,
-            auto_save_memory: false,
-            memory_event_recording: MemoryEventRecording::default(),
-            max_tool_iterations: 5,
-            read_only_tool_concurrency_window: 2,
-            read_only_tool_timeout_secs: 30,
-            priority_scheduling_enabled: false,
-            low_priority_tools: Vec::new(),
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            api_key: None,
-            api_url: None,
-            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
-            provider_runtime_options: providers::ProviderRuntimeOptions {
-                openprx_dir: Some(openprx_dir.to_path_buf()),
-                ..providers::ProviderRuntimeOptions::default()
-            },
-            workspace_dir: Arc::new(openprx_dir.to_path_buf()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            agent_compaction: crate::config::AgentCompactionConfig::default(),
-            tool_tiering: crate::config::ToolTieringConfig::default(),
-            signal_inbound_policy: None,
-            whatsapp_inbound_policy: None,
-            bot_names: vec!["prx".to_string()],
-            bot_uuids: vec![],
-            mention_only_by_channel: HashMap::new(),
-            group_reply_mode_by_channel: HashMap::new(),
-            smart_reply_cooldown: Arc::new(parking_lot::Mutex::new(HashMap::new())),
-            smart_group: crate::config::SmartGroupConfig::default(),
-            interrupt_on_new_message: false,
-            multimodal: crate::config::MultimodalConfig::default(),
-            security: Arc::new(arc_swap::ArcSwap::new(start_gen)),
-            native_tools: false,
-            skill_rag_ctx: None,
-            test_inbound_authorizer: None,
         })
     }
 
@@ -9378,144 +9304,6 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
-    /// Write a `config.toml` that produces a buildable provider (explicit api_key
-    /// makes the primary provider available offline) plus the given `[autonomy]`
-    /// level and `[autonomy.scopes]` default action ("allow" / "deny").
-    ///
-    /// Permission-model Phase 1: tool authorization is driven entirely by
-    /// `[autonomy]` (level + scopes), so a reload that flips a tool to deny is
-    /// expressed via the scope ACL default rather than the deleted
-    /// `[security.tool_policy]` pipeline.
-    fn write_reload_config(dir: &std::path::Path, level: &str, scope_default: &str) {
-        let toml = format!(
-            "default_provider = \"openrouter\"\n\
-             default_model = \"openrouter/auto\"\n\
-             default_temperature = 0.7\n\
-             api_key = \"sk-test-reload-key\"\n\
-             \n\
-             [autonomy]\n\
-             level = \"{level}\"\n\
-             workspace_only = true\n\
-             forbidden_paths = []\n\
-             max_actions_per_hour = 100\n\
-             max_cost_per_day_cents = 1000\n\
-             \n\
-             [autonomy.scopes]\n\
-             default = \"{scope_default}\"\n"
-        );
-        std::fs::write(dir.join("config.toml"), toml).expect("write config.toml");
-    }
-
-    /// T2-reload: drive `maybe_apply_runtime_config_update` end-to-end so it hits
-    /// the stamp-change branch, and assert the live `SecurityGen` is rebuilt —
-    /// the new `[autonomy]` level AND the new `[autonomy.scopes]` default both
-    /// take effect atomically in the swapped-in `SecurityPolicy`.
-    #[tokio::test]
-    async fn t2_reload_rebuilds_security_generation() {
-        use crate::security::policy::ToolDecision;
-
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        // Start the live generation at Supervised with allow-by-default scopes.
-        let ctx = reload_test_ctx(temp.path(), make_gen(crate::security::AutonomyLevel::Supervised));
-
-        // Sanity: the starting generation allows an arbitrary tool in scope.
-        {
-            let before = ctx.security.load_full();
-            assert!(
-                before
-                    .security
-                    .is_tool_allowed("memory_recall", "alice", "telegram", "direct"),
-                "starting Supervised generation must allow the tool before reload"
-            );
-        }
-
-        // On-disk config changes autonomy to readonly and flips the scope ACL
-        // default to deny.
-        write_reload_config(temp.path(), "readonly", "deny");
-
-        maybe_apply_runtime_config_update(ctx.as_ref())
-            .await
-            .expect("reload should succeed with a buildable provider config");
-
-        let live = ctx.security.load_full();
-        // The new autonomy level rode in on the swapped SecurityPolicy.
-        assert_eq!(
-            live.security.autonomy,
-            crate::security::AutonomyLevel::ReadOnly,
-            "reload must rebuild security with the new read_only autonomy"
-        );
-        // The new scope-deny default rode in on the SAME swapped SecurityPolicy:
-        // the scope ACL now denies, so the unified decision is Deny.
-        assert!(
-            !live
-                .security
-                .is_tool_allowed("memory_recall", "alice", "telegram", "direct"),
-            "reload must swap in the deny-by-default scope ACL in the same generation"
-        );
-        assert_eq!(
-            live.security.decide("memory_recall", "alice", "telegram", "direct"),
-            ToolDecision::Deny,
-            "after reload the unified decision must be Deny (scope ACL denies)"
-        );
-    }
-
-    /// T2-partial-apply: a reload whose fallible provider construction FAILS must
-    /// leave the live `SecurityGen` and the applied stamp untouched — proving the
-    /// all-or-nothing property (failure → store nothing → old generation kept).
-    /// We trigger the failure by naming an unknown primary provider, which makes
-    /// `create_resilient_provider_with_options` bail before the commit point.
-    #[tokio::test]
-    async fn t2_partial_apply_failure_keeps_old_generation() {
-        let temp = tempfile::TempDir::new().expect("temp dir");
-        let start_gen = make_gen(crate::security::AutonomyLevel::Supervised);
-        let ctx = reload_test_ctx(temp.path(), Arc::clone(&start_gen));
-
-        // Config flips autonomy to read_only BUT names a provider that cannot be
-        // constructed — the security generation would change *if* store ran before
-        // the provider build (the pre-fix partial-apply bug), so this asserts the
-        // store is correctly deferred until after the provider build succeeds.
-        let toml = "default_provider = \"definitely-not-a-real-provider-xyz\"\n\
-                    default_temperature = 0.7\n\
-                    api_key = \"sk-test\"\n\
-                    \n\
-                    [autonomy]\n\
-                    level = \"readonly\"\n\
-                    workspace_only = true\n\
-                    forbidden_paths = []\n\
-                    max_actions_per_hour = 100\n\
-                    max_cost_per_day_cents = 1000\n";
-        std::fs::write(temp.path().join("config.toml"), toml).expect("write config.toml");
-
-        let result = maybe_apply_runtime_config_update(ctx.as_ref()).await;
-        assert!(
-            result.is_err(),
-            "reload with an unbuildable provider must return Err (fallible step failed)"
-        );
-
-        // The live generation must be byte-for-byte the original one: same Arc,
-        // same autonomy. Nothing was stored.
-        let live = ctx.security.load_full();
-        assert!(
-            Arc::ptr_eq(&live, &start_gen),
-            "failed reload must not store any new generation (old Arc preserved — all-or-nothing)"
-        );
-        assert_eq!(
-            live.security.autonomy,
-            crate::security::AutonomyLevel::Supervised,
-            "failed reload must keep the old Supervised autonomy (no partial apply)"
-        );
-
-        // The stamp must NOT have been committed either, so a subsequent retry
-        // still treats the config as unapplied.
-        let config_path = temp.path().join("config.toml");
-        let store = runtime_config_store().lock();
-        let committed = store.get(&config_path).and_then(|s| s.last_applied_stamp.clone());
-        assert!(
-            committed.is_none(),
-            "failed reload must not commit the stamp (no partial apply)"
-        );
-    }
-
     /// T2-scope-deny: storing a generation built from a config with
     /// `[autonomy.scopes] default = "deny"` flips scope authorization
     /// (`is_tool_allowed`, what `scope_or_pipeline_denial` consults) to deny.
@@ -9562,6 +9350,7 @@ BTC is currently around $65,000 based on latest tool output."#
 
         // Build a deny-by-default SecurityPolicy via the real config path.
         let mut autonomy = crate::config::AutonomyConfig::default();
+        autonomy.level = crate::security::AutonomyLevel::Supervised;
         autonomy.scopes.default = "deny".to_string();
         let denying = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
 
@@ -9679,6 +9468,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(250),
@@ -9795,6 +9586,8 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -9920,6 +9713,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(180),
@@ -10030,6 +9825,8 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: Arc::new(SlowProvider {
                 delay: Duration::from_millis(20),
@@ -10123,9 +9920,11 @@ BTC is currently around $65,000 based on latest tool output."#
             )
             .await
             .unwrap();
-        assert_eq!(events.len(), 2);
-        let user_event = events.first().unwrap();
-        let assistant_event = events.get(1).unwrap();
+        let user_event = events.iter().find(|event| event.role == "user").expect("user event");
+        let assistant_event = events
+            .iter()
+            .find(|event| event.role == "assistant")
+            .expect("assistant event");
         assert_eq!(user_event.source, "channel");
         assert_eq!(user_event.role, "user");
         assert_eq!(user_event.content, "hello");
@@ -10690,6 +10489,8 @@ BTC is currently around $65,000 based on latest tool output."#
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10806,6 +10607,8 @@ BTC is currently around $65,000 based on latest tool output."#
 
         let provider_impl = Arc::new(HistoryCaptureProvider::default());
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),
@@ -10912,6 +10715,8 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            config: crate::config::new_shared(Config::default()),
+            config_generation: crate::config::new_shared(Config::default()).pin(),
             channels_by_name: Arc::new(channels_by_name),
             provider: provider_impl.clone(),
             default_provider: Arc::new("test-provider".to_string()),

@@ -199,8 +199,8 @@ pub async fn diagnose_runtime(config: &Config) -> DoctorReport {
     check_daemon_state(config, &mut items);
     check_gateway_runtime(config, &mut items);
     check_channel_runtime(config, &mut items);
-    check_console_runtime(config, &mut items).await;
-    check_runtime_memory_health(config, &mut items).await;
+    check_console_runtime(config, &mut items);
+    check_runtime_memory_health(config, &mut items);
     check_runtime_readiness(config, &mut items);
     check_postgres_health(config, &mut items).await;
     check_embedding_endpoint(config, &mut items).await;
@@ -357,7 +357,7 @@ fn configured_channel_names(config: &Config) -> Vec<&'static str> {
     names
 }
 
-async fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
+fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "console";
     if !config.modules.memory {
         items.push(DiagItem::disabled(
@@ -405,7 +405,7 @@ async fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     }
 }
 
-async fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
+fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "memory";
     if !config.modules.memory {
         items.push(DiagItem::disabled(cat, "memory module disabled"));
@@ -1437,6 +1437,58 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
         items.push(DiagItem::error(cat, format!("invalid daemon timestamp: {updated_at}")));
     }
 
+    if let Some(generation) = snapshot.get("config_generation") {
+        let active = generation.get("active_generation").and_then(serde_json::Value::as_u64);
+        let desired_revision = generation
+            .get("desired_source_revision")
+            .and_then(|revision| revision.get("fingerprint_sha256"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+        let in_progress = generation
+            .get("reload_in_progress")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        items.push(DiagItem::ok(
+            "config-generation",
+            format!(
+                "active generation {} (desired revision {}, reload_in_progress={in_progress})",
+                active.map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+                desired_revision
+            ),
+        ));
+
+        if let Some(failure) = generation.get("last_failure").filter(|failure| !failure.is_null()) {
+            let error = failure
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown reload failure");
+            items.push(DiagItem::error(
+                "config-generation",
+                format!("last config reload failed: {error}"),
+            ));
+        } else if let Some(restart_required) = generation
+            .get("last_report")
+            .and_then(|report| report.get("restart_required"))
+            .and_then(serde_json::Value::as_array)
+            .filter(|fields| !fields.is_empty())
+        {
+            let fields = restart_required
+                .iter()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            items.push(DiagItem::warn(
+                "config-generation",
+                format!("desired config requires process restart for: {fields}"),
+            ));
+        }
+    } else {
+        items.push(DiagItem::unknown(
+            "config-generation",
+            "daemon state does not expose config generation status",
+        ));
+    }
+
     // Components
     if let Some(components) = snapshot.get("components").and_then(serde_json::Value::as_object) {
         // Scheduler
@@ -1678,7 +1730,7 @@ mod tests {
         check_environment(&mut items);
         check_daemon_state(&config, &mut items);
         config.modules.memory = false;
-        check_runtime_memory_health(&config, &mut items).await;
+        check_runtime_memory_health(&config, &mut items);
 
         let states: std::collections::HashSet<_> = items.iter().map(|item| item.state).collect();
         for expected in [
@@ -2098,7 +2150,7 @@ mod tests {
         let db_path = config.workspace_dir.join("memory").join("brain.db");
 
         let mut items = Vec::new();
-        check_runtime_memory_health(&config, &mut items).await;
+        check_runtime_memory_health(&config, &mut items);
 
         assert!(!db_path.exists(), "doctor memory probe must not create brain.db");
     }

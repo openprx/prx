@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.7"
+version = "0.8.8"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"

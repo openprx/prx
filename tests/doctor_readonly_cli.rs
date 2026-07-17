@@ -2,7 +2,7 @@ use openprx::config::Config;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn run_doctor(config_dir: &std::path::Path, doctor_args: &[&str]) -> std::process::Output {
+fn run_doctor(config_dir: &std::path::Path, doctor_args: &[&str]) -> std::io::Result<std::process::Output> {
     Command::new(env!("CARGO_BIN_EXE_prx"))
         .arg("--config-dir")
         .arg(config_dir)
@@ -11,7 +11,6 @@ fn run_doctor(config_dir: &std::path::Path, doctor_args: &[&str]) -> std::proces
         .env_remove("OPENPRX_CONFIG_DIR")
         .env_remove("OPENPRX_WORKSPACE")
         .output()
-        .expect("run prx doctor")
 }
 
 #[test]
@@ -19,7 +18,7 @@ fn doctor_does_not_initialize_missing_config_directory() {
     let temp = TempDir::new().unwrap();
     let config_dir = temp.path().join("missing-config");
 
-    let output = run_doctor(&config_dir, &[]);
+    let output = run_doctor(&config_dir, &[]).unwrap();
 
     assert!(!output.status.success());
     assert!(
@@ -45,7 +44,7 @@ fn doctor_errors_exit_nonzero_without_initializing_workspace() {
     .unwrap();
     let workspace = config_dir.join("workspace");
 
-    let output = run_doctor(&config_dir, &[]);
+    let output = run_doctor(&config_dir, &[]).unwrap();
 
     assert!(!output.status.success(), "ERROR findings must produce a nonzero exit");
     assert!(!workspace.exists(), "doctor must not initialize the missing workspace");
@@ -70,7 +69,7 @@ fn doctor_runtime_does_not_create_memory_database() {
     .unwrap();
     let db_path = workspace.join("memory").join("brain.db");
 
-    let output = run_doctor(&config_dir, &["runtime"]);
+    let output = run_doctor(&config_dir, &["runtime"]).unwrap();
 
     assert!(
         !output.status.success(),

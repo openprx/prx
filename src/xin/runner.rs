@@ -32,6 +32,11 @@ const AGENT_MAX_TOOL_ITERATIONS: usize = 100;
 /// Floor for the heartbeat interval so very short leases still renew sanely.
 const MIN_HEARTBEAT_SECS: u64 = 5;
 
+tokio::task_local! {
+    static CONFIG_GENERATION: Arc<crate::config::ConfigGeneration>;
+    static CONFIG_MANAGER: crate::config::SharedConfig;
+}
+
 /// Stable per-process worker identity used for step lease ownership.
 fn worker_id() -> String {
     let pid = std::process::id();
@@ -51,7 +56,30 @@ fn hostname_hash() -> String {
 }
 
 /// Run the xin heartbeat loop. Called by daemon supervisor.
+#[allow(dead_code)]
 pub async fn run(config: Config) -> Result<()> {
+    run_loop(config).await
+}
+
+#[allow(dead_code)]
+pub async fn run_with_config_generation(
+    config: Config,
+    generation: Arc<crate::config::ConfigGeneration>,
+) -> Result<()> {
+    CONFIG_GENERATION.scope(generation, run_loop(config)).await
+}
+
+pub async fn run_with_config_generation_manager(
+    config: Config,
+    generation: Arc<crate::config::ConfigGeneration>,
+    manager: crate::config::SharedConfig,
+) -> Result<()> {
+    CONFIG_MANAGER
+        .scope(manager, CONFIG_GENERATION.scope(generation, run_loop(config)))
+        .await
+}
+
+async fn run_loop(config: Config) -> Result<()> {
     let interval_minutes = runner_interval_minutes(&config);
     let interval_secs = u64::from(interval_minutes) * 60;
     let mut interval = time::interval(Duration::from_secs(interval_secs));
@@ -109,6 +137,7 @@ pub async fn run(config: Config) -> Result<()> {
         evolution_integration = config.xin.evolution_integration,
         "xin heartbeat engine started"
     );
+    wait_for_generation_activation().await;
 
     loop {
         interval.tick().await;
@@ -177,6 +206,18 @@ pub async fn run(config: Config) -> Result<()> {
         );
 
         crate::health::mark_component_ok(XIN_COMPONENT);
+    }
+}
+
+async fn wait_for_generation_activation() {
+    let Ok(generation_id) = CONFIG_GENERATION.try_with(|generation| generation.id) else {
+        return;
+    };
+    let Ok(manager) = CONFIG_MANAGER.try_with(Arc::clone) else {
+        return;
+    };
+    while manager.active_generation_id() != generation_id {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -289,11 +330,13 @@ async fn execute_single_task(
     task: &XinTask,
 ) -> (bool, String) {
     let task_id = task.id.clone();
+    let lease_ttl_secs = u64::from(config.xin.stale_timeout_minutes.max(1)).saturating_mul(60);
+    let worker = worker_id();
 
     // Atomically claim the task (prevents duplicate execution)
-    match store::claim_task(config, &task_id) {
-        Ok(true) => {} // claimed successfully
-        Ok(false) => {
+    let initial_lease = match store::claim_task_with_lease(config, &task_id, &worker, lease_ttl_secs) {
+        Ok(Some(lease)) => lease,
+        Ok(None) => {
             tracing::debug!(target: "xin", task_id = %task_id, "task already claimed or disabled, skipping");
             return (true, task_id); // not a failure — another worker got it
         }
@@ -301,16 +344,96 @@ async fn execute_single_task(
             tracing::warn!(target: "xin", task_id = %task_id, "failed to claim task: {e}");
             return (false, task_id);
         }
-    }
+    };
 
     let started_at = Utc::now();
+    let heartbeat_secs = (lease_ttl_secs / 3).max(MIN_HEARTBEAT_SECS);
+    let heartbeat_stop = CancellationToken::new();
+    let heartbeat_stop_child = heartbeat_stop.clone();
+    let lease_lost = CancellationToken::new();
+    let lease_lost_hb = lease_lost.clone();
+    let hb_config = config.clone();
+    let hb_task_id = task_id.clone();
+    let initial_deadline = (initial_lease.expires_at - Utc::now())
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    let exact_lease = Arc::new(parking_lot::Mutex::new(initial_lease));
+    let execution_authority = XinRuntimeAuthority::Legacy(exact_lease.lock().clone());
+    let heartbeat_lease = Arc::clone(&exact_lease);
+    let heartbeat_handle = tokio::spawn(async move {
+        let mut current_lease = heartbeat_lease.lock().clone();
+        let mut ticker = time::interval(Duration::from_secs(heartbeat_secs));
+        ticker.tick().await;
+        let lease_deadline = time::sleep(initial_deadline);
+        tokio::pin!(lease_deadline);
+        loop {
+            tokio::select! {
+                biased;
+                () = &mut lease_deadline => {
+                    tracing::warn!(target: "xin", task_id = %hb_task_id, "legacy task lease deadline elapsed");
+                    lease_lost_hb.cancel();
+                    return true;
+                }
+                _ = ticker.tick() => {
+                    match store::renew_task_lease_generation(
+                        &hb_config,
+                        &hb_task_id,
+                        &current_lease,
+                        lease_ttl_secs,
+                    ) {
+                        Ok(Some(renewed_lease)) => {
+                            let remaining = (renewed_lease.expires_at - Utc::now())
+                                .to_std()
+                                .unwrap_or(Duration::ZERO);
+                            current_lease = renewed_lease.clone();
+                            *heartbeat_lease.lock() = renewed_lease;
+                            lease_deadline.as_mut().reset(time::Instant::now() + remaining);
+                        }
+                        Ok(None) => {
+                            tracing::warn!(target: "xin", task_id = %hb_task_id, "legacy task lease authority lost");
+                            lease_lost_hb.cancel();
+                            return true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "xin", task_id = %hb_task_id, "legacy task lease renewal failed: {error}");
+                        }
+                    }
+                }
+                () = heartbeat_stop_child.cancelled() => return false,
+            }
+        }
+    });
 
     // Execute based on mode
-    let (success, output) = match task.execution_mode {
-        ExecutionMode::Internal => run_internal(config, registry, task).await,
-        ExecutionMode::AgentSession => run_agent(config, security, task).await,
-        ExecutionMode::Shell => run_shell(config, security, task).await,
+    let shell_cancellation = lease_lost.clone();
+    let mut execution = Box::pin(async {
+        match task.execution_mode {
+            ExecutionMode::Internal => run_internal(config, registry, task).await,
+            ExecutionMode::AgentSession => run_agent(config, security, task, execution_authority).await,
+            ExecutionMode::Shell => run_shell_with_cancellation(config, security, task, Some(shell_cancellation)).await,
+        }
+    });
+    let result = tokio::select! {
+        biased;
+        () = lease_lost.cancelled() => None,
+        result = &mut execution => Some(result),
     };
+    drop(execution);
+    heartbeat_stop.cancel();
+    let authority_lost = match heartbeat_handle.await {
+        Ok(lost) => lost,
+        Err(error) => {
+            tracing::warn!(target: "xin", task_id = %task_id, "legacy task heartbeat join failed: {error}");
+            true
+        }
+    };
+    let Some((success, output)) = result else {
+        return (false, task_id);
+    };
+    if authority_lost {
+        return (false, task_id);
+    }
+    let lease = exact_lease.lock().clone();
 
     let finished_at = Utc::now();
     let duration_ms = (finished_at - started_at).num_milliseconds();
@@ -318,6 +441,7 @@ async fn execute_single_task(
     let committed = match store::commit_task_execution(
         config,
         &task_id,
+        &lease,
         success,
         &output,
         started_at,
@@ -475,6 +599,21 @@ enum StepExecutionOutcome {
     AuthorityLost,
 }
 
+#[derive(Clone)]
+enum XinRuntimeAuthority {
+    Legacy(store::XinTaskLease),
+    Step(store::XinStepLease),
+}
+
+impl XinRuntimeAuthority {
+    const fn epoch(&self) -> u64 {
+        match self {
+            Self::Legacy(lease) => lease.epoch,
+            Self::Step(lease) => lease.epoch,
+        }
+    }
+}
+
 fn persist_step_execution_outcome(config: &Config, step: &XinStep, outcome: StepExecutionOutcome) {
     match outcome {
         StepExecutionOutcome::AuthorityLost => {
@@ -534,6 +673,7 @@ async fn execute_step_with_heartbeat(
     let hb_config = config.clone();
     let hb_step_id = step.id.clone();
     let initial_expiry = initial_lease.expires_at;
+    let execution_authority = XinRuntimeAuthority::Step(initial_lease.clone());
     let exact_lease = Arc::new(parking_lot::Mutex::new(initial_lease));
     let heartbeat_lease = Arc::clone(&exact_lease);
     let initial_deadline = (initial_expiry - Utc::now()).to_std().unwrap_or(Duration::ZERO);
@@ -584,6 +724,7 @@ async fn execute_step_with_heartbeat(
         registry,
         step,
         goal,
+        execution_authority,
         Some(lease_lost.clone()),
     ));
     let result = tokio::select! {
@@ -629,13 +770,14 @@ async fn execute_step_inner(
     registry: &BuiltinRegistry,
     step: &XinStep,
     goal: &XinGoal,
+    authority: XinRuntimeAuthority,
     cancellation: Option<CancellationToken>,
 ) -> (bool, String) {
     // Bridge the step into the existing XinTask-shaped execution backends.
     let bridge = step_as_task(step, goal);
     match step.execution_mode {
         ExecutionMode::Internal => run_internal(config, registry, &bridge).await,
-        ExecutionMode::AgentSession => run_agent(config, security, &bridge).await,
+        ExecutionMode::AgentSession => run_agent(config, security, &bridge, authority).await,
         ExecutionMode::Shell => run_shell_with_cancellation(config, security, &bridge, cancellation).await,
     }
 }
@@ -701,7 +843,12 @@ async fn run_internal(config: &Config, registry: &BuiltinRegistry, task: &XinTas
     }
 }
 
-async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
+async fn run_agent(
+    config: &Config,
+    security: &SecurityPolicy,
+    task: &XinTask,
+    authority: XinRuntimeAuthority,
+) -> (bool, String) {
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".into());
     }
@@ -731,7 +878,7 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
         config.default_model.clone(),
         config.default_temperature,
         crate::runtime::shutdown::never_cancelled_shutdown(),
-        Some(xin_task_runtime_envelope(config, task)),
+        Some(xin_task_runtime_envelope(config, task, authority)),
     )
     .await
     {
@@ -747,13 +894,25 @@ async fn run_agent(config: &Config, security: &SecurityPolicy, task: &XinTask) -
     }
 }
 
-fn xin_task_runtime_envelope(config: &Config, task: &XinTask) -> RuntimeEnvelope {
-    let mut envelope = RuntimeEnvelope::agent(
+fn xin_task_runtime_envelope(config: &Config, task: &XinTask, authority: XinRuntimeAuthority) -> RuntimeEnvelope {
+    let lease_epoch = authority.epoch();
+    let guard_config = config.clone();
+    let guard_task_id = task.id.clone();
+    let authority_guard =
+        crate::memory::RuntimeAuthorityGuard::new(format!("xin:{}:{lease_epoch}", task.id), move || match &authority {
+            XinRuntimeAuthority::Legacy(lease) => {
+                store::task_lease_is_current(&guard_config, &guard_task_id, lease, Utc::now())
+            }
+            XinRuntimeAuthority::Step(lease) => {
+                store::step_lease_is_current(&guard_config, &guard_task_id, lease, Utc::now())
+            }
+        });
+    let mut envelope = RuntimeEnvelope::xin(
         config.workspace_dir.to_string_lossy().to_string(),
-        format!("xin:{}", task.id),
+        task.id.clone(),
+        lease_epoch,
     )
-    .with_channel("xin")
-    .with_sender("xin")
+    .with_authority_guard(authority_guard)
     .with_recipient(format!("xin:goal:task:{}", task.id))
     .with_task_id(task.id.clone());
     if let Some(owner_id) = task.owner_id.as_deref() {
@@ -765,9 +924,13 @@ fn xin_task_runtime_envelope(config: &Config, task: &XinTask) -> RuntimeEnvelope
     if let Some(source_message_event_id) = task.source_message_event_id.as_deref() {
         envelope = envelope.with_source_message_event_id(source_message_event_id);
     }
+    if let Ok(generation) = CONFIG_GENERATION.try_with(Arc::clone) {
+        envelope = envelope.with_config_generation(&generation);
+    }
     envelope
 }
 
+#[cfg(test)]
 async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
     run_shell_with_cancellation(config, security, task, None).await
 }
@@ -967,10 +1130,11 @@ mod tests {
         assert!(!store::get_task(&config, &task.id).unwrap().enabled);
         let goals = store::list_goals(&config).unwrap();
         assert_eq!(goals.len(), 1);
-        assert_eq!(goals[0].owner_id.as_deref(), Some("owner-a"));
-        assert_eq!(goals[0].topic_id.as_deref(), Some("topic-a"));
-        assert_eq!(goals[0].source_message_event_id.as_deref(), Some("message-a"));
-        assert_eq!(store::list_steps(&config, &goals[0].id).unwrap().len(), 2);
+        let goal = goals.first().expect("adopted task must create one goal");
+        assert_eq!(goal.owner_id.as_deref(), Some("owner-a"));
+        assert_eq!(goal.topic_id.as_deref(), Some("topic-a"));
+        assert_eq!(goal.source_message_event_id.as_deref(), Some("message-a"));
+        assert_eq!(store::list_steps(&config, &goal.id).unwrap().len(), 2);
     }
 
     #[test]
@@ -1100,7 +1264,7 @@ mod tests {
 
         let due = due_tasks_for_runtime(&config, Utc::now() + chrono::Duration::seconds(1)).unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due[0].id, heartbeat.id);
+        assert_eq!(due.first().map(|task| task.id.as_str()), Some(heartbeat.id.as_str()));
     }
 
     #[tokio::test]
@@ -1475,12 +1639,21 @@ mod tests {
         assert_eq!(bridge.source_message_event_id.as_deref(), Some("source-runtime"));
         assert_eq!(bridge.kind, TaskKind::Agent);
         assert_eq!(bridge.priority, TaskPriority::Critical);
-        let envelope = xin_task_runtime_envelope(&config, &bridge);
+        let envelope = xin_task_runtime_envelope(
+            &config,
+            &bridge,
+            XinRuntimeAuthority::Legacy(store::XinTaskLease {
+                worker_id: "test-worker".to_string(),
+                epoch: 7,
+                expires_at: Utc::now() + chrono::Duration::minutes(1),
+            }),
+        );
         assert_eq!(envelope.owner_id.as_deref(), Some("owner-runtime"));
         assert_eq!(envelope.topic_id.as_deref(), Some("topic-runtime"));
         assert_eq!(envelope.task_id.as_deref(), Some(step.id.as_str()));
         assert_eq!(envelope.source_message_event_id.as_deref(), Some("source-runtime"));
         assert_eq!(envelope.channel.as_deref(), Some("xin"));
+        assert_eq!(envelope.message_scope().lease_epoch, Some(7));
     }
 
     #[tokio::test]

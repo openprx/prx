@@ -2786,7 +2786,7 @@ fn set_runtime_proxy_cached_client(cache_key: String, client: reqwest::Client) {
     runtime_proxy_client_cache().write().insert(cache_key, client);
 }
 
-pub fn set_runtime_proxy_config(config: ProxyConfig) {
+pub(crate) fn set_runtime_proxy_config(config: ProxyConfig) {
     *runtime_proxy_state().write() = config;
     clear_runtime_proxy_client_cache();
 }
@@ -5698,6 +5698,18 @@ impl Config {
     /// performing any mutation. Used for staging multi-file config commits.
     pub(crate) fn validate_stored_from_path(config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let merged = read_merged_toml_with_gate(config_path)?;
+        Self::validate_stored_merged(merged, config_path, workspace_dir)
+    }
+
+    pub(crate) fn validate_stored_from_path_unchecked_generation(
+        config_path: &Path,
+        workspace_dir: PathBuf,
+    ) -> Result<()> {
+        let merged = crate::config::files::read_merged_toml_with_gate_once(config_path)?;
+        Self::validate_stored_merged(merged, config_path, workspace_dir)
+    }
+
+    fn validate_stored_merged(merged: toml::Value, config_path: &Path, workspace_dir: PathBuf) -> Result<()> {
         let compaction_max_context_explicit = agent_compaction_max_context_tokens_present(&merged);
         let mut config: Self = merged.try_into().context("Failed to deserialize merged config")?;
         config.config_path = config_path.to_path_buf();
@@ -5770,6 +5782,9 @@ impl Config {
             .context("Failed to create workspace directory")?;
 
         if config_path.exists() {
+            crate::config::files::recover_unfinished_config_generation(&config_path, &workspace_dir)
+                .await
+                .context("Failed to recover unfinished config generation")?;
             // Warn if config file is world-readable (may contain API keys)
             #[cfg(unix)]
             {
@@ -5853,17 +5868,13 @@ impl Config {
             {
                 anyhow::bail!("webhook.token must be set when webhook.enabled is true");
             }
-            let webhook_backend = self
-                .storage
-                .provider
-                .config
-                .provider
-                .trim()
-                .is_empty()
-                .then_some(self.memory.backend.as_str())
-                .unwrap_or(self.storage.provider.config.provider.as_str())
-                .trim()
-                .to_ascii_lowercase();
+            let webhook_backend = if self.storage.provider.config.provider.trim().is_empty() {
+                self.memory.backend.as_str()
+            } else {
+                self.storage.provider.config.provider.as_str()
+            }
+            .trim()
+            .to_ascii_lowercase();
             if !matches!(webhook_backend.as_str(), "sqlite" | "lucid" | "postgres") {
                 anyhow::bail!(
                     "standalone webhook durable ingestion requires memory backend 'sqlite', 'lucid', or 'postgres' (got '{webhook_backend}')"

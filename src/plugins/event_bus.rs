@@ -306,7 +306,7 @@ impl EventBus {
     }
 
     /// Returns the number of active subscriptions (exact + wildcard).
-    pub async fn subscription_count(&self) -> usize {
+    pub fn subscription_count(&self) -> usize {
         self.active_subscriptions.load(Ordering::Acquire)
     }
 }
@@ -513,19 +513,19 @@ mod tests {
     #[tokio::test]
     async fn subscription_count_tracking() {
         let bus = Arc::new(EventBus::new());
-        assert_eq!(bus.subscription_count().await, 0);
+        assert_eq!(bus.subscription_count(), 0);
 
         let (id1, _rx1) = bus.subscribe("p1", "topic.a").await.unwrap();
-        assert_eq!(bus.subscription_count().await, 1);
+        assert_eq!(bus.subscription_count(), 1);
 
         let (id2, _rx2) = bus.subscribe("p2", "topic.*").await.unwrap();
-        assert_eq!(bus.subscription_count().await, 2);
+        assert_eq!(bus.subscription_count(), 2);
 
         bus.unsubscribe(id1).await.unwrap();
-        assert_eq!(bus.subscription_count().await, 1);
+        assert_eq!(bus.subscription_count(), 1);
 
         bus.unsubscribe(id2).await.unwrap();
-        assert_eq!(bus.subscription_count().await, 0);
+        assert_eq!(bus.subscription_count(), 0);
     }
 
     // 11. Unsubscribe with unknown ID returns error.
@@ -553,7 +553,7 @@ mod tests {
         drop(inbox);
         bus.publish("runtime.ready", "cleanup").await.unwrap();
         timeout(Duration::from_millis(100), async {
-            while bus.subscription_count().await != 0 {
+            while bus.subscription_count() != 0 {
                 tokio::task::yield_now().await;
             }
         })

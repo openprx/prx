@@ -921,12 +921,34 @@ async fn persist_legacy_chat_compaction_audit(
         }
     };
     let provenance_status = if provenance.is_some() { "exact" } else { "unavailable" };
+    let fidelity_status = if provenance.is_some() {
+        "accepted_legacy_deterministic"
+    } else {
+        "accepted_legacy_content_hash_fallback"
+    };
     let source_event_ids_json = provenance
         .as_ref()
         .and_then(|provenance| serde_json::to_string(&provenance.source_event_ids).ok());
     let source_event_range_json = provenance
         .as_ref()
         .and_then(|provenance| serde_json::to_string(&provenance.covered_range).ok());
+    let source_document_refs_json = serde_json::to_string(
+        &source_history
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                serde_json::json!({
+                    "kind": "message_content_hash",
+                    "index": index,
+                    "role": message.role,
+                    "content_sha256": crate::self_system::evolution::safety_utils::sha256_hex(
+                        &sanitize::sanitize_for_persistence(&message.content)
+                    )
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .ok();
     let summary = format!(
         "Legacy chat context overflow compaction preserved the system prompt, kept the last {COMPACT_KEEP_MESSAGES} non-system messages, truncated turns to {COMPACT_CONTENT_CHARS} chars, and capped retained chat context at {COMPACT_TOTAL_CHARS} chars."
     );
@@ -960,7 +982,7 @@ async fn persist_legacy_chat_compaction_audit(
             "compaction_run_id": run_id,
             "trigger": trigger,
             "mode": "legacy_chat_overflow",
-            "fidelity_status": "accepted_legacy_deterministic",
+            "fidelity_status": fidelity_status,
             "source_event_ids": provenance.source_event_ids,
             "covered_event_range": provenance.covered_range
         })
@@ -991,6 +1013,8 @@ async fn persist_legacy_chat_compaction_audit(
                 correlation_id: Some(run_id.clone()),
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: envelope.config_generation_id,
+                config_source_revision: envelope.config_source_revision.clone(),
                 content: sanitize::sanitize_for_persistence(&summary),
                 raw_payload_json: Some(raw_payload_json),
                 visibility: envelope.visibility.clone(),
@@ -1022,8 +1046,8 @@ async fn persist_legacy_chat_compaction_audit(
             summary_memory_key: Some(summary_memory_key),
             source_event_ids_json,
             source_event_range_json,
-            source_document_refs_json: None,
-            fidelity_status: "accepted_legacy_deterministic".to_string(),
+            source_document_refs_json,
+            fidelity_status: fidelity_status.to_string(),
             payload_json: Some(
                 serde_json::json!({
                     "compact_keep_messages": COMPACT_KEEP_MESSAGES,
@@ -2984,6 +3008,7 @@ async fn finalize_chat_success_turn(
     history_commit_len: usize,
     summary: &str,
     cost_config: &crate::config::schema::CostConfig,
+    workspace_dir: &std::path::Path,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
     let history = recorded_response.map(|assistant_content| crate::agent::terminal::TurnHistoryProjection {
         assistant_content,
@@ -3013,6 +3038,7 @@ async fn finalize_chat_success_turn(
             },
         },
         cost_config,
+        workspace_dir,
     )
     .await
 }
@@ -3027,6 +3053,7 @@ async fn finalize_chat_non_success_turn(
     started_at: chrono::DateTime<chrono::Utc>,
     summary: &str,
     cost_config: &crate::config::schema::CostConfig,
+    workspace_dir: &std::path::Path,
 ) -> anyhow::Result<crate::agent::terminal::TurnTerminalReceipt> {
     let finished_at = provider_outcome
         .as_ref()
@@ -3050,6 +3077,7 @@ async fn finalize_chat_non_success_turn(
             },
         },
         cost_config,
+        workspace_dir,
     )
     .await
 }
@@ -6662,7 +6690,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
         }
 
         // Inject memory context
-        let runtime_envelope = chat_runtime_envelope(memory_fabric.workspace_id(), &chat_session_key);
+        let runtime_envelope = chat_runtime_envelope(memory_fabric.workspace_id(), &chat_session_key)
+            .with_config_generation(&ctx.config_generation);
         let document_ingest = Some(
             DocumentIngestRuntime::from_envelope(mem.clone(), &runtime_envelope)
                 .with_source_message_event_id(chat_user_event.as_ref().map(|event| event.event_id.clone())),
@@ -6909,6 +6938,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
             topic_id: runtime_envelope.topic_id.as_deref(),
             task_id: runtime_envelope.resolved_task_id(),
             source_message_event_id: runtime_envelope.source_message_event_id.as_deref(),
+            config_generation_id: runtime_envelope.config_generation_id,
+            config_source_revision: runtime_envelope.config_source_revision.as_deref(),
         };
 
         // ── Timeout budget ───────────────────────────────────────
@@ -7409,6 +7440,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             history_commit_len,
                             "redux driver completed with empty response",
                             &config.cost,
+                            &config.workspace_dir,
                         )
                         .await
                         {
@@ -7484,6 +7516,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         history_commit_len,
                         "redux driver completed",
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7561,6 +7594,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         provider_started_at,
                         &format!("redux driver failed: {err}"),
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7601,6 +7635,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         provider_started_at,
                         "redux driver cancelled",
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7973,6 +8008,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     provider_started_at,
                     "legacy tool loop cancelled",
                     &config.cost,
+                    &config.workspace_dir,
                 )
                 .await
                 {
@@ -8012,6 +8048,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                     provider_started_at,
                     &format!("legacy tool loop failed: {err}"),
                     &config.cost,
+                    &config.workspace_dir,
                 )
                 .await
                 {
@@ -8171,6 +8208,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                 history.len(),
                 "legacy tool loop completed with empty response",
                 &config.cost,
+                &config.workspace_dir,
             )
             .await
             {
@@ -8261,6 +8299,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             history.len().saturating_add(1),
             "legacy tool loop completed",
             &config.cost,
+            &config.workspace_dir,
         )
         .await
         {
@@ -9769,6 +9808,7 @@ async fn commit_completed_provider_turn(
             "redux driver completed"
         },
         &config.cost,
+        &config.workspace_dir,
     )
     .await
     {
@@ -10033,6 +10073,7 @@ async fn finalize_per_turn_context(
                 pending.provider_started_at,
                 &format!("redux driver failed: {err}"),
                 &config.cost,
+                &config.workspace_dir,
             )
             .await
             {
@@ -10066,6 +10107,7 @@ async fn finalize_per_turn_context(
                 pending.provider_started_at,
                 "redux driver cancelled",
                 &config.cost,
+                &config.workspace_dir,
             )
             .await
             {
@@ -12992,16 +13034,20 @@ fn apply_chat_message_event_projection(
     let turns_from_events = !message_events.is_empty()
         && message_events.len() == snapshot_turn_indices.len()
         && message_events.iter().zip(&snapshot_turn_indices).all(|(event, index)| {
-            let turn = &snapshot.turns[*index];
-            event.role == turn.role && event.content == turn.content
+            snapshot
+                .turns
+                .get(*index)
+                .is_some_and(|turn| event.role == turn.role && event.content == turn.content)
         });
     if turns_from_events {
         for (event, index) in message_events.iter().zip(snapshot_turn_indices) {
             // MessageEvent owns replay role/content. Blob-only timestamp and
             // tool-call summaries remain compatibility metadata until the event
             // contract can reproduce them as well.
-            snapshot.turns[index].role.clone_from(&event.role);
-            snapshot.turns[index].content.clone_from(&event.content);
+            if let Some(turn) = snapshot.turns.get_mut(index) {
+                turn.role.clone_from(&event.role);
+                turn.content.clone_from(&event.content);
+            }
         }
     }
 
@@ -13029,9 +13075,27 @@ fn apply_chat_message_event_projection(
             projected_usage.push(record);
         }
     }
-    let usage_from_events =
-        !final_outcome_events.is_empty() && !malformed_outcome && projected_usage == snapshot.token_usage_records;
+    let usage_from_events = !final_outcome_events.is_empty()
+        && !malformed_outcome
+        && projected_usage.len() == snapshot.token_usage_records.len()
+        && projected_usage
+            .iter()
+            .zip(&snapshot.token_usage_records)
+            .all(|(projected, persisted)| {
+                projected.provider == persisted.provider
+                    && projected.model == persisted.model
+                    && projected.prompt_tokens == persisted.prompt_tokens
+                    && projected.completion_tokens == persisted.completion_tokens
+                    && projected.total_tokens == persisted.total_tokens
+                    && projected.cache_creation_input_tokens == persisted.cache_creation_input_tokens
+                    && projected.cache_read_input_tokens == persisted.cache_read_input_tokens
+                    && projected.source == persisted.source
+                    && projected.cost_usd == persisted.cost_usd
+            });
     if usage_from_events {
+        for (projected, persisted) in projected_usage.iter_mut().zip(&snapshot.token_usage_records) {
+            projected.settlement_id.clone_from(&persisted.settlement_id);
+        }
         snapshot.token_usage_records = projected_usage;
     }
 
@@ -14073,6 +14137,8 @@ mod session_runtime_binding_tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "legacy pre-cutover turn".to_string(),
                 raw_payload_json: None,
                 visibility: crate::memory::MemoryVisibility::Workspace,
@@ -14142,7 +14208,10 @@ mod chat_message_event_projection_tests {
             chrono::Utc::now(),
             TokenUsage::reported(Some(120), Some(30), Some(150)),
         );
-        snapshot.record_provider_usage(&outcome, &cost_config).unwrap();
+        let mut settled =
+            crate::llm::route_decision::MeteredTokenUsageRecord::from_provider_outcome(&outcome, &cost_config).unwrap();
+        settled.settlement_id = Some("turn-1".to_string());
+        snapshot.record_usage_settlement(settled).unwrap();
         save_session(memory.as_ref(), &snapshot).await.unwrap();
 
         let session_key = format!("chat:{}", snapshot.id);
@@ -14464,10 +14533,28 @@ mod legacy_chat_compaction_audit_tests {
         assert_eq!(source_event_ids, expected_source_event_ids);
         let covered_range: crate::memory::CompactionSourceEventRange =
             serde_json::from_str(&source_event_range_json).unwrap();
-        assert_eq!(covered_range.first_event_id, expected_source_event_ids[0]);
-        assert_eq!(covered_range.last_event_id, expected_source_event_ids[3]);
+        assert_eq!(
+            Some(covered_range.first_event_id.as_str()),
+            expected_source_event_ids.first().map(String::as_str)
+        );
+        assert_eq!(
+            Some(covered_range.last_event_id.as_str()),
+            expected_source_event_ids.get(3).map(String::as_str)
+        );
         assert_eq!(covered_range.source_event_count, 4);
-        assert!(source_document_refs_json.is_none());
+        let source_document_refs: Vec<serde_json::Value> =
+            serde_json::from_str(source_document_refs_json.as_deref().unwrap()).unwrap();
+        assert_eq!(source_document_refs.len(), 4);
+        assert!(
+            source_document_refs.iter().all(|reference| {
+                reference.get("kind").and_then(serde_json::Value::as_str) == Some("message_content_hash")
+                    && reference
+                        .get("content_sha256")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|hash| hash.len() == 64)
+            }),
+            "legacy compaction must retain deterministic content-hash provenance"
+        );
         let payload: serde_json::Value = serde_json::from_str(&payload_json).unwrap();
         assert_eq!(
             payload
@@ -14500,14 +14587,17 @@ mod legacy_chat_compaction_audit_tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(summary_causation, expected_source_event_ids[3]);
+        assert_eq!(
+            Some(summary_causation.as_str()),
+            expected_source_event_ids.get(3).map(String::as_str)
+        );
         let summary_payload: serde_json::Value = serde_json::from_str(&summary_payload).unwrap();
         assert_eq!(
             summary_payload
                 .get("covered_event_range")
                 .and_then(|range| range.get("last_event_id"))
                 .and_then(serde_json::Value::as_str),
-            Some(expected_source_event_ids[3].as_str())
+            expected_source_event_ids.get(3).map(String::as_str)
         );
         assert_eq!(
             payload
@@ -14528,6 +14618,45 @@ mod legacy_chat_compaction_audit_tests {
             )
             .unwrap();
         assert_eq!(stored_summary_count, 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_chat_compaction_downgrades_fidelity_when_event_provenance_is_unavailable() {
+        let tmp = TempDir::new().unwrap();
+        let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
+        let envelope = RuntimeEnvelope::chat("workspace-a", "session-without-events");
+        let source_history = vec![
+            ChatMessage::user("first compacted turn"),
+            ChatMessage::assistant("second compacted turn"),
+        ];
+        let token_metadata = legacy_compaction_token_metadata(&source_history, &source_history);
+
+        persist_legacy_chat_compaction_audit(
+            mem.as_ref(),
+            &envelope,
+            &source_history,
+            &source_history,
+            token_metadata,
+            "chat_context_overflow",
+        )
+        .await;
+
+        let conn = rusqlite::Connection::open(tmp.path().join("memory").join("brain.db")).unwrap();
+        let (fidelity_status, source_event_ids, source_refs): (String, Option<String>, String) = conn
+            .query_row(
+                "SELECT fidelity_status, source_event_ids_json, source_document_refs_json
+                 FROM compaction_runs
+                 ORDER BY id DESC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+
+        assert_eq!(fidelity_status, "accepted_legacy_content_hash_fallback");
+        assert!(source_event_ids.is_none());
+        let refs: Vec<serde_json::Value> = serde_json::from_str(&source_refs).unwrap();
+        assert_eq!(refs.len(), source_history.len());
     }
 
     /// D8-2: chat run_id is per-turn. Two turns within one session must produce

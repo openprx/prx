@@ -17,6 +17,7 @@
 use openprx::config::ScopeRule;
 use openprx::config::hotreload::new_shared;
 use openprx::config::schema::Config;
+use openprx::config::{ConfigApplyReport, ConfigReloadTrigger, SharedConfig};
 use openprx::memory::backend::{MemoryBackendKind, classify_memory_backend};
 use openprx::memory::filter::should_autosave_content;
 use openprx::memory::markdown::MarkdownMemory;
@@ -28,6 +29,25 @@ use openprx::self_system::evolution::{
     CircuitBreaker, CircuitBreakerState, RollbackManager, TraceContext, current_trace, with_trace,
 };
 use std::sync::Arc;
+
+fn config_manager_fixture() -> anyhow::Result<(tempfile::TempDir, SharedConfig)> {
+    let temp = tempfile::TempDir::new()?;
+    let config_path = temp.path().join("config.toml");
+    let config = Config {
+        config_path: config_path.clone(),
+        workspace_dir: temp.path().join("workspace"),
+        ..Config::default()
+    };
+    std::fs::write(&config_path, toml::to_string_pretty(&config)?)?;
+    Ok((temp, new_shared(config)))
+}
+
+fn reload_candidate(shared: &SharedConfig, mutate: impl FnOnce(&mut Config)) -> anyhow::Result<ConfigApplyReport> {
+    let mut candidate = shared.load_full().as_ref().clone();
+    mutate(&mut candidate);
+    std::fs::write(&candidate.config_path, toml::to_string_pretty(&candidate)?)?;
+    shared.reload_from_disk(ConfigReloadTrigger::Tool)
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // INT-AM-02: Agent skips auto-save for short messages
@@ -120,8 +140,8 @@ async fn int_cs_02_scope_rule_channel_differentiation() {
 
 /// Hot-reload swaps config atomically — concurrent readers see consistent snapshots.
 #[tokio::test]
-async fn int_cr_01_hot_reload_concurrent_readers_see_consistent_config() {
-    let shared = new_shared(Config::default());
+async fn int_cr_01_hot_reload_concurrent_readers_see_consistent_config() -> anyhow::Result<()> {
+    let (_temp, shared) = config_manager_fixture()?;
     let original_temp = shared.load_full().default_temperature;
 
     // Spawn 10 concurrent readers
@@ -140,14 +160,10 @@ async fn int_cr_01_hot_reload_concurrent_readers_see_consistent_config() {
     }
 
     // Mid-stream swap
-    let new_cfg = Config {
-        default_temperature: 0.42,
-        ..Config::default()
-    };
-    shared.store(Arc::new(new_cfg));
+    reload_candidate(&shared, |config| config.default_temperature = 0.42)?;
 
     for h in handles {
-        h.await.expect("test: reader task panicked");
+        h.await?;
     }
 
     // After all readers complete, the new config should be the current one
@@ -163,27 +179,29 @@ async fn int_cr_01_hot_reload_concurrent_readers_see_consistent_config() {
         (original_temp - 0.42).abs() > 1e-9,
         "test: original temperature should differ from 0.42"
     );
+    Ok(())
 }
 
 /// Config change propagates to `SecurityPolicy` construction.
 /// INT-CR-03: Verify that changes to autonomy config produce different `SecurityPolicy`.
 #[tokio::test]
-async fn int_cr_03_config_change_propagates_to_security_policy() {
-    let shared = new_shared(Config::default());
+async fn int_cr_03_config_change_propagates_to_security_policy() -> anyhow::Result<()> {
+    let (_temp, shared) = config_manager_fixture()?;
 
     // Build SecurityPolicy from initial config
     let cfg1 = shared.load_full();
     let policy1 = SecurityPolicy::from_config(&cfg1.autonomy, &std::env::temp_dir());
     let initial_autonomy = policy1.autonomy;
+    let target_autonomy = if initial_autonomy == openprx::security::policy::AutonomyLevel::Full {
+        openprx::security::policy::AutonomyLevel::ReadOnly
+    } else {
+        openprx::security::policy::AutonomyLevel::Full
+    };
 
     // Swap config with different autonomy level
-    #[allow(clippy::field_reassign_with_default)]
-    let new_cfg = {
-        let mut cfg = Config::default();
-        cfg.autonomy.level = openprx::security::policy::AutonomyLevel::Full;
-        cfg
-    };
-    shared.store(Arc::new(new_cfg));
+    let report = reload_candidate(&shared, |config| {
+        config.autonomy.level = target_autonomy;
+    })?;
 
     // Build SecurityPolicy from new config
     let cfg2 = shared.load_full();
@@ -195,12 +213,19 @@ async fn int_cr_03_config_change_propagates_to_security_policy() {
         "test: old policy snapshot should retain initial autonomy"
     );
 
-    // The new policy should reflect the change
+    // Security-baked runtime fields cannot become active without a registered
+    // rebuild participant; the manager must report that honestly.
     assert_eq!(
-        policy2.autonomy,
-        openprx::security::policy::AutonomyLevel::Full,
-        "test: new policy should reflect 'full' autonomy from config swap"
+        policy2.autonomy, initial_autonomy,
+        "test: active config must stay on the old security generation"
     );
+    assert!(
+        report
+            .restart_required
+            .iter()
+            .any(|field| field.starts_with("autonomy"))
+    );
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -726,39 +751,34 @@ async fn int_cs_03_decide_layers_scope_and_autonomy() {
 
 /// Simulate config swap and verify that new sessions pick up the updated config.
 #[tokio::test]
-async fn int_e2e_02_config_hot_reload_provider_change() {
-    let shared = new_shared(Config::default());
+async fn int_e2e_02_config_hot_reload_provider_change() -> anyhow::Result<()> {
+    let (_temp, shared) = config_manager_fixture()?;
 
     // Initial config: default provider
     let cfg1 = shared.load_full();
     let initial_provider = cfg1.default_provider.clone();
 
     // Swap config with different provider
-    let new_cfg = Config {
-        default_provider: Some("openai".to_string()),
-        default_model: Some("gpt-4o".to_string()),
-        ..Config::default()
-    };
-    shared.store(Arc::new(new_cfg));
+    let report = reload_candidate(&shared, |config| {
+        config.default_provider = Some("openai".to_string());
+        config.default_model = Some("gpt-4o".to_string());
+    })?;
 
-    // New sessions should pick up the new provider
+    // Without a registered turn-runtime rebuild participant, provider/model
+    // changes are desired-only and explicitly restart-required.
     let cfg2 = shared.load_full();
-    assert_eq!(
-        cfg2.default_provider.as_deref(),
-        Some("openai"),
-        "test: new config should have openai provider"
-    );
-    assert_eq!(
-        cfg2.default_model.as_deref(),
-        Some("gpt-4o"),
-        "test: new config should have gpt-4o model"
-    );
+    assert_eq!(cfg2.default_provider.as_ref(), initial_provider.as_ref());
+    assert_ne!(cfg2.default_model.as_deref(), Some("gpt-4o"));
+    assert!(report.restart_required.iter().any(|field| field == "default_provider"));
+    assert!(report.restart_required.iter().any(|field| field == "default_model"));
 
     // Old snapshot is still valid
     assert_eq!(
-        cfg1.default_provider, initial_provider,
+        cfg1.default_provider.as_ref(),
+        initial_provider.as_ref(),
         "test: old snapshot should retain original provider"
     );
+    Ok(())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

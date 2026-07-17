@@ -112,8 +112,10 @@ pub fn register_kv_host_functions(linker: &mut wasmtime::component::Linker<HostS
                             return Ok(());
                         }
                         let kv = store.data().kv_store.clone();
-                        let mut guard = kv.write().await;
-                        guard.insert(key, value);
+                        let quota = store.data().kv_quota_bytes;
+                        if let Err(error) = crate::plugins::host::host_kv_set_bounded(&kv, quota, key, value).await {
+                            tracing::warn!(plugin = %store.data().plugin_name, "{error}");
+                        }
                         Ok(())
                     })
                 },

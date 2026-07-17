@@ -294,9 +294,13 @@ async fn run_chat_fixture(
     let (action_tx, mut action_rx) = mpsc::channel::<Action>(128);
     let policy = Arc::new(SecurityPolicy::default());
     let context = chat_tool_execution_context(policy.as_ref(), None, None, FIXTURE_DRAFT);
+    let ledger_dir = tempfile::TempDir::new().expect("chat fixture ledger");
+    let ledger: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(ledger_dir.path()).expect("chat fixture sqlite"));
     let service = registry.as_ref().map(|registry| {
         Arc::new(chat_tool_execution_service(
             Arc::clone(registry),
+            Some(Arc::clone(&ledger)),
             Arc::clone(&policy),
             Arc::new(ApprovalRouter::new()),
             action_tx.clone(),
@@ -342,6 +346,11 @@ async fn run_agent_fixture(
     on_tool_call: Option<mpsc::Sender<crate::agent::loop_::ToolCallNotification>>,
 ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
     let temp = tempfile::TempDir::new().expect("fixture tempdir");
+    let memory: Arc<dyn crate::memory::Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(temp.path()).expect("agent fixture sqlite"));
+    let envelope =
+        crate::runtime::envelope::RuntimeEnvelope::agent(temp.path().to_string_lossy().to_string(), FIXTURE_DRAFT);
+    let document_ingest = crate::agent::loop_::DocumentIngestRuntime::from_envelope(memory, &envelope);
     let mut history = initial_history();
     let result = crate::agent::loop_::run_tool_call_loop_outcome(
         provider.as_ref(),
@@ -369,7 +378,7 @@ async fn run_agent_fixture(
         None,
         on_tool_call,
         None,
-        None,
+        Some(document_ingest),
         crate::agent::loop_::ChatMode::Edit,
         None,
         false,

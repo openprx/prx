@@ -808,7 +808,7 @@ impl SqliteMemory {
             CREATE TABLE IF NOT EXISTS message_events (
                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_id           TEXT NOT NULL UNIQUE,
-                idempotency_key    TEXT UNIQUE,
+                idempotency_key    TEXT,
                 workspace_id       TEXT NOT NULL,
                 owner_id           TEXT,
                 source             TEXT NOT NULL,
@@ -830,12 +830,15 @@ impl SqliteMemory {
                 correlation_id     TEXT,
                 attempt_id         TEXT,
                 lease_epoch        INTEGER,
+                config_generation_id INTEGER,
+                config_source_revision TEXT,
                 content            TEXT NOT NULL,
                 content_hash       TEXT,
                 raw_payload_json   TEXT,
                 visibility         TEXT NOT NULL DEFAULT 'workspace',
                 created_at         TEXT NOT NULL,
-                updated_at         TEXT NOT NULL
+                updated_at         TEXT NOT NULL,
+                UNIQUE (workspace_id, idempotency_key)
             );
             CREATE INDEX IF NOT EXISTS idx_message_events_workspace_id
                 ON message_events(workspace_id, id);
@@ -1310,6 +1313,8 @@ impl SqliteMemory {
             ("correlation_id", "TEXT"),
             ("attempt_id", "TEXT"),
             ("lease_epoch", "INTEGER"),
+            ("config_generation_id", "INTEGER"),
+            ("config_source_revision", "TEXT"),
         ] {
             if msg_names.contains(name) {
                 continue;
@@ -1323,11 +1328,14 @@ impl SqliteMemory {
                 Err(e) => return Err(anyhow::anyhow!("Failed to add message_events.{name}: {e}")),
             }
         }
+        Self::upgrade_message_event_idempotency_scope(conn)?;
         conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS idx_message_events_event_type
                 ON message_events(workspace_id, event_type, id);
              CREATE INDEX IF NOT EXISTS idx_message_events_correlation
-                ON message_events(workspace_id, correlation_id, id);",
+                ON message_events(workspace_id, correlation_id, id);
+             CREATE INDEX IF NOT EXISTS idx_message_events_config_generation
+                ON message_events(workspace_id, config_generation_id, id);",
         )?;
 
         let mut session_column_stmt = conn.prepare("PRAGMA table_info(sessions)")?;
@@ -1620,6 +1628,112 @@ impl SqliteMemory {
         Ok(())
     }
 
+    /// Rebuild legacy `message_events` tables whose `idempotency_key` was
+    /// globally unique. Idempotency belongs to a workspace boundary: two
+    /// independent workspaces may legitimately receive the same external
+    /// provider key, while retries inside one workspace must still converge.
+    fn upgrade_message_event_idempotency_scope(conn: &Connection) -> anyhow::Result<()> {
+        let mut index_stmt = conn.prepare("PRAGMA index_list('message_events')")?;
+        let indexes = index_stmt.query_map([], |row| Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?)))?;
+        for index in indexes {
+            let (index_name, unique) = index?;
+            if unique == 0 {
+                continue;
+            }
+            let mut columns_stmt = conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")?;
+            let columns = columns_stmt
+                .query_map([index_name], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            if columns == ["workspace_id", "idempotency_key"] {
+                return Ok(());
+            }
+        }
+
+        let rebuild = conn.execute_batch(
+            "BEGIN IMMEDIATE;
+             ALTER TABLE message_events RENAME TO message_events_legacy_idempotency_scope;
+             CREATE TABLE message_events (
+                 id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                 event_id           TEXT NOT NULL UNIQUE,
+                 idempotency_key    TEXT,
+                 workspace_id       TEXT NOT NULL,
+                 owner_id           TEXT,
+                 source             TEXT NOT NULL,
+                 channel            TEXT,
+                 session_key        TEXT,
+                 parent_session_key TEXT,
+                 run_id             TEXT,
+                 parent_run_id      TEXT,
+                 agent_id           TEXT,
+                 persona_id         TEXT,
+                 sender             TEXT,
+                 recipient          TEXT,
+                 role               TEXT NOT NULL,
+                 event_type         TEXT NOT NULL,
+                 source_ref_json    TEXT,
+                 subject_ref_json   TEXT,
+                 goal_id            TEXT,
+                 causation_event_id TEXT,
+                 correlation_id     TEXT,
+                 attempt_id         TEXT,
+                 lease_epoch        INTEGER,
+                 config_generation_id INTEGER,
+                 config_source_revision TEXT,
+                 content            TEXT NOT NULL,
+                 content_hash       TEXT,
+                 raw_payload_json   TEXT,
+                 visibility         TEXT NOT NULL DEFAULT 'workspace',
+                 created_at         TEXT NOT NULL,
+                 updated_at         TEXT NOT NULL,
+                 UNIQUE (workspace_id, idempotency_key)
+             );
+             INSERT INTO message_events (
+                 id, event_id, idempotency_key, workspace_id, owner_id, source, channel,
+                 session_key, parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                 sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                 goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                 config_generation_id, config_source_revision,
+                 content, content_hash, raw_payload_json, visibility, created_at, updated_at
+             )
+             SELECT
+                 id, event_id, idempotency_key, workspace_id, owner_id, source, channel,
+                 session_key, parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                 sender, recipient, role, COALESCE(event_type, 'message.legacy'),
+                 source_ref_json, subject_ref_json, goal_id, causation_event_id,
+                 correlation_id, attempt_id, lease_epoch, config_generation_id,
+                 config_source_revision, content, content_hash,
+                 raw_payload_json, visibility, created_at, updated_at
+             FROM message_events_legacy_idempotency_scope;
+             DROP TABLE message_events_legacy_idempotency_scope;
+             CREATE INDEX idx_message_events_workspace_id
+                 ON message_events(workspace_id, id);
+             CREATE INDEX idx_message_events_owner
+                 ON message_events(workspace_id, owner_id, id);
+             CREATE INDEX idx_message_events_session
+                 ON message_events(workspace_id, session_key, id);
+             CREATE INDEX idx_message_events_agent
+                 ON message_events(workspace_id, agent_id, id);
+             CREATE INDEX idx_message_events_channel_sender
+                 ON message_events(workspace_id, channel, sender, id);
+             CREATE INDEX idx_message_events_visibility
+                 ON message_events(workspace_id, visibility, id);
+             CREATE INDEX idx_message_events_event_type
+                 ON message_events(workspace_id, event_type, id);
+             CREATE INDEX idx_message_events_correlation
+                 ON message_events(workspace_id, correlation_id, id);
+             CREATE INDEX idx_message_events_created_at
+                 ON message_events(created_at);
+             CREATE INDEX idx_message_events_config_generation
+                 ON message_events(workspace_id, config_generation_id, id);
+             COMMIT;",
+        );
+        if let Err(error) = rebuild {
+            let _ = conn.execute_batch("ROLLBACK;");
+            return Err(error).context("failed to scope message event idempotency to workspace");
+        }
+        Ok(())
+    }
+
     /// Record-and-verify versioned schema migrations (FIX-P0-25).
     ///
     /// The legacy `init_schema` above creates / upgrades tables with idempotent
@@ -1761,6 +1875,16 @@ impl SqliteMemory {
                 "compaction_source_event_range",
                 "compaction_runs.source_event_ids_json contains only real MessageEvent event_id strings + source_event_range_json(first_event_id,last_event_id,first_row_id,last_row_id,source_event_count)",
             ),
+            (
+                13,
+                "message_event_workspace_idempotency",
+                "message_events UNIQUE(workspace_id,idempotency_key) replaces global UNIQUE(idempotency_key) + workspace-scoped conflict lookup",
+            ),
+            (
+                14,
+                "message_event_config_generation",
+                "message_events + config_generation_id + config_source_revision + idx_message_events_config_generation",
+            ),
         ]
     }
 
@@ -1793,7 +1917,7 @@ impl SqliteMemory {
         let subject = subject_ref_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok());
-        let visibility_raw: String = row.get(27)?;
+        let visibility_raw: String = row.get(29)?;
         Ok(MessageEvent {
             id: row.get(0)?,
             event_id: row.get(1)?,
@@ -1820,12 +1944,16 @@ impl SqliteMemory {
             correlation_id: row.get(21)?,
             attempt_id: row.get(22)?,
             lease_epoch: row.get(23)?,
-            content: row.get(24)?,
-            content_hash: row.get(25)?,
-            raw_payload_json: row.get(26)?,
+            config_generation_id: row
+                .get::<_, Option<i64>>(24)?
+                .and_then(|value| u64::try_from(value).ok()),
+            config_source_revision: row.get(25)?,
+            content: row.get(26)?,
+            content_hash: row.get(27)?,
+            raw_payload_json: row.get(28)?,
             visibility: visibility_raw.parse().unwrap_or(MemoryVisibility::Workspace),
-            created_at: row.get(28)?,
-            updated_at: row.get(29)?,
+            created_at: row.get(30)?,
+            updated_at: row.get(31)?,
         })
     }
 
@@ -4299,17 +4427,19 @@ impl Memory for SqliteMemory {
             let source = input.source.as_str().to_string();
             let source_ref_json = serde_json::to_string(&input.source)?;
             let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
+            let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
 
             let inserted = tx.execute(
                 "INSERT OR IGNORE INTO message_events (
                     event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                     sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                     content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  )
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)",
+                         ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29,
+                         ?30, ?31)",
                 params![
                     event_id,
                     input.idempotency_key,
@@ -4334,6 +4464,8 @@ impl Memory for SqliteMemory {
                     input.correlation_id,
                     input.attempt_id,
                     input.lease_epoch,
+                    config_generation_id,
+                    input.config_source_revision,
                     input.content,
                     content_hash,
                     input.raw_payload_json,
@@ -4348,13 +4480,14 @@ impl Memory for SqliteMemory {
                     "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                             sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                             content, content_hash, raw_payload_json, visibility, created_at, updated_at
                      FROM message_events
-                     WHERE event_id = ?1 OR idempotency_key = ?2
+                     WHERE event_id = ?1
+                        OR (workspace_id = ?3 AND idempotency_key = ?2)
                      ORDER BY CASE WHEN event_id = ?1 THEN 0 ELSE 1 END
                      LIMIT 1",
-                    params![event_id, idempotency_key],
+                    params![event_id, idempotency_key, input.workspace_id],
                     Self::message_event_from_row,
                 )?
             } else {
@@ -4362,7 +4495,7 @@ impl Memory for SqliteMemory {
                     "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                             parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                             sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                             content, content_hash, raw_payload_json, visibility, created_at, updated_at
                      FROM message_events
                      WHERE event_id = ?1
@@ -4399,6 +4532,34 @@ impl Memory for SqliteMemory {
         .await?
     }
 
+    async fn find_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        let workspace_id = workspace_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        let conn = self.conn.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock();
+            conn.query_row(
+                "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                 FROM message_events
+                 WHERE workspace_id = ?1 AND idempotency_key = ?2
+                 LIMIT 1",
+                params![workspace_id, idempotency_key],
+                Self::message_event_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+        .await?
+    }
+
     async fn list_message_events_since(
         &self,
         principal: &MemoryPrincipal,
@@ -4423,7 +4584,7 @@ impl Memory for SqliteMemory {
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
@@ -4494,7 +4655,7 @@ impl Memory for SqliteMemory {
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE (
@@ -4566,7 +4727,7 @@ impl Memory for SqliteMemory {
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
@@ -4655,7 +4816,7 @@ impl Memory for SqliteMemory {
                 "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                         parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                         sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                        goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                         content, content_hash, raw_payload_json, visibility, created_at, updated_at
                  FROM message_events
                  WHERE id > ?1
@@ -5826,6 +5987,8 @@ mod tests {
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: content.to_string(),
             raw_payload_json: None,
             visibility,
@@ -6109,9 +6272,11 @@ mod tests {
                     updated_at TEXT NOT NULL
                  );
                  INSERT INTO message_events (
-                    event_id, workspace_id, source, role, content, visibility, created_at, updated_at
+                    event_id, idempotency_key, workspace_id, source, role, content,
+                    visibility, created_at, updated_at
                  ) VALUES (
-                    'legacy-event-1', 'workspace-a', 'legacy-adapter', 'user', 'legacy content',
+                    'legacy-event-1', 'shared-legacy-key', 'workspace-a',
+                    'legacy-adapter', 'user', 'legacy content',
                     'workspace', '2026-07-01T00:00:00Z', '2026-07-01T00:00:00Z'
                  );",
             )
@@ -6144,6 +6309,19 @@ mod tests {
             assert!(event.correlation_id.is_none());
         }
 
+        let mut second_workspace = message_input(
+            "workspace-b",
+            "same external key in another workspace",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:b"),
+            Some("bob"),
+        );
+        second_workspace.idempotency_key = Some("shared-legacy-key".to_string());
+        let second_workspace_event = mem.append_message_event(second_workspace).await.unwrap();
+        assert_eq!(second_workspace_event.workspace_id, "workspace-b");
+        assert_ne!(second_workspace_event.event_id, "legacy-event-1");
+
         let conn = mem.conn.lock();
         for column in [
             "source_ref_json",
@@ -6153,6 +6331,8 @@ mod tests {
             "correlation_id",
             "attempt_id",
             "lease_epoch",
+            "config_generation_id",
+            "config_source_revision",
         ] {
             let count: i64 = conn
                 .query_row(
@@ -6163,6 +6343,15 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "missing upgraded message_events.{column}");
         }
+        let generation_index_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_index_list('message_events')
+                 WHERE name = 'idx_message_events_config_generation'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(generation_index_count, 1, "missing generation lookup index");
     }
 
     #[tokio::test]
@@ -6835,23 +7024,25 @@ source: tool_output\n\
     #[tokio::test]
     async fn append_message_event_inserts_event_and_outbox_row() {
         let (_tmp, mem) = temp_sqlite();
+        let mut input = message_input(
+            "workspace-a",
+            "hello from terminal",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:1"),
+            Some("alice"),
+        );
+        input.config_generation_id = Some(42);
+        input.config_source_revision = Some("sha256:test-revision".to_string());
 
-        let event = mem
-            .append_message_event(message_input(
-                "workspace-a",
-                "hello from terminal",
-                MemoryVisibility::Workspace,
-                None,
-                Some("chat:1"),
-                Some("alice"),
-            ))
-            .await
-            .unwrap();
+        let event = mem.append_message_event(input).await.unwrap();
 
         assert!(event.id > 0);
         assert_eq!(event.workspace_id, "workspace-a");
         assert_eq!(event.visibility, MemoryVisibility::Workspace);
         assert!(event.content_hash.is_some());
+        assert_eq!(event.config_generation_id, Some(42));
+        assert_eq!(event.config_source_revision.as_deref(), Some("sha256:test-revision"));
 
         let outbox_count: i64 = mem
             .conn
@@ -6977,6 +7168,50 @@ source: tool_output\n\
             .unwrap();
         assert_eq!(message_count, 1);
         assert_eq!(outbox_count, 1);
+    }
+
+    #[tokio::test]
+    async fn append_message_event_idempotency_key_is_scoped_to_workspace() {
+        let (_tmp, mem) = temp_sqlite();
+        let mut workspace_a = message_input(
+            "workspace-a",
+            "workspace a content",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:a"),
+            Some("alice"),
+        );
+        workspace_a.idempotency_key = Some("shared-provider-key".to_string());
+
+        let mut workspace_b = message_input(
+            "workspace-b",
+            "workspace b content",
+            MemoryVisibility::Workspace,
+            None,
+            Some("chat:b"),
+            Some("bob"),
+        );
+        workspace_b.idempotency_key = Some("shared-provider-key".to_string());
+
+        let first_a = mem.append_message_event(workspace_a.clone()).await.unwrap();
+        let first_b = mem.append_message_event(workspace_b).await.unwrap();
+        let replay_a = mem.append_message_event(workspace_a).await.unwrap();
+
+        assert_ne!(first_a.event_id, first_b.event_id);
+        assert_eq!(first_a.workspace_id, "workspace-a");
+        assert_eq!(first_b.workspace_id, "workspace-b");
+        assert_eq!(replay_a.event_id, first_a.event_id);
+        assert_eq!(replay_a.content, "workspace a content");
+
+        let conn = mem.conn.lock();
+        let message_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM message_events", [], |row| row.get(0))
+            .unwrap();
+        let outbox_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM memory_events", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(message_count, 2);
+        assert_eq!(outbox_count, 2);
     }
 
     #[tokio::test]

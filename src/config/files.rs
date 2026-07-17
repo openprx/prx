@@ -1,4 +1,6 @@
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -8,6 +10,8 @@ use tokio::fs;
 use toml::{Value, map::Map};
 
 const CONFIG_GENERATION_FILE: &str = ".config-generation";
+const CONFIG_TRANSACTION_JOURNAL_FILE: &str = ".config-transaction.json";
+const CONFIG_TRANSACTION_JOURNAL_VERSION: u32 = 1;
 const CONFIG_SNAPSHOT_RETRIES: usize = 100;
 const CONFIG_SNAPSHOT_RETRY_DELAY: Duration = Duration::from_millis(10);
 
@@ -196,7 +200,7 @@ pub fn read_merged_toml_with_gate(config_path: &Path) -> Result<Value> {
     with_consistent_config_snapshot(config_path, || read_merged_toml_with_gate_once(config_path))
 }
 
-fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Value> {
+pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Value> {
     // Single read of main config; extract module gates from it directly.
     let mut merged = read_toml_file(config_path)?;
     let modules = extract_modules_from_value(&merged)?;
@@ -234,7 +238,7 @@ fn config_generation_path(config_path: &Path) -> Result<PathBuf> {
         .join(CONFIG_GENERATION_FILE))
 }
 
-fn read_config_generation(config_path: &Path) -> Result<u64> {
+pub(crate) fn read_config_generation(config_path: &Path) -> Result<u64> {
     let path = config_generation_path(config_path)?;
     let raw = match std::fs::read_to_string(&path) {
         Ok(raw) => raw,
@@ -246,6 +250,56 @@ fn read_config_generation(config_path: &Path) -> Result<u64> {
     raw.trim()
         .parse::<u64>()
         .with_context(|| format!("Invalid config generation in {}", path.display()))
+}
+
+async fn reconcile_unfinished_generation_locked(config_path: &Path, workspace_dir: &Path) -> Result<bool> {
+    let pending_generation = read_config_generation(config_path)?;
+    if pending_generation % 2 == 0 {
+        remove_config_transaction_journal(config_path).await?;
+        return Ok(false);
+    }
+
+    let (stable_generation, journal_pending_generation, snapshot) = read_config_transaction_journal(config_path)
+        .with_context(|| {
+            format!(
+                "Config generation {pending_generation} is unfinished and cannot be recovered without its durable transaction journal"
+            )
+        })?;
+    if pending_generation != journal_pending_generation || pending_generation != stable_generation.saturating_add(1) {
+        bail!(
+            "Config transaction journal generation mismatch: stable={stable_generation}, journal_pending={journal_pending_generation}, observed_pending={pending_generation}"
+        );
+    }
+    restore_mutation_snapshot(&snapshot)
+        .await
+        .context("Failed to restore config transaction before-image")?;
+    crate::config::schema::Config::validate_stored_from_path_unchecked_generation(
+        config_path,
+        workspace_dir.to_path_buf(),
+    )
+    .context("Recovered config transaction before-image is invalid")?;
+    let generation_path = config_generation_path(config_path)?;
+    crate::config::schema::write_toml_string_atomic_without_lock(&generation_path, &format!("{stable_generation}\n"))
+        .await?;
+    remove_config_transaction_journal(config_path).await?;
+    tracing::warn!(
+        config = %config_path.display(),
+        pending_generation,
+        stable_generation,
+        "Rolled back an unfinished config generation from its durable transaction journal"
+    );
+    Ok(true)
+}
+
+/// Recover a writer that crashed after publishing an odd generation.
+///
+/// The recovery takes the same OS-backed writer lock as normal mutations,
+/// restores the exact durable before-image, and only then republishes the
+/// previous stable even generation. An odd generation without a valid journal
+/// remains fail-closed instead of accepting a potentially mixed file tree.
+pub async fn recover_unfinished_config_generation(config_path: &Path, workspace_dir: &Path) -> Result<bool> {
+    let _transaction_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(config_path).await?;
+    reconcile_unfinished_generation_locked(config_path, workspace_dir).await
 }
 
 /// Run a read against one stable configuration generation.
@@ -329,6 +383,15 @@ pub fn should_skip_fragment(file_name: &str, modules: &crate::config::schema::Mo
 /// from the already-loaded value to avoid a second disk read.
 pub fn compute_config_fingerprint_gated(config_path: &Path) -> Result<Vec<u8>> {
     with_consistent_config_snapshot(config_path, || compute_config_fingerprint_gated_once(config_path))
+}
+
+pub(crate) fn compute_config_revision_gated(config_path: &Path) -> Result<(Vec<u8>, u64)> {
+    with_consistent_config_snapshot(config_path, || {
+        Ok((
+            compute_config_fingerprint_gated_once(config_path)?,
+            read_config_generation(config_path)?,
+        ))
+    })
 }
 
 fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> {
@@ -557,6 +620,181 @@ struct ConfigFileSnapshot {
     permissions: Option<std::fs::Permissions>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigTransactionJournal {
+    version: u32,
+    stable_generation: u64,
+    pending_generation: u64,
+    files: Vec<ConfigTransactionJournalFile>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigTransactionJournalFile {
+    relative_path: String,
+    bytes_base64: Option<String>,
+    unix_mode: Option<u32>,
+}
+
+fn config_transaction_journal_path(config_path: &Path) -> Result<PathBuf> {
+    Ok(config_path
+        .parent()
+        .context("Config path must have a parent directory")?
+        .join(CONFIG_TRANSACTION_JOURNAL_FILE))
+}
+
+fn config_snapshot_relative_path(config_path: &Path, path: &Path) -> Result<String> {
+    let parent = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    let relative = path
+        .strip_prefix(parent)
+        .with_context(|| format!("Config transaction target escapes config directory: {}", path.display()))?;
+    let components = relative.components().collect::<Vec<_>>();
+    let main_name = config_path.file_name().context("Config path must have a file name")?;
+    let allowed = components.as_slice() == [std::path::Component::Normal(main_name)]
+        || matches!(
+            components.as_slice(),
+            [
+                std::path::Component::Normal(config_dir),
+                std::path::Component::Normal(_)
+            ] if *config_dir == std::ffi::OsStr::new("config.d")
+        );
+    if !allowed {
+        bail!(
+            "Config transaction journal target has unsupported layout: {}",
+            relative.display()
+        );
+    }
+    relative
+        .to_str()
+        .map(ToOwned::to_owned)
+        .with_context(|| format!("Config transaction target is not UTF-8: {}", relative.display()))
+}
+
+fn config_snapshot_path_from_relative(config_path: &Path, relative: &str) -> Result<PathBuf> {
+    let parent = config_path
+        .parent()
+        .context("Config path must have a parent directory")?;
+    let candidate = parent.join(relative);
+    config_snapshot_relative_path(config_path, &candidate)?;
+    Ok(candidate)
+}
+
+#[cfg(unix)]
+fn snapshot_unix_mode(snapshot: &ConfigFileSnapshot) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    snapshot.permissions.as_ref().map(std::fs::Permissions::mode)
+}
+
+#[cfg(not(unix))]
+const fn snapshot_unix_mode(_snapshot: &ConfigFileSnapshot) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+fn permissions_from_unix_mode(mode: Option<u32>) -> Option<std::fs::Permissions> {
+    use std::os::unix::fs::PermissionsExt;
+    mode.map(std::fs::Permissions::from_mode)
+}
+
+#[cfg(not(unix))]
+const fn permissions_from_unix_mode(_mode: Option<u32>) -> Option<std::fs::Permissions> {
+    None
+}
+
+async fn write_config_transaction_journal(
+    config_path: &Path,
+    stable_generation: u64,
+    pending_generation: u64,
+    snapshot: &BTreeMap<PathBuf, ConfigFileSnapshot>,
+) -> Result<()> {
+    let files = snapshot
+        .iter()
+        .map(|(path, previous)| {
+            Ok(ConfigTransactionJournalFile {
+                relative_path: config_snapshot_relative_path(config_path, path)?,
+                bytes_base64: previous.bytes.as_ref().map(|bytes| BASE64_STANDARD.encode(bytes)),
+                unix_mode: snapshot_unix_mode(previous),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let journal = ConfigTransactionJournal {
+        version: CONFIG_TRANSACTION_JOURNAL_VERSION,
+        stable_generation,
+        pending_generation,
+        files,
+    };
+    let encoded = serde_json::to_string_pretty(&journal).context("Failed to encode config transaction journal")?;
+    let path = config_transaction_journal_path(config_path)?;
+    crate::config::schema::write_toml_string_atomic_without_lock(&path, &encoded)
+        .await
+        .context("Failed to persist config transaction journal")
+}
+
+fn read_config_transaction_journal(config_path: &Path) -> Result<(u64, u64, BTreeMap<PathBuf, ConfigFileSnapshot>)> {
+    let path = config_transaction_journal_path(config_path)?;
+    let metadata = std::fs::symlink_metadata(&path)
+        .with_context(|| format!("Failed to inspect config transaction journal: {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!(
+            "Config transaction journal must be a regular non-symlink file: {}",
+            path.display()
+        );
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("Failed to read config transaction journal: {}", path.display()))?;
+    let journal: ConfigTransactionJournal =
+        serde_json::from_slice(&bytes).context("Failed to decode config transaction journal")?;
+    if journal.version != CONFIG_TRANSACTION_JOURNAL_VERSION {
+        bail!("Unsupported config transaction journal version {}", journal.version);
+    }
+    if journal.stable_generation % 2 != 0 || journal.pending_generation != journal.stable_generation.saturating_add(1) {
+        bail!(
+            "Invalid config transaction journal generations: stable={}, pending={}",
+            journal.stable_generation,
+            journal.pending_generation
+        );
+    }
+    let mut snapshot = BTreeMap::new();
+    for file in journal.files {
+        let target = config_snapshot_path_from_relative(config_path, &file.relative_path)?;
+        let previous = ConfigFileSnapshot {
+            bytes: file
+                .bytes_base64
+                .map(|encoded| {
+                    BASE64_STANDARD
+                        .decode(encoded)
+                        .context("Invalid base64 in config transaction journal")
+                })
+                .transpose()?,
+            permissions: permissions_from_unix_mode(file.unix_mode),
+        };
+        if snapshot.insert(target.clone(), previous).is_some() {
+            bail!("Duplicate config transaction journal target: {}", target.display());
+        }
+    }
+    if snapshot.is_empty() {
+        bail!("Config transaction journal contains no before-images");
+    }
+    Ok((journal.stable_generation, journal.pending_generation, snapshot))
+}
+
+async fn remove_config_transaction_journal(config_path: &Path) -> Result<()> {
+    let path = config_transaction_journal_path(config_path)?;
+    match fs::remove_file(&path).await {
+        Ok(()) => {
+            let parent = path.parent().context("Config transaction journal has no parent")?;
+            crate::config::schema::sync_directory(parent).await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("Failed to remove config transaction journal: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
 fn snapshot_file(path: &Path) -> Result<ConfigFileSnapshot> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => {
@@ -623,6 +861,10 @@ async fn restore_mutation_snapshot(snapshot: &BTreeMap<PathBuf, ConfigFileSnapsh
                     fs::remove_file(path)
                         .await
                         .with_context(|| format!("Failed to remove uncommitted config file: {}", path.display()))?;
+                    let parent = path
+                        .parent()
+                        .with_context(|| format!("Rollback target has no parent: {}", path.display()))?;
+                    crate::config::schema::sync_directory(parent).await?;
                 }
                 Ok(_) => bail!("Refusing to remove non-file rollback target: {}", path.display()),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -668,7 +910,7 @@ fn fail_config_mutation_if_requested(config_path: &Path) -> Result<()> {
 }
 
 #[cfg(not(test))]
-fn fail_config_mutation_if_requested(_config_path: &Path) -> Result<()> {
+const fn fail_config_mutation_if_requested(_config_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -687,17 +929,11 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
         .with_context(|| format!("Failed to create config directory: {}", parent.display()))?;
     let _transaction_lock = crate::self_system::evolution::safety_utils::acquire_file_lock(&plan.config_path).await?;
 
+    reconcile_unfinished_generation_locked(&plan.config_path, &plan.workspace_dir).await?;
     // Re-stage under the writer lock so concurrently edited user-owned
     // fragments are part of the validated effective tree.
     stage_and_validate_mutation(&plan)?;
     let stable_generation = read_config_generation(&plan.config_path)?;
-    if stable_generation % 2 == 1 {
-        bail!(
-            "Refusing config mutation while generation {} is unfinished at {}",
-            stable_generation,
-            plan.config_path.display()
-        );
-    }
     let pending_generation = stable_generation
         .checked_add(1)
         .context("Config generation overflow before transaction")?;
@@ -706,8 +942,16 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
         .context("Config generation overflow after transaction")?;
     let snapshot = capture_mutation_snapshot(&plan)?;
     let generation_path = config_generation_path(&plan.config_path)?;
-    crate::config::schema::write_toml_string_atomic_without_lock(&generation_path, &format!("{pending_generation}\n"))
-        .await?;
+    write_config_transaction_journal(&plan.config_path, stable_generation, pending_generation, &snapshot).await?;
+    if let Err(error) = crate::config::schema::write_toml_string_atomic_without_lock(
+        &generation_path,
+        &format!("{pending_generation}\n"),
+    )
+    .await
+    {
+        let _ = remove_config_transaction_journal(&plan.config_path).await;
+        return Err(error).context("Failed to publish pending config generation");
+    }
 
     let apply_result: Result<()> = async {
         let config_dir = config_dir_path(&plan.config_path);
@@ -751,6 +995,9 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
         )
         .await
         .context("Config transaction rolled back but failed to restore stable generation")?;
+        remove_config_transaction_journal(&plan.config_path)
+            .await
+            .context("Config transaction rolled back but failed to clear its journal")?;
         return Err(apply_error).context("Config transaction rolled back");
     }
 
@@ -771,7 +1018,18 @@ pub async fn commit_mutation_atomically(plan: ConfigMutationPlan) -> Result<()> 
         )
         .await
         .context("Config files rolled back but failed to restore stable generation")?;
+        remove_config_transaction_journal(&plan.config_path)
+            .await
+            .context("Config files rolled back but failed to clear the transaction journal")?;
         return Err(commit_error).context("Config generation publish failed; transaction rolled back");
+    }
+    if let Err(error) = remove_config_transaction_journal(&plan.config_path).await {
+        tracing::warn!(
+            config = %plan.config_path.display(),
+            error = %error,
+            committed_generation,
+            "Config transaction committed but its stale journal could not be removed"
+        );
     }
     Ok(())
 }
@@ -1074,8 +1332,136 @@ backend = "sqlite"
             "[operator_owned]\nvalue = 9\n"
         );
         assert_eq!(read_config_generation(&config_path).unwrap() % 2, 0);
+        assert!(!config_transaction_journal_path(&config_path).unwrap().exists());
         let loaded = crate::config::Config::load_from_path(&config_path, workspace).unwrap();
         assert_ne!(loaded.default_model.as_deref(), Some("transaction-candidate"));
+    }
+
+    #[tokio::test]
+    async fn unfinished_generation_rolls_back_from_journal_and_stale_lock_file() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        let mut config = crate::config::Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace.clone();
+        write_split_config(&config, false).await.unwrap();
+        let stable_generation = read_config_generation(&config_path).unwrap();
+        assert_eq!(stable_generation % 2, 0);
+        let before = std::fs::read(&config_path).unwrap();
+
+        config.default_model = Some("uncommitted-candidate".to_string());
+        let (candidate_main, candidate_fragments) = config.to_split_toml_strings().unwrap();
+        let plan = plan_mutation(&config_path, &workspace, candidate_main.clone(), candidate_fragments).unwrap();
+        let snapshot = capture_mutation_snapshot(&plan).unwrap();
+        write_config_transaction_journal(&config_path, stable_generation, stable_generation + 1, &snapshot)
+            .await
+            .unwrap();
+
+        std::fs::write(
+            tmp.path().join(CONFIG_GENERATION_FILE),
+            format!("{}\n", stable_generation + 1),
+        )
+        .unwrap();
+        std::fs::write(&config_path, candidate_main).unwrap();
+        std::fs::write(config_path.with_extension("toml.lock"), "stale lock inode").unwrap();
+
+        assert!(
+            recover_unfinished_config_generation(&config_path, &workspace)
+                .await
+                .unwrap()
+        );
+        assert_eq!(read_config_generation(&config_path).unwrap(), stable_generation);
+        assert_eq!(std::fs::read(&config_path).unwrap(), before);
+        assert!(!config_transaction_journal_path(&config_path).unwrap().exists());
+        let loaded = crate::config::Config::load_from_path(&config_path, workspace).unwrap();
+        assert_ne!(loaded.default_model.as_deref(), Some("uncommitted-candidate"));
+    }
+
+    #[tokio::test]
+    async fn unfinished_generation_without_journal_remains_fail_closed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        std::fs::write(&config_path, "default_temperature = 0.7\n").unwrap();
+        std::fs::write(tmp.path().join(CONFIG_GENERATION_FILE), "1\n").unwrap();
+
+        let error = recover_unfinished_config_generation(&config_path, &workspace)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("cannot be recovered without its durable transaction journal"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(read_config_generation(&config_path).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_journal_before_image_never_publishes_stable_generation() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        let mut config = crate::config::Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace.clone();
+        write_split_config(&config, false).await.unwrap();
+        let stable_generation = read_config_generation(&config_path).unwrap();
+        let mut snapshot = BTreeMap::new();
+        snapshot.insert(
+            config_path.clone(),
+            ConfigFileSnapshot {
+                bytes: Some(b"not = [valid".to_vec()),
+                permissions: std::fs::metadata(&config_path)
+                    .ok()
+                    .map(|metadata| metadata.permissions()),
+            },
+        );
+        write_config_transaction_journal(&config_path, stable_generation, stable_generation + 1, &snapshot)
+            .await
+            .unwrap();
+        std::fs::write(
+            tmp.path().join(CONFIG_GENERATION_FILE),
+            format!("{}\n", stable_generation + 1),
+        )
+        .unwrap();
+
+        let error = recover_unfinished_config_generation(&config_path, &workspace)
+            .await
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("Recovered config transaction before-image is invalid"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(read_config_generation(&config_path).unwrap(), stable_generation + 1);
+        assert!(config_transaction_journal_path(&config_path).unwrap().exists());
+    }
+
+    #[tokio::test]
+    async fn stable_generation_discards_journal_left_before_pending_publish() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let config_path = tmp.path().join("config.toml");
+        let workspace = tmp.path().join("workspace");
+        let mut config = crate::config::Config::default();
+        config.config_path = config_path.clone();
+        config.workspace_dir = workspace.clone();
+        write_split_config(&config, false).await.unwrap();
+        let stable_generation = read_config_generation(&config_path).unwrap();
+        let (main, fragments) = config.to_split_toml_strings().unwrap();
+        let plan = plan_mutation(&config_path, &workspace, main, fragments).unwrap();
+        let snapshot = capture_mutation_snapshot(&plan).unwrap();
+        write_config_transaction_journal(&config_path, stable_generation, stable_generation + 1, &snapshot)
+            .await
+            .unwrap();
+
+        assert!(
+            !recover_unfinished_config_generation(&config_path, &workspace)
+                .await
+                .unwrap()
+        );
+        assert_eq!(read_config_generation(&config_path).unwrap(), stable_generation);
+        assert!(!config_transaction_journal_path(&config_path).unwrap().exists());
     }
 
     #[tokio::test]

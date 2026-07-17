@@ -353,6 +353,16 @@ impl Memory for LucidMemory {
         self.local.append_message_event(input).await
     }
 
+    async fn find_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        self.local
+            .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+            .await
+    }
+
     async fn list_message_events_since(
         &self,
         principal: &MemoryPrincipal,

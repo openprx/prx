@@ -72,12 +72,9 @@ struct WindowBounds {
     end: DateTime<Utc>,
 }
 
-/// Run the P0-1 fitness report pipeline and persist the result to memory.
-///
-/// Output memory key format:
-/// `self/fitness/daily/YYYY-MM-DD`, category `core`.
-pub async fn run_fitness_report() -> Result<FitnessReport> {
-    let config = Config::load_or_init().await?;
+/// Run the fitness pipeline against a configuration already pinned by the
+/// caller's runtime generation.
+pub async fn run_fitness_report_with_config(config: &Config) -> Result<FitnessReport> {
     let storage_provider = Some(&config.storage.provider.config);
     let memory = memory::create_memory_with_storage_and_routes(
         &config.memory,
@@ -90,7 +87,7 @@ pub async fn run_fitness_report() -> Result<FitnessReport> {
     let tracker = CostTracker::new(config.cost.clone(), &config.workspace_dir).ok();
     let tracker_ref = tracker.as_ref();
 
-    build_and_store_fitness_report(memory.as_ref(), &config, tracker_ref).await
+    build_and_store_fitness_report(memory.as_ref(), config, tracker_ref).await
 }
 
 async fn build_and_store_fitness_report(

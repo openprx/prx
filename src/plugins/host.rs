@@ -119,6 +119,9 @@ pub struct HostState {
     /// Namespaced in-memory KV store (plugin-isolated).
     pub kv_store: Arc<RwLock<HashMap<String, Vec<u8>>>>,
 
+    /// Hard cap for the complete KV namespace, including key and value bytes.
+    pub kv_quota_bytes: usize,
+
     /// Resource limits.
     pub timeout_ms: u64,
 
@@ -163,7 +166,11 @@ impl HostState {
         optional_permissions: HashSet<String>,
         http_allowlist: Vec<String>,
         timeout_ms: u64,
+        max_kv_storage_mb: u64,
     ) -> Self {
+        let kv_quota_bytes = usize::try_from(max_kv_storage_mb)
+            .unwrap_or(usize::MAX)
+            .saturating_mul(1024 * 1024);
         Self {
             plugin_name,
             config,
@@ -171,6 +178,7 @@ impl HostState {
             optional_permissions,
             http_allowlist,
             kv_store: Arc::new(RwLock::new(HashMap::new())),
+            kv_quota_bytes,
             timeout_ms,
             #[cfg(feature = "wasm-plugins")]
             store_limits: wasmtime::StoreLimitsBuilder::new().build(),
@@ -442,9 +450,35 @@ pub async fn host_kv_get(state: &HostState, key: &str) -> Option<Vec<u8>> {
 
 /// Set a value in the plugin's KV store.
 /// Maps to `prx:host/kv.set(key, value)`.
-pub async fn host_kv_set(state: &HostState, key: String, value: Vec<u8>) {
-    let mut store = state.kv_store.write().await;
+pub async fn host_kv_set(state: &HostState, key: String, value: Vec<u8>) -> Result<(), String> {
+    host_kv_set_bounded(&state.kv_store, state.kv_quota_bytes, key, value).await
+}
+
+pub(crate) async fn host_kv_set_bounded(
+    kv_store: &Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    quota_bytes: usize,
+    key: String,
+    value: Vec<u8>,
+) -> Result<(), String> {
+    let mut store = kv_store.write().await;
+    let current_bytes = store
+        .iter()
+        .map(|(existing_key, existing_value)| existing_key.len().saturating_add(existing_value.len()))
+        .sum::<usize>();
+    let previous_bytes = store
+        .get(&key)
+        .map_or(0, |previous| key.len().saturating_add(previous.len()));
+    let next_bytes = current_bytes
+        .saturating_sub(previous_bytes)
+        .saturating_add(key.len())
+        .saturating_add(value.len());
+    if next_bytes > quota_bytes {
+        return Err(format!(
+            "plugin KV quota exceeded: requested {next_bytes} bytes, limit {quota_bytes} bytes"
+        ));
+    }
     store.insert(key, value);
+    Ok(())
 }
 
 /// Delete a value from the plugin's KV store.
@@ -635,6 +669,7 @@ mod tests {
                 "ws://mock.example/*".to_string(),
             ],
             30_000,
+            10,
         )
     }
 
@@ -678,6 +713,7 @@ mod tests {
             HashSet::new(),
             vec![],
             5000,
+            10,
         );
         assert!(state.check_url_allowed("https://anything.com"));
     }
@@ -730,7 +766,9 @@ mod tests {
         let state = test_state();
         assert_eq!(host_kv_get(&state, "key1").await, None);
 
-        host_kv_set(&state, "key1".to_string(), b"value1".to_vec()).await;
+        host_kv_set(&state, "key1".to_string(), b"value1".to_vec())
+            .await
+            .unwrap();
         assert_eq!(host_kv_get(&state, "key1").await, Some(b"value1".to_vec()));
 
         let deleted = host_kv_delete(&state, "key1").await;
@@ -741,13 +779,37 @@ mod tests {
     #[tokio::test]
     async fn kv_list_keys_with_prefix() {
         let state = test_state();
-        host_kv_set(&state, "weather:tokyo".to_string(), b"sunny".to_vec()).await;
-        host_kv_set(&state, "weather:london".to_string(), b"rainy".to_vec()).await;
-        host_kv_set(&state, "config:api_key".to_string(), b"key".to_vec()).await;
+        host_kv_set(&state, "weather:tokyo".to_string(), b"sunny".to_vec())
+            .await
+            .unwrap();
+        host_kv_set(&state, "weather:london".to_string(), b"rainy".to_vec())
+            .await
+            .unwrap();
+        host_kv_set(&state, "config:api_key".to_string(), b"key".to_vec())
+            .await
+            .unwrap();
 
         let mut keys = host_kv_list_keys(&state, "weather:").await;
         keys.sort();
         assert_eq!(keys, vec!["weather:london", "weather:tokyo"]);
+    }
+
+    #[tokio::test]
+    async fn kv_quota_counts_insert_overwrite_delete_and_rejects_growth() {
+        let state = HostState {
+            kv_quota_bytes: 16,
+            ..test_state()
+        };
+
+        host_kv_set(&state, "a".to_string(), vec![1; 8]).await.unwrap();
+        let error = host_kv_set(&state, "b".to_string(), vec![2; 8]).await.unwrap_err();
+        assert!(error.contains("quota exceeded"));
+        assert!(host_kv_get(&state, "b").await.is_none());
+
+        host_kv_set(&state, "a".to_string(), vec![3; 12]).await.unwrap();
+        assert_eq!(host_kv_get(&state, "a").await.unwrap().len(), 12);
+        assert!(host_kv_delete(&state, "a").await);
+        host_kv_set(&state, "b".to_string(), vec![4; 15]).await.unwrap();
     }
 
     #[tokio::test]
@@ -805,6 +867,7 @@ mod tests {
             HashSet::from(["websocket-outbound".to_string()]),
             HashSet::new(),
             vec!["ws://mock.example/*".to_string()],
+            10,
             10,
         )
         .with_websocket_connector(connector);

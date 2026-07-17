@@ -1985,7 +1985,14 @@ mod tests {
         let cfg_snap = cfg.load_full();
         let marker = cfg_snap.workspace_dir.join("must-remain-absent");
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", "echo historical-output").unwrap();
-        let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
+        let tool = CronTool::new(
+            Arc::clone(&cfg),
+            Arc::new(SecurityPolicy {
+                autonomy: AutonomyLevel::Supervised,
+                workspace_dir: cfg_snap.workspace_dir.clone(),
+                ..SecurityPolicy::default()
+            }),
+        );
         let seeded = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
         assert!(seeded.success, "{:?}", seeded.error);
         let before_rejection = cron::get_job(&cfg_snap, &job.id).unwrap();

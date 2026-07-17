@@ -98,7 +98,7 @@ pub struct UpdateHookRequest {
 // ── Helpers ───────────────────────────────────────────────
 
 fn hooks_json_path(state: &AppState) -> std::path::PathBuf {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     config.workspace_dir.join(HOOKS_JSON_FILE)
 }
 

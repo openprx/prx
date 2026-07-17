@@ -19,20 +19,22 @@ use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
-use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::sync::{Mutex, OnceCell, RwLock};
+use tokio::sync::{Mutex, OnceCell, RwLock, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 type HmacSha256 = Hmac<Sha256>;
 const MUTATION_REPLAY_CAPACITY: usize = 128;
-const MUTATION_REPLAY_MIN_TTL: Duration = Duration::from_secs(60);
+const HMAC_FRESHNESS_WINDOW_SECS: i64 = 300;
+const MUTATION_REPLAY_MIN_TTL: Duration = Duration::from_secs((HMAC_FRESHNESS_WINDOW_SECS as u64).saturating_mul(2));
 const MAX_RPC_REQUEST_BYTES: usize = 2 * 1024 * 1024;
 const OUTPUT_DRAIN_GRACE: Duration = Duration::from_secs(1);
+const NODE_SAFE_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+const NODE_CALLER_ENV_ALLOWLIST: &[&str] = &["LANG", "LC_ALL", "LC_CTYPE", "TERM", "TZ"];
 
 #[derive(Clone)]
 enum CachedRpcOutcome {
@@ -84,11 +86,10 @@ struct TaskResult {
     stderr: String,
     timed_out: bool,
     cancelled: bool,
-    async_exec: bool,
 }
 
 impl TaskResult {
-    fn running(task_id: String, async_exec: bool) -> Self {
+    fn running(task_id: String) -> Self {
         Self {
             task_id,
             status: TaskState::Running,
@@ -100,7 +101,6 @@ impl TaskResult {
             stderr: String::new(),
             timed_out: false,
             cancelled: false,
-            async_exec,
         }
     }
 
@@ -169,6 +169,7 @@ struct AppState {
     running_tasks: Arc<RwLock<HashMap<String, CancellationToken>>>,
     task_results: Arc<RwLock<HashMap<String, TaskResult>>>,
     mutation_replays: Arc<Mutex<HashMap<String, Arc<MutationReplay>>>>,
+    async_task_slots: Arc<Semaphore>,
 }
 
 struct SandboxRoot {
@@ -190,6 +191,7 @@ pub async fn run_node_server(config: NodeServerConfig) -> Result<()> {
         running_tasks: Arc::new(RwLock::new(HashMap::new())),
         task_results: Arc::new(RwLock::new(HashMap::new())),
         mutation_replays: Arc::new(Mutex::new(HashMap::new())),
+        async_task_slots: Arc::new(Semaphore::new(config.max_concurrent_tasks)),
     };
 
     let app = Router::new()
@@ -415,36 +417,36 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams, source_ip:
     let timeout_ms = params.timeout_ms.unwrap_or(state.config.exec_timeout_ms);
     let timeout = Duration::from_millis(timeout_ms.max(1));
     let async_exec = params.async_exec.unwrap_or(false);
-
-    if async_exec {
-        let running_async_tasks = count_running_async_tasks(state).await;
-        if running_async_tasks >= state.config.max_concurrent_tasks {
-            bail!(
+    let env = validate_node_environment(params.env)?;
+    let async_permit = async_exec
+        .then(|| Arc::clone(&state.async_task_slots).try_acquire_owned())
+        .transpose()
+        .map_err(|_| {
+            anyhow!(
                 "max concurrent async tasks reached ({})",
                 state.config.max_concurrent_tasks
-            );
-        }
-    }
+            )
+        })?;
 
     let task_id = uuid::Uuid::new_v4().to_string();
     let cancellation = CancellationToken::new();
-    register_task(state, &task_id, cancellation.clone(), async_exec).await;
+    register_task(state, &task_id, cancellation.clone()).await;
 
     if async_exec {
         let state_clone = state.clone();
         let parsed_clone = parsed_command.clone();
         let cwd_clone = cwd.clone();
-        let env_clone = params.env.clone();
         let callback_url_clone = callback_url.clone();
         let source_ip_owned = source_ip.to_string();
         let task_id_clone = task_id.clone();
 
         tokio::spawn(async move {
+            let _permit = async_permit;
             let result = execute_shell_command(
                 &state_clone,
                 &parsed_clone,
                 cwd_clone,
-                env_clone,
+                env,
                 timeout,
                 &task_id_clone,
                 cancellation,
@@ -466,7 +468,7 @@ async fn handle_exec_shell(state: &AppState, params: ExecShellParams, source_ip:
         return Ok(serde_json::to_value(accepted)?);
     }
 
-    let result = execute_shell_command(state, &parsed_command, cwd, params.env, timeout, &task_id, cancellation).await;
+    let result = execute_shell_command(state, &parsed_command, cwd, env, timeout, &task_id, cancellation).await;
 
     let callback_payload = finalize_task(state.clone(), &result).await;
     log_exec_shell_event(&parsed_command, &result, source_ip);
@@ -491,10 +493,19 @@ async fn execute_shell_command(
 ) -> ExecShellResult {
     let started = Instant::now();
     let mut cmd = Command::new(&parsed_command.program);
-    cmd.kill_on_drop(true);
     cmd.args(&parsed_command.args);
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    cmd.stdin(std::process::Stdio::null());
+    cmd.stdout(std::process::Stdio::piped());
+    cmd.stderr(std::process::Stdio::piped());
+    cmd.env_clear();
+    for variable in crate::runtime::shell_process::SAFE_ENV_VARS {
+        if *variable != "PATH"
+            && let Ok(value) = std::env::var(variable)
+        {
+            cmd.env(variable, value);
+        }
+    }
+    cmd.env("PATH", NODE_SAFE_PATH);
     if let Some(cwd) = cwd {
         cmd.current_dir(cwd);
     }
@@ -502,7 +513,7 @@ async fn execute_shell_command(
         cmd.envs(env);
     }
 
-    let mut child = match cmd.spawn() {
+    let mut child = match crate::runtime::shell_process::spawn_managed_shell_child(cmd) {
         Ok(child) => child,
         Err(error) => {
             return ExecShellResult {
@@ -519,14 +530,14 @@ async fn execute_shell_command(
 
     let output_budget = Arc::new(AtomicUsize::new(state.config.max_output_bytes.max(1)));
     let output_truncated = Arc::new(AtomicBool::new(false));
-    let stdout_reader = child.stdout.take().map(|stdout| {
+    let stdout_reader = child.take_stdout().map(|stdout| {
         tokio::spawn(drain_bounded_output(
             stdout,
             Arc::clone(&output_budget),
             Arc::clone(&output_truncated),
         ))
     });
-    let stderr_reader = child.stderr.take().map(|stderr| {
+    let stderr_reader = child.take_stderr().map(|stderr| {
         tokio::spawn(drain_bounded_output(
             stderr,
             Arc::clone(&output_budget),
@@ -542,11 +553,13 @@ async fn execute_shell_command(
             Err(error) => (None, false, false, Some(error.to_string())),
         },
         _ = &mut deadline => {
-            let error = terminate_and_reap(&mut child).await.err().map(|error| error.to_string());
+            let reaped = child.terminate_and_reap().await;
+            let error = (!reaped).then(|| "failed to reap command process tree".to_string());
             (None, true, false, error.or_else(|| Some("command execution timed out".to_string())))
         },
         _ = cancellation.cancelled() => {
-            let error = terminate_and_reap(&mut child).await.err().map(|error| error.to_string());
+            let reaped = child.terminate_and_reap().await;
+            let error = (!reaped).then(|| "failed to reap command process tree".to_string());
             (None, false, true, error.or_else(|| Some("command cancelled".to_string())))
         }
     };
@@ -562,8 +575,10 @@ async fn execute_shell_command(
         append_diagnostic(&mut stderr, "[output truncated by node max_output_bytes]");
     }
     if stdout_incomplete || stderr_incomplete {
+        let _ = child.terminate_and_reap().await;
         append_diagnostic(&mut stderr, "[output drain stopped after bounded grace period]");
     }
+    child.mark_complete();
 
     ExecShellResult {
         task_id: task_id.to_string(),
@@ -576,8 +591,16 @@ async fn execute_shell_command(
     }
 }
 
-async fn terminate_and_reap(child: &mut tokio::process::Child) -> std::io::Result<()> {
-    child.kill().await
+fn validate_node_environment(env: Option<HashMap<String, String>>) -> Result<Option<HashMap<String, String>>> {
+    let Some(env) = env else {
+        return Ok(None);
+    };
+    for key in env.keys() {
+        if !NODE_CALLER_ENV_ALLOWLIST.contains(&key.as_str()) {
+            bail!("node environment variable is not allowed: {key}");
+        }
+    }
+    Ok(Some(env))
 }
 
 async fn drain_bounded_output<R>(
@@ -601,7 +624,7 @@ where
             })
             .unwrap_or(0);
         let keep = available.min(read);
-        retained.extend_from_slice(&chunk[..keep]);
+        retained.extend_from_slice(chunk.get(..keep).unwrap_or_default());
         if keep < read {
             truncated.store(true, Ordering::Relaxed);
         }
@@ -644,17 +667,14 @@ fn log_exec_shell_event(command: &ParsedCommand, result: &ExecShellResult, sourc
     );
 }
 
-async fn register_task(state: &AppState, task_id: &str, cancellation: CancellationToken, async_exec: bool) {
+async fn register_task(state: &AppState, task_id: &str, cancellation: CancellationToken) {
     {
         let mut running_tasks = state.running_tasks.write().await;
         running_tasks.insert(task_id.to_string(), cancellation);
     }
 
     let mut task_results = state.task_results.write().await;
-    task_results.insert(
-        task_id.to_string(),
-        TaskResult::running(task_id.to_string(), async_exec),
-    );
+    task_results.insert(task_id.to_string(), TaskResult::running(task_id.to_string()));
 }
 
 async fn finalize_task(state: AppState, result: &ExecShellResult) -> Value {
@@ -668,7 +688,7 @@ async fn finalize_task(state: AppState, result: &ExecShellResult) -> Value {
         let mut task_results = state.task_results.write().await;
         let entry = task_results
             .entry(result.task_id.clone())
-            .or_insert_with(|| TaskResult::running(result.task_id.clone(), false));
+            .or_insert_with(|| TaskResult::running(result.task_id.clone()));
         entry.apply_exec_result(result, now);
         entry.to_status_result(now)
     };
@@ -689,14 +709,6 @@ async fn cleanup_expired_task_results(state: &AppState) {
             .map(|completed_at| now.saturating_duration_since(completed_at) <= ttl)
             .unwrap_or(false)
     });
-}
-
-async fn count_running_async_tasks(state: &AppState) -> usize {
-    let task_results = state.task_results.read().await;
-    task_results
-        .values()
-        .filter(|task| task.status == TaskState::Running && task.async_exec)
-        .count()
 }
 
 async fn handle_task_status(state: &AppState, params: TaskStatusParams) -> Result<TaskStatusResult> {
@@ -903,7 +915,7 @@ fn validate_hmac(headers: &HeaderMap, body: &str, config: &NodeServerConfig) -> 
     let timestamp = timestamp_raw.parse::<i64>().context("invalid X-OpenPRX-Timestamp")?;
 
     let now = Utc::now().timestamp();
-    if (now - timestamp).abs() > 300 {
+    if (now - timestamp).abs() > HMAC_FRESHNESS_WINDOW_SECS {
         bail!("stale request timestamp");
     }
 
@@ -1455,6 +1467,7 @@ mod tests {
         config.allowed_commands = vec!["sh".to_string()];
         config.max_output_bytes = 64;
         config.exec_timeout_ms = 5_000;
+        let max_concurrent_tasks = config.max_concurrent_tasks;
         let sandbox_root = prepare_sandbox_root(&config.sandbox_root).unwrap();
         AppState {
             config: Arc::new(config),
@@ -1462,6 +1475,7 @@ mod tests {
             running_tasks: Arc::new(RwLock::new(HashMap::new())),
             task_results: Arc::new(RwLock::new(HashMap::new())),
             mutation_replays: Arc::new(Mutex::new(HashMap::new())),
+            async_task_slots: Arc::new(Semaphore::new(max_concurrent_tasks)),
         }
     }
 
@@ -1540,6 +1554,101 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         assert!(result.stdout.len() <= state.config.max_output_bytes);
         assert!(result.stderr.contains("output truncated"));
+    }
+
+    #[test]
+    fn exec_shell_rejects_runtime_loader_environment() {
+        let mut env = HashMap::new();
+        env.insert("BASH_ENV".to_string(), "/tmp/attacker-profile".to_string());
+
+        let error = validate_node_environment(Some(env)).unwrap_err();
+
+        assert!(error.to_string().contains("BASH_ENV"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn concurrent_async_exec_never_exceeds_configured_cap() {
+        let temp = TempDir::new().unwrap();
+        let mut state = test_state(&temp);
+        Arc::make_mut(&mut state.config).max_concurrent_tasks = 1;
+        state.async_task_slots = Arc::new(Semaphore::new(1));
+        let params = || ExecShellParams {
+            cmd: "sh -c 'sleep 30'".to_string(),
+            timeout_ms: None,
+            cwd: Some(state.sandbox_root.path.to_string_lossy().to_string()),
+            env: None,
+            async_exec: Some(true),
+            callback_url: None,
+        };
+
+        let (first, second) = tokio::join!(
+            handle_exec_shell(&state, params(), "127.0.0.1"),
+            handle_exec_shell(&state, params(), "127.0.0.1")
+        );
+        assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+        let rejected = first.err().or_else(|| second.err()).unwrap();
+        assert!(rejected.to_string().contains("max concurrent async tasks"));
+
+        for cancellation in state.running_tasks.read().await.values() {
+            cancellation.cancel();
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.async_task_slots.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(handle_exec_shell(&state, params(), "127.0.0.1").await.is_ok());
+        for cancellation in state.running_tasks.read().await.values() {
+            cancellation.cancel();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancel_kills_descendant_process_group() {
+        let temp = TempDir::new().unwrap();
+        let state = test_state(&temp);
+        let cancellation = CancellationToken::new();
+        let cancellation_for_task = cancellation.clone();
+        let state_for_task = state.clone();
+        let task = tokio::spawn(async move {
+            let command = parse_command("sh -c 'sleep 30 & echo $! > descendant.pid; wait'").unwrap();
+            execute_shell_command(
+                &state_for_task,
+                &command,
+                Some(state_for_task.sandbox_root.path.clone()),
+                None,
+                Duration::from_secs(30),
+                "process-tree",
+                cancellation_for_task,
+            )
+            .await
+        });
+        let pid_path = state.sandbox_root.path.join("descendant.pid");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !pid_path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let descendant_pid = std::fs::read_to_string(&pid_path).unwrap();
+        let descendant_pid = descendant_pid.trim();
+
+        cancellation.cancel();
+        let result = task.await.unwrap();
+
+        assert!(result.cancelled);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while Path::new("/proc").join(descendant_pid).exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
 
     #[cfg(unix)]

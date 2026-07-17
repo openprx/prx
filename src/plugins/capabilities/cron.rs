@@ -49,6 +49,7 @@ impl WasmCronJob {
             optional,
             manifest.permissions.http_allowlist.clone(),
             timeout_ms,
+            manifest.resources.max_kv_storage_mb,
         );
         if let Some(bus) = event_bus {
             host_state = host_state.with_event_bus(bus);

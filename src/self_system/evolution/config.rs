@@ -1,13 +1,8 @@
 use anyhow::{Context, Result};
 use arc_swap::ArcSwap;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
-use tokio::time::{Duration, Instant};
+use std::path::Path;
+use std::sync::Arc;
 
 /// Evolution execution mode.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -311,109 +306,17 @@ impl EvolutionConfig {
     }
 }
 
-/// Shared lock-free handle for runtime evolution config.
+/// Transactional in-process state for the evolution pipeline.
+///
+/// This domain object is loaded once by the ConfigGeneration-controlled
+/// self-system supervisor. It has no file watcher; only a successful,
+/// persisted evolution mutation may swap it during that pinned supervisor
+/// generation.
 pub type SharedEvolutionConfig = Arc<ArcSwap<EvolutionConfig>>;
 
 /// Create a shared evolution config handle.
 pub fn new_shared_evolution_config(initial: EvolutionConfig) -> SharedEvolutionConfig {
     Arc::new(ArcSwap::from_pointee(initial))
-}
-
-/// Runtime polling hot-reload manager for `evolution_config.toml`.
-pub struct EvolutionRuntimeConfigManager {
-    _handle: tokio::task::JoinHandle<()>,
-    reload_version: Arc<AtomicU64>,
-    shared: SharedEvolutionConfig,
-}
-
-impl EvolutionRuntimeConfigManager {
-    /// Spawn a background poller that reloads config when file content changes.
-    pub fn spawn(config_path: PathBuf, initial: EvolutionConfig) -> Self {
-        let shared = new_shared_evolution_config(initial.clone());
-        let poll_interval = Duration::from_secs(initial.runtime.poll_interval_secs.max(1));
-        let reload_version = Arc::new(AtomicU64::new(0));
-        let version_ref = Arc::clone(&reload_version);
-        let shared_ref = Arc::clone(&shared);
-        let initial_hash = match std::fs::read(&config_path) {
-            Ok(data) => Some(hash_bytes(&data)),
-            Err(err) => {
-                tracing::debug!(
-                    path = %config_path.display(),
-                    error = %err,
-                    "failed to read initial evolution config hash; waiting for first successful poll"
-                );
-                None
-            }
-        };
-
-        let handle = tokio::spawn(async move {
-            let mut ticker = tokio::time::interval_at(Instant::now() + poll_interval, poll_interval);
-            let mut last_hash = initial_hash;
-
-            loop {
-                ticker.tick().await;
-                let Ok(content) = tokio::fs::read(&config_path).await else {
-                    tracing::debug!(
-                        path = %config_path.display(),
-                        "skipping evolution config poll because file is currently unreadable"
-                    );
-                    continue;
-                };
-                let current_hash = hash_bytes(&content);
-                if last_hash.as_ref().is_some_and(|h| h == &current_hash) {
-                    continue;
-                }
-
-                let raw = match std::str::from_utf8(&content) {
-                    Ok(raw) => raw,
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %config_path.display(),
-                            error = %err,
-                            "skipping evolution config reload due to invalid utf-8 content"
-                        );
-                        continue;
-                    }
-                };
-                match toml::from_str::<EvolutionConfig>(raw) {
-                    Ok(config) => {
-                        shared_ref.store(Arc::new(config));
-                        last_hash = Some(current_hash);
-                        version_ref.fetch_add(1, Ordering::Relaxed);
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            path = %config_path.display(),
-                            error = %err,
-                            "skipping evolution config reload due to parse error"
-                        );
-                    }
-                }
-            }
-        });
-
-        Self {
-            _handle: handle,
-            reload_version,
-            shared,
-        }
-    }
-
-    /// Number of successful runtime reloads.
-    pub fn reload_version(&self) -> u64 {
-        self.reload_version.load(Ordering::Relaxed)
-    }
-
-    /// Shared config state.
-    pub fn shared(&self) -> SharedEvolutionConfig {
-        Arc::clone(&self.shared)
-    }
-}
-
-fn hash_bytes(bytes: &[u8]) -> Vec<u8> {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hasher.finalize().to_vec()
 }
 
 #[cfg(test)]
@@ -452,72 +355,6 @@ mod tests {
         assert_eq!(cfg.rollback.max_versions, 10);
         assert_eq!(cfg.rollback.circuit_breaker_threshold, 5);
         assert_eq!(cfg.rollback.cooldown_after_rollback_hours, 24);
-    }
-
-    #[tokio::test]
-    async fn manager_hot_reloads_on_content_change() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("evolution_config.toml");
-        tokio::fs::write(
-            &path,
-            r#"
-[runtime]
-mode = "shadow"
-storage_dir = "self/evolution"
-batch_size = 32
-poll_interval_secs = 1
-
-[runtime.retention]
-hot_days = 30
-warm_days = 90
-cold_days = 180
-
-[runtime.data_thresholds]
-decision_log = 200
-memory_access = 800
-same_failure = 25
-"#,
-        )
-        .await
-        .unwrap();
-
-        let initial = EvolutionConfig::load_from_path(&path).await.unwrap();
-        let manager = EvolutionRuntimeConfigManager::spawn(path.clone(), initial);
-
-        tokio::fs::write(
-            &path,
-            r#"
-[runtime]
-mode = "auto"
-storage_dir = "self/evolution"
-batch_size = 64
-poll_interval_secs = 1
-
-[runtime.retention]
-hot_days = 30
-warm_days = 90
-cold_days = 180
-
-[runtime.data_thresholds]
-decision_log = 200
-memory_access = 800
-same_failure = 25
-"#,
-        )
-        .await
-        .unwrap();
-
-        let mut reloaded = false;
-        for _ in 0..10 {
-            if manager.reload_version() >= 1 {
-                reloaded = true;
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-        assert!(reloaded);
-        assert_eq!(manager.shared().load_full().runtime.mode, EvolutionMode::Auto);
-        assert_eq!(manager.shared().load_full().runtime.batch_size, 64);
     }
 
     #[test]

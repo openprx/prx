@@ -116,6 +116,8 @@ mod tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "router.route_decision decision_id=test".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,

@@ -1,9 +1,16 @@
 pub mod files;
+pub mod generation;
 pub mod hotreload;
 pub mod init;
 pub mod schema;
 
+pub use generation::{
+    ConfigApplyReport, ConfigGeneration, ConfigGenerationAuditEvent, ConfigGenerationAuditSink, ConfigGenerationId,
+    ConfigGenerationManager, ConfigGenerationParticipant, ConfigGenerationStatus, ConfigReloadFailure,
+    ConfigReloadTrigger, ConfigSourceRevision, DeferredConfigChange, DesiredConfigState, PreparedConfigGeneration,
+};
 pub use hotreload::{HotReloadManager, SharedConfig, new_shared};
+pub(crate) use schema::set_runtime_proxy_config;
 
 #[allow(unused_imports)]
 pub use schema::{
@@ -22,7 +29,7 @@ pub use schema::{
     StorageProviderSection, StreamMode, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule, TelegramConfig,
     ToolTieringConfig, TunnelConfig, UserPolicyConfig, WacliConfig, WebSearchConfig, WebhookConfig, WhatsAppConfig,
     apply_runtime_proxy_to_builder, build_runtime_proxy_client, build_runtime_proxy_client_with_timeouts,
-    runtime_proxy_config, set_runtime_proxy_config,
+    runtime_proxy_config,
 };
 
 #[cfg(test)]

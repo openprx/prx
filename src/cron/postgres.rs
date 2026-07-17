@@ -476,6 +476,18 @@ impl PostgresCronStore {
         })
     }
 
+    pub fn job_claim_is_current(&self, job_id: &str, claim: &CronClaim, now: DateTime<Utc>) -> Result<bool> {
+        self.with_client(|client| {
+            let row = client.query_one(
+                "SELECT COUNT(*) FROM cron_jobs
+                 WHERE id = $1 AND claim_owner = $2 AND attempt_id = $3
+                   AND claim_expires_at > $4",
+                &[&job_id, &claim.worker_id, &claim.attempt_id, &format_claim_time(now)],
+            )?;
+            Ok(row.get::<_, i64>(0) == 1)
+        })
+    }
+
     pub fn abandon_job_claim(
         &self,
         workspace_id: &str,

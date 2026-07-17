@@ -29,6 +29,47 @@ fail-closed and are not loaded as configuration. A process that finds an odd
 generation left by an interrupted commit fails closed; restore the last
 known-good configuration and an even generation before restarting.
 
+## Runtime Configuration Generations
+
+The disk transaction barrier above is separate from the process runtime
+generation. A running daemon has one `ConfigGenerationManager` with:
+
+- `desired`: the latest valid merged configuration accepted from disk;
+- `active`: the configuration and runtime objects PRX currently guarantees are
+  in effect;
+- a monotonic process-local generation id pinned when a turn, message, cron
+  job, Xin task, or webhook task is admitted.
+
+The file watcher, config API, and `config_reload` tool all use this same
+manager. Components cannot publish configuration directly. A reload is
+serialized, validated, and classified before publication:
+
+- snapshot-hot fields apply to newly admitted work while in-flight work keeps
+  its pinned generation;
+- provider, model, tools, and security-baked runtime objects are rebuilt as one
+  candidate and swapped only after preparation succeeds;
+- Channels, Cron, Xin/Heartbeat, webhook, and self-system workers use
+  generation-scoped supervisors and controlled restart;
+- memory/storage/runtime backends, gateway bind/tunnel, module topology, and
+  configuration-source paths remain process-restart-only.
+
+For process-restart-only changes, `desired` advances but `active` does not. The
+reload response reports those fields in `restart_required`; it never reports
+them as live. If candidate construction, readiness, or commit fails, PRX keeps
+the old active generation and records the failure in runtime status.
+
+`GET /api/status` exposes the active and desired source revisions, active
+generation id, reload state, registered generation participants,
+restart-required fields, and the most recent reload failure. Runtime
+`message_events` also persist typed `config_generation_id` and
+`config_source_revision` columns for SQLite and PostgreSQL.
+
+`evolution_config.toml` is a separate self-system policy document. It is loaded
+once when an evolution supervisor generation starts; it has no private file
+watcher and cannot publish the process `Config`. The evolution pipeline may
+atomically update its in-memory adaptive policy during a run, but a disk policy
+change is adopted only through the owning supervisor lifecycle.
+
 ## Example Configuration
 
 ```toml

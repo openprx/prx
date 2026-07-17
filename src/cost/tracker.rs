@@ -7,7 +7,41 @@ use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+
+const COST_LEDGER_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const COST_LEDGER_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+struct CostLedgerLockGuard {
+    _file: File,
+}
+
+fn acquire_cost_ledger_lock(path: &Path) -> Result<CostLedgerLockGuard> {
+    let lock_path = path.with_extension("jsonl.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open cost ledger lock {}", lock_path.display()))?;
+    let started = std::time::Instant::now();
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(CostLedgerLockGuard { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if started.elapsed() > COST_LEDGER_LOCK_TIMEOUT {
+                    anyhow::bail!("Timed out waiting for cost ledger lock {}", lock_path.display());
+                }
+                std::thread::sleep(COST_LEDGER_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error)
+                    .with_context(|| format!("Failed to acquire cost ledger lock {}", lock_path.display()));
+            }
+        }
+    }
+}
 
 /// Cost tracker for API usage monitoring and budget enforcement.
 pub struct CostTracker {
@@ -20,12 +54,12 @@ pub struct CostTracker {
 impl CostTracker {
     /// Return the sole process-level cost authority for a canonical workspace.
     pub fn for_workspace(config: CostConfig, workspace_dir: &Path) -> Result<Arc<Self>> {
-        static TRACKERS: OnceLock<StdMutex<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
+        static TRACKERS: OnceLock<Mutex<HashMap<PathBuf, Arc<CostTracker>>>> = OnceLock::new();
         let workspace_dir = workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| workspace_dir.to_path_buf());
-        let trackers = TRACKERS.get_or_init(|| StdMutex::new(HashMap::new()));
-        let mut trackers = trackers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let trackers = TRACKERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut trackers = trackers.lock();
         if let Some(tracker) = trackers.get(&workspace_dir) {
             *tracker.config.lock() = config;
             return Ok(Arc::clone(tracker));
@@ -75,6 +109,8 @@ impl CostTracker {
         }
 
         let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
         let (daily_cost, monthly_cost) = storage.get_aggregated_costs()?;
 
         Ok(budget_check(&config, daily_cost, monthly_cost, estimated_cost_usd))
@@ -95,6 +131,8 @@ impl CostTracker {
         // Persist first for durability guarantees.
         {
             let mut storage = self.lock_storage();
+            let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+            storage.refresh_from_disk()?;
             storage.add_record(record.clone())?;
         }
 
@@ -127,6 +165,8 @@ impl CostTracker {
         }
 
         let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
         if storage.has_settlement(settlement_id) {
             return Ok(CostSettlement::Replayed);
         }
@@ -151,6 +191,8 @@ impl CostTracker {
     pub fn get_summary(&self) -> Result<CostSummary> {
         let (daily_cost, monthly_cost) = {
             let mut storage = self.lock_storage();
+            let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+            storage.refresh_from_disk()?;
             storage.get_aggregated_costs()?
         };
 
@@ -172,13 +214,17 @@ impl CostTracker {
 
     /// Get the daily cost for a specific date.
     pub fn get_daily_cost(&self, date: NaiveDate) -> Result<f64> {
-        let storage = self.lock_storage();
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
         storage.get_cost_for_date(date)
     }
 
     /// Get the monthly cost for a specific month.
     pub fn get_monthly_cost(&self, year: i32, month: u32) -> Result<f64> {
-        let storage = self.lock_storage();
+        let mut storage = self.lock_storage();
+        let _ledger_lock = acquire_cost_ledger_lock(&storage.path)?;
+        storage.refresh_from_disk()?;
         storage.get_cost_for_month(year, month)
     }
 }
@@ -300,6 +346,15 @@ impl CostStorage {
         storage.load_settlement_ids()?;
 
         Ok(storage)
+    }
+
+    fn refresh_from_disk(&mut self) -> Result<()> {
+        let now = Utc::now();
+        self.rebuild_aggregates(now.date_naive(), now.year(), now.month())?;
+        self.cached_day = now.date_naive();
+        self.cached_year = now.year();
+        self.cached_month = now.month();
+        self.load_settlement_ids()
     }
 
     fn load_settlement_ids(&mut self) -> Result<()> {
@@ -623,6 +678,82 @@ mod tests {
         ));
         assert_eq!(second.settle_metered(&record).unwrap(), CostSettlement::Replayed);
         assert_eq!(first.get_summary().unwrap().request_count, 1);
+    }
+
+    #[test]
+    fn separate_tracker_instances_serialize_the_same_settlement() {
+        let tmp = TempDir::new().unwrap();
+        let first = Arc::new(CostTracker::new(enabled_config(), tmp.path()).unwrap());
+        let second = Arc::new(CostTracker::new(enabled_config(), tmp.path()).unwrap());
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+
+        let first_result = {
+            let tracker = Arc::clone(&first);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                tracker.settle_metered(&metered_record("shared-settlement", Some(0.002)))
+            })
+        };
+        let second_result = {
+            let tracker = Arc::clone(&second);
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                barrier.wait();
+                tracker.settle_metered(&metered_record("shared-settlement", Some(0.002)))
+            })
+        };
+
+        let results = [
+            first_result.join().unwrap().unwrap(),
+            second_result.join().unwrap().unwrap(),
+        ];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, CostSettlement::Recorded { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, CostSettlement::Replayed))
+                .count(),
+            1
+        );
+        let persisted = std::fs::read_to_string(tmp.path().join("state").join("costs.jsonl")).unwrap();
+        assert_eq!(persisted.lines().filter(|line| !line.trim().is_empty()).count(), 1);
+    }
+
+    #[test]
+    fn separate_tracker_instances_refresh_budget_and_summary_from_disk() {
+        let tmp = TempDir::new().unwrap();
+        let config = CostConfig {
+            enabled: true,
+            daily_limit_usd: 1.0,
+            monthly_limit_usd: 10.0,
+            ..Default::default()
+        };
+        let writer = CostTracker::new(config.clone(), tmp.path()).unwrap();
+        let reader = CostTracker::new(config, tmp.path()).unwrap();
+
+        assert!(matches!(
+            writer
+                .settle_metered(&metered_record("external-settlement", Some(0.9)))
+                .unwrap(),
+            CostSettlement::Recorded { .. }
+        ));
+        assert!(matches!(
+            reader.check_budget(0.2).unwrap(),
+            BudgetCheck::Exceeded {
+                period: UsagePeriod::Day,
+                ..
+            }
+        ));
+        let summary = reader.get_summary().unwrap();
+        assert!((summary.daily_cost_usd - 0.9).abs() < f64::EPSILON);
+        assert!((summary.monthly_cost_usd - 0.9).abs() < f64::EPSILON);
     }
 
     #[test]

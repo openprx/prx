@@ -28,6 +28,8 @@ use std::collections::{BTreeSet, HashMap, hash_map::DefaultHasher};
 use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::io::Write as _;
+#[cfg(feature = "llm-router")]
+use std::path::Path;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -225,6 +227,8 @@ pub(crate) struct ScopeContext<'a> {
     pub topic_id: Option<&'a str>,
     pub task_id: Option<&'a str>,
     pub source_message_event_id: Option<&'a str>,
+    pub config_generation_id: Option<u64>,
+    pub config_source_revision: Option<&'a str>,
 }
 
 #[derive(Clone)]
@@ -243,6 +247,8 @@ pub(crate) struct DocumentIngestRuntime {
     /// Originating sender. Retained so OS-paging recall (FIX-P3-05) can rebuild
     /// the exact owner-scoped `MemoryPrincipal` used when pages were ingested.
     sender: Option<String>,
+    config_generation_id: Option<u64>,
+    config_source_revision: Option<String>,
     visibility: MemoryVisibility,
 }
 
@@ -261,6 +267,8 @@ impl DocumentIngestRuntime {
             persona_id: envelope.persona_id.clone(),
             channel: envelope.channel.clone(),
             sender: envelope.sender.clone(),
+            config_generation_id: envelope.config_generation_id,
+            config_source_revision: envelope.config_source_revision.clone(),
             visibility: envelope.visibility.clone(),
         }
     }
@@ -292,6 +300,8 @@ impl DocumentIngestRuntime {
             // resolve channel scope on later recall (FIX-P1-08).
             channel: Some(scope.channel.to_string()),
             sender: Some(scope.sender.to_string()),
+            config_generation_id: scope.config_generation_id,
+            config_source_revision: scope.config_source_revision.map(ToString::to_string),
             visibility: MemoryVisibility::Session,
         }
     }
@@ -1440,6 +1450,8 @@ async fn persist_compaction_audit(
                 correlation_id: Some(run_id.clone()),
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: audit.config_generation_id,
+                config_source_revision: audit.config_source_revision.clone(),
                 content: crate::chat::sanitize::sanitize_for_persistence(summary),
                 raw_payload_json: Some(raw_payload_json),
                 visibility: audit.visibility.clone(),
@@ -4007,6 +4019,18 @@ async fn execute_one_tool(
                     serde_json::Value::String(source_message_event_id.to_string()),
                 );
             }
+            if let Some(config_generation_id) = ctx.config_generation_id {
+                scope.insert(
+                    "config_generation_id".to_string(),
+                    serde_json::Value::Number(config_generation_id.into()),
+                );
+            }
+            if let Some(config_source_revision) = ctx.config_source_revision {
+                scope.insert(
+                    "config_source_revision".to_string(),
+                    serde_json::Value::String(config_source_revision.to_string()),
+                );
+            }
         }
         if let Ok(spawn_ctx) = crate::tools::sessions_spawn::SPAWN_EXECUTION_CONTEXT.try_with(Clone::clone) {
             if let Some(scope) = trusted_scope.as_object_mut() {
@@ -4976,6 +5000,8 @@ impl AgentToolApprovalStrategy {
             topic_id: envelope.topic_id.as_deref(),
             task_id: envelope.task_id.as_deref(),
             source_message_event_id: envelope.source_message_event_id.as_deref(),
+            config_generation_id: envelope.config_generation_id,
+            config_source_revision: envelope.config_source_revision.as_deref(),
         };
         runtime_approval_grant_for_call(
             &request.descriptor.public_name,
@@ -5803,13 +5829,16 @@ pub(crate) async fn run_tool_call_loop_outcome(
             policy: Arc::clone(&policy),
             cancellation: cancellation_token.clone(),
         };
-        let service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
+        let mut service = crate::tools::ToolExecutionService::from_shared_boxed_registry(
             Arc::clone(&tools_registry),
             Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
             Arc::new(approval_strategy),
             Arc::new(crate::tools::AdapterOwnedSandboxStrategy),
             Arc::new(crate::tools::TracingToolExecutionAudit),
         );
+        if let Some(document_ingest) = document_ingest.as_ref() {
+            service = service.with_idempotency_memory(Arc::clone(&document_ingest.memory));
+        }
         ToolLoopRuntimeAdapter {
             events: None,
             stream_provider: false,
@@ -6290,7 +6319,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
                     } else {
                         apply_aggressive_trim(history, COMPACTION_KEEP_RECENT_MESSAGES);
                     }
-                    if !emitted_exact_patch && !(runtime_adapter.stream_provider && compaction_config.is_some()) {
+                    if !(emitted_exact_patch || runtime_adapter.stream_provider && compaction_config.is_some()) {
                         emit_tool_loop_event(&runtime_adapter, ToolLoopEvent::ContextCompacted).await?;
                     }
                     continue;
@@ -6740,6 +6769,7 @@ async fn emit_cte_ask_approval(
     observer: &dyn Observer,
     hooks: &HookManager,
     cost_config: &crate::config::schema::CostConfig,
+    workspace_dir: &Path,
     provider_name: &str,
     model_name: &str,
     session_id: &str,
@@ -6772,6 +6802,7 @@ async fn emit_cte_ask_approval(
             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
         },
         cost_config,
+        workspace_dir,
     )
     .await
     {
@@ -7021,11 +7052,14 @@ pub(crate) async fn run_with_runtime_envelope(
         // Keep the turn identity outside the raced future so a shutdown that
         // drops it can still close the shared terminal boundary as Cancelled.
         let turn_run_id = Uuid::new_v4().to_string();
-        let runtime_envelope = resolve_agent_turn_envelope(
+        let mut runtime_envelope = resolve_agent_turn_envelope(
             runtime_envelope_override.as_ref(),
             memory_fabric.workspace_id(),
             &turn_run_id,
         );
+        if runtime_envelope.config_source_revision.is_none() {
+            runtime_envelope = runtime_envelope.with_config_generation(&ctx.config_generation);
+        }
         let fabric_scope = runtime_envelope
             .message_scope()
             .with_recipient(format!("{provider_name}/{model_name}"));
@@ -7120,6 +7154,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             observer.as_ref(),
                             &hooks,
                             &config.cost,
+                            &config.workspace_dir,
                             provider_name,
                             model_name,
                             &turn_run_id,
@@ -7229,6 +7264,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                         },
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7264,6 +7300,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                 },
                 &config.cost,
+                &config.workspace_dir,
             )
             .await
             {
@@ -7316,6 +7353,7 @@ pub(crate) async fn run_with_runtime_envelope(
                         delivery_intent: crate::agent::terminal::TurnDeliveryIntent::None,
                     },
                     &config.cost,
+                    &config.workspace_dir,
                 ).await {
                     tracing::warn!(error = %error, "Failed to commit cancelled single-shot agent terminal event");
                 }
@@ -7421,7 +7459,8 @@ pub(crate) async fn run_with_runtime_envelope(
             let turn_run_id = Uuid::new_v4().to_string();
             let runtime_envelope =
                 RuntimeEnvelope::agent(memory_fabric.workspace_id().to_string(), turn_run_id.clone())
-                    .with_recipient("cli:local-user");
+                    .with_recipient("cli:local-user")
+                    .with_config_generation(&ctx.config_generation);
             let fabric_scope = runtime_envelope
                 .message_scope()
                 .with_recipient(format!("{provider_name}/{model_name}"));
@@ -7515,6 +7554,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             observer.as_ref(),
                             &hooks,
                             &config.cost,
+                            &config.workspace_dir,
                             provider_name,
                             model_name,
                             &turn_run_id,
@@ -7650,6 +7690,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                         },
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7692,6 +7733,7 @@ pub(crate) async fn run_with_runtime_envelope(
                             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                         },
                         &config.cost,
+                        &config.workspace_dir,
                     )
                     .await
                     {
@@ -7786,6 +7828,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
     let hooks = HookManager::new(config.workspace_dir.clone());
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let shared_config = crate::config::new_shared(config.clone());
+    let config_generation = shared_config.pin();
     // FIX-P1-31: honour the configured `security.audit` block on the gate audit path.
     let security = Arc::new(
         SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
@@ -7815,6 +7859,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     };
     let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
+        Arc::clone(&shared_config),
         &security,
         runtime,
         mem.clone(),
@@ -7874,7 +7919,8 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
 
     let runtime_envelope =
         RuntimeEnvelope::agent_process_message(memory_fabric.workspace_id().to_string(), agent_session_key.clone())
-            .with_run_id(agent_run_id.clone());
+            .with_run_id(agent_run_id.clone())
+            .with_config_generation(&config_generation);
     let fabric_scope = runtime_envelope
         .message_scope()
         .with_recipient(format!("{provider_name}/{model_name}"));
@@ -7976,6 +8022,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
                     delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                 },
                 &config.cost,
+                &config.workspace_dir,
             )
             .await
             {
@@ -8011,6 +8058,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
         },
         &config.cost,
+        &config.workspace_dir,
     )
     .await
     {
@@ -8177,8 +8225,8 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
     use crate::memory::{
-        DocumentIngestInput, DocumentRecord, Memory, MemoryCategory, MemoryEntry, MemoryVisibility, MessageEventInput,
-        SqliteMemory,
+        DocumentIngestInput, DocumentRecord, Memory, MemoryCategory, MemoryEntry, MemoryVisibility, MessageEvent,
+        MessageEventInput, SqliteMemory,
     };
     use crate::observability::NoopObserver;
     use crate::providers::ChatResponse;
@@ -8478,6 +8526,18 @@ mod tests {
         async fn health_check(&self) -> bool {
             self.inner.health_check().await
         }
+        async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+            self.inner.append_message_event(input).await
+        }
+        async fn find_message_event_by_idempotency_key(
+            &self,
+            workspace_id: &str,
+            idempotency_key: &str,
+        ) -> anyhow::Result<Option<MessageEvent>> {
+            self.inner
+                .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+                .await
+        }
     }
 
     #[async_trait]
@@ -8535,6 +8595,18 @@ mod tests {
         }
         async fn health_check(&self) -> bool {
             self.inner.health_check().await
+        }
+        async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
+            self.inner.append_message_event(input).await
+        }
+        async fn find_message_event_by_idempotency_key(
+            &self,
+            workspace_id: &str,
+            idempotency_key: &str,
+        ) -> anyhow::Result<Option<MessageEvent>> {
+            self.inner
+                .find_message_event_by_idempotency_key(workspace_id, idempotency_key)
+                .await
         }
     }
 
@@ -9449,7 +9521,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
-            None, // no document ingest
+            None,
             ChatMode::default(),
         )
         .await
@@ -9590,6 +9662,11 @@ mod tests {
         ];
 
         let approval_mgr = ApprovalManager::new();
+        let ledger_dir = TempDir::new().unwrap();
+        let ledger_memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(ledger_dir.path()).unwrap());
+        let ledger_envelope =
+            RuntimeEnvelope::agent(ledger_dir.path().to_string_lossy().to_string(), "stateful-serial");
+        let document_ingest = DocumentIngestRuntime::from_envelope(ledger_memory, &ledger_envelope);
 
         let mut history = vec![ChatMessage::system("test-system"), ChatMessage::user("run tool calls")];
         let observer = NoopObserver;
@@ -9624,7 +9701,7 @@ mod tests {
             None, // no scope context
             None,
             None, // no tool tiering
-            None, // no document ingest
+            Some(document_ingest),
             ChatMode::default(),
         )
         .await
@@ -9731,6 +9808,8 @@ mod tests {
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
+            config_generation_id: None,
+            config_source_revision: None,
         };
 
         let call = ParsedToolCall {
@@ -9783,6 +9862,8 @@ mod tests {
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
+            config_generation_id: None,
+            config_source_revision: None,
         };
         let call = ParsedToolCall {
             name: "delegate".to_string(),
@@ -9843,6 +9924,8 @@ mod tests {
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
+            config_generation_id: None,
+            config_source_revision: None,
         };
 
         let call = ParsedToolCall {
@@ -9900,6 +9983,8 @@ mod tests {
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
+            config_generation_id: None,
+            config_source_revision: None,
         };
 
         // Seed the session "Always" allowlist for `delegate`.
@@ -11311,6 +11396,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "telegram status update".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11340,6 +11427,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "what changed".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11404,6 +11493,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "previous current-session request".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11433,6 +11524,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "previous current-session answer".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11486,6 +11579,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "gateway shared status".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11697,6 +11792,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: "important current-session fact".to_string(),
             raw_payload_json: None,
             visibility: MemoryVisibility::Workspace,
@@ -11727,6 +11824,8 @@ ls -la
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: format!("external noisy event {index}"),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,
@@ -11787,6 +11886,8 @@ ls -la
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: Some(0),
+            config_source_revision: None,
             content: content.to_string(),
             content_hash: None,
             raw_payload_json: None,
@@ -12888,6 +12989,8 @@ Let me check the result."#;
             persona_id: None,
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
+            config_generation_id: Some(0),
+            config_source_revision: None,
             visibility: MemoryVisibility::Workspace,
         }
     }
@@ -13281,6 +13384,7 @@ Let me check the result."#;
                 obs.as_ref(),
                 &hooks,
                 &crate::config::schema::CostConfig::default(),
+                tmp.path(),
                 "prov",
                 "model",
                 "run-cte-approval",

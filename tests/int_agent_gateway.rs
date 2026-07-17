@@ -33,14 +33,13 @@ use axum::{Json, Router};
 use openprx::HookManager;
 use openprx::agent::agent::Agent;
 use openprx::agent::dispatcher::NativeToolDispatcher;
-use openprx::config::{AgentConfig, Config, MemoryConfig};
+use openprx::config::{AgentConfig, Config, MemoryConfig, new_shared};
 use openprx::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, MAX_BODY_SIZE};
 use openprx::memory::{self, Memory, MemoryCategory, MemoryEntry};
 use openprx::observability::{NoopObserver, Observer};
 use openprx::providers::{ChatRequest, ChatResponse, Provider, ToolCall};
 use openprx::security::pairing::PairingGuard;
 use openprx::tools::{Tool, ToolResult};
-use parking_lot::Mutex;
 use serde_json::json;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -328,8 +327,7 @@ fn build_agent_with_config(provider: Box<dyn Provider>, tools: Vec<Box<dyn Tool>
 /// Build a minimal `AppState` for gateway integration tests.
 fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
     AppState {
-        config: Arc::new(Mutex::new(Config::default())),
-        shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+        config: new_shared(Config::default()),
         provider: overrides.provider.unwrap_or_else(|| Arc::new(GatewayMockProvider)),
         model: "test-model".into(),
         temperature: 0.0,
@@ -337,6 +335,7 @@ fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
         auto_save: false,
         tools_registry: Arc::new(vec![]),
         mcp_tool: None,
+        turn_runtime: None,
         hooks: Arc::new(HookManager::new(std::env::temp_dir())),
         webhook_token_hash: overrides.webhook_token_hash,
         webhook_signing_secret: overrides.webhook_signing_secret,
@@ -360,15 +359,7 @@ fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
         gateway_port: 0,
         logs_broadcast_tx: broadcast::channel(16).0,
         #[cfg(feature = "wasm-plugins")]
-        plugin_manager: None,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_middleware: None,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_hook_executor: None,
-        #[cfg(feature = "wasm-plugins")]
-        wasm_cron_manager: None,
-        #[cfg(feature = "wasm-plugins")]
-        event_bus: None,
+        plugin_runtime: None,
     }
 }
 

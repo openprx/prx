@@ -1,5 +1,5 @@
 use crate::memory::principal::{MemoryWriteContext, OwnerPrincipal, Role};
-use crate::memory::{MemoryPrincipal, MemoryVisibility, MessageEventScope};
+use crate::memory::{MemoryPrincipal, MemoryVisibility, MessageEventScope, RuntimeAuthorityGuard};
 
 /// Normalized ingress metadata for an agent-runtime turn.
 ///
@@ -22,6 +22,11 @@ pub struct RuntimeEnvelope {
     pub source_message_event_id: Option<String>,
     pub run_id: Option<String>,
     pub parent_run_id: Option<String>,
+    pub attempt_id: Option<String>,
+    pub lease_epoch: Option<i64>,
+    pub config_generation_id: Option<u64>,
+    pub config_source_revision: Option<String>,
+    pub authority_guard: Option<RuntimeAuthorityGuard>,
     pub agent_id: Option<String>,
     pub persona_id: Option<String>,
     pub channel: Option<String>,
@@ -40,6 +45,8 @@ pub enum RuntimeSource {
     SessionWorker,
     SessionsSpawn,
     Delegate,
+    Cron,
+    Xin,
 }
 
 impl RuntimeSource {
@@ -54,6 +61,8 @@ impl RuntimeSource {
             Self::SessionWorker => "session_worker",
             Self::SessionsSpawn => "sessions_spawn",
             Self::Delegate => "delegate",
+            Self::Cron => "cron",
+            Self::Xin => "xin",
         }
     }
 }
@@ -81,6 +90,11 @@ impl RuntimeEnvelope {
             source_message_event_id: None,
             run_id: None,
             parent_run_id: None,
+            attempt_id: None,
+            lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            authority_guard: None,
             agent_id: None,
             persona_id: None,
             channel: None,
@@ -197,6 +211,42 @@ impl RuntimeEnvelope {
         .with_run_id(run_id)
         .with_channel("cli")
         .with_sender("local-user")
+    }
+
+    #[must_use]
+    pub fn cron(workspace_id: impl Into<String>, job_id: impl Into<String>, attempt_id: impl Into<String>) -> Self {
+        let job_id = job_id.into();
+        let attempt_id = attempt_id.into();
+        Self::new_internal(
+            RuntimeSource::Cron,
+            workspace_id,
+            format!("cron:{job_id}"),
+            MemoryVisibility::Workspace,
+        )
+        .with_run_id(format!("cron:{job_id}:{attempt_id}"))
+        .with_task_id(job_id.clone())
+        .with_attempt_id(attempt_id)
+        .with_channel("cron")
+        .with_sender("cron")
+        .with_recipient(format!("cron:job:{job_id}"))
+    }
+
+    #[must_use]
+    pub fn xin(workspace_id: impl Into<String>, task_id: impl Into<String>, lease_epoch: u64) -> Self {
+        let task_id = task_id.into();
+        Self::new_internal(
+            RuntimeSource::Xin,
+            workspace_id,
+            format!("xin:{task_id}"),
+            MemoryVisibility::Workspace,
+        )
+        .with_run_id(format!("xin:{task_id}:{lease_epoch}"))
+        .with_task_id(task_id.clone())
+        .with_attempt_id(format!("xin:{task_id}:{lease_epoch}"))
+        .with_lease_epoch(lease_epoch)
+        .with_channel("xin")
+        .with_sender("xin")
+        .with_recipient(format!("xin:task:{task_id}"))
     }
 
     /// `Agent` envelope for the `process_message` entry path.
@@ -366,6 +416,24 @@ impl RuntimeEnvelope {
     #[must_use]
     pub fn with_parent_run_id(mut self, parent_run_id: impl Into<String>) -> Self {
         self.parent_run_id = Some(parent_run_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_attempt_id(mut self, attempt_id: impl Into<String>) -> Self {
+        self.attempt_id = Some(attempt_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_lease_epoch(mut self, lease_epoch: u64) -> Self {
+        self.lease_epoch = i64::try_from(lease_epoch).ok();
+        self
+    }
+
+    #[must_use]
+    pub fn with_authority_guard(mut self, authority_guard: RuntimeAuthorityGuard) -> Self {
+        self.authority_guard = Some(authority_guard);
         self
     }
 
@@ -574,6 +642,11 @@ impl RuntimeEnvelope {
         if let Some(parent_run_id) = &self.parent_run_id {
             scope = scope.with_parent_run_id(parent_run_id.clone());
         }
+        scope.attempt_id = self.attempt_id.clone();
+        scope.lease_epoch = self.lease_epoch;
+        scope.config_generation_id = self.config_generation_id;
+        scope.config_source_revision = self.config_source_revision.clone();
+        scope.authority_guard = self.authority_guard.clone();
         if let Some(agent_id) = &self.agent_id {
             scope = scope.with_agent_id(agent_id.clone());
         }
@@ -602,6 +675,14 @@ impl RuntimeEnvelope {
             });
         scope.causation_event_id = self.source_message_event_id.clone();
         scope
+    }
+
+    /// Pin the configuration generation used by this complete runtime operation.
+    #[must_use]
+    pub fn with_config_generation(mut self, generation: &crate::config::ConfigGeneration) -> Self {
+        self.config_generation_id = Some(generation.id.0);
+        self.config_source_revision = Some(generation.source_revision.fingerprint_sha256.clone());
+        self
     }
 
     #[must_use]
@@ -661,6 +742,28 @@ mod tests {
         assert_eq!(write_context.chat_id.as_deref(), Some(envelope.session_key.as_str()));
         assert_eq!(write_context.sender_id.as_deref(), Some("terminal:local-user"));
         assert_eq!(write_context.raw_sender.as_deref(), Some("local-user"));
+    }
+
+    #[test]
+    fn scheduler_envelopes_preserve_execution_authority_lineage() {
+        let cron = RuntimeEnvelope::cron("workspace", "job-1", "attempt-7");
+        let cron_scope = cron.message_scope();
+        assert_eq!(cron_scope.source, "cron");
+        assert_eq!(cron_scope.attempt_id.as_deref(), Some("attempt-7"));
+        assert_eq!(
+            cron_scope.subject,
+            Some(crate::memory::MessageEventSubject::Task("job-1".to_string()))
+        );
+
+        let xin = RuntimeEnvelope::xin("workspace", "step-1", 9);
+        let xin_scope = xin.message_scope();
+        assert_eq!(xin_scope.source, "xin");
+        assert_eq!(xin_scope.attempt_id.as_deref(), Some("xin:step-1:9"));
+        assert_eq!(xin_scope.lease_epoch, Some(9));
+        assert_eq!(
+            xin_scope.subject,
+            Some(crate::memory::MessageEventSubject::Task("step-1".to_string()))
+        );
     }
 
     #[test]

@@ -19,6 +19,12 @@ pub struct WorkerManifest {
     /// SHA-256 generation of config.toml plus every config.d TOML fragment.
     #[serde(default)]
     pub config_generation: String,
+    /// Runtime configuration generation pinned by the parent turn.
+    #[serde(default)]
+    pub runtime_config_generation_id: Option<u64>,
+    /// Stable source revision associated with the pinned runtime generation.
+    #[serde(default)]
+    pub runtime_config_source_revision: Option<String>,
     pub workspace_dir: PathBuf,
     pub memory_db_path: PathBuf,
     #[serde(default)]
@@ -131,6 +137,8 @@ mod tests {
             temperature: 0.7,
             config_dir: PathBuf::from("/tmp/openprx"),
             config_generation: "a".repeat(64),
+            runtime_config_generation_id: Some(42),
+            runtime_config_source_revision: Some("revision-42".into()),
             workspace_dir: PathBuf::from("/tmp/ws"),
             memory_db_path: PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/parent-ws".into()),
@@ -171,6 +179,8 @@ mod tests {
         assert_eq!(parsed.run_id, "run-1");
         assert_eq!(parsed.config_dir, PathBuf::from("/tmp/openprx"));
         assert_eq!(parsed.config_generation, "a".repeat(64));
+        assert_eq!(parsed.runtime_config_generation_id, Some(42));
+        assert_eq!(parsed.runtime_config_source_revision.as_deref(), Some("revision-42"));
         assert_eq!(parsed.parent_capability.as_deref(), Some("capability"));
         assert_eq!(parsed.allowed_tools.len(), 2);
         assert_eq!(parsed.memory_workspace_id.as_deref(), Some("/tmp/parent-ws"));

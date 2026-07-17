@@ -97,6 +97,12 @@ impl PostgresClientSlot {
     fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
         let mut guard = self.client.lock();
         let client = guard.as_mut().context("PostgreSQL memory backend client is closed")?;
+        // The synchronous client is reused across requests, while PostgreSQL
+        // RLS settings are session-scoped. Always start a checkout in the
+        // neutral system context; owner-scoped operations override this inside
+        // the same lock before issuing their query. This prevents one
+        // principal's owner setting from leaking into the next operation.
+        client.execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])?;
         f(client)
     }
 }
@@ -492,7 +498,7 @@ impl PostgresMemory {
             CREATE TABLE IF NOT EXISTS {qualified_message_events_table} (
                 id BIGSERIAL PRIMARY KEY,
                 event_id TEXT UNIQUE NOT NULL,
-                idempotency_key TEXT UNIQUE,
+                idempotency_key TEXT,
                 workspace_id TEXT NOT NULL,
                 owner_id TEXT,
                 source TEXT NOT NULL,
@@ -514,6 +520,8 @@ impl PostgresMemory {
                 correlation_id TEXT,
                 attempt_id TEXT,
                 lease_epoch BIGINT,
+                config_generation_id BIGINT,
+                config_source_revision TEXT,
                 content TEXT NOT NULL,
                 content_hash TEXT,
                 raw_payload_json TEXT,
@@ -530,7 +538,9 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS causation_event_id TEXT,
                 ADD COLUMN IF NOT EXISTS correlation_id TEXT,
                 ADD COLUMN IF NOT EXISTS attempt_id TEXT,
-                ADD COLUMN IF NOT EXISTS lease_epoch BIGINT;
+                ADD COLUMN IF NOT EXISTS lease_epoch BIGINT,
+                ADD COLUMN IF NOT EXISTS config_generation_id BIGINT,
+                ADD COLUMN IF NOT EXISTS config_source_revision TEXT;
 
             CREATE INDEX IF NOT EXISTS idx_message_events_workspace_id
                 ON {qualified_message_events_table}(workspace_id, id);
@@ -550,6 +560,8 @@ impl PostgresMemory {
                 ON {qualified_message_events_table}(workspace_id, correlation_id, id);
             CREATE INDEX IF NOT EXISTS idx_message_events_created_at
                 ON {qualified_message_events_table}(created_at);
+            CREATE INDEX IF NOT EXISTS idx_message_events_config_generation
+                ON {qualified_message_events_table}(workspace_id, config_generation_id, id);
 
             CREATE TABLE IF NOT EXISTS {qualified_memory_events_table} (
                 id BIGSERIAL PRIMARY KEY,
@@ -900,11 +912,13 @@ impl PostgresMemory {
             "
         ))?;
 
+        Self::ensure_message_event_idempotency_scope(client, qualified_message_events_table)?;
+
         // FIX-P1-19: document_chunks → documents FK with ON DELETE CASCADE.
         // Added as a guarded step (not in the idempotent batch) because adding a
         // constraint that already exists raises an error rather than being a
         // no-op; we therefore detect-then-add and tolerate the duplicate.
-        Self::ensure_document_chunks_fk(client, schema_ident, qualified_document_chunks_table)?;
+        Self::ensure_document_chunks_fk(client, qualified_documents_table, qualified_document_chunks_table)?;
 
         // FIX-P3-04: enable row-level security on `memories` so owner isolation is
         // enforced at the database layer (defense-in-depth: even if the app-level
@@ -1022,6 +1036,16 @@ impl PostgresMemory {
                 "compaction_source_event_range",
                 "compaction_runs.source_event_ids_json contains only real MessageEvent event_id strings + source_event_range_json(first_event_id,last_event_id,first_row_id,last_row_id,source_event_count)",
             ),
+            (
+                18,
+                "message_event_workspace_idempotency",
+                "message_events UNIQUE(workspace_id,idempotency_key) replaces global UNIQUE(idempotency_key) + workspace-scoped conflict lookup",
+            ),
+            (
+                19,
+                "message_event_config_generation",
+                "message_events + config_generation_id + config_source_revision + idx_message_events_config_generation",
+            ),
         ]
     }
 
@@ -1079,18 +1103,23 @@ impl PostgresMemory {
     /// `ADD CONSTRAINT` is not idempotent in PostgreSQL, so we first probe
     /// `pg_constraint` for the named constraint and only add it when missing.
     ///
-    /// SAFETY: `schema_ident` and `qualified_document_chunks_table` are validated
-    /// + quoted at construction; all dynamic values use bind params.
+    /// SAFETY: both qualified table identifiers are validated and quoted at
+    /// construction; all dynamic metadata values use bind params.
     fn ensure_document_chunks_fk(
         client: &mut Client,
-        schema_ident: &str,
+        qualified_documents_table: &str,
         qualified_document_chunks_table: &str,
     ) -> Result<()> {
         const FK_NAME: &str = "fk_document_chunks_document";
         let exists: bool = client
             .query_one(
-                "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)",
-                &[&FK_NAME],
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = to_regclass($1::text)
+                      AND conname = $2
+                )",
+                &[&qualified_document_chunks_table, &FK_NAME],
             )?
             .get(0);
         if exists {
@@ -1100,7 +1129,7 @@ impl PostgresMemory {
             "ALTER TABLE {qualified_document_chunks_table}
              ADD CONSTRAINT {FK_NAME}
              FOREIGN KEY (document_id)
-             REFERENCES {schema_ident}.documents(document_id)
+             REFERENCES {qualified_documents_table}(document_id)
              ON DELETE CASCADE"
         );
         if let Err(error) = client.batch_execute(&add_fk) {
@@ -1108,14 +1137,49 @@ impl PostgresMemory {
             // between our probe and ALTER; surface anything else.
             let refreshed: bool = client
                 .query_one(
-                    "SELECT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = $1)",
-                    &[&FK_NAME],
+                    "SELECT EXISTS (
+                        SELECT 1
+                        FROM pg_constraint
+                        WHERE conrelid = to_regclass($1::text)
+                          AND conname = $2
+                    )",
+                    &[&qualified_document_chunks_table, &FK_NAME],
                 )?
                 .get(0);
             if !refreshed {
                 return Err(anyhow::anyhow!("failed to add document_chunks foreign key: {error}"));
             }
         }
+        Ok(())
+    }
+
+    /// Replace the legacy global MessageEvent idempotency constraint with a
+    /// workspace-scoped unique index. The constraint name is discovered from
+    /// PostgreSQL metadata because derived table names may be truncated.
+    fn ensure_message_event_idempotency_scope(client: &mut Client, qualified_message_events_table: &str) -> Result<()> {
+        let legacy_constraint = client.query_opt(
+            "SELECT conname
+             FROM pg_constraint
+             WHERE conrelid = to_regclass($1::text)
+               AND contype = 'u'
+               AND pg_get_constraintdef(oid) = 'UNIQUE (idempotency_key)'
+             LIMIT 1",
+            &[&qualified_message_events_table],
+        )?;
+        if let Some(row) = legacy_constraint {
+            let constraint_name: String = row.get(0);
+            validate_identifier(&constraint_name, "message event idempotency constraint")?;
+            let constraint_ident = quote_identifier(&constraint_name);
+            client.batch_execute(&format!(
+                "ALTER TABLE {qualified_message_events_table}
+                 DROP CONSTRAINT IF EXISTS {constraint_ident}"
+            ))?;
+        }
+        client.batch_execute(&format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_message_events_workspace_idempotency
+             ON {qualified_message_events_table}(workspace_id, idempotency_key)
+             WHERE idempotency_key IS NOT NULL"
+        ))?;
         Ok(())
     }
 
@@ -1572,7 +1636,7 @@ impl PostgresMemory {
     /// FIX-P0-22: append an access-audit row (parity with SQLite `log_access`).
     /// System/owner principals are not audited. Best-effort: a logging failure
     /// must not abort the caller's operation, so errors are traced and dropped.
-    fn log_access_best_effort(
+    fn log_access_best_effort_blocking(
         client: &PostgresClientSlot,
         audit_table: &str,
         principal: &Principal,
@@ -1610,6 +1674,34 @@ impl PostgresMemory {
         });
         if let Err(error) = outcome {
             tracing::debug!(error = %error, "Postgres access-audit log write failed (best-effort)");
+        }
+    }
+
+    async fn log_access_best_effort(
+        client: Arc<PostgresClientSlot>,
+        audit_table: String,
+        principal: Principal,
+        action: &'static str,
+        query: Option<String>,
+        memory_id: Option<String>,
+        policy_rule: Option<&'static str>,
+        result: &'static str,
+    ) {
+        let outcome = tokio::task::spawn_blocking(move || {
+            Self::log_access_best_effort_blocking(
+                &client,
+                &audit_table,
+                &principal,
+                action,
+                query.as_deref(),
+                memory_id.as_deref(),
+                policy_rule,
+                result,
+            );
+        })
+        .await;
+        if let Err(error) = outcome {
+            tracing::debug!(error = %error, "Postgres access-audit task failed (best-effort)");
         }
     }
 
@@ -1755,10 +1847,10 @@ impl PostgresMemory {
         let subject = subject_ref_json
             .as_deref()
             .and_then(|json| serde_json::from_str(json).ok());
-        let created_at: DateTime<Utc> = row.get(28);
-        let updated_at: DateTime<Utc> = row.get(29);
+        let created_at: DateTime<Utc> = row.get(30);
+        let updated_at: DateTime<Utc> = row.get(31);
         let visibility = row
-            .get::<_, String>(27)
+            .get::<_, String>(29)
             .parse::<MemoryVisibility>()
             .unwrap_or(MemoryVisibility::Workspace);
 
@@ -1788,9 +1880,13 @@ impl PostgresMemory {
             correlation_id: row.get(21),
             attempt_id: row.get(22),
             lease_epoch: row.get(23),
-            content: row.get(24),
-            content_hash: row.get(25),
-            raw_payload_json: row.get(26),
+            config_generation_id: row
+                .get::<_, Option<i64>>(24)
+                .and_then(|value| u64::try_from(value).ok()),
+            config_source_revision: row.get(25),
+            content: row.get(26),
+            content_hash: row.get(27),
+            raw_payload_json: row.get(28),
             visibility,
             created_at: created_at.to_rfc3339(),
             updated_at: updated_at.to_rfc3339(),
@@ -2710,11 +2806,11 @@ impl Memory for PostgresMemory {
         };
         let principal = self.resolve_principal_from_context(&context).await;
         Self::log_access_best_effort(
-            &self.client,
-            &self.qualified_access_audit_log_table(),
-            &principal,
+            Arc::clone(&self.client),
+            self.qualified_access_audit_log_table(),
+            principal,
             "search",
-            Some(query),
+            Some(query.to_string()),
             None,
             Some(match mode {
                 MemoryReadMode::Enforce => "acl_enforced",
@@ -2727,7 +2823,8 @@ impl Memory for PostgresMemory {
             } else {
                 "allowed"
             },
-        );
+        )
+        .await;
         Ok(selected)
     }
 
@@ -2822,12 +2919,15 @@ impl Memory for PostgresMemory {
         };
         let principal = self.resolve_principal_from_context(&context).await;
         Self::log_access_best_effort(
-            &self.client,
-            &self.qualified_access_audit_log_table(),
-            &principal,
+            Arc::clone(&self.client),
+            self.qualified_access_audit_log_table(),
+            principal,
             "get",
             None,
-            selected.as_ref().map(|entry| entry.id.as_str()).or(Some(key)),
+            selected
+                .as_ref()
+                .map(|entry| entry.id.clone())
+                .or_else(|| Some(key.to_string())),
             Some(match mode {
                 MemoryReadMode::Enforce => "acl_enforced",
                 MemoryReadMode::Observe => "observe_mode",
@@ -2839,7 +2939,8 @@ impl Memory for PostgresMemory {
             } else {
                 "denied"
             },
-        );
+        )
+        .await;
         Ok(selected)
     }
 
@@ -2926,7 +3027,7 @@ impl Memory for PostgresMemory {
                 Ok(client.execute(&stmt, &params)?)
             })?;
             let result = if deleted > 0 { "allowed" } else { "denied" };
-            Self::log_access_best_effort(
+            Self::log_access_best_effort_blocking(
                 &client,
                 &audit_table,
                 &principal,
@@ -3184,6 +3285,7 @@ impl Memory for PostgresMemory {
             let source = input.source.as_str().to_string();
             let source_ref_json = serde_json::to_string(&input.source)?;
             let subject_ref_json = input.subject.as_ref().map(serde_json::to_string).transpose()?;
+            let config_generation_id = input.config_generation_id.map(i64::try_from).transpose()?;
 
             let insert_stmt = format!(
                 "
@@ -3191,13 +3293,14 @@ impl Memory for PostgresMemory {
                     event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                     parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                     sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                    goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                     content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 )
                 VALUES (
                     $1, $2, $3, $4, $5, $6, $7, $8, $9, $10,
                     $11, $12, $13, $14, $15, $16, $17, $18, $19, $20,
-                    $21, $22, $23, $24, $25, $26, $27, $28, $29
+                    $21, $22, $23, $24, $25, $26, $27, $28, $29, $30,
+                    $31
                 )
                 ON CONFLICT DO NOTHING
                 "
@@ -3207,10 +3310,11 @@ impl Memory for PostgresMemory {
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
-                WHERE event_id = $1 OR ($2::TEXT IS NOT NULL AND idempotency_key = $2)
+                WHERE event_id = $1
+                   OR ($2::TEXT IS NOT NULL AND workspace_id = $3 AND idempotency_key = $2)
                 ORDER BY CASE WHEN event_id = $1 THEN 0 ELSE 1 END
                 LIMIT 1
                 "
@@ -3254,6 +3358,8 @@ impl Memory for PostgresMemory {
                         &input.correlation_id,
                         &input.attempt_id,
                         &input.lease_epoch,
+                        &config_generation_id,
+                        &input.config_source_revision,
                         &input.content,
                         &content_hash,
                         &input.raw_payload_json,
@@ -3262,7 +3368,7 @@ impl Memory for PostgresMemory {
                         &now,
                     ],
                 )?;
-                let row = tx.query_one(&select_stmt, &[&event_id, &input.idempotency_key])?;
+                let row = tx.query_one(&select_stmt, &[&event_id, &input.idempotency_key, &input.workspace_id])?;
                 let event = Self::row_to_message_event(&row)?;
                 if inserted > 0 {
                     tx.execute(
@@ -3282,6 +3388,36 @@ impl Memory for PostgresMemory {
                 }
                 tx.commit()?;
                 Ok(event)
+            })
+        })
+        .await?
+    }
+
+    async fn find_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<MessageEvent>> {
+        let client = self.client.clone();
+        let qualified_message_events_table = self.qualified_message_events_table.clone();
+        let workspace_id = workspace_id.to_string();
+        let idempotency_key = idempotency_key.to_string();
+        tokio::task::spawn_blocking(move || {
+            client.with_client(|client| {
+                let stmt = format!(
+                    "SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
+                            parent_session_key, run_id, parent_run_id, agent_id, persona_id,
+                            sender, recipient, role, event_type, source_ref_json, subject_ref_json,
+                            goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
+                            content, content_hash, raw_payload_json, visibility, created_at, updated_at
+                     FROM {qualified_message_events_table}
+                     WHERE workspace_id = $1 AND idempotency_key = $2
+                     LIMIT 1"
+                );
+                client
+                    .query_opt(&stmt, &[&workspace_id, &idempotency_key])?
+                    .map(|row| Self::row_to_message_event(&row))
+                    .transpose()
             })
         })
         .await?
@@ -3312,7 +3448,7 @@ impl Memory for PostgresMemory {
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
@@ -3384,7 +3520,7 @@ impl Memory for PostgresMemory {
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE (
@@ -3461,7 +3597,7 @@ impl Memory for PostgresMemory {
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
@@ -3556,7 +3692,7 @@ impl Memory for PostgresMemory {
                 SELECT id, event_id, idempotency_key, workspace_id, owner_id, source, channel, session_key,
                        parent_session_key, run_id, parent_run_id, agent_id, persona_id,
                        sender, recipient, role, event_type, source_ref_json, subject_ref_json,
-                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch,
+                       goal_id, causation_event_id, correlation_id, attempt_id, lease_epoch, config_generation_id, config_source_revision,
                        content, content_hash, raw_payload_json, visibility, created_at, updated_at
                 FROM {qualified_message_events_table}
                 WHERE id > $1
@@ -5141,6 +5277,8 @@ mod tests {
                 correlation_id: Some("correlation-pg-1".to_string()),
                 attempt_id: Some("attempt-pg-2".to_string()),
                 lease_epoch: Some(3),
+                config_generation_id: Some(42),
+                config_source_revision: Some("sha256:postgres-test".to_string()),
                 content: "hello from postgres".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,
@@ -5171,6 +5309,8 @@ mod tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "duplicate should not replace".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,
@@ -5179,6 +5319,40 @@ mod tests {
             .unwrap();
         assert_eq!(duplicate.event_id, user.event_id);
         assert_eq!(duplicate.content, user.content);
+        let other_workspace = mem
+            .append_message_event(MessageEventInput {
+                event_id: Some("event-user-workspace-b".to_string()),
+                idempotency_key: Some("idem-user-1".to_string()),
+                workspace_id: "workspace-b".to_string(),
+                owner_id: Some("owner-b".to_string()),
+                source: "postgres-test".into(),
+                channel: Some("telegram".to_string()),
+                session_key: Some("telegram_sender-1".to_string()),
+                parent_session_key: None,
+                run_id: Some("run-b".to_string()),
+                parent_run_id: None,
+                agent_id: Some("agent-b".to_string()),
+                persona_id: Some("persona-b".to_string()),
+                sender: Some("sender-b".to_string()),
+                recipient: Some("prx".to_string()),
+                role: "user".to_string(),
+                event_type: "message.created".to_string(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
+                content: "same idempotency key in another workspace".to_string(),
+                raw_payload_json: None,
+                visibility: MemoryVisibility::Workspace,
+            })
+            .await
+            .unwrap();
+        assert_eq!(other_workspace.workspace_id, "workspace-b");
+        assert_ne!(other_workspace.event_id, user.event_id);
         assert_eq!(user.event_type, "message.created");
         assert_eq!(user.source, "postgres-test");
         assert_eq!(
@@ -5190,6 +5364,8 @@ mod tests {
         assert_eq!(user.correlation_id.as_deref(), Some("correlation-pg-1"));
         assert_eq!(user.attempt_id.as_deref(), Some("attempt-pg-2"));
         assert_eq!(user.lease_epoch, Some(3));
+        assert_eq!(user.config_generation_id, Some(42));
+        assert_eq!(user.config_source_revision.as_deref(), Some("sha256:postgres-test"));
 
         let assistant = mem
             .append_message_event(MessageEventInput {
@@ -5215,6 +5391,8 @@ mod tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "postgres reply".to_string(),
                 raw_payload_json: None,
                 visibility: MemoryVisibility::Workspace,

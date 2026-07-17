@@ -22,11 +22,12 @@ pub(super) struct McpServersResponse {
 }
 
 pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersResponse> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     let mcp = &config.mcp;
 
     // Collect runtime-discovered tools if available.
-    let discovered = state
+    let runtime = state.pin_turn_runtime();
+    let discovered = runtime
         .mcp_tool
         .as_ref()
         .map(|t| t.list_discovered_tools())

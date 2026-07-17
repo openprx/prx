@@ -17,7 +17,7 @@ pub(super) struct ChannelsStatusResponse {
 }
 
 pub async fn get_channels_status(State(state): State<AppState>) -> Json<ChannelsStatusResponse> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     let mut channels = Vec::new();
 
     let mut push_channel = |name: &str, enabled: bool| {

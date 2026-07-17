@@ -506,7 +506,7 @@ fn claim_sqlite_job_snapshot(
     }
     let schedule_json = serde_json::to_string(&job.schedule)?;
     with_connection(config, |conn| {
-        let tx = conn.unchecked_transaction()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let previous: Option<(Option<String>, Option<String>, Option<String>, Option<String>)> = tx
             .query_row(
                 "SELECT claim_owner, attempt_id, claimed_at, claim_expires_at FROM cron_jobs WHERE id = ?1",
@@ -644,6 +644,22 @@ pub fn renew_job_claim(
             expires_at,
             ..claim.clone()
         }))
+    })
+}
+
+pub fn job_claim_is_current(config: &Config, job_id: &str, claim: &CronClaim, now: DateTime<Utc>) -> Result<bool> {
+    if let Some(store) = pg_store(config)? {
+        return store.job_claim_is_current(job_id, claim, now);
+    }
+    with_connection(config, |conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM cron_jobs
+             WHERE id = ?1 AND claim_owner = ?2 AND attempt_id = ?3
+               AND claim_expires_at > ?4",
+            params![job_id, claim.worker_id, claim.attempt_id, format_claim_time(now),],
+            |row| row.get(0),
+        )?;
+        Ok(count == 1)
     })
 }
 
@@ -1691,28 +1707,8 @@ fn insert_job_event(
     status: Option<&str>,
     payload_json: Option<&str>,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO cron_job_events (
-            event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
-            event_type, status, payload_json, created_at
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![
-            Uuid::new_v4().to_string(),
-            job_id,
-            workspace_id,
-            lineage.owner_id.as_deref(),
-            lineage.topic_id.as_deref(),
-            lineage.parent_task_id.as_deref(),
-            lineage.source_message_event_id.as_deref(),
-            event_type,
-            status,
-            payload_json,
-            Utc::now().to_rfc3339(),
-        ],
-    )
-    .context("Failed to insert cron job event")?;
-    if let Err(error) = mirror_cron_job_event(
-        workspace_id,
+    let event_id = Uuid::new_v4().to_string();
+    let mirrored_payload = cron_job_event_payload(
         job_id,
         MirrorLineage {
             owner_id: lineage.owner_id.as_deref(),
@@ -1721,13 +1717,60 @@ fn insert_job_event(
             source_message_event_id: lineage.source_message_event_id.as_deref(),
             status: lineage.status.as_deref(),
         },
-        event_type,
         status,
         payload_json,
-    ) {
-        tracing::warn!(job_id = %job_id, event_type, "failed to mirror cron job event into memory_events: {error}");
+    );
+    conn.execute_batch("SAVEPOINT cron_event_with_outbox")?;
+    let result = (|| -> Result<()> {
+        conn.execute(
+            "INSERT INTO cron_job_events (
+                event_id, job_id, workspace_id, owner_id, topic_id, parent_task_id, source_message_event_id,
+                event_type, status, payload_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                event_id,
+                job_id,
+                workspace_id,
+                lineage.owner_id.as_deref(),
+                lineage.topic_id.as_deref(),
+                lineage.parent_task_id.as_deref(),
+                lineage.source_message_event_id.as_deref(),
+                event_type,
+                status,
+                payload_json,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .context("Failed to insert cron job event")?;
+        conn.execute(
+            "INSERT INTO cron_event_outbox (
+                event_id, workspace_id, job_id, event_type, payload_json, created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                event_id,
+                workspace_id,
+                job_id,
+                event_type,
+                mirrored_payload,
+                Utc::now().to_rfc3339(),
+            ],
+        )
+        .context("Failed to insert cron event outbox row")?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("RELEASE SAVEPOINT cron_event_with_outbox")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch(
+                "ROLLBACK TO SAVEPOINT cron_event_with_outbox;
+                 RELEASE SAVEPOINT cron_event_with_outbox;",
+            );
+            Err(error)
+        }
     }
-    Ok(())
 }
 
 /// Lineage fields used to enrich a mirrored cron event. Backend-agnostic
@@ -1743,27 +1786,64 @@ pub(crate) struct MirrorLineage<'a> {
 /// Mirror a SQLite cron lifecycle event into the colocated SQLite
 /// `memory_events` fabric. The Postgres store writes its configured Postgres
 /// event table transactionally and only reuses the payload builder below.
-pub(crate) fn mirror_cron_job_event(
-    workspace_id: &str,
-    job_id: &str,
-    lineage: MirrorLineage<'_>,
-    event_type: &str,
-    status: Option<&str>,
-    payload_json: Option<&str>,
-) -> Result<i64> {
-    let payload_json = cron_job_event_payload(job_id, lineage, status, payload_json);
-    crate::memory::sqlite::append_task_event_mirror(
-        std::path::Path::new(workspace_id),
-        crate::memory::sqlite::SqliteTaskEventMirror {
-            workspace_id,
-            task_id: job_id,
-            event_type,
-            session_key: None,
-            agent_id: None,
-            persona_id: None,
-            payload_json: Some(&payload_json),
-        },
-    )
+fn deliver_pending_cron_event_outbox(conn: &Connection) -> Result<usize> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id, workspace_id, job_id, event_type, payload_json
+         FROM cron_event_outbox
+         WHERE delivered_at IS NULL
+         ORDER BY created_at ASC
+         LIMIT 100",
+    )?;
+    let pending = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(stmt);
+
+    let mut delivered = 0;
+    for (event_id, workspace_id, job_id, event_type, payload_json) in pending {
+        let result = crate::memory::sqlite::append_task_event_mirror_idempotent(
+            std::path::Path::new(&workspace_id),
+            &event_id,
+            crate::memory::sqlite::SqliteTaskEventMirror {
+                workspace_id: &workspace_id,
+                task_id: &job_id,
+                event_type: &event_type,
+                session_key: None,
+                agent_id: None,
+                persona_id: None,
+                payload_json: Some(&payload_json),
+            },
+        );
+        match result {
+            Ok(_) => {
+                conn.execute(
+                    "UPDATE cron_event_outbox
+                     SET delivered_at = ?1, attempt_count = attempt_count + 1, last_error = NULL
+                     WHERE event_id = ?2 AND delivered_at IS NULL",
+                    params![Utc::now().to_rfc3339(), event_id],
+                )?;
+                delivered += 1;
+            }
+            Err(error) => {
+                conn.execute(
+                    "UPDATE cron_event_outbox
+                     SET attempt_count = attempt_count + 1, last_error = ?1
+                     WHERE event_id = ?2 AND delivered_at IS NULL",
+                    params![truncate_cron_output(&error.to_string()), event_id],
+                )?;
+                tracing::warn!(job_id, event_type, "failed to deliver Cron event outbox row: {error}");
+            }
+        }
+    }
+    Ok(delivered)
 }
 
 pub(crate) fn cron_job_event_payload(
@@ -1953,7 +2033,21 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
         CREATE INDEX IF NOT EXISTS idx_cron_job_events_job_id ON cron_job_events(job_id, id);
         CREATE INDEX IF NOT EXISTS idx_cron_job_events_owner ON cron_job_events(workspace_id, owner_id, id);
         CREATE INDEX IF NOT EXISTS idx_cron_job_events_topic ON cron_job_events(workspace_id, topic_id, id);
-        CREATE INDEX IF NOT EXISTS idx_cron_job_events_type ON cron_job_events(event_type, id);",
+        CREATE INDEX IF NOT EXISTS idx_cron_job_events_type ON cron_job_events(event_type, id);
+
+        CREATE TABLE IF NOT EXISTS cron_event_outbox (
+            event_id      TEXT PRIMARY KEY,
+            workspace_id  TEXT NOT NULL,
+            job_id        TEXT NOT NULL,
+            event_type    TEXT NOT NULL,
+            payload_json  TEXT NOT NULL,
+            created_at    TEXT NOT NULL,
+            delivered_at  TEXT,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            last_error    TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_cron_event_outbox_pending
+            ON cron_event_outbox(delivered_at, created_at);",
     )
     .context("Failed to initialize cron schema")?;
 
@@ -2001,7 +2095,11 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
     )
     .context("Failed to backfill terminal state for historical one-shot jobs")?;
 
-    f(&mut conn)
+    let result = f(&mut conn);
+    if let Err(error) = deliver_pending_cron_event_outbox(&conn) {
+        tracing::warn!("failed to drain Cron event outbox: {error}");
+    }
+    result
 }
 
 #[allow(clippy::indexing_slicing)]
@@ -2114,6 +2212,65 @@ mod tests {
         assert_eq!(payload["parent_task_id"].as_str(), Some("task-parent"));
         assert_eq!(payload["source_message_event_id"].as_str(), Some("msg-1"));
         assert_eq!(payload["task"].as_str(), Some("lineage-test"));
+    }
+
+    #[test]
+    fn cron_event_outbox_retries_memory_mirror_idempotently() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let memory_dir = config.workspace_dir.join("memory");
+        std::fs::create_dir_all(&memory_dir).unwrap();
+        std::fs::create_dir(memory_dir.join("brain.db")).unwrap();
+
+        let job = add_job(&config, "*/5 * * * *", "echo retry").unwrap();
+        let cron_db = config.workspace_dir.join("cron").join("jobs.db");
+        let cron_conn = Connection::open(&cron_db).unwrap();
+        let (delivered_at, attempt_count): (Option<String>, i64) = cron_conn
+            .query_row(
+                "SELECT delivered_at, attempt_count
+                 FROM cron_event_outbox
+                 WHERE job_id = ?1",
+                params![job.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(delivered_at.is_none());
+        assert!(attempt_count > 0);
+        drop(cron_conn);
+
+        std::fs::remove_dir(memory_dir.join("brain.db")).unwrap();
+        assert_eq!(list_jobs(&config).unwrap().len(), 1);
+
+        let cron_conn = Connection::open(&cron_db).unwrap();
+        let delivered_at: Option<String> = cron_conn
+            .query_row(
+                "SELECT delivered_at FROM cron_event_outbox WHERE job_id = ?1",
+                params![job.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(delivered_at.is_some());
+        let memory_conn = Connection::open(memory_dir.join("brain.db")).unwrap();
+        let mirror_count: i64 = memory_conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events
+                 WHERE subject_table = 'tasks' AND subject_id = ?1 AND event_type = 'cron.job.created'",
+                params![job.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirror_count, 1);
+
+        assert_eq!(list_jobs(&config).unwrap().len(), 1);
+        let mirror_count_after_replay: i64 = memory_conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_events
+                 WHERE subject_table = 'tasks' AND subject_id = ?1 AND event_type = 'cron.job.created'",
+                params![job.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(mirror_count_after_replay, 1);
     }
 
     #[test]

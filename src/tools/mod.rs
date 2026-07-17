@@ -242,8 +242,10 @@ pub fn all_tools(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> Vec<Box<dyn Tool>> {
+    let shared_config = crate::config::new_shared(config.as_ref().clone());
     all_tools_with_runtime(
         config,
+        shared_config,
         security,
         Arc::new(NativeRuntime::new()),
         memory,
@@ -271,6 +273,7 @@ pub struct ToolsRegistryResult {
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime(
     config: Arc<Config>,
+    shared_config: crate::config::SharedConfig,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
@@ -285,6 +288,7 @@ pub fn all_tools_with_runtime(
 ) -> Vec<Box<dyn Tool>> {
     let result = all_tools_with_runtime_ext(
         config,
+        shared_config,
         security,
         runtime,
         memory,
@@ -305,6 +309,7 @@ pub fn all_tools_with_runtime(
 #[allow(clippy::implicit_hasher, clippy::too_many_arguments)]
 pub fn all_tools_with_runtime_ext(
     config: Arc<Config>,
+    shared_config: crate::config::SharedConfig,
     security: &Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
     memory: Arc<dyn Memory>,
@@ -317,9 +322,6 @@ pub fn all_tools_with_runtime_ext(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> ToolsRegistryResult {
-    // Wrap Arc<Config> into a SharedConfig (ArcSwap) for tools that support hot-reload.
-    let shared_config: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from(config.clone()));
-
     // Bug #2 + Bug #3: resolve the opt-in trusted toolchain dirs EXACTLY ONCE and
     // hand the very same Vec to both consumers — the Landlock sandbox allow-list
     // and the shell tool's PATH. A single resolution means a config edit can never

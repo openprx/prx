@@ -7,14 +7,20 @@
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolSpec, ToolTier, is_tool_cancelled_result};
 use crate::capability::CapabilityAvailability;
+use crate::memory::{Memory, MessageEventInput};
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::security::SecurityPolicy;
 use crate::security::policy::{RUNTIME_APPROVAL_GRANT_ARG, RUNTIME_APPROVAL_GRANTED_ARG, ToolDecision};
 use async_trait::async_trait;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -171,7 +177,7 @@ impl ToolBackend for LegacyToolAdapter {
 }
 
 /// Immutable public descriptor captured before policy evaluation.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDescriptor {
     pub public_name: String,
     pub backend_name: String,
@@ -187,7 +193,7 @@ pub struct ToolDescriptor {
 }
 
 /// One normalized execution request.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionCommand {
     pub operation_id: String,
     pub name: String,
@@ -225,22 +231,36 @@ pub struct ToolExecutionContext {
     pub envelope: RuntimeEnvelope,
     pub chat_type: String,
     pub chat_id: String,
+    pub semantic_turn_id: String,
 }
 
 impl ToolExecutionContext {
     #[must_use]
     pub fn new(envelope: RuntimeEnvelope, chat_type: impl Into<String>) -> Self {
         let chat_id = envelope.session_key.clone();
+        let semantic_turn_id = envelope
+            .source_message_event_id
+            .clone()
+            .or_else(|| envelope.run_id.clone())
+            .or_else(|| envelope.task_id.clone())
+            .unwrap_or_else(|| envelope.session_key.clone());
         Self {
             envelope,
             chat_type: chat_type.into(),
             chat_id,
+            semantic_turn_id,
         }
     }
 
     #[must_use]
     pub fn with_chat_id(mut self, chat_id: impl Into<String>) -> Self {
         self.chat_id = chat_id.into();
+        self
+    }
+
+    #[must_use]
+    pub fn with_semantic_turn_id(mut self, semantic_turn_id: impl Into<String>) -> Self {
+        self.semantic_turn_id = semantic_turn_id.into();
         self
     }
 
@@ -274,7 +294,7 @@ pub struct SecurityEffectPolicy {
 
 impl SecurityEffectPolicy {
     #[must_use]
-    pub fn new(policy: Arc<SecurityPolicy>) -> Self {
+    pub const fn new(policy: Arc<SecurityPolicy>) -> Self {
         Self { policy }
     }
 }
@@ -319,7 +339,7 @@ pub struct ToolApprovalRequest {
 
 /// Approval result. Runtime-only grant material is never accepted from the
 /// original command arguments; only this trusted adapter may supply it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolApprovalDecision {
     Approved {
         runtime_approval_granted: bool,
@@ -399,6 +419,8 @@ pub enum ToolExecutionStatus {
     UnknownTool,
     InvalidArguments,
     Cancelled,
+    IdempotencyConflict,
+    Indeterminate,
 }
 
 /// Stable typed outcome shared by entrypoint-specific model/UI projections.
@@ -413,6 +435,8 @@ pub struct ToolExecutionOutcome {
     pub error: Option<String>,
     pub sandbox: Option<ToolSandboxPermit>,
     pub duration_ms: u64,
+    #[serde(default)]
+    pub replayed: bool,
 }
 
 impl ToolExecutionOutcome {
@@ -422,9 +446,69 @@ impl ToolExecutionOutcome {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolExecutionReservation {
+    operation_id: String,
+    #[serde(default)]
+    owner_token: String,
+    #[serde(default)]
+    attempt: u32,
+    capability: String,
+    input_sha256: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ToolExecutionTerminalRecord {
+    reservation: ToolExecutionReservation,
+    outcome: ToolExecutionOutcome,
+}
+
+fn tool_execution_lock(
+    workspace_id: &str,
+    session_key: &str,
+    semantic_turn_id: &str,
+    idempotency_key: &str,
+) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Weak<AsyncMutex<()>>>>> = OnceLock::new();
+    let lock_key = format!("{workspace_id}\0{session_key}\0{semantic_turn_id}\0{idempotency_key}");
+    let locks = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut locks = locks.lock();
+    if let Some(lock) = locks.get(&lock_key).and_then(Weak::upgrade) {
+        return lock;
+    }
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    let lock = Arc::new(AsyncMutex::new(()));
+    locks.insert(lock_key, Arc::downgrade(&lock));
+    lock
+}
+
+fn tool_execution_ledger_keys(context: &ToolExecutionContext, idempotency_key: &str) -> (String, String) {
+    let scope = format!(
+        "{}\0{}\0{}",
+        context.envelope.session_key, context.semantic_turn_id, idempotency_key
+    );
+    let digest = format!("{:x}", Sha256::digest(scope.as_bytes()));
+    (
+        format!("tool-execution:{digest}:reservation"),
+        format!("tool-execution:{digest}:terminal"),
+    )
+}
+
+fn tool_execution_reservation_key(base_key: &str, attempt: u32) -> String {
+    if attempt == 0 {
+        base_key.to_string()
+    } else {
+        format!("{base_key}:retry:{attempt}")
+    }
+}
+
+fn tool_execution_abandonment_key(base_key: &str, attempt: u32) -> String {
+    format!("{}:abandoned", tool_execution_reservation_key(base_key, attempt))
+}
+
 /// Audit projection emitted exactly once for every service outcome, including
 /// resolution, policy, approval, sandbox, validation, and cancellation failures.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionAuditRecord {
     pub operation_id: String,
     pub capability: String,
@@ -484,6 +568,14 @@ impl ToolExecutionAuditSink for TracingToolExecutionAudit {
 struct ResolvedTool {
     backend: Arc<dyn ToolBackend>,
     descriptor: ToolDescriptor,
+}
+
+struct ToolExecutionLease {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    memory: Arc<dyn Memory>,
+    reservation: ToolExecutionReservation,
+    abandonment_key: String,
+    terminal_key: String,
 }
 
 /// Immutable descriptor snapshot shared by discovery and execution.
@@ -634,6 +726,16 @@ pub struct ToolExecutionService {
     approval: Arc<dyn ApprovalStrategy>,
     sandbox: Arc<dyn ToolSandboxStrategy>,
     audit: Arc<dyn ToolExecutionAuditSink>,
+    idempotency_memory: Option<Arc<dyn Memory>>,
+    #[cfg(test)]
+    post_reservation_gate: Option<Arc<TestPostReservationGate>>,
+}
+
+#[cfg(test)]
+struct TestPostReservationGate {
+    armed: AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
 }
 
 impl ToolExecutionService {
@@ -669,6 +771,9 @@ impl ToolExecutionService {
             approval,
             sandbox,
             audit,
+            idempotency_memory: None,
+            #[cfg(test)]
+            post_reservation_gate: None,
         }
     }
 
@@ -695,9 +800,9 @@ impl ToolExecutionService {
         sandbox: Arc<dyn ToolSandboxStrategy>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
-        let root_names = registry.iter().map(|tool| tool.name().to_string()).collect::<Vec<_>>();
-        let backends = root_names
-            .into_iter()
+        let backends = registry
+            .iter()
+            .map(|tool| tool.name().to_string())
             .map(|root_name| {
                 Arc::new(SharedRegistryToolAdapter {
                     registry: Arc::clone(&registry),
@@ -720,6 +825,27 @@ impl ToolExecutionService {
         )
     }
 
+    /// Attach the durable MessageEvent ledger used to reserve and replay
+    /// idempotent tool executions.
+    #[must_use]
+    pub fn with_idempotency_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        if matches!(memory.name(), "sqlite" | "postgres" | "lucid") {
+            self.idempotency_memory = Some(memory);
+        } else {
+            tracing::warn!(
+                backend = memory.name(),
+                "tool execution idempotency is unavailable for this memory backend"
+            );
+        }
+        self
+    }
+
+    #[cfg(test)]
+    fn with_post_reservation_gate(mut self, gate: Arc<TestPostReservationGate>) -> Self {
+        self.post_reservation_gate = Some(gate);
+        self
+    }
+
     fn resolve(&self, public_name: &str) -> Option<ResolvedTool> {
         let descriptor = self.catalog.descriptor(public_name)?.clone();
         let backend = self
@@ -727,7 +853,7 @@ impl ToolExecutionService {
             .iter()
             .find(|backend| backend.root_name() == descriptor.backend_name && backend.supports_name(public_name))?
             .clone();
-        Some(ResolvedTool { descriptor, backend })
+        Some(ResolvedTool { backend, descriptor })
     }
 
     #[must_use]
@@ -738,6 +864,436 @@ impl ToolExecutionService {
     #[must_use]
     pub const fn catalog(&self) -> &ToolCatalog {
         &self.catalog
+    }
+
+    async fn prepare_idempotent_execution(
+        &self,
+        command: &ToolExecutionCommand,
+        context: &ToolExecutionContext,
+        input_sha256: &str,
+        descriptor: &ToolDescriptor,
+        decision: ToolExecutionDecision,
+        sandbox: &ToolSandboxPermit,
+        started: Instant,
+    ) -> Result<Option<ToolExecutionLease>, ToolExecutionOutcome> {
+        let Some(idempotency_key) = command.idempotency_key.as_deref() else {
+            return Ok(None);
+        };
+        let Some(memory) = self.idempotency_memory.as_ref() else {
+            if descriptor.effect == ToolEffect::Read {
+                return Ok(None);
+            }
+            return Err(self.finish(
+                command,
+                context,
+                input_sha256.to_string(),
+                Some(descriptor.clone()),
+                Some(decision),
+                ToolExecutionStatus::Indeterminate,
+                "Error: durable tool idempotency ledger is unavailable; refusing side effect".to_string(),
+                None,
+                Some("durable tool idempotency ledger is unavailable".to_string()),
+                Some(sandbox.clone()),
+                started,
+            ));
+        };
+        let lock = tool_execution_lock(
+            &context.envelope.workspace_id,
+            &context.envelope.session_key,
+            &context.semantic_turn_id,
+            idempotency_key,
+        );
+        let guard = lock.lock_owned().await;
+        let (base_reservation_key, terminal_key) = tool_execution_ledger_keys(context, idempotency_key);
+
+        match memory
+            .find_message_event_by_idempotency_key(&context.envelope.workspace_id, &terminal_key)
+            .await
+        {
+            Ok(Some(event)) => {
+                let terminal = event
+                    .raw_payload_json
+                    .as_deref()
+                    .and_then(|payload| serde_json::from_str::<ToolExecutionTerminalRecord>(payload).ok());
+                let Some(terminal) = terminal else {
+                    return Err(self.finish(
+                        command,
+                        context,
+                        input_sha256.to_string(),
+                        Some(descriptor.clone()),
+                        Some(decision),
+                        ToolExecutionStatus::Indeterminate,
+                        "Error: persisted tool terminal record is unreadable; refusing replay".to_string(),
+                        None,
+                        Some("persisted tool terminal record is unreadable".to_string()),
+                        Some(sandbox.clone()),
+                        started,
+                    ));
+                };
+                if terminal.reservation.capability != command.name || terminal.reservation.input_sha256 != input_sha256
+                {
+                    return Err(self.finish(
+                        command,
+                        context,
+                        input_sha256.to_string(),
+                        Some(descriptor.clone()),
+                        Some(decision),
+                        ToolExecutionStatus::IdempotencyConflict,
+                        "Error: idempotency key was already used for a different tool command".to_string(),
+                        None,
+                        Some("idempotency key command fingerprint mismatch".to_string()),
+                        Some(sandbox.clone()),
+                        started,
+                    ));
+                }
+                return Err(self.replay_outcome(command, context, input_sha256, terminal.outcome));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(self.finish(
+                    command,
+                    context,
+                    input_sha256.to_string(),
+                    Some(descriptor.clone()),
+                    Some(decision),
+                    ToolExecutionStatus::Indeterminate,
+                    format!("Error: unable to inspect tool idempotency ledger: {error}"),
+                    None,
+                    Some(error.to_string()),
+                    Some(sandbox.clone()),
+                    started,
+                ));
+            }
+        }
+
+        let mut attempt = 0_u32;
+        loop {
+            let reservation_key = tool_execution_reservation_key(&base_reservation_key, attempt);
+            match memory
+                .find_message_event_by_idempotency_key(&context.envelope.workspace_id, &reservation_key)
+                .await
+            {
+                Ok(Some(event)) => {
+                    let existing = event
+                        .raw_payload_json
+                        .as_deref()
+                        .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
+                    let Some(existing) = existing else {
+                        return Err(self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            "Error: persisted tool reservation is unreadable; refusing duplicate side effect"
+                                .to_string(),
+                            None,
+                            Some("persisted tool reservation is unreadable".to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        ));
+                    };
+                    if existing.capability != command.name || existing.input_sha256 != input_sha256 {
+                        return Err(self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::IdempotencyConflict,
+                            "Error: idempotency key was already used for a different tool command".to_string(),
+                            None,
+                            Some("idempotency key command fingerprint mismatch".to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        ));
+                    }
+                    let abandonment_key = tool_execution_abandonment_key(&base_reservation_key, attempt);
+                    let abandoned = memory
+                        .find_message_event_by_idempotency_key(&context.envelope.workspace_id, &abandonment_key)
+                        .await
+                        .map_err(|error| {
+                            self.finish(
+                                command,
+                                context,
+                                input_sha256.to_string(),
+                                Some(descriptor.clone()),
+                                Some(decision),
+                                ToolExecutionStatus::Indeterminate,
+                                format!("Error: unable to inspect tool idempotency abandonment: {error}"),
+                                None,
+                                Some(error.to_string()),
+                                Some(sandbox.clone()),
+                                started,
+                            )
+                        })?;
+                    let Some(abandoned) = abandoned else {
+                        return Err(self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            "Error: tool execution was reserved without a terminal outcome; refusing duplicate side effect"
+                                .to_string(),
+                            None,
+                            Some(
+                                "tool execution was reserved without a terminal outcome; refusing duplicate side effect"
+                                    .to_string(),
+                            ),
+                            Some(sandbox.clone()),
+                            started,
+                        ));
+                    };
+                    let abandoned = abandoned
+                        .raw_payload_json
+                        .as_deref()
+                        .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
+                    if abandoned.as_ref().is_none_or(|abandoned| {
+                        abandoned.owner_token != existing.owner_token
+                            || abandoned.attempt != existing.attempt
+                            || abandoned.capability != existing.capability
+                            || abandoned.input_sha256 != existing.input_sha256
+                    }) {
+                        return Err(self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            "Error: persisted tool abandonment is unreadable or does not own the reservation"
+                                .to_string(),
+                            None,
+                            Some("persisted tool abandonment does not match reservation owner".to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        ));
+                    }
+                    attempt = attempt.checked_add(1).ok_or_else(|| {
+                        self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            "Error: tool idempotency retry generation overflow".to_string(),
+                            None,
+                            Some("tool idempotency retry generation overflow".to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        )
+                    })?;
+                }
+                Ok(None) => {
+                    let reservation = ToolExecutionReservation {
+                        operation_id: command.operation_id.clone(),
+                        owner_token: Uuid::now_v7().to_string(),
+                        attempt,
+                        capability: command.name.clone(),
+                        input_sha256: input_sha256.to_string(),
+                    };
+                    let payload = serde_json::to_string(&reservation).map_err(|error| {
+                        self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            format!("Error: unable to encode tool idempotency reservation: {error}"),
+                            None,
+                            Some(error.to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        )
+                    })?;
+                    let event = memory
+                        .append_message_event(tool_execution_event_input(
+                            context,
+                            &reservation_key,
+                            "tool.execution.reserved",
+                            format!(
+                                "operation_id={} capability={} attempt={attempt}",
+                                command.operation_id, command.name
+                            ),
+                            payload,
+                        ))
+                        .await
+                        .map_err(|error| {
+                            self.finish(
+                                command,
+                                context,
+                                input_sha256.to_string(),
+                                Some(descriptor.clone()),
+                                Some(decision),
+                                ToolExecutionStatus::Indeterminate,
+                                format!("Error: unable to reserve idempotent tool execution: {error}"),
+                                None,
+                                Some(error.to_string()),
+                                Some(sandbox.clone()),
+                                started,
+                            )
+                        })?;
+                    let recorded = event
+                        .raw_payload_json
+                        .as_deref()
+                        .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
+                    if recorded
+                        .as_ref()
+                        .is_none_or(|recorded| recorded.owner_token != reservation.owner_token)
+                    {
+                        return Err(self.finish(
+                            command,
+                            context,
+                            input_sha256.to_string(),
+                            Some(descriptor.clone()),
+                            Some(decision),
+                            ToolExecutionStatus::Indeterminate,
+                            "Error: another runtime owns this idempotent tool execution".to_string(),
+                            None,
+                            Some("another runtime owns this idempotent tool execution".to_string()),
+                            Some(sandbox.clone()),
+                            started,
+                        ));
+                    }
+                    return Ok(Some(ToolExecutionLease {
+                        _guard: guard,
+                        memory: Arc::clone(memory),
+                        abandonment_key: tool_execution_abandonment_key(&base_reservation_key, attempt),
+                        reservation,
+                        terminal_key,
+                    }));
+                }
+                Err(error) => {
+                    return Err(self.finish(
+                        command,
+                        context,
+                        input_sha256.to_string(),
+                        Some(descriptor.clone()),
+                        Some(decision),
+                        ToolExecutionStatus::Indeterminate,
+                        format!("Error: unable to inspect tool idempotency reservation: {error}"),
+                        None,
+                        Some(error.to_string()),
+                        Some(sandbox.clone()),
+                        started,
+                    ));
+                }
+            }
+        }
+    }
+
+    async fn commit_idempotent_execution(
+        &self,
+        lease: Option<&ToolExecutionLease>,
+        context: &ToolExecutionContext,
+        outcome: &ToolExecutionOutcome,
+    ) {
+        let Some(lease) = lease else {
+            return;
+        };
+        let terminal = ToolExecutionTerminalRecord {
+            reservation: lease.reservation.clone(),
+            outcome: outcome.clone(),
+        };
+        let payload = match serde_json::to_string(&terminal) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(error = %error, "failed to encode idempotent tool terminal outcome");
+                return;
+            }
+        };
+        if let Err(error) = lease
+            .memory
+            .append_message_event(tool_execution_event_input(
+                context,
+                &lease.terminal_key,
+                "tool.execution.finalized",
+                format!("operation_id={} status={:?}", outcome.operation_id, outcome.status),
+                payload,
+            ))
+            .await
+        {
+            tracing::error!(
+                operation_id = %outcome.operation_id,
+                error = %error,
+                "tool side effect completed but terminal idempotency outcome was not persisted"
+            );
+        }
+    }
+
+    async fn abandon_idempotent_execution(
+        &self,
+        lease: Option<&ToolExecutionLease>,
+        context: &ToolExecutionContext,
+    ) -> Result<(), String> {
+        let Some(lease) = lease else {
+            return Ok(());
+        };
+        let payload = serde_json::to_string(&lease.reservation)
+            .map_err(|error| format!("unable to encode tool idempotency abandonment: {error}"))?;
+        let event = lease
+            .memory
+            .append_message_event(tool_execution_event_input(
+                context,
+                &lease.abandonment_key,
+                "tool.execution.abandoned",
+                format!(
+                    "operation_id={} attempt={}",
+                    lease.reservation.operation_id, lease.reservation.attempt
+                ),
+                payload,
+            ))
+            .await
+            .map_err(|error| format!("unable to abandon tool idempotency reservation: {error}"))?;
+        let recorded = event
+            .raw_payload_json
+            .as_deref()
+            .and_then(|payload| serde_json::from_str::<ToolExecutionReservation>(payload).ok());
+        if recorded.as_ref().is_none_or(|recorded| {
+            recorded.owner_token != lease.reservation.owner_token
+                || recorded.attempt != lease.reservation.attempt
+                || recorded.capability != lease.reservation.capability
+                || recorded.input_sha256 != lease.reservation.input_sha256
+        }) {
+            return Err("another runtime owns the tool idempotency abandonment".to_string());
+        }
+        Ok(())
+    }
+
+    fn replay_outcome(
+        &self,
+        command: &ToolExecutionCommand,
+        context: &ToolExecutionContext,
+        input_sha256: &str,
+        mut outcome: ToolExecutionOutcome,
+    ) -> ToolExecutionOutcome {
+        outcome.operation_id = command.operation_id.clone();
+        outcome.replayed = true;
+        self.audit.record(ToolExecutionAuditRecord {
+            operation_id: command.operation_id.clone(),
+            capability: command.name.clone(),
+            backend_name: outcome.descriptor.as_ref().map(|value| value.backend_name.clone()),
+            adapter: outcome.descriptor.as_ref().map(|value| value.adapter),
+            effect: outcome.descriptor.as_ref().map(|value| value.effect),
+            decision: outcome.decision,
+            status: outcome.status,
+            sandbox_strategy: outcome.sandbox.as_ref().map(|value| value.strategy.clone()),
+            input_sha256: input_sha256.to_string(),
+            source: context.envelope.source.as_str().to_string(),
+            workspace_id: context.envelope.workspace_id.clone(),
+            session_key: context.envelope.session_key.clone(),
+            run_id: context.envelope.run_id.clone(),
+            parent_run_id: context.envelope.parent_run_id.clone(),
+            task_id: context.envelope.task_id.clone(),
+            error: outcome.error.clone(),
+            duration_ms: 0,
+        });
+        outcome
     }
 
     /// Run the fixed descriptor -> effect -> policy -> approval -> sandbox ->
@@ -892,12 +1448,80 @@ impl ToolExecutionService {
                 );
             }
         };
+        if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+            return self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                Some(decision),
+                ToolExecutionStatus::Cancelled,
+                "Error: tool execution cancelled".to_string(),
+                None,
+                Some("tool execution cancelled before reservation".to_string()),
+                Some(sandbox),
+                started,
+            );
+        }
+
+        let idempotency_lease = match self
+            .prepare_idempotent_execution(
+                &command,
+                &context,
+                &input_sha256,
+                &descriptor,
+                decision,
+                &sandbox,
+                started,
+            )
+            .await
+        {
+            Ok(lease) => lease,
+            Err(outcome) => return outcome,
+        };
+        #[cfg(test)]
+        if let Some(gate) = self
+            .post_reservation_gate
+            .as_ref()
+            .filter(|gate| gate.armed.swap(false, AtomicOrdering::AcqRel))
+        {
+            gate.entered.notify_one();
+            gate.release.notified().await;
+        }
 
         // The resolved Arc is immutable for the in-flight call even if a
         // dynamic catalog refresh changes future descriptor snapshots.
         let backend = resolved.backend;
         let tool_future = backend.invoke(&command.name, arguments, cancellation.clone());
-        let raw_result = if let Some(token) = cancellation {
+        let mut cancelled_before_invoke = false;
+        let raw_result = if let (Some(token), Some(_)) = (cancellation.clone(), idempotency_lease.as_ref()) {
+            // The outer cancellation race owns only the ReservedNotStarted
+            // phase. The wrapper marks the handoff immediately before the
+            // backend's first poll. Once that boundary is crossed we retain
+            // ownership and drive the backend's cooperative cancellation to a
+            // terminal result instead of dropping an indeterminate side
+            // effect.
+            let backend_started = Arc::new(AtomicBool::new(false));
+            tokio::pin!(tool_future);
+            let started_for_poll = Arc::clone(&backend_started);
+            let tracked_future = std::future::poll_fn(move |context| {
+                started_for_poll.store(true, AtomicOrdering::Release);
+                tool_future.as_mut().poll(context)
+            });
+            tokio::pin!(tracked_future);
+            tokio::select! {
+                biased;
+                () = token.cancelled() => {
+                    if backend_started.load(AtomicOrdering::Acquire) {
+                        Some(tracked_future.as_mut().await)
+                    } else {
+                        cancelled_before_invoke = true;
+                        None
+                    }
+                },
+                result = tracked_future.as_mut() => Some(result),
+            }
+        } else if let Some(token) = cancellation {
             tokio::select! {
                 biased;
                 () = token.cancelled() => None,
@@ -907,8 +1531,28 @@ impl ToolExecutionService {
             Some(tool_future.await)
         };
 
-        match raw_result {
-            None => self.finish(
+        let abandonment_error = if cancelled_before_invoke {
+            self.abandon_idempotent_execution(idempotency_lease.as_ref(), &context)
+                .await
+                .err()
+        } else {
+            None
+        };
+        let outcome = match (raw_result, abandonment_error) {
+            (None, Some(error)) => self.finish(
+                &command,
+                &context,
+                input_sha256,
+                Some(descriptor),
+                Some(decision),
+                ToolExecutionStatus::Indeterminate,
+                format!("Error: {error}"),
+                None,
+                Some(error),
+                Some(sandbox),
+                started,
+            ),
+            (None, None) => self.finish(
                 &command,
                 &context,
                 input_sha256,
@@ -921,7 +1565,7 @@ impl ToolExecutionService {
                 Some(sandbox),
                 started,
             ),
-            Some(Ok(result)) if is_tool_cancelled_result(&result) => self.finish(
+            (Some(Ok(result)), _) if is_tool_cancelled_result(&result) => self.finish(
                 &command,
                 &context,
                 input_sha256,
@@ -934,7 +1578,7 @@ impl ToolExecutionService {
                 Some(sandbox),
                 started,
             ),
-            Some(Ok(result)) => {
+            (Some(Ok(result)), _) => {
                 let (status, model_content, error) = if result.success {
                     (ToolExecutionStatus::Succeeded, result.output.clone(), None)
                 } else {
@@ -961,7 +1605,7 @@ impl ToolExecutionService {
                     started,
                 )
             }
-            Some(Err(error)) => {
+            (Some(Err(error)), _) => {
                 let error = error.to_string();
                 let hint = super::error_hints::recovery_hint(&command.name, &error);
                 let model_content = if hint.is_empty() {
@@ -983,7 +1627,12 @@ impl ToolExecutionService {
                     started,
                 )
             }
+        };
+        if !cancelled_before_invoke {
+            self.commit_idempotent_execution(idempotency_lease.as_ref(), &context, &outcome)
+                .await;
         }
+        outcome
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1031,7 +1680,46 @@ impl ToolExecutionService {
             error,
             sandbox,
             duration_ms,
+            replayed: false,
         }
+    }
+}
+
+fn tool_execution_event_input(
+    context: &ToolExecutionContext,
+    idempotency_key: &str,
+    event_type: &str,
+    content: String,
+    raw_payload_json: String,
+) -> MessageEventInput {
+    MessageEventInput {
+        event_id: None,
+        idempotency_key: Some(idempotency_key.to_string()),
+        workspace_id: context.envelope.workspace_id.clone(),
+        owner_id: context.envelope.owner_id.clone(),
+        source: context.envelope.source.as_str().into(),
+        channel: context.envelope.channel.clone(),
+        session_key: Some(context.envelope.session_key.clone()),
+        parent_session_key: context.envelope.legacy_session_key.clone(),
+        run_id: context.envelope.run_id.clone(),
+        parent_run_id: context.envelope.parent_run_id.clone(),
+        agent_id: context.envelope.agent_id.clone(),
+        persona_id: context.envelope.persona_id.clone(),
+        sender: context.envelope.sender.clone(),
+        recipient: context.envelope.recipient.clone(),
+        role: "event".to_string(),
+        event_type: event_type.to_string(),
+        subject: None,
+        goal_id: None,
+        causation_event_id: context.envelope.source_message_event_id.clone(),
+        correlation_id: context.envelope.run_id.clone(),
+        attempt_id: None,
+        lease_epoch: None,
+        config_generation_id: context.envelope.config_generation_id,
+        config_source_revision: context.envelope.config_source_revision.clone(),
+        content,
+        raw_payload_json: Some(raw_payload_json),
+        visibility: context.envelope.visibility.clone(),
     }
 }
 
@@ -1088,6 +1776,17 @@ fn normalize_arguments(
             "source_message_event_id",
             context.envelope.source_message_event_id.as_deref(),
         );
+        if let Some(config_generation_id) = context.envelope.config_generation_id {
+            scope.insert(
+                "config_generation_id".to_string(),
+                serde_json::Value::Number(config_generation_id.into()),
+            );
+        }
+        insert_optional(
+            scope,
+            "config_source_revision",
+            context.envelope.config_source_revision.as_deref(),
+        );
     }
     root.insert("_zc_scope".to_string(), scope);
     root.insert("_zc_scope_trusted".to_string(), serde_json::Value::Bool(true));
@@ -1112,6 +1811,7 @@ fn insert_optional(map: &mut serde_json::Map<String, serde_json::Value>, key: &s
 mod tests {
     use super::*;
     use crate::security::policy::AutonomyLevel;
+    use crate::tools::traits::TOOL_EXECUTION_CANCELLED;
     use parking_lot::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1166,6 +1866,115 @@ mod tests {
                 success: true,
                 output: format!("executed:{name}"),
                 error: None,
+            })
+        }
+    }
+
+    struct PollRecordingBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ToolBackend for PollRecordingBackend {
+        fn root_name(&self) -> &str {
+            "native_write"
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "native_write".to_string(),
+                description: "records whether invoke was polled".to_string(),
+                parameters: serde_json::json!({"type":"object", "required":["value"]}),
+            }]
+        }
+
+        fn supports_name(&self, public_name: &str) -> bool {
+            public_name == "native_write"
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Standard
+        }
+
+        fn categories(&self) -> Vec<ToolCategory> {
+            Vec::new()
+        }
+
+        fn adapter_kind(&self, _public_name: &str) -> ToolAdapterKind {
+            ToolAdapterKind::Native
+        }
+
+        async fn invoke(
+            &self,
+            _public_name: &str,
+            _arguments: serde_json::Value,
+            cancellation: Option<CancellationToken>,
+        ) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if cancellation.as_ref().is_some_and(CancellationToken::is_cancelled) {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
+                });
+            }
+            Ok(ToolResult {
+                success: true,
+                output: "executed".to_string(),
+                error: None,
+            })
+        }
+    }
+
+    struct CancellationAwareBackend {
+        calls: Arc<AtomicUsize>,
+        started: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl ToolBackend for CancellationAwareBackend {
+        fn root_name(&self) -> &str {
+            "native_write"
+        }
+
+        fn specs(&self) -> Vec<ToolSpec> {
+            vec![ToolSpec {
+                name: "native_write".to_string(),
+                description: "waits for cooperative cancellation".to_string(),
+                parameters: serde_json::json!({"type":"object", "required":["value"]}),
+            }]
+        }
+
+        fn supports_name(&self, public_name: &str) -> bool {
+            public_name == "native_write"
+        }
+
+        fn tier(&self) -> ToolTier {
+            ToolTier::Standard
+        }
+
+        fn categories(&self) -> Vec<ToolCategory> {
+            Vec::new()
+        }
+
+        fn adapter_kind(&self, _public_name: &str) -> ToolAdapterKind {
+            ToolAdapterKind::Native
+        }
+
+        async fn invoke(
+            &self,
+            _public_name: &str,
+            _arguments: serde_json::Value,
+            cancellation: Option<CancellationToken>,
+        ) -> anyhow::Result<ToolResult> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            let cancellation = cancellation.expect("test backend requires cancellation token");
+            cancellation.cancelled().await;
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(TOOL_EXECUTION_CANCELLED.to_string()),
             })
         }
     }
@@ -1358,11 +2167,348 @@ mod tests {
             &["policy", "approval", "sandbox", "execute", "audit"]
         );
         let args = fixture.arguments.lock().first().cloned().unwrap();
-        assert_eq!(args["_zc_scope"]["sender"], "alice");
-        assert_eq!(args["_zc_scope"]["chat_id"], "chat-a");
-        assert_eq!(args["_zc_scope"]["task_id"], "task-a");
-        assert_eq!(args["_zc_scope_trusted"], true);
-        assert_eq!(args[RUNTIME_APPROVAL_GRANT_ARG], serde_json::json!({"trusted":"grant"}));
+        assert_eq!(
+            args.pointer("/_zc_scope/sender").and_then(serde_json::Value::as_str),
+            Some("alice")
+        );
+        assert_eq!(
+            args.pointer("/_zc_scope/chat_id").and_then(serde_json::Value::as_str),
+            Some("chat-a")
+        );
+        assert_eq!(
+            args.pointer("/_zc_scope/task_id").and_then(serde_json::Value::as_str),
+            Some("task-a")
+        );
+        assert_eq!(
+            args.get("_zc_scope_trusted").and_then(serde_json::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            args.get(RUNTIME_APPROVAL_GRANT_ARG),
+            Some(&serde_json::json!({"trusted":"grant"}))
+        );
+    }
+
+    #[tokio::test]
+    async fn idempotent_tool_execution_replays_persisted_terminal_without_reexecution() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let first_service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(Arc::clone(&memory));
+        let second_service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(memory);
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"once"}))
+                .with_operation_id("call-once")
+                .with_idempotency_key("call-once")
+        };
+
+        let first = first_service.execute(command(), context(), None).await;
+        let replay = second_service.execute(command(), context(), None).await;
+
+        assert_eq!(first.status, ToolExecutionStatus::Succeeded);
+        assert!(!first.replayed);
+        assert_eq!(replay.status, ToolExecutionStatus::Succeeded);
+        assert!(replay.replayed);
+        assert_eq!(replay.model_content, first.model_content);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn same_provider_call_id_is_isolated_between_semantic_turns() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(memory);
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"repeat"}))
+                .with_idempotency_key("call_0")
+        };
+
+        let first = service
+            .execute(command(), context().with_semantic_turn_id("turn-a"), None)
+            .await;
+        let second = service
+            .execute(command(), context().with_semantic_turn_id("turn-b"), None)
+            .await;
+
+        assert_eq!(first.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(second.status, ToolExecutionStatus::Succeeded);
+        assert!(!first.replayed);
+        assert!(!second.replayed);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn idempotent_mutation_fails_closed_without_durable_ledger() {
+        let fixture = fixture();
+        let service = fixture.service(
+            "native_write",
+            Vec::new(),
+            ToolExecutionDecision::Allow,
+            approved(),
+            true,
+        );
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"unsafe"}))
+                .with_idempotency_key("call-without-ledger")
+        };
+
+        let first = service.execute(command(), context(), None).await;
+        let second = service.execute(command(), context(), None).await;
+
+        assert_eq!(first.status, ToolExecutionStatus::Indeterminate);
+        assert_eq!(second.status, ToolExecutionStatus::Indeterminate);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_reservation_allows_same_idempotency_key_to_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(memory);
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"after-cancel"}))
+                .with_idempotency_key("cancel-before-reserve")
+        };
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let cancelled = service.execute(command(), context(), Some(cancellation)).await;
+        let retried = service.execute(command(), context(), None).await;
+
+        assert_eq!(cancelled.status, ToolExecutionStatus::Cancelled);
+        assert_eq!(retried.status, ToolExecutionStatus::Succeeded);
+        assert!(!retried.replayed);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_reservation_abandons_before_backend_and_allows_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let gate = Arc::new(TestPostReservationGate {
+            armed: AtomicBool::new(true),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let service = Arc::new(
+            ToolExecutionService::from_backends(
+                vec![Arc::new(PollRecordingBackend {
+                    calls: Arc::clone(&calls),
+                })],
+                Arc::new(FixedPolicy {
+                    decision: ToolExecutionDecision::Allow,
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(FixedApproval {
+                    decision: approved(),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(RecordingSandbox {
+                    stages: Arc::clone(&fixture.stages),
+                    allowed: true,
+                }),
+                Arc::new(RecordingAudit {
+                    records: Arc::clone(&fixture.records),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+            )
+            .with_idempotency_memory(memory)
+            .with_post_reservation_gate(Arc::clone(&gate)),
+        );
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"cancelled"}))
+                .with_idempotency_key("cancel-after-reserve")
+        };
+        let cancellation = CancellationToken::new();
+        let task = {
+            let service = Arc::clone(&service);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { service.execute(command(), context(), Some(cancellation)).await })
+        };
+
+        gate.entered.notified().await;
+        cancellation.cancel();
+        gate.release.notify_one();
+        let cancelled = task.await.unwrap();
+        let retried = service.execute(command(), context(), None).await;
+
+        assert_eq!(cancelled.status, ToolExecutionStatus::Cancelled);
+        assert!(!cancelled.replayed);
+        assert_eq!(retried.status, ToolExecutionStatus::Succeeded);
+        assert!(!retried.replayed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_after_backend_start_commits_one_terminal_and_never_reexecutes() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let service = Arc::new(
+            ToolExecutionService::from_backends(
+                vec![Arc::new(CancellationAwareBackend {
+                    calls: Arc::clone(&calls),
+                    started: Arc::clone(&started),
+                })],
+                Arc::new(FixedPolicy {
+                    decision: ToolExecutionDecision::Allow,
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(FixedApproval {
+                    decision: approved(),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+                Arc::new(RecordingSandbox {
+                    stages: Arc::clone(&fixture.stages),
+                    allowed: true,
+                }),
+                Arc::new(RecordingAudit {
+                    records: Arc::clone(&fixture.records),
+                    stages: Arc::clone(&fixture.stages),
+                }),
+            )
+            .with_idempotency_memory(memory),
+        );
+        let command = || {
+            ToolExecutionCommand::new("native_write", serde_json::json!({"value":"cancelled"}))
+                .with_idempotency_key("cancel-after-start")
+        };
+        let cancellation = CancellationToken::new();
+        let task = {
+            let service = Arc::clone(&service);
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move { service.execute(command(), context(), Some(cancellation)).await })
+        };
+
+        started.notified().await;
+        cancellation.cancel();
+        let cancelled = task.await.unwrap();
+        let replay = service.execute(command(), context(), None).await;
+
+        assert_eq!(cancelled.status, ToolExecutionStatus::Cancelled);
+        assert!(!cancelled.replayed);
+        assert_eq!(replay.status, ToolExecutionStatus::Cancelled);
+        assert!(replay.replayed);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn idempotency_key_reuse_with_different_command_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(memory);
+
+        let first = service
+            .execute(
+                ToolExecutionCommand::new("native_write", serde_json::json!({"value":"first"}))
+                    .with_idempotency_key("reused-key"),
+                context(),
+                None,
+            )
+            .await;
+        let conflict = service
+            .execute(
+                ToolExecutionCommand::new("native_write", serde_json::json!({"value":"second"}))
+                    .with_idempotency_key("reused-key"),
+                context(),
+                None,
+            )
+            .await;
+
+        assert_eq!(first.status, ToolExecutionStatus::Succeeded);
+        assert_eq!(conflict.status, ToolExecutionStatus::IdempotencyConflict);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn orphaned_idempotency_reservation_refuses_duplicate_side_effect() {
+        let temp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn Memory> = Arc::new(crate::memory::SqliteMemory::new(temp.path()).unwrap());
+        let fixture = fixture();
+        let service = fixture
+            .service(
+                "native_write",
+                Vec::new(),
+                ToolExecutionDecision::Allow,
+                approved(),
+                true,
+            )
+            .with_idempotency_memory(Arc::clone(&memory));
+        let command = ToolExecutionCommand::new("native_write", serde_json::json!({"value":"uncertain"}))
+            .with_operation_id("recovery-call")
+            .with_idempotency_key("recovery-key");
+        let execution_context = context();
+        let input_sha256 = format!("{:x}", Sha256::digest(command.arguments.to_string().as_bytes()));
+        let (reservation_key, _) = tool_execution_ledger_keys(&execution_context, "recovery-key");
+        let reservation = ToolExecutionReservation {
+            operation_id: "crashed-owner".to_string(),
+            owner_token: "crashed-owner-token".to_string(),
+            attempt: 0,
+            capability: command.name.clone(),
+            input_sha256,
+        };
+        memory
+            .append_message_event(tool_execution_event_input(
+                &execution_context,
+                &reservation_key,
+                "tool.execution.reserved",
+                "crashed owner".to_string(),
+                serde_json::to_string(&reservation).unwrap(),
+            ))
+            .await
+            .unwrap();
+
+        let outcome = service.execute(command, execution_context, None).await;
+
+        assert_eq!(outcome.status, ToolExecutionStatus::Indeterminate);
+        assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

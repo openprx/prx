@@ -23,7 +23,7 @@ pub(super) struct SkillsResponse {
 }
 
 pub async fn get_skills(State(state): State<AppState>) -> Json<SkillsResponse> {
-    let config = state.config.lock().clone();
+    let config = state.config.load_full();
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
     let items: Vec<SkillInfo> = skills
@@ -85,7 +85,7 @@ pub struct DiscoverResult {
 }
 
 pub async fn discover_skills(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     Query(params): Query<DiscoverQuery>,
 ) -> Result<Json<DiscoverResponse>, (StatusCode, Json<serde_json::Value>)> {
     use crate::skillforge::scout::{GitHubScout, Scout, ScoutSource};
@@ -101,7 +101,6 @@ pub async fn discover_skills(
 
     let results = match source {
         ScoutSource::GitHub => {
-            let _config = state.config.lock().clone();
             // Try to get github token from env or config
             let token = std::env::var("GITHUB_TOKEN").ok();
             let mut scout = match GitHubScout::new(token) {
@@ -212,7 +211,7 @@ pub async fn install_skill(
 
     super::authorize_resource_mutation(&state, "gateway_api:skills:install", ResourceRiskLevel::Low)?;
 
-    let config = state.config.lock().clone();
+    let config = state.config.load_full();
     let skills_dir = config.workspace_dir.join("skills");
 
     // Create skills directory if it doesn't exist
@@ -307,7 +306,7 @@ pub async fn uninstall_skill(
 
     super::authorize_resource_mutation(&state, "gateway_api:skills:uninstall", ResourceRiskLevel::Low)?;
 
-    let config = state.config.lock().clone();
+    let config = state.config.load_full();
     let skills_dir = config.workspace_dir.join("skills");
     let target_dir = skills_dir.join(&name);
 

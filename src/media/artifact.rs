@@ -1,12 +1,13 @@
 //! Workspace-owned media artifact admission and bounded source loading.
 
 use std::collections::{HashMap, VecDeque};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex as StdMutex, OnceLock, Weak};
+use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use futures_util::StreamExt;
+use parking_lot::Mutex as RegistryMutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const MAX_REMOTE_REDIRECTS: usize = 5;
@@ -90,13 +91,13 @@ impl Drop for MediaArtifactOwner {
 
 impl MediaArtifactOwner {
     pub fn for_workspace(workspace_dir: &Path) -> Arc<Self> {
-        static OWNERS: OnceLock<StdMutex<HashMap<PathBuf, Weak<MediaArtifactOwner>>>> = OnceLock::new();
+        static OWNERS: OnceLock<RegistryMutex<HashMap<PathBuf, Weak<MediaArtifactOwner>>>> = OnceLock::new();
 
         let workspace_dir = workspace_dir
             .canonicalize()
             .unwrap_or_else(|_| workspace_dir.to_path_buf());
-        let owners = OWNERS.get_or_init(|| StdMutex::new(HashMap::new()));
-        let mut owners = owners.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let owners = OWNERS.get_or_init(|| RegistryMutex::new(HashMap::new()));
+        let mut owners = owners.lock();
         if let Some(owner) = owners.get(&workspace_dir).and_then(Weak::upgrade) {
             return owner;
         }
@@ -118,28 +119,12 @@ impl MediaArtifactOwner {
         &self.artifact_dir
     }
 
-    /// Admit a local file for path-based media processors without buffering it.
+    /// Admit a local file by copying the bytes read through a descriptor-safe
+    /// workspace traversal into the owner-managed artifact store.
     pub async fn admit_workspace_file(&self, source: &str, max_bytes: usize) -> Result<PathBuf, ArtifactError> {
-        let requested = Path::new(source);
-        let joined = if requested.is_absolute() {
-            requested.to_path_buf()
-        } else {
-            self.workspace_dir.join(requested)
-        };
-        let resolved = tokio::fs::canonicalize(&joined)
-            .await
-            .map_err(|_| ArtifactError::InvalidLocalFile(source.to_string()))?;
-        if !resolved.starts_with(&self.workspace_dir) {
-            return Err(ArtifactError::OutsideWorkspace(source.to_string()));
-        }
-        let metadata = tokio::fs::metadata(&resolved)
-            .await
-            .map_err(|_| ArtifactError::InvalidLocalFile(source.to_string()))?;
-        if !metadata.is_file() {
-            return Err(ArtifactError::InvalidLocalFile(source.to_string()));
-        }
-        enforce_size(source, metadata.len(), max_bytes)?;
-        Ok(resolved)
+        let (bytes, resolved) = read_workspace_source_bounded(&self.workspace_dir, source, max_bytes).await?;
+        let extension = resolved.extension().and_then(|value| value.to_str()).unwrap_or("bin");
+        Ok(self.store_bytes(&bytes, extension).await?.path)
     }
 
     pub async fn load(
@@ -193,8 +178,7 @@ impl MediaArtifactOwner {
     }
 
     async fn read_workspace_file(&self, source: &str, max_bytes: usize) -> Result<LoadedArtifact, ArtifactError> {
-        let resolved = self.admit_workspace_file(source, max_bytes).await?;
-        let bytes = read_file_bounded(&resolved, max_bytes).await?;
+        let (bytes, resolved) = read_workspace_source_bounded(&self.workspace_dir, source, max_bytes).await?;
         Ok(LoadedArtifact {
             bytes,
             source_kind: ArtifactSourceKind::WorkspaceFile,
@@ -279,14 +263,13 @@ impl MediaArtifactOwner {
         extension: &str,
         max_bytes: usize,
     ) -> Result<ManagedArtifact, ArtifactError> {
-        let metadata = tokio::fs::symlink_metadata(source)
+        let source = source.to_path_buf();
+        let bytes = tokio::task::spawn_blocking(move || read_local_file_no_follow_bounded(&source, max_bytes))
             .await
-            .map_err(|_| ArtifactError::InvalidLocalFile(source.display().to_string()))?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(ArtifactError::InvalidLocalFile(source.display().to_string()));
-        }
-        enforce_size(&source.display().to_string(), metadata.len(), max_bytes)?;
-        let bytes = read_file_bounded(source, max_bytes).await?;
+            .map_err(|error| ArtifactError::Io {
+                path: "channel attachment".to_string(),
+                reason: error.to_string(),
+            })??;
         self.store_bytes(&bytes, extension).await
     }
 
@@ -406,6 +389,142 @@ pub(crate) async fn read_file_bounded(path: &Path, max_bytes: usize) -> Result<V
     Ok(bytes)
 }
 
+async fn read_workspace_source_bounded(
+    workspace_dir: &Path,
+    source: &str,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, PathBuf), ArtifactError> {
+    let workspace_dir = workspace_dir.to_path_buf();
+    let source = source.to_string();
+    let source_label = source.clone();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(unix)]
+        {
+            read_workspace_source_bounded_unix(&workspace_dir, &source, max_bytes)
+        }
+        #[cfg(not(unix))]
+        {
+            let requested = Path::new(&source);
+            let joined = if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                workspace_dir.join(requested)
+            };
+            let resolved = joined
+                .canonicalize()
+                .map_err(|_| ArtifactError::InvalidLocalFile(source.clone()))?;
+            if !resolved.starts_with(&workspace_dir) {
+                return Err(ArtifactError::OutsideWorkspace(source));
+            }
+            let bytes = read_local_file_no_follow_bounded(&resolved, max_bytes)?;
+            Ok((bytes, resolved))
+        }
+    })
+    .await
+    .map_err(|error| ArtifactError::Io {
+        path: source_label,
+        reason: error.to_string(),
+    })?
+}
+
+fn read_local_file_no_follow_bounded(path: &Path, max_bytes: usize) -> Result<Vec<u8>, ArtifactError> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+    let file = options.open(path).map_err(|error| io_error(path, error))?;
+    read_open_file_bounded(file, path, max_bytes)
+}
+
+fn read_open_file_bounded(
+    file: std::fs::File,
+    display_path: &Path,
+    max_bytes: usize,
+) -> Result<Vec<u8>, ArtifactError> {
+    use std::io::Read;
+    let metadata = file.metadata().map_err(|error| io_error(display_path, error))?;
+    if !metadata.is_file() {
+        return Err(ArtifactError::InvalidLocalFile(display_path.display().to_string()));
+    }
+    enforce_size(&display_path.display().to_string(), metadata.len(), max_bytes)?;
+    let mut bytes = Vec::new();
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(display_path, error))?;
+    enforce_size(&display_path.display().to_string(), bytes.len() as u64, max_bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(unix)]
+fn read_workspace_source_bounded_unix(
+    workspace_dir: &Path,
+    source: &str,
+    max_bytes: usize,
+) -> Result<(Vec<u8>, PathBuf), ArtifactError> {
+    use std::ffi::OsString;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let requested = Path::new(source);
+    let relative = if requested.is_absolute() {
+        requested
+            .strip_prefix(workspace_dir)
+            .map_err(|_| ArtifactError::OutsideWorkspace(source.to_string()))?
+    } else {
+        requested
+    };
+    let mut components = Vec::<OsString>::new();
+    let mut normalized = PathBuf::new();
+    for component in relative.components() {
+        match component {
+            Component::Normal(value) => {
+                components.push(value.to_os_string());
+                normalized.push(value);
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ArtifactError::OutsideWorkspace(source.to_string()));
+            }
+        }
+    }
+    let (file_name, parents) = components
+        .split_last()
+        .ok_or_else(|| ArtifactError::InvalidLocalFile(source.to_string()))?;
+    let mut root_options = std::fs::OpenOptions::new();
+    root_options
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    let mut parent = root_options
+        .open(workspace_dir)
+        .map_err(|error| io_error(workspace_dir, error))?;
+    for component in parents {
+        parent = rustix::fs::openat(
+            &parent,
+            component,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )
+        .map(std::fs::File::from)
+        .map_err(|error| io_error(&workspace_dir.join(&normalized), std::io::Error::from(error)))?;
+    }
+    let file = rustix::fs::openat(
+        &parent,
+        file_name,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map(std::fs::File::from)
+    .map_err(|error| io_error(&workspace_dir.join(&normalized), std::io::Error::from(error)))?;
+    let display_path = workspace_dir.join(normalized);
+    let bytes = read_open_file_bounded(file, &display_path, max_bytes)?;
+    Ok((bytes, display_path))
+}
+
 pub(crate) async fn read_response_bounded(
     response: reqwest::Response,
     source: &str,
@@ -507,6 +626,31 @@ mod tests {
 
         let error = owner.load("ok.png", 2, false).await.unwrap_err();
         assert!(matches!(error, ArtifactError::TooLarge { .. }));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_path_swap_cannot_escape_after_admission() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let owner = MediaArtifactOwner::for_workspace(temp.path());
+        let source = temp.path().join("source.wav");
+        let outside_file = outside.path().join("secret.wav");
+        std::fs::write(&source, b"workspace-audio").unwrap();
+        std::fs::write(&outside_file, b"outside-secret").unwrap();
+
+        let admitted = owner.admit_workspace_file(source.to_str().unwrap(), 64).await.unwrap();
+        std::fs::remove_file(&source).unwrap();
+        symlink(&outside_file, &source).unwrap();
+
+        assert_eq!(std::fs::read(admitted).unwrap(), b"workspace-audio");
+        let error = owner.load(source.to_str().unwrap(), 64, false).await.unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::Io { .. } | ArtifactError::InvalidLocalFile(_)
+        ));
     }
 
     #[test]

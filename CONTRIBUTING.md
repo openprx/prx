@@ -8,17 +8,22 @@ Thanks for your interest in contributing!
 git clone https://github.com/openprx/prx.git
 cd prx
 
-# Build
-cargo build
+# Normal local development loop
+cargo fmt --all
+cargo fmt --all -- --check
+cargo check -p openprx --all-features
+cargo test -p openprx <affected-test-filter>
+```
 
-# Run tests
+The normal local loop must run focused tests that execute at least one test.
+The full engineering gate is reserved for a GitHub delivery, an explicitly
+authorized release/deploy, or a comprehensive audit:
+
+```bash
 cargo test --locked
-
-# Format & lint
-cargo fmt --check
-cargo clippy -- -D warnings
-
-# Release build
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --test architecture_boundaries
+cargo deny check
 cargo build --release --locked
 ```
 
@@ -60,8 +65,11 @@ src/
 
 ## Pull Request Checklist
 
-- [ ] `cargo fmt --check` and `cargo clippy` pass
+- [ ] `cargo fmt --all -- --check` and `cargo check -p openprx --all-features` pass
+- [ ] Focused affected tests ran and executed at least one test
+- [ ] `cargo clippy --workspace --all-targets --all-features -- -D warnings` passes
 - [ ] `cargo test --locked` passes
+- [ ] Architecture boundaries and `cargo deny check` pass
 - [ ] New code has tests
 - [ ] No new dependencies unless necessary
 - [ ] README/docs updated if adding user-facing features

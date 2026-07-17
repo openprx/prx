@@ -78,6 +78,10 @@ use crate::causal_tree::CausalTreeEngine;
 /// deliberately **not** here — they live in the slot layer (dev-plan §2.2) and
 /// are built by each mode. Only the read-only core lives in `AppContext`.
 pub struct AppContext {
+    /// Sole configuration generation owner for this process/runtime bootstrap.
+    pub config_manager: crate::config::SharedConfig,
+    /// Startup generation pinned by non-hot-reloading CLI modes.
+    pub config_generation: Arc<crate::config::ConfigGeneration>,
     /// Read-only config snapshot. Hot-reload travels through the slot layer (D2),
     /// not through this field.
     pub config: Arc<Config>,
@@ -257,8 +261,11 @@ impl RuntimeBootstrap {
     pub async fn build(config: Config, profile: BootstrapProfile) -> Result<Arc<AppContext>> {
         // Wrap config once so all downstream users share the same allocation
         // (iron rule 7: Arc over deep copy). Arc<Config> deref-coerces to &Config
-        // everywhere a borrow is needed.
-        let config = Arc::new(config);
+        // everywhere a borrow is needed. The bootstrap also owns the one
+        // process-level generation manager used by every config-aware tool.
+        let config_manager = crate::config::new_shared(config);
+        let config_generation = config_manager.pin();
+        let config = Arc::clone(&config_generation.effective);
 
         // 1. observer — first, no dependencies beyond config.
         let observer: Arc<dyn Observer> = Arc::from(observability::create_observer(&config.observability));
@@ -374,6 +381,7 @@ impl RuntimeBootstrap {
             };
             let registry = tools::all_tools_with_runtime(
                 Arc::clone(&config),
+                Arc::clone(&config_manager),
                 &security,
                 rt,
                 mem,
@@ -394,6 +402,8 @@ impl RuntimeBootstrap {
         }
 
         Ok(Arc::new(AppContext {
+            config_manager,
+            config_generation,
             config,
             observer,
             security,

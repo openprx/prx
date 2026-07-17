@@ -7,14 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.8] - 2026-07-16
+
+### Added
+
+- One process-level `ConfigGenerationManager` now owns runtime configuration
+  publication. Turns, messages, Cron/Xin work, webhooks, channels, and runtime
+  events retain a typed, pinned configuration generation.
+- Durable event, idempotency, usage/cost, process ownership, readiness, and
+  recovery contracts now cover both SQLite and PostgreSQL-backed operation.
+- Stage 9 runtime domains add bounded Nodes, a process-level Skill catalog,
+  generation-owned Plugins/hooks, bounded media artifacts, and truthful
+  provider routing/cost settlement.
+
 ### Changed
 
+- Configuration reloads are transactional and field-aware. Snapshot-hot fields
+  apply to newly admitted work, rebuild-and-swap fields publish only after
+  candidate readiness, and process-only fields are reported as
+  `restart_required` without falsely advancing active state.
+- Chat and agent turns share authoritative tool execution, terminal commit,
+  MessageEvent, approval, and usage/cost paths. Tool calls use durable
+  reserve/execute/commit/replay semantics.
+- Cron, Xin/Heartbeat, Channels, webhook, and self-system supervisors use
+  generation fencing, readiness, rollback, and no-overlap replacement.
 - `prx chat` now defaults to the fullscreen terminal UI on TTYs. Native terminal
   scrollback is no longer the chat transcript surface; use in-app scrolling while
   chatting and `/export [md|json]` to save a transcript. `PRX_TUI=0 prx chat`,
   `prx chat --plain`, and non-TTY stdin still use the plain reedline fallback.
   The previous `[chat].tui_mode` / `PRX_TUI_MODE` inline-vs-fullscreen selector
   is removed because fullscreen is now the only TUI renderer.
+
+### Fixed
+
+- Prevented partial terminal commits when workspace validation or usage/cost
+  settlement fails; retries remain recoverable and idempotent.
+- Scoped MessageEvent idempotency by workspace in both persistence backends.
+- Enforced at-most-once tool execution across Chat and agent entry points.
+- Made process kill, Cron leases, webhook ingestion, service status, health,
+  readiness, migration diagnostics, and configured-backend selection truthful.
 
 ### Security
 

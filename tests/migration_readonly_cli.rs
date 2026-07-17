@@ -2,7 +2,7 @@ use openprx::config::Config;
 use std::process::Command;
 use tempfile::TempDir;
 
-fn prx_command(config_dir: &std::path::Path, subcommand: &str) -> std::process::Output {
+fn prx_command(config_dir: &std::path::Path, subcommand: &str) -> std::io::Result<std::process::Output> {
     Command::new(env!("CARGO_BIN_EXE_prx"))
         .arg("--config-dir")
         .arg(config_dir)
@@ -10,7 +10,6 @@ fn prx_command(config_dir: &std::path::Path, subcommand: &str) -> std::process::
         .env_remove("OPENPRX_CONFIG_DIR")
         .env_remove("OPENPRX_WORKSPACE")
         .output()
-        .expect("run prx migration command")
 }
 
 #[test]
@@ -18,7 +17,7 @@ fn status_does_not_initialize_missing_config_directory() {
     let temp = TempDir::new().unwrap();
     let config_dir = temp.path().join("missing-config");
 
-    let output = prx_command(&config_dir, "status");
+    let output = prx_command(&config_dir, "status").unwrap();
 
     assert!(!output.status.success());
     assert!(
@@ -44,7 +43,7 @@ fn verify_does_not_initialize_missing_workspace_or_database() {
     .unwrap();
     let workspace = config_dir.join("workspace");
 
-    let output = prx_command(&config_dir, "verify");
+    let output = prx_command(&config_dir, "verify").unwrap();
 
     assert!(!output.status.success());
     assert!(!workspace.exists(), "verify must not create the workspace or database");
@@ -67,7 +66,7 @@ fn baseline_is_a_read_only_compatibility_error() {
     .unwrap();
     let workspace = config_dir.join("workspace");
 
-    let output = prx_command(&config_dir, "baseline");
+    let output = prx_command(&config_dir, "baseline").unwrap();
 
     assert!(!output.status.success());
     assert!(

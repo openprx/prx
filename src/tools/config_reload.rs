@@ -1,33 +1,11 @@
-//! Config hot-reload tool — re-reads config.toml + enabled config.d fragments
-//! and updates runtime-mutable settings.
+//! Config reload tool.
 //!
-//! Hot-reloadable fields (take effect immediately):
-//!   - `default_temperature`
-//!   - `agent.*` (max_tool_iterations, max_history_messages, parallel_tools,
-//!     compact_context, read_only_tool_concurrency_window,
-//!     read_only_tool_timeout_secs, priority_scheduling_enabled, low_priority_tools,
-//!     rollout/kill-switch/rollback thresholds)
-//!   - `heartbeat.enabled`, `heartbeat.interval_minutes`
-//!   - `cron.enabled`, `cron.max_run_history`
-//!   - `web_search.enabled`, `web_search.max_results`
-//!
-//! Fields that require a full restart to take effect:
-//!   - `api_key`, `api_url`, `default_provider`, `default_model`
-//!   - `channels_config` (Signal, WhatsApp, Telegram, etc.)
-//!   - `memory`, `storage` backends
-//!   - already-instantiated tools / channel ACLs (the `SecurityPolicy` baked into a
-//!     live tool's `SideEffectGate` at startup is not re-armed by a reload)
-//!
-//! D2 update: `autonomy` and `security.audit` ARE hot for **gateway authorization
-//! decisions** — the gateway re-reads the SharedConfig (D) at each decision point, so
-//! a reload that changes autonomy / audit takes effect for gateway resource-mutation
-//! routes, `/api/*` config gates, per-session/console runtime turns, and this reload
-//! route's own gate WITHOUT a restart. Only the security gates already embedded in
-//! long-lived tool/channel instances (and the cron/webhook/evolution supervisors)
-//! remain restart-only.
+//! The tool does not decide or publish fields itself. It delegates to the
+//! process-level configuration generation owner and reports the exact applied,
+//! rebuilt, restarted and restart-required sets.
 
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::config::{Config, SharedConfig};
+use crate::config::{ConfigReloadTrigger, SharedConfig};
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
 use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
@@ -36,8 +14,7 @@ use std::sync::Arc;
 
 /// Tool that hot-reloads the merged configuration at runtime.
 ///
-/// Accepts a [`SharedConfig`] (ArcSwap-backed) and atomically stores the new
-/// config after validation — no Mutex required.
+/// Accepts the process-level [`SharedConfig`] generation owner.
 pub struct ConfigReloadTool {
     config: SharedConfig,
     security: Arc<SecurityPolicy>,
@@ -61,12 +38,9 @@ impl Tool for ConfigReloadTool {
     }
 
     fn description(&self) -> &str {
-        "Reload merged configuration (config.toml + enabled config.d files) without restarting the daemon. \
-         Hot-reloads: temperature, agent settings (max iterations/history, concurrency, priority), \
-         heartbeat, cron, and web_search settings. Autonomy and security.audit changes also take effect \
-         immediately for gateway authorization decisions (resource-mutation routes, config API gates, \
-         per-session runtime turns). Provider, model, channels, and memory backends, plus the security \
-         gates already baked into live tool/channel instances, still require a full restart."
+        "Reload merged configuration through the process ConfigGeneration owner. \
+         The result explicitly separates fields applied live, runtime objects rebuilt, \
+         components restarted, and fields that still require a process restart."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -93,240 +67,50 @@ impl Tool for ConfigReloadTool {
             });
         }
 
-        // 1. Read runtime config locations from current config (lock-free)
-        let current = self.config.load_full();
-        let config_path = current.config_path.clone();
-        let workspace_dir = current.workspace_dir.clone();
-
-        if config_path.as_os_str().is_empty() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Config path is not set; cannot reload.".into()),
-            });
-        }
-
-        // 2. Load merged config (config.toml + enabled config.d/*.toml) and validate.
-        let fresh: Config = match Config::load_from_path(&config_path, workspace_dir) {
-            Ok(c) => c,
-            Err(e) => {
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!(
-                        "Failed to load merged config from {} (including config.d): {e}",
-                        config_path.display()
-                    )),
-                });
-            }
-        };
-
-        // 3. Diff hot-reloadable fields and atomically store new config
-        let mut changes: Vec<String> = Vec::new();
-        {
-            let old = self.config.load_full();
-
-            // Temperature
-            if (old.default_temperature - fresh.default_temperature).abs() > 1e-9 {
-                changes.push(format!(
-                    "temperature: {:.2} → {:.2}",
-                    old.default_temperature, fresh.default_temperature
-                ));
-            }
-
-            // Agent: max_tool_iterations
-            if old.agent.max_tool_iterations != fresh.agent.max_tool_iterations {
-                changes.push(format!(
-                    "agent.max_tool_iterations: {} → {}",
-                    old.agent.max_tool_iterations, fresh.agent.max_tool_iterations
-                ));
-            }
-
-            // Agent: max_history_messages
-            if old.agent.max_history_messages != fresh.agent.max_history_messages {
-                changes.push(format!(
-                    "agent.max_history_messages: {} → {}",
-                    old.agent.max_history_messages, fresh.agent.max_history_messages
-                ));
-            }
-
-            // Agent: parallel_tools
-            if old.agent.parallel_tools != fresh.agent.parallel_tools {
-                changes.push(format!(
-                    "agent.parallel_tools: {} → {}",
-                    old.agent.parallel_tools, fresh.agent.parallel_tools
-                ));
-            }
-
-            // Agent: compact_context
-            if old.agent.compact_context != fresh.agent.compact_context {
-                changes.push(format!(
-                    "agent.compact_context: {} → {}",
-                    old.agent.compact_context, fresh.agent.compact_context
-                ));
-            }
-            if old.agent.read_only_tool_concurrency_window != fresh.agent.read_only_tool_concurrency_window {
-                changes.push(format!(
-                    "agent.read_only_tool_concurrency_window: {} → {}",
-                    old.agent.read_only_tool_concurrency_window, fresh.agent.read_only_tool_concurrency_window
-                ));
-            }
-            if old.agent.read_only_tool_timeout_secs != fresh.agent.read_only_tool_timeout_secs {
-                changes.push(format!(
-                    "agent.read_only_tool_timeout_secs: {} → {}",
-                    old.agent.read_only_tool_timeout_secs, fresh.agent.read_only_tool_timeout_secs
-                ));
-            }
-            if old.agent.priority_scheduling_enabled != fresh.agent.priority_scheduling_enabled {
-                changes.push(format!(
-                    "agent.priority_scheduling_enabled: {} → {}",
-                    old.agent.priority_scheduling_enabled, fresh.agent.priority_scheduling_enabled
-                ));
-            }
-            if old.agent.low_priority_tools != fresh.agent.low_priority_tools {
-                changes.push(format!(
-                    "agent.low_priority_tools: {:?} → {:?}",
-                    old.agent.low_priority_tools, fresh.agent.low_priority_tools
-                ));
-            }
-            if old.agent.concurrency_kill_switch_force_serial != fresh.agent.concurrency_kill_switch_force_serial {
-                changes.push(format!(
-                    "agent.concurrency_kill_switch_force_serial: {} → {}",
-                    old.agent.concurrency_kill_switch_force_serial, fresh.agent.concurrency_kill_switch_force_serial
-                ));
-            }
-            if old.agent.concurrency_rollout_stage != fresh.agent.concurrency_rollout_stage {
-                changes.push(format!(
-                    "agent.concurrency_rollout_stage: {} → {}",
-                    old.agent.concurrency_rollout_stage, fresh.agent.concurrency_rollout_stage
-                ));
-            }
-            if old.agent.concurrency_rollout_sample_percent != fresh.agent.concurrency_rollout_sample_percent {
-                changes.push(format!(
-                    "agent.concurrency_rollout_sample_percent: {} → {}",
-                    old.agent.concurrency_rollout_sample_percent, fresh.agent.concurrency_rollout_sample_percent
-                ));
-            }
-            if old.agent.concurrency_rollout_channels != fresh.agent.concurrency_rollout_channels {
-                changes.push(format!(
-                    "agent.concurrency_rollout_channels: {:?} → {:?}",
-                    old.agent.concurrency_rollout_channels, fresh.agent.concurrency_rollout_channels
-                ));
-            }
-            if old.agent.concurrency_auto_rollback_enabled != fresh.agent.concurrency_auto_rollback_enabled {
-                changes.push(format!(
-                    "agent.concurrency_auto_rollback_enabled: {} → {}",
-                    old.agent.concurrency_auto_rollback_enabled, fresh.agent.concurrency_auto_rollback_enabled
-                ));
-            }
-            if (old.agent.concurrency_rollback_timeout_rate_threshold
-                - fresh.agent.concurrency_rollback_timeout_rate_threshold)
-                .abs()
-                > f64::EPSILON
-            {
-                changes.push(format!(
-                    "agent.concurrency_rollback_timeout_rate_threshold: {:.3} → {:.3}",
-                    old.agent.concurrency_rollback_timeout_rate_threshold,
-                    fresh.agent.concurrency_rollback_timeout_rate_threshold
-                ));
-            }
-            if (old.agent.concurrency_rollback_cancel_rate_threshold
-                - fresh.agent.concurrency_rollback_cancel_rate_threshold)
-                .abs()
-                > f64::EPSILON
-            {
-                changes.push(format!(
-                    "agent.concurrency_rollback_cancel_rate_threshold: {:.3} → {:.3}",
-                    old.agent.concurrency_rollback_cancel_rate_threshold,
-                    fresh.agent.concurrency_rollback_cancel_rate_threshold
-                ));
-            }
-            if (old.agent.concurrency_rollback_error_rate_threshold
-                - fresh.agent.concurrency_rollback_error_rate_threshold)
-                .abs()
-                > f64::EPSILON
-            {
-                changes.push(format!(
-                    "agent.concurrency_rollback_error_rate_threshold: {:.3} → {:.3}",
-                    old.agent.concurrency_rollback_error_rate_threshold,
-                    fresh.agent.concurrency_rollback_error_rate_threshold
-                ));
-            }
-
-            // Heartbeat
-            if old.heartbeat.enabled != fresh.heartbeat.enabled {
-                changes.push(format!(
-                    "heartbeat.enabled: {} → {}",
-                    old.heartbeat.enabled, fresh.heartbeat.enabled
-                ));
-            }
-            if old.heartbeat.interval_minutes != fresh.heartbeat.interval_minutes {
-                changes.push(format!(
-                    "heartbeat.interval_minutes: {} → {}",
-                    old.heartbeat.interval_minutes, fresh.heartbeat.interval_minutes
-                ));
-            }
-
-            // Cron
-            if old.cron.enabled != fresh.cron.enabled {
-                changes.push(format!("cron.enabled: {} → {}", old.cron.enabled, fresh.cron.enabled));
-            }
-            if old.cron.max_run_history != fresh.cron.max_run_history {
-                changes.push(format!(
-                    "cron.max_run_history: {} → {}",
-                    old.cron.max_run_history, fresh.cron.max_run_history
-                ));
-            }
-
-            // Web search
-            if old.web_search.enabled != fresh.web_search.enabled {
-                changes.push(format!(
-                    "web_search.enabled: {} → {}",
-                    old.web_search.enabled, fresh.web_search.enabled
-                ));
-            }
-            if old.web_search.max_results != fresh.web_search.max_results {
-                changes.push(format!(
-                    "web_search.max_results: {} → {}",
-                    old.web_search.max_results, fresh.web_search.max_results
-                ));
-            }
-
-            // Atomically publish — preserve runtime paths
-            let mut updated = fresh;
-            updated.config_path = old.config_path.clone();
-            updated.workspace_dir = old.workspace_dir.clone();
-            if updated.memory.acl_enabled != old.memory.acl_enabled {
-                changes.push(format!(
-                    "memory.acl_enabled: {} → {} (deferred; restart required)",
-                    old.memory.acl_enabled, updated.memory.acl_enabled
-                ));
-                updated.memory.acl_enabled = old.memory.acl_enabled;
-            }
-            self.config.store(Arc::new(updated));
-        }
-
-        let output = if changes.is_empty() {
-            format!(
-                "✅ Config reloaded from `{}` — no hot-reloadable changes detected.",
-                config_path.display()
-            )
-        } else {
-            format!(
-                "✅ Config reloaded from `{}`.\n\nChanges applied:\n{}",
-                config_path.display(),
-                changes
-                    .iter()
-                    .map(|c| format!("  • {c}"))
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            )
-        };
+        let config_path = self.config.load_full().config_path.clone();
+        let manager = Arc::clone(&self.config);
+        let report =
+            match tokio::task::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool)).await {
+                Ok(Ok(report)) => report,
+                Ok(Err(error)) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to load merged config from {} (including config.d): {error}",
+                            config_path.display()
+                        )),
+                    });
+                }
+                Err(error) => {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Config reload worker failed for {}: {error}",
+                            config_path.display()
+                        )),
+                    });
+                }
+            };
+        let output = serde_json::to_string_pretty(&serde_json::json!({
+            "status": report.status(),
+            "active_generation": report.active_generation.0,
+            "active_source_revision": report.active_source_revision.fingerprint_sha256,
+            "desired_source_revision": report.desired_source_revision.fingerprint_sha256,
+            "changed": report.changed,
+            "applied": report.applied,
+            "rebuilt": report.rebuilt,
+            "restarted": report.restarted,
+            "restart_required": report.restart_required,
+            "participant_acks": report.participant_acks,
+        }))?;
 
         tracing::info!(
             path = %config_path.display(),
-            changes = %changes.len(),
-            "Config hot-reloaded"
+            active_generation = report.active_generation.0,
+            status = report.status(),
+            "Config generation reload completed"
         );
 
         Ok(ToolResult {
@@ -453,17 +237,15 @@ mod tests {
         let content = format!("default_temperature = {default_temp}\n");
         tokio::fs::write(tmp.path(), &content).await.unwrap();
 
-        let mut cfg = Config::default();
-        cfg.config_path = tmp.path().to_path_buf();
+        let workspace = tempfile::tempdir().unwrap();
+        let cfg = Config::load_from_path(tmp.path(), workspace.path().to_path_buf()).unwrap();
 
         let tool = make_tool_with_config(cfg);
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success);
-        assert!(
-            result.output.contains("no hot-reloadable changes"),
-            "Expected no-change message: {}",
-            result.output
-        );
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(output["status"], "unchanged", "Unexpected reload result: {output}");
+        assert_eq!(output["changed"], serde_json::json!([]));
     }
 
     #[tokio::test]
@@ -517,10 +299,12 @@ max_history_messages = 123
 
         let result = tool.execute(serde_json::json!({})).await.unwrap();
         assert!(result.success, "Expected success: {:?}", result.error);
+        let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert!(
-            result.output.contains("agent.max_history_messages: 50 → 123"),
-            "Expected fragment-driven diff in output: {}",
-            result.output
+            output["changed"]
+                .as_array()
+                .is_some_and(|fields| fields.iter().any(|field| field == "agent")),
+            "Expected fragment-driven agent diff in output: {output}"
         );
 
         let updated = shared.load_full();

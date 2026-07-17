@@ -2,13 +2,14 @@
 
 use anyhow::{Context, Result, bail};
 use directories::UserDirs;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock};
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".openprx-open-skills-sync";
@@ -123,7 +124,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
         openclaw_skills_enabled: config.skills.openclaw_skills_enabled,
         openclaw_skills_dir: config.skills.openclaw_skills_dir.as_deref().map(PathBuf::from),
     };
-    let mut catalogs = SKILL_CATALOGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut catalogs = SKILL_CATALOGS.lock();
     if let Some(skills) = catalogs.get(&key) {
         return skills.as_ref().clone();
     }
@@ -156,7 +157,6 @@ pub fn invalidate_skill_catalog(workspace_dir: &Path) {
     let workspace_dir = normalized_path(workspace_dir);
     SKILL_CATALOGS
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .retain(|key, _| key.workspace_dir != workspace_dir);
 }
 
@@ -185,28 +185,28 @@ pub async fn load_skills_with_embeddings(
         ));
     }
     let hydration_lock = {
-        let mut locks = SKILL_HYDRATION_LOCKS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(existing) = locks.get(&namespace) {
-            Arc::clone(existing)
-        } else {
-            if locks.len() >= MAX_HYDRATION_LOCKS {
-                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-            }
-            if locks.len() >= MAX_HYDRATION_LOCKS {
-                Arc::clone(&SKILL_HYDRATION_OVERFLOW_LOCK)
-            } else {
-                let lock = Arc::new(tokio::sync::Mutex::new(()));
-                locks.insert(namespace.clone(), Arc::clone(&lock));
-                lock
-            }
-        }
+        let mut locks = SKILL_HYDRATION_LOCKS.lock();
+        let existing = locks.get(&namespace).cloned();
+        existing.map_or_else(
+            || {
+                if locks.len() >= MAX_HYDRATION_LOCKS {
+                    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+                }
+                if locks.len() >= MAX_HYDRATION_LOCKS {
+                    Arc::clone(&SKILL_HYDRATION_OVERFLOW_LOCK)
+                } else {
+                    let lock = Arc::new(tokio::sync::Mutex::new(()));
+                    locks.insert(namespace.clone(), Arc::clone(&lock));
+                    lock
+                }
+            },
+            std::convert::identity,
+        )
     };
     let _hydration_guard = hydration_lock.lock().await;
     let mut pending = Vec::new();
     {
-        let cache = SKILL_EMBEDDINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let cache = SKILL_EMBEDDINGS.lock();
         for (index, skill) in skills.iter_mut().enumerate() {
             if skill.description.trim().is_empty() {
                 continue;
@@ -230,7 +230,7 @@ pub async fn load_skills_with_embeddings(
                 pending.len()
             );
         }
-        let mut cache = SKILL_EMBEDDINGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut cache = SKILL_EMBEDDINGS.lock();
         if cache.len().saturating_add(pending.len()) > MAX_EMBEDDING_CACHE_ENTRIES {
             cache.clear();
         }

@@ -432,6 +432,10 @@ pub struct MessageEventInput {
     pub attempt_id: Option<String>,
     #[serde(default)]
     pub lease_epoch: Option<i64>,
+    #[serde(default)]
+    pub config_generation_id: Option<u64>,
+    #[serde(default)]
+    pub config_source_revision: Option<String>,
     pub content: String,
     pub raw_payload_json: Option<String>,
     pub visibility: MemoryVisibility,
@@ -485,6 +489,10 @@ pub struct MessageEvent {
     pub attempt_id: Option<String>,
     #[serde(default)]
     pub lease_epoch: Option<i64>,
+    #[serde(default)]
+    pub config_generation_id: Option<u64>,
+    #[serde(default)]
+    pub config_source_revision: Option<String>,
     pub content: String,
     pub content_hash: Option<String>,
     pub raw_payload_json: Option<String>,
@@ -1289,6 +1297,20 @@ pub trait Memory: Send + Sync {
     async fn append_message_event(&self, input: MessageEventInput) -> anyhow::Result<MessageEvent> {
         let _ = input;
         Err(crate::memory::fabric::fail_fast(self.name(), "append_message_event"))
+    }
+
+    /// Find one MessageEvent by its workspace-scoped idempotency key.
+    ///
+    /// The default returns no match for backends without event-ledger lookup
+    /// support. Persistent event backends override this so execution recovery can
+    /// distinguish a committed result from an unowned retry.
+    async fn find_message_event_by_idempotency_key(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> anyhow::Result<Option<MessageEvent>> {
+        let _ = (workspace_id, idempotency_key);
+        Ok(None)
     }
 
     /// List message events visible to `principal` after a cursor.

@@ -1,5 +1,7 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::config::{Config, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config, set_runtime_proxy_config};
+use crate::config::{
+    Config, ConfigApplyReport, ConfigReloadTrigger, ProxyConfig, ProxyScope, SharedConfig, runtime_proxy_config,
+};
 use crate::security::SecurityPolicy;
 use crate::security::SideEffectGate;
 use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
@@ -179,6 +181,13 @@ impl ProxyConfigTool {
         })
     }
 
+    async fn reload_saved_config(&self) -> anyhow::Result<ConfigApplyReport> {
+        let manager = Arc::clone(&self.config);
+        tokio::task::spawn_blocking(move || manager.reload_from_disk(ConfigReloadTrigger::Tool))
+            .await
+            .map_err(|error| anyhow::anyhow!("proxy config reload worker failed: {error}"))?
+    }
+
     async fn handle_set(&self, args: &Value) -> anyhow::Result<ToolResult> {
         let mut cfg = self.load_config_without_env()?;
         let previous_scope = cfg.proxy.scope;
@@ -256,19 +265,31 @@ impl ProxyConfigTool {
 
         cfg.proxy = proxy.clone();
         cfg.save().await?;
-        set_runtime_proxy_config(proxy.clone());
+        let report = self.reload_saved_config().await?;
+        let active_proxy = self.config.load_full().proxy.clone();
 
-        if proxy.enabled && proxy.scope == ProxyScope::Environment {
+        if report.rebuilt.iter().any(|field| field == "proxy")
+            && proxy.enabled
+            && proxy.scope == ProxyScope::Environment
+        {
             proxy.apply_to_process_env();
-        } else if previous_scope == ProxyScope::Environment {
+        } else if report.rebuilt.iter().any(|field| field == "proxy") && previous_scope == ProxyScope::Environment {
             ProxyConfig::clear_process_env();
         }
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Proxy configuration updated",
-                "proxy": Self::proxy_json(&proxy),
+                "message": if report.restart_required.iter().any(|field| field == "proxy") {
+                    "Proxy configuration saved; process restart required before runtime activation"
+                } else {
+                    "Proxy configuration updated and activated"
+                },
+                "status": report.status(),
+                "active_generation": report.active_generation.0,
+                "restart_required": report.restart_required,
+                "desired_proxy": Self::proxy_json(&proxy),
+                "active_runtime_proxy": Self::proxy_json(&active_proxy),
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
@@ -280,22 +301,30 @@ impl ProxyConfigTool {
         let clear_env_default = cfg.proxy.scope == ProxyScope::Environment;
         cfg.proxy.enabled = false;
         cfg.save().await?;
-
-        set_runtime_proxy_config(cfg.proxy.clone());
+        let report = self.reload_saved_config().await?;
+        let active_proxy = self.config.load_full().proxy.clone();
 
         let clear_env = args
             .get("clear_env")
             .and_then(Value::as_bool)
             .unwrap_or(clear_env_default);
-        if clear_env {
+        if clear_env && report.rebuilt.iter().any(|field| field == "proxy") {
             ProxyConfig::clear_process_env();
         }
 
         Ok(ToolResult {
             success: true,
             output: serde_json::to_string_pretty(&json!({
-                "message": "Proxy disabled",
-                "proxy": Self::proxy_json(&cfg.proxy),
+                "message": if report.restart_required.iter().any(|field| field == "proxy") {
+                    "Proxy disable saved; process restart required before runtime activation"
+                } else {
+                    "Proxy disabled and activated"
+                },
+                "status": report.status(),
+                "active_generation": report.active_generation.0,
+                "restart_required": report.restart_required,
+                "desired_proxy": Self::proxy_json(&cfg.proxy),
+                "active_runtime_proxy": Self::proxy_json(&active_proxy),
                 "environment": Self::env_snapshot(),
             }))?,
             error: None,
@@ -303,8 +332,7 @@ impl ProxyConfigTool {
     }
 
     fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
-        let cfg = self.load_config_without_env()?;
-        let proxy = cfg.proxy;
+        let proxy = self.config.load_full().proxy.clone();
         proxy.validate()?;
 
         if !proxy.enabled {
@@ -319,7 +347,6 @@ impl ProxyConfigTool {
         }
 
         proxy.apply_to_process_env();
-        set_runtime_proxy_config(proxy.clone());
 
         Ok(ToolResult {
             success: true,
@@ -589,6 +616,17 @@ mod tests {
             .await
             .unwrap();
         assert!(set_result.success, "{:?}", set_result.error);
+        let set_output: Value = serde_json::from_str(&set_result.output).unwrap();
+        assert_eq!(set_output["status"], "restart_required");
+        assert_eq!(set_output["restart_required"], json!(["proxy"]));
+        assert!(
+            set_output["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("restart required")
+        );
+        assert_eq!(set_output["active_runtime_proxy"]["enabled"], false);
+        assert_eq!(set_output["desired_proxy"]["enabled"], true);
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         assert!(get_result.success);

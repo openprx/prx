@@ -996,6 +996,7 @@ impl WebhookRepository for PostgresWebhookRepository {
 /// Run the standalone webhook receiver from the authoritative application
 /// configuration with the durable repository injected by the daemon assembly
 /// boundary. This keeps backend selection out of the standalone HTTP service.
+#[allow(dead_code)]
 pub(crate) async fn run_configured_with_repository(
     config: &Config,
     repository: WebhookRepositoryHandle,
@@ -1012,6 +1013,30 @@ pub(crate) async fn run_configured_with_repository(
         config.webhook.signing_secret.as_deref(),
         repository.repository,
         security,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn run_configured_with_repository_generation(
+    config: &Config,
+    repository: WebhookRepositoryHandle,
+    security: Arc<SecurityPolicy>,
+    manager: crate::config::SharedConfig,
+    generation_id: crate::config::ConfigGenerationId,
+) -> Result<()> {
+    let token = config
+        .webhook
+        .token
+        .as_deref()
+        .context("webhook.token must be configured when webhook.enabled=true")?;
+    run_with_repository(
+        &config.webhook.bind,
+        token,
+        config.webhook.signing_secret.as_deref(),
+        repository.repository,
+        security,
+        Some((manager, generation_id)),
     )
     .await
 }
@@ -1058,6 +1083,7 @@ async fn run_with_repository(
     signing_secret: Option<&str>,
     repository: Arc<dyn WebhookRepository>,
     security: Arc<SecurityPolicy>,
+    activation: Option<(crate::config::SharedConfig, crate::config::ConfigGenerationId)>,
 ) -> Result<()> {
     let trimmed_token = token.trim();
     if trimmed_token.is_empty() {
@@ -1071,6 +1097,11 @@ async fn run_with_repository(
 
     tracing::info!("Webhook server listening on {}", addr);
     crate::health::mark_component_ok("webhook_receiver");
+    if let Some((manager, generation_id)) = activation {
+        while manager.active_generation_id() != generation_id {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
 
     let state = WebhookState {
         token: Arc::<str>::from(trimmed_token.to_string()),
@@ -2363,14 +2394,14 @@ mod tests {
 
         let daemon_source = include_str!("../daemon/mod.rs");
         let webhook_supervisor = daemon_source
-            .split_once("if config.modules.integrations && config.webhook.enabled")
+            .split_once("let (webhook_handle, webhook_controller) = spawn_config_generation_supervisor(")
             .unwrap()
             .1
-            .split_once("println!(\"🧠 OpenPRX daemon started\")")
+            .split_once("handles.push(webhook_handle)")
             .unwrap()
             .0;
-        assert!(webhook_supervisor.contains("repository_from_config(&webhook_cfg)"));
-        assert!(webhook_supervisor.contains("run_configured_with_repository(&cfg, repository"));
+        assert!(webhook_supervisor.contains("repository_from_config(&cfg)"));
+        assert!(webhook_supervisor.contains("run_configured_with_repository_generation("));
     }
 
     #[tokio::test]

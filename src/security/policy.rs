@@ -2047,7 +2047,10 @@ mod tests {
     }
 
     fn default_policy() -> SecurityPolicy {
-        SecurityPolicy::default()
+        SecurityPolicy {
+            autonomy: AutonomyLevel::Supervised,
+            ..SecurityPolicy::default()
+        }
     }
 
     fn readonly_policy() -> SecurityPolicy {
@@ -3693,7 +3696,7 @@ mod tests {
 
     #[test]
     fn unquoted_semicolon_after_quoted_sql_still_splits_commands() {
-        let p = SecurityPolicy::default();
+        let p = default_policy();
         // The unquoted `;` after the quoted SQL still splits off a second segment;
         // Phase 1: a plain `rm` segment now passes structurally, but a segment with
         // a subshell still fails — proving the split (and structural gate) happen.

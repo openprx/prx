@@ -76,6 +76,7 @@ impl WasmToolAdapter {
             optional,
             manifest.permissions.http_allowlist.clone(),
             timeout_ms,
+            manifest.resources.max_kv_storage_mb,
         );
         if let Some(mem) = memory {
             host_state = host_state.with_memory(mem);
@@ -160,9 +161,9 @@ impl WasmToolAdapter {
                                 return Ok((Err::<(), String>(e),));
                             }
                             let kv = store.data().kv_store.clone();
-                            let mut guard = kv.write().await;
-                            guard.insert(key, value);
-                            Ok((Ok::<(), String>(()),))
+                            let quota = store.data().kv_quota_bytes;
+                            let result = crate::plugins::host::host_kv_set_bounded(&kv, quota, key, value).await;
+                            Ok((result,))
                         })
                     },
                 )

@@ -1,8 +1,8 @@
-//! T3 end-to-end acceptance test: watcher → `SharedConfig` → gateway authorization.
+//! T3 end-to-end acceptance test: watcher → `ConfigGenerationManager` → gateway authorization.
 //!
 //! Proves that the full chain
 //!
-//!   file change → HotReloadManager (file watcher) → SharedConfig.store() → authz reads
+//!   file change → HotReloadManager (file watcher) → generation publish → authz reads
 //!
 //! works correctly after a hot-reload — the **"断链 1" repair** hard evidence.
 //!
@@ -60,7 +60,10 @@
 // permitted to panic via expect() per the project iron rules.
 #![allow(clippy::doc_markdown, clippy::expect_used)]
 
-use openprx::config::{Config, HotReloadManager, new_shared};
+use openprx::config::{
+    Config, ConfigGeneration, ConfigGenerationParticipant, HotReloadManager, PreparedConfigGeneration, SharedConfig,
+    new_shared,
+};
 use openprx::security::policy::ResourceRiskLevel;
 use openprx::security::{AutonomyLevel, SecurityPolicy, SideEffectGate};
 use std::sync::Arc;
@@ -94,6 +97,42 @@ fn authz_low_risk_mutation(shared: &openprx::config::SharedConfig, workspace: &s
     SideEffectGate::new(&policy)
         .authorize_resource_operation("gateway", "gateway:pair", ResourceRiskLevel::Low, None)
         .map(|_| ())
+}
+
+struct AuthzPreparedGeneration;
+
+impl PreparedConfigGeneration for AuthzPreparedGeneration {
+    fn commit(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn rollback(&mut self) {}
+}
+
+struct AuthzGenerationParticipant;
+
+impl ConfigGenerationParticipant for AuthzGenerationParticipant {
+    fn name(&self) -> &'static str {
+        "config-hotreload-authz-e2e"
+    }
+
+    fn supports_rebuild_field(&self, field: &str) -> bool {
+        field == "autonomy"
+    }
+
+    fn prepare(
+        &self,
+        _generation: Arc<ConfigGeneration>,
+        _changed_fields: &[String],
+    ) -> anyhow::Result<Box<dyn PreparedConfigGeneration>> {
+        Ok(Box::new(AuthzPreparedGeneration))
+    }
+}
+
+fn register_authz_participant(shared: &SharedConfig) -> Arc<dyn ConfigGenerationParticipant> {
+    let participant: Arc<dyn ConfigGenerationParticipant> = Arc::new(AuthzGenerationParticipant);
+    shared.register_participant(&participant);
+    participant
 }
 
 /// T3: watcher → SharedConfig → gateway authorization end-to-end.
@@ -142,13 +181,15 @@ fn watcher_shared_config_gateway_authz_e2e() {
     // ── Phase 1: write full Supervised config to disk ─────────────────────────
     // Using Config::default() serialized to TOML so all required fields are
     // present — avoids "missing field" parse errors in the watcher's loader.
-    let supervised_cfg = Config {
+    let mut supervised_cfg = Config {
         autonomy: openprx::config::AutonomyConfig {
             level: AutonomyLevel::Supervised,
             ..openprx::config::AutonomyConfig::default()
         },
         ..Config::default()
     };
+    supervised_cfg.config_path = config_path.clone();
+    supervised_cfg.workspace_dir = workspace.clone();
     write_config_file(&config_path, &supervised_cfg);
 
     // ── Phase 2: wiring — replicate daemon's build-one-handle pattern ────────
@@ -159,19 +200,25 @@ fn watcher_shared_config_gateway_authz_e2e() {
     //   // shared_config injected into gateway supervisor
     //
     // We replicate this minimal wiring with the same explicit Supervised seed.
-    let initial = supervised_cfg.clone();
+    let initial = supervised_cfg;
     assert_eq!(
         initial.autonomy.level,
         AutonomyLevel::Supervised,
         "sanity: explicit T3 pre-reload baseline must be Supervised"
     );
     let shared = new_shared(initial);
+    let _participant = register_authz_participant(&shared);
+
+    assert!(
+        authz_low_risk_mutation(&shared, &workspace).is_ok(),
+        "pre-reload: Supervised autonomy must allow a low-risk gateway mutation (gateway:pair)"
+    );
 
     // Run all async logic (spawn_blocking needs the runtime to be actively driven).
     // `rt.block_on` drives the runtime on the current thread while the async block
     // executes. `spawn_blocking` submissions are picked up by the runtime's blocking
     // thread pool, which is serviced as long as the runtime is running.
-    rt.block_on(async {
+    let reloaded = rt.block_on(async {
         // _watcher keeps the HotReloadManager alive for the duration of the test.
         // (Rust: `let _watcher = X` binds the value until end-of-scope. `let _ = X`
         // would drop immediately — the named binding is intentional.)
@@ -186,23 +233,19 @@ fn watcher_shared_config_gateway_authz_e2e() {
         // 2 s gives ample headroom for CI environments.
         tokio::time::sleep(Duration::from_millis(2000)).await;
 
-        // ── Phase 3: pre-reload — assert Supervised ALLOWS low-risk mutation ─────
-        assert!(
-            authz_low_risk_mutation(&shared, &workspace).is_ok(),
-            "pre-reload: Supervised autonomy must allow a low-risk gateway mutation (gateway:pair)"
-        );
-
         // ── Phase 4: trigger watcher — overwrite config.toml with ReadOnly ───────
         //
         // We serialize a ReadOnly `Config` (all fields present) so the watcher's
         // `Config::load_from_path` can parse it without a "missing field" error.
-        let read_only_cfg = Config {
+        let mut read_only_cfg = Config {
             autonomy: openprx::config::AutonomyConfig {
                 level: AutonomyLevel::ReadOnly,
                 ..openprx::config::AutonomyConfig::default()
             },
             ..Config::default()
         };
+        read_only_cfg.config_path = config_path.clone();
+        read_only_cfg.workspace_dir = workspace.clone();
         write_config_file(&config_path, &read_only_cfg);
 
         // ── Phase 5: bounded poll — wait for SharedConfig to reflect ReadOnly ────
@@ -213,7 +256,7 @@ fn watcher_shared_config_gateway_authz_e2e() {
         let timeout = Duration::from_secs(10);
         let deadline = Instant::now() + timeout;
 
-        let reloaded = loop {
+        loop {
             if shared.load_full().autonomy.level == AutonomyLevel::ReadOnly {
                 break true;
             }
@@ -221,36 +264,7 @@ fn watcher_shared_config_gateway_authz_e2e() {
                 break false;
             }
             tokio::time::sleep(poll_interval).await;
-        };
-
-        assert!(
-            reloaded,
-            "watcher did not propagate ReadOnly to SharedConfig within {timeout:?} — \
-             断链 1 not repaired: file change did not reach SharedConfig"
-        );
-
-        assert_eq!(
-            shared.load_full().autonomy.level,
-            AutonomyLevel::ReadOnly,
-            "SharedConfig must hold ReadOnly after watcher propagation"
-        );
-
-        // ── Phase 6: post-reload — assert ReadOnly DENIES the same low-risk mutation
-        let denied = authz_low_risk_mutation(&shared, &workspace)
-            .expect_err("post-reload: ReadOnly autonomy must deny the low-risk gateway mutation");
-        assert!(
-            denied.contains("read-only mode"),
-            "denial reason must mention read-only mode; got: {denied:?}"
-        );
-
-        // ── Non-empty-run guarantee ────────────────────────────────────────────────
-        //
-        // Phase 6 inverted to `.is_ok()` → panics:
-        //   "post-reload: ReadOnly autonomy must deny the low-risk gateway mutation"
-        // Phase 3 inverted to `.is_err()` → panics:
-        //   "pre-reload: Supervised autonomy must allow a low-risk gateway mutation"
-        // Both directions were transiently flipped and confirmed to fail during
-        // development before restoring the correct assertions.
+        }
     });
 
     // Shut down the runtime without waiting for blocking tasks.
@@ -261,9 +275,26 @@ fn watcher_shared_config_gateway_authz_e2e() {
     // `shutdown_background()` abandons them immediately — safe here because the
     // test assertions are already complete.
     rt.shutdown_background();
+
+    assert!(
+        reloaded,
+        "watcher did not propagate ReadOnly to SharedConfig within 10s — \
+         file change did not reach the active ConfigGeneration"
+    );
+    assert_eq!(
+        shared.load_full().autonomy.level,
+        AutonomyLevel::ReadOnly,
+        "SharedConfig must hold ReadOnly after watcher propagation"
+    );
+    let denied = authz_low_risk_mutation(&shared, &workspace)
+        .expect_err("post-reload: ReadOnly autonomy must deny the low-risk gateway mutation");
+    assert!(
+        denied.contains("read-only mode"),
+        "denial reason must mention read-only mode; got: {denied:?}"
+    );
 }
 
-/// Complementary smoke test: direct `SharedConfig.store()` → authz flip.
+/// Complementary smoke test: direct generation-manager apply → authz flip.
 ///
 /// Isolates the SharedConfig→authz leg from the file-watcher leg. If the watcher
 /// test ever becomes flaky on a specific FS or CI runner, this test still proves
@@ -283,6 +314,7 @@ fn shared_config_direct_store_authz_flip() {
         ..Config::default()
     };
     let shared = new_shared(supervised);
+    let _participant = register_authz_participant(&shared);
 
     assert_eq!(
         shared.load_full().autonomy.level,
@@ -296,8 +328,7 @@ fn shared_config_direct_store_authz_flip() {
         "Supervised allows low-risk mutation"
     );
 
-    // Publish ReadOnly directly — simulates daemon receiving a hot-reload event
-    // (HotReloadManager calls shared.store() internally after parsing the file).
+    // Publish ReadOnly through the sole generation owner.
     let read_only = Config {
         autonomy: openprx::config::AutonomyConfig {
             level: AutonomyLevel::ReadOnly,
@@ -305,7 +336,9 @@ fn shared_config_direct_store_authz_flip() {
         },
         ..Config::default()
     };
-    shared.store(Arc::new(read_only));
+    shared
+        .apply_runtime_config(read_only, openprx::config::ConfigReloadTrigger::Test)
+        .expect("apply read-only config");
 
     // Post-store: denied — proves authz reads D (SharedConfig), not stale C.
     let denied = authz_low_risk_mutation(&shared, &workspace).expect_err("ReadOnly must deny");

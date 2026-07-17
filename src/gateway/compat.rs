@@ -198,11 +198,11 @@ pub struct ExternalAgentIdentity {
 }
 
 pub async fn mcp_list_servers(State(state): State<AppState>) -> Json<McpListServersResponse> {
-    Json(build_mcp_list_servers_response(&state.config.lock()))
+    Json(build_mcp_list_servers_response(&state.config.load_full()))
 }
 
 pub async fn mcp_initialize(State(state): State<AppState>) -> Json<McpInitializeResponse> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     Json(McpInitializeResponse {
         protocol_version: MCP_PROTOCOL_VERSION,
         server_info: McpServerInfo {
@@ -218,7 +218,7 @@ pub async fn mcp_initialize(State(state): State<AppState>) -> Json<McpInitialize
 }
 
 pub async fn mcp_tools_list(State(state): State<AppState>) -> Json<Vec<McpExposedTool>> {
-    Json(exposed_tools(&state.config.lock()))
+    Json(exposed_tools(&state.config.load_full()))
 }
 
 pub async fn mcp_tools_call(
@@ -226,7 +226,7 @@ pub async fn mcp_tools_call(
     headers: HeaderMap,
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<Json<McpToolCallResponse>, (StatusCode, Json<Value>)> {
-    let config = state.config.lock().clone();
+    let config = state.config.load_full().clone();
     if !(config.modules.mcp_server && config.mcp_server.enabled) {
         return Err(json_error(StatusCode::FORBIDDEN, "mcp server tool calls are disabled"));
     }
@@ -293,7 +293,7 @@ pub async fn a2a_identity(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<A2aIdentityResponse>, (StatusCode, Json<Value>)> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     if !peer_issuer_allowed(&headers, &config.a2a) {
         return Err(json_error(
             StatusCode::FORBIDDEN,
@@ -307,7 +307,7 @@ pub async fn a2a_discover(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<A2aIdentityResponse>, (StatusCode, Json<Value>)> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     if !peer_issuer_allowed(&headers, &config.a2a) {
         return Err(json_error(
             StatusCode::FORBIDDEN,
@@ -323,7 +323,7 @@ pub async fn a2a_discover(
 /// card TTL so peers honour the same lifetime as `expires_at`.
 pub async fn well_known_agent_json(State(state): State<AppState>) -> Response {
     let (card, ttl) = {
-        let config = state.config.lock();
+        let config = state.config.load_full();
         (build_signed_agent_card(&config), config.a2a.card_ttl_seconds)
     };
     let cache = format!("max-age={ttl}");
@@ -333,7 +333,7 @@ pub async fn well_known_agent_json(State(state): State<AppState>) -> Response {
 /// `GET /a2a/v1/.well-known/jwks.json` — publishes the Ed25519 verification key
 /// for the Agent Card JWS so peers can verify card authenticity.
 pub async fn a2a_jwks(State(state): State<AppState>) -> Result<Json<A2aJwks>, (StatusCode, Json<Value>)> {
-    let config = state.config.lock();
+    let config = state.config.load_full();
     let signer = resolve_card_signer(&config.a2a)
         .ok_or_else(|| json_error(StatusCode::INTERNAL_SERVER_ERROR, "card signing key is unavailable"))?;
     Ok(Json(signer.jwks()))

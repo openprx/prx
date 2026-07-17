@@ -219,21 +219,7 @@ pub const fn is_raw_debug_enabled(enabled: bool) -> bool {
 /// RAII lock-file guard used by JSONL mutation paths.
 #[derive(Debug)]
 pub struct FileLockGuard {
-    lock_path: PathBuf,
-}
-
-impl Drop for FileLockGuard {
-    fn drop(&mut self) {
-        if let Err(err) = std::fs::remove_file(&self.lock_path) {
-            if err.kind() != std::io::ErrorKind::NotFound {
-                tracing::debug!(
-                    path = %self.lock_path.display(),
-                    error = %err,
-                    "failed to remove file lock"
-                );
-            }
-        }
-    }
+    _file: std::fs::File,
 }
 
 /// Acquire an exclusive lock-file beside `path` with bounded wait.
@@ -244,22 +230,27 @@ pub async fn acquire_file_lock(path: &Path) -> Result<FileLockGuard> {
         "{}.lock",
         path.extension().and_then(|v| v.to_str()).unwrap_or("file")
     ));
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open file lock: {}", lock_path.display()))?;
 
     let start = Instant::now();
     loop {
-        match OpenOptions::new().create_new(true).write(true).open(&lock_path).await {
-            Ok(mut lock_file) => {
-                lock_file.write_all(b"lock").await?;
-                lock_file.flush().await?;
-                return Ok(FileLockGuard { lock_path });
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+        match lock_file.try_lock() {
+            Ok(()) => return Ok(FileLockGuard { _file: lock_file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
                 if start.elapsed() > Duration::from_secs(5) {
                     bail!("timed out waiting for file lock: {}", path.display());
                 }
                 sleep(Duration::from_millis(20)).await;
             }
-            Err(err) => return Err(err.into()),
+            Err(std::fs::TryLockError::Error(error)) => {
+                return Err(error).with_context(|| format!("failed to acquire file lock: {}", lock_path.display()));
+            }
         }
     }
 }

@@ -400,7 +400,10 @@ mod tests {
     fn authoritative_checksum_mismatch_is_non_success() {
         let conn = Connection::open_in_memory().unwrap();
         create_authoritative_table(&conn);
-        let (_, name, _) = SqliteMemory::memory_schema_migration_registry()[0];
+        let (_, name, _) = SqliteMemory::memory_schema_migration_registry()
+            .first()
+            .copied()
+            .expect("migration registry must contain its baseline");
         conn.execute(
             "INSERT INTO memory_schema_migrations (version, name, checksum, applied_at) VALUES (1, ?1, 'bad', ?2)",
             params![name, Utc::now().to_rfc3339()],
@@ -450,7 +453,13 @@ mod tests {
         insert_sqlite_registry_row(&conn, 1);
         let status = status_sqlite(&conn).unwrap();
         assert_eq!(status.legacy_applied.len(), 1);
-        assert_eq!(status.legacy_applied[0].version, "PRX-2026.05-000");
+        assert_eq!(
+            status
+                .legacy_applied
+                .first()
+                .map(|migration| migration.version.as_str()),
+            Some("PRX-2026.05-000")
+        );
     }
 
     #[test]

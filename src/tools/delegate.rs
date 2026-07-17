@@ -60,6 +60,8 @@ struct DelegateScope {
     topic_id: Option<String>,
     task_id: Option<String>,
     source_message_event_id: Option<String>,
+    config_generation_id: Option<u64>,
+    config_source_revision: Option<String>,
 }
 
 fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
@@ -124,6 +126,13 @@ fn parse_delegate_scope(args: &serde_json::Value) -> Option<DelegateScope> {
         source_message_event_id: scope
             .get("message_event_id")
             .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        config_generation_id: scope.get("config_generation_id").and_then(serde_json::Value::as_u64),
+        config_source_revision: scope
+            .get("config_source_revision")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -279,6 +288,8 @@ fn delegate_event_scope(
         if let Some(source_message_event_id) = &scope.source_message_event_id {
             envelope = envelope.with_source_message_event_id(source_message_event_id.clone());
         }
+        envelope.config_generation_id = scope.config_generation_id;
+        envelope.config_source_revision = scope.config_source_revision.clone();
     }
     envelope.message_scope()
 }
@@ -582,6 +593,7 @@ impl Tool for DelegateTool {
             if let Some(fabric) = memory_fabric.as_ref() {
                 finalize_delegate_turn(
                     fabric,
+                    &self.security.workspace_dir,
                     event_scope.clone(),
                     &delegate_run_id,
                     provider_outcome,
@@ -640,6 +652,7 @@ impl Tool for DelegateTool {
                     );
                     finalize_delegate_turn(
                         fabric,
+                        &self.security.workspace_dir,
                         event_scope.clone(),
                         &delegate_run_id,
                         provider_outcome,
@@ -688,6 +701,7 @@ impl Tool for DelegateTool {
                     );
                     finalize_delegate_turn(
                         fabric,
+                        &self.security.workspace_dir,
                         event_scope.clone(),
                         &delegate_run_id,
                         provider_outcome,
@@ -725,6 +739,7 @@ impl Tool for DelegateTool {
                     );
                     finalize_delegate_turn(
                         fabric,
+                        &self.security.workspace_dir,
                         event_scope.clone(),
                         &delegate_run_id,
                         provider_outcome,
@@ -794,6 +809,7 @@ async fn record_delegate_result_event(
 
 async fn finalize_delegate_turn(
     fabric: &MemoryFabric,
+    workspace_dir: &std::path::Path,
     scope: MessageEventScope,
     run_id: &str,
     provider_outcome: crate::llm::route_decision::ProviderExecutionOutcome,
@@ -831,6 +847,7 @@ async fn finalize_delegate_turn(
             },
         },
         &crate::config::schema::CostConfig::default(),
+        workspace_dir,
     )
     .await
     {
@@ -976,6 +993,8 @@ impl DelegateTool {
             topic_id: scope.topic_id.as_deref(),
             task_id: scope.task_id.as_deref(),
             source_message_event_id: scope.source_message_event_id.as_deref(),
+            config_generation_id: scope.config_generation_id,
+            config_source_revision: scope.config_source_revision.as_deref(),
         });
         let resolved_compaction = self.resolve_child_compaction(effective_provider, effective_model);
         tracing::debug!(
@@ -1696,6 +1715,8 @@ mod tests {
             topic_id: Some("topic-a".to_string()),
             task_id: Some("task-a".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
+            config_generation_id: Some(17),
+            config_source_revision: Some("revision-17".to_string()),
         };
         let event_scope = delegate_event_scope("/tmp/ws", "run-delegate", "tester", Some(&scope));
 
@@ -1706,6 +1727,8 @@ mod tests {
             Some("delegate:telegram:chat-1:alice")
         );
         assert_eq!(event_scope.run_id.as_deref(), Some("run-delegate"));
+        assert_eq!(event_scope.config_generation_id, Some(17));
+        assert_eq!(event_scope.config_source_revision.as_deref(), Some("revision-17"));
         assert_eq!(event_scope.agent_id.as_deref(), Some("tester"));
         assert_eq!(event_scope.sender.as_deref(), Some("alice"));
         assert_eq!(event_scope.recipient.as_deref(), Some("chat-1"));
@@ -1724,7 +1747,9 @@ mod tests {
                 "owner_id": "owner:/tmp/ws:telegram:alice",
                 "topic_id": "topic-a",
                 "task_id": "task-a",
-                "source_message_event_id": "msg-a"
+                "source_message_event_id": "msg-a",
+                "config_generation_id": 17,
+                "config_source_revision": "revision-17"
             }
         }))
         .expect("trusted scope should parse");
@@ -1733,6 +1758,8 @@ mod tests {
         assert_eq!(scope.topic_id.as_deref(), Some("topic-a"));
         assert_eq!(scope.task_id.as_deref(), Some("task-a"));
         assert_eq!(scope.source_message_event_id.as_deref(), Some("msg-a"));
+        assert_eq!(scope.config_generation_id, Some(17));
+        assert_eq!(scope.config_source_revision.as_deref(), Some("revision-17"));
     }
 
     #[tokio::test]

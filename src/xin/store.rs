@@ -17,6 +17,13 @@ use uuid::Uuid;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024;
 const TRUNCATED_MARKER: &str = "\n...[truncated]";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XinTaskLease {
+    pub worker_id: String,
+    pub epoch: u64,
+    pub expires_at: DateTime<Utc>,
+}
+
 // ── CRUD ────────────────────────────────────────────────────────────────
 
 /// Insert a new task and return the persisted record.
@@ -276,38 +283,141 @@ pub fn update_task(config: &Config, task_id: &str, patch: &XinTaskPatch) -> Resu
     get_task(config, task_id)
 }
 
-/// Atomically claim a task for execution.
+/// Atomically claim a legacy task with a monotonically increasing lease epoch.
 ///
-/// Only transitions tasks that are still in a claimable state (`pending` or `stale`)
-/// AND enabled. Returns `true` if the claim succeeded, `false` if another worker
-/// already claimed it or it was disabled in the meantime.
-pub fn claim_task(config: &Config, task_id: &str) -> Result<bool> {
-    let now = Utc::now();
-    let changed = with_connection(config, |conn| {
+/// The returned token is required by renew and terminal commit operations, so
+/// an expired prior owner cannot commit after another worker reclaims the task.
+pub fn claim_task_with_lease(
+    config: &Config,
+    task_id: &str,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<Option<XinTaskLease>> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let expires_at = now + chrono::Duration::seconds(i64::try_from(lease_ttl_secs.max(1)).unwrap_or(i64::MAX));
         let changed = conn
             .execute(
                 "UPDATE xin_tasks
-             SET status = 'running', updated_at = ?1
-             WHERE id = ?2 AND status IN ('pending', 'stale') AND enabled = 1",
-                params![now.to_rfc3339(), task_id],
+                 SET status = 'running',
+                     lease_owner = ?1,
+                     lease_epoch = lease_epoch + 1,
+                     lease_expires_at = ?2,
+                     last_heartbeat_at = ?3,
+                     updated_at = ?3
+                 WHERE id = ?4 AND status IN ('pending', 'stale') AND enabled = 1",
+                params![worker_id, expires_at.to_rfc3339(), now.to_rfc3339(), task_id],
             )
             .context("Failed to claim xin task")?;
-        if changed > 0 {
-            if let Some(lineage) = load_task_lineage(conn, task_id)? {
-                insert_task_event(
-                    conn,
-                    &workspace_id(config),
-                    task_id,
-                    lineage,
-                    "xin.task.claimed",
-                    Some("running"),
-                    None,
-                )?;
-            }
+        if changed == 0 {
+            return Ok(None);
         }
-        Ok(changed)
-    })?;
-    Ok(changed > 0)
+        let epoch_i64: i64 = conn.query_row(
+            "SELECT lease_epoch FROM xin_tasks WHERE id = ?1",
+            params![task_id],
+            |row| row.get(0),
+        )?;
+        let epoch = u64::try_from(epoch_i64).context("xin task lease epoch is negative")?;
+        if let Some(lineage) = load_task_lineage(conn, task_id)? {
+            insert_task_event(
+                conn,
+                &workspace_id(config),
+                task_id,
+                lineage,
+                "xin.task.claimed",
+                Some("running"),
+                Some(
+                    serde_json::json!({
+                        "lease_owner": worker_id,
+                        "lease_epoch": epoch,
+                        "lease_expires_at": expires_at.to_rfc3339(),
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
+            )?;
+        }
+        Ok(Some(XinTaskLease {
+            worker_id: worker_id.to_string(),
+            epoch,
+            expires_at,
+        }))
+    })
+}
+
+/// Compatibility claim for callers that do not commit a production execution.
+#[cfg(test)]
+pub fn claim_task(config: &Config, task_id: &str) -> Result<bool> {
+    Ok(claim_task_with_lease(config, task_id, "legacy-compat", 3600)?.is_some())
+}
+
+pub fn renew_task_lease_generation(
+    config: &Config,
+    task_id: &str,
+    lease: &XinTaskLease,
+    lease_ttl_secs: u64,
+) -> Result<Option<XinTaskLease>> {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let expires_at = now + chrono::Duration::seconds(i64::try_from(lease_ttl_secs.max(1)).unwrap_or(i64::MAX));
+        let changed = conn.execute(
+            "UPDATE xin_tasks
+             SET lease_expires_at = ?1, last_heartbeat_at = ?2, updated_at = ?2
+             WHERE id = ?3 AND status = 'running'
+               AND lease_owner = ?4 AND lease_epoch = ?5
+               AND lease_expires_at > ?2",
+            params![
+                expires_at.to_rfc3339(),
+                now.to_rfc3339(),
+                task_id,
+                lease.worker_id,
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX),
+            ],
+        )?;
+        Ok((changed > 0).then(|| XinTaskLease {
+            worker_id: lease.worker_id.clone(),
+            epoch: lease.epoch,
+            expires_at,
+        }))
+    })
+}
+
+pub fn task_lease_is_current(config: &Config, task_id: &str, lease: &XinTaskLease, now: DateTime<Utc>) -> Result<bool> {
+    with_connection(config, |conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM xin_tasks
+             WHERE id = ?1 AND status = 'running'
+               AND lease_owner = ?2 AND lease_epoch = ?3
+               AND lease_expires_at > ?4",
+            params![
+                task_id,
+                lease.worker_id,
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX),
+                now.to_rfc3339(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count == 1)
+    })
+}
+
+pub fn step_lease_is_current(config: &Config, step_id: &str, lease: &XinStepLease, now: DateTime<Utc>) -> Result<bool> {
+    with_connection(config, |conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM xin_steps
+             WHERE id = ?1 AND status IN ('claimed', 'running')
+               AND lease_owner = ?2 AND lease_epoch = ?3
+               AND lease_expires_at > ?4",
+            params![
+                step_id,
+                lease.worker_id,
+                i64::try_from(lease.epoch).unwrap_or(i64::MAX),
+                now.to_rfc3339(),
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(count == 1)
+    })
 }
 
 /// Mark a task as completed after successful execution.
@@ -458,23 +568,34 @@ pub fn remove_completed(config: &Config) -> Result<usize> {
 
 /// Mark running tasks as stale if they exceeded `stale_timeout_minutes`.
 pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> {
-    let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
-    with_connection(config, |conn| {
+    with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let cutoff = now - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
         let mut stmt = conn.prepare(
             "SELECT id FROM xin_tasks
-             WHERE status = 'running' AND updated_at < ?1",
+             WHERE status = 'running'
+               AND (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?1)
+                    OR (lease_expires_at IS NULL AND updated_at < ?2)
+               )",
         )?;
         let ids = stmt
-            .query_map(params![cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+            .query_map(params![now.to_rfc3339(), cutoff.to_rfc3339()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
         let changed = conn
             .execute(
                 "UPDATE xin_tasks
-             SET status = 'stale', updated_at = ?1
-             WHERE status = 'running' AND updated_at < ?2",
-                params![Utc::now().to_rfc3339(), cutoff.to_rfc3339()],
+             SET status = 'stale', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+             WHERE status = 'running'
+               AND (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?1)
+                    OR (lease_expires_at IS NULL AND updated_at < ?2)
+               )",
+                params![now.to_rfc3339(), cutoff.to_rfc3339()],
             )
             .context("Failed to mark stale xin tasks")?;
         for task_id in ids {
@@ -500,24 +621,35 @@ pub(crate) fn mark_stale_system_tasks_in_namespace(
     stale_timeout_minutes: u32,
     namespace_prefix: &str,
 ) -> Result<usize> {
-    let cutoff = Utc::now() - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
     let pattern = format!("{namespace_prefix}%");
     with_immediate_connection(config, |conn| {
+        let now = authoritative_now(conn)?;
+        let cutoff = now - chrono::Duration::minutes(i64::from(stale_timeout_minutes));
         let mut stmt = conn.prepare(
             "SELECT id FROM xin_tasks
              WHERE kind = 'system' AND name LIKE ?1
-               AND status = 'running' AND updated_at < ?2",
+               AND status = 'running'
+               AND (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?2)
+                    OR (lease_expires_at IS NULL AND updated_at < ?3)
+               )",
         )?;
         let ids = stmt
-            .query_map(params![pattern, cutoff.to_rfc3339()], |row| row.get::<_, String>(0))?
+            .query_map(params![pattern, now.to_rfc3339(), cutoff.to_rfc3339()], |row| {
+                row.get::<_, String>(0)
+            })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
 
-        let now = Utc::now();
         let changed = conn.execute(
-            "UPDATE xin_tasks SET status = 'stale', updated_at = ?1
+            "UPDATE xin_tasks
+             SET status = 'stale', lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
              WHERE kind = 'system' AND name LIKE ?2
-               AND status = 'running' AND updated_at < ?3",
+               AND status = 'running'
+               AND (
+                    (lease_expires_at IS NOT NULL AND lease_expires_at <= ?1)
+                    OR (lease_expires_at IS NULL AND updated_at < ?3)
+               )",
             params![now.to_rfc3339(), pattern, cutoff.to_rfc3339()],
         )?;
         for task_id in ids {
@@ -644,6 +776,7 @@ pub(crate) fn disable_system_tasks_except(
 pub fn commit_task_execution(
     config: &Config,
     task_id: &str,
+    lease: &XinTaskLease,
     success: bool,
     output: &str,
     started_at: DateTime<Utc>,
@@ -667,18 +800,36 @@ pub fn commit_task_execution(
             conn.execute(
                 "UPDATE xin_tasks
                  SET status = 'completed', last_run_at = ?1, last_status = 'ok',
-                     last_output = ?2, run_count = run_count + 1, updated_at = ?1
-                 WHERE id = ?3 AND status = 'running'",
-                params![finished_at.to_rfc3339(), bounded, task_id],
+                     last_output = ?2, run_count = run_count + 1,
+                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+                 WHERE id = ?3 AND status = 'running'
+                   AND lease_owner = ?4 AND lease_epoch = ?5
+                   AND lease_expires_at > ?1",
+                params![
+                    finished_at.to_rfc3339(),
+                    bounded,
+                    task_id,
+                    lease.worker_id,
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX),
+                ],
             )?
         } else {
             conn.execute(
                 "UPDATE xin_tasks
                  SET status = 'failed', last_run_at = ?1, last_status = 'error',
                      last_output = ?2, run_count = run_count + 1,
-                     fail_count = fail_count + 1, updated_at = ?1
-                 WHERE id = ?3 AND status = 'running'",
-                params![finished_at.to_rfc3339(), bounded, task_id],
+                     fail_count = fail_count + 1,
+                     lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1
+                 WHERE id = ?3 AND status = 'running'
+                   AND lease_owner = ?4 AND lease_epoch = ?5
+                   AND lease_expires_at > ?1",
+                params![
+                    finished_at.to_rfc3339(),
+                    bounded,
+                    task_id,
+                    lease.worker_id,
+                    i64::try_from(lease.epoch).unwrap_or(i64::MAX),
+                ],
             )?
         };
         if changed == 0 {
@@ -699,7 +850,15 @@ pub fn commit_task_execution(
                 lineage,
                 result_event_type,
                 Some(result_status),
-                Some(serde_json::json!({ "output": bounded }).to_string()).as_deref(),
+                Some(
+                    serde_json::json!({
+                        "output": bounded,
+                        "lease_owner": lease.worker_id,
+                        "lease_epoch": lease.epoch,
+                    })
+                    .to_string(),
+                )
+                .as_deref(),
             )?;
         }
 
@@ -1513,7 +1672,7 @@ pub fn fail_step(config: &Config, step_id: &str, output: &str) -> Result<()> {
 /// Reset steps whose lease expired (while claimed/running) back to `stale` so
 /// they can be re-claimed. Returns the affected step ids.
 pub fn mark_steps_stale(config: &Config, now: DateTime<Utc>) -> Result<Vec<String>> {
-    with_connection(config, |conn| {
+    with_immediate_connection(config, |conn| {
         let mut stmt = conn.prepare(
             "SELECT id FROM xin_steps
              WHERE status IN ('claimed', 'running')
@@ -2252,7 +2411,11 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
             fail_count       INTEGER NOT NULL DEFAULT 0,
             max_failures     INTEGER NOT NULL DEFAULT 0,
             enabled          INTEGER NOT NULL DEFAULT 1,
-            approval_grant_json TEXT
+            approval_grant_json TEXT,
+            lease_owner      TEXT,
+            lease_epoch      INTEGER NOT NULL DEFAULT 0,
+            lease_expires_at TEXT,
+            last_heartbeat_at TEXT
          );
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_next_run ON xin_tasks(next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_status ON xin_tasks(status);
@@ -2376,6 +2539,10 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     add_column_if_missing(&conn, "xin_tasks", "parent_task_id", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "source_message_event_id", "TEXT")?;
     add_column_if_missing(&conn, "xin_tasks", "approval_grant_json", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "lease_owner", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "lease_epoch", "INTEGER NOT NULL DEFAULT 0")?;
+    add_column_if_missing(&conn, "xin_tasks", "lease_expires_at", "TEXT")?;
+    add_column_if_missing(&conn, "xin_tasks", "last_heartbeat_at", "TEXT")?;
     add_column_if_missing(&conn, "xin_task_events", "source_message_event_id", "TEXT")?;
     // Forward-compat for any xin_steps table created before lease_ttl_secs existed.
     add_column_if_missing(&conn, "xin_steps", "lease_ttl_secs", "INTEGER NOT NULL DEFAULT 0")?;
@@ -2383,7 +2550,9 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&Connection) -> Result<T>)
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_xin_tasks_owner ON xin_tasks(owner_id, status, next_run_at);
          CREATE INDEX IF NOT EXISTS idx_xin_tasks_topic ON xin_tasks(topic_id, status, next_run_at);
-         CREATE INDEX IF NOT EXISTS idx_xin_tasks_parent ON xin_tasks(parent_task_id, id);",
+         CREATE INDEX IF NOT EXISTS idx_xin_tasks_parent ON xin_tasks(parent_task_id, id);
+         CREATE INDEX IF NOT EXISTS idx_xin_tasks_lease ON xin_tasks(status, lease_expires_at);
+         CREATE INDEX IF NOT EXISTS idx_xin_tasks_lease_owner ON xin_tasks(lease_owner, status);",
     )
     .context("Failed to initialize xin lineage indexes")?;
 
@@ -2665,11 +2834,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let task = add_task(&config, &recurring_task()).unwrap();
-        assert!(claim_task(&config, &task.id).unwrap());
+        let lease = claim_task_with_lease(&config, &task.id, "test-worker", 60)
+            .unwrap()
+            .expect("claimed");
 
         let started_at = Utc::now();
         let finished_at = started_at + chrono::Duration::seconds(2);
-        assert!(commit_task_execution(&config, &task.id, true, "healthy", started_at, finished_at, 2_000,).unwrap());
+        assert!(
+            commit_task_execution(
+                &config,
+                &task.id,
+                &lease,
+                true,
+                "healthy",
+                started_at,
+                finished_at,
+                2_000,
+            )
+            .unwrap()
+        );
 
         let committed = get_task(&config, &task.id).unwrap();
         assert_eq!(committed.status, TaskStatus::Pending);
@@ -2713,7 +2896,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp);
         let task = add_task(&config, &recurring_task()).unwrap();
-        assert!(claim_task(&config, &task.id).unwrap());
+        let lease = claim_task_with_lease(&config, &task.id, "test-worker", 60)
+            .unwrap()
+            .expect("claimed");
         let conn = open_xin_test_connection(&config);
         conn.execute_batch(
             "CREATE TRIGGER fail_xin_outbox
@@ -2727,6 +2912,7 @@ mod tests {
         let result = commit_task_execution(
             &config,
             &task.id,
+            &lease,
             true,
             "must roll back",
             started_at,
@@ -3033,11 +3219,11 @@ mod tests {
         let claimed = claim_task(&config, &task.id).unwrap();
         assert!(claimed);
 
-        // Backdate updated_at to simulate a long-running task
+        // Expire the exact lease to simulate a crashed long-running task.
         with_connection(&config, |conn| {
             let old = (Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
             conn.execute(
-                "UPDATE xin_tasks SET updated_at = ?1 WHERE id = ?2",
+                "UPDATE xin_tasks SET lease_expires_at = ?1 WHERE id = ?2",
                 params![old, task.id],
             )?;
             Ok(())
@@ -3049,6 +3235,69 @@ mod tests {
 
         let stale = get_task(&config, &task.id).unwrap();
         assert_eq!(stale.status, TaskStatus::Stale);
+    }
+
+    #[test]
+    fn reclaimed_legacy_task_rejects_old_owner_terminal_commit() {
+        let tmp = TempDir::new().unwrap();
+        let config = test_config(&tmp);
+        let task = add_task(&config, &sample_task()).unwrap();
+        let old_lease = claim_task_with_lease(&config, &task.id, "worker-a", 60)
+            .unwrap()
+            .expect("first claim");
+        with_connection(&config, |conn| {
+            conn.execute(
+                "UPDATE xin_tasks SET lease_expires_at = ?1 WHERE id = ?2",
+                params![(Utc::now() - chrono::Duration::seconds(1)).to_rfc3339(), task.id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(mark_stale(&config, 60).unwrap(), 1);
+        let current_lease = claim_task_with_lease(&config, &task.id, "worker-b", 60)
+            .unwrap()
+            .expect("reclaim");
+        assert!(current_lease.epoch > old_lease.epoch);
+
+        let started_at = Utc::now();
+        let finished_at = started_at + chrono::Duration::milliseconds(1);
+        assert!(
+            !commit_task_execution(
+                &config,
+                &task.id,
+                &old_lease,
+                true,
+                "stale owner",
+                started_at,
+                finished_at,
+                1,
+            )
+            .unwrap()
+        );
+        assert!(
+            commit_task_execution(
+                &config,
+                &task.id,
+                &current_lease,
+                true,
+                "current owner",
+                started_at,
+                finished_at,
+                1,
+            )
+            .unwrap()
+        );
+
+        let committed = get_task(&config, &task.id).unwrap();
+        assert_eq!(committed.status, TaskStatus::Completed);
+        assert_eq!(committed.last_output.as_deref(), Some("current owner"));
+        assert_eq!(committed.run_count, 1);
+        let terminal_events = list_task_events(&config, &task.id)
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.event_type == "xin.task.completed")
+            .count();
+        assert_eq!(terminal_events, 1);
     }
 
     #[test]
@@ -3065,7 +3314,7 @@ mod tests {
         with_connection(&config, |conn| {
             let old = (Utc::now() - chrono::Duration::minutes(120)).to_rfc3339();
             conn.execute(
-                "UPDATE xin_tasks SET updated_at = ?1 WHERE id IN (?2, ?3)",
+                "UPDATE xin_tasks SET lease_expires_at = ?1 WHERE id IN (?2, ?3)",
                 params![old, regular.id, heartbeat.id],
             )?;
             Ok(())
@@ -3630,7 +3879,7 @@ mod tests {
         assert!(claim_task(&config, &task.id).unwrap());
         let conn = open_xin_test_connection(&config);
         conn.execute(
-            "UPDATE xin_tasks SET updated_at = ?1 WHERE id = ?2",
+            "UPDATE xin_tasks SET lease_expires_at = ?1 WHERE id = ?2",
             params![(Utc::now() - chrono::Duration::hours(2)).to_rfc3339(), task.id],
         )
         .unwrap();

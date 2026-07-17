@@ -826,6 +826,7 @@ mod tests {
         // Supervised + require_approval_for_medium_risk (the default) denies a
         // Medium-risk evolution commit when no runtime grant is present.
         let policy = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Supervised,
             workspace_dir: dir.path().to_path_buf(),
             ..SecurityPolicy::default()
         });

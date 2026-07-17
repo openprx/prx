@@ -4,8 +4,8 @@ use crate::channels::{
 use crate::config::Config;
 use crate::cron::{
     CronClaim, CronJob, DeliveryConfig, JobType, Schedule, SessionTarget, claim_job_if_current, due_jobs,
-    finish_claimed_run, finish_claimed_run_preserving_schedule, next_run_for_schedule, record_claim_lost,
-    record_terminal_manual_run, renew_job_claim,
+    finish_claimed_run, finish_claimed_run_preserving_schedule, job_claim_is_current, next_run_for_schedule,
+    record_claim_lost, record_terminal_manual_run, renew_job_claim,
 };
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::policy::ApprovalGrant;
@@ -19,6 +19,11 @@ use tokio::time::{self, Duration};
 const MIN_POLL_SECONDS: u64 = 5;
 const SHELL_JOB_TIMEOUT_SECS: u64 = 120;
 const SCHEDULER_COMPONENT: &str = "scheduler";
+
+tokio::task_local! {
+    static CONFIG_GENERATION: Arc<crate::config::ConfigGeneration>;
+    static CONFIG_MANAGER: crate::config::SharedConfig;
+}
 
 #[derive(Clone, Copy)]
 enum ShellAuthorization<'a> {
@@ -40,6 +45,27 @@ impl SchedulerRuntimeIdentity {
 }
 
 pub async fn run(config: Config) -> Result<()> {
+    run_loop(config).await
+}
+
+pub async fn run_with_config_generation(
+    config: Config,
+    generation: Arc<crate::config::ConfigGeneration>,
+) -> Result<()> {
+    CONFIG_GENERATION.scope(generation, run_loop(config)).await
+}
+
+pub async fn run_with_config_generation_manager(
+    config: Config,
+    generation: Arc<crate::config::ConfigGeneration>,
+    manager: crate::config::SharedConfig,
+) -> Result<()> {
+    CONFIG_MANAGER
+        .scope(manager, CONFIG_GENERATION.scope(generation, run_loop(config)))
+        .await
+}
+
+async fn run_loop(config: Config) -> Result<()> {
     let poll_secs = config.reliability.scheduler_poll_secs.max(MIN_POLL_SECONDS);
     let mut interval = time::interval(Duration::from_secs(poll_secs));
     interval.set_missed_tick_behavior(time::MissedTickBehavior::Skip);
@@ -49,6 +75,7 @@ pub async fn run(config: Config) -> Result<()> {
     let identity = SchedulerRuntimeIdentity::new();
 
     crate::health::mark_component_ok(SCHEDULER_COMPONENT);
+    wait_for_generation_activation().await;
 
     loop {
         interval.tick().await;
@@ -65,6 +92,18 @@ pub async fn run(config: Config) -> Result<()> {
         };
 
         process_due_jobs_for_worker(&config, &security, jobs, SCHEDULER_COMPONENT, &identity.worker_id).await;
+    }
+}
+
+async fn wait_for_generation_activation() {
+    let Ok(generation_id) = CONFIG_GENERATION.try_with(|generation| generation.id) else {
+        return;
+    };
+    let Ok(manager) = CONFIG_MANAGER.try_with(Arc::clone) else {
+        return;
+    };
+    while manager.active_generation_id() != generation_id {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -113,6 +152,7 @@ async fn execute_job_with_retry(
         job,
         tool_name,
         ShellAuthorization::Authorize { grant: approval_grant },
+        None,
     )
     .await
 }
@@ -123,6 +163,7 @@ async fn execute_job_with_retry_authorization(
     job: &CronJob,
     tool_name: &str,
     authorization: ShellAuthorization<'_>,
+    claim: Option<&CronClaim>,
 ) -> (bool, String) {
     let mut last_output = String::new();
     let retries = config.reliability.scheduler_retries;
@@ -131,7 +172,7 @@ async fn execute_job_with_retry_authorization(
     for attempt in 0..=retries {
         let (success, output) = match job.job_type {
             JobType::Shell => run_job_command_authorization(config, security, job, tool_name, authorization).await,
-            JobType::Agent => run_agent_job(config, security, job).await,
+            JobType::Agent => run_agent_job(config, security, job, claim).await,
         };
         last_output = output;
 
@@ -303,9 +344,17 @@ async fn run_claimed_job(
     let mut renewal = time::interval_at(time::Instant::now() + renew_every, renew_every);
     let claim_state = Arc::new(parking_lot::Mutex::new(claim));
     let workflow_claim = Arc::clone(&claim_state);
+    let workflow_authority = claim_state.lock().clone();
     let mut workflow = Box::pin(async move {
-        let (success, output) =
-            execute_job_with_retry_authorization(config, security, job, tool_name, authorization).await;
+        let (success, output) = execute_job_with_retry_authorization(
+            config,
+            security,
+            job,
+            tool_name,
+            authorization,
+            Some(&workflow_authority),
+        )
+        .await;
         let finished_at = Utc::now();
         let persisted = persist_job_result(
             config,
@@ -433,7 +482,12 @@ fn record_lost_claim_best_effort(
     }
 }
 
-async fn run_agent_job(config: &Config, security: &SecurityPolicy, job: &CronJob) -> (bool, String) {
+async fn run_agent_job(
+    config: &Config,
+    security: &SecurityPolicy,
+    job: &CronJob,
+    claim: Option<&CronClaim>,
+) -> (bool, String) {
     if !security.can_act() {
         return (false, "blocked by security policy: autonomy is read-only".to_string());
     }
@@ -460,17 +514,46 @@ async fn run_agent_job(config: &Config, security: &SecurityPolicy, job: &CronJob
         cron_config.agent.max_tool_iterations = CRON_MAX_TOOL_ITERATIONS;
     }
 
+    let runtime_envelope = claim.map(|claim| {
+        let guard_config = config.clone();
+        let guard_job_id = job.id.clone();
+        let guard_claim = claim.clone();
+        let authority_guard =
+            crate::memory::RuntimeAuthorityGuard::new(format!("cron:{}:{}", job.id, claim.attempt_id), move || {
+                job_claim_is_current(&guard_config, &guard_job_id, &guard_claim, Utc::now())
+            });
+        let mut envelope = crate::runtime::envelope::RuntimeEnvelope::cron(
+            config.workspace_dir.to_string_lossy().to_string(),
+            job.id.clone(),
+            claim.attempt_id.clone(),
+        )
+        .with_authority_guard(authority_guard);
+        if let Some(owner_id) = job.owner_id.as_deref() {
+            envelope = envelope.with_owner_id(owner_id);
+        }
+        if let Some(topic_id) = job.topic_id.as_deref() {
+            envelope = envelope.with_topic_id(topic_id);
+        }
+        if let Some(source_message_event_id) = job.source_message_event_id.as_deref() {
+            envelope = envelope.with_source_message_event_id(source_message_event_id);
+        }
+        if let Ok(generation) = CONFIG_GENERATION.try_with(Arc::clone) {
+            envelope = envelope.with_config_generation(&generation);
+        }
+        envelope
+    });
     let run_result = match job.session_target {
         SessionTarget::Main | SessionTarget::Isolated => {
             // Background cron job: no cooperative shutdown signal of its own;
             // the scheduler drops/aborts the task. See never_cancelled_shutdown.
-            crate::agent::run(
+            crate::agent::run_with_runtime_envelope(
                 cron_config,
                 Some(prefixed_prompt),
                 None,
                 model_override,
                 config.default_temperature,
                 crate::runtime::shutdown::never_cancelled_shutdown(),
+                runtime_envelope,
             )
             .await
         }
@@ -1205,7 +1288,8 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_disallowed_command() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         let job = test_job("curl https://evil.example");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1219,7 +1303,8 @@ mod tests {
     #[tokio::test]
     async fn run_job_command_blocks_medium_risk_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
-        let config = test_config(&tmp).await;
+        let mut config = test_config(&tmp).await;
+        config.autonomy.level = crate::security::AutonomyLevel::Supervised;
         let job = test_job("touch cron-medium-risk");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
@@ -1351,7 +1436,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("agent job failed:"));
     }
@@ -1366,7 +1451,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("read-only"));
@@ -1382,7 +1467,7 @@ mod tests {
         job.prompt = Some("Say hello".into());
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
-        let (success, output) = run_agent_job(&config, &security, &job).await;
+        let (success, output) = run_agent_job(&config, &security, &job, None).await;
         assert!(!success);
         assert!(output.contains("blocked by security policy"));
         assert!(output.contains("rate limit exceeded"));

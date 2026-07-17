@@ -31,6 +31,7 @@ use crate::security::policy::ResourceRiskLevel;
 use crate::tools::{self, McpTool, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
+use arc_swap::ArcSwap;
 use axum::{
     Router,
     body::Bytes,
@@ -685,12 +686,15 @@ fn authorize_gateway_resource_mutation(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    // D2: authorization reads the hot SharedConfig (D) snapshot, NOT the cached
-    // `state.config` Mutex (C), so a config reload (autonomy / security.audit change)
-    // takes effect at this decision point without a restart. Logic is otherwise
-    // identical to the prior C-based path: same `build_security_policy` construction
-    // (FIX-P1-31 audit-config wiring preserved), same gate, same allow/deny result.
-    let config = state.shared_config.load_full();
+    let config = state.config.load_full();
+    authorize_gateway_config_resource_mutation(&config, operation_name, risk)
+}
+
+fn authorize_gateway_config_resource_mutation(
+    config: &Config,
+    operation_name: &str,
+    risk: ResourceRiskLevel,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
     let policy = crate::runtime::bootstrap::build_security_policy(&config);
     SideEffectGate::new(&policy)
         .authorize_resource_operation("gateway", operation_name, risk, None)
@@ -705,22 +709,8 @@ fn gateway_channel_webhook_operation(channel: &str, action: &str) -> String {
 /// Shared state for all axum handlers
 #[derive(Clone)]
 pub struct AppState {
-    /// Cached config (C) — a NON-authoritative, NON-authorization snapshot.
-    ///
-    /// D2 invariant: **no security / authorization decision may read `config`.**
-    /// All allow/deny gating reads [`shared_config`](Self::shared_config) (D) via
-    /// `load_full()` so config reloads take effect without a restart. `config` is
-    /// kept only for display/persist paths (serving the current config to the Web
-    /// Console, resolving `workspace_dir` for upload paths, persisting paired
-    /// tokens, etc.). Every config mutation route still dual-writes C **and** D
-    /// (holding this Mutex while it `.store()`s D) so the two stay consistent for
-    /// those non-security consumers; see `api/config.rs`.
-    pub config: Arc<Mutex<Config>>,
-    /// ArcSwap-backed hot config (D) — the SINGLE source of truth for every gateway
-    /// authorization decision (P1.5 / P3-1, D2). Updated by the daemon file-watch
-    /// hot-reload manager, the `ConfigReloadTool`, and the `/api/config/reload`
-    /// route; read lock-free via `load_full()` at each authz point.
-    pub shared_config: crate::config::SharedConfig,
+    /// Sole configuration generation owner used by every gateway path.
+    pub config: crate::config::SharedConfig,
     pub provider: Arc<dyn Provider>,
     pub model: String,
     pub temperature: f64,
@@ -730,6 +720,8 @@ pub struct AppState {
     pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
     /// Shared reference to the MCP tool for runtime introspection (discovered tools, etc.).
     pub mcp_tool: Option<Arc<McpTool>>,
+    /// Atomically rebuilt provider/model/tools bundle for newly admitted turns.
+    pub turn_runtime: Option<Arc<GatewayTurnRuntimeOwner>>,
     /// Hook manager for lifecycle events.
     pub hooks: Arc<HookManager>,
     /// SHA-256 hash of `webhook.token` for `X-Webhook-Token` auth.
@@ -763,10 +755,347 @@ pub struct AppState {
     pub plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
 }
 
+pub struct TurnRuntimeGeneration {
+    pub config_generation: Arc<crate::config::ConfigGeneration>,
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub temperature: f64,
+    pub tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    pub mcp_tool: Option<Arc<McpTool>>,
+}
+
+struct ConfigGenerationMessageAuditSink {
+    memory: Arc<dyn Memory>,
+    workspace_id: String,
+}
+
+impl crate::config::ConfigGenerationAuditSink for ConfigGenerationMessageAuditSink {
+    fn record(&self, event: crate::config::ConfigGenerationAuditEvent) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                event_type = %event.event_type,
+                "config generation audit event could not be scheduled outside a Tokio runtime"
+            );
+            return;
+        };
+        let memory = Arc::clone(&self.memory);
+        let workspace_id = self.workspace_id.clone();
+        handle.spawn(async move {
+            let source_revision = event
+                .source_revision
+                .as_ref()
+                .map(|revision| revision.fingerprint_sha256.clone());
+            let raw_payload_json = serde_json::to_string(&event).ok();
+            let input = crate::memory::MessageEventInput {
+                event_id: None,
+                idempotency_key: None,
+                workspace_id,
+                owner_id: Some("system".to_string()),
+                source: crate::memory::MessageEventSource::Other("config".to_string()),
+                channel: Some("daemon".to_string()),
+                session_key: Some("config-generation".to_string()),
+                parent_session_key: None,
+                run_id: event.generation_id.map(|generation| format!("config:{}", generation.0)),
+                parent_run_id: None,
+                agent_id: Some("config-generation-manager".to_string()),
+                persona_id: None,
+                sender: Some("system".to_string()),
+                recipient: Some("runtime".to_string()),
+                role: "event".to_string(),
+                event_type: event.event_type.clone(),
+                subject: None,
+                goal_id: None,
+                causation_event_id: None,
+                correlation_id: None,
+                attempt_id: None,
+                lease_epoch: None,
+                config_generation_id: event.generation_id.map(|generation| generation.0),
+                config_source_revision: source_revision,
+                content: event.payload.to_string(),
+                raw_payload_json,
+                visibility: MemoryVisibility::Workspace,
+            };
+            if let Err(error) = memory.append_message_event(input).await {
+                tracing::warn!(
+                    event_type = %event.event_type,
+                    "failed to append config generation audit event: {error}"
+                );
+            }
+        });
+    }
+}
+
+pub struct GatewayTurnRuntimeOwner {
+    current: Arc<ArcSwap<TurnRuntimeGeneration>>,
+    config: crate::config::SharedConfig,
+    memory: Arc<dyn Memory>,
+    signal: Option<Arc<SignalChannel>>,
+    whatsapp: Option<Arc<WhatsAppChannel>>,
+    linq: Option<Arc<LinqChannel>>,
+    nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    #[cfg(feature = "wasm-plugins")]
+    plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
+}
+
+impl GatewayTurnRuntimeOwner {
+    fn new(
+        current: TurnRuntimeGeneration,
+        config: crate::config::SharedConfig,
+        memory: Arc<dyn Memory>,
+        signal: Option<Arc<SignalChannel>>,
+        whatsapp: Option<Arc<WhatsAppChannel>>,
+        linq: Option<Arc<LinqChannel>>,
+        nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+        #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
+    ) -> Self {
+        Self {
+            current: Arc::new(ArcSwap::from_pointee(current)),
+            config,
+            memory,
+            signal,
+            whatsapp,
+            linq,
+            nextcloud_talk,
+            #[cfg(feature = "wasm-plugins")]
+            plugin_runtime,
+        }
+    }
+
+    fn pin(&self) -> Arc<TurnRuntimeGeneration> {
+        self.current.load_full()
+    }
+
+    fn build(&self, generation: Arc<crate::config::ConfigGeneration>) -> anyhow::Result<TurnRuntimeGeneration> {
+        build_gateway_turn_runtime(
+            generation,
+            Arc::clone(&self.config),
+            Arc::clone(&self.memory),
+            self.signal.clone(),
+            self.whatsapp.clone(),
+            self.linq.clone(),
+            self.nextcloud_talk.clone(),
+            #[cfg(feature = "wasm-plugins")]
+            self.plugin_runtime.clone(),
+        )
+    }
+
+    fn synchronize_to_active(&self) -> anyhow::Result<()> {
+        let active = self.config.pin();
+        if self.current.load().config_generation.id == active.id {
+            return Ok(());
+        }
+        self.current.store(Arc::new(self.build(active)?));
+        Ok(())
+    }
+}
+
+struct PreparedGatewayTurnRuntime {
+    current: Arc<ArcSwap<TurnRuntimeGeneration>>,
+    previous: Arc<TurnRuntimeGeneration>,
+    generation: TurnRuntimeGeneration,
+}
+
+impl crate::config::PreparedConfigGeneration for PreparedGatewayTurnRuntime {
+    fn commit(&mut self) -> anyhow::Result<()> {
+        self.current.store(Arc::new(TurnRuntimeGeneration {
+            config_generation: Arc::clone(&self.generation.config_generation),
+            provider: Arc::clone(&self.generation.provider),
+            model: self.generation.model.clone(),
+            temperature: self.generation.temperature,
+            tools_registry: Arc::clone(&self.generation.tools_registry),
+            mcp_tool: self.generation.mcp_tool.clone(),
+        }));
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        self.current.store(Arc::clone(&self.previous));
+    }
+}
+
+impl crate::config::ConfigGenerationParticipant for GatewayTurnRuntimeOwner {
+    fn name(&self) -> &'static str {
+        "gateway_turn_runtime"
+    }
+
+    fn supports_rebuild_field(&self, _field: &str) -> bool {
+        true
+    }
+
+    fn prepares_for_field(&self, field: &str) -> bool {
+        !crate::config::generation::is_process_restart_only(field)
+            && !crate::config::generation::is_controlled_restart(field)
+    }
+
+    fn prepare(
+        &self,
+        generation: Arc<crate::config::ConfigGeneration>,
+        _changed_fields: &[String],
+    ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+        let runtime = self.build(generation)?;
+        Ok(Box::new(PreparedGatewayTurnRuntime {
+            current: Arc::clone(&self.current),
+            previous: self.current.load_full(),
+            generation: runtime,
+        }))
+    }
+}
+
+impl AppState {
+    fn pin_turn_runtime(&self) -> Arc<TurnRuntimeGeneration> {
+        if let Some(runtime) = &self.turn_runtime {
+            return runtime.pin();
+        }
+        #[cfg(not(test))]
+        {
+            tracing::error!("production gateway state is missing its TurnRuntimeGeneration; aborting");
+            std::process::abort();
+        }
+        #[cfg(test)]
+        Arc::new(TurnRuntimeGeneration {
+            config_generation: self.config.pin(),
+            provider: Arc::clone(&self.provider),
+            model: self.model.clone(),
+            temperature: self.temperature,
+            tools_registry: Arc::clone(&self.tools_registry),
+            mcp_tool: self.mcp_tool.clone(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_gateway_turn_runtime(
+    generation: Arc<crate::config::ConfigGeneration>,
+    shared_config: crate::config::SharedConfig,
+    memory: Arc<dyn Memory>,
+    signal: Option<Arc<SignalChannel>>,
+    whatsapp: Option<Arc<WhatsAppChannel>>,
+    linq: Option<Arc<LinqChannel>>,
+    nextcloud_talk: Option<Arc<NextcloudTalkChannel>>,
+    #[cfg(feature = "wasm-plugins")] plugin_runtime: Option<Arc<crate::plugins::PluginRuntime>>,
+) -> anyhow::Result<TurnRuntimeGeneration> {
+    let config = generation.effective.as_ref();
+    let provider_runtime_options = providers::provider_runtime_options_from_config(config);
+    let provider: Arc<dyn Provider> = Arc::from(providers::create_resilient_provider_with_options(
+        config.default_provider.as_deref().unwrap_or("openrouter"),
+        config.api_key.as_deref(),
+        config.api_url.as_deref(),
+        &config.reliability,
+        &provider_runtime_options,
+    )?);
+    let model = config
+        .default_model
+        .clone()
+        .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
+    let security = crate::runtime::bootstrap::build_security_policy(config);
+    let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (
+            config.composio.api_key.as_deref(),
+            Some(config.composio.entity_id.as_str()),
+        )
+    } else {
+        (None, None)
+    };
+    let tools_result = tools::all_tools_with_runtime_ext(
+        Arc::clone(&generation.effective),
+        Arc::clone(&shared_config),
+        &security,
+        runtime,
+        Arc::clone(&memory),
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        config,
+    );
+    let mut tools_list = tools_result.tools;
+    let mcp_tool = tools_result.mcp_tool;
+
+    if let Some(signal_channel) = &signal {
+        tools_list.push(Box::new(tools::MessageSendTool::new_signal(
+            Arc::clone(signal_channel),
+            security.clone(),
+        )));
+    }
+
+    let spawn_tools_handle = signal.as_ref().map(|signal_channel| {
+        let mut channels_by_name: HashMap<String, Arc<dyn Channel>> = HashMap::new();
+        channels_by_name.insert(
+            signal_channel.name().to_string(),
+            Arc::clone(signal_channel) as Arc<dyn Channel>,
+        );
+        if let Some(channel) = &whatsapp {
+            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+        }
+        if let Some(channel) = &linq {
+            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+        }
+        if let Some(channel) = &nextcloud_talk {
+            channels_by_name.insert(channel.name().to_string(), Arc::clone(channel) as Arc<dyn Channel>);
+        }
+        let provider_name = config.default_provider.as_deref().unwrap_or("openrouter").to_string();
+        let spawn_tool = tools::SessionsSpawnTool::new(
+            Arc::clone(signal_channel) as Arc<dyn Channel>,
+            Arc::clone(&provider),
+            provider_name,
+            model.clone(),
+            config.default_temperature,
+            security.clone(),
+            config.workspace_dir.clone(),
+            config.multimodal.clone(),
+            config.agent.compaction.clone(),
+            config.agents.clone(),
+            config.api_key.clone(),
+            provider_runtime_options,
+            config.sessions_spawn.clone(),
+        )
+        .with_compaction_resolver(crate::router::CompactionResolver::new(
+            config.agent.compaction.clone(),
+            config.router.clone(),
+            config.model_routes.clone(),
+        ))
+        .with_channels(Arc::new(channels_by_name))
+        .with_shared_memory(Arc::clone(&memory))
+        .with_event_recording(config.memory.event_recording_config());
+        let handle = spawn_tool.tools_handle();
+        tools_list.push(Box::new(spawn_tool));
+        handle
+    });
+
+    tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
+        shared_config,
+        security,
+    )));
+
+    #[cfg(feature = "wasm-plugins")]
+    if let Some(runtime) = &plugin_runtime {
+        tools_list.push(runtime.tool_router());
+    }
+
+    let tools_registry = Arc::new(tools_list);
+    if let Some(handle) = spawn_tools_handle {
+        let _ = handle.set(Arc::clone(&tools_registry));
+    }
+
+    let temperature = config.default_temperature;
+    Ok(TurnRuntimeGeneration {
+        config_generation: generation,
+        provider,
+        model,
+        temperature,
+        tools_registry,
+        mcp_tool,
+    })
+}
+
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 ///
-/// `shared_config` is the single SharedConfig snapshot the gateway uses for ALL
-/// authorization decisions (D2). When the gateway runs under the daemon, the
+/// `shared_config` is the single ConfigGeneration owner the gateway uses for all
+/// authorization decisions. When the gateway runs under the daemon, the
 /// daemon owns this handle and also wires it to the file-watch hot-reload manager,
 /// so config.toml edits become visible at every gateway authz point. When invoked
 /// directly via `prx gateway` (no daemon), `None` is passed and the gateway builds
@@ -796,13 +1125,6 @@ pub async fn run_gateway(
              [gateway] allow_public_bind = true in config.toml (NOT recommended)."
         );
     }
-    // C: cached config for display/persist only (see `AppState::config`). It is
-    // NOT read by any authorization path (those read `shared_config`, D). On the
-    // reload-only paths (daemon file-watch + ConfigReloadTool / `/api/config/reload`)
-    // C intentionally lags D: only the explicit `/api/config` POST/PUT routes
-    // dual-write C+D. The lag is display-only and never affects allow/deny.
-    let config_state = Arc::new(Mutex::new(config.clone()));
-
     let addr: SocketAddr = format!("{host}:{port}").parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;
     let actual_port = listener.local_addr()?.port();
@@ -821,6 +1143,7 @@ pub async fn run_gateway(
         .clone()
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let temperature = config.default_temperature;
+    let shared_config_for_reload = shared_config.unwrap_or_else(|| crate::config::new_shared(config.clone()));
     let mem: Arc<dyn Memory> = Arc::from(memory::create_memory_with_storage(
         &config.memory,
         Some(&config.storage.provider.config),
@@ -833,17 +1156,10 @@ pub async fn run_gateway(
     // from (or forget) the audit-config wiring — byte-for-byte identical to the
     // former local from_config + audit-config construction.
     //
-    // D2 SCOPE / restart-only boundary: this `security` is a STARTUP snapshot baked
-    // into every tool instance constructed below (each tool carries its own
-    // `SideEffectGate`). It is therefore **restart-only** — a config reload does NOT
-    // re-arm the security gate already embedded in a live tool. Tool-execution
-    // authorization is per the user-ruled restart-only scope and is intentionally NOT
-    // hot in this increment. What IS hot (reads the SharedConfig D at decision time):
-    // gateway resource-mutation routes (`authorize_gateway_resource_mutation`), the
-    // `/api/*` config-mutation gates (`authorize_resource_mutation`), per-session /
-    // console runtime-turn policies, and the `/api/config/reload` route's own gate.
-    // The cron / webhook / evolution supervisors likewise use a restart-only security
-    // snapshot (their hot-reload is out of this increment's scope).
+    // This policy bootstraps static gateway gates and the initial tool registry.
+    // Gateway turn tools are rebuilt from one candidate ConfigGeneration and swapped
+    // atomically by GatewayTurnRuntimeOwner. Resource-mutation routes independently
+    // pin the manager's active generation at each authorization decision.
     let security = crate::runtime::bootstrap::build_security_policy(&config);
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
@@ -858,6 +1174,7 @@ pub async fn run_gateway(
     // Build the base tool list (mutable so we can append channel-aware tools below)
     let tools_result = tools::all_tools_with_runtime_ext(
         Arc::new(config.clone()),
+        Arc::clone(&shared_config_for_reload),
         &security,
         runtime,
         Arc::clone(&mem),
@@ -998,14 +1315,8 @@ pub async fn run_gateway(
         None
     };
 
-    // D2: the SharedConfig (D) is the single source of truth for all gateway
-    // authorization decisions. Use the daemon-injected handle when present (so the
-    // daemon's file-watch hot-reload is observed here); otherwise build a fallback
-    // for the standalone `prx gateway` path. The ConfigReloadTool and the
-    // `/api/config/reload` route both `.store()` into THIS handle, and every authz
-    // helper reads from it, so a reload is immediately visible to allow/deny.
-    let shared_config_for_reload =
-        shared_config.unwrap_or_else(|| Arc::new(arc_swap::ArcSwap::from_pointee(config.clone())));
+    // The ConfigReloadTool and `/api/config/reload` route both submit candidates to
+    // this same manager; no gateway path can publish configuration directly.
     tools_list.push(Box::new(tools::ConfigReloadTool::with_security(
         Arc::clone(&shared_config_for_reload),
         security.clone(),
@@ -1146,10 +1457,34 @@ pub async fn run_gateway(
     let observer: Arc<dyn crate::observability::Observer> =
         Arc::from(crate::observability::create_observer(&config.observability));
     let (logs_broadcast_tx, _) = broadcast::channel(1024);
+    let turn_runtime_owner = Arc::new(GatewayTurnRuntimeOwner::new(
+        TurnRuntimeGeneration {
+            config_generation: shared_config_for_reload.pin(),
+            provider: Arc::clone(&provider),
+            model: model.clone(),
+            temperature,
+            tools_registry: Arc::clone(&tools_registry),
+            mcp_tool: mcp_tool.clone(),
+        },
+        Arc::clone(&shared_config_for_reload),
+        Arc::clone(&mem),
+        signal_channel.clone(),
+        whatsapp_channel.clone(),
+        linq_channel.clone(),
+        nextcloud_talk_channel.clone(),
+        #[cfg(feature = "wasm-plugins")]
+        wasm_plugin_runtime.clone(),
+    ));
+    let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = turn_runtime_owner.clone();
+    shared_config_for_reload.register_participant(&participant);
+    turn_runtime_owner.synchronize_to_active()?;
+    shared_config_for_reload.register_audit_sink(Arc::new(ConfigGenerationMessageAuditSink {
+        memory: Arc::clone(&mem),
+        workspace_id: config.workspace_dir.to_string_lossy().to_string(),
+    }));
 
     let state = AppState {
-        config: config_state,
-        shared_config: Arc::clone(&shared_config_for_reload),
+        config: Arc::clone(&shared_config_for_reload),
         provider,
         model,
         temperature,
@@ -1157,6 +1492,7 @@ pub async fn run_gateway(
         auto_save: config.memory.auto_save && config.memory.semantic.auto_promote_user_messages,
         tools_registry,
         mcp_tool,
+        turn_runtime: Some(turn_runtime_owner),
         hooks,
         webhook_token_hash,
         webhook_signing_secret,
@@ -1345,7 +1681,7 @@ async fn handle_pair(
     match state.pairing.try_pair(code, &rate_key).await {
         Ok(Some(token)) => {
             tracing::info!("🔐 New client paired successfully");
-            if let Err(err) = persist_pairing_tokens(state.config.clone(), &state.shared_config, &state.pairing).await {
+            if let Err(err) = persist_pairing_tokens(&state.config, &state.pairing).await {
                 tracing::error!("🔐 Pairing succeeded but token persistence failed: {err:#}");
                 let body = serde_json::json!({
                     "paired": true,
@@ -1380,32 +1716,20 @@ async fn handle_pair(
     }
 }
 
-async fn persist_pairing_tokens(
-    config: Arc<Mutex<Config>>,
-    shared_config: &crate::config::SharedConfig,
-    pairing: &PairingGuard,
-) -> Result<()> {
+async fn persist_pairing_tokens(config: &crate::config::SharedConfig, pairing: &PairingGuard) -> Result<()> {
     let paired_tokens = pairing.tokens();
-    // D2 (correctness): base the persisted config on the hot SharedConfig (D)
-    // snapshot, NOT the cached C Mutex. C lags D on the reload-only paths; if we
-    // cloned a stale C, saved it, and re-stored it, we would write hot-reloaded
-    // fields back to their old values on disk AND clobber D. Cloning the D snapshot
-    // guarantees we only add the pairing tokens on top of the current authoritative
-    // config.
-    let mut updated_cfg = (*shared_config.load_full()).clone();
+    let mut updated_cfg = (*config.desired().config).clone();
     updated_cfg.gateway.paired_tokens = paired_tokens;
     updated_cfg
         .save()
         .await
         .context("Failed to persist paired tokens to config.toml")?;
-
-    // Publish to D and re-sync C to it (hold the Mutex across the `.store()` so the
-    // two stores stay observably consistent), preserving the C == D invariant.
-    {
-        let mut guard = config.lock();
-        *guard = updated_cfg.clone();
-        shared_config.store(Arc::new(updated_cfg));
-    }
+    let manager = Arc::clone(config);
+    tokio::task::spawn_blocking(move || {
+        manager.reload_from_disk(crate::config::ConfigReloadTrigger::PairingPersistence)
+    })
+    .await
+    .context("Pairing config reload worker failed")??;
     Ok(())
 }
 
@@ -1415,8 +1739,11 @@ async fn run_gateway_chat_with_multimodal(
     message: &str,
     fabric_ctx: &GatewayFabricContext,
 ) -> anyhow::Result<String> {
-    let workspace_id = state.config.lock().workspace_dir.to_string_lossy().to_string();
-    let event_recording = state.config.lock().memory.event_recording_config();
+    let turn_runtime = state.pin_turn_runtime();
+    let config_generation = Arc::clone(&turn_runtime.config_generation);
+    let config_snapshot = Arc::clone(&config_generation.effective);
+    let workspace_id = config_generation.effective.workspace_dir.to_string_lossy().to_string();
+    let event_recording = config_generation.effective.memory.event_recording_config();
     let fabric = MemoryFabric::new(state.mem.clone(), workspace_id.clone()).with_event_recording(event_recording);
     let run_id = Uuid::new_v4().to_string();
     // D4 C4: migrate the gateway fabric durable session_key to the recipient-aware
@@ -1445,19 +1772,23 @@ async fn run_gateway_chat_with_multimodal(
         MemoryVisibility::Session,
     )
     .with_run_id(run_id)
-    .with_legacy_session_key(legacy_session_key);
+    .with_legacy_session_key(legacy_session_key)
+    .with_config_generation(&config_generation);
     let base_scope = runtime_envelope.message_scope();
-    authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:user", ResourceRiskLevel::Low).map_err(
-        |(_, body)| {
-            let error = body
-                .0
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or("gateway resource mutation denied")
-                .to_string();
-            anyhow::anyhow!(error)
-        },
-    )?;
+    authorize_gateway_config_resource_mutation(
+        &config_snapshot,
+        "gateway:webhook:message_event:user",
+        ResourceRiskLevel::Low,
+    )
+    .map_err(|(_, body)| {
+        let error = body
+            .0
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("gateway resource mutation denied")
+            .to_string();
+        anyhow::anyhow!(error)
+    })?;
     if let Err(error) = fabric
         .record_inbound_user_message(
             base_scope.clone(),
@@ -1474,7 +1805,7 @@ async fn run_gateway_chat_with_multimodal(
         );
     }
 
-    let min_relevance_score = state.config.lock().memory.min_relevance_score;
+    let min_relevance_score = config_snapshot.memory.min_relevance_score;
     let semantic_scope = runtime_envelope.memory_write_context(if fabric_ctx.channel == "webhook" {
         "webhook"
     } else {
@@ -1496,8 +1827,8 @@ async fn run_gateway_chat_with_multimodal(
 
     let user_messages = vec![ChatMessage::user(&enriched_message)];
     let image_marker_count = crate::multimodal::count_image_markers(&user_messages);
-    let mode_capabilities = state.provider.capabilities_for(
-        &state.model,
+    let mode_capabilities = turn_runtime.provider.capabilities_for(
+        &turn_runtime.model,
         crate::providers::traits::ProviderRequestMode::NonStreaming,
     );
     if image_marker_count > 0 && !mode_capabilities.vision {
@@ -1513,14 +1844,8 @@ async fn run_gateway_chat_with_multimodal(
 
     // Build system prompt with native_tools flag so the prompt instructs the
     // LLM to use tools rather than emit XML tags.
-    let (config_snapshot, multimodal_config, max_tool_iterations) = {
-        let config_guard = state.config.lock();
-        (
-            config_guard.clone(),
-            config_guard.multimodal.clone(),
-            config_guard.agent.max_tool_iterations,
-        )
-    };
+    let multimodal_config = config_snapshot.multimodal.clone();
+    let max_tool_iterations = config_snapshot.agent.max_tool_iterations;
     let native_tools = mode_capabilities.native_tool_calling;
     let skill_embedder =
         crate::memory::create_embedder_from_config(&config_snapshot, config_snapshot.api_key.as_deref());
@@ -1552,7 +1877,7 @@ async fn run_gateway_chat_with_multimodal(
         ];
         crate::channels::build_system_prompt_with_mode(
             &config_snapshot.workspace_dir,
-            &state.model,
+            &turn_runtime.model,
             &tool_descs,
             &selected_skills,
             Some(&config_snapshot.identity),
@@ -1592,30 +1917,32 @@ async fn run_gateway_chat_with_multimodal(
         topic_id: None,
         task_id: None,
         source_message_event_id: None,
+        config_generation_id: runtime_envelope.config_generation_id,
+        config_source_revision: runtime_envelope.config_source_revision.as_deref(),
     };
 
     let provider_started_at = chrono::Utc::now();
     let route_decision = crate::llm::route_decision::RouteDecision::single_candidate_for_context(
         provider_label,
-        state.model.clone(),
+        turn_runtime.model.clone(),
         runtime_envelope.resolved_owner_id(),
         runtime_envelope.session_key.clone(),
         runtime_envelope.source_message_event_id.clone(),
         None,
         "gateway_webhook",
         u32::try_from(message.chars().count() / 4).unwrap_or(u32::MAX),
-        !state.tools_registry.is_empty(),
+        !turn_runtime.tools_registry.is_empty(),
         false,
     );
     let loop_result = run_tool_call_loop_traced(
-        state.provider.as_ref(),
+        turn_runtime.provider.as_ref(),
         &mut history,
-        Arc::clone(&state.tools_registry),
+        Arc::clone(&turn_runtime.tools_registry),
         &noop_observer,
         state.hooks.as_ref(),
         provider_label,
-        &state.model,
-        state.temperature,
+        &turn_runtime.model,
+        turn_runtime.temperature,
         true, // silent
         None, // no approval manager
         "webhook",
@@ -1678,6 +2005,7 @@ async fn run_gateway_chat_with_multimodal(
                     delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
                 },
                 &config_snapshot.cost,
+                &config_snapshot.workspace_dir,
             )
             .await
             {
@@ -1687,16 +2015,20 @@ async fn run_gateway_chat_with_multimodal(
         }
     };
 
-    authorize_gateway_resource_mutation(state, "gateway:webhook:message_event:assistant", ResourceRiskLevel::Low)
-        .map_err(|(_, body)| {
-            let error = body
-                .0
-                .get("error")
-                .and_then(|value| value.as_str())
-                .unwrap_or("gateway resource mutation denied")
-                .to_string();
-            anyhow::anyhow!(error)
-        })?;
+    authorize_gateway_config_resource_mutation(
+        &config_snapshot,
+        "gateway:webhook:message_event:assistant",
+        ResourceRiskLevel::Low,
+    )
+    .map_err(|(_, body)| {
+        let error = body
+            .0
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("gateway resource mutation denied")
+            .to_string();
+        anyhow::anyhow!(error)
+    })?;
     let provider_outcome =
         crate::agent::terminal::provider_outcome_from_trace(&route_decision, provider_started_at, trace);
     let terminal_id = runtime_envelope
@@ -1716,7 +2048,7 @@ async fn run_gateway_chat_with_multimodal(
             history_scope: Some(
                 base_scope
                     .clone()
-                    .with_sender(format!("{provider_label}/{}", state.model))
+                    .with_sender(format!("{provider_label}/{}", turn_runtime.model))
                     .with_recipient(fabric_ctx.sender.clone()),
             ),
             provider_outcome: Some(provider_outcome),
@@ -1728,6 +2060,7 @@ async fn run_gateway_chat_with_multimodal(
             delivery_intent: crate::agent::terminal::TurnDeliveryIntent::ReturnToCaller,
         },
         &config_snapshot.cost,
+        &config_snapshot.workspace_dir,
     )
     .await
     {
@@ -1739,7 +2072,7 @@ async fn run_gateway_chat_with_multimodal(
         if let Err(fallback_error) = fabric
             .record_assistant_message(
                 base_scope
-                    .with_sender(format!("{provider_label}/{}", state.model))
+                    .with_sender(format!("{provider_label}/{}", turn_runtime.model))
                     .with_recipient(fabric_ctx.sender.clone()),
                 response.clone(),
             )
@@ -1969,7 +2302,7 @@ async fn handle_webhook(
 
     let provider_label = state
         .config
-        .lock()
+        .load_full()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -2208,7 +2541,7 @@ async fn handle_whatsapp_message(State(state): State<AppState>, headers: HeaderM
     // Process each message
     let provider_label = state
         .config
-        .lock()
+        .load_full()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -2337,7 +2670,7 @@ async fn handle_linq_webhook(State(state): State<AppState>, headers: HeaderMap, 
     // Process each message
     let provider_label = state
         .config
-        .lock()
+        .load_full()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -2474,7 +2807,7 @@ async fn handle_nextcloud_talk_webhook(
 
     let provider_label = state
         .config
-        .lock()
+        .load_full()
         .default_provider
         .clone()
         .unwrap_or_else(|| "unknown".to_string());
@@ -2564,6 +2897,39 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::sync::Notify;
 
+    struct TestConfigParticipant;
+    struct TestPreparedConfig;
+
+    impl crate::config::ConfigGenerationParticipant for TestConfigParticipant {
+        fn name(&self) -> &'static str {
+            "gateway_test_runtime"
+        }
+
+        fn supports_rebuild_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn prepares_for_field(&self, _field: &str) -> bool {
+            true
+        }
+
+        fn prepare(
+            &self,
+            _generation: Arc<crate::config::ConfigGeneration>,
+            _changed_fields: &[String],
+        ) -> anyhow::Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+            Ok(Box::new(TestPreparedConfig))
+        }
+    }
+
+    impl crate::config::PreparedConfigGeneration for TestPreparedConfig {
+        fn commit(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn rollback(&mut self) {}
+    }
+
     /// Generate a random hex secret at runtime to avoid hard-coded cryptographic values.
     fn generate_test_secret() -> String {
         let bytes: [u8; 32] = rand::random();
@@ -2626,8 +2992,7 @@ mod tests {
     /// for exercising the gateway authorization helpers in isolation.
     fn authz_test_state(config: Config) -> AppState {
         AppState {
-            config: Arc::new(Mutex::new(config.clone())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            config: crate::config::new_shared(config),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2635,6 +3000,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -2667,6 +3033,8 @@ mod tests {
         use crate::security::policy::ResourceRiskLevel;
 
         let state = authz_test_state(Config::default());
+        let participant: Arc<dyn crate::config::ConfigGenerationParticipant> = Arc::new(TestConfigParticipant);
+        state.config.register_participant(&participant);
         assert!(
             authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low).is_ok(),
             "default autonomous policy should allow a low-risk core gateway mutation"
@@ -2679,24 +3047,69 @@ mod tests {
             },
             ..Config::default()
         };
-        // Publish to D only; C stays at the permissive default on purpose.
-        state.shared_config.store(Arc::new(read_only));
+        state
+            .config
+            .apply_runtime_config(read_only, crate::config::ConfigReloadTrigger::Test)
+            .expect("apply read-only config");
 
         let denied = authorize_gateway_resource_mutation(&state, "gateway:pair", ResourceRiskLevel::Low)
             .expect_err("ReadOnly published to D must deny the core gateway mutation");
         assert_eq!(denied.0, StatusCode::FORBIDDEN);
-        // C is unchanged — the deny came purely from reading D.
         assert_eq!(
-            state.config.lock().autonomy.level,
-            crate::security::policy::AutonomyLevel::default()
+            state.config.load_full().autonomy.level,
+            crate::security::policy::AutonomyLevel::ReadOnly
         );
+    }
+
+    #[test]
+    fn turn_runtime_swap_keeps_in_flight_generation_pinned_and_is_reversible() {
+        let manager = crate::config::new_shared(Config::default());
+        let generation_zero = manager.pin();
+        let current = Arc::new(ArcSwap::from_pointee(TurnRuntimeGeneration {
+            config_generation: Arc::clone(&generation_zero),
+            provider: Arc::new(MockProvider::default()),
+            model: "model-zero".to_string(),
+            temperature: 0.7,
+            tools_registry: Arc::new(Vec::new()),
+            mcp_tool: None,
+        }));
+        let in_flight = current.load_full();
+        let generation_one = Arc::new(crate::config::ConfigGeneration {
+            id: crate::config::ConfigGenerationId(1),
+            source_revision: generation_zero.source_revision.clone(),
+            effective: Arc::clone(&generation_zero.effective),
+            applied_at: chrono::Utc::now(),
+            trigger: crate::config::ConfigReloadTrigger::Test,
+            deferred_changes: Arc::from([]),
+        });
+        let mut prepared = PreparedGatewayTurnRuntime {
+            current: Arc::clone(&current),
+            previous: current.load_full(),
+            generation: TurnRuntimeGeneration {
+                config_generation: generation_one,
+                provider: Arc::new(MockProvider::default()),
+                model: "model-one".to_string(),
+                temperature: 0.2,
+                tools_registry: Arc::new(Vec::new()),
+                mcp_tool: None,
+            },
+        };
+
+        crate::config::PreparedConfigGeneration::commit(&mut prepared).unwrap();
+        assert_eq!(current.load().config_generation.id.0, 1);
+        assert_eq!(current.load().model, "model-one");
+        assert_eq!(in_flight.config_generation.id.0, 0);
+        assert_eq!(in_flight.model, "model-zero");
+
+        crate::config::PreparedConfigGeneration::rollback(&mut prepared);
+        assert_eq!(current.load().config_generation.id.0, 0);
+        assert_eq!(current.load().model, "model-zero");
     }
 
     #[tokio::test]
     async fn metrics_endpoint_returns_hint_when_prometheus_is_disabled() {
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2704,6 +3117,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -2751,8 +3165,7 @@ mod tests {
 
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -2760,6 +3173,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -3015,9 +3429,8 @@ mod tests {
         let token = guard.try_pair(&code, "test_client").await.unwrap().unwrap();
         assert!(guard.is_authenticated(&token));
 
-        let cached = Arc::new(Mutex::new(cached_config));
-        let shared: crate::config::SharedConfig = Arc::new(arc_swap::ArcSwap::from_pointee(hot_config));
-        persist_pairing_tokens(cached.clone(), &shared, &guard).await.unwrap();
+        let shared = crate::config::new_shared(hot_config);
+        persist_pairing_tokens(&shared, &guard).await.unwrap();
 
         let saved = tokio::fs::read_to_string(config_path).await.unwrap();
         let parsed: Config = toml::from_str(&saved).unwrap();
@@ -3036,26 +3449,19 @@ mod tests {
         assert_eq!(persisted.len(), 64);
         assert!(persisted.chars().all(|c| c.is_ascii_hexdigit()));
 
-        // (c) C == D after persist (sync invariant restored), and both carry the HOT
-        // temperature and the new token — not the stale C value.
-        let in_memory = cached.lock();
-        assert!(
-            (in_memory.default_temperature - 0.42).abs() < 1e-9,
-            "C must be re-synced to the hot value 0.42, got {}",
-            in_memory.default_temperature
-        );
-        assert_eq!(in_memory.gateway.paired_tokens.len(), 1);
-        assert_eq!(&in_memory.gateway.paired_tokens[0], persisted);
-        drop(in_memory);
-
         let hot = shared.load_full();
         assert!(
             (hot.default_temperature - 0.42).abs() < 1e-9,
             "D must retain the hot value 0.42 after persist, got {}",
             hot.default_temperature
         );
-        assert_eq!(hot.gateway.paired_tokens.len(), 1);
-        assert_eq!(&hot.gateway.paired_tokens[0], persisted);
+        assert!(
+            hot.gateway.paired_tokens.is_empty(),
+            "restart-only gateway fields must not be reported active before restart"
+        );
+        let desired = shared.desired();
+        assert_eq!(desired.config.gateway.paired_tokens.len(), 1);
+        assert_eq!(&desired.config.gateway.paired_tokens[0], persisted);
     }
 
     #[test]
@@ -3310,8 +3716,7 @@ mod tests {
 
     fn webhook_test_state(provider: Arc<dyn Provider>) -> AppState {
         AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3319,6 +3724,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -3685,8 +4091,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
 
         let state = AppState {
-            config: Arc::new(Mutex::new(config.clone())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(config)),
+            config: crate::config::new_shared(config),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3694,6 +4099,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(tmp.path().to_path_buf())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -3827,8 +4233,7 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3836,6 +4241,7 @@ mod tests {
             auto_save: true,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -3897,8 +4303,7 @@ mod tests {
         let memory: Arc<dyn Memory> = tracking_impl.clone();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3906,6 +4311,7 @@ mod tests {
             auto_save: true,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -3963,8 +4369,7 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -3972,6 +4377,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             webhook_signing_secret: None,
@@ -4016,8 +4422,7 @@ mod tests {
         let wrong_secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4025,6 +4430,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: Some(Arc::from(hash_webhook_secret(&valid_secret))),
             webhook_signing_secret: None,
@@ -4071,8 +4477,7 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4080,6 +4485,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: Some(Arc::from(hash_webhook_secret(&secret))),
             webhook_signing_secret: None,
@@ -4126,8 +4532,7 @@ mod tests {
         let secret = generate_test_secret();
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4135,6 +4540,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: Some(Arc::from(secret)),
@@ -4179,8 +4585,7 @@ mod tests {
         let body = br#"{"message":"hello"}"#;
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4188,6 +4593,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: Some(Arc::from(secret.clone())),
@@ -4240,8 +4646,7 @@ mod tests {
         let memory: Arc<dyn Memory> = Arc::new(MockMemory);
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4249,6 +4654,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -4301,8 +4707,7 @@ mod tests {
         let invalid_signature = "deadbeef";
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider,
             model: "test-model".into(),
             temperature: 0.0,
@@ -4310,6 +4715,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -4690,8 +5096,7 @@ mod tests {
 
         let observer: Arc<dyn crate::observability::Observer> = prom;
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -4699,6 +5104,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,
@@ -4753,8 +5159,7 @@ mod tests {
         crate::observability::chat_metrics::inc_dispatch_drop("s2_5_p1c_noop_drop");
 
         let state = AppState {
-            config: Arc::new(Mutex::new(Config::default())),
-            shared_config: Arc::new(arc_swap::ArcSwap::from_pointee(Config::default())),
+            config: crate::config::new_shared(Config::default()),
             provider: Arc::new(MockProvider::default()),
             model: "test-model".into(),
             temperature: 0.0,
@@ -4762,6 +5167,7 @@ mod tests {
             auto_save: false,
             tools_registry: Arc::new(vec![]),
             mcp_tool: None,
+            turn_runtime: None,
             hooks: Arc::new(HookManager::new(std::env::temp_dir())),
             webhook_token_hash: None,
             webhook_signing_secret: None,

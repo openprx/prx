@@ -323,6 +323,8 @@ struct SpawnScope {
     topic_id: Option<String>,
     parent_task_id: Option<String>,
     source_message_event_id: Option<String>,
+    config_generation_id: Option<u64>,
+    config_source_revision: Option<String>,
 }
 
 fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
@@ -387,6 +389,13 @@ fn parse_spawn_scope(args: &serde_json::Value) -> Option<SpawnScope> {
         source_message_event_id: scope
             .get("message_event_id")
             .or_else(|| scope.get("source_message_event_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        config_generation_id: scope.get("config_generation_id").and_then(serde_json::Value::as_u64),
+        config_source_revision: scope
+            .get("config_source_revision")
             .and_then(serde_json::Value::as_str)
             .map(str::trim)
             .filter(|value| !value.is_empty())
@@ -791,6 +800,8 @@ fn spawn_event_scope(
         envelope = envelope
             .with_sender(scope.sender.as_str())
             .with_recipient(scope.chat_id.as_str());
+        envelope.config_generation_id = scope.config_generation_id;
+        envelope.config_source_revision = scope.config_source_revision.clone();
     }
     let mut event_scope = envelope.message_scope();
     if let Some(owner_id) = scope.and_then(|scope| scope.owner_id.as_deref()) {
@@ -1989,6 +2000,7 @@ impl Tool for SessionsSpawnTool {
                         delivery_intent,
                     },
                     &cost_config,
+                    &workspace_dir,
                 )
                 .await
                 {
@@ -3006,6 +3018,8 @@ async fn run_sub_agent_task(
                 topic_id: scope.topic_id.as_deref(),
                 task_id: scope.parent_task_id.as_deref(),
                 source_message_event_id: scope.source_message_event_id.as_deref(),
+                config_generation_id: scope.config_generation_id,
+                config_source_revision: scope.config_source_revision.as_deref(),
             });
             // Only build an `ApprovalManager` when a resolver is attached. Under
             // permission-model Phase 1 the unified `SecurityPolicy::decide`
@@ -3228,6 +3242,8 @@ fn build_session_worker_manifest(
         temperature,
         config_dir,
         config_generation: config_generation.to_string(),
+        runtime_config_generation_id: scope.and_then(|ctx| ctx.config_generation_id),
+        runtime_config_source_revision: scope.and_then(|ctx| ctx.config_source_revision.clone()),
         workspace_dir: worker_workspace,
         memory_db_path,
         memory_workspace_id: Some(memory_workspace_id),
@@ -4397,6 +4413,18 @@ mod tests {
             parent_task_id: None,
             source_message_event_id: None,
         };
+        let scope = SpawnScope {
+            sender: "alice".to_string(),
+            channel: "telegram".to_string(),
+            chat_type: "direct".to_string(),
+            chat_id: "chat-1".to_string(),
+            owner_id: None,
+            topic_id: None,
+            parent_task_id: None,
+            source_message_event_id: None,
+            config_generation_id: Some(17),
+            config_source_revision: Some("revision-17".to_string()),
+        };
 
         let (manifest, _, _) = build_session_worker_manifest(
             "run-child",
@@ -4420,7 +4448,7 @@ mod tests {
             30,
             4,
             None,
-            None,
+            Some(&scope),
             &lineage,
             0,
             "sessions_spawn:test",
@@ -4433,6 +4461,27 @@ mod tests {
         assert_eq!(manifest_config.max_context_tokens, 200_000);
         assert_eq!(manifest.model, "small-child");
         assert_ne!(manifest_config.max_context_tokens, 1_000_000);
+        assert_eq!(manifest.runtime_config_generation_id, Some(17));
+        assert_eq!(manifest.runtime_config_source_revision.as_deref(), Some("revision-17"));
+    }
+
+    #[test]
+    fn parse_spawn_scope_preserves_config_generation() {
+        let scope = parse_spawn_scope(&json!({
+            "_zc_scope_trusted": true,
+            "_zc_scope": {
+                "sender": "alice",
+                "channel": "telegram",
+                "chat_type": "direct",
+                "chat_id": "chat-1",
+                "config_generation_id": 17,
+                "config_source_revision": "revision-17"
+            }
+        }))
+        .expect("trusted scope should parse");
+
+        assert_eq!(scope.config_generation_id, Some(17));
+        assert_eq!(scope.config_source_revision.as_deref(), Some("revision-17"));
     }
 
     /// FIX-P0-37: spawning is now a Medium-risk side effect, which requires an
@@ -5413,11 +5462,16 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
         let (ch, _) = RecordingChannel::new();
-        let tool = make_tool(
+        let tool = make_tool_with_security_and_spawn_config(
             Arc::new(ch),
             Arc::new(EchoProvider {
                 response: "done".into(),
             }),
+            Arc::new(SecurityPolicy {
+                autonomy: crate::security::AutonomyLevel::Supervised,
+                ..SecurityPolicy::default()
+            }),
+            crate::config::SessionsSpawnConfig::default(),
         )
         .with_shared_memory(memory.clone());
         {
@@ -6007,6 +6061,8 @@ mod tests {
             temperature: 0.7,
             config_dir: std::path::PathBuf::from("/tmp/openprx"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
@@ -6128,6 +6184,8 @@ mod tests {
             topic_id: Some("topic-a".to_string()),
             parent_task_id: Some("parent-task".to_string()),
             source_message_event_id: Some("msg-a".to_string()),
+            config_generation_id: Some(17),
+            config_source_revision: Some("revision-17".to_string()),
         };
         let event_scope = spawn_event_scope(
             "/tmp/ws",
@@ -6139,6 +6197,8 @@ mod tests {
         );
 
         assert_eq!(event_scope.source, "sessions_spawn");
+        assert_eq!(event_scope.config_generation_id, Some(17));
+        assert_eq!(event_scope.config_source_revision.as_deref(), Some("revision-17"));
         assert_eq!(event_scope.channel.as_deref(), Some("telegram"));
         assert_eq!(event_scope.session_key.as_deref(), Some("telegram:chat-1:alice"));
         assert_eq!(event_scope.run_id.as_deref(), Some("run-child"));

@@ -5,4 +5,4 @@ pub mod fitness;
 
 pub const SELF_SYSTEM_SESSION_ID: &str = "self_system";
 
-pub use fitness::run_fitness_report;
+pub use fitness::run_fitness_report_with_config;

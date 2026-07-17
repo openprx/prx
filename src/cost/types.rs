@@ -126,6 +126,7 @@ pub enum CostSettlement {
     UnknownPricing,
     Replayed,
     Recorded { budget: BudgetCheck },
+    Failed { error: String },
 }
 
 /// Cost summary for reporting.

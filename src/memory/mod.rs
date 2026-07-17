@@ -24,7 +24,7 @@ pub use backend::{
     selectable_memory_backends,
 };
 #[allow(unused_imports)]
-pub use fabric::{MemoryEventRecording, MemoryEventWatcher, MemoryFabric, MessageEventScope};
+pub use fabric::{MemoryEventRecording, MemoryEventWatcher, MemoryFabric, MessageEventScope, RuntimeAuthorityGuard};
 pub use filter::{should_autosave_content, should_autosave_content_with_min};
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;

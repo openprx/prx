@@ -10,6 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
 use tokio::time::Duration;
@@ -34,15 +35,8 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     let initial_backoff = config.reliability.channel_initial_backoff_secs.max(1);
     let max_backoff = config.reliability.channel_max_backoff_secs.max(initial_backoff);
 
-    // Activate hot-reload watcher so config.toml changes take effect without restart.
-    // D2: the watcher and the gateway must observe the SAME SharedConfig snapshot so
-    // file-driven reloads are visible at every gateway authorization point. Build one
-    // handle here, hand it to the watcher AND to the gateway supervisor below.
+    // Build the sole process configuration owner before assembling participants.
     let shared_config = new_shared(config.clone());
-    let _hot_reload = {
-        let config_path = config.config_path.clone();
-        HotReloadManager::spawn(config_path, Arc::clone(&shared_config))
-    };
 
     let startup_trace =
         crate::runtime::control_ladder::ControlLadderSnapshot::from_config(&config).build_trace("daemon.start", None);
@@ -56,7 +50,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
     }
 
-    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
+    let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone(), Arc::clone(&shared_config))];
 
     // Gateway always starts — modules.network only controls whether network.toml
     // is loaded, not the gateway itself.
@@ -68,7 +62,6 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             Duration::from_secs(CORE_HEALTH_TTL_SECONDS),
             crate::health::ComponentState::Starting,
         );
-        let gateway_cfg = config.clone();
         let gateway_host = host.clone();
         let gateway_shared = Arc::clone(&shared_config);
         handles.push(spawn_component_supervisor(
@@ -76,10 +69,10 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
             initial_backoff,
             max_backoff,
             move || {
-                let cfg = gateway_cfg.clone();
                 let host = gateway_host.clone();
                 let shared = Arc::clone(&gateway_shared);
                 async move {
+                    let cfg = (*shared.load_full()).clone();
                     // Supervised gateway: the supervisor restarts it on exit, so
                     // it uses a never-cancelled token. See never_cancelled_shutdown.
                     crate::gateway::run_gateway(
@@ -95,203 +88,227 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         ));
     }
 
-    if config.modules.channels {
-        if has_supervised_channels(&config) {
-            register_optional_component("channels", "channels", true, OPTIONAL_HEALTH_TTL_SECONDS);
-            let channels_cfg = config.clone();
-            handles.push(spawn_component_supervisor(
-                "channels",
-                initial_backoff,
-                max_backoff,
-                move || {
-                    let cfg = channels_cfg.clone();
-                    // Supervised channels: the supervisor restarts on exit, so
-                    // it uses a never-cancelled token. See never_cancelled_shutdown.
-                    async move {
-                        crate::channels::start_channels(cfg, crate::runtime::shutdown::never_cancelled_shutdown()).await
+    let initial_generation = shared_config.pin();
+    let mut generation_controllers = Vec::new();
+
+    let (channels_handle, channels_controller) = spawn_config_generation_supervisor(
+        "channels",
+        "channels",
+        OPTIONAL_HEALTH_TTL_SECONDS,
+        Arc::clone(&initial_generation),
+        Arc::new(|field| field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)),
+        Arc::new(|cfg| cfg.modules.channels && has_supervised_channels(cfg)),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    crate::channels::start_channels_with_config(
+                        (*generation.effective).clone(),
+                        shared,
+                        generation,
+                        shutdown,
+                    )
+                    .await
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(channels_handle);
+    generation_controllers.push(channels_controller);
+
+    let scheduler_ttl = config
+        .reliability
+        .scheduler_poll_secs
+        .saturating_mul(3)
+        .max(OPTIONAL_HEALTH_TTL_SECONDS);
+    let (scheduler_handle, scheduler_controller) = spawn_config_generation_supervisor(
+        "scheduler",
+        "cron",
+        scheduler_ttl,
+        Arc::clone(&initial_generation),
+        Arc::new(|field| {
+            matches!(field, "cron" | "scheduler") || crate::config::generation::is_rebuild_and_swap(field)
+        }),
+        Arc::new(|cfg| cfg.modules.scheduler && cfg.cron.enabled),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    let cfg = (*generation.effective).clone();
+                    tokio::select! {
+                        result = crate::cron::scheduler::run_with_config_generation_manager(
+                            cfg,
+                            generation,
+                            shared,
+                        ) => result,
+                        () = shutdown.cancelled() => Ok(()),
                     }
-                },
-            ));
-        } else {
-            register_optional_component("channels", "channels", false, OPTIONAL_HEALTH_TTL_SECONDS);
-            tracing::info!("No real-time channels configured; channel supervisor disabled");
-        }
-    } else {
-        register_optional_component("channels", "channels", false, OPTIONAL_HEALTH_TTL_SECONDS);
-        tracing::debug!("Channels module disabled, skipping channel supervisor startup");
-    }
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(scheduler_handle);
+    generation_controllers.push(scheduler_controller);
 
-    if config.modules.scheduler && config.heartbeat.enabled {
-        let heartbeat_ttl = u64::from(config.heartbeat.interval_minutes)
-            .saturating_mul(120)
-            .max(OPTIONAL_HEALTH_TTL_SECONDS);
-        register_optional_component("heartbeat", "xin", true, heartbeat_ttl);
-        tracing::info!("Heartbeat tasks are materialized and scheduled by xin");
-    } else {
-        register_optional_component("heartbeat", "heartbeat", false, OPTIONAL_HEALTH_TTL_SECONDS);
-        if !config.modules.scheduler {
-            tracing::debug!("Scheduler module disabled, skipping heartbeat startup");
-        } else {
-            tracing::debug!("Heartbeat disabled, skipping heartbeat startup");
-        }
-    }
+    let xin_ttl = u64::from(crate::xin::runner::runner_interval_minutes(&config))
+        .saturating_mul(120)
+        .max(OPTIONAL_HEALTH_TTL_SECONDS);
+    let (xin_handle, xin_controller) = spawn_config_generation_supervisor(
+        "xin",
+        "xin",
+        xin_ttl,
+        Arc::clone(&initial_generation),
+        Arc::new(|field| {
+            matches!(field, "xin" | "heartbeat" | "self_system")
+                || crate::config::generation::is_rebuild_and_swap(field)
+        }),
+        Arc::new(xin_runtime_enabled),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    let cfg = (*generation.effective).clone();
+                    tokio::select! {
+                        result = crate::xin::runner::run_with_config_generation_manager(
+                            cfg,
+                            generation,
+                            shared,
+                        ) => result,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(xin_handle);
+    generation_controllers.push(xin_controller);
 
-    if config.modules.scheduler && config.cron.enabled {
-        let scheduler_ttl = config
-            .reliability
-            .scheduler_poll_secs
-            .saturating_mul(3)
-            .max(OPTIONAL_HEALTH_TTL_SECONDS);
-        register_optional_component("scheduler", "cron", true, scheduler_ttl);
-        let scheduler_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "scheduler",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = scheduler_cfg.clone();
-                async move { crate::cron::scheduler::run(cfg).await }
-            },
-        ));
-    } else {
-        register_optional_component("scheduler", "cron", false, OPTIONAL_HEALTH_TTL_SECONDS);
-        if !config.modules.scheduler {
-            tracing::debug!("Scheduler module disabled, skipping cron startup");
-        } else {
-            tracing::info!("Cron disabled; scheduler supervisor not started");
-        }
-    }
+    let fitness_ttl = config
+        .self_system
+        .fitness_interval_hours
+        .saturating_mul(7200)
+        .max(OPTIONAL_HEALTH_TTL_SECONDS);
+    let (fitness_handle, fitness_controller) = spawn_config_generation_supervisor(
+        "self_system_fitness",
+        "self-system",
+        fitness_ttl,
+        Arc::clone(&initial_generation),
+        Arc::new(|field| field == "self_system"),
+        Arc::new(|cfg| {
+            let xin_manages =
+                cfg.modules.scheduler && cfg.xin.enabled && cfg.xin.builtin_tasks && cfg.xin.evolution_integration;
+            cfg.self_system.enabled && !xin_manages
+        }),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    tokio::select! {
+                        result = run_fitness_worker(
+                            (*generation.effective).clone(),
+                            shared,
+                            generation.id,
+                        ) => result,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(fitness_handle);
+    generation_controllers.push(fitness_controller);
 
-    // ── Xin (心) autonomous task engine ──
-    if xin_runtime_enabled(&config) {
-        let xin_ttl = u64::from(crate::xin::runner::runner_interval_minutes(&config))
-            .saturating_mul(120)
-            .max(OPTIONAL_HEALTH_TTL_SECONDS);
-        register_optional_component("xin", "xin", true, xin_ttl);
-        let xin_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "xin",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = xin_cfg.clone();
-                async move { crate::xin::runner::run(cfg).await }
-            },
-        ));
-    } else {
-        register_optional_component("xin", "xin", false, OPTIONAL_HEALTH_TTL_SECONDS);
-        if !config.modules.scheduler {
-            tracing::debug!("Scheduler module disabled, skipping xin startup");
-        } else {
-            tracing::info!("Xin and Heartbeat disabled; xin supervisor not started");
-        }
-    }
+    let (evolution_handle, evolution_controller) = spawn_config_generation_supervisor(
+        "evolution_scheduler",
+        "self-system",
+        fitness_ttl,
+        Arc::clone(&initial_generation),
+        Arc::new(|field| field == "self_system" || crate::config::generation::is_rebuild_and_swap(field)),
+        Arc::new(|cfg| {
+            let xin_manages =
+                cfg.modules.scheduler && cfg.xin.enabled && cfg.xin.builtin_tasks && cfg.xin.evolution_integration;
+            cfg.self_system.evolution_enabled && !xin_manages
+        }),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    tokio::select! {
+                        result = run_evolution_scheduler_worker(
+                            (*generation.effective).clone(),
+                            shared,
+                            generation.id,
+                        ) => result,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(evolution_handle);
+    generation_controllers.push(evolution_controller);
 
-    // ── Self-system fitness ──
-    // Xin takes over fitness only when ALL three flags are true:
-    // xin.enabled + xin.builtin_tasks + xin.evolution_integration.
-    // If builtin_tasks is false, xin won't register the fitness task, so
-    // the standalone worker must still run.
-    // Note: xin_manages_evolution requires scheduler module for xin to run.
-    let xin_manages_evolution =
-        config.modules.scheduler && config.xin.enabled && config.xin.builtin_tasks && config.xin.evolution_integration;
-    let spawn_fitness = config.self_system.enabled && !xin_manages_evolution;
-    if spawn_fitness {
-        let fitness_ttl = config
-            .self_system
-            .fitness_interval_hours
-            .saturating_mul(7200)
-            .max(OPTIONAL_HEALTH_TTL_SECONDS);
-        register_optional_component("self_system_fitness", "self-system", true, fitness_ttl);
-        let fitness_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "self_system_fitness",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = fitness_cfg.clone();
-                async move { run_fitness_worker(cfg).await }
-            },
-        ));
-    } else {
-        register_optional_component(
-            "self_system_fitness",
-            if xin_manages_evolution { "xin" } else { "self-system" },
-            false,
-            OPTIONAL_HEALTH_TTL_SECONDS,
-        );
-        if xin_manages_evolution {
-            tracing::info!("Fitness managed by xin; standalone fitness supervisor not started");
-        } else {
-            tracing::info!("Self-system fitness disabled; fitness supervisor not started");
-        }
-    }
+    let (webhook_handle, webhook_controller) = spawn_config_generation_supervisor(
+        "webhook_receiver",
+        "webhook",
+        OPTIONAL_HEALTH_TTL_SECONDS,
+        initial_generation,
+        Arc::new(|field| field == "webhook" || crate::config::generation::is_rebuild_and_swap(field)),
+        Arc::new(|cfg| cfg.modules.integrations && cfg.webhook.enabled),
+        {
+            let shared = Arc::clone(&shared_config);
+            Arc::new(move |generation, shutdown| {
+                let shared = Arc::clone(&shared);
+                Box::pin(async move {
+                    let cfg = (*generation.effective).clone();
+                    let repository = crate::webhook::repository_from_config(&cfg)?;
+                    let security = crate::runtime::bootstrap::build_security_policy(&cfg);
+                    tokio::select! {
+                        result = crate::webhook::run_configured_with_repository_generation(
+                            &cfg,
+                            repository,
+                            security,
+                            shared,
+                            generation.id,
+                        ) => result,
+                        () = shutdown.cancelled() => Ok(()),
+                    }
+                })
+            })
+        },
+        shutdown.clone(),
+    );
+    handles.push(webhook_handle);
+    generation_controllers.push(webhook_controller);
 
-    // ── Evolution scheduler ──
-    // Same guard: xin takes over evolution only when all three flags are on.
-    let spawn_evolution = config.self_system.evolution_enabled && !xin_manages_evolution;
-    if spawn_evolution {
-        register_optional_component(
-            "evolution_scheduler",
-            "self-system",
-            true,
-            config
-                .self_system
-                .fitness_interval_hours
-                .saturating_mul(7200)
-                .max(OPTIONAL_HEALTH_TTL_SECONDS),
-        );
-        let evolution_cfg = config.clone();
-        handles.push(spawn_component_supervisor(
-            "evolution_scheduler",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = evolution_cfg.clone();
-                async move { run_evolution_scheduler_worker(cfg).await }
-            },
-        ));
-    } else {
-        register_optional_component(
-            "evolution_scheduler",
-            if xin_manages_evolution { "xin" } else { "self-system" },
-            false,
-            OPTIONAL_HEALTH_TTL_SECONDS,
-        );
-        if xin_manages_evolution {
-            tracing::info!("Evolution managed by xin; standalone evolution supervisor not started");
-        } else {
-            tracing::info!("Evolution scheduler disabled; evolution supervisor not started");
-        }
-    }
+    let daemon_participant: Arc<dyn crate::config::ConfigGenerationParticipant> =
+        Arc::new(DaemonConfigGenerationParticipant {
+            controllers: generation_controllers,
+        });
+    shared_config.register_participant(&daemon_participant);
+    // Start disk observation only after controlled-runtime participants exist,
+    // so the first candidate cannot publish into an owner with no supervisor.
+    let _hot_reload = HotReloadManager::spawn(config.config_path.clone(), Arc::clone(&shared_config));
 
-    if config.modules.integrations && config.webhook.enabled {
-        register_optional_component("webhook_receiver", "webhook", true, OPTIONAL_HEALTH_TTL_SECONDS);
-        let webhook_cfg = config.clone();
-        let webhook_repository = crate::webhook::repository_from_config(&webhook_cfg)?;
-        handles.push(spawn_component_supervisor(
-            "webhook_receiver",
-            initial_backoff,
-            max_backoff,
-            move || {
-                let cfg = webhook_cfg.clone();
-                let repository = webhook_repository.clone();
-                async move {
-                    // FIX-P1-03: pass the security policy so the standalone webhook
-                    // server gates topic-store persistence on autonomy (ReadOnly = no write).
-                    let webhook_security = crate::runtime::bootstrap::build_security_policy(&cfg);
-                    crate::webhook::run_configured_with_repository(&cfg, repository, webhook_security).await
-                }
-            },
-        ));
-    } else {
-        register_optional_component("webhook_receiver", "webhook", false, OPTIONAL_HEALTH_TTL_SECONDS);
-        if !config.modules.integrations {
-            tracing::debug!("Integrations module disabled, skipping webhook receiver startup");
-        } else {
-            tracing::info!("Webhook receiver disabled; webhook supervisor not started");
-        }
-    }
+    let heartbeat_ttl = u64::from(config.heartbeat.interval_minutes)
+        .saturating_mul(120)
+        .max(OPTIONAL_HEALTH_TTL_SECONDS);
+    register_optional_component(
+        "heartbeat",
+        "xin",
+        config.modules.scheduler && config.heartbeat.enabled,
+        heartbeat_ttl,
+    );
 
     println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
@@ -359,7 +376,7 @@ pub fn state_file_path(config: &Config) -> PathBuf {
         .join("daemon_state.json")
 }
 
-fn spawn_state_writer(config: Config) -> JoinHandle<()> {
+fn spawn_state_writer(config: Config, shared_config: crate::config::SharedConfig) -> JoinHandle<()> {
     tokio::spawn(async move {
         let path = state_file_path(&config);
         if let Some(parent) = path.parent() {
@@ -375,6 +392,14 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
             let mut json = crate::health::snapshot_json();
             if let Some(obj) = json.as_object_mut() {
                 obj.insert("written_at".into(), serde_json::json!(Utc::now().to_rfc3339()));
+                match serde_json::to_value(shared_config.status()) {
+                    Ok(status) => {
+                        obj.insert("config_generation".into(), status);
+                    }
+                    Err(error) => {
+                        tracing::warn!("Failed to serialize config generation status: {error}");
+                    }
+                }
             }
             let data = serde_json::to_vec_pretty(&json).unwrap_or_else(|_| b"{}".to_vec());
             if let Err(e) = tokio::fs::write(&path, &data).await {
@@ -385,7 +410,7 @@ fn spawn_state_writer(config: Config) -> JoinHandle<()> {
     })
 }
 
-fn xin_runtime_enabled(config: &Config) -> bool {
+const fn xin_runtime_enabled(config: &Config) -> bool {
     config.modules.scheduler && (config.xin.enabled || config.heartbeat.enabled)
 }
 
@@ -503,13 +528,540 @@ where
     })
 }
 
-async fn run_fitness_worker(config: Config) -> Result<()> {
+type GenerationComponentFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type GenerationComponentRunner =
+    Arc<dyn Fn(Arc<crate::config::ConfigGeneration>, CancellationToken) -> GenerationComponentFuture + Send + Sync>;
+type GenerationComponentEnabled = Arc<dyn Fn(&Config) -> bool + Send + Sync>;
+type GenerationComponentFieldFilter = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+#[derive(Clone)]
+struct GenerationSupervisorController {
+    name: &'static str,
+    prepares_for_field: GenerationComponentFieldFilter,
+    commands: tokio::sync::mpsc::UnboundedSender<GenerationSupervisorCommand>,
+}
+
+enum GenerationSupervisorCommand {
+    Prepare {
+        generation: Arc<crate::config::ConfigGeneration>,
+        response: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    },
+    Commit {
+        generation_id: u64,
+        response: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    },
+    Finalize {
+        generation_id: u64,
+    },
+    Rollback {
+        generation_id: u64,
+        response: std::sync::mpsc::SyncSender<std::result::Result<(), String>>,
+    },
+}
+
+struct DaemonConfigGenerationParticipant {
+    controllers: Vec<GenerationSupervisorController>,
+}
+
+struct PreparedDaemonConfigGeneration {
+    controllers: Vec<GenerationSupervisorController>,
+    generation_id: u64,
+}
+
+impl crate::config::PreparedConfigGeneration for PreparedDaemonConfigGeneration {
+    fn commit(&mut self) -> Result<()> {
+        for controller in &self.controllers {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            controller
+                .commands
+                .send(GenerationSupervisorCommand::Commit {
+                    generation_id: self.generation_id,
+                    response: tx,
+                })
+                .map_err(|_| anyhow::anyhow!("{} supervisor is unavailable during commit", controller.name))?;
+            match rx.recv_timeout(Duration::from_secs(45)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => anyhow::bail!("{} commit failed: {error}", controller.name),
+                Err(error) => anyhow::bail!("{} commit acknowledgement failed: {error}", controller.name),
+            }
+        }
+        Ok(())
+    }
+
+    fn rollback(&mut self) {
+        for controller in self.controllers.iter().rev() {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            if controller
+                .commands
+                .send(GenerationSupervisorCommand::Rollback {
+                    generation_id: self.generation_id,
+                    response: tx,
+                })
+                .is_err()
+            {
+                tracing::error!(
+                    component = controller.name,
+                    generation = self.generation_id,
+                    "failed to request config-generation rollback"
+                );
+                continue;
+            }
+            match rx.recv_timeout(Duration::from_secs(45)) {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::error!(
+                    component = controller.name,
+                    generation = self.generation_id,
+                    "config-generation rollback failed: {error}"
+                ),
+                Err(error) => tracing::error!(
+                    component = controller.name,
+                    generation = self.generation_id,
+                    "config-generation rollback acknowledgement failed: {error}"
+                ),
+            }
+        }
+    }
+
+    fn finalize(&mut self) {
+        for controller in &self.controllers {
+            if controller
+                .commands
+                .send(GenerationSupervisorCommand::Finalize {
+                    generation_id: self.generation_id,
+                })
+                .is_err()
+            {
+                tracing::error!(
+                    component = controller.name,
+                    generation = self.generation_id,
+                    "failed to finalize committed config generation"
+                );
+            }
+        }
+    }
+}
+
+impl crate::config::ConfigGenerationParticipant for DaemonConfigGenerationParticipant {
+    fn name(&self) -> &'static str {
+        "daemon_component_supervisors"
+    }
+
+    fn supports_controlled_restart_field(&self, field: &str) -> bool {
+        crate::config::generation::is_controlled_restart(field)
+            && self
+                .controllers
+                .iter()
+                .any(|controller| (controller.prepares_for_field)(field))
+    }
+
+    fn supports_rebuild_field(&self, field: &str) -> bool {
+        crate::config::generation::is_rebuild_and_swap(field)
+            && self
+                .controllers
+                .iter()
+                .any(|controller| (controller.prepares_for_field)(field))
+    }
+
+    fn prepares_for_field(&self, field: &str) -> bool {
+        self.controllers
+            .iter()
+            .any(|controller| (controller.prepares_for_field)(field))
+    }
+
+    fn prepare(
+        &self,
+        generation: Arc<crate::config::ConfigGeneration>,
+        changed_fields: &[String],
+    ) -> Result<Box<dyn crate::config::PreparedConfigGeneration>> {
+        let controllers = self
+            .controllers
+            .iter()
+            .filter(|controller| {
+                changed_fields
+                    .iter()
+                    .any(|field| (controller.prepares_for_field)(field))
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if controllers.is_empty() {
+            return Ok(Box::new(PreparedDaemonConfigGeneration {
+                controllers: Vec::new(),
+                generation_id: generation.id.0,
+            }));
+        }
+
+        let mut prepared = Vec::new();
+        for controller in &controllers {
+            let (tx, rx) = std::sync::mpsc::sync_channel(1);
+            controller
+                .commands
+                .send(GenerationSupervisorCommand::Prepare {
+                    generation: Arc::clone(&generation),
+                    response: tx,
+                })
+                .map_err(|_| anyhow::anyhow!("{} supervisor is unavailable", controller.name))?;
+            match rx.recv_timeout(Duration::from_secs(45)) {
+                Ok(Ok(())) => prepared.push(controller.clone()),
+                Ok(Err(error)) => {
+                    rollback_prepared_supervisors(&prepared, generation.id.0);
+                    anyhow::bail!("{} failed to prepare: {error}", controller.name);
+                }
+                Err(error) => {
+                    rollback_prepared_supervisors(&prepared, generation.id.0);
+                    anyhow::bail!("{} prepare acknowledgement failed: {error}", controller.name);
+                }
+            }
+        }
+
+        Ok(Box::new(PreparedDaemonConfigGeneration {
+            controllers: prepared,
+            generation_id: generation.id.0,
+        }))
+    }
+}
+
+fn rollback_prepared_supervisors(controllers: &[GenerationSupervisorController], generation_id: u64) {
+    for controller in controllers.iter().rev() {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let _ = controller.commands.send(GenerationSupervisorCommand::Rollback {
+            generation_id,
+            response: tx,
+        });
+        let _ = rx.recv_timeout(Duration::from_secs(45));
+    }
+}
+
+fn spawn_config_generation_supervisor(
+    name: &'static str,
+    owner: &'static str,
+    freshness_ttl_seconds: u64,
+    initial_generation: Arc<crate::config::ConfigGeneration>,
+    prepares_for_field: GenerationComponentFieldFilter,
+    enabled: GenerationComponentEnabled,
+    runner: GenerationComponentRunner,
+    root_shutdown: CancellationToken,
+) -> (JoinHandle<()>, GenerationSupervisorController) {
+    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let controller = GenerationSupervisorController {
+        name,
+        prepares_for_field,
+        commands,
+    };
+    let handle = tokio::spawn(run_config_generation_supervisor(
+        name,
+        owner,
+        freshness_ttl_seconds,
+        initial_generation,
+        enabled,
+        runner,
+        root_shutdown,
+        receiver,
+    ));
+    (handle, controller)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_config_generation_supervisor(
+    name: &'static str,
+    owner: &'static str,
+    freshness_ttl_seconds: u64,
+    initial_generation: Arc<crate::config::ConfigGeneration>,
+    enabled: GenerationComponentEnabled,
+    runner: GenerationComponentRunner,
+    root_shutdown: CancellationToken,
+    mut commands: tokio::sync::mpsc::UnboundedReceiver<GenerationSupervisorCommand>,
+) {
+    let mut current_generation = initial_generation;
+    let mut previous_generation: Option<Arc<crate::config::ConfigGeneration>> = None;
+    let mut committed_generation: Option<u64> = None;
+    let (mut task, mut task_shutdown) = match start_generation_component(
+        name,
+        owner,
+        freshness_ttl_seconds,
+        Arc::clone(&current_generation),
+        &enabled,
+        &runner,
+    )
+    .await
+    {
+        Ok(state) => state,
+        Err(error) => {
+            crate::health::mark_component_error(name, error.to_string());
+            tracing::error!(component = name, "initial generation failed: {error}");
+            (None, None)
+        }
+    };
+
+    loop {
+        tokio::select! {
+            () = root_shutdown.cancelled() => {
+                stop_generation_component(name, &mut task, &mut task_shutdown).await;
+                break;
+            }
+            command = commands.recv() => {
+                let Some(command) = command else {
+                    stop_generation_component(name, &mut task, &mut task_shutdown).await;
+                    break;
+                };
+                match command {
+                    GenerationSupervisorCommand::Prepare { generation, response } => {
+                        if generation.id <= current_generation.id || previous_generation.is_some() {
+                            let _ = response.send(Err(format!(
+                                "stale or overlapping generation prepare rejected: current={}, candidate={}",
+                                current_generation.id.0,
+                                generation.id.0
+                            )));
+                            continue;
+                        }
+                        let old = Arc::clone(&current_generation);
+                        stop_generation_component(name, &mut task, &mut task_shutdown).await;
+                        match start_generation_component(
+                            name,
+                            owner,
+                            freshness_ttl_seconds,
+                            Arc::clone(&generation),
+                            &enabled,
+                            &runner,
+                        ).await {
+                            Ok((next_task, next_shutdown)) => {
+                                task = next_task;
+                                task_shutdown = next_shutdown;
+                                current_generation = generation;
+                                previous_generation = Some(old);
+                                committed_generation = None;
+                                let _ = response.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let rollback = start_generation_component(
+                                    name,
+                                    owner,
+                                    freshness_ttl_seconds,
+                                    Arc::clone(&old),
+                                    &enabled,
+                                    &runner,
+                                ).await;
+                                match rollback {
+                                    Ok((old_task, old_shutdown)) => {
+                                        task = old_task;
+                                        task_shutdown = old_shutdown;
+                                        current_generation = old;
+                                    }
+                                    Err(rollback_error) => {
+                                        tracing::error!(
+                                            component = name,
+                                            "candidate failed and old generation could not restart: {rollback_error}"
+                                        );
+                                    }
+                                }
+                                let _ = response.send(Err(error.to_string()));
+                            }
+                        }
+                    }
+                    GenerationSupervisorCommand::Commit { generation_id, response } => {
+                        if current_generation.id.0 != generation_id || previous_generation.is_none() {
+                            let _ = response.send(Err(format!(
+                                "stale generation commit rejected: current={}, candidate={generation_id}",
+                                current_generation.id.0
+                            )));
+                            continue;
+                        }
+                        committed_generation = Some(generation_id);
+                        let _ = response.send(Ok(()));
+                    }
+                    GenerationSupervisorCommand::Finalize { generation_id } => {
+                        if current_generation.id.0 == generation_id
+                            && committed_generation == Some(generation_id)
+                        {
+                            previous_generation = None;
+                            committed_generation = None;
+                        } else {
+                            tracing::warn!(
+                                component = name,
+                                current_generation = current_generation.id.0,
+                                generation = generation_id,
+                                "stale config-generation finalize rejected"
+                            );
+                        }
+                    }
+                    GenerationSupervisorCommand::Rollback { generation_id, response } => {
+                        if current_generation.id.0 != generation_id {
+                            let _ = response.send(Err(format!(
+                                "stale generation rollback rejected: current={}, candidate={generation_id}",
+                                current_generation.id.0
+                            )));
+                            continue;
+                        }
+                        let Some(previous) = previous_generation.take() else {
+                            let _ = response.send(Err("previous generation is unavailable".to_string()));
+                            continue;
+                        };
+                        stop_generation_component(name, &mut task, &mut task_shutdown).await;
+                        match start_generation_component(
+                            name,
+                            owner,
+                            freshness_ttl_seconds,
+                            Arc::clone(&previous),
+                            &enabled,
+                            &runner,
+                        ).await {
+                            Ok((old_task, old_shutdown)) => {
+                                task = old_task;
+                                task_shutdown = old_shutdown;
+                                current_generation = previous;
+                                committed_generation = None;
+                                let _ = response.send(Ok(()));
+                            }
+                            Err(error) => {
+                                let _ = response.send(Err(error.to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+            () = tokio::time::sleep(Duration::from_millis(250)) => {
+                if task.as_ref().is_some_and(tokio::task::JoinHandle::is_finished) {
+                    if let Some(finished) = task.take() {
+                        match finished.await {
+                            Ok(Ok(())) => tracing::warn!(component = name, "component exited unexpectedly"),
+                            Ok(Err(error)) => tracing::error!(component = name, "component failed: {error}"),
+                            Err(error) => tracing::error!(component = name, "component task failed: {error}"),
+                        }
+                    }
+                    task_shutdown = None;
+                    crate::health::bump_component_restart(name);
+                    match start_generation_component(
+                        name,
+                        owner,
+                        freshness_ttl_seconds,
+                        Arc::clone(&current_generation),
+                        &enabled,
+                        &runner,
+                    ).await {
+                        Ok((next_task, next_shutdown)) => {
+                            task = next_task;
+                            task_shutdown = next_shutdown;
+                        }
+                        Err(error) => crate::health::mark_component_error(name, error.to_string()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn start_generation_component(
+    name: &'static str,
+    owner: &'static str,
+    freshness_ttl_seconds: u64,
+    generation: Arc<crate::config::ConfigGeneration>,
+    enabled: &GenerationComponentEnabled,
+    runner: &GenerationComponentRunner,
+) -> Result<(Option<JoinHandle<Result<()>>>, Option<CancellationToken>)> {
+    let should_run = enabled(&generation.effective);
+    register_optional_component(name, owner, should_run, freshness_ttl_seconds);
+    if !should_run {
+        return Ok((None, None));
+    }
+    let token = CancellationToken::new();
+    let future = runner(Arc::clone(&generation), token.clone());
+    let mut handle = tokio::spawn(future);
+    let readiness = async {
+        loop {
+            tokio::select! {
+                result = &mut handle => {
+                    return match result {
+                        Ok(Ok(())) => Err(anyhow::anyhow!("{name} exited during generation preparation")),
+                        Ok(Err(error)) => Err(error).with_context(|| format!("{name} failed during generation preparation")),
+                        Err(error) => Err(anyhow::anyhow!("{name} task failed during generation preparation: {error}")),
+                    };
+                }
+                () = tokio::time::sleep(Duration::from_millis(25)) => {
+                    match component_health_status(name).as_deref() {
+                        Some("ok") => return Ok(()),
+                        Some("error") => {
+                            return Err(anyhow::anyhow!(
+                                "{name} reported failed health during generation preparation"
+                            ));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    };
+    match tokio::time::timeout(generation_readiness_timeout(), readiness).await {
+        Ok(Ok(())) => Ok((Some(handle), Some(token))),
+        Ok(Err(error)) => {
+            token.cancel();
+            handle.abort();
+            let _ = handle.await;
+            Err(error)
+        }
+        Err(_) => {
+            token.cancel();
+            handle.abort();
+            let _ = handle.await;
+            anyhow::bail!(
+                "{name} did not acknowledge readiness within {} milliseconds",
+                generation_readiness_timeout().as_millis()
+            )
+        }
+    }
+}
+
+#[cfg(not(test))]
+const fn generation_readiness_timeout() -> Duration {
+    Duration::from_secs(45)
+}
+
+#[cfg(test)]
+const fn generation_readiness_timeout() -> Duration {
+    Duration::from_millis(500)
+}
+
+fn component_health_status(name: &str) -> Option<String> {
+    crate::health::snapshot_json()
+        .get("components")
+        .and_then(|components| components.get(name))
+        .and_then(|component| component.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+}
+
+async fn stop_generation_component(
+    name: &'static str,
+    task: &mut Option<JoinHandle<Result<()>>>,
+    shutdown: &mut Option<CancellationToken>,
+) {
+    if let Some(token) = shutdown.take() {
+        token.cancel();
+    }
+    let Some(mut handle) = task.take() else {
+        return;
+    };
+    match tokio::time::timeout(Duration::from_secs(30), &mut handle).await {
+        Ok(_) => {}
+        Err(_) => {
+            tracing::warn!(component = name, "component generation drain timed out; aborting");
+            handle.abort();
+            let _ = handle.await;
+        }
+    }
+}
+
+async fn run_fitness_worker(
+    config: Config,
+    manager: crate::config::SharedConfig,
+    generation_id: crate::config::ConfigGenerationId,
+) -> Result<()> {
     let interval_hours = config.self_system.fitness_interval_hours.max(1);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
+    crate::health::mark_component_ok("self_system_fitness");
+    wait_for_active_generation(&manager, generation_id).await;
 
     loop {
         interval.tick().await;
-        match crate::self_system::run_fitness_report().await {
+        match crate::self_system::run_fitness_report_with_config(&config).await {
             Ok(report) => {
                 crate::health::mark_component_ok("self_system_fitness");
                 tracing::info!(
@@ -531,9 +1083,15 @@ async fn run_fitness_worker(config: Config) -> Result<()> {
     }
 }
 
-async fn run_evolution_scheduler_worker(config: Config) -> Result<()> {
+async fn run_evolution_scheduler_worker(
+    config: Config,
+    manager: crate::config::SharedConfig,
+    generation_id: crate::config::ConfigGenerationId,
+) -> Result<()> {
     let (mut scheduler, interval_hours) = build_evolution_scheduler(&config).await?;
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.max(1).saturating_mul(3600)));
+    crate::health::mark_component_ok("evolution_scheduler");
+    wait_for_active_generation(&manager, generation_id).await;
 
     loop {
         interval.tick().await;
@@ -563,6 +1121,15 @@ async fn run_evolution_scheduler_worker(config: Config) -> Result<()> {
                 );
             }
         }
+    }
+}
+
+async fn wait_for_active_generation(
+    manager: &crate::config::SharedConfig,
+    generation_id: crate::config::ConfigGenerationId,
+) {
+    while manager.active_generation_id() != generation_id {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 
@@ -925,6 +1492,7 @@ mod systemd_notify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     fn test_config(tmp: &TempDir) -> Config {
@@ -1136,6 +1704,199 @@ mod tests {
             snapshot["components"]["daemon-test-pending"]["status"], "ok",
             "a pending task has not acknowledged readiness"
         );
+    }
+
+    fn next_test_generation(
+        previous: &Arc<crate::config::ConfigGeneration>,
+        id: u64,
+    ) -> Arc<crate::config::ConfigGeneration> {
+        Arc::new(crate::config::ConfigGeneration {
+            id: crate::config::ConfigGenerationId(id),
+            source_revision: previous.source_revision.clone(),
+            effective: Arc::clone(&previous.effective),
+            applied_at: Utc::now(),
+            trigger: crate::config::ConfigReloadTrigger::Test,
+            deferred_changes: Arc::from([]),
+        })
+    }
+
+    async fn receive_generation_ack(
+        receiver: std::sync::mpsc::Receiver<std::result::Result<(), String>>,
+    ) -> std::result::Result<(), String> {
+        tokio::task::spawn_blocking(move || {
+            receiver
+                .recv_timeout(Duration::from_secs(2))
+                .map_err(|error| error.to_string())?
+        })
+        .await
+        .expect("ack task")
+    }
+
+    #[test]
+    fn daemon_generation_participant_routes_only_matching_fields() {
+        let (commands, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let participant = DaemonConfigGenerationParticipant {
+            controllers: vec![GenerationSupervisorController {
+                name: "cron-only",
+                prepares_for_field: Arc::new(|field| field == "cron"),
+                commands,
+            }],
+        };
+
+        assert!(crate::config::ConfigGenerationParticipant::supports_controlled_restart_field(&participant, "cron"));
+        assert!(crate::config::ConfigGenerationParticipant::prepares_for_field(
+            &participant,
+            "cron"
+        ));
+        assert!(
+            !crate::config::ConfigGenerationParticipant::supports_controlled_restart_field(
+                &participant,
+                "channels_config"
+            )
+        );
+        assert!(!crate::config::ConfigGenerationParticipant::prepares_for_field(
+            &participant,
+            "default_temperature"
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn generation_supervisor_fences_stale_commit_and_rolls_back_without_overlap() {
+        let name = "daemon-generation-fencing-test";
+        let root_shutdown = CancellationToken::new();
+        let initial = crate::config::new_shared(Config::default()).pin();
+        let starts = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let runner: GenerationComponentRunner = {
+            let starts = Arc::clone(&starts);
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            Arc::new(move |generation, shutdown| {
+                let starts = Arc::clone(&starts);
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                Box::pin(async move {
+                    starts.lock().push(generation.id.0);
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    crate::health::mark_component_ok(name);
+                    shutdown.cancelled().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            })
+        };
+        let (handle, controller) = spawn_config_generation_supervisor(
+            name,
+            "test",
+            60,
+            Arc::clone(&initial),
+            Arc::new(|_| true),
+            Arc::new(|_| true),
+            runner,
+            root_shutdown.clone(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let generation = next_test_generation(&initial, 1);
+        let (prepare_tx, prepare_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Prepare {
+                generation,
+                response: prepare_tx,
+            })
+            .unwrap();
+        assert_eq!(receive_generation_ack(prepare_rx).await, Ok(()));
+
+        let (stale_tx, stale_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Commit {
+                generation_id: 0,
+                response: stale_tx,
+            })
+            .unwrap();
+        assert!(receive_generation_ack(stale_rx).await.is_err());
+
+        let (commit_tx, commit_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Commit {
+                generation_id: 1,
+                response: commit_tx,
+            })
+            .unwrap();
+        assert_eq!(receive_generation_ack(commit_rx).await, Ok(()));
+
+        let (rollback_tx, rollback_rx) = std::sync::mpsc::sync_channel(1);
+        controller
+            .commands
+            .send(GenerationSupervisorCommand::Rollback {
+                generation_id: 1,
+                response: rollback_tx,
+            })
+            .unwrap();
+        assert_eq!(receive_generation_ack(rollback_rx).await, Ok(()));
+
+        root_shutdown.cancel();
+        handle.await.unwrap();
+        assert_eq!(*starts.lock(), vec![0, 1, 0]);
+        assert_eq!(max_active.load(Ordering::SeqCst), 1);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn generation_component_requires_explicit_health_readiness_ack() {
+        let generation = crate::config::new_shared(Config::default()).pin();
+        let runner: GenerationComponentRunner = Arc::new(|_, shutdown| {
+            Box::pin(async move {
+                shutdown.cancelled().await;
+                Ok(())
+            })
+        });
+        let enabled: GenerationComponentEnabled = Arc::new(|_| true);
+
+        let error = start_generation_component(
+            "daemon-generation-no-readiness-test",
+            "test",
+            60,
+            generation,
+            &enabled,
+            &runner,
+        )
+        .await
+        .expect_err("task survival without health ack must not count as readiness");
+
+        assert!(error.to_string().contains("did not acknowledge readiness"));
+    }
+
+    #[tokio::test]
+    async fn generation_activation_waits_until_manager_publishes_candidate() {
+        let manager = crate::config::new_shared(Config::default());
+        let waiter = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            async move {
+                wait_for_active_generation(&manager, crate::config::ConfigGenerationId(1)).await;
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert!(
+            !waiter.is_finished(),
+            "candidate work admitted before active publication"
+        );
+
+        let mut desired = (*manager.load_full()).clone();
+        desired.default_temperature = 0.16;
+        manager
+            .apply_runtime_config(desired, crate::config::ConfigReloadTrigger::Test)
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("activation waiter timed out")
+            .unwrap();
     }
 
     #[test]

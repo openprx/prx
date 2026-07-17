@@ -15,7 +15,7 @@ pub struct HeartbeatEngine {
 }
 
 impl HeartbeatEngine {
-    pub fn new(config: HeartbeatConfig, workspace_dir: std::path::PathBuf) -> Self {
+    pub const fn new(config: HeartbeatConfig, workspace_dir: std::path::PathBuf) -> Self {
         Self { config, workspace_dir }
     }
 

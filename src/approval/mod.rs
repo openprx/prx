@@ -54,6 +54,7 @@ pub struct ApprovalLogEntry {
 ///
 /// - Maintains a session-scoped "always" allowlist (skips re-prompting).
 /// - Records an audit trail of all decisions.
+///
 /// Runtime grants are minted by the execution strategy from the complete typed
 /// command/context after approval; this UI owner never stores authority.
 pub struct ApprovalManager {

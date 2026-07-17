@@ -215,6 +215,8 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
             topic_id: envelope.topic_id.as_deref(),
             task_id: envelope.task_id.as_deref(),
             source_message_event_id: envelope.source_message_event_id.as_deref(),
+            config_generation_id: envelope.config_generation_id,
+            config_source_revision: envelope.config_source_revision.as_deref(),
         };
         let runtime_grant = crate::agent::loop_::runtime_approval_grant_for_call(
             &request.descriptor.public_name,
@@ -1148,6 +1150,7 @@ impl EffectExecutor {
                 let tool_execution_service = tools_registry.as_ref().map(|registry| {
                     Arc::new(chat_tool_execution_service(
                         Arc::clone(registry),
+                        Some(Arc::clone(&deps.memory)),
                         Arc::clone(&tool_security_policy),
                         Arc::clone(&deps.approval_router),
                         action_tx.clone(),
@@ -2045,13 +2048,14 @@ fn chat_tool_execution_context(
 
 fn chat_tool_execution_service(
     registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
+    idempotency_memory: Option<Arc<dyn Memory>>,
     policy: Arc<crate::security::SecurityPolicy>,
     approval_router: Arc<ApprovalRouter>,
     action_tx: mpsc::Sender<Action>,
     cancellation: CancellationToken,
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
 ) -> ToolExecutionService {
-    ToolExecutionService::from_shared_boxed_registry(
+    let service = ToolExecutionService::from_shared_boxed_registry(
         registry,
         Arc::new(SecurityEffectPolicy::new(Arc::clone(&policy))),
         Arc::new(ChatTuiApprovalStrategy {
@@ -2063,7 +2067,29 @@ fn chat_tool_execution_service(
         }),
         Arc::new(ChatToolSandboxStrategy { task_id, action_tx }),
         Arc::new(TracingToolExecutionAudit),
-    )
+    );
+    #[cfg(test)]
+    let idempotency_memory = idempotency_memory.map(|memory| {
+        if matches!(memory.name(), "sqlite" | "postgres" | "lucid") {
+            memory
+        } else {
+            chat_test_idempotency_memory()
+        }
+    });
+    match idempotency_memory {
+        Some(memory) => service.with_idempotency_memory(memory),
+        None => service,
+    }
+}
+
+#[cfg(test)]
+fn chat_test_idempotency_memory() -> Arc<dyn Memory> {
+    static MEMORY: std::sync::OnceLock<Arc<crate::memory::SqliteMemory>> = std::sync::OnceLock::new();
+    let memory = MEMORY.get_or_init(|| {
+        let path = std::env::temp_dir().join(format!("openprx-chat-test-ledger-{}", std::process::id()));
+        Arc::new(crate::memory::SqliteMemory::new(&path).expect("chat test idempotency ledger"))
+    });
+    Arc::clone(memory) as Arc<dyn Memory>
 }
 
 struct ReduxToolLoopEventSink {
@@ -3174,6 +3200,8 @@ async fn execute_single_tool_call(
             | ToolExecutionStatus::ApprovalDenied
             | ToolExecutionStatus::SandboxDenied
             | ToolExecutionStatus::UnknownTool
+            | ToolExecutionStatus::IdempotencyConflict
+            | ToolExecutionStatus::Indeterminate
     );
     let unrecoverable = if !ok_flag && (terminal_block || is_unrecoverable_tool_error(&summary)) {
         Some(unrecoverable_signature(&call.name, &summary))
@@ -3843,19 +3871,28 @@ fn tool_service_for_test(
     action_tx: &mpsc::Sender<Action>,
     draft_id: &str,
     level: crate::security::AutonomyLevel,
-) -> (ToolExecutionService, ToolExecutionContext, CancellationToken) {
+) -> (
+    ToolExecutionService,
+    ToolExecutionContext,
+    CancellationToken,
+    tempfile::TempDir,
+) {
     let policy = tool_security_policy(level);
     let cancellation = CancellationToken::new();
     let context = chat_tool_execution_context(policy.as_ref(), None, None, draft_id);
+    let ledger = tempfile::TempDir::new().expect("tool ledger tempdir");
+    let memory: Arc<dyn Memory> =
+        Arc::new(crate::memory::SqliteMemory::new(ledger.path()).expect("tool ledger sqlite"));
     let service = chat_tool_execution_service(
         registry,
+        Some(memory),
         policy,
         Arc::new(ApprovalRouter::new()),
         action_tx.clone(),
         cancellation.clone(),
         None,
     );
-    (service, context, cancellation)
+    (service, context, cancellation, ledger)
 }
 
 // ─── 单元测试 ─────────────────────────────────────────────────────────────────
@@ -7374,7 +7411,10 @@ mod real_mode_tests {
         #[async_trait]
         impl Provider for ToolThenTextProvider {
             fn capabilities(&self) -> ProviderCapabilities {
-                ProviderCapabilities::default()
+                ProviderCapabilities {
+                    native_tool_calling: true,
+                    vision: false,
+                }
             }
             async fn chat_with_system(
                 &self,
@@ -11129,8 +11169,12 @@ mod real_mode_tests {
         let mut history = Vec::new();
         let cancellation = CancellationToken::new();
         let context = chat_tool_execution_context(policy.as_ref(), None, None, "draft-router");
+        let ledger = tempfile::TempDir::new().expect("approval router ledger");
+        let ledger_memory: Arc<dyn Memory> =
+            Arc::new(crate::memory::SqliteMemory::new(ledger.path()).expect("approval router sqlite"));
         let service = chat_tool_execution_service(
             Arc::clone(&registry),
+            Some(ledger_memory),
             policy,
             Arc::clone(&approval_router),
             action_tx.clone(),
@@ -11207,7 +11251,7 @@ mod real_mode_tests {
             args: "{}".to_string(),
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
-        let (service, context, cancellation) = tool_service_for_test(
+        let (service, context, cancellation, _ledger) = tool_service_for_test(
             registry,
             &action_tx,
             "draft-read-only",
@@ -11257,6 +11301,7 @@ mod real_mode_tests {
         let approval_router = Arc::new(ApprovalRouter::new());
         let service = chat_tool_execution_service(
             registry,
+            None,
             policy,
             Arc::clone(&approval_router),
             action_tx.clone(),
@@ -11992,7 +12037,7 @@ mod s4_a_3 {
         };
         let (action_tx, mut action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
-        let (service, context, cancellation) = tool_service_for_test(
+        let (service, context, cancellation, _ledger) = tool_service_for_test(
             Arc::clone(&registry),
             &action_tx,
             "draft-plan",
@@ -12084,7 +12129,7 @@ mod s4_a_3 {
             crate::providers::traits::ChatMessage::system("sys"),
             crate::providers::traits::ChatMessage::user("run the large command"),
         ];
-        let (service, context, cancellation) = tool_service_for_test(
+        let (service, context, cancellation, _ledger) = tool_service_for_test(
             Arc::clone(&registry),
             &action_tx,
             "draft-large",
@@ -12161,7 +12206,7 @@ mod s4_a_3 {
         };
         let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
-        let (service, context, cancellation) = tool_service_for_test(
+        let (service, context, cancellation, _ledger) = tool_service_for_test(
             Arc::clone(&registry),
             &action_tx,
             "draft-rej",
@@ -12235,7 +12280,7 @@ mod s4_a_3 {
         };
         let (action_tx, _action_rx) = mpsc::channel::<Action>(8);
         let mut history = Vec::new();
-        let (service, context, cancellation) = tool_service_for_test(
+        let (service, context, cancellation, _ledger) = tool_service_for_test(
             Arc::clone(&registry),
             &action_tx,
             "draft-flaky",

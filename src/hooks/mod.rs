@@ -291,11 +291,10 @@ impl HookManager {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::piped());
 
-        cmd.kill_on_drop(true);
-        let mut child = cmd.spawn()?;
+        let mut child = crate::runtime::shell_process::spawn_managed_shell_child(cmd)?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
 
-        let stderr = child.stderr.take();
+        let stderr = child.take_stderr();
         let stderr_reader = tokio::spawn(async move {
             let Some(stderr) = stderr else {
                 return std::io::Result::Ok(Vec::new());
@@ -306,20 +305,20 @@ impl HookManager {
         });
 
         if action.stdin_json {
-            if let Some(mut stdin) = child.stdin.take() {
+            if let Some(mut stdin) = child.take_stdin() {
                 let write_result = tokio::time::timeout_at(deadline, stdin.write_all(payload_json.as_bytes())).await;
-                if write_result.is_err() {
-                    terminate_and_reap(&mut child).await;
-                    let _ = stderr_reader.await;
-                    anyhow::bail!("hook timed out while writing stdin");
-                }
-                if let Err(e) = write_result.expect("timeout checked") {
-                    // Hook command may not consume stdin; fallback file path is still available.
-                    if e.kind() != std::io::ErrorKind::BrokenPipe {
-                        terminate_and_reap(&mut child).await;
+                match write_result {
+                    Err(_) => {
+                        let _ = child.terminate_and_reap().await;
                         let _ = stderr_reader.await;
-                        return Err(e.into());
+                        anyhow::bail!("hook timed out while writing stdin");
                     }
+                    Ok(Err(error)) if error.kind() != std::io::ErrorKind::BrokenPipe => {
+                        let _ = child.terminate_and_reap().await;
+                        let _ = stderr_reader.await;
+                        return Err(error.into());
+                    }
+                    Ok(_) => {}
                 }
             }
         }
@@ -327,17 +326,18 @@ impl HookManager {
         let status = match tokio::time::timeout_at(deadline, child.wait()).await {
             Ok(Ok(status)) => status,
             Ok(Err(error)) => {
-                terminate_and_reap(&mut child).await;
+                let _ = child.terminate_and_reap().await;
                 let _ = stderr_reader.await;
                 return Err(error.into());
             }
             Err(_) => {
-                terminate_and_reap(&mut child).await;
+                let _ = child.terminate_and_reap().await;
                 let _ = stderr_reader.await;
                 anyhow::bail!("hook timed out after {timeout_ms} ms");
             }
         };
         let mut stderr = stderr_reader.await??;
+        child.mark_complete();
         let stderr_truncated = stderr.len() > MAX_STDERR_BYTES as usize;
         stderr.truncate(MAX_STDERR_BYTES as usize);
 
@@ -360,11 +360,6 @@ impl HookManager {
             }
         )
     }
-}
-
-async fn terminate_and_reap(child: &mut tokio::process::Child) {
-    let _ = child.start_kill();
-    let _ = child.wait().await;
 }
 
 fn bounded_timeout(timeout_ms: u64) -> anyhow::Result<u64> {
@@ -728,7 +723,9 @@ mod tests {
             command: "sh".into(),
             args: vec![
                 "-c".into(),
-                "echo $$ > hook.pid; echo \"$ZERO_HOOK_PAYLOAD_FILE\" > payload.path; exec sleep 10".into(),
+                "echo $$ > hook.pid; sleep 10 & echo $! > hook-descendant.pid; \
+                 echo \"$ZERO_HOOK_PAYLOAD_FILE\" > payload.path; wait"
+                    .into(),
             ],
             env: HashMap::new(),
             cwd: None,
@@ -743,9 +740,29 @@ mod tests {
             .unwrap()
             .trim()
             .to_string();
+        for _ in 0..200 {
+            if !Path::new(&format!("/proc/{pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         assert!(
             !Path::new(&format!("/proc/{pid}")).exists(),
             "hook child was not reaped"
+        );
+        let descendant_pid = std::fs::read_to_string(temp.path().join("hook-descendant.pid"))
+            .unwrap()
+            .trim()
+            .to_string();
+        for _ in 0..200 {
+            if !Path::new(&format!("/proc/{descendant_pid}")).exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            !Path::new(&format!("/proc/{descendant_pid}")).exists(),
+            "hook descendant process was not terminated"
         );
         let payload_path = std::fs::read_to_string(temp.path().join("payload.path")).unwrap();
         assert!(!Path::new(payload_path.trim()).exists(), "payload temp file leaked");

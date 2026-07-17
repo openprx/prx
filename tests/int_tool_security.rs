@@ -78,24 +78,30 @@ async fn int_ts_01_shell_supervised_allows_low_risk() {
 
 #[tokio::test]
 async fn int_ts_02_risk_classification_low_executes() {
+    let workspace = tempfile::tempdir().expect("test: create isolated workspace");
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
-        p.workspace_dir = std::env::temp_dir();
+        p.workspace_dir = workspace.path().to_path_buf();
     });
 
-    // ls /tmp is Low risk; under Supervised, low-risk commands run without a grant
+    // `ls .` is Low risk and stays inside the configured workspace; under
+    // Supervised, low-risk commands run without a grant.
     assert_eq!(
-        security.command_risk_level("ls /tmp"),
+        security.command_risk_level("ls ."),
         CommandRiskLevel::Low,
-        "test: 'ls /tmp' should be classified Low"
+        "test: 'ls .' should be classified Low"
     );
 
     let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
     let result = tool
-        .execute(json!({"command": "ls /tmp"}))
+        .execute(json!({"command": "ls ."}))
         .await
         .expect("test: low-risk command should return ToolResult");
-    assert!(result.success, "Low-risk 'ls /tmp' should execute");
+    assert!(
+        result.success,
+        "Low-risk 'ls .' should execute, error: {:?}",
+        result.error
+    );
 }
 
 #[tokio::test]
@@ -128,25 +134,29 @@ async fn int_ts_02_risk_classification_medium_needs_approval() {
 
 #[tokio::test]
 async fn int_ts_02_risk_classification_high_blocked() {
+    let workspace = tempfile::tempdir().expect("test: create isolated workspace");
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
-        p.workspace_dir = std::env::temp_dir();
+        p.workspace_dir = workspace.path().to_path_buf();
     });
 
     assert_eq!(
-        security.command_risk_level("rm -rf /"),
+        security.command_risk_level("rm -rf ./fixture"),
         CommandRiskLevel::High,
-        "test: 'rm -rf /' should be classified High"
+        "test: workspace-local recursive removal should be classified High"
     );
 
     let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
     let result = tool
-        .execute(json!({"command": "rm -rf /"}))
+        .execute(json!({"command": "rm -rf ./fixture"}))
         .await
         .expect("test: high-risk command should return ToolResult");
     // Phase 1: under Supervised, a high-risk command without a runtime approval
     // grant is denied via the grant gate (no per-command allowlist anymore).
-    assert!(!result.success, "High-risk 'rm -rf /' must be blocked under Supervised");
+    assert!(
+        !result.success,
+        "High-risk workspace-local recursive removal must be blocked under Supervised"
+    );
     let err = result.error.as_deref().unwrap_or("");
     assert!(
         err.contains("runtime approval grant"),

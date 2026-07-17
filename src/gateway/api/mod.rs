@@ -25,11 +25,9 @@ pub(super) fn authorize_resource_mutation(
     operation_name: &str,
     risk: ResourceRiskLevel,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
-    // D2: authorization reads the hot SharedConfig (D) snapshot, not the cached
-    // `state.config` Mutex (C), so config reloads (autonomy / security.audit) take
-    // effect here without restart. `authorize_resource_mutation_for_config` builds
-    // the exact same policy as before — only the config source changed (C → D).
-    let config = state.shared_config.load_full();
+    // Authorization reads the sole active ConfigGeneration, so config reloads
+    // take effect consistently at every API authorization point.
+    let config = state.config.load_full();
     authorize_resource_mutation_for_config(&config, operation_name, risk)
 }
 

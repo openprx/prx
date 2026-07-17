@@ -86,6 +86,45 @@ pub struct MemoryEventWatcher {
     limit: usize,
 }
 
+#[derive(Clone)]
+pub struct RuntimeAuthorityGuard {
+    identity: String,
+    validator: Arc<dyn Fn() -> anyhow::Result<bool> + Send + Sync>,
+}
+
+impl RuntimeAuthorityGuard {
+    pub fn new(
+        identity: impl Into<String>,
+        validator: impl Fn() -> anyhow::Result<bool> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            identity: identity.into(),
+            validator: Arc::new(validator),
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<bool> {
+        (self.validator)()
+    }
+}
+
+impl std::fmt::Debug for RuntimeAuthorityGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeAuthorityGuard")
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for RuntimeAuthorityGuard {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity == other.identity
+    }
+}
+
+impl Eq for RuntimeAuthorityGuard {}
+
 /// Common routing and ownership metadata for message-fabric writes.
 #[derive(Debug, Clone)]
 pub struct MessageEventScope {
@@ -106,6 +145,9 @@ pub struct MessageEventScope {
     pub correlation_id: Option<String>,
     pub attempt_id: Option<String>,
     pub lease_epoch: Option<i64>,
+    pub config_generation_id: Option<u64>,
+    pub config_source_revision: Option<String>,
+    pub authority_guard: Option<RuntimeAuthorityGuard>,
     pub visibility: MemoryVisibility,
 }
 
@@ -130,6 +172,9 @@ impl MessageEventScope {
             correlation_id: None,
             attempt_id: None,
             lease_epoch: None,
+            config_generation_id: None,
+            config_source_revision: None,
+            authority_guard: None,
             visibility,
         }
     }
@@ -627,6 +672,8 @@ impl MemoryFabric {
                 correlation_id: scope.correlation_id,
                 attempt_id: scope.attempt_id,
                 lease_epoch: scope.lease_epoch,
+                config_generation_id: scope.config_generation_id,
+                config_source_revision: scope.config_source_revision,
                 content,
                 raw_payload_json,
                 visibility: scope.visibility,
@@ -681,6 +728,8 @@ impl MemoryFabric {
             correlation_id: scope.correlation_id,
             attempt_id: scope.attempt_id,
             lease_epoch: scope.lease_epoch,
+            config_generation_id: scope.config_generation_id,
+            config_source_revision: scope.config_source_revision,
             content,
             content_hash: None,
             raw_payload_json,

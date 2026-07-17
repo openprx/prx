@@ -558,6 +558,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
     }
 
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
+    let shared_config = crate::config::new_shared(config.clone());
 
     let (composio_key, composio_entity_id) = if config.composio.enabled {
         (
@@ -570,6 +571,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
 
     let full_tools = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
+        shared_config,
         &security,
         runtime,
         memory.clone(),
@@ -635,6 +637,8 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
                     topic_id: manifest.topic_id.as_deref(),
                     task_id: manifest.parent_task_id.as_deref(),
                     source_message_event_id: manifest.source_message_event_id.as_deref(),
+                    config_generation_id: manifest.runtime_config_generation_id,
+                    config_source_revision: manifest.runtime_config_source_revision.as_deref(),
                 })
             }
             _ => None,
@@ -767,6 +771,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
             },
         },
         &config.cost,
+        &config.workspace_dir,
     )
     .await
     {
@@ -1037,6 +1042,8 @@ fn worker_runtime_envelope_for_workspace(manifest: &WorkerManifest, workspace_id
     if let Some(chat_id) = manifest.scope_chat_id.as_deref() {
         envelope = envelope.with_recipient(chat_id);
     }
+    envelope.config_generation_id = manifest.runtime_config_generation_id;
+    envelope.config_source_revision = manifest.runtime_config_source_revision.clone();
     envelope
 }
 
@@ -1165,6 +1172,8 @@ mod tests {
             temperature: 0.7,
             config_dir: workspace.join("config"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: workspace.to_path_buf(),
             memory_db_path: workspace.join("memory").join("brain.db"),
             memory_workspace_id: Some(workspace.to_string_lossy().to_string()),
@@ -1561,6 +1570,8 @@ mod tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "parent shared context".to_string(),
                 raw_payload_json: None,
                 visibility: crate::memory::MemoryVisibility::Workspace,
@@ -1577,6 +1588,8 @@ mod tests {
             temperature: 0.7,
             config_dir: parent.path().join("config"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker.path().join("brain.db"),
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1648,6 +1661,8 @@ mod tests {
             temperature: 0.7,
             config_dir: parent.path().join("config"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1778,6 +1793,8 @@ mod tests {
             temperature: 0.7,
             config_dir: parent.path().join("config"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: worker.path().to_path_buf(),
             memory_db_path: worker_db,
             memory_workspace_id: Some(worker.path().to_string_lossy().to_string()),
@@ -1854,6 +1871,8 @@ mod tests {
             temperature: 0.7,
             config_dir: std::path::PathBuf::from("/tmp/openprx"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: None,
+            runtime_config_source_revision: None,
             workspace_dir: std::path::PathBuf::from("/tmp/ws"),
             memory_db_path: std::path::PathBuf::from("/tmp/ws/brain.db"),
             memory_workspace_id: Some("/tmp/ws".to_string()),
@@ -1923,6 +1942,8 @@ mod tests {
             temperature: 0.7,
             config_dir: std::path::PathBuf::from("/tmp/openprx"),
             config_generation: "0".repeat(64),
+            runtime_config_generation_id: Some(17),
+            runtime_config_source_revision: Some("revision-17".to_string()),
             workspace_dir: std::path::PathBuf::from("/tmp/worker"),
             memory_db_path: std::path::PathBuf::from("/tmp/parent/memory/brain.db"),
             memory_workspace_id: Some("/tmp/parent".to_string()),
@@ -1957,6 +1978,8 @@ mod tests {
         assert_eq!(scope.channel.as_deref(), Some("telegram"));
         assert_eq!(scope.session_key.as_deref(), Some("telegram:chat-1:alice"));
         assert_eq!(scope.run_id.as_deref(), Some("run-child"));
+        assert_eq!(scope.config_generation_id, Some(17));
+        assert_eq!(scope.config_source_revision.as_deref(), Some("revision-17"));
         assert_eq!(scope.parent_run_id.as_deref(), Some("run-parent"));
         assert_eq!(scope.owner_id.as_deref(), Some("owner-a"));
         assert_eq!(scope.agent_id.as_deref(), Some("agent-a"));

@@ -506,6 +506,8 @@ mod tests {
                 correlation_id: None,
                 attempt_id: None,
                 lease_epoch: None,
+                config_generation_id: Some(0),
+                config_source_revision: None,
                 content: "message-only task".to_string(),
                 raw_payload_json: Some(
                     json!({

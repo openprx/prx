@@ -62,8 +62,12 @@ pub fn session_visibility_or_fragment(dialect: PlaceholderDialect, indices: &[us
         },
         [only] => {
             let token = dialect.token(*only);
+            let null_check = match dialect {
+                PlaceholderDialect::Sqlite => format!("{token} IS NOT NULL"),
+                PlaceholderDialect::Postgres => format!("{token}::TEXT IS NOT NULL"),
+            };
             SessionKeyPredicate {
-                sql: format!("({token} IS NOT NULL AND session_key = {token})"),
+                sql: format!("({null_check} AND session_key = {token})"),
                 bound_keys: 1,
             }
         }
@@ -135,7 +139,7 @@ mod tests {
     #[test]
     fn or_fragment_single_key_is_legacy_byte_identical_postgres() {
         let p = session_visibility_or_fragment(PlaceholderDialect::Postgres, &[4]);
-        assert_eq!(p.sql, "($4 IS NOT NULL AND session_key = $4)");
+        assert_eq!(p.sql, "($4::TEXT IS NOT NULL AND session_key = $4)");
         assert_eq!(p.bound_keys, 1);
     }
 

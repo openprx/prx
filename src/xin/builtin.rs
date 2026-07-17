@@ -24,7 +24,7 @@ impl BuiltinRegistry {
         handlers.insert("xin:health_check", |cfg| Box::pin(handle_health_check(cfg)));
         handlers.insert("xin:stale_cleanup", |cfg| Box::pin(handle_stale_cleanup(cfg)));
         handlers.insert("xin:memory_evolution", |cfg| Box::pin(handle_memory_evolution(cfg)));
-        handlers.insert("xin:fitness_report", |_cfg| Box::pin(handle_fitness_report()));
+        handlers.insert("xin:fitness_report", |cfg| Box::pin(handle_fitness_report(cfg)));
         handlers.insert("xin:memory_hygiene", |cfg| Box::pin(handle_memory_hygiene(cfg)));
         Self { handlers }
     }
@@ -163,8 +163,8 @@ async fn handle_memory_evolution(config: Config) -> Result<String> {
     ))
 }
 
-async fn handle_fitness_report() -> Result<String> {
-    let report = crate::self_system::fitness::run_fitness_report().await?;
+async fn handle_fitness_report(config: Config) -> Result<String> {
+    let report = crate::self_system::fitness::run_fitness_report_with_config(&config).await?;
     Ok(format!(
         "fitness report: score={:.3}, confidence={:.3}, date={}",
         report.final_score, report.confidence, report.window.date
