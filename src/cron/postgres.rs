@@ -49,7 +49,7 @@ const CLAIM_LEASE_MIGRATION_SQL: &str = "ALTER TABLE cron_jobs ADD COLUMN IF NOT
 /// guarded by a `parking_lot::Mutex` (no poison, no unwrap), matching the
 /// memory backend's `PostgresClientSlot` pattern.
 pub struct PostgresCronStore {
-    client: Mutex<Client>,
+    client: Mutex<Option<Client>>,
     qualified_memory_events_table: String,
 }
 
@@ -103,7 +103,7 @@ impl PostgresCronStore {
             .map_err(|_| anyhow::anyhow!("cron postgres initializer thread panicked"))??;
 
         Ok(Self {
-            client: Mutex::new(client),
+            client: Mutex::new(Some(client)),
             qualified_memory_events_table,
         })
     }
@@ -131,9 +131,22 @@ impl PostgresCronStore {
         )
     }
 
-    fn with_client<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
+    fn with_client_direct<T>(&self, f: impl FnOnce(&mut Client) -> Result<T>) -> Result<T> {
         let mut guard = self.client.lock();
-        f(&mut guard)
+        let client = guard.as_mut().context("PostgreSQL cron backend client is closed")?;
+        f(client)
+    }
+
+    fn with_client<T: Send>(&self, f: impl FnOnce(&mut Client) -> Result<T> + Send) -> Result<T> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(move || self.with_client_direct(f))
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("cron postgres operation thread panicked"))?
+            });
+        }
+        self.with_client_direct(f)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1308,6 +1321,17 @@ impl PostgresCronStore {
     }
 }
 
+impl Drop for PostgresCronStore {
+    fn drop(&mut self) {
+        let Some(client) = self.client.get_mut().take() else {
+            return;
+        };
+        let _ = std::thread::Builder::new()
+            .name("cron-postgres-drop".to_string())
+            .spawn(move || drop(client));
+    }
+}
+
 const SELECT_JOB_COLUMNS: &str = "SELECT id, owner_id, topic_id, parent_task_id, source_message_event_id,
             expression, command, schedule, job_type, prompt, name, session_target, model,
             enabled, delivery, delete_after_run, created_at, next_run, last_run, last_status, last_output,
@@ -2422,7 +2446,7 @@ mod tests {
             )
             .expect("test: lock-wait claim")
             .expect("test: lock-wait claim handle");
-        let thread_url = db_url;
+        let thread_url = db_url.clone();
         let thread_job = lock_wait_job.clone();
         let thread_claim = lock_claim;
         let lock_wait_result = store
@@ -2562,5 +2586,20 @@ mod tests {
                 .expect("test: runs after remove")
                 .is_empty()
         );
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test: build deployed-entrypoint runtime");
+        runtime.block_on(async {
+            let runtime_store =
+                PostgresCronStore::connect(&db_url, Some(5)).expect("test: connect cron postgres inside Tokio runtime");
+            assert!(
+                runtime_store
+                    .list_jobs()
+                    .expect("test: query cron postgres inside Tokio runtime")
+                    .is_empty()
+            );
+        });
     }
 }

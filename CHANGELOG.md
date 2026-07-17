@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.12] - 2026-07-17
+
+### Fixed
+
+- Kept synchronous PostgreSQL Cron operations and client shutdown off Tokio
+  runtime threads, preventing deployed `cron` commands and scheduler calls from
+  panicking while initializing or querying the shared PostgreSQL store.
+- Made every release platform required, failed artifact uploads on missing
+  files, and added a 20-file completeness assertion before publication.
+- Added a Windows MSVC check to normal Rust CI so Windows compile failures are
+  caught before an immutable release tag is created.
+
+### Release status
+
+- `v0.8.11` published a complete cross-platform GitHub Release, but its Stage 5
+  deployment was rolled back after the isolated PostgreSQL legacy-Cron check
+  reproduced the Tokio runtime panic. Production returned to healthy 0.8.7.
+
 ## [0.8.11] - 2026-07-17
 
 ### Fixed
@@ -20,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `v0.8.10` was stopped before deployment after its Windows build failed. Its
   incomplete GitHub Release was removed and its immutable tag retained. Upgrade
-  directly from the deployed 0.8.7 baseline to 0.8.11.
+  directly from the deployed 0.8.7 baseline to 0.8.12.
+- `v0.8.11` was later stopped during Stage 5 and rolled back after its isolated
+  PostgreSQL Cron deployment check exposed a Tokio runtime panic.
 
 ## [0.8.10] - 2026-07-17
 
@@ -36,7 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this legacy Cron upgrade-order defect during Stage 5 local-binary deployment;
   production was rolled back atomically and remained on 0.8.7. The 0.8.10
   Windows release build later failed, so its incomplete GitHub Release was
-  removed without moving its tag. Upgrade directly from 0.8.7 to 0.8.11.
+  removed without moving its tag. Upgrade directly from 0.8.7 to 0.8.12.
 
 ## [0.8.9] - 2026-07-17
 

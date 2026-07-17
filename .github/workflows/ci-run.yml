@@ -99,6 +99,26 @@ jobs:
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
 
+    windows-check:
+        name: Windows Check
+        needs: [changes]
+        if: needs.changes.outputs.rust_changed == 'true'
+        runs-on: windows-latest
+        timeout-minutes: 35
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.93.0
+                  targets: x86_64-pc-windows-msvc
+            - name: Install system dependencies
+              run: choco install protoc --yes
+            - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+              with:
+                  key: x86_64-pc-windows-msvc-check
+            - name: Check Windows binaries
+              run: cargo check --locked --target x86_64-pc-windows-msvc --bin prx --bin prx-node
+
     docs-only:
         name: Docs-Only Fast Path
         needs: [changes]
@@ -221,7 +241,7 @@ jobs:
     ci-required:
         name: CI Required Gate
         if: always()
-        needs: [changes, lint, test, build, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
+        needs: [changes, lint, test, build, windows-check, docs-only, non-rust, docs-quality, lint-feedback, workflow-owner-approval]
         runs-on: ubuntu-latest
         steps:
             - name: Enforce required status
@@ -269,11 +289,13 @@ jobs:
                   lint_strict_delta_result="${{ needs.lint.result }}"
                   test_result="${{ needs.test.result }}"
                   build_result="${{ needs.build.result }}"
+                  windows_check_result="${{ needs.windows-check.result }}"
 
                   echo "lint=${lint_result}"
                   echo "lint_strict_delta=${lint_strict_delta_result}"
                   echo "test=${test_result}"
                   echo "build=${build_result}"
+                  echo "windows_check=${windows_check_result}"
                   echo "docs=${docs_result}"
                   echo "workflow_owner_approval=${workflow_owner_result}"
 
@@ -283,7 +305,7 @@ jobs:
                   fi
 
                   if [ "$event_name" = "pull_request" ]; then
-                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                    if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$windows_check_result" != "success" ]; then
                       echo "Required PR CI jobs did not pass."
                       exit 1
                     fi
@@ -291,7 +313,7 @@ jobs:
                     exit 0
                   fi
 
-                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ]; then
+                  if [ "$lint_result" != "success" ] || [ "$lint_strict_delta_result" != "success" ] || [ "$test_result" != "success" ] || [ "$build_result" != "success" ] || [ "$windows_check_result" != "success" ]; then
                     echo "Required push CI jobs did not pass."
                     exit 1
                   fi

@@ -43,7 +43,6 @@ jobs:
             use_cross: false
 
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.use_cross }}
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
@@ -128,7 +127,7 @@ jobs:
           path: |
             prx-${{ matrix.suffix }}.*
             prx-node-${{ matrix.suffix }}.*
-          if-no-files-found: ignore
+          if-no-files-found: error
 
   release:
     needs: build
@@ -140,6 +139,36 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Verify release asset completeness
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected=(
+            prx-linux-amd64.tar.gz
+            prx-linux-amd64.tar.gz.sha256
+            prx-linux-arm64.tar.gz
+            prx-linux-arm64.tar.gz.sha256
+            prx-macos-amd64.tar.gz
+            prx-macos-amd64.tar.gz.sha256
+            prx-macos-arm64.tar.gz
+            prx-macos-arm64.tar.gz.sha256
+            prx-windows-amd64.zip
+            prx-windows-amd64.zip.sha256
+            prx-node-linux-amd64.tar.gz
+            prx-node-linux-amd64.tar.gz.sha256
+            prx-node-linux-arm64.tar.gz
+            prx-node-linux-arm64.tar.gz.sha256
+            prx-node-macos-amd64.tar.gz
+            prx-node-macos-amd64.tar.gz.sha256
+            prx-node-macos-arm64.tar.gz
+            prx-node-macos-arm64.tar.gz.sha256
+            prx-node-windows-amd64.zip
+            prx-node-windows-amd64.zip.sha256
+          )
+          test "$(find artifacts -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
+          for asset in "${expected[@]}"; do
+            test -s "artifacts/$asset"
+          done
       - name: Determine tag
         id: tag
         run: |
