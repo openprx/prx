@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-07-17
+
+### Fixed
+
+- Made Cron's SQLite schema upgrade add the legacy `cron_runs.attempt_id` and
+  `worker_id` columns before creating the attempt-identity index. Existing
+  0.8.7 workspaces now initialize the scheduler without losing run history.
+
+### Release status
+
+- `v0.8.8` and `v0.8.9` were both stopped before deployment. The latter exposed
+  this legacy Cron upgrade-order defect during Stage 5 local-binary deployment;
+  production was rolled back atomically and remained on 0.8.7. Upgrade directly
+  from 0.8.7 to 0.8.10.
+
 ## [0.8.9] - 2026-07-17
 
 ### Fixed

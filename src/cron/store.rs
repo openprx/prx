@@ -2013,8 +2013,6 @@ fn with_connection<T>(config: &Config, f: impl FnOnce(&mut Connection) -> Result
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_started_at ON cron_runs(started_at);
         CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_job_attempt
-            ON cron_runs(job_id, attempt_id) WHERE attempt_id IS NOT NULL;
 
         CREATE TABLE IF NOT EXISTS cron_job_events (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2350,13 +2348,29 @@ mod tests {
                 command          TEXT NOT NULL,
                 created_at       TEXT NOT NULL,
                 next_run         TEXT NOT NULL
-            );",
+            );
+            CREATE TABLE cron_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT NOT NULL,
+                status      TEXT NOT NULL,
+                output      TEXT,
+                duration_ms INTEGER,
+                FOREIGN KEY (job_id) REFERENCES cron_jobs(id) ON DELETE CASCADE
+            );
+            INSERT INTO cron_jobs (id, expression, command, created_at, next_run)
+                VALUES ('legacy-job', '* * * * *', 'echo legacy',
+                        '2026-01-01T00:00:00Z', '2026-01-01T00:01:00Z');
+            INSERT INTO cron_runs (job_id, started_at, finished_at, status, output, duration_ms)
+                VALUES ('legacy-job', '2026-01-01T00:00:00Z', '2026-01-01T00:00:01Z',
+                        'ok', 'legacy output', 1000);",
         )
         .unwrap();
         drop(conn);
 
         let jobs = list_jobs(&config).unwrap();
-        assert!(jobs.is_empty());
+        assert_eq!(jobs.len(), 1);
 
         with_connection(&config, |conn| {
             let mut stmt = conn.prepare("PRAGMA table_info(cron_jobs)")?;
@@ -2387,6 +2401,26 @@ mod tests {
                 event_names.iter().any(|existing| existing == "source_message_event_id"),
                 "missing cron_job_events.source_message_event_id"
             );
+            let mut run_stmt = conn.prepare("PRAGMA table_info(cron_runs)")?;
+            let run_names = run_stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            for name in ["attempt_id", "worker_id"] {
+                assert!(run_names.iter().any(|existing| existing == name), "missing {name}");
+            }
+            let attempt_indexes: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_cron_runs_job_attempt'",
+                [],
+                |row| row.get(0),
+            )?;
+            assert_eq!(attempt_indexes, 1);
+            let retained_run: (String, Option<String>, Option<String>) = conn.query_row(
+                "SELECT output, attempt_id, worker_id FROM cron_runs WHERE job_id = 'legacy-job'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            assert_eq!(retained_run, ("legacy output".to_string(), None, None));
             Ok(())
         })
         .unwrap();
