@@ -1586,8 +1586,6 @@ fn init_schema(client: &mut Client) -> Result<()> {
             );
             CREATE INDEX IF NOT EXISTS idx_cron_runs_job_id ON cron_runs(job_id);
             CREATE INDEX IF NOT EXISTS idx_cron_runs_job_started ON cron_runs(job_id, started_at);
-            CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_runs_job_attempt
-                ON cron_runs(job_id, attempt_id) WHERE attempt_id IS NOT NULL;
 
             CREATE TABLE IF NOT EXISTS cron_job_events (
                 id             BIGSERIAL PRIMARY KEY,
@@ -1728,6 +1726,15 @@ mod tests {
                         last_status TEXT,
                         last_output TEXT,
                         approval_grant_json TEXT
+                     );
+                     CREATE TABLE cron_runs (
+                        id BIGSERIAL PRIMARY KEY,
+                        job_id TEXT NOT NULL REFERENCES cron_jobs(id) ON DELETE CASCADE,
+                        started_at TEXT NOT NULL,
+                        finished_at TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        output TEXT,
+                        duration_ms BIGINT
                      );",
                 )?;
                 let at = Utc::now() - chrono::Duration::hours(1);
@@ -1746,6 +1753,12 @@ mod tests {
                         &[&id, &schedule_json, &at.to_rfc3339(), &status],
                     )?;
                 }
+                client.execute(
+                    "INSERT INTO cron_runs (
+                        job_id, started_at, finished_at, status, output, duration_ms
+                     ) VALUES ('legacy-at-ok', $1, $1, 'ok', 'legacy output', 1000)",
+                    &[&at.to_rfc3339()],
+                )?;
                 init_schema(client)?;
                 let rows = client.query("SELECT id, terminal_state, enabled FROM cron_jobs ORDER BY id", &[])?;
                 let states = rows
@@ -1762,9 +1775,40 @@ mod tests {
                 assert_eq!(states["legacy-at-running"], (None, true));
                 assert_eq!(states["legacy-at-unknown"], (None, true));
                 assert_eq!(states["legacy-at-null"], (None, true));
+                let run_columns = client.query(
+                    "SELECT column_name FROM information_schema.columns
+                     WHERE table_schema = current_schema() AND table_name = 'cron_runs'",
+                    &[],
+                )?;
+                let run_columns = run_columns
+                    .iter()
+                    .map(|row| row.get::<_, String>(0))
+                    .collect::<std::collections::HashSet<_>>();
+                assert!(run_columns.contains("attempt_id"));
+                assert!(run_columns.contains("worker_id"));
+                let attempt_index: bool = client
+                    .query_one(
+                        "SELECT EXISTS (
+                            SELECT 1 FROM pg_indexes
+                            WHERE schemaname = current_schema()
+                              AND tablename = 'cron_runs'
+                              AND indexname = 'idx_cron_runs_job_attempt'
+                         )",
+                        &[],
+                    )?
+                    .get(0);
+                assert!(attempt_index);
+                let retained_run = client.query_one(
+                    "SELECT output, attempt_id, worker_id
+                     FROM cron_runs WHERE job_id = 'legacy-at-ok'",
+                    &[],
+                )?;
+                assert_eq!(retained_run.get::<_, String>(0), "legacy output");
+                assert_eq!(retained_run.get::<_, Option<String>>(1), None);
+                assert_eq!(retained_run.get::<_, Option<String>>(2), None);
                 Ok(())
             })
-            .expect("test: migrate legacy terminal state");
+            .expect("test: migrate populated legacy postgres cron schema");
 
         // Isolate from prior runs: drop and recreate the cron tables.
         store
