@@ -966,6 +966,11 @@ pub struct EffectExecutor {
     /// 新句柄，使后续 turn 的 `drive_start_turn_stream` 读到新 provider。
     /// shadow 模式为 `None`。
     provider_slot: Option<ProviderSlot>,
+    /// Error from the most recently executed SaveSession effect. The
+    /// dispatcher consumes this immediately after reducing one Action so a
+    /// terminal notification cannot claim success when durable persistence
+    /// failed.
+    persistence_error: Arc<ParkingMutex<Option<String>>>,
 }
 
 impl EffectExecutor {
@@ -978,6 +983,7 @@ impl EffectExecutor {
             deps: None,
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot: None,
+            persistence_error: Arc::new(ParkingMutex::new(None)),
         }
     }
 
@@ -991,6 +997,18 @@ impl EffectExecutor {
             deps: Some(deps),
             redraw_slot: Arc::new(parking_lot::Mutex::new(None)),
             provider_slot,
+            persistence_error: Arc::new(ParkingMutex::new(None)),
+        }
+    }
+
+    fn outcome_after_effects(&self, outcome: Option<TurnOutcomeKind>) -> Option<TurnOutcomeKind> {
+        let persistence_error = self.persistence_error.lock().take();
+        match (outcome, persistence_error) {
+            (Some(TurnOutcomeKind::Completed { .. }), Some(err)) => Some(TurnOutcomeKind::Failed {
+                err: format!("session persistence failed: {err}"),
+                retryable: true,
+            }),
+            (outcome, _) => outcome,
         }
     }
 
@@ -1292,6 +1310,7 @@ impl EffectExecutor {
                 }
             }
             Effect::SaveSession(session) => {
+                *self.persistence_error.lock() = None;
                 let session = crate::chat::sanitize::sanitize_session_content(&session);
                 // T3-3-fixB D1：inline await 替代 tokio::spawn，让主循环
                 // executor.execute(effect).await 的串行性贯穿到底，关闭
@@ -1306,23 +1325,52 @@ impl EffectExecutor {
                     Ok(j) => j,
                     Err(e) => {
                         tracing::warn!(error = %e, "SaveSession effect: serialize failed");
+                        *self.persistence_error.lock() = Some(e.to_string());
                         return;
                     }
                 };
-                match memory
+                let mut store_result = memory
                     .store(
                         &session.memory_key(),
                         &json,
                         crate::memory::MemoryCategory::Conversation,
                         Some(&session.id),
                     )
-                    .await
-                {
+                    .await;
+                // The SQLite memory backend may briefly report BUSY/LOCKED
+                // while the same completed turn is committing its message
+                // events. Yield and retry a small bounded number of times;
+                // this is contention recovery, not a timing delay. Every
+                // other error remains fail-fast and is propagated through the
+                // terminal acknowledgement below.
+                for _ in 0..3 {
+                    let retryable = store_result.as_ref().is_err_and(|error| {
+                        let message = error.to_string().to_ascii_lowercase();
+                        message.contains("database is locked")
+                            || message.contains("database is busy")
+                            || message.contains("sqlite_busy")
+                            || message.contains("sqlite_locked")
+                    });
+                    if !retryable {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                    store_result = memory
+                        .store(
+                            &session.memory_key(),
+                            &json,
+                            crate::memory::MemoryCategory::Conversation,
+                            Some(&session.id),
+                        )
+                        .await;
+                }
+                match store_result {
                     Ok(()) => {
                         let _ = action_tx.try_send(Action::SessionSaved { id: session_id });
                     }
                     Err(e) => {
                         tracing::warn!(error = %e, "SaveSession effect: store failed");
+                        *self.persistence_error.lock() = Some(e.to_string());
                     }
                 }
             }
@@ -3571,6 +3619,7 @@ pub fn spawn_dispatcher_task_full(
                         for effect in effects {
                             executor.execute(effect).await;
                         }
+                        let outcome = executor.outcome_after_effects(outcome);
                         push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
@@ -3611,6 +3660,7 @@ pub fn spawn_dispatcher_task_full(
                             for effect in effects {
                                 executor.execute(effect).await;
                             }
+                            let outcome = executor.outcome_after_effects(outcome);
                             push_snapshot_if_dirty(&mut state, &snapshot_tx, &snapshot_rev, ui_dirty);
                             // S3 T3-1: reducer 处理完 ToolApprovalReceived 后，把决策
                             // 通过 approval_router 转给 driver 的 pending oneshot。
@@ -3675,6 +3725,7 @@ pub fn spawn_dispatcher_task_full(
                         for effect in effects {
                             executor.execute(effect).await;
                         }
+                        let outcome = executor.outcome_after_effects(outcome);
                         if let (Some((tool_id, approved)), Some(router)) =
                             (approval_response, approval_router.as_ref())
                         {
@@ -3702,6 +3753,7 @@ pub fn spawn_dispatcher_task_full(
                             for effect in effects {
                                 executor.execute(effect).await;
                             }
+                            let outcome = executor.outcome_after_effects(outcome);
                             if let (Some((tool_id, approved)), Some(router)) =
                                 (approval_response, approval_router.as_ref())
                             {

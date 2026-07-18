@@ -783,11 +783,14 @@ fn security_template(spec: Spec) -> String {
 [autonomy]
 level = "full"
 workspace_only = true
-# Behavior-limits Phase 1: rate/cost caps opened to u32::MAX (high-position
-# billing/runaway safeguards). NOTE: 0 means "blocked", NOT "unlimited".
-max_actions_per_hour = 4294967295
-max_cost_per_day_cents = 4294967295
-forbidden_paths = []                   # no extra path denylist
+# Secure autonomous defaults. Operators may explicitly widen these values.
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+forbidden_paths = [
+  "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt",
+  "/boot", "/dev", "/proc", "/sys", "/var", "/tmp",
+  "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
+]
 
 # Sandbox (folded in from the former [security.sandbox]); disabled by default.
 [autonomy.sandbox]
@@ -802,6 +805,17 @@ encrypt = true
 max_memory_mb = 512
 max_cpu_time_seconds = 300
 max_subprocesses = 10
+
+# Direct natural-person adapters emit this notice before the first AI response.
+[compliance.interaction_notice]
+enabled = true
+applicability = "required"
+version = "v1"
+message = "You are interacting with an AI system."
+
+# Legal/product owner must replace this before using high-risk-only controls.
+[compliance.eu_ai_act.classification]
+status = "unclassified"               # unclassified | high_risk | not_high_risk
 "#
         .into(),
 
@@ -835,6 +849,17 @@ enabled = true
 log_path = "audit.log"
 max_size_mb = 100
 # sign_events = false
+
+# Direct natural-person adapters emit this notice before the first AI response.
+[compliance.interaction_notice]
+enabled = true
+applicability = "required"
+version = "v1"
+message = "You are interacting with an AI system."
+
+# Legal/product owner must replace this before using high-risk-only controls.
+[compliance.eu_ai_act.classification]
+status = "unclassified"               # unclassified | high_risk | not_high_risk
 "#
         .into(),
     }
@@ -995,6 +1020,7 @@ enabled = false
 # agentic = true
 # max_iterations = 100
 # allowed_tools = ["web_search", "read_file"]
+# allowed_tools = ["*"]                # explicit inheritance of eligible parent tools
 "#
         .into(),
     }
@@ -1586,6 +1612,9 @@ mod tests {
         assert!(content.contains("enabled = true"));
         assert!(content.contains("log_path = \"audit.log\""));
         assert!(content.contains("max_size_mb = 100"));
+        assert!(content.contains("[compliance.interaction_notice]"));
+        assert!(content.contains("[compliance.eu_ai_act.classification]"));
+        assert!(content.contains("status = \"unclassified\""));
     }
 
     #[test]
@@ -1605,6 +1634,9 @@ mod tests {
         let content = security_template(Spec::Server);
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = true"));
+        assert!(content.contains("max_actions_per_hour = 20"));
+        assert!(content.contains("max_cost_per_day_cents = 500"));
+        assert!(content.contains("\"/etc\""));
         assert!(!content.contains("level = \"supervised\""));
     }
 

@@ -8701,6 +8701,7 @@ source: tool_output\n\
     async fn recall_with_context_filters_private_sender_scope() {
         let (_tmp, mem) = temp_sqlite();
         let alice_ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
             chat_id: Some("dm-alice".into()),
@@ -8708,6 +8709,7 @@ source: tool_output\n\
             raw_sender: Some("alice".into()),
         };
         let bob_ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
             chat_id: Some("dm-bob".into()),

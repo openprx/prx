@@ -1178,39 +1178,7 @@ pub struct SecurityPolicy {
 
 impl Default for SecurityPolicy {
     fn default() -> Self {
-        Self {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: PathBuf::from("."),
-            workspace_only: true,
-            forbidden_paths: vec![
-                // System directories (blocked even when workspace_only=false)
-                "/etc".into(),
-                "/root".into(),
-                "/home".into(),
-                "/usr".into(),
-                "/bin".into(),
-                "/sbin".into(),
-                "/lib".into(),
-                "/opt".into(),
-                "/boot".into(),
-                "/dev".into(),
-                "/proc".into(),
-                "/sys".into(),
-                "/var".into(),
-                "/tmp".into(),
-                // Sensitive dotfiles
-                "~/.ssh".into(),
-                "~/.gnupg".into(),
-                "~/.aws".into(),
-                "~/.config".into(),
-            ],
-            max_actions_per_hour: 20,
-            max_cost_per_day_cents: 500,
-            tracker: ActionTracker::new(),
-            scope_rules: Vec::new(),
-            scope_default_allow: true,
-            audit_config: crate::config::AuditConfig::default(),
-        }
+        Self::from_config(&crate::config::AutonomyConfig::default(), Path::new("."))
     }
 }
 
@@ -3594,11 +3562,14 @@ mod tests {
     #[test]
     fn default_policy_has_sane_values() {
         let p = SecurityPolicy::default();
+        let autonomy = crate::config::AutonomyConfig::default();
         assert_eq!(p.autonomy, AutonomyLevel::Full);
         assert!(p.workspace_only);
         assert!(!p.forbidden_paths.is_empty());
-        assert!(p.max_actions_per_hour > 0);
-        assert!(p.max_cost_per_day_cents > 0);
+        assert_eq!(p.workspace_only, autonomy.workspace_only);
+        assert_eq!(p.forbidden_paths, autonomy.forbidden_paths);
+        assert_eq!(p.max_actions_per_hour, autonomy.max_actions_per_hour);
+        assert_eq!(p.max_cost_per_day_cents, autonomy.max_cost_per_day_cents);
     }
 
     // ── ActionTracker / rate limiting ───────────────────────

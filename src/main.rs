@@ -263,6 +263,60 @@ enum AuditCommands {
         /// Include implementation notes in markdown output
         #[arg(long)]
         verbose: bool,
+        /// Turn the report into a release gate at the selected severity
+        #[arg(long, value_enum)]
+        fail_on: Option<AuditFailOn>,
+    },
+    /// Generate a versioned Article 47 / Annex V declaration artifact from explicit operator inputs
+    #[command(name = "generate-eu-declaration")]
+    GenerateEuDeclaration {
+        /// Output path; defaults to compliance.eu_ai_act.declaration.artifact_path
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Reference to an operator-controlled external signature or signing receipt
+        #[arg(long)]
+        signature_reference: String,
+    },
+    /// Create a durable Article 73 serious-incident record from a JSON input file
+    #[command(name = "incident-create")]
+    IncidentCreate {
+        /// JSON file containing the incident classification and ownership fields
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Record or replace the initial report for an open serious incident
+    #[command(name = "incident-initial-report")]
+    IncidentInitialReport {
+        incident_id: String,
+        /// UTF-8 file containing the initial report
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Append supplemental facts to a serious incident
+    #[command(name = "incident-supplement")]
+    IncidentSupplement {
+        incident_id: String,
+        /// UTF-8 file containing the supplement
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Close a serious incident with an explicit timestamp and summary
+    #[command(name = "incident-close")]
+    IncidentClose {
+        incident_id: String,
+        /// RFC 3339 closure timestamp
+        #[arg(long)]
+        closed_at: String,
+        /// UTF-8 file containing the closure summary
+        #[arg(long)]
+        summary: PathBuf,
+    },
+    /// Export an incident, supplements, and immutable audit-event hashes
+    #[command(name = "incident-export")]
+    IncidentExport {
+        incident_id: String,
+        #[arg(long)]
+        output: PathBuf,
     },
 }
 
@@ -272,26 +326,80 @@ enum AuditOutputFormat {
     Json,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum AuditFailOn {
+    Fail,
+    Warning,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ControlStatus {
+    Pass,
+    Warning,
+    Fail,
+    NotApplicable,
+    Unknown,
+}
+
+impl ControlStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pass => "pass",
+            Self::Warning => "warning",
+            Self::Fail => "fail",
+            Self::NotApplicable => "not_applicable",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct EvidenceReference {
+    kind: &'static str,
+    reference: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApplicabilityDecision {
+    status: ControlStatus,
+    classification: String,
+    owner: Option<String>,
+    reviewed_at: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct EuAiActAttestation {
+    report_type: &'static str,
+    evaluator_version: &'static str,
+    product_version: &'static str,
+    source_identity: Option<String>,
+    config_generation: Option<u64>,
+    config_source_revision: Option<String>,
     generated_at: String,
-    classification: String,
+    applicability: ApplicabilityDecision,
     default_provider: Option<String>,
     total_checks: usize,
     passed_count: usize,
     warning_count: usize,
     failed_count: usize,
+    unknown_count: usize,
+    not_applicable_count: usize,
     checks: Vec<EuAiActCheck>,
 }
 
 #[derive(Debug, Serialize)]
 struct EuAiActCheck {
     id: &'static str,
-    article: &'static str,
+    framework_reference: &'static str,
     control: &'static str,
-    status: &'static str,
-    evidence: &'static str,
-    gap: &'static str,
+    applicability: &'static str,
+    severity: &'static str,
+    status: ControlStatus,
+    observed_at: String,
+    evidence: Vec<EvidenceReference>,
+    explanation: String,
+    remediation: String,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -1317,214 +1425,558 @@ fn format_expiry(profile: &auth::profiles::AuthProfile) -> String {
         )
 }
 
-fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
-    let checks = vec![
-        EuAiActCheck {
-            id: "L01",
-            article: "Art.12",
-            control: "Side-effect gate decisions are audit-loggable",
-            status: "pass",
-            evidence: "SideEffectGate emits ToolGate audit events through AuditLogger.",
-            gap: "Retention policy still needs a configurable floor.",
+fn attestation_check(
+    observed_at: &str,
+    id: &'static str,
+    framework_reference: &'static str,
+    control: &'static str,
+    status: ControlStatus,
+    evidence_kind: &'static str,
+    evidence_reference: impl Into<String>,
+    explanation: impl Into<String>,
+    remediation: impl Into<String>,
+) -> EuAiActCheck {
+    EuAiActCheck {
+        id,
+        framework_reference,
+        control,
+        applicability: "operator classification required",
+        severity: if matches!(status, ControlStatus::Fail) {
+            "release_blocking"
+        } else {
+            "advisory"
         },
-        EuAiActCheck {
-            id: "L02",
-            article: "Art.12",
-            control: "Audit log retention floor",
-            status: "warning",
-            evidence: "security.audit has enablement and size settings.",
-            gap: "No six-month minimum retention configuration is enforced yet.",
-        },
-        EuAiActCheck {
-            id: "L03",
-            article: "Art.12",
-            control: "Control ladder trace rotation",
-            status: "warning",
-            evidence: "control_ladder_traces records runtime decisions.",
-            gap: "Rotation and archival policy are still pending.",
-        },
-        EuAiActCheck {
-            id: "L04",
-            article: "Art.12",
-            control: "Message timeline records router/provider events",
-            status: "pass",
-            evidence: "router.route_decision and provider.final_outcome message_events are persisted.",
-            gap: "Provider policy URL metadata is not attached to every event.",
-        },
-        EuAiActCheck {
-            id: "T01",
-            article: "Art.13",
-            control: "Provider routing transparency",
-            status: "pass",
-            evidence: "RouteDecision and ProviderExecutionOutcome capture selected provider and model.",
-            gap: "User-facing provider transparency pages are still pending.",
-        },
-        EuAiActCheck {
-            id: "T02",
-            article: "Art.13",
-            control: "Third-party LLM data policy disclosure",
-            status: "warning",
-            evidence: "Provider names are available in runtime configuration.",
-            gap: "Policy URLs and data-use terms are not emitted by doctor/chat yet.",
-        },
-        EuAiActCheck {
-            id: "T04",
-            article: "Art.50",
-            control: "AI interaction notice",
-            status: "fail",
-            evidence: "No universal first-message disclosure was found in runtime routing.",
-            gap: "Channel adapters need a first-contact AI identity notice.",
-        },
-        EuAiActCheck {
-            id: "H01",
-            article: "Art.14",
-            control: "ApprovalGrant v2 cryptographic witness",
-            status: "pass",
-            evidence: "ApprovalGrantV2 signs and verifies grants with Ed25519 witness signatures.",
-            gap: "Persistence, revocation, and rotation policy remain future work.",
-        },
-        EuAiActCheck {
-            id: "H02",
-            article: "Art.14",
-            control: "Side-effect tool gate coverage",
-            status: "pass",
-            evidence: "Fourteen side-effect tools call authorize_resource_operation.",
-            gap: "Inbound channel listeners still need end-to-end supervised-mode coverage.",
-        },
-        EuAiActCheck {
-            id: "H03",
-            article: "Art.14",
-            control: "High-risk operation blocking",
-            status: "pass",
-            evidence: "ResourceRiskLevel::High is blocked when policy disables high-risk operations.",
-            gap: "Policy presets need operator-facing documentation.",
-        },
-        EuAiActCheck {
-            id: "H04",
-            article: "Art.14",
-            control: "Inbound listener human oversight",
-            status: "warning",
-            evidence: "Tool execution paths are gated.",
-            gap: "Native channel inbound paths still require explicit gate integration.",
-        },
-        EuAiActCheck {
-            id: "A01",
-            article: "Art.15",
-            control: "Retrieval traceability",
-            status: "pass",
-            evidence: "retrieval_traces and fail-fast retrieval memory traits are present.",
-            gap: "All context injection paths need trace coverage.",
-        },
-        EuAiActCheck {
-            id: "A02",
-            article: "Art.15",
-            control: "Context compaction provenance",
-            status: "pass",
-            evidence: "compaction_runs records source events and compaction status.",
-            gap: "Summary fidelity scoring is not yet enforced as a runtime gate.",
-        },
-        EuAiActCheck {
-            id: "A03",
-            article: "Art.15",
-            control: "Prompt-injection content boundaries",
-            status: "warning",
-            evidence: "Document and retrieval layers are separated in memory traits.",
-            gap: "Retrieved document chunks still need structured trust-boundary wrappers.",
-        },
-        EuAiActCheck {
-            id: "A04",
-            article: "Art.15",
-            control: "Vector-store row-level isolation",
-            status: "fail",
-            evidence: "Owner-centric fields exist in memory models.",
-            gap: "pgvector SQL row-level security policy is not implemented.",
-        },
-        EuAiActCheck {
-            id: "Q01",
-            article: "Art.16",
-            control: "Dependency vulnerability gate",
-            status: "pass",
-            evidence: "cargo audit is part of the current milestone validation surface.",
-            gap: "CI evidence should be attached to release attestations.",
-        },
-        EuAiActCheck {
-            id: "Q02",
-            article: "Art.16",
-            control: "Rust quality gate",
-            status: "pass",
-            evidence: "fmt, clippy -D warnings, cargo check, and cargo test are local release gates.",
-            gap: "Business E2E evidence remains deploy-gated.",
-        },
-        EuAiActCheck {
-            id: "Q03",
-            article: "Art.16",
-            control: "Quality management documentation",
-            status: "warning",
-            evidence: "Reaudit and milestone reports define current acceptance gates.",
-            gap: "A formal QMS document set is still pending.",
-        },
-        EuAiActCheck {
-            id: "C01",
-            article: "Art.17",
-            control: "Conformity assessment attestation",
-            status: "warning",
-            evidence: "This command generates an implementation attestation.",
-            gap: "A signed release-level conformity assessment document is still pending.",
-        },
-        EuAiActCheck {
-            id: "C02",
-            article: "Art.18",
-            control: "Declaration of conformity template",
-            status: "fail",
-            evidence: "No declaration template is currently emitted.",
-            gap: "DoC template requires product identity, version, operator, and scope fields.",
-        },
-        EuAiActCheck {
-            id: "M01",
-            article: "Art.19",
-            control: "Runtime monitoring surfaces",
-            status: "pass",
-            evidence: "doctor runtime and control ladder traces expose runtime health and decision data.",
-            gap: "Long-running trace rotation remains pending.",
-        },
-        EuAiActCheck {
-            id: "M02",
-            article: "Art.19",
-            control: "Incident response runbook",
-            status: "warning",
-            evidence: "Audit events can capture denied side-effect attempts.",
-            gap: "Operator incident triage and escalation runbooks are not documented.",
-        },
-        EuAiActCheck {
-            id: "M03",
-            article: "Art.19",
-            control: "Post-market monitoring report cadence",
-            status: "warning",
-            evidence: "Runtime traces provide raw monitoring inputs.",
-            gap: "Weekly/monthly monitoring report templates are still pending.",
-        },
-        EuAiActCheck {
-            id: "M04",
-            article: "Art.19",
-            control: "Serious incident reporting workflow",
-            status: "fail",
-            evidence: "No dedicated serious-incident workflow is currently wired.",
-            gap: "A 72-hour reporting workflow is needed for high-risk deployments.",
-        },
-    ];
+        status,
+        observed_at: observed_at.to_string(),
+        evidence: vec![EvidenceReference {
+            kind: evidence_kind,
+            reference: evidence_reference.into(),
+        }],
+        explanation: explanation.into(),
+        remediation: remediation.into(),
+    }
+}
 
-    let passed_count = checks.iter().filter(|check| check.status == "pass").count();
-    let warning_count = checks.iter().filter(|check| check.status == "warning").count();
-    let failed_count = checks.iter().filter(|check| check.status == "fail").count();
+fn config_source_revision(config: &Config) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = fs::read(&config.config_path).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn config_generation(config: &Config) -> Option<u64> {
+    let generation_path = config.config_path.parent()?.join(".config-generation");
+    fs::read_to_string(generation_path).ok()?.trim().parse().ok()
+}
+
+fn declaration_artifact_path(config: &Config) -> Option<PathBuf> {
+    config
+        .compliance
+        .eu_ai_act
+        .declaration
+        .artifact_path
+        .as_ref()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                config.workspace_dir.join(path)
+            }
+        })
+}
+
+fn incident_store_path(config: &Config) -> Option<PathBuf> {
+    config.compliance.eu_ai_act.incident_store_path.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            config.workspace_dir.join(path)
+        }
+    })
+}
+
+fn verified_declaration_control(config: &Config) -> (ControlStatus, String, String) {
+    let Some(path) = declaration_artifact_path(config) else {
+        return (
+            ControlStatus::Fail,
+            "declaration-of-conformity:path-missing".to_string(),
+            "High-risk classification is recorded, but no declaration artifact path is configured.".to_string(),
+        );
+    };
+    openprx::compliance::declaration::verify_declaration_artifact(&path).map_or_else(
+        |_| {
+            (
+                ControlStatus::Fail,
+                "declaration-of-conformity:verification-failed".to_string(),
+                "The configured declaration artifact is missing, incomplete, or has a mismatched hash.".to_string(),
+            )
+        },
+        |evidence| {
+            (
+                ControlStatus::Pass,
+                evidence,
+                "Artifact structure/hash and an operator-supplied external signature reference were verified; PRX did not validate signature authenticity or submission."
+                    .to_string(),
+            )
+        },
+    )
+}
+
+fn verified_incident_control(config: &Config) -> (ControlStatus, String, String) {
+    let Some(path) = incident_store_path(config) else {
+        return (
+            ControlStatus::Fail,
+            "article-73-incidents:path-missing".to_string(),
+            "High-risk classification is recorded, but no durable incident store path is configured.".to_string(),
+        );
+    };
+    openprx::compliance::incident::verify_incident_store(&path).map_or_else(
+        |_| {
+            (
+                ControlStatus::Fail,
+                "article-73-incidents:verification-failed".to_string(),
+                "The configured incident store is missing, incompatible, or contains an overdue open incident without an initial report."
+                    .to_string(),
+            )
+        },
+        |evidence| {
+            (
+                ControlStatus::Pass,
+                evidence,
+                "The durable store schema and open-incident initial-report deadlines were verified read-only."
+                    .to_string(),
+            )
+        },
+    )
+}
+
+fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
+    let observed_at = chrono::Utc::now().to_rfc3339();
+    let config_revision = config_source_revision(config);
+    let config_evidence = config_revision
+        .clone()
+        .unwrap_or_else(|| "config:unavailable".to_string());
+    let audit_status = if config.security.audit.enabled {
+        ControlStatus::Pass
+    } else {
+        ControlStatus::Fail
+    };
+    let events_status = if config.memory.events.enabled {
+        ControlStatus::Pass
+    } else {
+        ControlStatus::Warning
+    };
+    let postgres = config.memory.backend == "postgres" || config.storage.provider.config.provider == "postgres";
+    let (vector_isolation_status, vector_isolation_evidence, vector_isolation_explanation) = if postgres {
+        let storage = &config.storage.provider.config;
+        match storage.db_url.as_deref().map(|db_url| {
+            memory::postgres::PostgresMemory::verify_vector_isolation(
+                db_url,
+                &storage.schema,
+                &storage.table,
+                storage.connect_timeout_secs,
+            )
+        }) {
+            Some(Ok(evidence)) => (
+                ControlStatus::Pass,
+                evidence,
+                "Migration 21 and forced RLS policies were verified read-only on all PostgreSQL vector tables."
+                    .to_string(),
+            ),
+            Some(Err(_)) => (
+                ControlStatus::Fail,
+                "postgres:vector-isolation:verification-failed".to_string(),
+                "PostgreSQL is configured, but live migration/RLS evidence could not be verified.".to_string(),
+            ),
+            None => (
+                ControlStatus::Fail,
+                "postgres:vector-isolation:db-url-missing".to_string(),
+                "PostgreSQL is configured without the connection data required for read-only evidence verification."
+                    .to_string(),
+            ),
+        }
+    } else {
+        (
+            ControlStatus::NotApplicable,
+            "backend:not-postgres".to_string(),
+            "PostgreSQL vector RLS is not applicable to this backend; application owner isolation is evaluated separately."
+                .to_string(),
+        )
+    };
+    let notice = &config.compliance.interaction_notice;
+    let (notice_status, notice_explanation) = match notice.applicability {
+        config::schema::InteractionNoticeApplicability::NotApplicable => (
+            ControlStatus::NotApplicable,
+            format!(
+                "Operator exception owner={} reviewed_at={}",
+                notice.exception_owner.as_deref().unwrap_or("missing"),
+                notice.exception_reviewed_at.as_deref().unwrap_or("missing")
+            ),
+        ),
+        config::schema::InteractionNoticeApplicability::Required if notice.enabled => (
+            ControlStatus::Pass,
+            format!(
+                "versioned notice {} is enabled before channel response routing",
+                notice.version
+            ),
+        ),
+        config::schema::InteractionNoticeApplicability::Required => (
+            ControlStatus::Fail,
+            "AI interaction notice is required but disabled".to_string(),
+        ),
+    };
+    let eu_classification = &config.compliance.eu_ai_act.classification;
+    let (declaration_status, declaration_evidence, declaration_explanation) = match eu_classification.status {
+        config::schema::EuAiActRiskClassification::Unclassified => (
+            ControlStatus::Unknown,
+            "classification:unclassified".to_string(),
+            "No named owner has classified this deployment for the high-risk declaration requirement.".to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::NotHighRisk => (
+            ControlStatus::NotApplicable,
+            format!(
+                "classification:owner={}:assessed_at={}",
+                eu_classification.owner.as_deref().unwrap_or("missing"),
+                eu_classification.assessed_at.as_deref().unwrap_or("missing")
+            ),
+            "The recorded operator/legal classification says this deployment is not a high-risk AI system.".to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::HighRisk => verified_declaration_control(config),
+    };
+    let (incident_status, incident_evidence, incident_explanation) = match eu_classification.status {
+        config::schema::EuAiActRiskClassification::Unclassified => (
+            ControlStatus::Unknown,
+            "classification:unclassified".to_string(),
+            "The incident workflow cannot be evaluated until a named owner classifies the deployment.".to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::NotHighRisk => (
+            ControlStatus::NotApplicable,
+            format!(
+                "classification:owner={}:assessed_at={}",
+                eu_classification.owner.as_deref().unwrap_or("missing"),
+                eu_classification.assessed_at.as_deref().unwrap_or("missing")
+            ),
+            "The recorded operator/legal classification says Article 73 is not applicable to this deployment."
+                .to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::HighRisk => verified_incident_control(config),
+    };
+
+    let mut checks = vec![
+        attestation_check(
+            &observed_at,
+            "L01",
+            "Article 12",
+            "Side-effect audit logging enabled",
+            audit_status,
+            "config_revision",
+            &config_evidence,
+            format!("security.audit.enabled={}", config.security.audit.enabled),
+            "Enable security.audit and retain signed audit evidence.",
+        ),
+        attestation_check(
+            &observed_at,
+            "L02",
+            "Article 12",
+            "Audit retention floor",
+            ControlStatus::Warning,
+            "config_revision",
+            &config_evidence,
+            format!(
+                "audit rotation size is {} MiB; no time-based floor is enforced",
+                config.security.audit.max_size_mb
+            ),
+            "Define and enforce an operator-approved retention period.",
+        ),
+        attestation_check(
+            &observed_at,
+            "L03",
+            "Article 12",
+            "Control-ladder trace rotation",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "doctor:runtime/control_ladder_traces",
+            "No runtime trace-archive evidence was evaluated by this command.",
+            "Attach trace rotation and archival evidence.",
+        ),
+        attestation_check(
+            &observed_at,
+            "L04",
+            "Article 12",
+            "Message timeline recording",
+            events_status,
+            "config_revision",
+            &config_evidence,
+            format!("memory.events.enabled={}", config.memory.events.enabled),
+            "Enable message-event recording and attach retention evidence.",
+        ),
+        attestation_check(
+            &observed_at,
+            "T01",
+            "Article 13",
+            "Provider routing transparency",
+            ControlStatus::Warning,
+            "config_revision",
+            &config_evidence,
+            format!(
+                "default provider is {:?}; runtime route evidence was not queried",
+                config.default_provider
+            ),
+            "Attach route-decision and final-outcome event references.",
+        ),
+        attestation_check(
+            &observed_at,
+            "T02",
+            "Article 13",
+            "Third-party provider data-policy disclosure",
+            ControlStatus::Unknown,
+            "operator_assertion",
+            "provider-policy-owner:missing",
+            "Provider policy URL and review ownership were not supplied.",
+            "Record policy URLs, owner, and review expiry for each provider.",
+        ),
+        attestation_check(
+            &observed_at,
+            "T04",
+            "Article 50",
+            "AI interaction notice",
+            notice_status,
+            "config_revision",
+            &config_evidence,
+            notice_explanation,
+            "Emit and minimally acknowledge a versioned AI identity notice before the first response.",
+        ),
+        attestation_check(
+            &observed_at,
+            "H01",
+            "Article 14",
+            "Approval grant cryptographic witness",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "approval-ledger:not_evaluated",
+            "Source presence alone is not execution evidence.",
+            "Attach a verified ApprovalGrant v2 ledger receipt.",
+        ),
+        attestation_check(
+            &observed_at,
+            "H02",
+            "Article 14",
+            "Side-effect authorization coverage",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "tool-gate-coverage:not_evaluated",
+            "This report did not execute tool-gate coverage tests.",
+            "Attach release test receipts for every side-effect tool.",
+        ),
+        attestation_check(
+            &observed_at,
+            "H03",
+            "Article 14",
+            "High-risk operation supervision",
+            ControlStatus::Warning,
+            "config_revision",
+            &config_evidence,
+            format!("autonomy level is {:?}", config.autonomy.level),
+            "Use supervised policy and attach approval receipts where applicable.",
+        ),
+        attestation_check(
+            &observed_at,
+            "H04",
+            "Article 14",
+            "Inbound listener human oversight",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "channel-oversight:not_evaluated",
+            "No live inbound-channel oversight evidence was evaluated.",
+            "Run adapter-level supervised-mode conformance tests.",
+        ),
+        attestation_check(
+            &observed_at,
+            "A01",
+            "Article 15",
+            "Retrieval traceability",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "retrieval-traces:not_evaluated",
+            "No retrieval trace was sampled.",
+            "Attach immutable retrieval-trace identifiers.",
+        ),
+        attestation_check(
+            &observed_at,
+            "A02",
+            "Article 15",
+            "Compaction provenance",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "compaction-runs:not_evaluated",
+            "No compaction run was sampled.",
+            "Attach completed compaction-run identifiers and fidelity evidence.",
+        ),
+        attestation_check(
+            &observed_at,
+            "A03",
+            "Article 15",
+            "Prompt-injection content boundaries",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "content-boundary:not_evaluated",
+            "Static implementation claims are insufficient evidence.",
+            "Attach adversarial content-boundary test results.",
+        ),
+        attestation_check(
+            &observed_at,
+            "A04",
+            "Article 15 internal security control",
+            "Vector owner/tenant isolation",
+            vector_isolation_status,
+            "postgres_runtime_evidence",
+            vector_isolation_evidence,
+            vector_isolation_explanation,
+            "Install authoritative RLS policies and attach cross-owner negative-test evidence.",
+        ),
+        attestation_check(
+            &observed_at,
+            "Q01",
+            "Article 16",
+            "Dependency vulnerability gate",
+            ControlStatus::Unknown,
+            "release_receipt",
+            "cargo-audit:missing",
+            "No cargo-audit receipt was supplied to this invocation.",
+            "Attach a timestamped cargo-audit release receipt.",
+        ),
+        attestation_check(
+            &observed_at,
+            "Q02",
+            "Article 16",
+            "Rust engineering gate",
+            ControlStatus::Unknown,
+            "release_receipt",
+            "engineering-gate:missing",
+            "No fmt/clippy/check/test receipt was supplied.",
+            "Attach source-identity-bound engineering gate results.",
+        ),
+        attestation_check(
+            &observed_at,
+            "Q03",
+            "Article 16",
+            "Quality management documentation",
+            ControlStatus::Unknown,
+            "operator_assertion",
+            "qms-owner:missing",
+            "No QMS owner or reviewed document set was supplied.",
+            "Record the QMS owner, document versions, and review date.",
+        ),
+        attestation_check(
+            &observed_at,
+            "C01",
+            "Article 17",
+            "Quality management system",
+            ControlStatus::Unknown,
+            "operator_assertion",
+            "qms-classification:missing",
+            "Applicability and operator evidence are unresolved.",
+            "Complete legal classification and QMS evidence review.",
+        ),
+        attestation_check(
+            &observed_at,
+            "C02",
+            "Article 47 and Annex V",
+            "EU declaration of conformity artifact",
+            declaration_status,
+            "artifact",
+            declaration_evidence,
+            declaration_explanation,
+            "Generate a versioned artifact only from explicit operator declarations.",
+        ),
+        attestation_check(
+            &observed_at,
+            "M01",
+            "Article 72",
+            "Post-market monitoring inputs",
+            ControlStatus::Unknown,
+            "runtime_diagnostic",
+            "monitoring-evidence:not_evaluated",
+            "Runtime health and trace data were not sampled.",
+            "Attach monitoring evidence and an operator-approved plan.",
+        ),
+        attestation_check(
+            &observed_at,
+            "M02",
+            "Article 73",
+            "Incident response ownership",
+            ControlStatus::Unknown,
+            "operator_assertion",
+            "incident-owner:missing",
+            "No incident owner or jurisdiction matrix was supplied.",
+            "Record the incident owner, jurisdictions, and escalation runbook.",
+        ),
+        attestation_check(
+            &observed_at,
+            "M03",
+            "Article 72",
+            "Post-market report cadence",
+            ControlStatus::Unknown,
+            "operator_assertion",
+            "monitoring-cadence:missing",
+            "No reviewed monitoring cadence was supplied.",
+            "Record cadence, owner, review date, and report references.",
+        ),
+        attestation_check(
+            &observed_at,
+            "M04",
+            "Article 73",
+            "Serious-incident workflow",
+            incident_status,
+            "incident_store",
+            incident_evidence,
+            incident_explanation,
+            "Configure the durable incident store and use the incident CLI to record awareness, classification, reports, supplements, and closure.",
+        ),
+    ];
+    checks.sort_by_key(|check| check.id);
+
+    let passed_count = checks
+        .iter()
+        .filter(|check| check.status == ControlStatus::Pass)
+        .count();
+    let warning_count = checks
+        .iter()
+        .filter(|check| check.status == ControlStatus::Warning)
+        .count();
+    let failed_count = checks
+        .iter()
+        .filter(|check| check.status == ControlStatus::Fail)
+        .count();
+    let unknown_count = checks
+        .iter()
+        .filter(|check| check.status == ControlStatus::Unknown)
+        .count();
+    let not_applicable_count = checks
+        .iter()
+        .filter(|check| check.status == ControlStatus::NotApplicable)
+        .count();
 
     EuAiActAttestation {
-        generated_at: chrono::Utc::now().to_rfc3339(),
-        classification: "Art.50 Transparency Obligations System with high-risk-compatible controls".to_string(),
+        report_type: "EU AI Act implementation attestation",
+        evaluator_version: "prx-eu-ai-act-controls/v2",
+        product_version: env!("CARGO_PKG_VERSION"),
+        source_identity: option_env!("PRX_BUILD_SOURCE_REVISION").map(str::to_string),
+        config_generation: config_generation(config),
+        config_source_revision: config_revision,
+        generated_at: observed_at,
+        applicability: ApplicabilityDecision {
+            status: ControlStatus::Unknown,
+            classification: "unclassified; operator and legal review required".to_string(),
+            owner: None,
+            reviewed_at: None,
+        },
         default_provider: config.default_provider.clone(),
         total_checks: checks.len(),
         passed_count,
         warning_count,
         failed_count,
+        unknown_count,
+        not_applicable_count,
         checks,
     }
 }
@@ -1532,23 +1984,50 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
 fn render_eu_ai_act_attestation_markdown(attestation: &EuAiActAttestation, verbose: bool) -> String {
     let mut output = String::new();
     output.push_str("# PRX EU AI Act Implementation Attestation\n\n");
-    output.push_str(&format!("- Generated at: {}\n", attestation.generated_at));
-    output.push_str(&format!("- Classification: {}\n", attestation.classification));
+    output.push_str("This is an implementation attestation, not a regulator-issued certification.\n\n");
+    output.push_str(&format!("- Product version: {}\n", attestation.product_version));
     output.push_str(&format!(
-        "- Checks: {} total, {} pass, {} warning, {} fail\n\n",
-        attestation.total_checks, attestation.passed_count, attestation.warning_count, attestation.failed_count
+        "- Source identity: {}\n",
+        attestation.source_identity.as_deref().unwrap_or("unavailable")
+    ));
+    output.push_str(&format!("- Generated at: {}\n", attestation.generated_at));
+    output.push_str(&format!(
+        "- Classification: {}\n",
+        attestation.applicability.classification
+    ));
+    output.push_str(&format!(
+        "- Checks: {} total, {} pass, {} warning, {} fail, {} unknown, {} not applicable\n\n",
+        attestation.total_checks,
+        attestation.passed_count,
+        attestation.warning_count,
+        attestation.failed_count,
+        attestation.unknown_count,
+        attestation.not_applicable_count
     ));
     output.push_str("| ID | Article | Status | Control |\n");
     output.push_str("|----|---------|--------|---------|\n");
     for check in &attestation.checks {
         output.push_str(&format!(
             "| {} | {} | {} | {} |\n",
-            check.id, check.article, check.status, check.control
+            check.id,
+            check.framework_reference,
+            check.status.as_str(),
+            check.control
         ));
         if verbose {
             output.push_str(&format!(
-                "\n{} evidence: {}\n\n{} gap: {}\n\n",
-                check.id, check.evidence, check.id, check.gap
+                "\n{} evidence: {}\n\n{} explanation: {}\n\n{} remediation: {}\n\n",
+                check.id,
+                check
+                    .evidence
+                    .iter()
+                    .map(|evidence| format!("{}={}", evidence.kind, evidence.reference))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                check.id,
+                check.explanation,
+                check.id,
+                check.remediation
             ));
         }
     }
@@ -1559,6 +2038,16 @@ fn render_eu_ai_act_attestation_json(attestation: &EuAiActAttestation) -> Result
     serde_json::to_string_pretty(attestation).context("Failed to serialize EU AI Act attestation")
 }
 
+fn attestation_fails_gate(attestation: &EuAiActAttestation, fail_on: AuditFailOn) -> bool {
+    attestation.checks.iter().any(|check| match fail_on {
+        AuditFailOn::Fail => check.status == ControlStatus::Fail,
+        AuditFailOn::Warning => matches!(
+            check.status,
+            ControlStatus::Warning | ControlStatus::Unknown | ControlStatus::Fail
+        ),
+    })
+}
+
 fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result<()> {
     match audit_command {
         AuditCommands::AttestEuAiAct {
@@ -1566,6 +2055,7 @@ fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result
             format,
             output,
             verbose,
+            fail_on,
         } => {
             let attestation = build_eu_ai_act_attestation(config);
             let stdout_json = json || format == AuditOutputFormat::Json;
@@ -1587,6 +2077,113 @@ fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result
             }
 
             println!("{stdout_rendered}");
+            if fail_on.is_some_and(|threshold| attestation_fails_gate(&attestation, threshold)) {
+                bail!("EU AI Act implementation attestation did not satisfy --fail-on threshold");
+            }
+            Ok(())
+        }
+        AuditCommands::GenerateEuDeclaration {
+            output,
+            signature_reference,
+        } => {
+            let configured_path = declaration_artifact_path(config);
+            let output = output
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config.workspace_dir.join(path)
+                    }
+                })
+                .or_else(|| configured_path.clone())
+                .context(
+                    "declaration output is required via --output or compliance.eu_ai_act.declaration.artifact_path",
+                )?;
+            if let Some(configured_path) = configured_path {
+                anyhow::ensure!(
+                    output == configured_path,
+                    "--output must match compliance.eu_ai_act.declaration.artifact_path so attestation can verify it"
+                );
+            }
+            let artifact = openprx::compliance::declaration::build_declaration_artifact(
+                config.compliance.eu_ai_act.classification.status,
+                &config.compliance.eu_ai_act.declaration,
+                &signature_reference,
+            )?;
+            openprx::compliance::declaration::write_declaration_artifact(&output, &artifact)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "artifact": output,
+                    "payload_sha256": artifact.payload_sha256,
+                    "signature_status": artifact.signature.status,
+                    "submitted": artifact.signature.submitted,
+                })
+            );
+            Ok(())
+        }
+        AuditCommands::IncidentCreate { input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let bytes =
+                fs::read(&input).with_context(|| format!("Failed to read incident input {}", input.display()))?;
+            let request = serde_json::from_slice(&bytes).context("Failed to parse incident input JSON")?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.create(request)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentInitialReport { incident_id, input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let report = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read initial report {}", input.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.set_initial_report(&incident_id, &report)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentSupplement { incident_id, input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let content = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read incident supplement {}", input.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let supplement = store.add_supplement(&incident_id, &content)?;
+            println!("{}", serde_json::to_string_pretty(&supplement)?);
+            Ok(())
+        }
+        AuditCommands::IncidentClose {
+            incident_id,
+            closed_at,
+            summary,
+        } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let closed_at = chrono::DateTime::parse_from_rfc3339(&closed_at)
+                .context("--closed-at must be RFC 3339")?
+                .with_timezone(&Utc);
+            let summary = fs::read_to_string(&summary)
+                .with_context(|| format!("Failed to read closure summary {}", summary.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.close(&incident_id, closed_at, &summary)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentExport { incident_id, output } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let output = if output.is_absolute() {
+                output
+            } else {
+                config.workspace_dir.join(output)
+            };
+            let store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let export = store.export(&incident_id)?;
+            openprx::compliance::incident::write_incident_export(&output, &export)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "artifact": output,
+                    "incident_id": incident_id,
+                    "automatically_submitted": export.automatically_submitted,
+                })
+            );
             Ok(())
         }
     }
@@ -2192,6 +2789,7 @@ mod tests {
                         format,
                         output,
                         verbose,
+                        fail_on,
                     },
             } => {
                 assert!(json);
@@ -2201,9 +2799,122 @@ mod tests {
                     Some(std::path::Path::new("/tmp/eu-ai-act-test.json"))
                 );
                 assert!(!verbose);
+                assert_eq!(fail_on, None);
             }
             other => panic!("expected audit attest-eu-ai-act command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eu_declaration_cli_requires_explicit_signature_reference() {
+        let cli = Cli::try_parse_from([
+            "prx",
+            "audit",
+            "generate-eu-declaration",
+            "--output",
+            "declaration.json",
+            "--signature-reference",
+            "external:receipt-1",
+        ])
+        .expect("declaration generator should parse");
+        match cli.command {
+            Commands::Audit {
+                audit_command:
+                    AuditCommands::GenerateEuDeclaration {
+                        output,
+                        signature_reference,
+                    },
+            } => {
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("declaration.json")));
+                assert_eq!(signature_reference, "external:receipt-1");
+            }
+            other => panic!("expected declaration generator, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "prx",
+                "audit",
+                "generate-eu-declaration",
+                "--output",
+                "declaration.json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn incident_audit_cli_parses_mutating_and_export_commands() {
+        let create = Cli::try_parse_from(["prx", "audit", "incident-create", "--input", "incident.json"])
+            .expect("incident create should parse");
+        assert!(matches!(
+            create.command,
+            Commands::Audit {
+                audit_command: AuditCommands::IncidentCreate { input }
+            } if input == std::path::Path::new("incident.json")
+        ));
+
+        let export = Cli::try_parse_from([
+            "prx",
+            "audit",
+            "incident-export",
+            "incident-7",
+            "--output",
+            "incident-7-export.json",
+        ])
+        .expect("incident export should parse");
+        assert!(matches!(
+            export.command,
+            Commands::Audit {
+                audit_command: AuditCommands::IncidentExport {
+                    incident_id,
+                    output,
+                }
+            } if incident_id == "incident-7" && output == std::path::Path::new("incident-7-export.json")
+        ));
+    }
+
+    #[test]
+    fn declaration_attestation_respects_operator_classification() {
+        let mut config = Config::default();
+        let c02_status = |config: &Config| {
+            build_eu_ai_act_attestation(config)
+                .checks
+                .into_iter()
+                .find(|check| check.id == "C02")
+                .expect("C02 control")
+                .status
+        };
+        assert_eq!(c02_status(&config), ControlStatus::Unknown);
+
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::NotHighRisk;
+        config.compliance.eu_ai_act.classification.owner = Some("legal-owner".to_string());
+        config.compliance.eu_ai_act.classification.assessed_at = Some("2026-07-18".to_string());
+        assert_eq!(c02_status(&config), ControlStatus::NotApplicable);
+
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
+        assert_eq!(c02_status(&config), ControlStatus::Fail);
+    }
+
+    #[test]
+    fn incident_attestation_requires_and_verifies_durable_store_for_high_risk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store_path = temp.path().join("article-73.sqlite3");
+        let mut config = Config::default();
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
+
+        let m04_status = |config: &Config| {
+            build_eu_ai_act_attestation(config)
+                .checks
+                .into_iter()
+                .find(|check| check.id == "M04")
+                .expect("M04 control")
+                .status
+        };
+        assert_eq!(m04_status(&config), ControlStatus::Fail);
+
+        config.compliance.eu_ai_act.incident_store_path = Some(store_path.clone());
+        openprx::compliance::incident::IncidentStore::open(&store_path).unwrap();
+        assert_eq!(m04_status(&config), ControlStatus::Pass);
     }
 
     #[test]
@@ -2212,22 +2923,57 @@ mod tests {
 
         assert_eq!(attestation.total_checks, 24);
         assert_eq!(attestation.checks.len(), 24);
-        assert!(attestation.passed_count >= 8);
         assert_eq!(
             attestation.total_checks,
-            attestation.passed_count + attestation.warning_count + attestation.failed_count
+            attestation.passed_count
+                + attestation.warning_count
+                + attestation.failed_count
+                + attestation.unknown_count
+                + attestation.not_applicable_count
         );
 
         let json = render_eu_ai_act_attestation_json(&attestation).expect("attestation should serialize");
         let value: serde_json::Value = serde_json::from_str(&json).expect("attestation json should parse");
         assert_eq!(value.get("total_checks").and_then(serde_json::Value::as_u64), Some(24));
-        assert!(
-            value
-                .get("passed_count")
-                .and_then(serde_json::Value::as_u64)
-                .expect("passed_count should be numeric")
-                >= 8
+        assert_eq!(
+            value.get("report_type").and_then(serde_json::Value::as_str),
+            Some("EU AI Act implementation attestation")
         );
+        let c02 = value
+            .get("checks")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check.get("id").and_then(serde_json::Value::as_str) == Some("C02"))
+            })
+            .expect("C02 control should exist");
+        assert_eq!(
+            c02.get("framework_reference").and_then(serde_json::Value::as_str),
+            Some("Article 47 and Annex V")
+        );
+    }
+
+    #[test]
+    fn eu_ai_act_audit_cli_parses_fail_on_and_gate_semantics() {
+        let cli = Cli::try_parse_from(["prx", "audit", "attest-eu-ai-act", "--json", "--fail-on", "warning"])
+            .expect("strict attestation gate should parse");
+        let Commands::Audit {
+            audit_command: AuditCommands::AttestEuAiAct { fail_on, .. },
+        } = cli.command
+        else {
+            panic!("expected audit command");
+        };
+        assert_eq!(fail_on, Some(AuditFailOn::Warning));
+
+        let mut config = Config::default();
+        let attestation = build_eu_ai_act_attestation(&config);
+        assert!(!attestation_fails_gate(&attestation, AuditFailOn::Fail));
+        assert!(attestation_fails_gate(&attestation, AuditFailOn::Warning));
+
+        config.security.audit.enabled = false;
+        let failed_attestation = build_eu_ai_act_attestation(&config);
+        assert!(attestation_fails_gate(&failed_attestation, AuditFailOn::Fail));
     }
 
     #[tokio::test]

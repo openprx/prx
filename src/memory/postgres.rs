@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use postgres::{Client, NoTls, Row};
+use postgres::{Client, GenericClient, NoTls, Row};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use std::time::Duration;
@@ -124,6 +124,108 @@ impl Drop for PostgresClientSlot {
 }
 
 impl PostgresMemory {
+    /// Read-only proof that the A04 vector isolation migration and policies are
+    /// active on the configured PostgreSQL deployment. The returned reference
+    /// contains only migration/policy hashes, never credentials or row data.
+    pub fn verify_vector_isolation(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+    ) -> Result<String> {
+        let db_url = db_url.to_string();
+        let schema = schema.to_string();
+        let table = table.to_string();
+        std::thread::Builder::new()
+            .name("postgres-vector-evidence".to_string())
+            .spawn(move || Self::verify_vector_isolation_blocking(&db_url, &schema, &table, connect_timeout_secs))
+            .context("failed to spawn PostgreSQL evidence verifier thread")?
+            .join()
+            .map_err(|_| anyhow::anyhow!("PostgreSQL evidence verifier thread panicked"))?
+    }
+
+    fn verify_vector_isolation_blocking(
+        db_url: &str,
+        schema: &str,
+        table: &str,
+        connect_timeout_secs: Option<u64>,
+    ) -> Result<String> {
+        validate_identifier(schema, "schema")?;
+        validate_identifier(table, "table")?;
+        let chunks = related_table_name(table, "_document_chunks")?;
+        let cache = related_table_name(table, "_embedding_cache")?;
+        let mut pg_config: postgres::Config = db_url.parse().context("invalid PostgreSQL connection URL")?;
+        if let Some(timeout) = connect_timeout_secs {
+            pg_config.connect_timeout(Duration::from_secs(timeout.max(1)));
+        }
+        let mut client = pg_config
+            .connect(NoTls)
+            .context("PostgreSQL isolation evidence connection failed")?;
+        let migration_table = format!("{}.memory_schema_migrations", quote_identifier(schema));
+        let (version, _, descriptor) = Self::memory_schema_migration_registry()
+            .iter()
+            .find(|(version, _, _)| *version == 21)
+            .context("A04 schema migration is not registered")?;
+        let expected_checksum = Self::schema_migration_checksum(descriptor);
+        let row = client
+            .query_opt(
+                &format!("SELECT checksum FROM {migration_table} WHERE version = $1"),
+                &[version],
+            )?
+            .context("A04 schema migration 21 is not recorded")?;
+        let recorded_checksum: String = row.get(0);
+        anyhow::ensure!(
+            recorded_checksum == expected_checksum,
+            "A04 schema migration checksum does not match the runtime evaluator"
+        );
+
+        let targets = [
+            (table, "memories_owner_isolation"),
+            (chunks.as_str(), "document_chunks_owner_isolation"),
+            (cache.as_str(), "embedding_cache_owner_isolation"),
+        ];
+        let mut policy_proof = String::new();
+        for (target, policy) in targets {
+            let qualified = format!("{}.{}", quote_identifier(schema), quote_identifier(target));
+            let flags = client
+                .query_opt(
+                    "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = to_regclass($1::text)",
+                    &[&qualified],
+                )?
+                .with_context(|| format!("A04 vector table {target} is missing"))?;
+            anyhow::ensure!(
+                flags.get::<_, bool>(0) && flags.get::<_, bool>(1),
+                "A04 RLS is not enabled and forced for {target}"
+            );
+            let policy_row = client
+                .query_opt(
+                    "SELECT COALESCE(qual, ''), COALESCE(with_check, '') \
+                     FROM pg_policies \
+                     WHERE schemaname = $1 AND tablename = $2 AND policyname = $3",
+                    &[&schema, &target, &policy],
+                )?
+                .with_context(|| format!("A04 policy {policy} is missing"))?;
+            let using_expr: String = policy_row.get(0);
+            let check_expr: String = policy_row.get(1);
+            for required in ["prx.current_workspace", "prx.current_owner"] {
+                anyhow::ensure!(
+                    using_expr.contains(required) && check_expr.contains(required),
+                    "A04 policy {policy} lacks required transaction context"
+                );
+            }
+            policy_proof.push_str(policy);
+            policy_proof.push('\0');
+            policy_proof.push_str(&using_expr);
+            policy_proof.push('\0');
+            policy_proof.push_str(&check_expr);
+            policy_proof.push('\0');
+        }
+        let policy_hash = Self::schema_migration_checksum(&policy_proof);
+        Ok(format!(
+            "postgres:migration:{version}:sha256:{expected_checksum}:policy-sha256:{policy_hash}"
+        ))
+    }
+
     pub fn new(db_url: &str, schema: &str, table: &str, connect_timeout_secs: Option<u64>) -> Result<Self> {
         Self::with_embedder(
             db_url,
@@ -481,6 +583,8 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS policy_version BIGINT;
 
             CREATE TABLE IF NOT EXISTS {qualified_embedding_cache_table} (
+                workspace_id TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
                 content_hash TEXT NOT NULL,
                 embedding BYTEA NOT NULL,
                 provider TEXT NOT NULL,
@@ -488,8 +592,12 @@ impl PostgresMemory {
                 dimensions BIGINT NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL,
                 accessed_at TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (content_hash, provider, model, dimensions)
+                PRIMARY KEY (workspace_id, owner_id, content_hash, provider, model, dimensions)
             );
+            ALTER TABLE {qualified_embedding_cache_table}
+                ADD COLUMN IF NOT EXISTS workspace_id TEXT NOT NULL DEFAULT '__prx_system__';
+            ALTER TABLE {qualified_embedding_cache_table}
+                ADD COLUMN IF NOT EXISTS owner_id TEXT NOT NULL DEFAULT '__prx_system__';
             CREATE INDEX IF NOT EXISTS idx_embedding_cache_accessed
                 ON {qualified_embedding_cache_table}(accessed_at);
             CREATE INDEX IF NOT EXISTS idx_embedding_cache_provider_model
@@ -678,6 +786,7 @@ impl PostgresMemory {
                 embedding_provider TEXT,
                 embedding_model TEXT,
                 embedding_dimensions BIGINT,
+                visibility TEXT NOT NULL DEFAULT 'workspace',
                 source_anchor TEXT NOT NULL,
                 token_estimate BIGINT NOT NULL DEFAULT 0,
                 created_at TIMESTAMPTZ NOT NULL
@@ -691,6 +800,8 @@ impl PostgresMemory {
                 ADD COLUMN IF NOT EXISTS embedding_model TEXT;
             ALTER TABLE {qualified_document_chunks_table}
                 ADD COLUMN IF NOT EXISTS embedding_dimensions BIGINT;
+            ALTER TABLE {qualified_document_chunks_table}
+                ADD COLUMN IF NOT EXISTS visibility TEXT NOT NULL DEFAULT 'workspace';
 
             CREATE TABLE IF NOT EXISTS {qualified_memory_links_table} (
                 id BIGSERIAL PRIMARY KEY,
@@ -919,14 +1030,18 @@ impl PostgresMemory {
         // constraint that already exists raises an error rather than being a
         // no-op; we therefore detect-then-add and tolerate the duplicate.
         Self::ensure_document_chunks_fk(client, qualified_documents_table, qualified_document_chunks_table)?;
+        Self::ensure_embedding_cache_scope_key(client, qualified_embedding_cache_table)?;
 
-        // FIX-P3-04: enable row-level security on `memories` so owner isolation is
-        // enforced at the database layer (defense-in-depth: even if the app-level
-        // ACL/post_filter is bypassed, the DB still scopes rows to the active
-        // owner). Best-effort — if RLS cannot be configured (insufficient role
-        // privileges) it degrades like pgvector init: logged and skipped, never
-        // breaking the backend.
-        Self::try_init_rls(client, qualified_table);
+        // A04: vector-bearing memory and document rows are protected by an
+        // authoritative, fail-closed RLS migration. Startup must fail if the
+        // configured role cannot install or verify these policies; silently
+        // running without isolation would make the attestation untruthful.
+        Self::init_vector_rls(
+            client,
+            qualified_table,
+            qualified_document_chunks_table,
+            qualified_embedding_cache_table,
+        )?;
 
         // FIX-P0-25: record-and-verify versioned schema migrations. The DDL was
         // already executed by the idempotent batch above; this ledger records a
@@ -1051,6 +1166,11 @@ impl PostgresMemory {
                 "message_event_execution_metadata",
                 "message_events + source_ref_json + subject_ref_json + goal_id + causation_event_id + correlation_id + attempt_id + lease_epoch",
             ),
+            (
+                21,
+                "vector_owner_workspace_row_level_security",
+                "memories + document_chunks + embedding_cache scoped by workspace_id/owner_id and ENABLE+FORCE ROW LEVEL SECURITY; transaction-local workspace required; private/cache owner exact; shared reads tenant-scoped; writes owner exact; missing context denies",
+            ),
         ]
     }
 
@@ -1158,6 +1278,37 @@ impl PostgresMemory {
         Ok(())
     }
 
+    /// Upgrade the embedding cache from its historical global content key to
+    /// a workspace/owner-scoped key. The cache stores vectors and therefore
+    /// must not reveal reuse or content-derived state across principals.
+    fn ensure_embedding_cache_scope_key(client: &mut Client, qualified_cache_table: &str) -> Result<()> {
+        let primary = client.query_opt(
+            "SELECT c.conname, pg_get_constraintdef(c.oid) \
+             FROM pg_constraint c \
+             WHERE c.conrelid = to_regclass($1::text) AND c.contype = 'p'",
+            &[&qualified_cache_table],
+        )?;
+        if let Some(row) = primary {
+            let name: String = row.get(0);
+            let definition: String = row.get(1);
+            if definition.contains("workspace_id") && definition.contains("owner_id") {
+                return Ok(());
+            }
+            let constraint = quote_identifier(&name);
+            client.batch_execute(&format!(
+                "ALTER TABLE {qualified_cache_table} DROP CONSTRAINT {constraint}; \
+                 ALTER TABLE {qualified_cache_table} \
+                 ADD PRIMARY KEY (workspace_id, owner_id, content_hash, provider, model, dimensions);"
+            ))?;
+        } else {
+            client.batch_execute(&format!(
+                "ALTER TABLE {qualified_cache_table} \
+                 ADD PRIMARY KEY (workspace_id, owner_id, content_hash, provider, model, dimensions);"
+            ))?;
+        }
+        Ok(())
+    }
+
     /// Replace the legacy global MessageEvent idempotency constraint with a
     /// workspace-scoped unique index. The constraint name is discovered from
     /// PostgreSQL metadata because derived table names may be truncated.
@@ -1226,86 +1377,87 @@ impl PostgresMemory {
         }
     }
 
-    /// FIX-P3-04: enable row-level security on the `memories` table so owner
-    /// isolation is enforced inside PostgreSQL itself (defense-in-depth).
-    ///
-    /// Policy `memories_owner_isolation` admits a row when ANY holds:
-    /// - the system-bypass flag `prx.rls_bypass` is `'on'` (set per-query for the
-    ///   four canonical system principals so internal/router/system operations are
-    ///   never locked out);
-    /// - the owner session variable `prx.current_owner` is unset (NULL) — this
-    ///   keeps the many code paths that do not carry a principal working exactly as
-    ///   before, so RLS only tightens (never breaks) existing behaviour;
-    /// - the row's `owner_id` matches `prx.current_owner` (NULL-safe via
-    ///   `IS NOT DISTINCT FROM`, so a NULL-owner row matches a NULL setting).
-    ///
-    /// `FORCE ROW LEVEL SECURITY` is applied so the policy is honoured even when
-    /// the connection role owns the table (table owners otherwise bypass RLS).
-    ///
-    /// Best-effort: if the role lacks privileges to alter the table / create the
-    /// policy, the failure is logged and skipped — identical to pgvector init —
-    /// so deployments without superuser/table-owner rights still start cleanly.
-    ///
-    /// SAFETY: `qualified_table` is validated + quoted at construction via
-    /// `validate_identifier()` + `quote_identifier()`; no untrusted input is
-    /// interpolated into the DDL. Session-variable values are passed as bind
-    /// params in `apply_rls_context`.
-    fn try_init_rls(client: &mut Client, qualified_table: &str) {
-        // `CREATE POLICY` is not idempotent, so drop-then-create makes re-init
-        // safe. `ENABLE`/`FORCE` are idempotent. Run as a single batch so the
-        // policy is never left dropped if a later statement fails.
-        let init = format!(
-            "
-            ALTER TABLE {qualified_table} ENABLE ROW LEVEL SECURITY;
-            ALTER TABLE {qualified_table} FORCE ROW LEVEL SECURITY;
-            DROP POLICY IF EXISTS memories_owner_isolation ON {qualified_table};
-            CREATE POLICY memories_owner_isolation ON {qualified_table}
-                USING (
-                    current_setting('prx.rls_bypass', true) = 'on'
-                    OR current_setting('prx.current_owner', true) IS NULL
-                    OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true)
-                )
-                WITH CHECK (
-                    current_setting('prx.rls_bypass', true) = 'on'
-                    OR current_setting('prx.current_owner', true) IS NULL
-                    OR owner_id IS NOT DISTINCT FROM current_setting('prx.current_owner', true)
-                );
-            "
-        );
-        if let Err(error) = client.batch_execute(&init) {
-            tracing::debug!(error = %error, "Postgres row-level security initialization skipped");
+    /// Install the A04 vector isolation policy on every table that stores a
+    /// retrievable vector. Missing workspace/owner context is deliberately not
+    /// an allow case. The migration is fatal because starting without the policy
+    /// would expose a different security contract than the report advertises.
+    fn init_vector_rls(
+        client: &mut Client,
+        qualified_memories_table: &str,
+        qualified_document_chunks_table: &str,
+        qualified_embedding_cache_table: &str,
+    ) -> Result<()> {
+        let mut tx = client.transaction()?;
+        for (table, policy, shared_reads) in [
+            (qualified_memories_table, "memories_owner_isolation", true),
+            (qualified_document_chunks_table, "document_chunks_owner_isolation", true),
+            (
+                qualified_embedding_cache_table,
+                "embedding_cache_owner_isolation",
+                false,
+            ),
+        ] {
+            let read_scope = if shared_reads {
+                "(owner_id = current_setting('prx.current_owner', true) OR visibility IN ('global', 'workspace'))"
+            } else {
+                "owner_id = current_setting('prx.current_owner', true)"
+            };
+            tx.batch_execute(&format!(
+                "
+                ALTER TABLE {table} ENABLE ROW LEVEL SECURITY;
+                ALTER TABLE {table} FORCE ROW LEVEL SECURITY;
+                DROP POLICY IF EXISTS {policy} ON {table};
+                CREATE POLICY {policy} ON {table}
+                    USING (
+                        current_setting('prx.rls_bypass', true) = 'on'
+                        OR (
+                            NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
+                            AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
+                            AND workspace_id = current_setting('prx.current_workspace', true)
+                            AND {read_scope}
+                        )
+                    )
+                    WITH CHECK (
+                        current_setting('prx.rls_bypass', true) = 'on'
+                        OR (
+                            NULLIF(current_setting('prx.current_workspace', true), '') IS NOT NULL
+                            AND NULLIF(current_setting('prx.current_owner', true), '') IS NOT NULL
+                            AND workspace_id = current_setting('prx.current_workspace', true)
+                            AND owner_id = current_setting('prx.current_owner', true)
+                        )
+                    );
+                "
+            ))?;
         }
+        tx.commit()?;
+        Ok(())
     }
 
-    /// FIX-P3-04: push the RLS session context for `principal` onto `client`
-    /// before an owner-scoped query.
-    ///
-    /// - system principals get the bypass flag so internal/router/system actors
-    ///   are never restricted by the policy;
-    /// - everyone else binds their `owner_id` (or NULL when absent) into
-    ///   `prx.current_owner`, restricting visible rows to that owner.
-    ///
-    /// Because the backend reuses a single long-lived connection, the variables
-    /// must be (re)set on every owner-scoped query so a previous principal's
-    /// context never leaks into the next.
-    ///
-    /// `set_config(name, value, is_local => false)` is used instead of `SET`
-    /// because it accepts the value as a bind parameter, preserving the
-    /// parameterized-query rule (no string interpolation of values).
-    ///
-    /// Owner-scoped read paths capture only the system-bypass flag and the owner
-    /// id (not the whole principal) into their blocking task, so this takes those
-    /// two values directly.
-    fn apply_rls_context_raw(client: &mut Client, system: bool, owner_id: Option<&str>) -> Result<()> {
+    /// Bind trusted isolation context to the current transaction only. Values
+    /// come from resolved runtime principals, never prompt/tool arguments. A
+    /// non-system operation without both identifiers fails before SQL executes.
+    fn apply_rls_context_raw<C: GenericClient>(
+        client: &mut C,
+        system: bool,
+        workspace_id: Option<&str>,
+        owner_id: Option<&str>,
+    ) -> Result<()> {
         if system {
-            client.execute("SELECT set_config('prx.rls_bypass', 'on', false)", &[])?;
-            let cleared: Option<&str> = None;
-            client.execute("SELECT set_config('prx.current_owner', $1, false)", &[&cleared])?;
-        } else {
-            client.execute("SELECT set_config('prx.rls_bypass', 'off', false)", &[])?;
-            let owner: Option<&str> = owner_id.filter(|owner| !owner.trim().is_empty());
-            client.execute("SELECT set_config('prx.current_owner', $1, false)", &[&owner])?;
+            client.execute("SELECT set_config('prx.rls_bypass', 'on', true)", &[])?;
+            return Ok(());
         }
+
+        let workspace = workspace_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("PostgreSQL vector isolation requires a trusted workspace context")?;
+        let owner = owner_id
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("PostgreSQL vector isolation requires a trusted owner context")?;
+        client.execute("SELECT set_config('prx.rls_bypass', 'off', true)", &[])?;
+        client.execute("SELECT set_config('prx.current_workspace', $1, true)", &[&workspace])?;
+        client.execute("SELECT set_config('prx.current_owner', $1, true)", &[&owner])?;
         Ok(())
     }
 
@@ -1358,10 +1510,32 @@ impl PostgresMemory {
         i64::try_from(self.embedder.dimensions()).unwrap_or(i64::MAX)
     }
 
-    async fn get_or_compute_embedding(&self, text: &str) -> Result<Option<Vec<f32>>> {
+    async fn get_or_compute_embedding(
+        &self,
+        text: &str,
+        workspace_id: Option<&str>,
+        owner_id: Option<&str>,
+        system: bool,
+    ) -> Result<Option<Vec<f32>>> {
         if self.embedder.dimensions() == 0 {
             return Ok(None);
         }
+        let (scope_workspace, scope_owner) = if system {
+            ("__prx_system__".to_string(), "__prx_system__".to_string())
+        } else {
+            (
+                workspace_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context("PostgreSQL embedding cache requires workspace context")?
+                    .to_string(),
+                owner_id
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .context("PostgreSQL embedding cache requires owner context")?
+                    .to_string(),
+            )
+        };
         let content_hash = Self::content_hash(text);
         let provider_name = self.embedding_provider_name();
         let model_name = self.embedding_model_name();
@@ -1371,43 +1545,72 @@ impl PostgresMemory {
         let cache_hash = content_hash.clone();
         let cache_provider = provider_name.clone();
         let cache_model = model_name.clone();
+        let select_workspace = scope_workspace.clone();
+        let select_owner = scope_owner.clone();
         let cached = tokio::task::spawn_blocking(move || -> Result<Option<Vec<f32>>> {
             let select_stmt = format!(
                 "
                 SELECT embedding
                 FROM {cache_table}
-                WHERE content_hash = $1
-                  AND provider = $2
-                  AND model = $3
-                  AND dimensions = $4
+                WHERE workspace_id = $1
+                  AND owner_id = $2
+                  AND content_hash = $3
+                  AND provider = $4
+                  AND model = $5
+                  AND dimensions = $6
                 LIMIT 1
                 "
             );
             let update_stmt = format!(
                 "
                 UPDATE {cache_table}
-                SET accessed_at = $5
-                WHERE content_hash = $1
-                  AND provider = $2
-                  AND model = $3
-                  AND dimensions = $4
+                SET accessed_at = $7
+                WHERE workspace_id = $1
+                  AND owner_id = $2
+                  AND content_hash = $3
+                  AND provider = $4
+                  AND model = $5
+                  AND dimensions = $6
                 "
             );
             client.with_client(|client| {
-                let row = client.query_opt(&select_stmt, &[&cache_hash, &cache_provider, &cache_model, &dimensions])?;
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, system, Some(&select_workspace), Some(&select_owner))?;
+                let row = tx.query_opt(
+                    &select_stmt,
+                    &[
+                        &select_workspace,
+                        &select_owner,
+                        &cache_hash,
+                        &cache_provider,
+                        &cache_model,
+                        &dimensions,
+                    ],
+                )?;
                 let Some(row) = row else {
+                    tx.commit()?;
                     return Ok(None);
                 };
                 let bytes: Vec<u8> = row.get(0);
                 let embedding = vector::bytes_to_vec(&bytes);
                 if embedding.len() != usize::try_from(dimensions).unwrap_or(usize::MAX) {
+                    tx.commit()?;
                     return Ok(None);
                 }
                 let now = Utc::now();
-                client.execute(
+                tx.execute(
                     &update_stmt,
-                    &[&cache_hash, &cache_provider, &cache_model, &dimensions, &now],
+                    &[
+                        &select_workspace,
+                        &select_owner,
+                        &cache_hash,
+                        &cache_provider,
+                        &cache_model,
+                        &dimensions,
+                        &now,
+                    ],
                 )?;
+                tx.commit()?;
                 Ok(Some(embedding))
             })
         })
@@ -1437,22 +1640,26 @@ impl PostgresMemory {
             let insert_stmt = format!(
                 "
                 INSERT INTO {cache_table} (
-                    content_hash, embedding, provider, model, dimensions, created_at, accessed_at
+                    workspace_id, owner_id, content_hash, embedding, provider, model,
+                    dimensions, created_at, accessed_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $6)
-                ON CONFLICT (content_hash, provider, model, dimensions)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $8)
+                ON CONFLICT (workspace_id, owner_id, content_hash, provider, model, dimensions)
                 DO UPDATE SET embedding = EXCLUDED.embedding, accessed_at = EXCLUDED.accessed_at
                 "
             );
             let evict_stmt = format!(
                 "
                 DELETE FROM {cache_table}
-                WHERE (content_hash, provider, model, dimensions) IN (
+                WHERE workspace_id = $1 AND owner_id = $2
+                  AND (content_hash, provider, model, dimensions) IN (
                     SELECT content_hash, provider, model, dimensions
                     FROM {cache_table}
+                    WHERE workspace_id = $1 AND owner_id = $2
                     ORDER BY accessed_at ASC
                     LIMIT GREATEST(
-                        (SELECT COUNT(*) FROM {cache_table}) - $1,
+                        (SELECT COUNT(*) FROM {cache_table}
+                         WHERE workspace_id = $1 AND owner_id = $2) - $3,
                         0
                     )
                 )
@@ -1460,12 +1667,22 @@ impl PostgresMemory {
             );
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, system, Some(&scope_workspace), Some(&scope_owner))?;
                 let now = Utc::now();
                 tx.execute(
                     &insert_stmt,
-                    &[&content_hash, &bytes, &provider_name, &model_name, &dimensions, &now],
+                    &[
+                        &scope_workspace,
+                        &scope_owner,
+                        &content_hash,
+                        &bytes,
+                        &provider_name,
+                        &model_name,
+                        &dimensions,
+                        &now,
+                    ],
                 )?;
-                tx.execute(&evict_stmt, &[&cache_max])?;
+                tx.execute(&evict_stmt, &[&scope_workspace, &scope_owner, &cache_max])?;
                 tx.commit()?;
                 Ok(())
             })
@@ -1478,6 +1695,9 @@ impl PostgresMemory {
         &self,
         category: &MemoryCategory,
         content: &str,
+        workspace_id: Option<&str>,
+        owner_id: Option<&str>,
+        system: bool,
     ) -> Result<(
         Option<Vec<u8>>,
         Option<String>,
@@ -1488,7 +1708,10 @@ impl PostgresMemory {
         if !Self::memory_category_needs_embedding(category) {
             return Ok((None, None, None, None, None));
         }
-        let Some(embedding) = self.get_or_compute_embedding(content).await? else {
+        let Some(embedding) = self
+            .get_or_compute_embedding(content, workspace_id, owner_id, system)
+            .await?
+        else {
             return Ok((None, None, None, None, None));
         };
         let pgvector_literal = self
@@ -2286,8 +2509,9 @@ impl Memory for PostgresMemory {
         metadata: MemoryStoreMetadata,
     ) -> Result<()> {
         validate_memory_write_target(key, session_id)?;
-        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) =
-            self.embedding_metadata_for_category(&category, content).await?;
+        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) = self
+            .embedding_metadata_for_category(&category, content, None, None, true)
+            .await?;
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let pgvector_available = self.pgvector_available;
@@ -2384,8 +2608,28 @@ impl Memory for PostgresMemory {
         };
 
         validate_memory_write_target(key, session_id)?;
-        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) =
-            self.embedding_metadata_for_category(&category, content).await?;
+        let isolation_workspace = metadata.workspace_id.clone().or_else(|| context.workspace_id.clone());
+        let isolation_owner = metadata.owner_id.clone().or_else(|| {
+            context.sender_id.clone().or_else(|| {
+                context
+                    .channel
+                    .as_ref()
+                    .zip(context.raw_sender.as_ref())
+                    .map(|(channel, sender)| format!("anonymous:{channel}:{sender}"))
+            })
+        });
+        let isolation_system = isolation_owner
+            .as_deref()
+            .is_some_and(super::principal::is_system_principal);
+        let (embedding, embedding_provider, embedding_model, embedding_dimensions, embedding_vector) = self
+            .embedding_metadata_for_category(
+                &category,
+                content,
+                isolation_workspace.as_deref(),
+                isolation_owner.as_deref(),
+                isolation_system,
+            )
+            .await?;
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
         let pgvector_available = self.pgvector_available;
@@ -2412,6 +2656,8 @@ impl Memory for PostgresMemory {
                 }
             });
             let owner_id = metadata.owner_id.clone().or_else(|| sender_id.clone());
+            let workspace_id = metadata.workspace_id.clone().or_else(|| context.workspace_id.clone());
+            let rls_system = super::principal::is_system_principal(&principal.user_id);
             // FIX-P0-23 (#4 F4): persist topic_id instead of hard-coded NULL.
             // Prefer the explicit metadata topic_id; fall back to source_event_id
             // (source_event_id 兜底) so a write still threads back to its
@@ -2460,7 +2706,9 @@ impl Memory for PostgresMemory {
 
             let id = Uuid::new_v4().to_string();
             client.with_client(|client| {
-                client.execute(
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, rls_system, workspace_id.as_deref(), owner_id.as_deref())?;
+                tx.execute(
                     &stmt,
                     &[
                         &id,
@@ -2470,7 +2718,7 @@ impl Memory for PostgresMemory {
                         &now,
                         &now,
                         &sid,
-                        &metadata.workspace_id,
+                        &workspace_id,
                         &owner_id,
                         &metadata.agent_id,
                         &metadata.persona_id,
@@ -2493,16 +2741,21 @@ impl Memory for PostgresMemory {
                     ],
                 )?;
                 if pgvector_available {
-                    let update_vector_stmt =
-                        format!("UPDATE {qualified_table} SET embedding_vector = $1::vector WHERE key = $2");
-                    let clear_vector_stmt =
-                        format!("UPDATE {qualified_table} SET embedding_vector = NULL WHERE key = $1");
+                    let update_vector_stmt = format!(
+                        "UPDATE {qualified_table} SET embedding_vector = $1::vector \
+                         WHERE key = $2 AND workspace_id = $3 AND owner_id = $4"
+                    );
+                    let clear_vector_stmt = format!(
+                        "UPDATE {qualified_table} SET embedding_vector = NULL \
+                         WHERE key = $1 AND workspace_id = $2 AND owner_id = $3"
+                    );
                     if let Some(embedding_vector) = embedding_vector.as_ref() {
-                        client.execute(&update_vector_stmt, &[embedding_vector, &key])?;
+                        tx.execute(&update_vector_stmt, &[embedding_vector, &key, &workspace_id, &owner_id])?;
                     } else {
-                        client.execute(&clear_vector_stmt, &[&key])?;
+                        tx.execute(&clear_vector_stmt, &[&key, &workspace_id, &owner_id])?;
                     }
                 }
+                tx.commit()?;
                 Ok(())
             })?;
             Ok(())
@@ -2518,7 +2771,7 @@ impl Memory for PostgresMemory {
         let query_embedding = if query.is_empty() {
             None
         } else {
-            self.get_or_compute_embedding(&query).await?
+            self.get_or_compute_embedding(&query, None, None, true).await?
         };
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
@@ -2701,6 +2954,7 @@ impl Memory for PostgresMemory {
         let Some(context) = context.cloned() else {
             return self.recall(query, limit, session_id).await;
         };
+        let rls_workspace = context.workspace_id.clone().unwrap_or_default();
 
         // FIX-P0-22 (#3 F3): resolve a full ACL principal (identity_bindings +
         // user_policies) so blocked_patterns and role are populated, then apply
@@ -2771,12 +3025,15 @@ impl Memory for PostgresMemory {
             #[allow(clippy::cast_possible_wrap)]
             let limit_i64 = fetch_limit.max(1) as i64;
             let rows = client.with_client(|client| {
-                Self::apply_rls_context_raw(client, rls_system, rls_owner.as_deref())?;
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&query, &sid, &limit_i64];
                 for value in &scope_values {
                     params.push(value);
                 }
-                Ok(client.query(&stmt, &params)?)
+                let rows = tx.query(&stmt, &params)?;
+                tx.commit()?;
+                Ok(rows)
             })?;
             rows.iter()
                 .map(Self::row_to_entry)
@@ -2858,6 +3115,7 @@ impl Memory for PostgresMemory {
 
     async fn get_with_context(&self, key: &str, context: Option<&MemoryWriteContext>) -> Result<Option<MemoryEntry>> {
         let context = context.cloned().unwrap_or_default();
+        let rls_workspace = context.workspace_id.clone().unwrap_or_default();
         let principal = self.resolve_principal_from_context(&context).await;
         let sender_id = context.sender_id.clone().or_else(|| {
             if context.channel.is_some() && context.raw_sender.is_some() {
@@ -2891,12 +3149,15 @@ impl Memory for PostgresMemory {
                   LIMIT 1"
             );
             let row = client.with_client(|client| {
-                Self::apply_rls_context_raw(client, rls_system, rls_owner.as_deref())?;
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
                 for value in &scope_values {
                     params.push(value);
                 }
-                Ok(client.query_opt(&stmt, &params)?)
+                let row = tx.query_opt(&stmt, &params)?;
+                tx.commit()?;
+                Ok(row)
             })?;
             let entry = row.as_ref().map(Self::row_to_entry).transpose()?;
             let mut visible =
@@ -2995,10 +3256,19 @@ impl Memory for PostgresMemory {
         let Some(context) = context.cloned() else {
             return self.forget(key).await;
         };
+        let rls_workspace = context.workspace_id.clone().unwrap_or_default();
 
         // FIX-P0-22 (#3 F3): resolve the ACL principal and record an access-audit
         // entry for both allowed and denied deletes (parity with SQLite).
         let principal = self.resolve_principal_from_context(&context).await;
+        let rls_system = super::principal::is_system_principal(&principal.user_id);
+        let rls_owner = context.sender_id.clone().or_else(|| {
+            context
+                .channel
+                .as_ref()
+                .zip(context.raw_sender.as_ref())
+                .map(|(channel, sender)| format!("anonymous:{channel}:{sender}"))
+        });
 
         let client = self.client.clone();
         let qualified_table = self.qualified_table.clone();
@@ -3025,11 +3295,15 @@ impl Memory for PostgresMemory {
                 "
             );
             let deleted = client.with_client(|client| {
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), rls_owner.as_deref())?;
                 let mut params: Vec<&(dyn postgres::types::ToSql + Sync)> = vec![&key];
                 for value in &scope_values {
                     params.push(value);
                 }
-                Ok(client.execute(&stmt, &params)?)
+                let deleted = tx.execute(&stmt, &params)?;
+                tx.commit()?;
+                Ok(deleted)
             })?;
             let result = if deleted > 0 { "allowed" } else { "denied" };
             Self::log_access_best_effort_blocking(
@@ -3142,6 +3416,7 @@ impl Memory for PostgresMemory {
             .as_deref()
             .filter(|owner| !owner.trim().is_empty())
             .map(str::to_string);
+        let workspace_id = principal.workspace_id.trim().to_string();
         let session_key = session_key.to_string();
         #[allow(clippy::cast_possible_wrap)]
         let limit = limit.clamp(1, 500) as i64;
@@ -3181,13 +3456,16 @@ impl Memory for PostgresMemory {
                 session_fragment = session_fragment.sql,
             );
             let rows = client.with_client(|client| {
-                Self::apply_rls_context_raw(client, system_allowed, owner_id.as_deref())?;
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, system_allowed, Some(&workspace_id), owner_id.as_deref())?;
                 let mut bind: Vec<&(dyn postgres::types::ToSql + Sync)> =
                     vec![&session_key, &limit, &offset, &system_allowed, &owner_id];
                 for key in &legacy_session_keys {
                     bind.push(key);
                 }
-                Ok(client.query(&stmt, &bind)?)
+                let rows = tx.query(&stmt, &bind)?;
+                tx.commit()?;
+                Ok(rows)
             })?;
             let mut turns: Vec<ConversationTurn> = rows
                 .iter()
@@ -4330,6 +4608,19 @@ impl Memory for PostgresMemory {
     }
 
     async fn ingest_document(&self, input: DocumentIngestInput) -> Result<DocumentRecord> {
+        let workspace_context = input.workspace_id.trim();
+        anyhow::ensure!(
+            !workspace_context.is_empty(),
+            "PostgreSQL vector isolation requires document workspace_id"
+        );
+        let owner_context = input
+            .owner_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .context("PostgreSQL vector isolation requires document owner_id")?;
+        let workspace_context = workspace_context.to_string();
+        let owner_context = owner_context.to_string();
         let client = self.client.clone();
         let qualified_documents_table = self.qualified_documents_table.clone();
         let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
@@ -4349,7 +4640,9 @@ impl Memory for PostgresMemory {
             .collect();
         let mut prepared_chunks = Vec::with_capacity(raw_chunks.len());
         for (chunk_index, heading, content) in raw_chunks {
-            let embedding = self.get_or_compute_embedding(&content).await?;
+            let embedding = self
+                .get_or_compute_embedding(&content, Some(&workspace_context), Some(&owner_context), false)
+                .await?;
             let embedding_vector = embedding.as_ref().and_then(|embedding| {
                 self.pgvector_available
                     .then(|| Self::pgvector_literal(embedding))
@@ -4391,16 +4684,19 @@ impl Memory for PostgresMemory {
                     updated_at = EXCLUDED.updated_at
                 "
             );
-            let delete_chunks_stmt = format!("DELETE FROM {qualified_document_chunks_table} WHERE document_id = $1");
+            let delete_chunks_stmt = format!(
+                "DELETE FROM {qualified_document_chunks_table} \
+                 WHERE document_id = $1 AND workspace_id = $2 AND owner_id = $3"
+            );
             let insert_chunk_stmt = format!(
                 "
                 INSERT INTO {qualified_document_chunks_table} (
                     chunk_id, document_id, workspace_id, owner_id, topic_id, task_id,
                     chunk_index, heading, content, content_sha256, embedding,
                     embedding_provider, embedding_model, embedding_dimensions,
-                    source_anchor, token_estimate, created_at
+                    visibility, source_anchor, token_estimate, created_at
                 )
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                 "
             );
             let insert_event_stmt = format!(
@@ -4419,12 +4715,13 @@ impl Memory for PostgresMemory {
                        content_sha256, mime_type, visibility, metadata_json,
                        chunk_count, created_at, updated_at
                 FROM {qualified_documents_table}
-                WHERE document_id = $1
+                WHERE document_id = $1 AND workspace_id = $2 AND owner_id = $3
                 LIMIT 1
                 "
             );
             client.with_client(|client| {
                 let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, false, Some(&workspace_context), Some(&owner_context))?;
                 tx.execute(
                     &insert_document_stmt,
                     &[
@@ -4446,10 +4743,11 @@ impl Memory for PostgresMemory {
                         &now,
                     ],
                 )?;
-                tx.execute(&delete_chunks_stmt, &[&document_id])?;
+                tx.execute(&delete_chunks_stmt, &[&document_id, &workspace_context, &owner_context])?;
                 let update_chunk_vector_stmt = if pgvector_available {
                     Some(format!(
-                        "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector WHERE chunk_id = $2"
+                        "UPDATE {qualified_document_chunks_table} SET embedding_vector = $1::vector \
+                         WHERE chunk_id = $2 AND workspace_id = $3 AND owner_id = $4"
                     ))
                 } else {
                     None
@@ -4480,6 +4778,7 @@ impl Memory for PostgresMemory {
                             &chunk_embedding_provider,
                             &chunk_embedding_model,
                             &chunk_embedding_dimensions,
+                            &visibility,
                             &source_anchor,
                             &token_estimate,
                             &now,
@@ -4488,7 +4787,7 @@ impl Memory for PostgresMemory {
                     if let (Some(stmt), Some(embedding_vector)) =
                         (update_chunk_vector_stmt.as_ref(), embedding_vector.as_ref())
                     {
-                        tx.execute(stmt, &[embedding_vector, &chunk_id])?;
+                        tx.execute(stmt, &[embedding_vector, &chunk_id, &workspace_context, &owner_context])?;
                     }
                 }
                 let payload_json = serde_json::json!({
@@ -4511,7 +4810,10 @@ impl Memory for PostgresMemory {
                         &Utc::now(),
                     ],
                 )?;
-                let row = tx.query_one(&select_document_stmt, &[&document_id])?;
+                let row = tx.query_one(
+                    &select_document_stmt,
+                    &[&document_id, &workspace_context, &owner_context],
+                )?;
                 let document = Self::row_to_document(&row)?;
                 tx.commit()?;
                 Ok(document)
@@ -4531,12 +4833,19 @@ impl Memory for PostgresMemory {
         let qualified_document_chunks_table = self.qualified_document_chunks_table.clone();
         let principal = principal.clone();
         let query = query.trim().to_string();
-        let owner_id = Self::document_owner_for_principal(&principal);
+        let owner_id = principal
+            .owner_id
+            .clone()
+            .or_else(|| Self::document_owner_for_principal(&principal));
+        let rls_system = Self::is_system_principal(&principal);
+        let rls_workspace = principal.workspace_id.trim().to_string();
         let limit_i64 = i64::try_from(limit.max(1)).unwrap_or(i64::MAX);
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let query_embedding = self.get_or_compute_embedding(&query).await?;
+        let query_embedding = self
+            .get_or_compute_embedding(&query, Some(&rls_workspace), owner_id.as_deref(), rls_system)
+            .await?;
         let embedding_provider = self.embedding_provider_name();
         let embedding_model = self.embedding_model_name();
         let embedding_dimensions = self.embedder.dimensions();
@@ -4573,7 +4882,11 @@ impl Memory for PostgresMemory {
                 "
             );
             let rows = client.with_client(|client| {
-                Ok(client.query(&stmt, &[&query, &principal.workspace_id, &owner_id, &limit_i64])?)
+                let mut tx = client.transaction()?;
+                Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), owner_id.as_deref())?;
+                let rows = tx.query(&stmt, &[&query, &principal.workspace_id, &owner_id, &limit_i64])?;
+                tx.commit()?;
+                Ok(rows)
             })?;
             let mut by_chunk = std::collections::HashMap::<String, DocumentSearchResult>::new();
             for row in &rows {
@@ -4618,7 +4931,14 @@ impl Memory for PostgresMemory {
                         );
                         let candidate_limit = limit_i64.saturating_mul(4).max(limit_i64);
                         let rows = client.with_client(|client| {
-                            Ok(client.query(
+                            let mut tx = client.transaction()?;
+                            Self::apply_rls_context_raw(
+                                &mut tx,
+                                rls_system,
+                                Some(&rls_workspace),
+                                owner_id.as_deref(),
+                            )?;
+                            let rows = tx.query(
                                 &vector_stmt,
                                 &[
                                     query_vector,
@@ -4629,7 +4949,9 @@ impl Memory for PostgresMemory {
                                     &owner_id,
                                     &candidate_limit,
                                 ],
-                            )?)
+                            )?;
+                            tx.commit()?;
+                            Ok(rows)
                         })?;
                         for row in &rows {
                             let score = row.try_get::<_, f32>(14).unwrap_or(0.0) * vector_weight;
@@ -4681,7 +5003,9 @@ impl Memory for PostgresMemory {
                         "
                     );
                     let rows = client.with_client(|client| {
-                        Ok(client.query(
+                        let mut tx = client.transaction()?;
+                        Self::apply_rls_context_raw(&mut tx, rls_system, Some(&rls_workspace), owner_id.as_deref())?;
+                        let rows = tx.query(
                             &vector_stmt,
                             &[
                                 &embedding_provider,
@@ -4691,7 +5015,9 @@ impl Memory for PostgresMemory {
                                 &owner_id,
                                 &candidate_limit,
                             ],
-                        )?)
+                        )?;
+                        tx.commit()?;
+                        Ok(rows)
                     })?;
                     for row in &rows {
                         let embedding_blob: Vec<u8> = row.get(14);
@@ -5005,7 +5331,7 @@ impl Memory for PostgresMemory {
 
         let mut count = 0usize;
         for (id, content) in entries {
-            if let Some(embedding) = self.get_or_compute_embedding(&content).await? {
+            if let Some(embedding) = self.get_or_compute_embedding(&content, None, None, true).await? {
                 let embedding_bytes = vector::vec_to_bytes(&embedding);
                 let embedding_vector = self
                     .pgvector_available
@@ -5078,7 +5404,7 @@ impl Memory for PostgresMemory {
         .await??;
 
         for (chunk_id, content) in chunks {
-            if let Some(embedding) = self.get_or_compute_embedding(&content).await? {
+            if let Some(embedding) = self.get_or_compute_embedding(&content, None, None, true).await? {
                 let embedding_bytes = vector::vec_to_bytes(&embedding);
                 let embedding_vector = self
                     .pgvector_available
@@ -5412,7 +5738,7 @@ mod tests {
             session_key: Some("telegram_sender-1".to_string()),
             channel: Some("telegram".to_string()),
             sender: Some("sender-1".to_string()),
-            owner_id: None,
+            owner_id: Some("owner-a".to_string()),
             legacy_session_key: None,
         };
         let events = mem.list_message_events_since(&principal, 0, 10).await.unwrap();
@@ -5764,7 +6090,7 @@ mod tests {
         mem.ingest_document(DocumentIngestInput {
             document_id: Some("doc-vector-postgres-1".to_string()),
             workspace_id: "workspace-a".to_string(),
-            owner_id: None,
+            owner_id: Some("owner-a".to_string()),
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
@@ -5781,7 +6107,7 @@ mod tests {
         mem.ingest_document(DocumentIngestInput {
             document_id: Some("doc-vector-postgres-2".to_string()),
             workspace_id: "workspace-a".to_string(),
-            owner_id: None,
+            owner_id: Some("owner-a".to_string()),
             topic_id: None,
             task_id: None,
             source_message_event_id: None,
@@ -5807,7 +6133,7 @@ mod tests {
             session_key: Some("chat:postgres-vector".to_string()),
             channel: Some("terminal".to_string()),
             sender: Some("local-user".to_string()),
-            owner_id: None,
+            owner_id: Some("owner-a".to_string()),
             legacy_session_key: None,
         };
         let document_results = mem
@@ -5822,8 +6148,8 @@ mod tests {
         );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            3,
-            "Postgres document search should reuse the cached query embedding"
+            4,
+            "Postgres document search must not reuse a system-scoped query embedding across owners"
         );
         {
             let client_slot = mem.client.clone();
@@ -5834,7 +6160,7 @@ mod tests {
                         .query_one(&format!("SELECT COUNT(*) FROM {qualified_embedding_cache_table}"), &[])
                         .map(|row| row.get(0))?;
                     assert!(
-                        count >= 3,
+                        count >= 4,
                         "Postgres embedding cache should retain stored/query embeddings"
                     );
                     Ok(())
@@ -5939,6 +6265,144 @@ mod tests {
             .unwrap()
             .unwrap();
         }
+
+        drop(mem);
+        tokio::task::spawn_blocking(move || {
+            let mut client = db_url.parse::<postgres::Config>().unwrap().connect(NoTls).unwrap();
+            client
+                .batch_execute(&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_identifier(&schema)))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn postgres_vector_rls_denies_missing_and_cross_owner_context_from_env() {
+        let Ok(db_url) = std::env::var("OPENPRX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let schema = format!("prx_vector_rls_test_{}", Uuid::new_v4().simple());
+        let mem = PostgresMemory::with_embedder(
+            &db_url,
+            &schema,
+            "memories",
+            Some(5),
+            Arc::new(CountingEmbedding {
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            1.0,
+            0.0,
+        )
+        .unwrap();
+
+        let context = |workspace: &str, owner: &str| MemoryWriteContext {
+            workspace_id: Some(workspace.to_string()),
+            channel: Some("test".to_string()),
+            chat_type: Some("private".to_string()),
+            chat_id: Some(format!("chat-{owner}")),
+            sender_id: Some(owner.to_string()),
+            raw_sender: Some(owner.to_string()),
+        };
+        let metadata = |workspace: &str, owner: &str| MemoryStoreMetadata {
+            workspace_id: Some(workspace.to_string()),
+            owner_id: Some(owner.to_string()),
+            ..MemoryStoreMetadata::default()
+        };
+        let owner_a = context("workspace-a", "owner-a");
+        let owner_b = context("workspace-a", "owner-b");
+        let other_workspace = context("workspace-b", "owner-a");
+
+        mem.store_with_context_and_metadata(
+            "vector-owner-a",
+            "isolation-token shared",
+            MemoryCategory::Core,
+            None,
+            Some(&owner_a),
+            metadata("workspace-a", "owner-a"),
+        )
+        .await
+        .unwrap();
+        mem.store_with_context_and_metadata(
+            "vector-owner-b",
+            "isolation-token shared",
+            MemoryCategory::Core,
+            None,
+            Some(&owner_b),
+            metadata("workspace-a", "owner-b"),
+        )
+        .await
+        .unwrap();
+
+        let visible_a = mem
+            .recall_with_context("isolation-token", 10, None, Some(&owner_a))
+            .await
+            .unwrap();
+        assert_eq!(visible_a.len(), 1);
+        assert_eq!(visible_a.first().unwrap().key, "vector-owner-a");
+        let visible_b = mem
+            .recall_with_context("isolation-token", 10, None, Some(&owner_b))
+            .await
+            .unwrap();
+        assert_eq!(visible_b.len(), 1);
+        assert_eq!(visible_b.first().unwrap().key, "vector-owner-b");
+        assert!(
+            mem.recall_with_context("isolation-token", 10, None, Some(&other_workspace))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let missing_workspace = MemoryWriteContext {
+            workspace_id: None,
+            ..owner_a.clone()
+        };
+        let missing_error = mem
+            .recall_with_context("isolation-token", 10, None, Some(&missing_workspace))
+            .await
+            .unwrap_err();
+        assert!(missing_error.to_string().contains("trusted workspace context"));
+
+        let cache_table = mem.qualified_embedding_cache_table.clone();
+        let memories_table = mem.qualified_table.clone();
+        let chunks_table = mem.qualified_document_chunks_table.clone();
+        let scoped_cache_rows = tokio::task::spawn_blocking({
+            let client = Arc::clone(&mem.client);
+            move || {
+                client.with_client(|client| {
+                    let count: i64 = client
+                        .query_one(
+                            &format!(
+                                "SELECT COUNT(*) FROM {cache_table} \
+                                 WHERE workspace_id = 'workspace-a' \
+                                 AND owner_id IN ('owner-a', 'owner-b')"
+                            ),
+                            &[],
+                        )?
+                        .get(0);
+                    for table in [&memories_table, &chunks_table, &cache_table] {
+                        let row = client.query_one(
+                            "SELECT c.relrowsecurity, c.relforcerowsecurity \
+                             FROM pg_class c WHERE c.oid = to_regclass($1::text)",
+                            &[table],
+                        )?;
+                        assert!(row.get::<_, bool>(0));
+                        assert!(row.get::<_, bool>(1));
+                    }
+                    Ok(count)
+                })
+            }
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            scoped_cache_rows, 2,
+            "identical model/cache dimensions remain owner-scoped"
+        );
+        let evidence = PostgresMemory::verify_vector_isolation(&db_url, &schema, "memories", Some(5)).unwrap();
+        assert!(evidence.starts_with("postgres:migration:21:sha256:"));
+        assert!(evidence.contains(":policy-sha256:"));
 
         drop(mem);
         tokio::task::spawn_blocking(move || {

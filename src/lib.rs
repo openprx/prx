@@ -94,6 +94,7 @@ pub(crate) mod causal_tree;
 pub mod channels;
 #[allow(dead_code, private_interfaces)]
 pub mod chat;
+pub mod compliance;
 pub mod config;
 pub mod cost;
 pub mod cron;

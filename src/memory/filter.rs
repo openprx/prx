@@ -105,8 +105,15 @@ impl MemorySafetyFilter {
     /// Run the complete safety pipeline before memory write.
     pub async fn check(&self, content: &str, source: &SourceMetadata) -> SafetyCheckResult {
         let mut issues = Vec::new();
+        // Session snapshots contain system-generated UUIDs. Depending on their
+        // random digits, the phone detector could interpret a substring across
+        // UUID hyphens as a telephone number and reject an otherwise identical
+        // conversation nondeterministically. UUIDs are opaque internal
+        // identifiers, so exclude only their canonical shape from numeric PII
+        // detectors while continuing to inspect every user-authored field.
+        let numeric_pii_content = canonical_uuid_regex().replace_all(content, "<uuid>");
 
-        if pii_phone_regex().is_match(content) {
+        if pii_phone_regex().is_match(&numeric_pii_content) {
             issues.push(SafetyIssue {
                 kind: SafetyIssueKind::Pii,
                 detail: "detected phone-like identifier".to_string(),
@@ -118,13 +125,13 @@ impl MemorySafetyFilter {
                 detail: "detected email address".to_string(),
             });
         }
-        if pii_id_regex().is_match(content) {
+        if pii_id_regex().is_match(&numeric_pii_content) {
             issues.push(SafetyIssue {
                 kind: SafetyIssueKind::Pii,
                 detail: "detected identity-number-like token".to_string(),
             });
         }
-        if contains_credit_card_number(content) {
+        if contains_credit_card_number(&numeric_pii_content) {
             issues.push(SafetyIssue {
                 kind: SafetyIssueKind::Pii,
                 detail: "detected payment-card-like number".to_string(),
@@ -203,6 +210,15 @@ fn pii_phone_regex() -> &'static Regex {
             .expect("BUG: invalid hardcoded phone regex")
     });
     &PHONE
+}
+
+fn canonical_uuid_regex() -> &'static Regex {
+    #[allow(clippy::expect_used)]
+    static UUID: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(?i)\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b")
+            .expect("BUG: invalid hardcoded UUID regex")
+    });
+    &UUID
 }
 
 fn pii_email_regex() -> &'static Regex {
@@ -304,6 +320,22 @@ mod tests {
         assert!(!result.passed);
         assert!(result.issues.iter().any(|i| i.kind == SafetyIssueKind::Pii));
         assert!(result.issues.iter().any(|i| i.kind == SafetyIssueKind::PromptInjection));
+    }
+
+    #[tokio::test]
+    async fn canonical_uuid_digits_are_not_phone_pii_but_real_phone_still_is() {
+        let filter = MemorySafetyFilter::default();
+        let source = SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        };
+        let uuid_only = r#"{"id":"12345678-1234-1234-1234-123456789012","turns":[]}"#;
+        assert!(filter.check(uuid_only, &source).await.passed);
+
+        let with_phone = format!("{uuid_only} call 212-555-0199");
+        let result = filter.check(&with_phone, &source).await;
+        assert!(!result.passed);
+        assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
     }
 
     #[test]

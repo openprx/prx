@@ -162,10 +162,21 @@ max_concurrent_subagents = 4
 max_spawn_depth = 2
 max_children_per_agent = 5
 
+# Secure autonomous defaults. `full` skips confirmation prompts but remains
+# workspace-scoped and bounded unless the operator explicitly widens it.
+[autonomy]
+level = "full"
+workspace_only = true
+forbidden_paths = ["/etc", "/root", "/home", "/opt", "/tmp", "~/.ssh"]
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+
 # Multi-agent setup
 [agents.researcher]
 provider = "anthropic"
 model = "claude-sonnet-4-6"
+agentic = true
+allowed_tools = ["web_search", "file_read"]
 max_iterations = 200
 
 # Model fallbacks
@@ -175,6 +186,23 @@ claude-opus-4-6 = ["claude-sonnet-4-6"]
 # Provider fallbacks
 fallback_providers = ["xai"]
 ```
+
+An unrestricted profile is always explicit: set `workspace_only = false`,
+clear `forbidden_paths`, and widen both ceilings deliberately. `prx doctor`
+warns when all four unrestricted choices are active together.
+
+Agentic delegates fail closed when `allowed_tools` is missing or empty. Named
+entries select only matching eligible parent tools. Use `allowed_tools = ["*"]`
+to explicitly inherit every eligible parent tool except `delegate`; the
+wildcard cannot be mixed with names. Tool inheritance does not bypass the
+child runtime envelope, scope policy, side-effect gate, approval, or audit.
+
+Compliance controls are operator-classified and evidence-bearing. Generated
+server/full configurations enable the first-contact AI interaction notice but
+leave the EU risk classification as `unclassified`; PRX does not infer legal
+applicability. See [Evidence-bearing compliance controls](compliance-controls.md)
+for high-risk classification, declaration, incident workflow, evidence, and
+rollback examples.
 
 `HEARTBEAT.md` remains the editable periodic checklist. When heartbeat is
 enabled, its dash-bullet entries are reconciled into stable recurring Xin

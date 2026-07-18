@@ -99,6 +99,9 @@ const ALLOWED_RAW_CHILD_PROCESS_SPAWNS: &[&str] = &[
 ];
 
 const ALLOWED_PERSISTED_EVENT_TABLES: &[&str] = &[
+    // Dedicated Article 73 compliance ledger: it stores immutable event hashes,
+    // is owned by IncidentStore, and is intentionally separate from message/memory events.
+    "src/compliance/incident.rs::serious_incident_audit_events",
     "src/cron/postgres.rs::cron_job_events",
     "src/cron/postgres.rs::{qualified_memory_events_table}",
     "src/cron/store.rs::cron_event_outbox",

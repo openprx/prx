@@ -410,6 +410,10 @@ pub struct Config {
     #[serde(default)]
     pub security: SecurityConfig,
 
+    /// Operator-owned compliance controls (`[compliance]`).
+    #[serde(default)]
+    pub compliance: ComplianceConfig,
+
     /// Module control switches — determines which config.d/ files are loaded (`[modules]`).
     #[serde(default)]
     pub modules: ModulesConfig,
@@ -476,6 +480,7 @@ impl std::fmt::Debug for Config {
             .field("media", &self.media)
             .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
+            .field("compliance", &self.compliance)
             .field("modules", &self.modules)
             .field("tool_tiering", &self.tool_tiering)
             .finish()
@@ -3467,6 +3472,9 @@ impl Default for ScopeConfig {
 /// The sandbox configuration now lives under `[autonomy.sandbox]` (folded in
 /// from the former top-level `[security.sandbox]`) and is disabled by default
 /// (NoopSandbox); Phase 2 may re-enable it per risk level.
+pub const DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR: u32 = 20;
+pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised`, or `full` (default).
@@ -3475,10 +3483,11 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `u32::MAX` (open).
-    /// Note: `0` means "blocked", NOT "unlimited" — use a large value to open.
+    /// Maximum actions allowed per hour per policy. Default: `20`.
+    /// Note: `0` means "blocked", NOT "unlimited" — use `u32::MAX` only as an
+    /// explicit unrestricted operator choice.
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `u32::MAX` (open).
+    /// Maximum cost per day in cents per policy. Default: `500`.
     pub max_cost_per_day_cents: u32,
 
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
@@ -3526,11 +3535,8 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            // 🔴 Behavior-limits Phase 1: opened to u32::MAX (NOT 0 — 0 would
-            // trip the `count >= limit` rate-limiter and block ALL actions).
-            // Field retained as a high-position billing/runaway safeguard.
-            max_actions_per_hour: u32::MAX,
-            max_cost_per_day_cents: u32::MAX,
+            max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
+            max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
             scopes: ScopeConfig::default(),
             sandbox: default_disabled_sandbox(),
         }
@@ -5043,6 +5049,148 @@ pub struct LarkConfig {
 
 // ── Security Config ─────────────────────────────────────────────────
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ComplianceConfig {
+    #[serde(default)]
+    pub interaction_notice: InteractionNoticeConfig,
+    #[serde(default)]
+    pub eu_ai_act: EuAiActComplianceConfig,
+}
+
+impl Default for ComplianceConfig {
+    fn default() -> Self {
+        Self {
+            interaction_notice: InteractionNoticeConfig::default(),
+            eu_ai_act: EuAiActComplianceConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EuAiActComplianceConfig {
+    #[serde(default)]
+    pub classification: EuAiActClassificationConfig,
+    #[serde(default)]
+    pub declaration: DeclarationOfConformityConfig,
+    #[serde(default)]
+    pub incident_store_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EuAiActClassificationConfig {
+    #[serde(default)]
+    pub status: EuAiActRiskClassification,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub assessed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EuAiActRiskClassification {
+    #[default]
+    Unclassified,
+    HighRisk,
+    NotHighRisk,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DeclarationOfConformityConfig {
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+    #[serde(default)]
+    pub artifact_version: Option<String>,
+    #[serde(default)]
+    pub system_name: Option<String>,
+    #[serde(default)]
+    pub system_type: Option<String>,
+    #[serde(default)]
+    pub system_reference: Option<String>,
+    #[serde(default)]
+    pub provider_name: Option<String>,
+    #[serde(default)]
+    pub provider_address: Option<String>,
+    #[serde(default)]
+    pub sole_responsibility_statement: Option<String>,
+    #[serde(default)]
+    pub conformity_statement: Option<String>,
+    #[serde(default)]
+    pub applicable_union_law: Vec<String>,
+    #[serde(default)]
+    pub processes_personal_data: bool,
+    #[serde(default)]
+    pub personal_data_compliance_statement: Option<String>,
+    #[serde(default)]
+    pub harmonised_standards: Vec<String>,
+    #[serde(default)]
+    pub standards_not_applicable_reason: Option<String>,
+    #[serde(default)]
+    pub conformity_assessment_procedure: Option<String>,
+    #[serde(default)]
+    pub notified_body_name: Option<String>,
+    #[serde(default)]
+    pub notified_body_identification_number: Option<String>,
+    #[serde(default)]
+    pub notified_body_certificate: Option<String>,
+    #[serde(default)]
+    pub issue_place: Option<String>,
+    #[serde(default)]
+    pub issue_date: Option<String>,
+    #[serde(default)]
+    pub signer_name: Option<String>,
+    #[serde(default)]
+    pub signer_function: Option<String>,
+    #[serde(default)]
+    pub signer_on_behalf_of: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct InteractionNoticeConfig {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default = "default_interaction_notice_version")]
+    pub version: String,
+    #[serde(default = "default_interaction_notice_text")]
+    pub text: String,
+    #[serde(default)]
+    pub applicability: InteractionNoticeApplicability,
+    #[serde(default)]
+    pub exception_owner: Option<String>,
+    #[serde(default)]
+    pub exception_reviewed_at: Option<String>,
+}
+
+impl Default for InteractionNoticeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            version: default_interaction_notice_version(),
+            text: default_interaction_notice_text(),
+            applicability: InteractionNoticeApplicability::Required,
+            exception_owner: None,
+            exception_reviewed_at: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionNoticeApplicability {
+    #[default]
+    Required,
+    NotApplicable,
+}
+
+fn default_interaction_notice_version() -> String {
+    "1".to_string()
+}
+
+fn default_interaction_notice_text() -> String {
+    "You are interacting with PRX, an AI system. Its responses may be generated by third-party model providers."
+        .to_string()
+}
+
 /// Security configuration for resource limits and audit logging.
 ///
 /// Permission-model Phase 1: the former `[security.sandbox]` section moved to
@@ -5352,6 +5500,7 @@ impl Default for Config {
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            compliance: ComplianceConfig::default(),
             modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         }
@@ -5905,6 +6054,50 @@ impl Config {
     /// Called after TOML deserialization and env-override application to catch
     /// obviously invalid values early instead of failing at arbitrary runtime points.
     pub fn validate(&self) -> Result<()> {
+        let notice = &self.compliance.interaction_notice;
+        if notice.version.trim().is_empty() {
+            anyhow::bail!("compliance.interaction_notice.version must not be empty");
+        }
+        if !notice.enabled && notice.applicability == InteractionNoticeApplicability::Required {
+            anyhow::bail!(
+                "compliance.interaction_notice.enabled must be true when the notice is required; use not_applicable with reviewed exception metadata"
+            );
+        }
+        if notice.enabled
+            && notice.applicability == InteractionNoticeApplicability::Required
+            && notice.text.trim().is_empty()
+        {
+            anyhow::bail!("compliance.interaction_notice.text must not be empty when the notice is required");
+        }
+        if notice.applicability == InteractionNoticeApplicability::NotApplicable
+            && (notice
+                .exception_owner
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+                || notice
+                    .exception_reviewed_at
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+        {
+            anyhow::bail!(
+                "compliance.interaction_notice not_applicable requires exception_owner and exception_reviewed_at"
+            );
+        }
+        let classification = &self.compliance.eu_ai_act.classification;
+        if classification.status != EuAiActRiskClassification::Unclassified
+            && (classification
+                .owner
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+                || classification
+                    .assessed_at
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+        {
+            anyhow::bail!(
+                "compliance.eu_ai_act.classification requires owner and assessed_at for a legal applicability decision"
+            );
+        }
         // Gateway
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
@@ -5999,6 +6192,24 @@ impl Config {
             }
             if route.model.trim().is_empty() {
                 anyhow::bail!("embedding_routes[{i}].model must not be empty");
+            }
+        }
+
+        for (name, agent) in &self.agents {
+            if !agent.agentic {
+                continue;
+            }
+            let allowed_tools = agent
+                .allowed_tools
+                .iter()
+                .map(|tool| tool.trim())
+                .filter(|tool| !tool.is_empty())
+                .collect::<Vec<_>>();
+            if allowed_tools.is_empty() {
+                anyhow::bail!("agents.{name}.allowed_tools must not be empty when agentic=true");
+            }
+            if allowed_tools.contains(&"*") && allowed_tools.len() != 1 {
+                anyhow::bail!("agents.{name}.allowed_tools must use '*' exclusively");
             }
         }
 
@@ -6267,6 +6478,51 @@ mod tests {
         config.validate().unwrap();
     }
 
+    fn agentic_delegate_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: "openrouter".into(),
+            model: "model-test".into(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools,
+            max_iterations: 10,
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        }
+    }
+
+    #[test]
+    async fn config_rejects_empty_agentic_delegate_allowlist() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("worker".into(), agentic_delegate_config(Vec::new()));
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("agents.worker.allowed_tools must not be empty"));
+    }
+
+    #[test]
+    async fn config_requires_delegate_wildcard_to_be_exclusive() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "worker".into(),
+            agentic_delegate_config(vec!["*".into(), "shell".into()]),
+        );
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("agents.worker.allowed_tools must use '*' exclusively"));
+
+        config
+            .agents
+            .insert("worker".into(), agentic_delegate_config(vec!["*".into()]));
+        config.validate().unwrap();
+    }
+
     #[test]
     async fn config_dir_creation_error_mentions_openrc_and_path() {
         let msg = config_dir_creation_error(Path::new("/etc/prx"));
@@ -6318,9 +6574,8 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Full);
         assert!(a.workspace_only);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        // Behavior-limits Phase 1: opened to u32::MAX (high-position safeguard).
-        assert_eq!(a.max_actions_per_hour, u32::MAX);
-        assert_eq!(a.max_cost_per_day_cents, u32::MAX);
+        assert_eq!(a.max_actions_per_hour, DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR);
+        assert_eq!(a.max_cost_per_day_cents, DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS);
     }
 
     #[test]
@@ -6480,6 +6735,40 @@ min_chars = 12
     }
 
     #[test]
+    async fn interaction_notice_defaults_required_and_enabled() {
+        let config = Config::default();
+
+        assert!(config.compliance.interaction_notice.enabled);
+        assert_eq!(
+            config.compliance.interaction_notice.applicability,
+            InteractionNoticeApplicability::Required
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    async fn interaction_notice_rejects_disabled_required_notice() {
+        let mut config = Config::default();
+        config.compliance.interaction_notice.enabled = false;
+
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    async fn interaction_notice_not_applicable_requires_reviewed_exception() {
+        let mut config = Config::default();
+        config.compliance.interaction_notice.applicability = InteractionNoticeApplicability::NotApplicable;
+        config.compliance.interaction_notice.enabled = false;
+        assert!(config.validate().is_err());
+
+        config.compliance.interaction_notice.exception_owner = Some("compliance@example.invalid".to_string());
+        assert!(config.validate().is_err());
+
+        config.compliance.interaction_notice.exception_reviewed_at = Some("2026-Jul-18".to_string());
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
     async fn chat_config_roundtrips_without_renderer_mode() {
         let config = ChatConfig {
             max_concurrent_visible_turns: 3,
@@ -6602,6 +6891,7 @@ min_chars = 12
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            compliance: ComplianceConfig::default(),
             modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         };
@@ -6958,6 +7248,7 @@ concurrency_rollback_error_rate_threshold = 0.23
             media: MediaConfig::default(),
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
+            compliance: ComplianceConfig::default(),
             modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         };

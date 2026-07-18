@@ -936,6 +936,17 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
+    if !config.autonomy.workspace_only
+        && config.autonomy.forbidden_paths.is_empty()
+        && config.autonomy.max_actions_per_hour == u32::MAX
+        && config.autonomy.max_cost_per_day_cents == u32::MAX
+    {
+        items.push(DiagItem::warn(
+            cat,
+            "explicit unrestricted autonomy profile: host-wide paths and unbounded action/cost ceilings",
+        ));
+    }
+
     // Config file exists
     if config.config_path.exists() {
         items.push(DiagItem::configured(
@@ -1211,6 +1222,12 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
                     "agent \"{name}\" uses invalid provider \"{}\": {}",
                     agent.provider, reason
                 ),
+            ));
+        }
+        if agent.agentic && agent.allowed_tools.iter().any(|tool| tool.trim() == "*") {
+            items.push(DiagItem::warn(
+                cat,
+                format!("agent \"{name}\" explicitly inherits all eligible parent tools"),
             ));
         }
     }
@@ -1780,6 +1797,55 @@ mod tests {
         let temp_item = items.iter().find(|i| i.message.contains("temperature"));
         assert!(temp_item.is_some());
         assert_eq!(temp_item.unwrap().severity, Severity::Ok);
+    }
+
+    #[test]
+    fn config_validation_warns_for_explicit_unrestricted_autonomy() {
+        let mut config = Config::default();
+        config.autonomy.workspace_only = false;
+        config.autonomy.forbidden_paths.clear();
+        config.autonomy.max_actions_per_hour = u32::MAX;
+        config.autonomy.max_cost_per_day_cents = u32::MAX;
+        let mut items = Vec::new();
+
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| item.message.contains("explicit unrestricted autonomy profile"))
+            .expect("unrestricted posture warning");
+        assert_eq!(item.severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_warns_for_explicit_delegate_wildcard() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "worker".into(),
+            crate::config::DelegateAgentConfig {
+                provider: "openrouter".into(),
+                model: "model-test".into(),
+                system_prompt: None,
+                api_key: None,
+                temperature: None,
+                max_depth: 3,
+                agentic: true,
+                allowed_tools: vec!["*".into()],
+                max_iterations: 10,
+                identity_dir: None,
+                memory_scope: None,
+                spawn_enabled: None,
+            },
+        );
+        let mut items = Vec::new();
+
+        check_config_semantics(&config, &mut items);
+
+        let item = items
+            .iter()
+            .find(|item| item.message.contains("explicitly inherits all eligible parent tools"))
+            .expect("delegate wildcard warning");
+        assert_eq!(item.severity, Severity::Warn);
     }
 
     #[test]

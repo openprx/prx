@@ -196,6 +196,7 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         media: crate::config::MediaConfig::default(),
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        compliance: crate::config::schema::ComplianceConfig::default(),
         modules: crate::config::schema::ModulesConfig::default(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };
@@ -497,6 +498,7 @@ async fn run_quick_setup_with_home(
         media: crate::config::MediaConfig::default(),
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
+        compliance: crate::config::schema::ComplianceConfig::default(),
         modules: crate::config::schema::ModulesConfig::default(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };

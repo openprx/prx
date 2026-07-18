@@ -18,6 +18,12 @@
 
 `cron` schedules with `kind: "at"` are one-shot regardless of physical retention: after their final success or failure they expose a typed terminal state and are never due again. `delete_after_run` atomically removes the job with its successful terminal commit; failures remain visible for run and event audit. The cron tool's update action can re-arm a retained terminal job with a new future `at` schedule; setting `enabled: true` alone does not, and an in-flight `at` schedule cannot be replaced. Manual `run` remains available for paused or terminal jobs; only a nonterminal `at` is consumed into terminal state. The CLI supports creating and displaying `at` jobs but does not expose an `at`-schedule update flag.
 
+Agentic `delegate` configurations require an explicit non-empty
+`allowed_tools`. A named list is intersected with the eligible parent registry;
+unknown or ineligible names fail before the provider turn starts. The exclusive
+wildcard form `allowed_tools = ["*"]` inherits all eligible parent tools except
+`delegate` itself. An empty list never means “inherit all.”
+
 Scheduler execution uses renewable database claim leases (`scheduler.claim_lease_secs`, default 90 seconds) and attempt fencing. A crashed worker's claim becomes recoverable at the lease expiry boundary, while an older attempt cannot record a run or overwrite the newer attempt's state. This protects cron state and run history from stale commits; it does **not** make external side effects exactly-once. Operators upgrading a shared database must coordinate shutdown of all older scheduler processes before starting lease-aware schedulers, because older binaries do not renew or honor the claim tuple.
 
 Claim timestamps currently use each scheduler caller's UTC clock. Multi-node deployments must maintain NTP synchronization and bounded clock skew well below the configured lease interval. A schedule change is rejected while any claim is still active; once that claim has expired, an explicit update may clear the stale tuple. Manual runs of nonterminal jobs use the same renewable lease, delivery, and fenced commit path as background runs.

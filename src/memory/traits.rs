@@ -1600,6 +1600,7 @@ pub(crate) mod conformance {
 
     pub(crate) async fn assert_scoped_memory_acl_conformance(mem: &dyn Memory, key_prefix: &str) {
         let alice_ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
             chat_id: Some(format!("{key_prefix}:dm-alice")),
@@ -1607,6 +1608,7 @@ pub(crate) mod conformance {
             raw_sender: Some("alice".into()),
         };
         let bob_ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("telegram".into()),
             chat_type: Some("private".into()),
             chat_id: Some(format!("{key_prefix}:dm-bob")),

@@ -31,10 +31,11 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
             .map(str::to_string)
     };
     Some(MemoryWriteContext {
+        workspace_id: str_field("workspace_id"),
         channel: str_field("channel"),
         chat_type: str_field("chat_type"),
         chat_id: str_field("chat_id"),
-        sender_id: str_field("sender_id"),
+        sender_id: str_field("owner_id").or_else(|| str_field("sender_id")),
         raw_sender: str_field("sender").or_else(|| str_field("raw_sender")),
     })
 }
@@ -117,6 +118,7 @@ impl Tool for MemoryRecallTool {
         // unchanged.
         let recall_result = if self.acl_enabled {
             let scope_ctx = parse_scope_ctx(&args).unwrap_or(MemoryWriteContext {
+                workspace_id: None,
                 channel: None,
                 chat_type: None,
                 chat_id: None,
