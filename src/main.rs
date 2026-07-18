@@ -2966,9 +2966,14 @@ mod tests {
         };
         assert_eq!(fail_on, Some(AuditFailOn::Warning));
 
-        let attestation = build_eu_ai_act_attestation(&Config::default());
-        assert!(attestation_fails_gate(&attestation, AuditFailOn::Fail));
+        let mut config = Config::default();
+        let attestation = build_eu_ai_act_attestation(&config);
+        assert!(!attestation_fails_gate(&attestation, AuditFailOn::Fail));
         assert!(attestation_fails_gate(&attestation, AuditFailOn::Warning));
+
+        config.security.audit.enabled = false;
+        let failed_attestation = build_eu_ai_act_attestation(&config);
+        assert!(attestation_fails_gate(&failed_attestation, AuditFailOn::Fail));
     }
 
     #[tokio::test]
