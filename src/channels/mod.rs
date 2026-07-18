@@ -2641,51 +2641,10 @@ async fn process_channel_message(
         return;
     }
 
-    // Article 50 transparency control: a versioned AI identity notice must be
-    // delivered and minimally acknowledged before provider initialization,
-    // draft creation, streaming, or any final AI response. A required notice
-    // failure is fail-closed for this turn.
-    if let Some(channel) = target_channel.as_ref()
-        && let Err(error) = crate::compliance::interaction_notice::ensure_interaction_notice(
-            &config_generation.effective.compliance.interaction_notice,
-            &ctx.memory,
-            channel,
-            &msg.channel,
-            &msg.reply_target,
-            msg.thread_ts.clone(),
-        )
-        .await
-    {
-        tracing::error!(
-            channel = %msg.channel,
-            error = %error,
-            "required AI interaction notice could not be completed; rejecting turn"
-        );
-        return;
-    }
-
     let history_key = ConversationKey::from_message(&msg);
     let message_visibility = channel_message_visibility(&msg);
     let route = get_route_selection_for_generation(ctx.as_ref(), &history_key, &config_generation);
     let runtime_defaults = runtime_defaults_for_generation(ctx.as_ref(), &config_generation);
-    let active_provider = match get_or_create_provider_for_generation(ctx.as_ref(), &route.provider, &config_generation)
-        .await
-    {
-        Ok(provider) => provider,
-        Err(err) => {
-            let safe_err = providers::sanitize_api_error(&err.to_string());
-            let message = format!(
-                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
-                route.provider
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                let _ = channel
-                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
-                    .await;
-            }
-            return;
-        }
-    };
     let chat_kind = chat_kind_from_message(&msg);
     let inferred_chat_type = chat_kind.scope_chat_type();
     let is_direct_chat = chat_kind == ChatKind::Dm;
@@ -2821,6 +2780,31 @@ async fn process_channel_message(
             .await;
     }
 
+    let active_provider = match get_or_create_provider_for_generation(ctx.as_ref(), &route.provider, &config_generation)
+        .await
+    {
+        Ok(provider) => provider,
+        Err(err) => {
+            if authorize_channel_outbound(ctx.as_ref(), security.as_ref(), &msg.channel).is_err()
+                || !ensure_notice_before_channel_output(ctx.as_ref(), &config_generation, &msg, target_channel.as_ref())
+                    .await
+            {
+                return;
+            }
+            let safe_err = providers::sanitize_api_error(&err.to_string());
+            let message = format!(
+                "⚠️ Failed to initialize provider `{}`. Please run `/models` to choose another provider.\nDetails: {safe_err}",
+                route.provider
+            );
+            if let Some(channel) = target_channel.as_ref() {
+                let _ = channel
+                    .send(&SendMessage::new(message, &msg.reply_target).in_thread(msg.thread_ts.clone()))
+                    .await;
+            }
+            return;
+        }
+    };
+
     // ── Smart group-reply decision context ──────────────────────────────────
     // Effective mode for this channel. Smart-capable channels (Telegram/Discord)
     // tag group-ness via `msg.is_group_hint` since their `reply_target` is a bare
@@ -2938,6 +2922,11 @@ async fn process_channel_message(
                     sender = %msg.sender,
                     "channel outbound (vision fallback) blocked by InboundGate: {reason}"
                 );
+                return;
+            }
+            if !ensure_notice_before_channel_output(ctx.as_ref(), &config_generation, &msg, target_channel.as_ref())
+                .await
+            {
                 return;
             }
             let fallback = SIGNAL_IMAGE_UNCERTAINTY_FALLBACK.to_string();
@@ -3122,6 +3111,13 @@ async fn process_channel_message(
             sender = %msg.sender,
             "channel outbound blocked by InboundGate: {reason}"
         );
+        return;
+    }
+    // Article 50 transparency control: after inbound/outbound authorization but
+    // before draft creation, streaming, or the final AI response, deliver and
+    // minimally acknowledge the versioned AI identity notice. A required notice
+    // failure is fail-closed for this turn.
+    if !ensure_notice_before_channel_output(ctx.as_ref(), &config_generation, &msg, target_channel.as_ref()).await {
         return;
     }
 
@@ -3788,6 +3784,35 @@ async fn process_channel_message(
             }
         }
     }
+}
+
+async fn ensure_notice_before_channel_output(
+    ctx: &ChannelRuntimeContext,
+    config_generation: &crate::config::ConfigGeneration,
+    msg: &traits::ChannelMessage,
+    target_channel: Option<&Arc<dyn Channel>>,
+) -> bool {
+    let Some(channel) = target_channel else {
+        return true;
+    };
+    if let Err(error) = crate::compliance::interaction_notice::ensure_interaction_notice(
+        &config_generation.effective.compliance.interaction_notice,
+        &ctx.memory,
+        channel,
+        &msg.channel,
+        &msg.reply_target,
+        msg.thread_ts.clone(),
+    )
+    .await
+    {
+        tracing::error!(
+            channel = %msg.channel,
+            error = %error,
+            "required AI interaction notice could not be completed; rejecting turn"
+        );
+        return false;
+    }
+    true
 }
 
 /// Classify whether a channel message originated from a system source
@@ -7019,6 +7044,15 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
     }
 
+    fn response_messages(sent_messages: &[String]) -> Vec<&str> {
+        let notice = crate::config::schema::InteractionNoticeConfig::default().text;
+        sent_messages
+            .iter()
+            .map(String::as_str)
+            .filter(|message| !message.contains(&notice))
+            .collect()
+    }
+
     #[async_trait::async_trait]
     impl Channel for TelegramRecordingChannel {
         fn name(&self) -> &str {
@@ -7560,11 +7594,13 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-42:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"tool_calls\""));
-        assert!(!sent_messages[0].contains("mock_price"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-42:"));
+        assert!(response.contains("BTC is currently around"));
+        assert!(!response.contains("\"tool_calls\""));
+        assert!(!response.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -7648,11 +7684,13 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-raw:"));
-        assert!(sent_messages[0].contains("BTC is currently around"));
-        assert!(!sent_messages[0].contains("\"name\":\"mock_price\""));
-        assert!(!sent_messages[0].contains("\"result\""));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-raw:"));
+        assert!(response.contains("BTC is currently around"));
+        assert!(!response.contains("\"name\":\"mock_price\""));
+        assert!(!response.contains("\"result\""));
     }
 
     #[tokio::test]
@@ -7736,11 +7774,13 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-84:"));
-        assert!(sent_messages[0].contains("alias-tag flow resolved"));
-        assert!(!sent_messages[0].contains("<toolcall>"));
-        assert!(!sent_messages[0].contains("mock_price"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-84:"));
+        assert!(response.contains("alias-tag flow resolved"));
+        assert!(!response.contains("<toolcall>"));
+        assert!(!response.contains("mock_price"));
     }
 
     #[tokio::test]
@@ -7826,9 +7866,11 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].contains("无法确认，请提供更清晰图片或补充说明"));
-        assert!(!sent_messages[0].contains("维生素C"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.contains("无法确认，请提供更清晰图片或补充说明"));
+        assert!(!response.contains("维生素C"));
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -7915,8 +7957,9 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].contains("signal text-only ok"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        assert!(responses.first().unwrap().contains("signal text-only ok"));
         assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 1);
     }
 
@@ -8418,10 +8461,12 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-success:"));
-        assert!(sent_messages[0].contains("Completed after 11 tool iterations."));
-        assert!(!sent_messages[0].contains("⚠️ Error:"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-iter-success:"));
+        assert!(response.contains("Completed after 11 tool iterations."));
+        assert!(!response.contains("⚠️ Error:"));
     }
 
     #[tokio::test]
@@ -8507,9 +8552,11 @@ BTC is currently around $65,000 based on latest tool output."#
         .await;
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-iter-fail:"));
-        assert!(sent_messages[0].contains("⚠️ Something went wrong. Please try again later."));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-iter-fail:"));
+        assert!(response.contains("⚠️ Something went wrong. Please try again later."));
     }
 
     struct NoopMemory;
@@ -8996,13 +9043,14 @@ BTC is currently around $65,000 based on latest tool output."#
         process_channel_message(ctx, signal_vision_fallback_message(), CancellationToken::new()).await;
 
         let sent = channel_impl.sent_messages.lock().await;
+        let responses = response_messages(&sent);
         assert_eq!(
-            sent.len(),
+            responses.len(),
             1,
             "Signal vision fallback must send exactly one reply when outbound is allowed"
         );
         assert!(
-            sent[0].contains(SIGNAL_IMAGE_UNCERTAINTY_FALLBACK),
+            responses.first().unwrap().contains(SIGNAL_IMAGE_UNCERTAINTY_FALLBACK),
             "the sent reply must be the vision uncertainty fallback text"
         );
     }
@@ -9593,7 +9641,7 @@ BTC is currently around $65,000 based on latest tool output."#
         );
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
+        assert_eq!(response_messages(&sent_messages).len(), 2);
     }
 
     #[tokio::test]
@@ -9704,9 +9752,11 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 1);
-        assert!(sent_messages[0].starts_with("chat-1:"));
-        assert!(sent_messages[0].contains("response-2"));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 1);
+        let response = responses.first().unwrap();
+        assert!(response.starts_with("chat-1:"));
+        assert!(response.contains("response-2"));
         drop(sent_messages);
 
         let calls = provider_impl.calls.lock();
@@ -9833,9 +9883,10 @@ BTC is currently around $65,000 based on latest tool output."#
         send_task.await.unwrap();
 
         let sent_messages = channel_impl.sent_messages.lock().await;
-        assert_eq!(sent_messages.len(), 2);
-        assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-1:")));
-        assert!(sent_messages.iter().any(|msg| msg.starts_with("chat-2:")));
+        let responses = response_messages(&sent_messages);
+        assert_eq!(responses.len(), 2);
+        assert!(responses.iter().any(|msg| msg.starts_with("chat-1:")));
+        assert!(responses.iter().any(|msg| msg.starts_with("chat-2:")));
     }
 
     #[tokio::test]

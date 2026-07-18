@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::LazyLock;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,12 @@ use sha2::{Digest, Sha256};
 use crate::channels::{Channel, SendMessage};
 use crate::config::schema::{InteractionNoticeApplicability, InteractionNoticeConfig};
 use crate::memory::{Memory, MemoryCategory};
+
+// Serialize the read-send-ack sequence so concurrent first messages for the
+// same peer cannot both observe a missing acknowledgement and duplicate the
+// legally significant notice. First-contact notices are rare, so a process-wide
+// lock keeps the backend-neutral contract deterministic without storing peers.
+static NOTICE_EMISSION_LOCK: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InteractionNotice {
@@ -53,6 +60,7 @@ pub async fn ensure_interaction_notice(
     anyhow::ensure!(!notice.text.is_empty(), "AI interaction notice text is empty");
 
     let key = acknowledgement_key(channel_name, peer, &notice.version);
+    let _emission_guard = NOTICE_EMISSION_LOCK.lock().await;
     if memory.get(&key).await?.is_some() {
         return Ok(InteractionNoticeOutcome::AlreadyAcknowledged {
             acknowledgement_key: key,
