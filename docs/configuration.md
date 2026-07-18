@@ -197,6 +197,13 @@ to explicitly inherit every eligible parent tool except `delegate`; the
 wildcard cannot be mixed with names. Tool inheritance does not bypass the
 child runtime envelope, scope policy, side-effect gate, approval, or audit.
 
+Compliance controls are operator-classified and evidence-bearing. Generated
+server/full configurations enable the first-contact AI interaction notice but
+leave the EU risk classification as `unclassified`; PRX does not infer legal
+applicability. See [Evidence-bearing compliance controls](compliance-controls.md)
+for high-risk classification, declaration, incident workflow, evidence, and
+rollback examples.
+
 `HEARTBEAT.md` remains the editable periodic checklist. When heartbeat is
 enabled, its dash-bullet entries are reconciled into stable recurring Xin
 tasks; Xin is the only execution scheduler even when `[xin].enabled` is false.

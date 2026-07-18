@@ -58,11 +58,13 @@ Instead, please report them responsibly:
 OpenPRX implements defense-in-depth security:
 
 ### Autonomy Levels
+
 - **ReadOnly** — Agent can only read, no shell or write access
 - **Supervised** — Agent can act within allowlists (default)
 - **Full** — Agent has full access within workspace sandbox
 
 ### Sandboxing Layers
+
 1. **Workspace isolation** — All file operations confined to workspace directory
 2. **Path traversal blocking** — `..` sequences and absolute paths rejected
 3. **Command allowlisting** — Only explicitly approved commands can execute
@@ -70,11 +72,28 @@ OpenPRX implements defense-in-depth security:
 5. **Rate limiting** — Max actions per hour and cost per day caps
 
 ### What We Protect Against
+
 - Path traversal attacks (`../../../etc/passwd`)
 - Command injection (`rm -rf /`, `curl | sh`)
 - Workspace escape via symlinks or absolute paths
 - Runaway cost from LLM API calls
 - Unauthorized shell command execution
+
+### Compliance-control threat boundaries
+
+- AI interaction acknowledgement keys are hashed and contain no message text.
+- PostgreSQL vector ownership is set from trusted runtime scope inside each
+  transaction; untrusted prompts and tool arguments cannot choose it.
+- Forced RLS remains the safe rollback floor for multi-owner vector tables.
+- Conformity declarations require operator-supplied legal fields and an
+  external signature reference; PRX does not fabricate, authenticate, or
+  submit them.
+- Serious-incident records use a durable versioned store and immutable event
+  hashes. PRX calculates conditional deadlines and prepares exports but never
+  submits a regulatory report automatically.
+
+Operational configuration, evidence commands, and per-control rollback are in
+[docs/compliance-controls.md](docs/compliance-controls.md).
 
 ## Security Testing
 
@@ -113,6 +132,7 @@ docker run --read-only -v /path/to/workspace:/workspace openprx gateway
 ### CI Enforcement
 
 The `docker` job in `.github/workflows/ci.yml` automatically verifies:
+
 1. Container does not run as root (UID 0)
 2. Runtime stage uses `:nonroot` variant
 3. Explicit `USER` directive with numeric UID exists

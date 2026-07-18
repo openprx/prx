@@ -805,6 +805,17 @@ encrypt = true
 max_memory_mb = 512
 max_cpu_time_seconds = 300
 max_subprocesses = 10
+
+# Direct natural-person adapters emit this notice before the first AI response.
+[compliance.interaction_notice]
+enabled = true
+applicability = "required"
+version = "v1"
+message = "You are interacting with an AI system."
+
+# Legal/product owner must replace this before using high-risk-only controls.
+[compliance.eu_ai_act.classification]
+status = "unclassified"               # unclassified | high_risk | not_high_risk
 "#
         .into(),
 
@@ -838,6 +849,17 @@ enabled = true
 log_path = "audit.log"
 max_size_mb = 100
 # sign_events = false
+
+# Direct natural-person adapters emit this notice before the first AI response.
+[compliance.interaction_notice]
+enabled = true
+applicability = "required"
+version = "v1"
+message = "You are interacting with an AI system."
+
+# Legal/product owner must replace this before using high-risk-only controls.
+[compliance.eu_ai_act.classification]
+status = "unclassified"               # unclassified | high_risk | not_high_risk
 "#
         .into(),
     }
@@ -1590,6 +1612,9 @@ mod tests {
         assert!(content.contains("enabled = true"));
         assert!(content.contains("log_path = \"audit.log\""));
         assert!(content.contains("max_size_mb = 100"));
+        assert!(content.contains("[compliance.interaction_notice]"));
+        assert!(content.contains("[compliance.eu_ai_act.classification]"));
+        assert!(content.contains("status = \"unclassified\""));
     }
 
     #[test]
