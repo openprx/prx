@@ -267,6 +267,16 @@ enum AuditCommands {
         #[arg(long, value_enum)]
         fail_on: Option<AuditFailOn>,
     },
+    /// Generate a versioned Article 47 / Annex V declaration artifact from explicit operator inputs
+    #[command(name = "generate-eu-declaration")]
+    GenerateEuDeclaration {
+        /// Output path; defaults to compliance.eu_ai_act.declaration.artifact_path
+        #[arg(long)]
+        output: Option<PathBuf>,
+        /// Reference to an operator-controlled external signature or signing receipt
+        #[arg(long)]
+        signature_reference: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1417,6 +1427,22 @@ fn config_generation(config: &Config) -> Option<u64> {
     fs::read_to_string(generation_path).ok()?.trim().parse().ok()
 }
 
+fn declaration_artifact_path(config: &Config) -> Option<PathBuf> {
+    config
+        .compliance
+        .eu_ai_act
+        .declaration
+        .artifact_path
+        .as_ref()
+        .map(|path| {
+            if path.is_absolute() {
+                path.clone()
+            } else {
+                config.workspace_dir.join(path)
+            }
+        })
+}
+
 fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
     let observed_at = chrono::Utc::now().to_rfc3339();
     let config_revision = config_source_revision(config);
@@ -1491,6 +1517,43 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             ControlStatus::Fail,
             "AI interaction notice is required but disabled".to_string(),
         ),
+    };
+    let eu_classification = &config.compliance.eu_ai_act.classification;
+    let (declaration_status, declaration_evidence, declaration_explanation) = match eu_classification.status {
+        config::schema::EuAiActRiskClassification::Unclassified => (
+            ControlStatus::Unknown,
+            "classification:unclassified".to_string(),
+            "No named owner has classified this deployment for the high-risk declaration requirement.".to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::NotHighRisk => (
+            ControlStatus::NotApplicable,
+            format!(
+                "classification:owner={}:assessed_at={}",
+                eu_classification.owner.as_deref().unwrap_or("missing"),
+                eu_classification.assessed_at.as_deref().unwrap_or("missing")
+            ),
+            "The recorded operator/legal classification says this deployment is not a high-risk AI system.".to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::HighRisk => match declaration_artifact_path(config) {
+            Some(path) => match openprx::compliance::declaration::verify_declaration_artifact(&path) {
+                Ok(evidence) => (
+                    ControlStatus::Pass,
+                    evidence,
+                    "Artifact structure/hash and an operator-supplied external signature reference were verified; PRX did not validate signature authenticity or submission."
+                        .to_string(),
+                ),
+                Err(_) => (
+                    ControlStatus::Fail,
+                    "declaration-of-conformity:verification-failed".to_string(),
+                    "The configured declaration artifact is missing, incomplete, or has a mismatched hash.".to_string(),
+                ),
+            },
+            None => (
+                ControlStatus::Fail,
+                "declaration-of-conformity:path-missing".to_string(),
+                "High-risk classification is recorded, but no declaration artifact path is configured.".to_string(),
+            ),
+        },
     };
 
     let mut checks = vec![
@@ -1714,10 +1777,10 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             "C02",
             "Article 47 and Annex V",
             "EU declaration of conformity artifact",
-            ControlStatus::Fail,
+            declaration_status,
             "artifact",
-            "declaration-of-conformity:missing",
-            "Required operator, product, procedure, legislation, and signer inputs are absent.",
+            declaration_evidence,
+            declaration_explanation,
             "Generate a versioned artifact only from explicit operator declarations.",
         ),
         attestation_check(
@@ -1912,6 +1975,46 @@ fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result
             if fail_on.is_some_and(|threshold| attestation_fails_gate(&attestation, threshold)) {
                 bail!("EU AI Act implementation attestation did not satisfy --fail-on threshold");
             }
+            Ok(())
+        }
+        AuditCommands::GenerateEuDeclaration {
+            output,
+            signature_reference,
+        } => {
+            let configured_path = declaration_artifact_path(config);
+            let output = output
+                .map(|path| {
+                    if path.is_absolute() {
+                        path
+                    } else {
+                        config.workspace_dir.join(path)
+                    }
+                })
+                .or(configured_path.clone())
+                .context(
+                    "declaration output is required via --output or compliance.eu_ai_act.declaration.artifact_path",
+                )?;
+            if let Some(configured_path) = configured_path {
+                anyhow::ensure!(
+                    output == configured_path,
+                    "--output must match compliance.eu_ai_act.declaration.artifact_path so attestation can verify it"
+                );
+            }
+            let artifact = openprx::compliance::declaration::build_declaration_artifact(
+                config.compliance.eu_ai_act.classification.status,
+                &config.compliance.eu_ai_act.declaration,
+                &signature_reference,
+            )?;
+            openprx::compliance::declaration::write_declaration_artifact(&output, &artifact)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "artifact": output,
+                    "payload_sha256": artifact.payload_sha256,
+                    "signature_status": artifact.signature.status,
+                    "submitted": artifact.signature.submitted,
+                })
+            );
             Ok(())
         }
     }
@@ -2531,6 +2634,65 @@ mod tests {
             }
             other => panic!("expected audit attest-eu-ai-act command, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn eu_declaration_cli_requires_explicit_signature_reference() {
+        let cli = Cli::try_parse_from([
+            "prx",
+            "audit",
+            "generate-eu-declaration",
+            "--output",
+            "declaration.json",
+            "--signature-reference",
+            "external:receipt-1",
+        ])
+        .expect("declaration generator should parse");
+        match cli.command {
+            Commands::Audit {
+                audit_command:
+                    AuditCommands::GenerateEuDeclaration {
+                        output,
+                        signature_reference,
+                    },
+            } => {
+                assert_eq!(output.as_deref(), Some(std::path::Path::new("declaration.json")));
+                assert_eq!(signature_reference, "external:receipt-1");
+            }
+            other => panic!("expected declaration generator, got {other:?}"),
+        }
+        assert!(
+            Cli::try_parse_from([
+                "prx",
+                "audit",
+                "generate-eu-declaration",
+                "--output",
+                "declaration.json",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn declaration_attestation_respects_operator_classification() {
+        let mut config = Config::default();
+        let c02_status = |config: &Config| {
+            build_eu_ai_act_attestation(config)
+                .checks
+                .into_iter()
+                .find(|check| check.id == "C02")
+                .expect("C02 control")
+                .status
+        };
+        assert_eq!(c02_status(&config), ControlStatus::Unknown);
+
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::NotHighRisk;
+        config.compliance.eu_ai_act.classification.owner = Some("legal-owner".to_string());
+        config.compliance.eu_ai_act.classification.assessed_at = Some("2026-07-18".to_string());
+        assert_eq!(c02_status(&config), ControlStatus::NotApplicable);
+
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
+        assert_eq!(c02_status(&config), ControlStatus::Fail);
     }
 
     #[test]

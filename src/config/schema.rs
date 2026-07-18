@@ -5052,14 +5052,94 @@ pub struct LarkConfig {
 pub struct ComplianceConfig {
     #[serde(default)]
     pub interaction_notice: InteractionNoticeConfig,
+    #[serde(default)]
+    pub eu_ai_act: EuAiActComplianceConfig,
 }
 
 impl Default for ComplianceConfig {
     fn default() -> Self {
         Self {
             interaction_notice: InteractionNoticeConfig::default(),
+            eu_ai_act: EuAiActComplianceConfig::default(),
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EuAiActComplianceConfig {
+    #[serde(default)]
+    pub classification: EuAiActClassificationConfig,
+    #[serde(default)]
+    pub declaration: DeclarationOfConformityConfig,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct EuAiActClassificationConfig {
+    #[serde(default)]
+    pub status: EuAiActRiskClassification,
+    #[serde(default)]
+    pub owner: Option<String>,
+    #[serde(default)]
+    pub assessed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum EuAiActRiskClassification {
+    #[default]
+    Unclassified,
+    HighRisk,
+    NotHighRisk,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DeclarationOfConformityConfig {
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+    #[serde(default)]
+    pub artifact_version: Option<String>,
+    #[serde(default)]
+    pub system_name: Option<String>,
+    #[serde(default)]
+    pub system_type: Option<String>,
+    #[serde(default)]
+    pub system_reference: Option<String>,
+    #[serde(default)]
+    pub provider_name: Option<String>,
+    #[serde(default)]
+    pub provider_address: Option<String>,
+    #[serde(default)]
+    pub sole_responsibility_statement: Option<String>,
+    #[serde(default)]
+    pub conformity_statement: Option<String>,
+    #[serde(default)]
+    pub applicable_union_law: Vec<String>,
+    #[serde(default)]
+    pub processes_personal_data: bool,
+    #[serde(default)]
+    pub personal_data_compliance_statement: Option<String>,
+    #[serde(default)]
+    pub harmonised_standards: Vec<String>,
+    #[serde(default)]
+    pub standards_not_applicable_reason: Option<String>,
+    #[serde(default)]
+    pub conformity_assessment_procedure: Option<String>,
+    #[serde(default)]
+    pub notified_body_name: Option<String>,
+    #[serde(default)]
+    pub notified_body_identification_number: Option<String>,
+    #[serde(default)]
+    pub notified_body_certificate: Option<String>,
+    #[serde(default)]
+    pub issue_place: Option<String>,
+    #[serde(default)]
+    pub issue_date: Option<String>,
+    #[serde(default)]
+    pub signer_name: Option<String>,
+    #[serde(default)]
+    pub signer_function: Option<String>,
+    #[serde(default)]
+    pub signer_on_behalf_of: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -5998,6 +6078,21 @@ impl Config {
         {
             anyhow::bail!(
                 "compliance.interaction_notice not_applicable requires exception_owner and exception_reviewed_at"
+            );
+        }
+        let classification = &self.compliance.eu_ai_act.classification;
+        if classification.status != EuAiActRiskClassification::Unclassified
+            && (classification
+                .owner
+                .as_deref()
+                .is_none_or(|value| value.trim().is_empty())
+                || classification
+                    .assessed_at
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty()))
+        {
+            anyhow::bail!(
+                "compliance.eu_ai_act.classification requires owner and assessed_at for a legal applicability decision"
             );
         }
         // Gateway
