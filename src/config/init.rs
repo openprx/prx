@@ -783,11 +783,14 @@ fn security_template(spec: Spec) -> String {
 [autonomy]
 level = "full"
 workspace_only = true
-# Behavior-limits Phase 1: rate/cost caps opened to u32::MAX (high-position
-# billing/runaway safeguards). NOTE: 0 means "blocked", NOT "unlimited".
-max_actions_per_hour = 4294967295
-max_cost_per_day_cents = 4294967295
-forbidden_paths = []                   # no extra path denylist
+# Secure autonomous defaults. Operators may explicitly widen these values.
+max_actions_per_hour = 20
+max_cost_per_day_cents = 500
+forbidden_paths = [
+  "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt",
+  "/boot", "/dev", "/proc", "/sys", "/var", "/tmp",
+  "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
+]
 
 # Sandbox (folded in from the former [security.sandbox]); disabled by default.
 [autonomy.sandbox]
@@ -995,6 +998,7 @@ enabled = false
 # agentic = true
 # max_iterations = 100
 # allowed_tools = ["web_search", "read_file"]
+# allowed_tools = ["*"]                # explicit inheritance of eligible parent tools
 "#
         .into(),
     }
@@ -1605,6 +1609,9 @@ mod tests {
         let content = security_template(Spec::Server);
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = true"));
+        assert!(content.contains("max_actions_per_hour = 20"));
+        assert!(content.contains("max_cost_per_day_cents = 500"));
+        assert!(content.contains("\"/etc\""));
         assert!(!content.contains("level = \"supervised\""));
     }
 

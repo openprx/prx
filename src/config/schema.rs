@@ -3467,6 +3467,9 @@ impl Default for ScopeConfig {
 /// The sandbox configuration now lives under `[autonomy.sandbox]` (folded in
 /// from the former top-level `[security.sandbox]`) and is disabled by default
 /// (NoopSandbox); Phase 2 may re-enable it per risk level.
+pub const DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR: u32 = 20;
+pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised`, or `full` (default).
@@ -3475,10 +3478,11 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
-    /// Maximum actions allowed per hour per policy. Default: `u32::MAX` (open).
-    /// Note: `0` means "blocked", NOT "unlimited" — use a large value to open.
+    /// Maximum actions allowed per hour per policy. Default: `20`.
+    /// Note: `0` means "blocked", NOT "unlimited" — use `u32::MAX` only as an
+    /// explicit unrestricted operator choice.
     pub max_actions_per_hour: u32,
-    /// Maximum cost per day in cents per policy. Default: `u32::MAX` (open).
+    /// Maximum cost per day in cents per policy. Default: `500`.
     pub max_cost_per_day_cents: u32,
 
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
@@ -3526,11 +3530,8 @@ impl Default for AutonomyConfig {
                 "~/.aws".into(),
                 "~/.config".into(),
             ],
-            // 🔴 Behavior-limits Phase 1: opened to u32::MAX (NOT 0 — 0 would
-            // trip the `count >= limit` rate-limiter and block ALL actions).
-            // Field retained as a high-position billing/runaway safeguard.
-            max_actions_per_hour: u32::MAX,
-            max_cost_per_day_cents: u32::MAX,
+            max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
+            max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
             scopes: ScopeConfig::default(),
             sandbox: default_disabled_sandbox(),
         }
@@ -6002,6 +6003,24 @@ impl Config {
             }
         }
 
+        for (name, agent) in &self.agents {
+            if !agent.agentic {
+                continue;
+            }
+            let allowed_tools = agent
+                .allowed_tools
+                .iter()
+                .map(|tool| tool.trim())
+                .filter(|tool| !tool.is_empty())
+                .collect::<Vec<_>>();
+            if allowed_tools.is_empty() {
+                anyhow::bail!("agents.{name}.allowed_tools must not be empty when agentic=true");
+            }
+            if allowed_tools.contains(&"*") && allowed_tools.len() != 1 {
+                anyhow::bail!("agents.{name}.allowed_tools must use '*' exclusively");
+            }
+        }
+
         // Proxy (delegate to existing validation)
         self.proxy.validate()?;
 
@@ -6267,6 +6286,51 @@ mod tests {
         config.validate().unwrap();
     }
 
+    fn agentic_delegate_config(allowed_tools: Vec<String>) -> DelegateAgentConfig {
+        DelegateAgentConfig {
+            provider: "openrouter".into(),
+            model: "model-test".into(),
+            system_prompt: None,
+            api_key: None,
+            temperature: None,
+            max_depth: 3,
+            agentic: true,
+            allowed_tools,
+            max_iterations: 10,
+            identity_dir: None,
+            memory_scope: None,
+            spawn_enabled: None,
+        }
+    }
+
+    #[test]
+    async fn config_rejects_empty_agentic_delegate_allowlist() {
+        let mut config = Config::default();
+        config
+            .agents
+            .insert("worker".into(), agentic_delegate_config(Vec::new()));
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("agents.worker.allowed_tools must not be empty"));
+    }
+
+    #[test]
+    async fn config_requires_delegate_wildcard_to_be_exclusive() {
+        let mut config = Config::default();
+        config.agents.insert(
+            "worker".into(),
+            agentic_delegate_config(vec!["*".into(), "shell".into()]),
+        );
+
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("agents.worker.allowed_tools must use '*' exclusively"));
+
+        config
+            .agents
+            .insert("worker".into(), agentic_delegate_config(vec!["*".into()]));
+        config.validate().unwrap();
+    }
+
     #[test]
     async fn config_dir_creation_error_mentions_openrc_and_path() {
         let msg = config_dir_creation_error(Path::new("/etc/prx"));
@@ -6318,9 +6382,8 @@ mod tests {
         assert_eq!(a.level, AutonomyLevel::Full);
         assert!(a.workspace_only);
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
-        // Behavior-limits Phase 1: opened to u32::MAX (high-position safeguard).
-        assert_eq!(a.max_actions_per_hour, u32::MAX);
-        assert_eq!(a.max_cost_per_day_cents, u32::MAX);
+        assert_eq!(a.max_actions_per_hour, DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR);
+        assert_eq!(a.max_cost_per_day_cents, DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS);
     }
 
     #[test]

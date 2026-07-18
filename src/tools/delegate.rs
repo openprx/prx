@@ -945,18 +945,55 @@ impl DelegateTool {
             });
         }
 
-        let allowed = agent_config
+        let requested = agent_config
             .allowed_tools
             .iter()
             .map(|name| name.trim())
             .filter(|name| !name.is_empty())
             .collect::<std::collections::HashSet<_>>();
+        let inherit_all = requested.contains("*");
+        if inherit_all && requested.len() != 1 {
+            return Ok(DelegateAgenticExecution {
+                result: ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Agent '{agent_name}' must use allowed_tools=['*'] exclusively")),
+                },
+                trace: None,
+                history_commit_len: 0,
+            });
+        }
+
+        let parent_tool_names = self
+            .parent_tools
+            .iter()
+            .map(|tool| tool.name())
+            .filter(|name| *name != "delegate")
+            .collect::<std::collections::HashSet<_>>();
+        if !inherit_all {
+            let mut unknown = requested.difference(&parent_tool_names).copied().collect::<Vec<_>>();
+            unknown.sort_unstable();
+            if !unknown.is_empty() {
+                return Ok(DelegateAgenticExecution {
+                    result: ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Agent '{agent_name}' requested unknown or ineligible tools: {}",
+                            unknown.join(", ")
+                        )),
+                    },
+                    trace: None,
+                    history_commit_len: 0,
+                });
+            }
+        }
 
         let sub_tools: Vec<Box<dyn Tool>> = self
             .parent_tools
             .iter()
-            .filter(|tool| allowed.contains(tool.name()))
             .filter(|tool| tool.name() != "delegate")
+            .filter(|tool| inherit_all || requested.contains(tool.name()))
             .map(|tool| Box::new(ToolArcRef::new(tool.clone())) as Box<dyn Tool>)
             .collect();
 
@@ -966,7 +1003,7 @@ impl DelegateTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Agent '{agent_name}' has no executable tools after filtering allowlist ({})",
+                        "Agent '{agent_name}' has no executable tools after filtering allowed_tools ({})",
                         agent_config.allowed_tools.join(", ")
                     )),
                 },
@@ -1847,7 +1884,71 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result.error.as_deref().unwrap_or("").contains("no executable tools"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("unknown or ineligible tools: missing_tool")
+        );
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_inherits_parent_tools_only_with_explicit_wildcard() {
+        let config = agentic_config(vec!["*".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![
+            Arc::new(EchoTool),
+            Arc::new(DelegateTool::new(HashMap::new(), None, test_security())),
+        ]));
+        let provider = OneToolThenFinalProvider;
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(result.result.success);
+    }
+
+    #[tokio::test]
+    async fn agentic_mode_rejects_wildcard_mixed_with_named_tools() {
+        let config = agentic_config(vec!["*".to_string(), "echo_tool".to_string()], 10);
+        let tool = DelegateTool::new(HashMap::new(), None, test_security())
+            .with_parent_tools(Arc::new(vec![Arc::new(EchoTool)]));
+        let provider = OneToolThenFinalProvider;
+
+        let result = tool
+            .execute_agentic(
+                "agentic",
+                &config,
+                "openrouter",
+                "model-test",
+                &provider,
+                "run",
+                0.2,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(!result.result.success);
+        assert!(
+            result
+                .result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("must use allowed_tools=['*'] exclusively")
+        );
     }
 
     #[tokio::test]
@@ -1898,7 +1999,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_agentic_excludes_delegate_even_if_allowlisted() {
+    async fn execute_agentic_rejects_delegate_as_ineligible() {
         let config = agentic_config(vec!["delegate".to_string()], 10);
         let tool =
             DelegateTool::new(HashMap::new(), None, test_security()).with_parent_tools(Arc::new(vec![Arc::new(
@@ -1927,7 +2028,7 @@ mod tests {
                 .error
                 .as_deref()
                 .unwrap_or("")
-                .contains("no executable tools")
+                .contains("unknown or ineligible tools: delegate")
         );
     }
 
