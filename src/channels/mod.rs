@@ -2641,6 +2641,29 @@ async fn process_channel_message(
         return;
     }
 
+    // Article 50 transparency control: a versioned AI identity notice must be
+    // delivered and minimally acknowledged before provider initialization,
+    // draft creation, streaming, or any final AI response. A required notice
+    // failure is fail-closed for this turn.
+    if let Some(channel) = target_channel.as_ref()
+        && let Err(error) = crate::compliance::interaction_notice::ensure_interaction_notice(
+            &config_generation.effective.compliance.interaction_notice,
+            &ctx.memory,
+            channel,
+            &msg.channel,
+            &msg.reply_target,
+            msg.thread_ts.clone(),
+        )
+        .await
+    {
+        tracing::error!(
+            channel = %msg.channel,
+            error = %error,
+            "required AI interaction notice could not be completed; rejecting turn"
+        );
+        return;
+    }
+
     let history_key = ConversationKey::from_message(&msg);
     let message_visibility = channel_message_visibility(&msg);
     let route = get_route_selection_for_generation(ctx.as_ref(), &history_key, &config_generation);

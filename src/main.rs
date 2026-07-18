@@ -1434,6 +1434,28 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
         ControlStatus::Warning
     };
     let postgres = config.memory.backend == "postgres" || config.storage.provider.config.provider == "postgres";
+    let notice = &config.compliance.interaction_notice;
+    let (notice_status, notice_explanation) = match notice.applicability {
+        config::schema::InteractionNoticeApplicability::NotApplicable => (
+            ControlStatus::NotApplicable,
+            format!(
+                "Operator exception owner={} reviewed_at={}",
+                notice.exception_owner.as_deref().unwrap_or("missing"),
+                notice.exception_reviewed_at.as_deref().unwrap_or("missing")
+            ),
+        ),
+        config::schema::InteractionNoticeApplicability::Required if notice.enabled => (
+            ControlStatus::Pass,
+            format!(
+                "versioned notice {} is enabled before channel response routing",
+                notice.version
+            ),
+        ),
+        config::schema::InteractionNoticeApplicability::Required => (
+            ControlStatus::Fail,
+            "AI interaction notice is required but disabled".to_string(),
+        ),
+    };
 
     let mut checks = vec![
         attestation_check(
@@ -1513,10 +1535,10 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             "T04",
             "Article 50",
             "AI interaction notice",
-            ControlStatus::Fail,
-            "runtime_control",
-            "interaction_notice:not_implemented",
-            "No adapter-neutral first-interaction notice control is currently evidenced.",
+            notice_status,
+            "config_revision",
+            &config_evidence,
+            notice_explanation,
             "Emit and minimally acknowledge a versioned AI identity notice before the first response.",
         ),
         attestation_check(
