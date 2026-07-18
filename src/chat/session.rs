@@ -610,8 +610,8 @@ mod tests {
     }
 
     #[test]
-    fn provider_usage_record_computes_kimi_code_cost() {
-        let decision = crate::llm::route_decision::RouteDecision::single_candidate("kimi-code", "kimi-k2.7-code");
+    fn provider_usage_record_leaves_subscription_billed_kimi_code_cost_unknown() {
+        let decision = crate::llm::route_decision::RouteDecision::single_candidate("kimi-code", "k3");
         let outcome = crate::llm::route_decision::ProviderExecutionOutcome::success_for_decision_with_usage(
             &decision,
             Utc::now(),
@@ -626,13 +626,7 @@ mod tests {
         assert_eq!(record.completion_tokens, 500);
         assert_eq!(record.total_tokens, 1_500);
         assert_eq!(record.source, crate::llm::route_decision::TokenUsageSource::Reported);
-        let cost = record
-            .cost_usd
-            .expect("default kimi-code/kimi-k2.7-code price should compute cost");
-        assert!(
-            (cost - 0.002_95).abs() < 0.000_000_1,
-            "kimi-code cost should use default pricing: {cost}"
-        );
+        assert_eq!(record.cost_usd, None);
     }
 
     #[test]

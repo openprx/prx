@@ -1,5 +1,6 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
+use crate::auth::{profiles::AuthProfilesStore, select_profile_id};
 use crate::config::init::Spec;
 use crate::config::schema::{
     DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
@@ -12,8 +13,9 @@ use crate::config::{
 use crate::memory::{default_memory_backend_key, memory_backend_profile, selectable_memory_backends};
 use crate::onboard::auto_detect::is_claude_code_oauth_setup_token;
 use crate::providers::{
-    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_minimax_alias, is_moonshot_alias,
-    is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_zai_alias, is_zai_cn_alias,
+    canonical_china_provider_name, is_glm_alias, is_glm_cn_alias, is_huggingface_alias, is_litellm_alias,
+    is_minimax_alias, is_moonshot_alias, is_qianfan_alias, is_qwen_alias, is_qwen_oauth_alias, is_vllm_alias,
+    is_zai_alias, is_zai_cn_alias,
 };
 use anyhow::{Context, Result, bail};
 use console::style;
@@ -599,6 +601,15 @@ fn canonical_provider_name(provider_name: &str) -> &str {
     if is_qwen_oauth_alias(provider_name) {
         return "qwen-code";
     }
+    if is_litellm_alias(provider_name) {
+        return "litellm";
+    }
+    if is_vllm_alias(provider_name) {
+        return "vllm";
+    }
+    if is_huggingface_alias(provider_name) {
+        return "huggingface";
+    }
 
     if let Some(canonical) = canonical_china_provider_name(provider_name) {
         return canonical;
@@ -619,22 +630,22 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "venice" | "astrai" | "nvidia"
+        "openrouter" | "ollama" | "llamacpp" | "litellm" | "vllm" | "compatible" | "venice" | "astrai" | "nvidia"
     )
 }
 
 /// Pick a sensible default model for the given provider.
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
-        "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "openrouter" => "anthropic/claude-sonnet-4.6".into(),
-        "openai" => "gpt-5.2".into(),
-        "openai-codex" => "gpt-5-codex".into(),
+        "anthropic" => "claude-sonnet-5".into(),
+        "openrouter" => "anthropic/claude-sonnet-5".into(),
+        "openai" => "gpt-5.6".into(),
+        "openai-codex" => "gpt-5.2-codex".into(),
         "venice" => "zai-org-glm-5".into(),
         "groq" => "llama-3.3-70b-versatile".into(),
         "mistral" => "mistral-large-latest".into(),
         "deepseek" => "deepseek-chat".into(),
-        "xai" => "grok-4-1-fast-reasoning".into(),
+        "xai" => "grok-4.20".into(),
         "perplexity" => "sonar-pro".into(),
         "fireworks" => "accounts/fireworks/models/llama-v3p3-70b-instruct".into(),
         "together-ai" => "meta-llama/Llama-3.3-70B-Instruct-Turbo".into(),
@@ -642,16 +653,19 @@ fn default_model_for_provider(provider: &str) -> String {
         "moonshot" => "kimi-k2.5".into(),
         "glm" | "zai" => "glm-5".into(),
         "minimax" => "MiniMax-M2.5".into(),
-        "qwen" => "qwen-plus".into(),
+        "qwen" => "qwen3.7-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
-        "gemini" => "gemini-2.5-pro".into(),
-        "kimi-code" => "kimi-k2.7-code".into(),
-        "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
+        "gemini" => "gemini-3.5-flash".into(),
+        "kimi-code" => "k3".into(),
+        "bedrock" => "anthropic.claude-sonnet-5".into(),
+        "copilot" => "gpt-5.4".into(),
+        "litellm" => "default".into(),
+        "vllm" | "huggingface" | "compatible" => "default".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
         "astrai" => "anthropic/claude-sonnet-4.6".into(),
-        _ => "anthropic/claude-sonnet-4.6".into(),
+        _ => "anthropic/claude-sonnet-5".into(),
     }
 }
 
@@ -659,21 +673,21 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
     match canonical_provider_name(provider_name) {
         "openrouter" => vec![
             (
-                "anthropic/claude-sonnet-4.6".to_string(),
-                "Claude Sonnet 4.6 (balanced, recommended)".to_string(),
+                "anthropic/claude-sonnet-5".to_string(),
+                "Claude Sonnet 5 (balanced, recommended)".to_string(),
             ),
-            ("openai/gpt-5.2".to_string(), "GPT-5.2 (latest flagship)".to_string()),
+            ("openai/gpt-5.6".to_string(), "GPT-5.6 (latest flagship)".to_string()),
             (
                 "openai/gpt-5-mini".to_string(),
                 "GPT-5 mini (fast, cost-efficient)".to_string(),
             ),
             (
-                "google/gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (frontier reasoning)".to_string(),
+                "google/gemini-3.5-flash".to_string(),
+                "Gemini 3.5 Flash (stable agentic model)".to_string(),
             ),
             (
-                "x-ai/grok-4.1-fast".to_string(),
-                "Grok 4.1 Fast (reasoning + speed)".to_string(),
+                "x-ai/grok-4.20".to_string(),
+                "Grok 4.20 (reasoning + tools)".to_string(),
             ),
             (
                 "deepseek/deepseek-v3.2".to_string(),
@@ -686,12 +700,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "anthropic" => vec![
             (
-                "claude-sonnet-4-5-20250929".to_string(),
-                "Claude Sonnet 4.5 (balanced, recommended)".to_string(),
+                "claude-sonnet-5".to_string(),
+                "Claude Sonnet 5 (balanced, recommended)".to_string(),
             ),
             (
-                "claude-opus-4-6".to_string(),
-                "Claude Opus 4.6 (best quality)".to_string(),
+                "claude-opus-4-8".to_string(),
+                "Claude Opus 4.8 (best quality)".to_string(),
             ),
             (
                 "claude-haiku-4-5-20251001".to_string(),
@@ -699,23 +713,23 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "openai" => vec![
+            ("gpt-5.6".to_string(), "GPT-5.6 (latest agentic flagship)".to_string()),
+            ("gpt-5.6-terra".to_string(), "GPT-5.6 Terra (balanced)".to_string()),
             (
-                "gpt-5.2".to_string(),
-                "GPT-5.2 (latest coding/agentic flagship)".to_string(),
+                "gpt-5.6-luna".to_string(),
+                "GPT-5.6 Luna (fast, cost-efficient)".to_string(),
             ),
-            ("gpt-5-mini".to_string(), "GPT-5 mini (faster, cheaper)".to_string()),
-            ("gpt-5-nano".to_string(), "GPT-5 nano (lowest latency/cost)".to_string()),
             (
                 "gpt-5.2-codex".to_string(),
                 "GPT-5.2 Codex (agentic coding)".to_string(),
             ),
         ],
         "openai-codex" => vec![
-            ("gpt-5-codex".to_string(), "GPT-5 Codex (recommended)".to_string()),
             (
                 "gpt-5.2-codex".to_string(),
-                "GPT-5.2 Codex (agentic coding)".to_string(),
+                "GPT-5.2 Codex (recommended agentic coding)".to_string(),
             ),
+            ("gpt-5-codex".to_string(), "GPT-5 Codex (stable fallback)".to_string()),
             ("o4-mini".to_string(), "o4-mini (fallback)".to_string()),
         ],
         "venice" => vec![
@@ -777,12 +791,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "xai" => vec![
             (
-                "grok-4-1-fast-reasoning".to_string(),
-                "Grok 4.1 Fast Reasoning (recommended)".to_string(),
+                "grok-4.20".to_string(),
+                "Grok 4.20 (recommended reasoning alias)".to_string(),
             ),
             (
-                "grok-4-1-fast-non-reasoning".to_string(),
-                "Grok 4.1 Fast Non-Reasoning (low latency)".to_string(),
+                "grok-4.20-non-reasoning-latest".to_string(),
+                "Grok 4.20 Non-Reasoning (low latency)".to_string(),
             ),
             (
                 "grok-code-fast-1".to_string(),
@@ -844,25 +858,14 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "kimi-code" => vec![
+            ("k3".to_string(), "Kimi K3 (latest, live-verified default)".to_string()),
             (
-                "kimi-k2.7-code".to_string(),
-                "Kimi K2.7 Code (latest, recommended)".to_string(),
-            ),
-            (
-                "kimi-k2.7-code-highspeed".to_string(),
-                "Kimi K2.7 Code Highspeed (faster inference)".to_string(),
-            ),
-            (
-                "kimi2.6".to_string(),
-                "Kimi 2.6 (Kimi Code subscription model)".to_string(),
+                "kimi-for-coding-highspeed".to_string(),
+                "Kimi for Coding Highspeed (K2.7, faster inference)".to_string(),
             ),
             (
                 "kimi-for-coding".to_string(),
                 "Kimi for Coding (official coding-agent model)".to_string(),
-            ),
-            (
-                "kimi-k2.5".to_string(),
-                "Kimi K2.5 (general coding endpoint model)".to_string(),
             ),
         ],
         "moonshot" => vec![
@@ -899,11 +902,14 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
             ),
         ],
         "qwen" => vec![
-            ("qwen-max".to_string(), "Qwen Max (highest quality)".to_string()),
-            ("qwen-plus".to_string(), "Qwen Plus (balanced default)".to_string()),
+            ("qwen3.7-max".to_string(), "Qwen 3.7 Max (highest quality)".to_string()),
             (
-                "qwen-turbo".to_string(),
-                "Qwen Turbo (fast and cost-efficient)".to_string(),
+                "qwen3.7-plus".to_string(),
+                "Qwen 3.7 Plus (balanced default)".to_string(),
+            ),
+            (
+                "qwen3.6-flash".to_string(),
+                "Qwen 3.6 Flash (fast and cost-efficient)".to_string(),
             ),
         ],
         "qwen-code" => vec![
@@ -972,12 +978,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "bedrock" => vec![
             (
-                "anthropic.claude-sonnet-4-6".to_string(),
-                "Claude Sonnet 4.6 (latest, recommended)".to_string(),
+                "anthropic.claude-sonnet-5".to_string(),
+                "Claude Sonnet 5 (latest, recommended)".to_string(),
             ),
             (
-                "anthropic.claude-opus-4-6-v1".to_string(),
-                "Claude Opus 4.6 (strongest)".to_string(),
+                "anthropic.claude-opus-4-8".to_string(),
+                "Claude Opus 4.8 (strongest)".to_string(),
             ),
             (
                 "anthropic.claude-haiku-4-5-20251001-v1:0".to_string(),
@@ -990,22 +996,45 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "gemini" => vec![
             (
-                "gemini-3-pro-preview".to_string(),
-                "Gemini 3 Pro Preview (latest frontier reasoning)".to_string(),
+                "gemini-3.5-flash".to_string(),
+                "Gemini 3.5 Flash (stable, recommended)".to_string(),
             ),
             (
-                "gemini-2.5-pro".to_string(),
-                "Gemini 2.5 Pro (stable reasoning)".to_string(),
+                "gemini-3.1-pro-preview".to_string(),
+                "Gemini 3.1 Pro Preview (frontier reasoning)".to_string(),
             ),
             (
-                "gemini-2.5-flash".to_string(),
-                "Gemini 2.5 Flash (best price/performance)".to_string(),
-            ),
-            (
-                "gemini-2.5-flash-lite".to_string(),
-                "Gemini 2.5 Flash-Lite (lowest cost)".to_string(),
+                "gemini-3.1-flash-lite".to_string(),
+                "Gemini 3.1 Flash-Lite (lowest cost)".to_string(),
             ),
         ],
+        "copilot" => vec![
+            ("gpt-5.4".to_string(), "GPT-5.4 (recommended)".to_string()),
+            (
+                "gpt-5.3-codex".to_string(),
+                "GPT-5.3 Codex (coding specialist)".to_string(),
+            ),
+            (
+                "claude-sonnet-4.6".to_string(),
+                "Claude Sonnet 4.6 (balanced alternative)".to_string(),
+            ),
+        ],
+        "litellm" => vec![(
+            "default".to_string(),
+            "Use a model or alias exposed by the LiteLLM proxy".to_string(),
+        )],
+        "vllm" => vec![(
+            "default".to_string(),
+            "Use the served model ID returned by /v1/models".to_string(),
+        )],
+        "huggingface" => vec![(
+            "default".to_string(),
+            "Use a model ID returned by the Hugging Face router".to_string(),
+        )],
+        "compatible" => vec![(
+            "default".to_string(),
+            "Use a model ID exposed by the configured OpenAI-compatible endpoint".to_string(),
+        )],
         _ => vec![("default".to_string(), "Default model".to_string())],
     }
 }
@@ -1024,6 +1053,11 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "kimi-code"
+            | "litellm"
+            | "vllm"
+            | "huggingface"
+            | "compatible"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -1060,6 +1094,10 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "kimi-code" => Some("https://api.kimi.com/coding/v1/models"),
+            "litellm" => Some("http://localhost:4000/v1/models"),
+            "vllm" => Some("http://localhost:8000/v1/models"),
+            "huggingface" => Some("https://router.huggingface.co/v1/models"),
             _ => None,
         },
     }
@@ -1251,11 +1289,17 @@ fn fetch_ollama_models() -> Result<Vec<String>> {
 }
 
 fn resolve_live_models_endpoint(provider_name: &str, provider_api_url: Option<&str>) -> Option<String> {
-    if canonical_provider_name(provider_name) == "llamacpp" {
+    if matches!(
+        canonical_provider_name(provider_name),
+        "llamacpp" | "litellm" | "vllm" | "huggingface" | "compatible"
+    ) {
         if let Some(url) = provider_api_url.map(str::trim).filter(|url| !url.is_empty()) {
             let normalized = url.trim_end_matches('/');
             if normalized.ends_with("/models") {
                 return Some(normalized.to_string());
+            }
+            if canonical_provider_name(provider_name) == "litellm" && !normalized.ends_with("/v1") {
+                return Some(format!("{normalized}/v1/models"));
             }
             return Some(format!("{normalized}/models"));
         }
@@ -1324,6 +1368,43 @@ fn fetch_live_models_for_provider(
     };
 
     Ok(models)
+}
+
+fn model_discovery_api_key(config: &Config, provider_name: &str) -> String {
+    if let Some(key) = config.api_key.as_deref().map(str::trim).filter(|key| !key.is_empty()) {
+        return key.to_string();
+    }
+
+    let state_dir = config
+        .config_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| {
+            directories::UserDirs::new().map_or_else(
+                || PathBuf::from(".openprx"),
+                |dirs| default_user_config_dir(dirs.home_dir()),
+            )
+        });
+    let store = AuthProfilesStore::new(&state_dir, config.secrets.encrypt);
+    let Ok(data) = store.load() else {
+        return String::new();
+    };
+    let canonical = canonical_provider_name(provider_name);
+    let Some(profile_id) = select_profile_id(&data, canonical, None) else {
+        return String::new();
+    };
+    let Some(profile) = data.profiles.get(&profile_id) else {
+        return String::new();
+    };
+    profile
+        .token
+        .as_deref()
+        .or_else(|| profile.token_set.as_ref().map(|tokens| tokens.access_token.as_str()))
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1551,7 +1632,7 @@ pub fn run_models_refresh(config: &Config, provider_override: Option<&str>, forc
         }
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
+    let api_key = model_discovery_api_key(config, &provider_name);
 
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
@@ -1620,7 +1701,7 @@ pub fn run_models_probe_read_only(config: &Config, provider_override: Option<&st
         return Ok(());
     }
 
-    let api_key = config.api_key.clone().unwrap_or_default();
+    let api_key = model_discovery_api_key(config, &provider_name);
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
             println!(
@@ -5017,24 +5098,21 @@ mod tests {
 
     #[test]
     fn default_model_for_provider_uses_latest_defaults() {
-        assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-4.6");
-        assert_eq!(default_model_for_provider("openai"), "gpt-5.2");
-        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5-codex");
-        assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-4-5-20250929");
-        assert_eq!(default_model_for_provider("qwen"), "qwen-plus");
-        assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
+        assert_eq!(default_model_for_provider("openrouter"), "anthropic/claude-sonnet-5");
+        assert_eq!(default_model_for_provider("openai"), "gpt-5.6");
+        assert_eq!(default_model_for_provider("openai-codex"), "gpt-5.2-codex");
+        assert_eq!(default_model_for_provider("anthropic"), "claude-sonnet-5");
+        assert_eq!(default_model_for_provider("qwen"), "qwen3.7-plus");
+        assert_eq!(default_model_for_provider("qwen-intl"), "qwen3.7-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
         assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.5");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
-        assert_eq!(default_model_for_provider("kimi-code"), "kimi-k2.7-code");
-        assert_eq!(
-            default_model_for_provider("bedrock"),
-            "anthropic.claude-sonnet-4-5-20250929-v1:0"
-        );
-        assert_eq!(default_model_for_provider("google-gemini"), "gemini-2.5-pro");
+        assert_eq!(default_model_for_provider("gemini"), "gemini-3.5-flash");
+        assert_eq!(default_model_for_provider("google"), "gemini-3.5-flash");
+        assert_eq!(default_model_for_provider("kimi-code"), "k3");
+        assert_eq!(default_model_for_provider("bedrock"), "anthropic.claude-sonnet-5");
+        assert_eq!(default_model_for_provider("google-gemini"), "gemini-3.5-flash");
         assert_eq!(default_model_for_provider("venice"), "zai-org-glm-5");
         assert_eq!(default_model_for_provider("moonshot"), "kimi-k2.5");
         assert_eq!(default_model_for_provider("nvidia"), "meta/llama-3.3-70b-instruct");
@@ -5062,6 +5140,9 @@ mod tests {
         assert_eq!(canonical_provider_name("aws-bedrock"), "bedrock");
         assert_eq!(canonical_provider_name("build.nvidia.com"), "nvidia");
         assert_eq!(canonical_provider_name("llama.cpp"), "llamacpp");
+        assert_eq!(canonical_provider_name("lite-llm"), "litellm");
+        assert_eq!(canonical_provider_name("v-llm"), "vllm");
+        assert_eq!(canonical_provider_name("hf"), "huggingface");
     }
 
     #[test]
@@ -5071,8 +5152,8 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"gpt-5.2".to_string()));
-        assert!(ids.contains(&"gpt-5-mini".to_string()));
+        assert!(ids.contains(&"gpt-5.6".to_string()));
+        assert!(ids.contains(&"gpt-5.6-luna".to_string()));
     }
 
     #[test]
@@ -5107,7 +5188,7 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"anthropic/claude-sonnet-4.6".to_string()));
+        assert!(ids.contains(&"anthropic/claude-sonnet-5".to_string()));
     }
 
     #[test]
@@ -5117,8 +5198,8 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"anthropic.claude-sonnet-4-6".to_string()));
-        assert!(ids.contains(&"anthropic.claude-opus-4-6-v1".to_string()));
+        assert!(ids.contains(&"anthropic.claude-sonnet-5".to_string()));
+        assert!(ids.contains(&"anthropic.claude-opus-4-8".to_string()));
         assert!(ids.contains(&"anthropic.claude-haiku-4-5-20251001-v1:0".to_string()));
         assert!(ids.contains(&"anthropic.claude-sonnet-4-5-20250929-v1:0".to_string()));
     }
@@ -5158,11 +5239,14 @@ mod tests {
             .map(|(id, _)| id)
             .collect();
 
-        assert!(ids.contains(&"kimi-for-coding".to_string()));
-        assert!(ids.contains(&"kimi2.6".to_string()));
-        assert!(ids.contains(&"kimi-k2.5".to_string()));
-        assert!(ids.contains(&"kimi-k2.7-code".to_string()));
-        assert!(ids.contains(&"kimi-k2.7-code-highspeed".to_string()));
+        assert_eq!(
+            ids,
+            vec![
+                "k3".to_string(),
+                "kimi-for-coding-highspeed".to_string(),
+                "kimi-for-coding".to_string()
+            ]
+        );
     }
 
     #[test]
@@ -5191,12 +5275,36 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("kimi-code"));
+        assert!(supports_live_model_fetch("litellm"));
+        assert!(supports_live_model_fetch("vllm"));
+        assert!(supports_live_model_fetch("huggingface"));
+        assert!(supports_live_model_fetch("compatible"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
         assert!(supports_live_model_fetch("qwen-intl"));
         assert!(!supports_live_model_fetch("minimax-cn"));
         assert!(!supports_live_model_fetch("unknown-provider"));
+    }
+
+    #[test]
+    fn model_discovery_uses_active_auth_profile_when_config_key_is_absent() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.api_key = None;
+        config.config_path = tmp.path().join("config.toml");
+        config.secrets.encrypt = false;
+
+        let store = AuthProfilesStore::new(tmp.path(), false);
+        store
+            .upsert_profile(
+                crate::auth::profiles::AuthProfile::new_token("kimi-code", "default", "profile-secret".to_string()),
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(model_discovery_api_key(&config, "kimi-code"), "profile-secret");
     }
 
     #[test]
@@ -5298,12 +5406,20 @@ mod tests {
             models_endpoint_for_provider("llama.cpp"),
             Some("http://localhost:8080/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("kimi-code"),
+            Some("https://api.kimi.com/coding/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("huggingface"),
+            Some("https://router.huggingface.co/v1/models")
+        );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
     }
 
     #[test]
-    fn resolve_live_models_endpoint_prefers_llamacpp_custom_url() {
+    fn resolve_live_models_endpoint_prefers_compatible_custom_url() {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1")),
             Some("http://127.0.0.1:8033/v1/models".to_string())
@@ -5315,6 +5431,14 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", Some("http://127.0.0.1:8033/v1/models")),
             Some("http://127.0.0.1:8033/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("litellm", Some("http://127.0.0.1:4000/v1")),
+            Some("http://127.0.0.1:4000/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("litellm", Some("http://127.0.0.1:4000")),
+            Some("http://127.0.0.1:4000/v1/models".to_string())
         );
     }
 
