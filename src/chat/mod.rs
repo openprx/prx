@@ -274,12 +274,6 @@ const TOOL_EVENT_CHANNEL_CAPACITY: usize = 32;
 /// Minimum base timeout (seconds) for per-turn timeout budget.
 const TIMEOUT_MIN_BASE_SECS: u64 = 30;
 
-/// Bounded grace period for reducer-owned persistence to finish before exit.
-const EXIT_PERSISTENCE_DRAIN_GRACE_MS: u64 = 250;
-
-/// Extra idle settle window after the persistence guard is inactive.
-const EXIT_PERSISTENCE_IDLE_SETTLE_MS: u64 = 50;
-
 /// Maximum multiplier applied to the base timeout (caps iterations-based scaling).
 const TIMEOUT_MAX_SCALE_FACTOR: u64 = 4;
 
@@ -4615,6 +4609,9 @@ pub async fn run(
                 &config,
                 sessions_redraw_handle.as_ref(),
                 redraw_tx_for_main.as_ref(),
+                &turn_signal,
+                plain_mode,
+                &mut plain_mode_turn_failed,
             )
             .await;
             #[cfg(not(feature = "terminal-tui"))]
@@ -8494,16 +8491,6 @@ Retry with a compatible model: /provider {new_provider} <model>"
         shutdown_child_sessions_for_exit(&mut chat_sessions, &mut chat_session, &chat_dispatcher).await;
     session_rings.clear();
 
-    // Give the reducer-owned turn persistence path a bounded chance to finish
-    // before shutdown cancellation drains the dispatcher. This closes the
-    // piped-stdin race where a successful response followed immediately by
-    // `/exit` could print to the user but miss `chat_session:*` persistence.
-    let drain_deadline = tokio::time::Instant::now() + Duration::from_millis(EXIT_PERSISTENCE_DRAIN_GRACE_MS);
-    while dual_write_guard.is_active() && tokio::time::Instant::now() < drain_deadline {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    tokio::time::sleep(Duration::from_millis(EXIT_PERSISTENCE_IDLE_SETTLE_MS)).await;
-
     // Step 5b: dispatcher task graceful shutdown.
     //
     // 1. shutdown.cancel() 让所有 spawn 出去的信号 handler / TUI loop 主动退出，
@@ -9040,6 +9027,11 @@ fn pop_next_input_message(
 fn pop_next_queued_input_message(
     backlog: &mut std::collections::VecDeque<QueuedInputMessage>,
 ) -> Option<QueuedInputMessage> {
+    let best_idx = next_queued_input_index(backlog)?;
+    backlog.remove(best_idx)
+}
+
+fn next_queued_input_index(backlog: &std::collections::VecDeque<QueuedInputMessage>) -> Option<usize> {
     let mut best_idx = None;
     let mut best_priority = InputQueuePriority::Normal;
     for (idx, queued) in backlog.iter().enumerate() {
@@ -9048,8 +9040,7 @@ fn pop_next_queued_input_message(
             best_priority = queued.priority;
         }
     }
-    let best_idx = best_idx?;
-    backlog.remove(best_idx)
+    best_idx
 }
 
 fn pop_next_input_message_with_scheduler(
@@ -9100,7 +9091,34 @@ fn pop_next_visible_input_task_with_scheduler(
     if !provider_turn_visible_admission(workers, target_kind, max_concurrent_visible_turns).can_start_visible {
         return None;
     }
+    if workers.snapshot().iter().any(|worker| !worker.state.is_terminal())
+        && next_queued_input_index(backlog)
+            .and_then(|index| backlog.get(index))
+            .is_some_and(|queued| is_persistence_dependent_command(&queued.msg.content))
+    {
+        // Provider concurrency may admit another ordinary user turn, but
+        // commands that inspect, mutate, switch, export, or terminate the
+        // foreground session must observe the preceding turn's durable state.
+        // Leave the command at the queue head until the ordered
+        // StreamCompleted -> SaveSession acknowledgement finalizes the worker.
+        return None;
+    }
     pop_next_input_task_with_scheduler(backlog, scheduler)
+}
+
+fn is_persistence_dependent_command(input: &str) -> bool {
+    let (_priority, content) = input_priority_from_text(input);
+    let command = content.trim();
+    is_chat_quit_command(command)
+        || command == "/apply"
+        || command == "/cost"
+        || command == "/export"
+        || command == "/resume"
+        || command.starts_with("/resume ")
+        || command == "/branch"
+        || command.starts_with("/branch ")
+        || command == "/rewind"
+        || command.starts_with("/rewind ")
 }
 
 fn requeue_post_route_admission_rejected_input(
@@ -9752,6 +9770,65 @@ fn dispatch_ordered_provider_turn_commit(
 }
 
 #[cfg(feature = "terminal-tui")]
+async fn dispatch_ordered_provider_turn_commit_and_wait(
+    chat_dispatcher: &crate::chat::dispatcher::ChatDispatcher,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    task_id: crate::chat::turn_scheduler::TurnTaskId,
+    draft_id: &str,
+    user_input: &str,
+    final_text: &str,
+    reasoning: &str,
+    empty_response: bool,
+) -> std::result::Result<(), String> {
+    // The first task-scoped notification means the provider produced its
+    // terminal payload. The ordered StreamCompleted below is a distinct phase:
+    // the dispatcher only emits its second notification after every reducer
+    // effect, including SaveSession, has completed. Arm the waiter before
+    // dispatch so the latch-less Notify cannot be missed.
+    // Provider completion consumption unregisters the first-phase slot. Open
+    // a fresh slot for the same task/draft so the ordered reducer commit has
+    // its own acknowledgement lifecycle.
+    turn_signal.register_turn(task_id, draft_id.to_string());
+    let Some(persistence_committed) = turn_signal.notified_for(task_id) else {
+        tracing::error!(task_id = task_id.get(), "missing task-scoped persistence waiter");
+        return Err("missing task-scoped persistence waiter".to_string());
+    };
+    dispatch_ordered_provider_turn_commit(
+        chat_dispatcher,
+        task_id,
+        draft_id,
+        user_input,
+        final_text,
+        reasoning,
+        empty_response,
+    );
+    match tokio::time::timeout(Duration::from_secs(30), persistence_committed).await {
+        Ok(()) => {
+            // Consume the second terminal outcome so a later waiter cannot
+            // mistake this persistence acknowledgement for a provider result.
+            let outcome = turn_signal.consume_turn_outcome(task_id);
+            turn_signal.unregister_turn(task_id);
+            match outcome {
+                Some(dispatcher::TurnOutcomeKind::Completed { .. }) => Ok(()),
+                Some(dispatcher::TurnOutcomeKind::Failed { err, .. }) => Err(err),
+                Some(dispatcher::TurnOutcomeKind::Cancelled) => {
+                    Err("ordered session persistence was cancelled".to_string())
+                }
+                None => Err("ordered session persistence acknowledged without an outcome".to_string()),
+            }
+        }
+        Err(_) => {
+            tracing::error!(
+                task_id = task_id.get(),
+                "timed out waiting for ordered session persistence"
+            );
+            turn_signal.unregister_turn(task_id);
+            Err("timed out waiting for ordered session persistence".to_string())
+        }
+    }
+}
+
+#[cfg(feature = "terminal-tui")]
 #[allow(clippy::too_many_arguments)]
 async fn commit_completed_provider_turn(
     pending_commit: PendingOrderedProviderTurnCommit,
@@ -9767,7 +9844,8 @@ async fn commit_completed_provider_turn(
     config: &Config,
     sessions_redraw_handle: Option<&mpsc::Sender<()>>,
     redraw_tx_for_main: Option<&mpsc::Sender<()>>,
-) {
+    turn_signal: &dispatcher::TurnCompletionSignal,
+) -> bool {
     let pending = pending_commit.context;
     let ProviderTurnTerminalPlan::Completed {
         final_text,
@@ -9783,7 +9861,7 @@ async fn commit_completed_provider_turn(
             task_id = pending.task_id.get(),
             "ordered provider turn commit received non-completed terminal plan"
         );
-        return;
+        return false;
     };
 
     let provider_turn_task_id = Some(pending.task_id);
@@ -9823,15 +9901,25 @@ async fn commit_completed_provider_turn(
         if let Err(e) = terminal.cancel_draft("user", &pending.draft_id).await {
             tracing::debug!(error = %e, "Redux driver: cancel empty-response draft failed");
         }
-        dispatch_ordered_provider_turn_commit(
+        let persistence_result = dispatch_ordered_provider_turn_commit_and_wait(
             chat_dispatcher,
+            turn_signal,
             pending.task_id,
             &pending.draft_id,
             &pending.user_input,
             &final_text,
             &reasoning,
             empty_response,
-        );
+        )
+        .await;
+        if let Err(error) = persistence_result {
+            surface_session_message(
+                chat_dispatcher,
+                sessions_redraw_handle,
+                &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+            );
+            return false;
+        }
         chat_session.add_user_turn(&pending.user_input);
         if let Some(record) = terminal_usage.and_then(|record| chat_session.record_usage_settlement(record)) {
             record_provider_turn_usage(turn_scheduler, provider_turn_task_id, &record);
@@ -9857,22 +9945,32 @@ async fn commit_completed_provider_turn(
         );
         publish_main_queue_status(chat_dispatcher, turn_scheduler);
         publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
-        return;
+        return true;
     }
 
     history.push(ChatMessage::assistant(final_text.clone()));
     if let Err(e) = terminal.finalize_draft("user", &pending.draft_id, &final_text).await {
         tracing::warn!(error = %e, "Redux driver: finalize_draft failed");
     }
-    dispatch_ordered_provider_turn_commit(
+    let persistence_result = dispatch_ordered_provider_turn_commit_and_wait(
         chat_dispatcher,
+        turn_signal,
         pending.task_id,
         &pending.draft_id,
         &pending.user_input,
         &final_text,
         &reasoning,
         empty_response,
-    );
+    )
+    .await;
+    if let Err(error) = persistence_result {
+        surface_session_message(
+            chat_dispatcher,
+            sessions_redraw_handle,
+            &format!("Session persistence failed; dependent commands remain blocked: {error}"),
+        );
+        return false;
+    }
     let attempts_count = u8::try_from(provider_outcome.attempts.len()).unwrap_or(u8::MAX);
     crate::runtime::control_ladder::append_provider_outcome_trace(
         std::path::Path::new(&config.workspace_dir),
@@ -9908,6 +10006,7 @@ async fn commit_completed_provider_turn(
     );
     publish_main_queue_status(chat_dispatcher, turn_scheduler);
     publish_provider_worker_status(chat_dispatcher, provider_turn_workers);
+    true
 }
 
 #[cfg(feature = "terminal-tui")]
@@ -9930,6 +10029,9 @@ async fn apply_ready_ordered_provider_turn_commits(
     config: &Config,
     sessions_redraw_handle: Option<&mpsc::Sender<()>>,
     redraw_tx_for_main: Option<&mpsc::Sender<()>>,
+    turn_signal: &dispatcher::TurnCompletionSignal,
+    plain_mode: bool,
+    plain_mode_turn_failed: &mut bool,
 ) -> bool {
     let mut applied = false;
     for result in results {
@@ -9946,7 +10048,7 @@ async fn apply_ready_ordered_provider_turn_commits(
             );
             continue;
         };
-        commit_completed_provider_turn(
+        let committed = commit_completed_provider_turn(
             pending_commit,
             history,
             turn_scheduler,
@@ -9960,8 +10062,12 @@ async fn apply_ready_ordered_provider_turn_commits(
             config,
             sessions_redraw_handle,
             redraw_tx_for_main,
+            turn_signal,
         )
         .await;
+        if !committed && plain_mode {
+            *plain_mode_turn_failed = true;
+        }
         applied = true;
     }
     applied
@@ -10134,6 +10240,9 @@ async fn finalize_per_turn_context(
         config,
         sessions_redraw_handle,
         redraw_tx_for_main,
+        turn_signal,
+        plain_mode,
+        plain_mode_turn_failed,
     )
     .await;
 }
@@ -12490,19 +12599,11 @@ fn run_tui_unified_loop(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        // Exit commands should not wait behind the async input
-                        // consumer or an in-flight provider turn. Handle them
-                        // at the TUI submit boundary and let the outer chat
-                        // loop perform its normal child-session cleanup.
-                        if is_chat_quit_command(&trimmed) {
-                            let _ = chat_dispatcher.dispatch_or_log(Action::ForceQuit, "chat.tui_quit_submitted");
-                            shutdown.cancel();
-                            let _ = terminal.draw(|frame| {
-                                let area = frame.area();
-                                frame.render_widget(ratatui::widgets::Clear, area);
-                            });
-                            return Ok(());
-                        }
+                        // `/exit` uses the same input queue as every other
+                        // submitted command. The async owner can therefore
+                        // hold it behind an in-flight turn's persistence
+                        // acknowledgement instead of cancelling the dispatcher
+                        // from this key thread and losing the final snapshot.
                         let (input_priority, _) = input_priority_from_text(&trimmed);
                         let activity_active = render_source
                             .with_view(|view| tui::execution_activity_active_for_view(view))
@@ -13169,7 +13270,7 @@ async fn load_latest_session(mem: &dyn Memory) -> Result<Option<session::ChatSes
         .map_err(|e| anyhow::anyhow!("failed to list saved sessions: {e}"))?;
     // Find entries with the session prefix, parse (corrupt exact entry -> Err) and sort by updated_at.
     let mut sessions: Vec<session::ChatSession> = collect_valid_sessions(&entries)?;
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sort_saved_sessions_newest_first(&mut sessions);
     Ok(sessions.into_iter().next())
 }
 
@@ -13320,8 +13421,17 @@ async fn saved_chat_sessions(mem: &dyn Memory) -> Result<Vec<session::ChatSessio
         .await
         .map_err(|e| anyhow::anyhow!("failed to list saved chat sessions: {e}"))?;
     let mut sessions = collect_valid_sessions(&entries)?;
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sort_saved_sessions_newest_first(&mut sessions);
     Ok(sessions)
+}
+
+fn sort_saved_sessions_newest_first(sessions: &mut [session::ChatSession]) {
+    sessions.sort_by(|a, b| {
+        b.updated_at
+            .cmp(&a.updated_at)
+            .then_with(|| b.created_at.cmp(&a.created_at))
+            .then_with(|| b.id.cmp(&a.id))
+    });
 }
 
 fn parse_turn_boundary(raw: &str, turn_count: usize, command: &str) -> std::result::Result<usize, String> {
@@ -14355,7 +14465,7 @@ async fn list_saved_sessions(mem: &dyn Memory) -> Result<()> {
     // C4: surface storage Err instead of unwrap_or_default printing a misleading
     // "No saved sessions"; corrupt exact entries propagate as Err (D10).
     let mut sessions: Vec<session::ChatSession> = collect_valid_sessions(&entries)?;
-    sessions.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    sort_saved_sessions_newest_first(&mut sessions);
 
     if sessions.is_empty() {
         println!("No saved sessions.");
@@ -17358,6 +17468,27 @@ mod p3_directional_switch_tests {
             crate::chat::turn_scheduler::TurnTaskState::Running,
             "delayed exit must not cancel or complete the active provider turn"
         );
+    }
+
+    #[test]
+    fn persistence_dependent_commands_cover_terminal_session_contract() {
+        for command in [
+            "/exit",
+            "/quit",
+            "/apply",
+            "/cost",
+            "/export",
+            "/resume",
+            "/resume last",
+            "/branch 1",
+            "/rewind 0",
+            "/priority /cost",
+        ] {
+            assert!(is_persistence_dependent_command(command), "{command}");
+        }
+        for command in ["hello", "/help", "/workers", "/queue status"] {
+            assert!(!is_persistence_dependent_command(command), "{command}");
+        }
     }
 
     #[cfg(feature = "terminal-tui")]

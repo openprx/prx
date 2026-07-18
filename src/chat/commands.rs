@@ -612,7 +612,7 @@ pub(crate) fn format_cost_feedback(chat_session: &session::ChatSession) -> Strin
     };
 
     format!(
-        "Session cost:\n  Turns:             {}\n  Metered requests:  {}\n  Prompt tokens:     {} (incl. cache)\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}{cache_detail}",
+        "Session cost:\n  Turns:        {}\n  Metered requests:  {}\n  Prompt tokens:     {} (incl. cache)\n  Completion tokens: {}\n  Total tokens:      {total_prefix}{}\n  Source split:      real {}, est ~{}\n  Cost:              {cost}{cache_detail}",
         chat_session.turn_count(),
         summary.request_count,
         session::format_token_count_compact(summary.prompt_tokens),
@@ -1471,10 +1471,7 @@ mod mode_tests {
 
         let text = command_output(super::dispatch("/cost", &ctx).await);
 
-        assert!(
-            text.contains("Turns:             2"),
-            "cost should report 2 turns: {text}"
-        );
+        assert!(text.contains("Turns:        2"), "cost should report 2 turns: {text}");
         assert!(
             text.contains("Prompt tokens:     1.0k (incl. cache)"),
             "prompt tokens missing: {text}"
@@ -1636,7 +1633,7 @@ mod mode_tests {
         let text = command_output(super::dispatch("/cost", &ctx).await);
 
         assert!(
-            text.contains("Turns:             0"),
+            text.contains("Turns:        0"),
             "empty session cost must be 0 turns: {text}"
         );
         assert!(
