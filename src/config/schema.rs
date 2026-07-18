@@ -5071,6 +5071,8 @@ pub struct EuAiActComplianceConfig {
     pub classification: EuAiActClassificationConfig,
     #[serde(default)]
     pub declaration: DeclarationOfConformityConfig,
+    #[serde(default)]
+    pub incident_store_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]

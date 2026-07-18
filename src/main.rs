@@ -277,6 +277,47 @@ enum AuditCommands {
         #[arg(long)]
         signature_reference: String,
     },
+    /// Create a durable Article 73 serious-incident record from a JSON input file
+    #[command(name = "incident-create")]
+    IncidentCreate {
+        /// JSON file containing the incident classification and ownership fields
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Record or replace the initial report for an open serious incident
+    #[command(name = "incident-initial-report")]
+    IncidentInitialReport {
+        incident_id: String,
+        /// UTF-8 file containing the initial report
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Append supplemental facts to a serious incident
+    #[command(name = "incident-supplement")]
+    IncidentSupplement {
+        incident_id: String,
+        /// UTF-8 file containing the supplement
+        #[arg(long)]
+        input: PathBuf,
+    },
+    /// Close a serious incident with an explicit timestamp and summary
+    #[command(name = "incident-close")]
+    IncidentClose {
+        incident_id: String,
+        /// RFC 3339 closure timestamp
+        #[arg(long)]
+        closed_at: String,
+        /// UTF-8 file containing the closure summary
+        #[arg(long)]
+        summary: PathBuf,
+    },
+    /// Export an incident, supplements, and immutable audit-event hashes
+    #[command(name = "incident-export")]
+    IncidentExport {
+        incident_id: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -1443,6 +1484,16 @@ fn declaration_artifact_path(config: &Config) -> Option<PathBuf> {
         })
 }
 
+fn incident_store_path(config: &Config) -> Option<PathBuf> {
+    config.compliance.eu_ai_act.incident_store_path.as_ref().map(|path| {
+        if path.is_absolute() {
+            path.clone()
+        } else {
+            config.workspace_dir.join(path)
+        }
+    })
+}
+
 fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
     let observed_at = chrono::Utc::now().to_rfc3339();
     let config_revision = config_source_revision(config);
@@ -1552,6 +1603,46 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
                 ControlStatus::Fail,
                 "declaration-of-conformity:path-missing".to_string(),
                 "High-risk classification is recorded, but no declaration artifact path is configured.".to_string(),
+            ),
+        },
+    };
+    let (incident_status, incident_evidence, incident_explanation) = match eu_classification.status {
+        config::schema::EuAiActRiskClassification::Unclassified => (
+            ControlStatus::Unknown,
+            "classification:unclassified".to_string(),
+            "The incident workflow cannot be evaluated until a named owner classifies the deployment."
+                .to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::NotHighRisk => (
+            ControlStatus::NotApplicable,
+            format!(
+                "classification:owner={}:assessed_at={}",
+                eu_classification.owner.as_deref().unwrap_or("missing"),
+                eu_classification.assessed_at.as_deref().unwrap_or("missing")
+            ),
+            "The recorded operator/legal classification says Article 73 is not applicable to this deployment."
+                .to_string(),
+        ),
+        config::schema::EuAiActRiskClassification::HighRisk => match incident_store_path(config) {
+            Some(path) => match openprx::compliance::incident::verify_incident_store(&path) {
+                Ok(evidence) => (
+                    ControlStatus::Pass,
+                    evidence,
+                    "The durable store schema and open-incident initial-report deadlines were verified read-only."
+                        .to_string(),
+                ),
+                Err(_) => (
+                    ControlStatus::Fail,
+                    "article-73-incidents:verification-failed".to_string(),
+                    "The configured incident store is missing, incompatible, or contains an overdue open incident without an initial report."
+                        .to_string(),
+                ),
+            },
+            None => (
+                ControlStatus::Fail,
+                "article-73-incidents:path-missing".to_string(),
+                "High-risk classification is recorded, but no durable incident store path is configured."
+                    .to_string(),
             ),
         },
     };
@@ -1821,11 +1912,11 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             "M04",
             "Article 73",
             "Serious-incident workflow",
-            ControlStatus::Fail,
-            "runtime_control",
-            "serious-incident-workflow:not_implemented",
-            "No evidence-bearing conditional-deadline workflow is currently available.",
-            "Implement awareness, classification, 2/10/15-day deadlines, supplements, and closure records.",
+            incident_status,
+            "incident_store",
+            incident_evidence,
+            incident_explanation,
+            "Configure the durable incident store and use the incident CLI to record awareness, classification, reports, supplements, and closure.",
         ),
     ];
     checks.sort_by_key(|check| check.id);
@@ -2013,6 +2104,70 @@ fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result
                     "payload_sha256": artifact.payload_sha256,
                     "signature_status": artifact.signature.status,
                     "submitted": artifact.signature.submitted,
+                })
+            );
+            Ok(())
+        }
+        AuditCommands::IncidentCreate { input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let bytes =
+                fs::read(&input).with_context(|| format!("Failed to read incident input {}", input.display()))?;
+            let request = serde_json::from_slice(&bytes).context("Failed to parse incident input JSON")?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.create(request)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentInitialReport { incident_id, input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let report = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read initial report {}", input.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.set_initial_report(&incident_id, &report)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentSupplement { incident_id, input } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let content = fs::read_to_string(&input)
+                .with_context(|| format!("Failed to read incident supplement {}", input.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let supplement = store.add_supplement(&incident_id, &content)?;
+            println!("{}", serde_json::to_string_pretty(&supplement)?);
+            Ok(())
+        }
+        AuditCommands::IncidentClose {
+            incident_id,
+            closed_at,
+            summary,
+        } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let closed_at = chrono::DateTime::parse_from_rfc3339(&closed_at)
+                .context("--closed-at must be RFC 3339")?
+                .with_timezone(&Utc);
+            let summary = fs::read_to_string(&summary)
+                .with_context(|| format!("Failed to read closure summary {}", summary.display()))?;
+            let mut store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let record = store.close(&incident_id, closed_at, &summary)?;
+            println!("{}", serde_json::to_string_pretty(&record)?);
+            Ok(())
+        }
+        AuditCommands::IncidentExport { incident_id, output } => {
+            let path = incident_store_path(config).context("compliance.eu_ai_act.incident_store_path is required")?;
+            let output = if output.is_absolute() {
+                output
+            } else {
+                config.workspace_dir.join(output)
+            };
+            let store = openprx::compliance::incident::IncidentStore::open(&path)?;
+            let export = store.export(&incident_id)?;
+            openprx::compliance::incident::write_incident_export(&output, &export)?;
+            println!(
+                "{}",
+                serde_json::json!({
+                    "artifact": output,
+                    "incident_id": incident_id,
+                    "automatically_submitted": export.automatically_submitted,
                 })
             );
             Ok(())
@@ -2674,6 +2829,37 @@ mod tests {
     }
 
     #[test]
+    fn incident_audit_cli_parses_mutating_and_export_commands() {
+        let create = Cli::try_parse_from(["prx", "audit", "incident-create", "--input", "incident.json"])
+            .expect("incident create should parse");
+        assert!(matches!(
+            create.command,
+            Commands::Audit {
+                audit_command: AuditCommands::IncidentCreate { input }
+            } if input == std::path::Path::new("incident.json")
+        ));
+
+        let export = Cli::try_parse_from([
+            "prx",
+            "audit",
+            "incident-export",
+            "incident-7",
+            "--output",
+            "incident-7-export.json",
+        ])
+        .expect("incident export should parse");
+        assert!(matches!(
+            export.command,
+            Commands::Audit {
+                audit_command: AuditCommands::IncidentExport {
+                    incident_id,
+                    output,
+                }
+            } if incident_id == "incident-7" && output == std::path::Path::new("incident-7-export.json")
+        ));
+    }
+
+    #[test]
     fn declaration_attestation_respects_operator_classification() {
         let mut config = Config::default();
         let c02_status = |config: &Config| {
@@ -2693,6 +2879,28 @@ mod tests {
 
         config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
         assert_eq!(c02_status(&config), ControlStatus::Fail);
+    }
+
+    #[test]
+    fn incident_attestation_requires_and_verifies_durable_store_for_high_risk() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store_path = temp.path().join("article-73.sqlite3");
+        let mut config = Config::default();
+        config.compliance.eu_ai_act.classification.status = config::schema::EuAiActRiskClassification::HighRisk;
+
+        let m04_status = |config: &Config| {
+            build_eu_ai_act_attestation(config)
+                .checks
+                .into_iter()
+                .find(|check| check.id == "M04")
+                .expect("M04 control")
+                .status
+        };
+        assert_eq!(m04_status(&config), ControlStatus::Fail);
+
+        config.compliance.eu_ai_act.incident_store_path = Some(store_path.clone());
+        openprx::compliance::incident::IncidentStore::open(&store_path).unwrap();
+        assert_eq!(m04_status(&config), ControlStatus::Pass);
     }
 
     #[test]
