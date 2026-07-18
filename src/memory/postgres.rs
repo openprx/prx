@@ -6339,13 +6339,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(visible_a.len(), 1);
-        assert_eq!(visible_a[0].key, "vector-owner-a");
+        assert_eq!(visible_a.first().unwrap().key, "vector-owner-a");
         let visible_b = mem
             .recall_with_context("isolation-token", 10, None, Some(&owner_b))
             .await
             .unwrap();
         assert_eq!(visible_b.len(), 1);
-        assert_eq!(visible_b[0].key, "vector-owner-b");
+        assert_eq!(visible_b.first().unwrap().key, "vector-owner-b");
         assert!(
             mem.recall_with_context("isolation-token", 10, None, Some(&other_workspace))
                 .await

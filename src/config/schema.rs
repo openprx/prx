@@ -480,6 +480,7 @@ impl std::fmt::Debug for Config {
             .field("media", &self.media)
             .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
+            .field("compliance", &self.compliance)
             .field("modules", &self.modules)
             .field("tool_tiering", &self.tool_tiering)
             .finish()

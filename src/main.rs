@@ -1494,6 +1494,61 @@ fn incident_store_path(config: &Config) -> Option<PathBuf> {
     })
 }
 
+fn verified_declaration_control(config: &Config) -> (ControlStatus, String, String) {
+    let Some(path) = declaration_artifact_path(config) else {
+        return (
+            ControlStatus::Fail,
+            "declaration-of-conformity:path-missing".to_string(),
+            "High-risk classification is recorded, but no declaration artifact path is configured.".to_string(),
+        );
+    };
+    openprx::compliance::declaration::verify_declaration_artifact(&path).map_or_else(
+        |_| {
+            (
+                ControlStatus::Fail,
+                "declaration-of-conformity:verification-failed".to_string(),
+                "The configured declaration artifact is missing, incomplete, or has a mismatched hash.".to_string(),
+            )
+        },
+        |evidence| {
+            (
+                ControlStatus::Pass,
+                evidence,
+                "Artifact structure/hash and an operator-supplied external signature reference were verified; PRX did not validate signature authenticity or submission."
+                    .to_string(),
+            )
+        },
+    )
+}
+
+fn verified_incident_control(config: &Config) -> (ControlStatus, String, String) {
+    let Some(path) = incident_store_path(config) else {
+        return (
+            ControlStatus::Fail,
+            "article-73-incidents:path-missing".to_string(),
+            "High-risk classification is recorded, but no durable incident store path is configured.".to_string(),
+        );
+    };
+    openprx::compliance::incident::verify_incident_store(&path).map_or_else(
+        |_| {
+            (
+                ControlStatus::Fail,
+                "article-73-incidents:verification-failed".to_string(),
+                "The configured incident store is missing, incompatible, or contains an overdue open incident without an initial report."
+                    .to_string(),
+            )
+        },
+        |evidence| {
+            (
+                ControlStatus::Pass,
+                evidence,
+                "The durable store schema and open-incident initial-report deadlines were verified read-only."
+                    .to_string(),
+            )
+        },
+    )
+}
+
 fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
     let observed_at = chrono::Utc::now().to_rfc3339();
     let config_revision = config_source_revision(config);
@@ -1585,33 +1640,13 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             ),
             "The recorded operator/legal classification says this deployment is not a high-risk AI system.".to_string(),
         ),
-        config::schema::EuAiActRiskClassification::HighRisk => match declaration_artifact_path(config) {
-            Some(path) => match openprx::compliance::declaration::verify_declaration_artifact(&path) {
-                Ok(evidence) => (
-                    ControlStatus::Pass,
-                    evidence,
-                    "Artifact structure/hash and an operator-supplied external signature reference were verified; PRX did not validate signature authenticity or submission."
-                        .to_string(),
-                ),
-                Err(_) => (
-                    ControlStatus::Fail,
-                    "declaration-of-conformity:verification-failed".to_string(),
-                    "The configured declaration artifact is missing, incomplete, or has a mismatched hash.".to_string(),
-                ),
-            },
-            None => (
-                ControlStatus::Fail,
-                "declaration-of-conformity:path-missing".to_string(),
-                "High-risk classification is recorded, but no declaration artifact path is configured.".to_string(),
-            ),
-        },
+        config::schema::EuAiActRiskClassification::HighRisk => verified_declaration_control(config),
     };
     let (incident_status, incident_evidence, incident_explanation) = match eu_classification.status {
         config::schema::EuAiActRiskClassification::Unclassified => (
             ControlStatus::Unknown,
             "classification:unclassified".to_string(),
-            "The incident workflow cannot be evaluated until a named owner classifies the deployment."
-                .to_string(),
+            "The incident workflow cannot be evaluated until a named owner classifies the deployment.".to_string(),
         ),
         config::schema::EuAiActRiskClassification::NotHighRisk => (
             ControlStatus::NotApplicable,
@@ -1623,28 +1658,7 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             "The recorded operator/legal classification says Article 73 is not applicable to this deployment."
                 .to_string(),
         ),
-        config::schema::EuAiActRiskClassification::HighRisk => match incident_store_path(config) {
-            Some(path) => match openprx::compliance::incident::verify_incident_store(&path) {
-                Ok(evidence) => (
-                    ControlStatus::Pass,
-                    evidence,
-                    "The durable store schema and open-incident initial-report deadlines were verified read-only."
-                        .to_string(),
-                ),
-                Err(_) => (
-                    ControlStatus::Fail,
-                    "article-73-incidents:verification-failed".to_string(),
-                    "The configured incident store is missing, incompatible, or contains an overdue open incident without an initial report."
-                        .to_string(),
-                ),
-            },
-            None => (
-                ControlStatus::Fail,
-                "article-73-incidents:path-missing".to_string(),
-                "High-risk classification is recorded, but no durable incident store path is configured."
-                    .to_string(),
-            ),
-        },
+        config::schema::EuAiActRiskClassification::HighRisk => verified_incident_control(config),
     };
 
     let mut checks = vec![
@@ -2081,7 +2095,7 @@ fn handle_audit_command(audit_command: AuditCommands, config: &Config) -> Result
                         config.workspace_dir.join(path)
                     }
                 })
-                .or(configured_path.clone())
+                .or_else(|| configured_path.clone())
                 .context(
                     "declaration output is required via --output or compliance.eu_ai_act.declaration.artifact_path",
                 )?;
@@ -2925,11 +2939,19 @@ mod tests {
             value.get("report_type").and_then(serde_json::Value::as_str),
             Some("EU AI Act implementation attestation")
         );
-        let c02 = value["checks"]
-            .as_array()
-            .and_then(|checks| checks.iter().find(|check| check["id"] == "C02"))
+        let c02 = value
+            .get("checks")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|checks| {
+                checks
+                    .iter()
+                    .find(|check| check.get("id").and_then(serde_json::Value::as_str) == Some("C02"))
+            })
             .expect("C02 control should exist");
-        assert_eq!(c02["framework_reference"], "Article 47 and Annex V");
+        assert_eq!(
+            c02.get("framework_reference").and_then(serde_json::Value::as_str),
+            Some("Article 47 and Annex V")
+        );
     }
 
     #[test]
