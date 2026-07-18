@@ -408,6 +408,10 @@ impl Principal {
 
 #[derive(Debug, Clone, Default)]
 pub struct MemoryWriteContext {
+    /// Canonical workspace supplied by the runtime envelope/trusted tool scope.
+    /// PostgreSQL uses it as transaction-local RLS context; it must never be
+    /// inferred from model-authored arguments.
+    pub workspace_id: Option<String>,
     pub channel: Option<String>,
     pub chat_type: Option<String>,
     pub chat_id: Option<String>,
@@ -734,6 +738,7 @@ mod tests {
         let principal = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
                 chat_id: Some("chat-1".into()),
@@ -750,6 +755,7 @@ mod tests {
     #[test]
     fn owner_principal_from_write_context_uses_sender_id_as_stable_anchor() {
         let ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("dm".into()),
             chat_id: Some("chat-1".into()),
@@ -788,6 +794,7 @@ mod tests {
         let principal = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
                 chat_id: Some("chat-ak".into()),
@@ -827,6 +834,7 @@ mod tests {
         let anonymous = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
                 chat_id: Some("chat-a".into()),
@@ -838,6 +846,7 @@ mod tests {
         let member = resolve_principal(
             &conn,
             &MemoryWriteContext {
+                workspace_id: Some("workspace-a".into()),
                 channel: Some("signal".into()),
                 chat_type: Some("dm".into()),
                 chat_id: Some("chat-m".into()),
@@ -868,6 +877,7 @@ mod tests {
             acl_enforced: true,
         };
         let ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("group".into()),
             chat_id: Some("group:1".into()),
@@ -897,6 +907,7 @@ mod tests {
             acl_enforced: false,
         };
         let ctx = MemoryWriteContext {
+            workspace_id: Some("workspace-a".into()),
             channel: Some("signal".into()),
             chat_type: Some("dm".into()),
             chat_id: Some("chat-ak".into()),

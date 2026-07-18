@@ -193,6 +193,7 @@ pub struct ExternalAgentIdentity {
     external_subject: String,
     external_issuer: String,
     auth_method: String,
+    workspace_id: String,
     prx_owner_id: String,
     prx_principal_id: String,
 }
@@ -794,6 +795,7 @@ fn external_identity_for(
         external_subject: external_subject.to_string(),
         external_issuer: external_issuer.to_string(),
         auth_method: auth_method.to_string(),
+        workspace_id: workspace_id.to_string(),
         prx_owner_id: format!("owner:{workspace_id}:{principal_id}"),
         prx_principal_id: principal_id,
     }
@@ -818,6 +820,7 @@ fn inject_trusted_scope(args: Value, identity: &ExternalAgentIdentity) -> Value 
         map.insert(
             "_zc_scope".to_string(),
             serde_json::json!({
+                "workspace_id": identity.workspace_id,
                 "owner_id": identity.prx_owner_id,
                 "principal_id": identity.prx_principal_id,
                 "channel": "mcp",

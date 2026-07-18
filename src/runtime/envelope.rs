@@ -690,6 +690,7 @@ impl RuntimeEnvelope {
         let recipient = self.recipient.as_deref().filter(|value| !value.is_empty());
         let owner_principal = self.owner_principal();
         MemoryWriteContext {
+            workspace_id: Some(self.workspace_id.clone()),
             channel: self.channel.clone(),
             chat_type: Some(chat_type.into()),
             chat_id: Some(recipient.unwrap_or(self.session_key.as_str()).to_string()),

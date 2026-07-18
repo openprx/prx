@@ -54,8 +54,13 @@ fn parse_scope_ctx(args: &serde_json::Value) -> Option<MemoryWriteContext> {
         .get("owner_id")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string);
+    let workspace_id = scope
+        .get("workspace_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
 
     Some(MemoryWriteContext {
+        workspace_id,
         channel,
         chat_type,
         chat_id,

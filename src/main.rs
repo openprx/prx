@@ -1434,6 +1434,42 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
         ControlStatus::Warning
     };
     let postgres = config.memory.backend == "postgres" || config.storage.provider.config.provider == "postgres";
+    let (vector_isolation_status, vector_isolation_evidence, vector_isolation_explanation) = if postgres {
+        let storage = &config.storage.provider.config;
+        match storage.db_url.as_deref().map(|db_url| {
+            memory::postgres::PostgresMemory::verify_vector_isolation(
+                db_url,
+                &storage.schema,
+                &storage.table,
+                storage.connect_timeout_secs,
+            )
+        }) {
+            Some(Ok(evidence)) => (
+                ControlStatus::Pass,
+                evidence,
+                "Migration 21 and forced RLS policies were verified read-only on all PostgreSQL vector tables."
+                    .to_string(),
+            ),
+            Some(Err(_)) => (
+                ControlStatus::Fail,
+                "postgres:vector-isolation:verification-failed".to_string(),
+                "PostgreSQL is configured, but live migration/RLS evidence could not be verified.".to_string(),
+            ),
+            None => (
+                ControlStatus::Fail,
+                "postgres:vector-isolation:db-url-missing".to_string(),
+                "PostgreSQL is configured without the connection data required for read-only evidence verification."
+                    .to_string(),
+            ),
+        }
+    } else {
+        (
+            ControlStatus::NotApplicable,
+            "backend:not-postgres".to_string(),
+            "PostgreSQL vector RLS is not applicable to this backend; application owner isolation is evaluated separately."
+                .to_string(),
+        )
+    };
     let notice = &config.compliance.interaction_notice;
     let (notice_status, notice_explanation) = match notice.applicability {
         config::schema::InteractionNoticeApplicability::NotApplicable => (
@@ -1623,18 +1659,10 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             "A04",
             "Article 15 internal security control",
             "Vector owner/tenant isolation",
-            if postgres {
-                ControlStatus::Fail
-            } else {
-                ControlStatus::NotApplicable
-            },
-            "config_revision",
-            &config_evidence,
-            if postgres {
-                "PostgreSQL is configured but RLS evidence is not available."
-            } else {
-                "PostgreSQL vector RLS is not applicable to this backend; application owner isolation is evaluated separately."
-            },
+            vector_isolation_status,
+            "postgres_runtime_evidence",
+            vector_isolation_evidence,
+            vector_isolation_explanation,
             "Install authoritative RLS policies and attach cross-owner negative-test evidence.",
         ),
         attestation_check(
