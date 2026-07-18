@@ -1,7 +1,8 @@
 # PRX LLM Provider and Model Upgrade Checklist
 
 Audit date: 2026-07-18. Implementation branch:
-`feat/llm-provider-upgrade`. The distinction between source verification,
+`feat/llm-provider-upgrade`; merged to `main` by `5e80192a`, with the 0.8.13
+release commit at `b549382c`. The distinction between source verification,
 adapter tests, and credential-backed live acceptance is intentional.
 
 ## Runtime baseline
@@ -85,5 +86,22 @@ credential resolver probe (200 / three models) and successful K3 requests.
   produce the same 7 pre-existing `tests/chat_pty_e2e.rs` session/resume
   harness failures (24 pass, 7 fail, 1 ignored); all 5,776 library tests pass
   serially (7 ignored). This is not introduced by the provider upgrade.
-- [ ] Deployment. The worktree binary passed tmux `demo:provider-upgrade`
-  acceptance; replacing the deployed binary remains a separate release action.
+- [x] Deployment. Release binary `prx 0.8.13` was built from `b549382c` and
+  installed at `/home/ck/.cargo/bin/prx`; SHA-256
+  `65cf35729da8c8af58cbf2cfff4feac4e20092cc3a4cf6e6f66ddade34ed4ab1`.
+  `prx.service` restarted healthy with K3 as its active model.
+- [x] Deployed runtime regression: doctor returned 20 ok / 2 warnings / 0
+  errors; runtime doctor returned 16 ok / 3 warnings / 0 errors and verified
+  the authoritative SQLite ledger at 15 migrations; live Kimi catalog returned
+  the three official IDs; deployed text and tool probes returned
+  `DEPLOY_K3_OK` and `DEPLOY_TOOL_OK`.
+- [x] Deployed interactive acceptance: `/home/ck/.cargo/bin/prx chat --plain -p
+  kimi-code -m k3` returned `DEPLOY_TMUX_STREAM_OK`; proof remains capturable in
+  tmux `demo:provider-deploy`.
+- [x] Rollback artifacts retained at
+  `/home/ck/.cargo/bin/prx.rollback-0.8.12-20260718-provider-upgrade` and
+  `/home/ck/.openprx/config.toml.rollback-0.8.12-20260718-provider-upgrade`.
+- [x] Migration contract checked. `prx migrate baseline` is intentionally
+  disabled because the legacy synthetic ledger is read-only evidence; backend
+  startup owns migration, and `doctor runtime` verified the authoritative
+  ledger after restart.
