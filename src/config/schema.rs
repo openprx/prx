@@ -1649,6 +1649,33 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
 
     // Anthropic models
     prices.insert(
+        "anthropic/claude-sonnet-5".into(),
+        ModelPricing {
+            input: 3.0,
+            output: 15.0,
+            cache_write: 3.75,
+            cache_read: 0.30,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-opus-4-8".into(),
+        ModelPricing {
+            input: 5.0,
+            output: 25.0,
+            cache_write: 6.25,
+            cache_read: 0.50,
+        },
+    );
+    prices.insert(
+        "anthropic/claude-haiku-4-5-20251001".into(),
+        ModelPricing {
+            input: 1.0,
+            output: 5.0,
+            cache_write: 1.25,
+            cache_read: 0.10,
+        },
+    );
+    prices.insert(
         "anthropic/claude-sonnet-4-20250514".into(),
         ModelPricing {
             input: 3.0,
@@ -1686,6 +1713,22 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     );
 
     // OpenAI models
+    for (model, input, output) in [
+        ("gpt-5.6", 5.0, 30.0),
+        ("gpt-5.6-sol", 5.0, 30.0),
+        ("gpt-5.6-terra", 2.5, 15.0),
+        ("gpt-5.6-luna", 1.0, 6.0),
+    ] {
+        prices.insert(
+            format!("openai/{model}"),
+            ModelPricing {
+                input,
+                output,
+                cache_write: 0.0,
+                cache_read: 0.0,
+            },
+        );
+    }
     prices.insert(
         "openai/gpt-4o".into(),
         ModelPricing {
@@ -1715,6 +1758,24 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
     );
 
     // Google models
+    prices.insert(
+        "google/gemini-3.1-pro-preview".into(),
+        ModelPricing {
+            input: 2.0,
+            output: 12.0,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
+    prices.insert(
+        "google/gemini-3.1-flash-lite".into(),
+        ModelPricing {
+            input: 0.25,
+            output: 1.50,
+            cache_write: 0.0,
+            cache_read: 0.0,
+        },
+    );
     prices.insert(
         "google/gemini-2.0-flash".into(),
         ModelPricing {
@@ -1747,11 +1808,9 @@ fn get_default_pricing() -> std::collections::HashMap<String, ModelPricing> {
             },
         );
     };
-    insert_kimi("kimi-code", "kimi-k2.7-code", 0.95, 4.0, 0.19);
-    insert_kimi("kimi-code", "kimi-k2.7-code-highspeed", 1.90, 8.0, 0.38);
-    insert_kimi("kimi-code", "kimi2.6", 0.95, 4.0, 0.16);
-    insert_kimi("kimi-code", "kimi-k2.6", 0.95, 4.0, 0.16);
-    insert_kimi("kimi-code", "kimi-k2.5", 0.60, 3.0, 0.10);
+    // Kimi Code is subscription/quota billed. Do not synthesize token prices
+    // for the coding endpoint aliases; Moonshot API-platform prices remain
+    // separate below.
     insert_kimi("moonshot", "kimi-k2.6", 0.95, 4.0, 0.16);
     insert_kimi("moonshot", "kimi-k2.5", 0.60, 3.0, 0.10);
 

@@ -1687,7 +1687,7 @@ fn create_provider_with_url_and_options(
         }
         name if is_huggingface_alias(name) => Ok(Box::new(OpenAiCompatibleProvider::new(
             "Hugging Face",
-            "https://api-inference.huggingface.co/v1",
+            "https://router.huggingface.co/v1",
             key,
             AuthStyle::Bearer,
         ))),
@@ -2121,13 +2121,7 @@ fn canonical_provider_info(provider_name: &str) -> Option<ProviderInfo> {
     })
 }
 
-const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &[
-    "kimi2.6",
-    "kimi-for-coding",
-    "kimi-k2.5",
-    "kimi-k2.7-code",
-    "kimi-k2.7-code-highspeed",
-];
+const KIMI_CODE_SUPPORTED_MODELS: &[&str] = &["k3", "kimi-for-coding", "kimi-for-coding-highspeed"];
 
 /// Validate model IDs that PRX can safely validate locally.
 ///
@@ -3473,17 +3467,17 @@ mod tests {
 
     #[test]
     fn validate_provider_model_rejects_unknown_kimi_code_model() {
-        assert!(validate_provider_model("kimi-code", "kimi2.6").is_ok());
+        assert!(validate_provider_model("kimi-code", "k3").is_ok());
         assert!(validate_provider_model("kimi_coding", "kimi-for-coding").is_ok());
-        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_ok());
-        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code-highspeed").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-for-coding-highspeed").is_ok());
+        assert!(validate_provider_model("kimi-code", "kimi-k2.7-code").is_err());
 
         let err = validate_provider_model("kimi-code", "definitely-not-a-real-model")
             .expect_err("unknown Kimi Code model should fail local validation")
             .to_string();
 
         assert!(err.contains("invalid model 'definitely-not-a-real-model'"));
-        assert!(err.contains("kimi2.6"));
+        assert!(err.contains("k3"));
     }
 
     /// OpenRouter is a model aggregator: it must accept any `org/model` style
