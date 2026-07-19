@@ -73,6 +73,20 @@ const IDEMPOTENCY_REPLAY_BUDGET_BYTES: usize = 32 * 1024 * 1024;
 /// purpose: `main.rs`'s private `RUNTIME_SHUTDOWN_TIMEOUT` is unreachable from
 /// the lib crate.
 const GATEWAY_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Refresh required gateway liveness independently of inbound traffic. This is
+/// deliberately shorter than the daemon's 60-second core-health TTL.
+const GATEWAY_HEALTH_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+
+async fn run_health_heartbeat(component: &'static str, interval: Duration, shutdown: CancellationToken) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => crate::health::touch_component(component),
+            () = shutdown.cancelled() => break,
+        }
+    }
+}
 
 fn webhook_memory_key(idempotency_digest: Option<&str>) -> String {
     idempotency_digest.map_or_else(
@@ -1567,6 +1581,16 @@ pub async fn run_gateway(
     // gateway readiness boundary.
     crate::health::mark_component_ok("gateway");
 
+    // A quiet listener is still a live listener. Refresh gateway health from an
+    // owner-controlled heartbeat rather than relying on `/health` requests to
+    // keep the required component fresh.
+    let health_shutdown = CancellationToken::new();
+    let health_heartbeat = tokio::spawn(run_health_heartbeat(
+        "gateway",
+        GATEWAY_HEALTH_HEARTBEAT_INTERVAL,
+        health_shutdown.clone(),
+    ));
+
     // Run the server with graceful shutdown (D5/D9 step 3, DEV-02). On root token
     // cancellation axum stops accepting and drains in-flight requests. The drain
     // bound must only start counting *after* shutdown is requested — never while
@@ -1578,8 +1602,8 @@ pub async fn run_gateway(
         .with_graceful_shutdown(async move { shutdown.cancelled().await })
         .into_future();
     tokio::pin!(serve_fut);
-    tokio::select! {
-        res = &mut serve_fut => res?,
+    let serve_result = tokio::select! {
+        res = &mut serve_fut => res,
         _ = async {
             drain_deadline.cancelled().await;
             tokio::time::sleep(GATEWAY_GRACEFUL_TIMEOUT).await;
@@ -1588,8 +1612,13 @@ pub async fn run_gateway(
                 timeout_secs = GATEWAY_GRACEFUL_TIMEOUT.as_secs(),
                 "gateway graceful shutdown timed out; forcing exit"
             );
+            Ok(())
         }
-    }
+    };
+
+    health_shutdown.cancel();
+    let _ = health_heartbeat.await;
+    serve_result?;
 
     crate::health::mark_component_stopping("gateway");
     crate::health::mark_component_stopped("gateway");
@@ -2944,6 +2973,34 @@ mod tests {
     #[test]
     fn security_api_body_limit_supports_media_batch_uploads() {
         assert!(MAX_API_BODY_SIZE >= (10 * 20 * 1024 * 1024));
+    }
+
+    #[tokio::test]
+    async fn gateway_health_heartbeat_refreshes_without_requests() {
+        const COMPONENT: &str = "gateway-heartbeat-test";
+        crate::health::register_component(
+            COMPONENT,
+            "gateway",
+            true,
+            Duration::from_secs(1),
+            crate::health::ComponentState::Ready,
+        );
+        let before = crate::health::snapshot().components[COMPONENT].updated_at.clone();
+        let shutdown = CancellationToken::new();
+        let heartbeat = tokio::spawn(run_health_heartbeat(
+            COMPONENT,
+            Duration::from_millis(5),
+            shutdown.clone(),
+        ));
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        shutdown.cancel();
+        heartbeat.await.unwrap();
+
+        let after = crate::health::snapshot().components[COMPONENT].clone();
+        assert!(after.fresh);
+        assert_eq!(after.state, crate::health::ComponentState::Ready);
+        assert_ne!(after.updated_at, before);
     }
 
     #[test]
