@@ -8,7 +8,7 @@
 //! - Observer resilience (INT-OA-01/02)
 //! - Gateway idempotency + public bind (INT-GS-06/07)
 //! - Gateway webhook filtering + idempotency (INT-GCW-02/04)
-//! - Runtime sandbox cascade (INT-TR-05)
+//! - Direct host-shell runtime construction (INT-TR-05)
 //! - Agent auto-save short message skip (INT-AM-02)
 //! - Scope rule channel filtering (INT-CS-02)
 //! - Channel mention-only filter (INT-CA-06)

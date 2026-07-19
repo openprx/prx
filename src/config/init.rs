@@ -687,7 +687,7 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 
         Spec::Full => r#"# Security configuration (full)
 # Permission model: a single [autonomy] section is the sole permission knob.
-# level = "full" grants maximum autonomy; the sandbox is disabled by default.
+# Host shell execution is direct and has no ACL or sandbox switch.
 
 [autonomy]
 level = "full"                         # read_only | supervised | full

@@ -42,7 +42,7 @@ pub enum ToolAdapterKind {
 
 /// Small raw execution port consumed by the application service.
 ///
-/// Backends expose descriptors and invocation only; policy, approval, sandbox
+/// Backends expose descriptors and invocation only; policy, approval, execution
 /// preparation, auditing, and typed outcomes remain service-owned.
 #[async_trait]
 pub trait ToolBackend: Send + Sync {
@@ -371,37 +371,36 @@ impl ApprovalStrategy for DenyApprovalStrategy {
     }
 }
 
-/// Prepared execution boundary returned by the sandbox stage.
+/// Prepared execution boundary returned by the preparation stage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ToolSandboxPermit {
+pub struct ToolExecutionPermit {
     pub strategy: String,
 }
 
 #[async_trait]
-pub trait ToolSandboxStrategy: Send + Sync {
+pub trait ToolExecutionPreparation: Send + Sync {
     async fn prepare(
         &self,
         descriptor: &ToolDescriptor,
         command: &ToolExecutionCommand,
         context: &ToolExecutionContext,
-    ) -> Result<ToolSandboxPermit, String>;
+    ) -> Result<ToolExecutionPermit, String>;
 }
 
-/// Migration strategy: the legacy native/MCP adapter retains its existing
-/// process sandbox and resource boundary, while the service still makes the
-/// sandbox stage explicit and auditable.
+/// Default preparation for native and MCP adapters. The service keeps readiness
+/// as an explicit auditable stage without claiming that it provides isolation.
 #[derive(Debug, Default)]
-pub struct AdapterOwnedSandboxStrategy;
+pub struct AdapterOwnedPreparation;
 
 #[async_trait]
-impl ToolSandboxStrategy for AdapterOwnedSandboxStrategy {
+impl ToolExecutionPreparation for AdapterOwnedPreparation {
     async fn prepare(
         &self,
         _descriptor: &ToolDescriptor,
         _command: &ToolExecutionCommand,
         _context: &ToolExecutionContext,
-    ) -> Result<ToolSandboxPermit, String> {
-        Ok(ToolSandboxPermit {
+    ) -> Result<ToolExecutionPermit, String> {
+        Ok(ToolExecutionPermit {
             strategy: "adapter_owned".to_string(),
         })
     }
@@ -415,7 +414,7 @@ pub enum ToolExecutionStatus {
     Failed,
     Denied,
     ApprovalDenied,
-    SandboxDenied,
+    PreparationDenied,
     UnknownTool,
     InvalidArguments,
     Cancelled,
@@ -433,7 +432,7 @@ pub struct ToolExecutionOutcome {
     pub model_content: String,
     pub result: Option<ToolResult>,
     pub error: Option<String>,
-    pub sandbox: Option<ToolSandboxPermit>,
+    pub preparation: Option<ToolExecutionPermit>,
     pub duration_ms: u64,
     #[serde(default)]
     pub replayed: bool,
@@ -507,7 +506,7 @@ fn tool_execution_abandonment_key(base_key: &str, attempt: u32) -> String {
 }
 
 /// Audit projection emitted exactly once for every service outcome, including
-/// resolution, policy, approval, sandbox, validation, and cancellation failures.
+/// resolution, policy, approval, preparation, validation, and cancellation failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolExecutionAuditRecord {
     pub operation_id: String,
@@ -517,7 +516,7 @@ pub struct ToolExecutionAuditRecord {
     pub effect: Option<ToolEffect>,
     pub decision: Option<ToolExecutionDecision>,
     pub status: ToolExecutionStatus,
-    pub sandbox_strategy: Option<String>,
+    pub preparation_strategy: Option<String>,
     pub input_sha256: String,
     pub source: String,
     pub workspace_id: String,
@@ -551,7 +550,7 @@ impl ToolExecutionAuditSink for TracingToolExecutionAudit {
             effect = ?record.effect,
             decision = ?record.decision,
             status = ?record.status,
-            sandbox = ?record.sandbox_strategy,
+            preparation = ?record.preparation_strategy,
             source = %record.source,
             workspace_id = %record.workspace_id,
             session_key = %record.session_key,
@@ -724,7 +723,7 @@ pub struct ToolExecutionService {
     catalog: ToolCatalog,
     policy: Arc<dyn EffectPolicy>,
     approval: Arc<dyn ApprovalStrategy>,
-    sandbox: Arc<dyn ToolSandboxStrategy>,
+    preparation: Arc<dyn ToolExecutionPreparation>,
     audit: Arc<dyn ToolExecutionAuditSink>,
     idempotency_memory: Option<Arc<dyn Memory>>,
     #[cfg(test)]
@@ -744,14 +743,14 @@ impl ToolExecutionService {
         tools: Vec<Arc<dyn Tool>>,
         policy: Arc<dyn EffectPolicy>,
         approval: Arc<dyn ApprovalStrategy>,
-        sandbox: Arc<dyn ToolSandboxStrategy>,
+        preparation: Arc<dyn ToolExecutionPreparation>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
         let backends = tools
             .into_iter()
             .map(|tool| Arc::new(LegacyToolAdapter::new(tool)) as Arc<dyn ToolBackend>)
             .collect();
-        Self::from_backends(backends, policy, approval, sandbox, audit)
+        Self::from_backends(backends, policy, approval, preparation, audit)
     }
 
     /// Assemble the service from raw execution ports.
@@ -760,7 +759,7 @@ impl ToolExecutionService {
         backends: Vec<Arc<dyn ToolBackend>>,
         policy: Arc<dyn EffectPolicy>,
         approval: Arc<dyn ApprovalStrategy>,
-        sandbox: Arc<dyn ToolSandboxStrategy>,
+        preparation: Arc<dyn ToolExecutionPreparation>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
         let catalog = ToolCatalog::from_backends(&backends);
@@ -769,7 +768,7 @@ impl ToolExecutionService {
             catalog,
             policy,
             approval,
-            sandbox,
+            preparation,
             audit,
             idempotency_memory: None,
             #[cfg(test)]
@@ -783,11 +782,11 @@ impl ToolExecutionService {
         tools: Vec<Box<dyn Tool>>,
         policy: Arc<dyn EffectPolicy>,
         approval: Arc<dyn ApprovalStrategy>,
-        sandbox: Arc<dyn ToolSandboxStrategy>,
+        preparation: Arc<dyn ToolExecutionPreparation>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
         let tools = tools.into_iter().map(Arc::<dyn Tool>::from).collect();
-        Self::new(tools, policy, approval, sandbox, audit)
+        Self::new(tools, policy, approval, preparation, audit)
     }
 
     /// Adapt a shared boxed registry without cloning or consuming stateful
@@ -797,7 +796,7 @@ impl ToolExecutionService {
         registry: Arc<Vec<Box<dyn Tool>>>,
         policy: Arc<dyn EffectPolicy>,
         approval: Arc<dyn ApprovalStrategy>,
-        sandbox: Arc<dyn ToolSandboxStrategy>,
+        preparation: Arc<dyn ToolExecutionPreparation>,
         audit: Arc<dyn ToolExecutionAuditSink>,
     ) -> Self {
         let backends = registry
@@ -810,7 +809,7 @@ impl ToolExecutionService {
                 }) as Arc<dyn ToolBackend>
             })
             .collect();
-        Self::from_backends(backends, policy, approval, sandbox, audit)
+        Self::from_backends(backends, policy, approval, preparation, audit)
     }
 
     /// Fail-closed convenience assembly for non-interactive callers.
@@ -820,7 +819,7 @@ impl ToolExecutionService {
             tools,
             Arc::new(SecurityEffectPolicy::new(policy)),
             Arc::new(DenyApprovalStrategy),
-            Arc::new(AdapterOwnedSandboxStrategy),
+            Arc::new(AdapterOwnedPreparation),
             Arc::new(TracingToolExecutionAudit),
         )
     }
@@ -873,7 +872,7 @@ impl ToolExecutionService {
         input_sha256: &str,
         descriptor: &ToolDescriptor,
         decision: ToolExecutionDecision,
-        sandbox: &ToolSandboxPermit,
+        preparation: &ToolExecutionPermit,
         started: Instant,
     ) -> Result<Option<ToolExecutionLease>, ToolExecutionOutcome> {
         let Some(idempotency_key) = command.idempotency_key.as_deref() else {
@@ -893,7 +892,7 @@ impl ToolExecutionService {
                 "Error: durable tool idempotency ledger is unavailable; refusing side effect".to_string(),
                 None,
                 Some("durable tool idempotency ledger is unavailable".to_string()),
-                Some(sandbox.clone()),
+                Some(preparation.clone()),
                 started,
             ));
         };
@@ -926,7 +925,7 @@ impl ToolExecutionService {
                         "Error: persisted tool terminal record is unreadable; refusing replay".to_string(),
                         None,
                         Some("persisted tool terminal record is unreadable".to_string()),
-                        Some(sandbox.clone()),
+                        Some(preparation.clone()),
                         started,
                     ));
                 };
@@ -942,7 +941,7 @@ impl ToolExecutionService {
                         "Error: idempotency key was already used for a different tool command".to_string(),
                         None,
                         Some("idempotency key command fingerprint mismatch".to_string()),
-                        Some(sandbox.clone()),
+                        Some(preparation.clone()),
                         started,
                     ));
                 }
@@ -960,7 +959,7 @@ impl ToolExecutionService {
                     format!("Error: unable to inspect tool idempotency ledger: {error}"),
                     None,
                     Some(error.to_string()),
-                    Some(sandbox.clone()),
+                    Some(preparation.clone()),
                     started,
                 ));
             }
@@ -990,7 +989,7 @@ impl ToolExecutionService {
                                 .to_string(),
                             None,
                             Some("persisted tool reservation is unreadable".to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         ));
                     };
@@ -1005,7 +1004,7 @@ impl ToolExecutionService {
                             "Error: idempotency key was already used for a different tool command".to_string(),
                             None,
                             Some("idempotency key command fingerprint mismatch".to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         ));
                     }
@@ -1024,7 +1023,7 @@ impl ToolExecutionService {
                                 format!("Error: unable to inspect tool idempotency abandonment: {error}"),
                                 None,
                                 Some(error.to_string()),
-                                Some(sandbox.clone()),
+                                Some(preparation.clone()),
                                 started,
                             )
                         })?;
@@ -1043,7 +1042,7 @@ impl ToolExecutionService {
                                 "tool execution was reserved without a terminal outcome; refusing duplicate side effect"
                                     .to_string(),
                             ),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         ));
                     };
@@ -1068,7 +1067,7 @@ impl ToolExecutionService {
                                 .to_string(),
                             None,
                             Some("persisted tool abandonment does not match reservation owner".to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         ));
                     }
@@ -1083,7 +1082,7 @@ impl ToolExecutionService {
                             "Error: tool idempotency retry generation overflow".to_string(),
                             None,
                             Some("tool idempotency retry generation overflow".to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         )
                     })?;
@@ -1107,7 +1106,7 @@ impl ToolExecutionService {
                             format!("Error: unable to encode tool idempotency reservation: {error}"),
                             None,
                             Some(error.to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         )
                     })?;
@@ -1134,7 +1133,7 @@ impl ToolExecutionService {
                                 format!("Error: unable to reserve idempotent tool execution: {error}"),
                                 None,
                                 Some(error.to_string()),
-                                Some(sandbox.clone()),
+                                Some(preparation.clone()),
                                 started,
                             )
                         })?;
@@ -1156,7 +1155,7 @@ impl ToolExecutionService {
                             "Error: another runtime owns this idempotent tool execution".to_string(),
                             None,
                             Some("another runtime owns this idempotent tool execution".to_string()),
-                            Some(sandbox.clone()),
+                            Some(preparation.clone()),
                             started,
                         ));
                     }
@@ -1179,7 +1178,7 @@ impl ToolExecutionService {
                         format!("Error: unable to inspect tool idempotency reservation: {error}"),
                         None,
                         Some(error.to_string()),
-                        Some(sandbox.clone()),
+                        Some(preparation.clone()),
                         started,
                     ));
                 }
@@ -1282,7 +1281,7 @@ impl ToolExecutionService {
             effect: outcome.descriptor.as_ref().map(|value| value.effect),
             decision: outcome.decision,
             status: outcome.status,
-            sandbox_strategy: outcome.sandbox.as_ref().map(|value| value.strategy.clone()),
+            preparation_strategy: outcome.preparation.as_ref().map(|value| value.strategy.clone()),
             input_sha256: input_sha256.to_string(),
             source: context.envelope.source.as_str().to_string(),
             workspace_id: context.envelope.workspace_id.clone(),
@@ -1296,7 +1295,7 @@ impl ToolExecutionService {
         outcome
     }
 
-    /// Run the fixed descriptor -> effect -> policy -> approval -> sandbox ->
+    /// Run the fixed descriptor -> effect -> policy -> approval -> preparation ->
     /// execute -> audit pipeline and return a typed terminal outcome.
     pub async fn execute(
         &self,
@@ -1405,7 +1404,7 @@ impl ToolExecutionService {
             }
         }
 
-        let sandbox = match self.sandbox.prepare(&descriptor, &command, &context).await {
+        let preparation = match self.preparation.prepare(&descriptor, &command, &context).await {
             Ok(permit) => permit,
             Err(error) => {
                 return self.finish(
@@ -1414,8 +1413,8 @@ impl ToolExecutionService {
                     input_sha256,
                     Some(descriptor),
                     Some(decision),
-                    ToolExecutionStatus::SandboxDenied,
-                    format!("Error: sandbox denied tool execution: {error}"),
+                    ToolExecutionStatus::PreparationDenied,
+                    format!("Error: preparation denied tool execution: {error}"),
                     None,
                     Some(error),
                     None,
@@ -1443,7 +1442,7 @@ impl ToolExecutionService {
                     format!("Error: {error}"),
                     None,
                     Some(error),
-                    Some(sandbox),
+                    Some(preparation),
                     started,
                 );
             }
@@ -1459,7 +1458,7 @@ impl ToolExecutionService {
                 "Error: tool execution cancelled".to_string(),
                 None,
                 Some("tool execution cancelled before reservation".to_string()),
-                Some(sandbox),
+                Some(preparation),
                 started,
             );
         }
@@ -1471,7 +1470,7 @@ impl ToolExecutionService {
                 &input_sha256,
                 &descriptor,
                 decision,
-                &sandbox,
+                &preparation,
                 started,
             )
             .await
@@ -1549,7 +1548,7 @@ impl ToolExecutionService {
                 format!("Error: {error}"),
                 None,
                 Some(error),
-                Some(sandbox),
+                Some(preparation),
                 started,
             ),
             (None, None) => self.finish(
@@ -1562,7 +1561,7 @@ impl ToolExecutionService {
                 "Error: tool execution cancelled".to_string(),
                 None,
                 Some("tool execution cancelled".to_string()),
-                Some(sandbox),
+                Some(preparation),
                 started,
             ),
             (Some(Ok(result)), _) if is_tool_cancelled_result(&result) => self.finish(
@@ -1575,7 +1574,7 @@ impl ToolExecutionService {
                 "Error: tool execution cancelled".to_string(),
                 Some(result),
                 Some("tool execution cancelled".to_string()),
-                Some(sandbox),
+                Some(preparation),
                 started,
             ),
             (Some(Ok(result)), _) => {
@@ -1601,7 +1600,7 @@ impl ToolExecutionService {
                     model_content,
                     Some(result),
                     error,
-                    Some(sandbox),
+                    Some(preparation),
                     started,
                 )
             }
@@ -1623,7 +1622,7 @@ impl ToolExecutionService {
                     model_content,
                     None,
                     Some(error),
-                    Some(sandbox),
+                    Some(preparation),
                     started,
                 )
             }
@@ -1647,7 +1646,7 @@ impl ToolExecutionService {
         model_content: String,
         result: Option<ToolResult>,
         error: Option<String>,
-        sandbox: Option<ToolSandboxPermit>,
+        preparation: Option<ToolExecutionPermit>,
         started: Instant,
     ) -> ToolExecutionOutcome {
         let duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
@@ -1659,7 +1658,7 @@ impl ToolExecutionService {
             effect: descriptor.as_ref().map(|value| value.effect),
             decision,
             status,
-            sandbox_strategy: sandbox.as_ref().map(|value| value.strategy.clone()),
+            preparation_strategy: preparation.as_ref().map(|value| value.strategy.clone()),
             input_sha256,
             source: context.envelope.source.as_str().to_string(),
             workspace_id: context.envelope.workspace_id.clone(),
@@ -1678,7 +1677,7 @@ impl ToolExecutionService {
             model_content,
             result,
             error,
-            sandbox,
+            preparation,
             duration_ms,
             replayed: false,
         }
@@ -2004,22 +2003,22 @@ mod tests {
         }
     }
 
-    struct RecordingSandbox {
+    struct RecordingPreparation {
         stages: Arc<Mutex<Vec<&'static str>>>,
         allowed: bool,
     }
 
     #[async_trait]
-    impl ToolSandboxStrategy for RecordingSandbox {
+    impl ToolExecutionPreparation for RecordingPreparation {
         async fn prepare(
             &self,
             _descriptor: &ToolDescriptor,
             _command: &ToolExecutionCommand,
             _context: &ToolExecutionContext,
-        ) -> Result<ToolSandboxPermit, String> {
-            self.stages.lock().push("sandbox");
+        ) -> Result<ToolExecutionPermit, String> {
+            self.stages.lock().push("preparation");
             self.allowed
-                .then(|| ToolSandboxPermit {
+                .then(|| ToolExecutionPermit {
                     strategy: "test".to_string(),
                 })
                 .ok_or_else(|| "blocked".to_string())
@@ -2052,7 +2051,7 @@ mod tests {
             aliases: Vec<&'static str>,
             decision: ToolExecutionDecision,
             approval: ToolApprovalDecision,
-            sandbox_allowed: bool,
+            preparation_allowed: bool,
         ) -> ToolExecutionService {
             let tool = RecordingTool {
                 root_name,
@@ -2071,9 +2070,9 @@ mod tests {
                     decision: approval,
                     stages: Arc::clone(&self.stages),
                 }),
-                Arc::new(RecordingSandbox {
+                Arc::new(RecordingPreparation {
                     stages: Arc::clone(&self.stages),
-                    allowed: sandbox_allowed,
+                    allowed: preparation_allowed,
                 }),
                 Arc::new(RecordingAudit {
                     records: Arc::clone(&self.records),
@@ -2164,7 +2163,7 @@ mod tests {
         assert_eq!(outcome.status, ToolExecutionStatus::Succeeded);
         assert_eq!(
             &*fixture.stages.lock(),
-            &["policy", "approval", "sandbox", "execute", "audit"]
+            &["policy", "approval", "preparation", "execute", "audit"]
         );
         let args = fixture.arguments.lock().first().cloned().unwrap();
         assert_eq!(
@@ -2339,7 +2338,7 @@ mod tests {
                     decision: approved(),
                     stages: Arc::clone(&fixture.stages),
                 }),
-                Arc::new(RecordingSandbox {
+                Arc::new(RecordingPreparation {
                     stages: Arc::clone(&fixture.stages),
                     allowed: true,
                 }),
@@ -2396,7 +2395,7 @@ mod tests {
                     decision: approved(),
                     stages: Arc::clone(&fixture.stages),
                 }),
-                Arc::new(RecordingSandbox {
+                Arc::new(RecordingPreparation {
                     stages: Arc::clone(&fixture.stages),
                     allowed: true,
                 }),
@@ -2512,7 +2511,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn policy_deny_prevents_approval_sandbox_and_execution_but_audits() {
+    async fn policy_deny_prevents_approval_preparation_and_execution_but_audits() {
         let fixture = fixture();
         let service = fixture.service(
             "native_write",
@@ -2561,7 +2560,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sandbox_denial_prevents_adapter_execution() {
+    async fn preparation_denial_prevents_adapter_execution() {
         let fixture = fixture();
         let service = fixture.service(
             "native_read",
@@ -2578,9 +2577,9 @@ mod tests {
             )
             .await;
 
-        assert_eq!(outcome.status, ToolExecutionStatus::SandboxDenied);
+        assert_eq!(outcome.status, ToolExecutionStatus::PreparationDenied);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(&*fixture.stages.lock(), &["policy", "sandbox", "audit"]);
+        assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
     }
 
     #[tokio::test]
@@ -2603,7 +2602,7 @@ mod tests {
                 decision: approved(),
                 stages: Arc::clone(&fixture.stages),
             }),
-            Arc::new(RecordingSandbox {
+            Arc::new(RecordingPreparation {
                 stages: Arc::clone(&fixture.stages),
                 allowed: true,
             }),
@@ -2650,7 +2649,7 @@ mod tests {
 
         assert_eq!(outcome.status, ToolExecutionStatus::InvalidArguments);
         assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
-        assert_eq!(&*fixture.stages.lock(), &["policy", "sandbox", "audit"]);
+        assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
     }
 
     #[tokio::test]
@@ -2755,7 +2754,7 @@ mod tests {
             vec![Arc::new(tool)],
             Arc::new(SecurityEffectPolicy::new(Arc::new(SecurityPolicy::default()))),
             Arc::new(DenyApprovalStrategy),
-            Arc::new(RecordingSandbox {
+            Arc::new(RecordingPreparation {
                 stages: Arc::clone(&fixture.stages),
                 allowed: true,
             }),
@@ -2817,7 +2816,7 @@ mod tests {
                 decision: approved(),
                 stages: Arc::clone(&fixture.stages),
             }),
-            Arc::new(RecordingSandbox {
+            Arc::new(RecordingPreparation {
                 stages: Arc::clone(&fixture.stages),
                 allowed: true,
             }),
@@ -2838,7 +2837,7 @@ mod tests {
             .await;
 
         assert_eq!(outcome.status, ToolExecutionStatus::Cancelled);
-        assert_eq!(&*fixture.stages.lock(), &["policy", "sandbox", "audit"]);
+        assert_eq!(&*fixture.stages.lock(), &["policy", "preparation", "audit"]);
         assert_eq!(fixture.records.lock().len(), 1);
     }
 }

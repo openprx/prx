@@ -5601,7 +5601,7 @@ fn shared_unrecoverable_tool_error(text: &str) -> bool {
         "not allowed",
         "blocked by policy",
         "approval denied",
-        "sandbox denied",
+        "preparation denied",
         "unknown tool",
     ]
     .iter()
@@ -5830,7 +5830,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
             Arc::clone(&tools_registry),
             Arc::new(crate::tools::SecurityEffectPolicy::new(policy)),
             Arc::new(approval_strategy),
-            Arc::new(crate::tools::AdapterOwnedSandboxStrategy),
+            Arc::new(crate::tools::AdapterOwnedPreparation),
             Arc::new(crate::tools::TracingToolExecutionAudit),
         );
         if let Some(document_ingest) = document_ingest.as_ref() {

@@ -48,5 +48,28 @@ workspace, non-zero status/stderr, timeout, cancellation, and process-group kill
 
 ## Delivery and deployed acceptance
 
-To be filled after the branch is merged into local `main`, the release build is
-installed, and the deployed K3 tmux self-check completes.
+Initial delivery reached local `main` at merge commit `1b4155af`; the release
+binary was installed as `/home/ck/.cargo/bin/prx` and identified itself as
+`prx 0.8.15`.
+
+The first deployed K3 run in `tmux demo:2.0` completed its full matrix with the
+marker `K3_PRX_0815_FULL_SELF_CHECK_DONE`. It verified direct host Shell behavior,
+memory store/recall/get/forget, Cron create/run/history/remove, Xin, Gateway,
+daemon, doctor, nodes, managed sessions, web search, provider streaming, and
+tool-call closure. MCP, hooks, WASM plugins, media, and external nodes were
+reported as optional and unconfigured rather than runtime failures.
+
+That run exposed two post-deploy defects which were then fixed:
+
+- the generic tool readiness stage still emitted the misleading audit field
+  `sandbox=adapter_owned_chat_dispatch`; types, states, fields, tests, and trace
+  output now consistently call this an execution `preparation` stage;
+- the memory phone detector treated a bare technical PID such as `3913571` as
+  PII and rejected chat-session persistence. Bare technical counters are now
+  accepted, while E.164, conventionally separated, and explicitly phone-labeled
+  numbers remain rejected.
+
+After these fixes the full gate was repeated. The main library now contains
+5,724 tests: 5,718 passed and 6 pre-existing tests were ignored; every integration
+test and doctest completed with zero failures. A final rebuild, main merge,
+deployment, and tmux K3 persistence/audit replay follow this receipt update.
