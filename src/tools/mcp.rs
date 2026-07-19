@@ -744,7 +744,9 @@ impl Tool for McpTool {
             "description": "Configured MCP server name"
         });
         if !server_names.is_empty() {
-            server_schema["enum"] = json!(server_names);
+            if let Some(object) = server_schema.as_object_mut() {
+                object.insert("enum".to_string(), json!(server_names));
+            }
         }
 
         let mut tool_schema = json!({
@@ -752,7 +754,9 @@ impl Tool for McpTool {
             "description": "Remote MCP tool name to invoke"
         });
         if !tool_names.is_empty() {
-            tool_schema["enum"] = json!(tool_names);
+            if let Some(object) = tool_schema.as_object_mut() {
+                object.insert("enum".to_string(), json!(tool_names));
+            }
         }
 
         json!({

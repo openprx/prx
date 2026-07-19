@@ -42,24 +42,24 @@ fn trusted_scope(args: &serde_json::Value) -> anyhow::Result<(&str, &str, &str)>
         .and_then(serde_json::Value::as_bool)
         .unwrap_or(false)
     {
-        anyhow::bail!("chat_profile_update requires trusted runtime scope");
+        anyhow::bail!("chat_profile_update: internal scope unavailable");
     }
     let scope = args
         .get("_zc_scope")
         .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| anyhow::anyhow!("chat_profile_update requires trusted runtime scope"))?;
+        .ok_or_else(|| anyhow::anyhow!("chat_profile_update: internal scope unavailable"))?;
     let channel = scope
         .get("channel")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("trusted runtime scope is missing channel"))?;
+        .ok_or_else(|| anyhow::anyhow!("chat_profile_update: internal channel scope unavailable"))?;
     let chat_id = scope
         .get("chat_id")
         .and_then(serde_json::Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("trusted runtime scope is missing chat_id"))?;
+        .ok_or_else(|| anyhow::anyhow!("chat_profile_update: internal chat scope unavailable"))?;
     let chat_kind = scope
         .get("chat_type")
         .and_then(serde_json::Value::as_str)
@@ -109,7 +109,7 @@ impl Tool for ChatProfileUpdateTool {
     }
 
     fn description(&self) -> &str {
-        "Maintain the current conversation profile: what this group or direct chat is for, useful notes, and short tags. This is the correct tool to record what the current chat/group is for; prefer it over general memory tools for conversation purpose, notes, and tags. The target is always the current trusted runtime chat."
+        "Record what this group or direct chat is for: its purpose, useful notes, and short tags. Provide only purpose/notes/tags; the target conversation is determined automatically. Prefer this over general memory tools for conversation purpose, notes, and tags."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -139,7 +139,9 @@ impl Tool for ChatProfileUpdateTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some("chat_profile_update target comes from trusted runtime scope, not model parameters".into()),
+                error: Some(
+                    "chat_profile_update target is determined automatically; do not provide channel or chat_id".into(),
+                ),
             });
         }
 
@@ -328,7 +330,7 @@ mod tests {
         insert_arg(&mut rejected, "purpose", json!("wrong target"));
         let result = tool.execute(rejected).await.unwrap();
         assert!(!result.success);
-        assert!(result.error.unwrap().contains("trusted runtime scope"));
+        assert!(result.error.unwrap().contains("determined automatically"));
 
         let mut args = approved_args("telegram", "group-a", "group");
         insert_arg(

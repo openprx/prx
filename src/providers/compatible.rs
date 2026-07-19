@@ -1428,8 +1428,11 @@ impl OpenAiCompatibleProvider {
         modified_messages
     }
 
-    fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
-        let tool_calls = message
+    fn parse_native_response(
+        message: ResponseMessage,
+        registered_tools: Option<&[crate::tools::ToolSpec]>,
+    ) -> ProviderChatResponse {
+        let mut tool_calls = message
             .tool_calls
             .unwrap_or_default()
             .into_iter()
@@ -1444,6 +1447,35 @@ impl OpenAiCompatibleProvider {
                 })
             })
             .collect::<Vec<_>>();
+
+        if tool_calls.is_empty() {
+            if let Some(content) = message.content.as_deref() {
+                let allowed = registered_tools.map(|tools| {
+                    tools
+                        .iter()
+                        .map(|tool| tool.name.as_str())
+                        .collect::<std::collections::HashSet<_>>()
+                });
+                let mut rest = content;
+                while let Some(start) = rest.find("<function=") {
+                    let after = &rest[start + "<function=".len()..];
+                    let Some(name_end) = after.find('>') else { break };
+                    let name = &after[..name_end];
+                    let body = &after[name_end + 1..];
+                    let Some(end) = body.find("</function>") else { break };
+                    let arguments = &body[..end];
+                    let registered = allowed.as_ref().is_none_or(|names| names.contains(name));
+                    if registered && serde_json::from_str::<serde_json::Value>(arguments).is_ok() {
+                        tool_calls.push(ProviderToolCall {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: name.to_string(),
+                            arguments: arguments.to_string(),
+                        });
+                    }
+                    rest = &body[end + "</function>".len()..];
+                }
+            }
+        }
 
         ProviderChatResponse {
             text: message.content,
@@ -1616,7 +1648,7 @@ impl OpenAiCompatibleProvider {
             .map(|choice| choice.message)
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let response = Self::parse_native_response(message);
+        let response = Self::parse_native_response(message, request.tools);
         let tokens_used = usage.unwrap_or_else(|| {
             let chars = response.text.as_deref().unwrap_or("").chars().count()
                 + response.reasoning_content.as_deref().unwrap_or("").chars().count();
@@ -2729,7 +2761,7 @@ mod tests {
             reasoning_content: None,
         };
 
-        let parsed = OpenAiCompatibleProvider::parse_native_response(message);
+        let parsed = OpenAiCompatibleProvider::parse_native_response(message, None);
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].id, "call_123");
         assert_eq!(parsed.tool_calls[0].name, "shell");

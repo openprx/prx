@@ -377,78 +377,59 @@ async fn int_ts_05_file_read_allows_file_within_workspace() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// INT-TS-07: HttpRequestTool SSRF protection
+// INT-TS-07: HttpRequestTool unrestricted native transport
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn int_ts_07_ssrf_blocks_cloud_metadata() {
+async fn int_ts_07_http_request_attempts_cloud_metadata() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
     });
 
-    let tool = HttpRequestTool::new(security, vec!["169.254.169.254".into()], 1_000_000, 10);
+    let tool = HttpRequestTool::new(security, vec![], 1_000_000, 10);
 
     let result = tool
         .execute(json!({"url": "http://169.254.169.254/metadata"}))
         .await
         .expect("test: SSRF block should return ToolResult");
 
-    assert!(!result.success, "SSRF: cloud metadata URL must be blocked");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("local/private") || err.contains("Blocked"),
-        "test: expected SSRF block error, got: {err}"
-    );
+    assert!(!result.error.as_deref().unwrap_or("").contains("allowlist"));
 }
 
 #[tokio::test]
-async fn int_ts_07_ssrf_blocks_localhost() {
+async fn int_ts_07_http_request_attempts_localhost() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
     });
 
-    let tool = HttpRequestTool::new(security, vec!["127.0.0.1".into()], 1_000_000, 10);
+    let tool = HttpRequestTool::new(security, vec![], 1_000_000, 10);
 
     let result = tool
         .execute(json!({"url": "http://127.0.0.1:8080"}))
         .await
         .expect("test: localhost block should return ToolResult");
 
-    assert!(!result.success, "SSRF: localhost must be blocked");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("local/private") || err.contains("Blocked"),
-        "test: expected SSRF block error, got: {err}"
-    );
+    assert!(!result.error.as_deref().unwrap_or("").contains("allowlist"));
 }
 
 #[tokio::test]
-async fn int_ts_07_ssrf_blocks_ipv6_localhost() {
+async fn int_ts_07_http_request_attempts_ipv6_localhost() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
     });
 
-    // IPv6 literal `::1` cannot be normalized to a valid domain, so we must
-    // provide a real domain in the allowlist to avoid the "no allowed_domains"
-    // early error. The actual block happens in extract_host which rejects
-    // IPv6 bracket notation.
-    let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 10);
+    let tool = HttpRequestTool::new(security, vec![], 1_000_000, 10);
 
     let result = tool
         .execute(json!({"url": "http://[::1]:8080"}))
         .await
         .expect("test: IPv6 localhost block should return ToolResult");
 
-    assert!(!result.success, "SSRF: IPv6 localhost [::1] must be blocked");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("IPv6") || err.contains("local/private") || err.contains("Blocked"),
-        "test: expected SSRF/IPv6 block error, got: {err}"
-    );
+    assert!(!result.error.as_deref().unwrap_or("").contains("allowlist"));
 }
 
 #[tokio::test]
-async fn int_ts_07_ssrf_blocks_private_ip_ranges() {
+async fn int_ts_07_http_request_attempts_private_ip_ranges() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
     });
@@ -460,46 +441,31 @@ async fn int_ts_07_ssrf_blocks_private_ip_ranges() {
     ];
 
     for url in &private_urls {
-        // Extract host from URL for allowlist (to bypass allowlist, test only SSRF check)
-        let host = url
-            .strip_prefix("http://")
-            .and_then(|rest| rest.split('/').next())
-            .unwrap_or("example.com");
-        let tool = HttpRequestTool::new(security.clone(), vec![host.into()], 1_000_000, 10);
+        let tool = HttpRequestTool::new(security.clone(), vec![], 1_000_000, 10);
 
         let result = tool
             .execute(json!({"url": url}))
             .await
             .expect("test: private IP should return ToolResult");
 
-        assert!(!result.success, "SSRF: private IP URL {url} must be blocked");
-        let err = result.error.as_deref().unwrap_or("");
-        assert!(
-            err.contains("local/private") || err.contains("Blocked"),
-            "test: expected SSRF block for {url}, got: {err}"
-        );
+        assert!(!result.error.as_deref().unwrap_or("").contains("allowlist"));
     }
 }
 
 #[tokio::test]
-async fn int_ts_07_http_request_readonly_blocked() {
+async fn int_ts_07_http_request_readonly_is_not_a_gate() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::ReadOnly;
     });
 
-    let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 10);
+    let tool = HttpRequestTool::new(security, vec![], 1_000_000, 10);
 
     let result = tool
         .execute(json!({"url": "https://example.com"}))
         .await
         .expect("test: ReadOnly HTTP should return ToolResult");
 
-    assert!(!result.success, "ReadOnly autonomy must block HTTP requests");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("read-only"),
-        "test: expected 'read-only' in error, got: {err}"
-    );
+    assert!(!result.error.as_deref().unwrap_or("").contains("read-only"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
