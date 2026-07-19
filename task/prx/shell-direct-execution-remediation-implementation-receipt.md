@@ -71,5 +71,25 @@ That run exposed two post-deploy defects which were then fixed:
 
 After these fixes the full gate was repeated. The main library now contains
 5,724 tests: 5,718 passed and 6 pre-existing tests were ignored; every integration
-test and doctest completed with zero failures. A final rebuild, main merge,
-deployment, and tmux K3 persistence/audit replay follow this receipt update.
+test and doctest completed with zero failures.
+
+Final acceptance completed as follows:
+
+- the follow-up code reached local `main` at merge commit `f1414853`;
+- the final release binary and deployed binary have the identical SHA-256
+  `64fe22f12b14a02f7f7420949da6ed46ce1f3a7092d72ba3dbacc1c27de06915`;
+- the restarted user daemon is active and reports `prx 0.8.15`;
+- K3 returned `K3_PRX_0815_FINAL_PERSISTENCE_OK` with PID, test-count, port,
+  version, duration, and run-id fields, and the dispatcher saved session
+  `5f7b57e8-25ab-4d77-b26a-c4182dfc5e31` without a PII rejection;
+- a separate forced Shell call returned `AUDIT_PREPARATION_OK` and
+  `K3_PRX_0815_PREPARATION_AUDIT_OK`; its successful audit row records
+  `preparation=chat_dispatch_ready`, and the dispatcher saved session
+  `df8d1c0d-6ee5-49c0-b75d-c1b176034972`;
+- post-deploy runtime logs contain no new error. The remaining warning is the
+  expected optional `web_fetch` registration warning because no browser domain
+  allowlist is configured.
+
+The complete tmux capture was preserved at
+`/opt/worker/tmp/prx-0.8.15-k3-full-selfcheck.txt`; deploy backups are under
+`/opt/worker/tmp/prx-0.8.15-deploy-uBnSmO`.
