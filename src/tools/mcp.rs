@@ -739,19 +739,27 @@ impl Tool for McpTool {
         let mut tool_names = tool_set.into_iter().collect::<Vec<_>>();
         tool_names.sort();
 
+        let mut server_schema = json!({
+            "type": "string",
+            "description": "Configured MCP server name"
+        });
+        if !server_names.is_empty() {
+            server_schema["enum"] = json!(server_names);
+        }
+
+        let mut tool_schema = json!({
+            "type": "string",
+            "description": "Remote MCP tool name to invoke"
+        });
+        if !tool_names.is_empty() {
+            tool_schema["enum"] = json!(tool_names);
+        }
+
         json!({
             "type": "object",
             "properties": {
-                "server": {
-                    "type": "string",
-                    "description": "Configured MCP server name",
-                    "enum": server_names
-                },
-                "tool": {
-                    "type": "string",
-                    "description": "Remote MCP tool name to invoke",
-                    "enum": tool_names
-                },
+                "server": server_schema,
+                "tool": tool_schema,
                 "arguments": {
                     "type": "object",
                     "description": "Arguments object forwarded to MCP call_tool",
@@ -1123,6 +1131,18 @@ mod tests {
         let required = schema["required"].as_array().expect("test: required");
         assert!(required.iter().any(|v| v == "server"));
         assert!(required.iter().any(|v| v == "tool"));
+    }
+
+    #[test]
+    fn mcp_tool_schema_never_emits_empty_enums() {
+        let tool = McpTool::new(
+            Arc::new(SecurityPolicy::default()),
+            McpConfig::default(),
+            std::env::temp_dir(),
+        );
+        let schema = tool.parameters_schema();
+        assert!(schema["properties"]["server"].get("enum").is_none());
+        assert!(schema["properties"]["tool"].get("enum").is_none());
     }
 
     // ── list_discovered_tools ───────────────────────────────────
