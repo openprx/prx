@@ -3385,6 +3385,11 @@ pub struct AutonomyConfig {
     /// Maximum cost per day in cents per policy. Default: `500`.
     pub max_cost_per_day_cents: u32,
 
+    /// Operator acknowledgement for an intentionally unrestricted profile.
+    /// This suppresses doctor noise only; it does not alter policy behavior.
+    #[serde(default)]
+    pub acknowledge_unrestricted_profile: bool,
+
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
     #[serde(default)]
     pub scopes: ScopeConfig,
@@ -3417,6 +3422,7 @@ impl Default for AutonomyConfig {
             ],
             max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
             max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
+            acknowledge_unrestricted_profile: false,
             scopes: ScopeConfig::default(),
         }
     }
@@ -3545,6 +3551,10 @@ pub struct ReliabilityConfig {
     /// Fallback provider chain (e.g. `["anthropic", "openai"]`).
     #[serde(default)]
     pub fallback_providers: Vec<String>,
+    /// Operator acknowledgement that no provider failover is configured.
+    /// This suppresses doctor noise only; it does not add a fallback.
+    #[serde(default)]
+    pub acknowledge_single_provider_risk: bool,
     /// Additional API keys for round-robin rotation on rate-limit (429) errors.
     /// The primary `api_key` is always tried first; these are extras.
     #[serde(default)]
@@ -3597,6 +3607,7 @@ impl Default for ReliabilityConfig {
             provider_retries: default_provider_retries(),
             provider_backoff_ms: default_provider_backoff_ms(),
             fallback_providers: Vec::new(),
+            acknowledge_single_provider_risk: false,
             api_keys: Vec::new(),
             model_fallbacks: std::collections::HashMap::new(),
             channel_initial_backoff_secs: default_channel_backoff_secs(),

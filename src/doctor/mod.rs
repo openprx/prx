@@ -892,7 +892,8 @@ pub fn run_models(config: &Config, provider_override: Option<&str>, use_cache: b
 fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "config";
 
-    if !config.autonomy.workspace_only
+    if !config.autonomy.acknowledge_unrestricted_profile
+        && !config.autonomy.workspace_only
         && config.autonomy.forbidden_paths.is_empty()
         && config.autonomy.max_actions_per_hour == u32::MAX
         && config.autonomy.max_cost_per_day_cents == u32::MAX
@@ -1040,7 +1041,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         &config.reliability,
         &crate::providers::provider_runtime_options_from_config(config),
     );
-    if availability.degraded {
+    if availability.degraded && !config.reliability.acknowledge_single_provider_risk {
         items.push(DiagItem::warn(
             cat,
             format!(
@@ -1791,6 +1792,25 @@ mod tests {
     }
 
     #[test]
+    fn config_validation_acknowledged_unrestricted_autonomy_is_quiet() {
+        let mut config = Config::default();
+        config.autonomy.workspace_only = false;
+        config.autonomy.forbidden_paths.clear();
+        config.autonomy.max_actions_per_hour = u32::MAX;
+        config.autonomy.max_cost_per_day_cents = u32::MAX;
+        config.autonomy.acknowledge_unrestricted_profile = true;
+        let mut items = Vec::new();
+
+        check_config_semantics(&config, &mut items);
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("explicit unrestricted autonomy profile"))
+        );
+    }
+
+    #[test]
     fn config_validation_warns_for_explicit_delegate_wildcard() {
         let mut config = Config::default();
         config.agents.insert(
@@ -2040,6 +2060,32 @@ mod tests {
         });
         assert!(degraded.is_some());
         assert_eq!(degraded.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn config_validation_acknowledged_single_provider_risk_is_quiet() {
+        let _guard = doctor_env_lock();
+        let iso_home = std::env::temp_dir().join(format!("openprx-doctor-ack-test-{}", std::process::id()));
+        std::fs::create_dir_all(&iso_home).unwrap();
+        let _home_guard = EnvGuard::set("HOME", Some(iso_home.to_str().unwrap()));
+        let _anthropic_key_guard = EnvGuard::set("ANTHROPIC_API_KEY", None);
+        let _anthropic_oauth_guard = EnvGuard::set("ANTHROPIC_OAUTH_TOKEN", None);
+
+        let mut config = Config::default();
+        config.default_provider = Some("openai".into());
+        config.api_key = Some("sk-test".into());
+        config.reliability.fallback_providers = vec!["anthropic".into()];
+        config.reliability.acknowledge_single_provider_risk = true;
+
+        let mut items = Vec::new();
+        check_config_semantics(&config, &mut items);
+
+        assert!(
+            !items
+                .iter()
+                .any(|item| item.message.contains("provider resilience degraded"))
+        );
+        let _ = std::fs::remove_dir_all(&iso_home);
     }
 
     #[test]

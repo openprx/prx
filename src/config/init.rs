@@ -654,6 +654,9 @@ workspace_only = true
 # Secure autonomous defaults. Operators may explicitly widen these values.
 max_actions_per_hour = 20
 max_cost_per_day_cents = 500
+# Set true only when host-wide unrestricted operation is intentional and
+# reviewed. This suppresses doctor noise; it is not a capability gate.
+acknowledge_unrestricted_profile = false
 forbidden_paths = [
   "/etc", "/root", "/home", "/usr", "/bin", "/sbin", "/lib", "/opt",
   "/boot", "/dev", "/proc", "/sys", "/var", "/tmp",
@@ -691,6 +694,9 @@ workspace_only = false
 forbidden_paths = []                   # no extra path denylist
 max_actions_per_hour = 4294967295
 max_cost_per_day_cents = 4294967295
+# Set true only when host-wide unrestricted operation is intentional and
+# reviewed. This suppresses doctor noise; it is not a capability gate.
+acknowledge_unrestricted_profile = false
 
 [secrets]
 encrypt = true
@@ -953,10 +959,11 @@ fn tools_template(spec: Spec) -> String {
 [http_request]
 timeout_secs = 30
 max_response_size = 10485760
-# allowed_domains = ["api.example.com"]
+# Explicit allowlist; an empty list denies all requests.
+# allowed_domains = ["api.github.com", "api.openai.com"]
 
 [web_search]
-# provider = "duckduckgo"             # duckduckgo | brave
+provider = "duckduckgo"              # duckduckgo | brave
 # brave_api_key = ""                  # required only for brave
 
 [multimodal]
@@ -978,10 +985,11 @@ max_response_size = 10485760
 [http_request]
 timeout_secs = 30
 max_response_size = 10485760
-# allowed_domains = ["api.example.com"] # empty denies all requests
+# Explicit allowlist; an empty list denies all requests.
+# allowed_domains = ["api.github.com", "api.openai.com"]
 
 [web_search]
-# provider = "duckduckgo"              # duckduckgo | brave
+provider = "duckduckgo"               # duckduckgo | brave
 # brave_api_key = ""                   # required only for brave
 
 [multimodal]
@@ -1113,6 +1121,9 @@ kind = "native"
 provider_retries = 3
 provider_backoff_ms = 1000
 # fallback_providers = ["openrouter", "openai"]
+# Set true only when single-provider risk is intentional and reviewed.
+# This suppresses doctor noise; it does not add a fallback.
+acknowledge_single_provider_risk = false
 "#
         .into(),
     }
