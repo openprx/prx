@@ -230,3 +230,10 @@ The config hot-reload applied generation 2 with `restart_required=[]`; the
 post-reload journal has no config errors. Full lib regression is 5,727 passed,
 0 failed, 6 ignored; doctor-focused acknowledgement tests are 41/41 and
 template tests 22/22.
+
+## Release follow-up (0.8.17)
+
+The audited source and lockfile package versions are bumped to `0.8.17`.
+Release notes are recorded in `docs/release-notes-0.8.17.md`; the binary and
+runtime checks below are repeated against that version before the main branch
+push.
