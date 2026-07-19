@@ -622,41 +622,30 @@ async fn int_gcw_02_webhook_group_filtering_noise() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// INT-TR-05: Sandbox selection cascade
+// INT-TR-05: Direct shell process construction
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// Sandbox auto-detection falls back gracefully when no specific backend is available.
+/// Host shell construction has no sandbox-selection path.
 #[tokio::test]
-async fn int_tr_05_sandbox_selection_cascade_fallback() {
-    use openprx::config::{SandboxBackend, SandboxConfig};
-    use openprx::security::detect::create_sandbox;
+async fn int_tr_05_direct_shell_process_has_no_sandbox_selection() {
+    use openprx::runtime::NativeRuntime;
+    use openprx::runtime::shell_process::{ShellProcessAdapter, ShellProcessRequest};
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    // Phase 1: sandbox config moved out of `SecurityConfig` into
-    // `autonomy.sandbox`; the creation fns now take a `&SandboxConfig` directly.
-
-    // Explicitly disabled sandbox returns NoopSandbox.
-    let disabled_config = SandboxConfig {
-        backend: SandboxBackend::None,
-        ..Default::default()
-    };
-    let sandbox = create_sandbox(&disabled_config);
-    assert_eq!(
-        sandbox.name(),
-        "none",
-        "test: disabled sandbox should return NoopSandbox"
-    );
-    assert!(sandbox.is_available(), "test: NoopSandbox should always be available");
-
-    // Auto-detection should return some sandbox (at least NoopSandbox)
-    let auto_config = SandboxConfig {
-        backend: SandboxBackend::Auto,
-        ..Default::default()
-    };
-    let auto_sandbox = create_sandbox(&auto_config);
-    assert!(
-        auto_sandbox.is_available(),
-        "test: auto-detected sandbox should be available"
-    );
+    let workspace = tempfile::tempdir().unwrap();
+    let process = ShellProcessAdapter::new(Arc::new(NativeRuntime::new()));
+    let output = process
+        .execute(ShellProcessRequest {
+            command: "printf ok >/dev/null; printf direct",
+            workspace_dir: workspace.path(),
+            timeout: Duration::from_secs(5),
+            cancellation: None,
+        })
+        .await
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, "direct");
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

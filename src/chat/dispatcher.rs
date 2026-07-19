@@ -3998,10 +3998,8 @@ mod tests {
         ));
         let registry: Vec<Box<dyn crate::tools::Tool>> = vec![
             Box::new(ShellTool::new(
-                security,
                 Arc::new(crate::runtime::NativeRuntime::new()),
-                Arc::new(crate::security::traits::NoopSandbox),
-                false,
+                security.workspace_dir.clone(),
             )),
             Box::new(StaySilentTool::new()),
         ];

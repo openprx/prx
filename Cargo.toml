@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.14"
+version = "0.8.15"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -219,10 +219,9 @@ wa-rs-proto = { version = "0.2", optional = true, default-features = false }
 wa-rs-ureq-http = { version = "0.2", optional = true }
 wa-rs-tokio-transport = { version = "0.2", optional = true, default-features = false }
 
-# Raspberry Pi GPIO / Landlock (Linux only) — target-specific to avoid compile failure on macOS
+# Raspberry Pi GPIO (Linux only) — target-specific to avoid compile failure on macOS
 [target.'cfg(target_os = "linux")'.dependencies]
 rppal = { version = "0.22", optional = true }
-landlock = { version = "0.4", optional = true }
 
 # Unix-specific dependencies (for root check, etc.)
 [target.'cfg(unix)'.dependencies]
@@ -230,14 +229,9 @@ libc = "0.2"
 rustix = { version = "1.1", features = ["fs"] }
 
 [features]
-default = ["channel-matrix", "llm-router", "wasm-plugins", "sandbox-landlock", "terminal-tui"]
+default = ["channel-matrix", "llm-router", "wasm-plugins", "terminal-tui"]
 channel-matrix = ["dep:matrix-sdk"]
 peripheral-rpi = ["rppal"]
-# Sandbox feature aliases used by cfg(feature = "sandbox-*")
-sandbox-landlock = ["dep:landlock"]
-sandbox-bubblewrap = []
-# Backward-compatible alias for older invocations
-landlock = ["sandbox-landlock"]
 # probe = probe-rs for Nucleo memory read (adds ~50 deps; optional)
 probe = ["dep:probe-rs"]
 # whatsapp-web = Native WhatsApp Web client with custom rusqlite storage backend

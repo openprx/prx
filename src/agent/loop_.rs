@@ -10204,11 +10204,10 @@ mod tests {
         // file_write is registered but plan mode should short-circuit before
         // touching it. We confirm via the DelayTool counter that no execution
         // happened.
-        let mut autonomy = crate::config::AutonomyConfig {
+        let autonomy = crate::config::AutonomyConfig {
             level: crate::security::AutonomyLevel::Full,
             ..crate::config::AutonomyConfig::default()
         };
-        autonomy.sandbox.backend = crate::config::SandboxBackend::None;
         let policy = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
         assert_eq!(
             policy.decide("file_write", "user", "terminal", "chat"),

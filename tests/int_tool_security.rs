@@ -1,14 +1,10 @@
 //! P0 Integration Tests: Tool Security
 //!
-//! These tests validate cross-cutting security properties that emerge from the
-//! interaction of tools (`ShellTool`, `FileReadTool`, `HttpRequestTool`) with the
-//! `SecurityPolicy` and its subsystems (autonomy levels, risk classification,
-//! rate limiting via `ActionTracker`, ACL memory protection, SSRF defences,
-//! and environment variable sanitization).
+//! These tests validate the direct-shell boundary alongside the independent
+//! `FileReadTool`, `HttpRequestTool`, and `SecurityPolicy` contracts.
 
 use openprx::runtime::NativeRuntime;
 use openprx::security::policy::{ActionTracker, AutonomyLevel, CommandRiskLevel, SecurityPolicy};
-use openprx::security::traits::{NoopSandbox, Sandbox};
 use openprx::tools::traits::Tool;
 use openprx::tools::{FileReadTool, HttpRequestTool, ShellTool};
 use serde_json::json;
@@ -26,8 +22,8 @@ fn native_runtime() -> Arc<dyn openprx::runtime::RuntimeAdapter> {
     Arc::new(NativeRuntime::new())
 }
 
-fn noop_sandbox() -> Arc<dyn Sandbox> {
-    Arc::new(NoopSandbox)
+fn shell_tool(security: &Arc<SecurityPolicy>) -> ShellTool {
+    ShellTool::new(native_runtime(), security.workspace_dir.clone())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -35,24 +31,20 @@ fn noop_sandbox() -> Arc<dyn Sandbox> {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn int_ts_01_shell_readonly_denies_execution() {
+async fn int_ts_01_direct_shell_does_not_reapply_autonomy_policy() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::ReadOnly;
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
     let result = tool
         .execute(json!({"command": "echo hello"}))
         .await
         .expect("test: shell readonly should return ToolResult, not Err");
 
-    assert!(!result.success, "ReadOnly autonomy must deny shell execution");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("not allowed"),
-        "test: expected 'not allowed' in error, got: {err}"
-    );
+    assert!(result.success, "shell executor must not reapply outer autonomy policy");
+    assert!(result.output.contains("hello"));
 }
 
 #[tokio::test]
@@ -62,7 +54,7 @@ async fn int_ts_01_shell_supervised_allows_low_risk() {
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
     let result = tool
         .execute(json!({"command": "echo supervised_ok"}))
         .await
@@ -92,7 +84,7 @@ async fn int_ts_02_risk_classification_low_executes() {
         "test: 'ls .' should be classified Low"
     );
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
     let result = tool
         .execute(json!({"command": "ls ."}))
         .await
@@ -106,9 +98,10 @@ async fn int_ts_02_risk_classification_low_executes() {
 
 #[tokio::test]
 async fn int_ts_02_risk_classification_medium_needs_approval() {
+    let workspace = tempfile::tempdir().expect("test: create isolated workspace");
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Supervised;
-        p.workspace_dir = std::env::temp_dir();
+        p.workspace_dir = workspace.path().to_path_buf();
     });
 
     assert_eq!(
@@ -117,19 +110,18 @@ async fn int_ts_02_risk_classification_medium_needs_approval() {
         "test: 'touch newfile' should be classified Medium"
     );
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
 
-    // Without approval => denied
-    let denied = tool
+    let executed = tool
         .execute(json!({"command": "touch newfile"}))
         .await
         .expect("test: unapproved medium-risk should return ToolResult");
-    assert!(!denied.success, "Medium-risk without approval must be denied");
-    let err = denied.error.as_deref().unwrap_or("");
     assert!(
-        err.contains("runtime approval grant"),
-        "test: expected 'runtime approval grant' in error, got: {err}"
+        executed.success,
+        "executor must not parse command risk: {:?}",
+        executed.error
     );
+    assert!(workspace.path().join("newfile").exists());
 }
 
 #[tokio::test]
@@ -146,21 +138,15 @@ async fn int_ts_02_risk_classification_high_blocked() {
         "test: workspace-local recursive removal should be classified High"
     );
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
     let result = tool
         .execute(json!({"command": "rm -rf ./fixture"}))
         .await
         .expect("test: high-risk command should return ToolResult");
-    // Phase 1: under Supervised, a high-risk command without a runtime approval
-    // grant is denied via the grant gate (no per-command allowlist anymore).
     assert!(
-        !result.success,
-        "High-risk workspace-local recursive removal must be blocked under Supervised"
-    );
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("runtime approval grant"),
-        "test: expected runtime approval grant denial, got: {err}"
+        result.success,
+        "executor must pass command through unchanged: {:?}",
+        result.error
     );
 }
 
@@ -169,14 +155,14 @@ async fn int_ts_02_risk_classification_high_blocked() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn int_ts_03_rate_limiting_blocks_after_budget() {
+async fn int_ts_03_direct_shell_does_not_reapply_action_budget() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
         p.max_actions_per_hour = 10;
     });
 
-    let tool = ShellTool::new(security.clone(), native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
 
     // Execute 10 commands — all should succeed
     for i in 0..10 {
@@ -191,17 +177,12 @@ async fn int_ts_03_rate_limiting_blocks_after_budget() {
         );
     }
 
-    // 11th command should be rate-limited
+    // Execution accounting belongs to the orchestration boundary, not here.
     let result = tool
         .execute(json!({"command": "echo overflow"}))
         .await
         .expect("test: rate-limited command should return ToolResult");
-    assert!(!result.success, "11th command must be rate-limited (limit=10)");
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("Rate limit") || err.contains("budget exhausted"),
-        "test: expected rate limit error, got: {err}"
-    );
+    assert!(result.success, "direct executor must not consume policy budget");
 }
 
 #[test]
@@ -219,51 +200,37 @@ fn int_ts_03_action_tracker_sliding_window() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test]
-async fn int_ts_04_shell_blocks_cat_memory_md_with_acl() {
+async fn int_ts_04_shell_does_not_apply_memory_acl_to_command_text() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), true);
+    let tool = shell_tool(&security);
     let result = tool
-        .execute(json!({"command": "cat memory.md"}))
+        .execute(json!({"command": "printf '%s' memory.md"}))
         .await
         .expect("test: ACL-blocked command should return ToolResult");
 
-    assert!(
-        !result.success,
-        "ACL should block 'cat memory.md' when acl_enabled=true"
-    );
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("ACL-protected memory path"),
-        "test: expected ACL-protected error, got: {err}"
-    );
+    assert!(result.success, "shell must not receive memory ACL state");
+    assert_eq!(result.output, "memory.md");
 }
 
 #[tokio::test]
-async fn int_ts_04_shell_blocks_sqlite3_memory_brain_db_with_acl() {
+async fn int_ts_04_shell_allows_memory_path_syntax() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), true);
+    let tool = shell_tool(&security);
     let result = tool
-        .execute(json!({"command": "sqlite3 memory/brain.db .dump"}))
+        .execute(json!({"command": "printf '%s' memory/brain.db"}))
         .await
         .expect("test: ACL-blocked command should return ToolResult");
 
-    assert!(
-        !result.success,
-        "ACL should block 'sqlite3 memory/brain.db .dump' when acl_enabled=true"
-    );
-    let err = result.error.as_deref().unwrap_or("");
-    assert!(
-        err.contains("ACL-protected memory path"),
-        "test: expected ACL-protected error, got: {err}"
-    );
+    assert!(result.success, "shell must not filter memory path syntax");
+    assert_eq!(result.output, "memory/brain.db");
 }
 
 #[tokio::test]
@@ -274,7 +241,7 @@ async fn int_ts_04_shell_allows_memory_access_when_acl_disabled() {
     });
 
     // acl_enabled = false => memory path check is skipped
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
     let result = tool
         .execute(json!({"command": "echo memory.md test"}))
         .await
@@ -540,10 +507,9 @@ async fn int_ts_07_http_request_readonly_blocked() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 #[tokio::test(flavor = "current_thread")]
-async fn int_ts_10_env_sanitization_excludes_api_keys() {
+async fn int_ts_10_direct_shell_inherits_complete_environment() {
     // SAFETY: test-only, single-threaded (current_thread flavor).
-    // Set fake API keys in the process environment, then verify they do NOT
-    // appear in the subprocess environment when ShellTool runs `env`.
+    // Direct host execution inherits the parent environment exactly.
     struct EnvGuard {
         key: &'static str,
         original: Option<String>,
@@ -581,7 +547,7 @@ async fn int_ts_10_env_sanitization_excludes_api_keys() {
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
 
     let result = tool
         .execute(json!({"command": "env"}))
@@ -594,18 +560,9 @@ async fn int_ts_10_env_sanitization_excludes_api_keys() {
         result.error
     );
 
-    assert!(
-        !result.output.contains("sk-test-openai-secret-999"),
-        "OPENAI_API_KEY must NOT appear in subprocess environment"
-    );
-    assert!(
-        !result.output.contains("sk-test-anthropic-secret-888"),
-        "ANTHROPIC_API_KEY must NOT appear in subprocess environment"
-    );
-    assert!(
-        !result.output.contains("aws-test-secret-777"),
-        "AWS_SECRET_ACCESS_KEY must NOT appear in subprocess environment"
-    );
+    assert!(result.output.contains("sk-test-openai-secret-999"));
+    assert!(result.output.contains("sk-test-anthropic-secret-888"));
+    assert!(result.output.contains("aws-test-secret-777"));
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -615,7 +572,7 @@ async fn int_ts_10_env_preserves_safe_vars() {
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
 
     // HOME and PATH are in SAFE_ENV_VARS and should be available
     let result = tool
@@ -641,13 +598,13 @@ async fn int_ts_10_env_preserves_safe_vars() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn int_ts_10_env_path_override_is_safe() {
+async fn int_ts_10_env_path_is_inherited_without_rewrite() {
     let security = make_security(|p| {
         p.autonomy = AutonomyLevel::Full;
         p.workspace_dir = std::env::temp_dir();
     });
 
-    let tool = ShellTool::new(security, native_runtime(), noop_sandbox(), false);
+    let tool = shell_tool(&security);
 
     let result = tool
         .execute(json!({"command": "echo $PATH"}))
@@ -657,21 +614,7 @@ async fn int_ts_10_env_path_override_is_safe() {
     assert!(result.success, "test: echo $PATH should succeed");
     let path_output = result.output.trim();
 
-    // The safe PATH should not contain user-writable directories
-    assert!(
-        !path_output.contains(".cargo"),
-        "test: safe PATH should not contain .cargo, got: {path_output}"
-    );
-    assert!(
-        !path_output.contains("node_modules"),
-        "test: safe PATH should not contain node_modules, got: {path_output}"
-    );
-
-    // Should contain standard system directories
-    assert!(
-        path_output.contains("/usr/bin") || path_output.contains("/bin"),
-        "test: safe PATH should contain /usr/bin or /bin, got: {path_output}"
-    );
+    assert_eq!(path_output, std::env::var("PATH").unwrap_or_default());
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

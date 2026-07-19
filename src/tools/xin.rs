@@ -470,15 +470,6 @@ impl Tool for XinTool {
                 };
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 let approval_grant_json = if matches!(execution_mode, ExecutionMode::Shell) {
-                    if let Err(reason) = crate::security::SideEffectGate::new(self.security.as_ref())
-                        .authorize_command_execution(self.name(), &payload, approval_grant.as_ref())
-                    {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(reason),
-                        });
-                    }
                     ApprovalGrant::persisted_runner_grant(
                         "xin_runner",
                         &payload,

@@ -11,6 +11,7 @@ use crate::heartbeat::engine::HeartbeatEngine;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
+#[cfg(test)]
 use crate::security::policy::ApprovalGrant;
 use crate::xin::builtin::BuiltinRegistry;
 use crate::xin::store;
@@ -929,32 +930,11 @@ async fn run_shell_with_cancellation(
 
 async fn run_shell_with_adapter(
     config: &Config,
-    security: &SecurityPolicy,
+    _security: &SecurityPolicy,
     task: &XinTask,
     cancellation: Option<CancellationToken>,
     process: &ShellProcessAdapter,
 ) -> (bool, String) {
-    if !security.can_act() {
-        return (false, "blocked by security policy: autonomy is read-only".into());
-    }
-
-    if security.is_rate_limited() {
-        return (false, "blocked by security policy: rate limit exceeded".into());
-    }
-
-    let approval_grant = persisted_task_approval_grant(task);
-    if let Err(reason) = crate::security::SideEffectGate::new(security).authorize_command_execution(
-        "xin_runner",
-        &task.payload,
-        approval_grant.as_ref(),
-    ) {
-        return (false, format!("blocked by security policy: {reason}"));
-    }
-
-    if !security.record_action() {
-        return (false, "blocked by security policy: action budget exhausted".into());
-    }
-
     match process
         .execute(ShellProcessRequest {
             command: &task.payload,
@@ -975,25 +955,14 @@ async fn run_shell_with_adapter(
         }
         Err(ShellProcessError::Timeout(_)) => (false, format!("task timed out after {SHELL_TIMEOUT_SECS}s")),
         Err(ShellProcessError::Cancelled) => (false, "task cancelled after lease loss".into()),
-        Err(ShellProcessError::Sandbox(error)) => (
-            false,
-            format!("blocked by security policy: sandbox failed to wrap command: {error}"),
-        ),
         Err(error) => (false, format!("spawn error: {error}")),
     }
-}
-
-fn persisted_task_approval_grant(task: &XinTask) -> Option<ApprovalGrant> {
-    task.approval_grant_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<ApprovalGrant>(raw).ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
-    use crate::security::traits::NoopSandbox;
     use crate::xin::types::{NewXinTask, TaskKind, TaskPriority};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1031,17 +1000,11 @@ mod tests {
     }
 
     fn test_config(tmp: &TempDir) -> Config {
-        let mut config = Config {
+        let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        // P0-39: pin the sandbox backend to None for shell-runner tests, mirroring
-        // ShellTool's use of NoopSandbox in tests/. The default `Auto` backend
-        // would auto-detect whatever heavy isolation backend (docker/firejail) the
-        // host happens to expose and wrap `sh -lc`, which is not what these tests
-        // exercise. Production still honours the operator's real sandbox config.
-        config.autonomy.sandbox.backend = crate::config::SandboxBackend::None;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
     }
@@ -1292,13 +1255,9 @@ mod tests {
         .unwrap();
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let called = Arc::new(AtomicBool::new(false));
-        let process = ShellProcessAdapter::new(
-            Arc::new(SpyRuntime {
-                called: Arc::clone(&called),
-            }),
-            Arc::new(NoopSandbox),
-            Vec::new(),
-        );
+        let process = ShellProcessAdapter::new(Arc::new(SpyRuntime {
+            called: Arc::clone(&called),
+        }));
 
         let (success, output) = run_shell_with_adapter(&config, &security, &task, None, &process).await;
 
@@ -1311,10 +1270,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn xin_forbidden_path_denial_has_single_runner_audit_identity() {
+    async fn xin_shell_does_not_apply_forbidden_path_policy_or_runner_audit() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.level = crate::security::AutonomyLevel::Full;
+        let outside_workspace = tmp.path().join("outside-workspace.txt");
+        std::fs::write(&outside_workspace, "xin-direct-path").unwrap();
         let task = store::add_task(
             &config,
             &NewXinTask {
@@ -1322,12 +1283,12 @@ mod tests {
                 topic_id: None,
                 parent_task_id: None,
                 source_message_event_id: None,
-                name: "forbidden_path".into(),
+                name: "direct_path".into(),
                 description: None,
                 kind: TaskKind::User,
                 priority: TaskPriority::Normal,
                 execution_mode: ExecutionMode::Shell,
-                payload: "cat /etc/passwd".into(),
+                payload: format!("cat '{}'", outside_workspace.display()),
                 recurring: false,
                 interval_secs: 0,
                 max_failures: 1,
@@ -1338,34 +1299,15 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_shell(&config, &security, &task).await;
-        assert!(!success);
-        assert!(output.contains("forbidden path argument: /etc/passwd"), "{output}");
-
-        let audit = std::fs::read_to_string(config.workspace_dir.join("audit.log")).expect("audit log");
-        let events: Vec<crate::security::audit::AuditEvent> = audit
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("audit event"))
-            .collect();
-        assert_eq!(events.len(), 1);
-        let action = events
-            .first()
-            .and_then(|event| event.action.as_ref())
-            .and_then(|action| action.command.as_deref())
-            .unwrap_or_default();
-        assert!(action.starts_with("xin_runner:"), "{action}");
+        assert!(success, "{output}");
+        assert!(output.contains("xin-direct-path"), "{output}");
+        assert!(!config.workspace_dir.join("audit.log").exists());
     }
 
     #[tokio::test]
-    async fn execute_shell_task_applies_sandbox_fail_closed() {
-        // P0-39: prove the sandbox is actually wired into the shell runner. An
-        // explicitly-requested-but-unavailable backend must fail closed (the
-        // command is refused) rather than silently running unsandboxed.
+    async fn execute_shell_task_runs_without_sandbox() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        // Request docker but force unavailability is environment-dependent; instead
-        // request a backend that is not available so create_sandbox returns the
-        // fail-closed UnavailableSandbox. Firejail is not installed in CI.
-        config.autonomy.sandbox.backend = crate::config::SandboxBackend::Firejail;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
 
         let new = NewXinTask {
@@ -1378,7 +1320,7 @@ mod tests {
             kind: TaskKind::User,
             priority: TaskPriority::Normal,
             execution_mode: ExecutionMode::Shell,
-            payload: "echo should-not-run".into(),
+            payload: "printf ok >/dev/null; printf should-run".into(),
             recurring: false,
             interval_secs: 0,
             max_failures: 3,
@@ -1389,12 +1331,8 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let (success, output) = run_shell(&config, &security, &task).await;
 
-        // If firejail happens to be installed the command may run; otherwise the
-        // fail-closed sandbox blocks it. Assert the sandbox path was exercised:
-        // either it was refused with the sandbox message, or it genuinely ran.
-        if !success {
-            assert!(output.contains("sandbox"), "expected sandbox refusal, got: {output}");
-        }
+        assert!(success, "{output}");
+        assert!(output.contains("should-run"));
     }
 
     #[tokio::test]
@@ -1427,7 +1365,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_shell_task_blocks_medium_risk_without_runtime_grant() {
+    async fn execute_shell_task_runs_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
@@ -1452,9 +1390,8 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let (success, output) = run_shell(&config, &security, &task).await;
 
-        assert!(!success);
-        assert!(output.contains("runtime approval grant"), "{output}");
-        assert!(!config.workspace_dir.join("xin-medium-risk").exists());
+        assert!(success, "{output}");
+        assert!(config.workspace_dir.join("xin-medium-risk").exists());
     }
 
     #[tokio::test]

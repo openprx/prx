@@ -39,7 +39,7 @@
 //! child killer and document the limitation.
 
 use super::id::SessionId;
-use crate::security::{SecurityPolicy, SideEffectGate};
+use crate::security::SecurityPolicy;
 use anyhow::{Result, anyhow};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -697,25 +697,9 @@ impl PtyShellSession {
     /// persistent drain reader is started here so the PTY can be detached and
     /// re-attached.)
     ///
-    /// Security: the command is authorized through the **same**
-    /// [`SideEffectGate`] the interactive shell tool uses, so high-risk commands
-    /// (`rm -rf /`, `mkfs`, …) are still blocked / require a grant even though
-    /// the operator typed `/pty`. The child runs in the workspace directory with
-    /// a hardened `PATH` + the same safe-env allow-list as the v2 background
-    /// shell (no secrets leak into the PTY).
+    /// The PTY child runs directly in the workspace with the inherited parent
+    /// environment and PATH.
     pub fn spawn(command: &str, security: &Arc<SecurityPolicy>, size: PtySize) -> Result<Self> {
-        // 1. Security gate — identical policy to the shell tool. We never bypass
-        //    the gate just because `/pty` was typed interactively.
-        if security.is_rate_limited() {
-            return Err(anyhow!("Rate limit exceeded: too many actions in the last hour"));
-        }
-        SideEffectGate::new(security.as_ref())
-            .authorize_command_execution("shell", command, None)
-            .map_err(|reason| anyhow!("{reason}"))?;
-        if !security.record_action() {
-            return Err(anyhow!("Rate limit exceeded: action budget exhausted"));
-        }
-
         let cwd = resolve_cwd(&security.workspace_dir);
         let id = SessionId::from_run_id(&uuid::Uuid::new_v4().to_string());
 
@@ -726,13 +710,12 @@ impl PtyShellSession {
             .map_err(|e| anyhow!("Failed to open pseudo-terminal: {e}"))?;
 
         // 3. Build the command: run it under a login shell so REPLs / pipelines
-        //    behave, in the workspace, with a hardened env. `sh -lc <command>`
+        //    behave, in the workspace, with the inherited env. `sh -lc <command>`
         //    mirrors the v2 background shell's `sh -c` but with a TTY attached.
         let mut builder = CommandBuilder::new("sh");
         builder.arg("-lc");
         builder.arg(command);
         builder.cwd(&cwd);
-        apply_safe_env(&mut builder);
 
         let child = pair
             .slave
@@ -1091,38 +1074,6 @@ fn resolve_cwd(workspace_dir: &Path) -> PathBuf {
         .canonicalize()
         .unwrap_or_else(|_| workspace_dir.to_path_buf())
 }
-
-/// Apply the hardened-PATH + safe-env baseline to a [`CommandBuilder`], mirroring
-/// the v2 background shell's allow-list so no API keys / secrets leak into the
-/// interactive PTY (CWE-200).
-fn apply_safe_env(builder: &mut CommandBuilder) {
-    builder.env_clear();
-    for var in SAFE_ENV_VARS {
-        if let Ok(val) = std::env::var(var) {
-            builder.env(var, val);
-        }
-    }
-    builder.env("PATH", HARDENED_PATH);
-    // A sane terminal type so curses programs (vim/top) render; the host's TERM
-    // is preferred when present (set above via the allow-list) but default to a
-    // widely-supported value otherwise.
-    if std::env::var("TERM").is_err() {
-        builder.env("TERM", "xterm-256color");
-    }
-}
-
-/// Environment variables safe to pass to an interactive PTY shell. Mirrors the
-/// v2 background shell allow-list: only functional variables, never secrets.
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Hardened PATH for interactive PTY commands (no user-writable directories),
-/// matching the v2 background shell secure default.
-#[cfg(not(target_os = "windows"))]
-const HARDENED_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-#[cfg(target_os = "windows")]
-const HARDENED_PATH: &str = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
 
 /// Derive the process-group id to signal from a spawned PTY child's pid.
 ///
@@ -2061,36 +2012,19 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn command_rejected_under_read_only() {
-        // Phase 1: ReadOnly autonomy denies every command before any PTY is
-        // opened, regardless of the command string.
+    async fn command_executes_directly_under_read_only_policy_object() {
         let sec = read_only_security();
-        let err = PtyShellSession::spawn("rm -rf /", &sec, PtySize::default())
-            .err()
-            .expect("test: ReadOnly denies all commands before PTY is opened");
-        assert!(!err.to_string().is_empty(), "denial carries a reason");
+        let session =
+            PtyShellSession::spawn("printf direct-read-only", &sec, PtySize::default()).expect("direct PTY spawn");
+        session.kill().await.ok();
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn full_autonomy_admits_high_risk_command() {
-        // Phase 1: Full autonomy does not block high-risk commands at the
-        // security-gate level. The gate must return Ok (not a policy denial).
-        // The OS may still refuse the command (e.g. permission error), which
-        // is unrelated to security policy.
+    async fn full_autonomy_executes_direct_command() {
         let sec = auto_security();
-        let result = PtyShellSession::spawn("rm -rf /", &sec, PtySize::default());
-        if let Err(ref e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("security policy") && !msg.contains("not allowed"),
-                "Full autonomy must not block via security gate; got: {msg}"
-            );
-        }
-        // Either Ok (PTY opened) or Err from OS/PTY allocation is acceptable.
-        if let Ok(session) = result {
-            session.kill().await.ok();
-        }
+        let session = PtyShellSession::spawn("printf direct-full", &sec, PtySize::default()).expect("direct PTY spawn");
+        session.kill().await.ok();
     }
 
     #[cfg(unix)]
