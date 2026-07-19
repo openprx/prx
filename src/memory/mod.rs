@@ -249,11 +249,7 @@ pub fn create_memory_with_storage_and_routes_with_acl(
         tracing::warn!("memory hygiene skipped: {e}");
     }
 
-    // If snapshot_on_hygiene is enabled, export core memories during hygiene.
-    if config.snapshot_enabled
-        && config.snapshot_on_hygiene
-        && matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid)
-    {
+    if matches!(backend_kind, MemoryBackendKind::Sqlite | MemoryBackendKind::Lucid) {
         if let Err(e) = snapshot::export_snapshot(workspace_dir) {
             tracing::warn!("memory snapshot skipped: {e}");
         }

@@ -16,13 +16,12 @@ Signal · WhatsApp (whatsmeow) · WhatsApp CLI (wacli) · Telegram · Discord ·
 
 ```toml
 [channels_config.signal]
-enabled = true
 account = "+1234567890"
 dm_policy = "allowlist"
 allowed_from = ["uuid:your-uuid"]
 
 [channels_config.wacli]
-enabled = true
-host = "127.0.0.1"
-port = 16867
+webhook_listen = "127.0.0.1:16868"
+webhook_path = "/wacli"
+webhook_secret = "replace-with-secret"
 ```

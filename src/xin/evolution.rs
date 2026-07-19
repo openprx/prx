@@ -297,7 +297,6 @@ mod tests {
     fn test_config(tmp: &TempDir) -> Config {
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
-        config.self_system.evolution_enabled = true;
         config
     }
 

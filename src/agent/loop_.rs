@@ -1868,9 +1868,6 @@ async fn apply_os_paging(
     runtime: Option<&DocumentIngestRuntime>,
 ) -> Result<bool> {
     let paging = &config.os_paging;
-    if !paging.enabled {
-        return Ok(false);
-    }
     if config.max_context_tokens == 0 {
         return Ok(false);
     }
@@ -1997,7 +1994,7 @@ async fn recall_context_pages(
     runtime: Option<&DocumentIngestRuntime>,
 ) -> Option<ChatMessage> {
     let paging = &config.os_paging;
-    if !paging.enabled || !paging.proactive_retrieval {
+    if !paging.proactive_retrieval {
         return None;
     }
     let query = query.trim();
@@ -2680,7 +2677,7 @@ pub(crate) async fn select_prompt_skills(
     config: &Config,
     embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
 ) -> Vec<crate::skills::Skill> {
-    if !config.skill_rag.enabled {
+    if !config.skill_rag.available() {
         return skills.to_vec();
     }
 
@@ -5859,7 +5856,7 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // user turn, not just its final iteration.
     let mut any_turn_had_fallback = false;
 
-    let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.filter(|c| c.enabled).map_or_else(
+    let tool_specs: Vec<crate::tools::ToolSpec> = tool_tiering.map_or_else(
         || crate::tools::ToolCatalog::from_boxed_registry(tools_registry.as_ref()).tool_specs(),
         |cfg| {
             let last_user_msg = history
@@ -5935,17 +5932,15 @@ pub(crate) async fn run_tool_call_loop_outcome(
     // Legacy compaction below still runs as a backstop if paging left the
     // context above the 0.85 threshold.
     if let Some(config) = compaction_config {
-        if config.os_paging.enabled {
-            if let Some(query) = latest_user_query(history).map(ToString::to_string) {
-                if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
-                    inject_recalled_context(history, recalled);
-                }
+        if let Some(query) = latest_user_query(history).map(ToString::to_string) {
+            if let Some(recalled) = recall_context_pages(&query, config, document_ingest.as_ref()).await {
+                inject_recalled_context(history, recalled);
             }
-            match apply_os_paging(history, config, document_ingest.as_ref()).await {
-                Ok(true) => tracing::debug!("os-paging: pre-turn eviction applied"),
-                Ok(false) => {}
-                Err(e) => tracing::warn!("os-paging: pre-turn eviction error (soft): {e}"),
-            }
+        }
+        match apply_os_paging(history, config, document_ingest.as_ref()).await {
+            Ok(true) => tracing::debug!("os-paging: pre-turn eviction applied"),
+            Ok(false) => {}
+            Err(e) => tracing::warn!("os-paging: pre-turn eviction error (soft): {e}"),
         }
     }
 
@@ -7014,7 +7009,7 @@ pub(crate) async fn run_with_runtime_envelope(
         "image_info",
         "Read image file metadata (format, dimensions, size) and optionally base64-encode it. Use when: inspecting images, preparing visual data for analysis.",
     ));
-    if config.composio.enabled {
+    if config.composio.configured() {
         tool_descs.push((
             "composio",
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
@@ -7367,7 +7362,7 @@ pub(crate) async fn run_with_runtime_envelope(
         let cli = crate::channels::CliChannel::new();
 
         // Persistent conversation history across turns
-        let mut history = if config.skill_rag.enabled {
+        let mut history = if config.skill_rag.available() {
             Vec::new()
         } else {
             vec![ChatMessage::system(build_runtime_system_prompt(
@@ -7423,7 +7418,7 @@ pub(crate) async fn run_with_runtime_envelope(
                     }
 
                     history.clear();
-                    if !config.skill_rag.enabled {
+                    if !config.skill_rag.available() {
                         history.push(ChatMessage::system(build_runtime_system_prompt(
                             &config,
                             model_name,
@@ -7849,7 +7844,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
     let agent_run_id = Uuid::new_v4().to_string();
     let agent_session_key = format!("agent:{agent_run_id}");
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
+    let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
             config.composio.api_key.as_deref(),
             Some(config.composio.entity_id.as_str()),
@@ -7898,7 +7893,7 @@ pub async fn process_message(config: Config, message: &str) -> Result<String> {
         ("memory_forget", "Delete a memory entry."),
         ("image_info", "Read image metadata."),
     ];
-    if config.composio.enabled {
+    if config.composio.configured() {
         tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
     }
     let native_tools = provider
@@ -10213,7 +10208,7 @@ mod tests {
             level: crate::security::AutonomyLevel::Full,
             ..crate::config::AutonomyConfig::default()
         };
-        autonomy.sandbox.enabled = Some(false);
+        autonomy.sandbox.backend = crate::config::SandboxBackend::None;
         let policy = crate::security::SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
         assert_eq!(
             policy.decide("file_write", "user", "terminal", "chat"),
@@ -12794,7 +12789,7 @@ Let me check the result."#;
         );
     }
 
-    fn paging_test_config(enabled: bool) -> crate::config::AgentCompactionConfig {
+    fn paging_test_config(_enabled: bool) -> crate::config::AgentCompactionConfig {
         crate::config::AgentCompactionConfig {
             mode: crate::config::AgentCompactionMode::Safeguard,
             reserve_tokens: 1,
@@ -12803,7 +12798,6 @@ Let me check the result."#;
             max_context_tokens: 50,
             max_context_tokens_explicit: true,
             os_paging: crate::config::OsPagingConfig {
-                enabled,
                 eviction_threshold: 0.70,
                 proactive_retrieval: true,
                 max_recalled_pages: 3,

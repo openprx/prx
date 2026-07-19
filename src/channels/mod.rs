@@ -3967,10 +3967,6 @@ async fn run_smart_pre_gate(
     active_provider: &Arc<dyn Provider>,
 ) -> pre_gate::PreGateOutcome {
     let cfg = &ctx.smart_group;
-    if !cfg.enabled {
-        return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::Disabled);
-    }
-
     let (recent_context, bot_recently_active) =
         gather_pre_gate_history(ctx, history_key, cfg.classifier_max_context_messages);
 
@@ -3983,10 +3979,6 @@ async fn run_smart_pre_gate(
         pre_gate::Heuristic::EnterLoop => pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::HeuristicEnter),
         pre_gate::Heuristic::Skip => pre_gate::PreGateOutcome::skip(pre_gate::PreGatePath::HeuristicSkip),
         pre_gate::Heuristic::Uncertain => {
-            if !cfg.classifier_enabled {
-                // Classifier off → err toward entering the loop (fail-open).
-                return pre_gate::PreGateOutcome::enter(pre_gate::PreGatePath::ClassifierFailOpen);
-            }
             let (provider, model) =
                 resolve_pre_gate_classifier(ctx, config_generation, route_provider, route_model, active_provider).await;
             pre_gate::classify_with_model(
@@ -4937,7 +4929,7 @@ pub async fn start_channels_with_config(
     let conversation_histories = Arc::new(Mutex::new(
         load_persisted_histories(&config.workspace_dir, mem.as_ref()).await,
     ));
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
+    let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
             config.composio.api_key.as_deref(),
             Some(config.composio.entity_id.as_str()),
@@ -5004,7 +4996,7 @@ pub async fn start_channels_with_config(
         ),
     ];
 
-    if config.composio.enabled {
+    if config.composio.configured() {
         tool_descs.push((
             "composio",
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover actions, 'list_accounts' to retrieve connected account IDs, 'execute' to run (optionally with connected_account_id), and 'connect' for OAuth.",
@@ -5068,7 +5060,7 @@ pub async fn start_channels_with_config(
     }
 
     // Build Skill RAG context for per-message skill selection (when enabled)
-    let skill_rag_ctx = if config.skill_rag.enabled {
+    let skill_rag_ctx = if config.skill_rag.available() {
         let tool_descs_owned: Vec<(String, String)> = tool_descs
             .iter()
             .map(|(a, b)| ((*a).to_string(), (*b).to_string()))
@@ -5261,22 +5253,18 @@ pub async fn start_channels_with_config(
     }
 
     if let Some(ref wc) = config.channels_config.wacli {
-        if wc.enabled {
-            channels.push(Arc::new(WacliChannel::new(wacli::WacliChannelConfig {
-                webhook_listen: wc.webhook_listen.clone(),
-                webhook_path: wc.webhook_path.clone(),
-                webhook_secret: wc.webhook_secret.clone(),
-                allow_unsigned_loopback: wc.allow_unsigned_loopback,
-                allowed_from: wc.allowed_from.clone(),
-                cli_path: wc.cli_path.clone(),
-                store_dir: wc.store_dir.clone(),
-                bot_jid: wc.bot_jid.clone(),
-                bot_number: wc.bot_number.clone(),
-                bot_lid: wc.bot_lid.clone(),
-            })));
-        } else {
-            tracing::debug!("wacli channel configured but not enabled (set enabled = true to activate)");
-        }
+        channels.push(Arc::new(WacliChannel::new(wacli::WacliChannelConfig {
+            webhook_listen: wc.webhook_listen.clone(),
+            webhook_path: wc.webhook_path.clone(),
+            webhook_secret: wc.webhook_secret.clone(),
+            allow_unsigned_loopback: wc.allow_unsigned_loopback,
+            allowed_from: wc.allowed_from.clone(),
+            cli_path: wc.cli_path.clone(),
+            store_dir: wc.store_dir.clone(),
+            bot_jid: wc.bot_jid.clone(),
+            bot_number: wc.bot_number.clone(),
+            bot_lid: wc.bot_lid.clone(),
+        })));
     }
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
@@ -5791,7 +5779,6 @@ mod tests {
             ..Default::default()
         });
         config.channels_config.wacli = Some(crate::config::WacliConfig {
-            enabled: true,
             group_reply_mode: Some(crate::config::GroupReplyMode::Smart),
             bot_jid: Some("123@s.whatsapp.net".into()),
             ..Default::default()
@@ -5996,15 +5983,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_gate_disabled_always_enters_loop() {
-        let mut ctx = ctx_with_histories(HashMap::new());
-        ctx.smart_group.enabled = false;
+    async fn pre_gate_is_always_active() {
+        let ctx = ctx_with_histories(HashMap::new());
         let provider: Arc<dyn Provider> = Arc::new(CountingProvider {
             answer: "NO".into(),
             calls: AtomicUsize::new(0),
         });
         let generation = ctx.config.pin();
-        // Even obvious noise enters the loop when the pre-gate is off.
         let outcome = run_smart_pre_gate(
             &ctx,
             &generation,
@@ -6015,8 +6000,8 @@ mod tests {
             &provider,
         )
         .await;
-        assert!(outcome.should_enter_loop());
-        assert_eq!(outcome.path, pre_gate::PreGatePath::Disabled);
+        assert!(!outcome.should_enter_loop());
+        assert_eq!(outcome.path, pre_gate::PreGatePath::HeuristicSkip);
     }
 
     #[tokio::test]
@@ -6109,10 +6094,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pre_gate_uncertain_with_classifier_disabled_fails_open() {
-        // Fail-open: classifier off => uncertain enters the loop, no model call.
-        let mut ctx = ctx_with_histories(HashMap::new());
-        ctx.smart_group.classifier_enabled = false;
+    async fn pre_gate_uncertain_uses_classifier() {
+        let ctx = ctx_with_histories(HashMap::new());
         let counting = Arc::new(CountingProvider {
             answer: "NO".into(),
             calls: AtomicUsize::new(0),
@@ -6129,13 +6112,9 @@ mod tests {
             &provider,
         )
         .await;
-        assert!(outcome.should_enter_loop(), "classifier disabled must fail open");
-        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierFailOpen);
-        assert_eq!(
-            counting.calls.load(Ordering::SeqCst),
-            0,
-            "classifier disabled => no call"
-        );
+        assert!(!outcome.should_enter_loop());
+        assert_eq!(outcome.path, pre_gate::PreGatePath::ClassifierSkip);
+        assert_eq!(counting.calls.load(Ordering::SeqCst), 1, "classifier is always active");
     }
 
     fn make_workspace() -> TempDir {

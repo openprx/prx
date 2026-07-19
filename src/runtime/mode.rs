@@ -362,14 +362,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
             println!("⚙️  Runtime:       {}", config.runtime.kind);
             let effective_memory_backend =
                 memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
-            println!(
-                "💓 Heartbeat:      {}",
-                if config.heartbeat.enabled {
-                    format!("every {}min", config.heartbeat.interval_minutes)
-                } else {
-                    "disabled".into()
-                }
-            );
+            println!("💓 Heartbeat:      every {}min", config.heartbeat.interval_minutes);
             println!(
                 "🧠 Memory:         {} (semantic auto-promote: {})",
                 effective_memory_backend,
@@ -389,14 +382,7 @@ pub async fn dispatch(command: Commands, config: Config) -> Result<()> {
                 "  Max cost/day:      ${:.2}",
                 f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
             );
-            println!(
-                "  Audit logging:     {}",
-                if config.security.audit.enabled {
-                    "enabled"
-                } else {
-                    "disabled"
-                }
-            );
+            println!("  Audit logging:     enabled");
             println!("  Audit log path:    {}", config.security.audit.log_path);
             println!();
             println!("Channels:");

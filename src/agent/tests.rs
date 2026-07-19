@@ -388,7 +388,6 @@ async fn turn_delegates_heavy_task_to_sessions_spawn_tool() {
         .tool_dispatcher(Box::new(NativeToolDispatcher))
         .workspace_dir(std::env::temp_dir())
         .task_routing_config(TaskRoutingConfig {
-            enabled: true,
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![TaskRoutingRule {
                 keywords: vec!["修复".into(), "部署".into()],

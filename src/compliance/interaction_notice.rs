@@ -50,7 +50,6 @@ pub async fn ensure_interaction_notice(
     if config.applicability == InteractionNoticeApplicability::NotApplicable {
         return Ok(InteractionNoticeOutcome::NotApplicable);
     }
-    anyhow::ensure!(config.enabled, "required AI interaction notice is disabled");
 
     let notice = InteractionNotice {
         version: config.version.trim().to_string(),

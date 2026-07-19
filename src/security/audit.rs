@@ -143,7 +143,6 @@ pub struct AuditLogger {
     /// Storing just these `Copy` scalars lets `new` borrow `&AuditConfig` instead
     /// of owning a clone, removing the per-decision `String` allocation that the
     /// side-effect gate audit hook previously paid on every authorized decision.
-    enabled: bool,
     max_size_mb: u32,
     _buffer: Mutex<Vec<AuditEvent>>,
 }
@@ -212,7 +211,6 @@ impl AuditLogger {
         };
         Ok(Self {
             log_path,
-            enabled: config.enabled,
             max_size_mb: config.max_size_mb,
             _buffer: Mutex::new(Vec::new()),
         })
@@ -220,10 +218,6 @@ impl AuditLogger {
 
     /// Log an event
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-
         // Check log size and rotate if needed
         self.rotate_if_needed()?;
 
@@ -352,9 +346,6 @@ pub fn record_side_effect_decision_best_effort(
     config: &AuditConfig,
     entry: SideEffectDecisionLog<'_>,
 ) {
-    if !config.enabled {
-        return;
-    }
     if workspace_dir.as_os_str().is_empty() || workspace_dir == Path::new(".") {
         return;
     }
@@ -538,30 +529,12 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn audit_logger_disabled_does_not_create_file() -> Result<()> {
-        let tmp = TempDir::new()?;
-        let config = AuditConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let logger = AuditLogger::new(&config, tmp.path().to_path_buf())?;
-        let event = AuditEvent::new(AuditEventType::CommandExecution);
-
-        logger.log(&event)?;
-
-        // File should not exist since logging is disabled
-        assert!(!tmp.path().join("audit.log").exists());
-        Ok(())
-    }
-
     // ── §8.1 Log rotation tests ─────────────────────────────
 
     #[tokio::test]
     async fn audit_logger_writes_event_when_enabled() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
-            enabled: true,
             max_size_mb: 10,
             ..Default::default()
         };
@@ -587,7 +560,6 @@ mod tests {
     async fn audit_log_command_event_writes_structured_entry() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
-            enabled: true,
             max_size_mb: 10,
             ..Default::default()
         };
@@ -622,7 +594,6 @@ mod tests {
     fn audit_rotation_creates_numbered_backup() -> Result<()> {
         let tmp = TempDir::new()?;
         let config = AuditConfig {
-            enabled: true,
             max_size_mb: 0, // Force rotation on first write
             ..Default::default()
         };

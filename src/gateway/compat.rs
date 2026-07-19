@@ -228,10 +228,6 @@ pub async fn mcp_tools_call(
     Json(request): Json<McpToolCallRequest>,
 ) -> Result<Json<McpToolCallResponse>, (StatusCode, Json<Value>)> {
     let config = state.config.load_full().clone();
-    if !(config.modules.mcp_server && config.mcp_server.enabled) {
-        return Err(json_error(StatusCode::FORBIDDEN, "mcp server tool calls are disabled"));
-    }
-
     // When a remote JWKS endpoint is configured, refresh its cache off the
     // async runtime before the synchronous identity-derivation path verifies
     // any bearer JWT. This keeps `derive_external_agent_identity` free of
@@ -345,7 +341,7 @@ fn build_mcp_list_servers_response(config: &crate::config::Config) -> McpListSer
         servers: vec![McpServerCard {
             name: PRX_MCP_SERVER_NAME,
             protocol_version: MCP_PROTOCOL_VERSION,
-            enabled: config.modules.mcp_server && config.mcp_server.enabled,
+            enabled: true,
             bind: config.mcp_server.bind.clone(),
             tools: exposed_tools(config),
         }],
@@ -356,7 +352,7 @@ fn build_a2a_identity_response(config: &crate::config::Config) -> A2aIdentityRes
     A2aIdentityResponse {
         agent_id: config.a2a.agent_id.clone(),
         spiffe_id: config.a2a.spiffe_id.clone(),
-        enabled: config.modules.a2a && config.a2a.enabled,
+        enabled: true,
         bind: config.a2a.bind.clone(),
         capabilities: A2aCapabilities {
             tools: config.mcp_server.exposed_tools.clone(),
@@ -1378,7 +1374,7 @@ mod tests {
         assert_eq!(response.servers.len(), 1);
         let server = response.servers.first().expect("server card should exist");
         assert_eq!(server.name, PRX_MCP_SERVER_NAME);
-        assert!(!server.enabled);
+        assert!(server.enabled);
         assert_eq!(server.tools.len(), 7);
     }
 
@@ -1388,7 +1384,7 @@ mod tests {
 
         assert_eq!(response.agent_id, "prx-default");
         assert_eq!(response.spiffe_id, "spiffe://prx-local/agent/prx-default");
-        assert!(!response.enabled);
+        assert!(response.enabled);
         assert_eq!(response.capabilities.modalities, vec!["text"]);
     }
 

@@ -340,8 +340,6 @@ pub fn all_tools_with_runtime_ext(
         &shell_extra_path_dirs,
     );
 
-    let modules = &root_config.modules;
-
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ShellTool::with_extra_path_dirs(
@@ -374,15 +372,10 @@ pub fn all_tools_with_runtime_ext(
     // and the background scheduler loop — registering the tool only makes the
     // surface available to the model, it does not start any execution.
     tool_arcs.push(Arc::new(CronTool::new(shared_config.clone(), security.clone())));
-    // The `xin` engine tool remains gated behind the scheduler module.
-    if modules.scheduler {
-        tool_arcs.push(Arc::new(XinTool::new(shared_config.clone(), security.clone())));
-    } else {
-        tracing::debug!("Scheduler module disabled, skipping xin tool registration");
-    }
+    tool_arcs.push(Arc::new(XinTool::new(shared_config.clone(), security.clone())));
 
-    // ── Memory module gates memory tools ──
-    if modules.memory {
+    // ── Memory tools ──
+    {
         tool_arcs.push(Arc::new(ChatProfileUpdateTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())));
         tool_arcs.push(Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())));
@@ -411,62 +404,43 @@ pub fn all_tools_with_runtime_ext(
         } else {
             tool_arcs.push(Arc::new(MemoryRecallTool::new(memory.clone(), false)));
         }
-    } else {
-        tracing::debug!("Memory module disabled, skipping memory tool registration");
     }
 
-    // ── Nodes module gates nodes tool ──
-    if modules.nodes {
-        tool_arcs.push(Arc::new(
-            NodesTool::new(shared_config, security.clone())
-                .with_shared_memory(memory.clone())
-                .with_event_recording(root_config.memory.event_recording_config()),
-        ));
-    } else {
-        tracing::debug!("Nodes module disabled, skipping nodes tool registration");
-    }
+    tool_arcs.push(Arc::new(
+        NodesTool::new(shared_config, security.clone())
+            .with_shared_memory(memory.clone())
+            .with_event_recording(root_config.memory.event_recording_config()),
+    ));
 
     // ── Integrations module gates MCP and Composio tools ──
-    let mcp_tool_ref: Option<Arc<McpTool>> =
-        if modules.integrations && config.mcp.enabled && !config.mcp.servers.is_empty() {
-            let mcp = Arc::new(McpTool::new(
-                security.clone(),
-                config.mcp.clone(),
-                workspace_dir.to_path_buf(),
-            ));
-            tool_arcs.push(mcp.clone());
-            Some(mcp)
-        } else {
-            if !modules.integrations {
-                tracing::debug!("Integrations module disabled, skipping MCP tool registration");
-            }
-            None
-        };
-
-    if modules.integrations {
-        if let Some(key) = composio_key {
-            if !key.is_empty() {
-                tool_arcs.push(Arc::new(ComposioTool::new(key, composio_entity_id, security.clone())));
-            }
-        }
+    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.configured() {
+        let mcp = Arc::new(McpTool::new(
+            security.clone(),
+            config.mcp.clone(),
+            workspace_dir.to_path_buf(),
+        ));
+        tool_arcs.push(mcp.clone());
+        Some(mcp)
     } else {
-        tracing::debug!("Integrations module disabled, skipping Composio tool registration");
+        None
+    };
+
+    if let Some(key) = composio_key {
+        if !key.is_empty() {
+            tool_arcs.push(Arc::new(ComposioTool::new(key, composio_entity_id, security.clone())));
+        }
     }
 
     // ── Tools module gates http_request, web_search, web_fetch ──
-    if modules.tools && http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
-            security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-        )));
-    } else if !modules.tools {
-        tracing::debug!("Tools module disabled, skipping http_request tool registration");
-    }
+    tool_arcs.push(Arc::new(HttpRequestTool::new(
+        security.clone(),
+        http_config.allowed_domains.clone(),
+        http_config.max_response_size,
+        http_config.timeout_secs,
+    )));
 
     // Web search tool (enabled by default for GLM and other models)
-    if modules.tools && root_config.web_search.enabled {
+    {
         let provider = root_config.web_search.provider.trim().to_ascii_lowercase();
         let brave_key = root_config
             .web_search
@@ -494,29 +468,23 @@ pub fn all_tools_with_runtime_ext(
                 root_config.web_search.provider
             );
         }
-    } else if !modules.tools {
-        tracing::debug!("Tools module disabled, skipping web_search tool registration");
     }
 
     // Web fetch tool — only register when both fetch_enabled AND allowed_domains
     // are configured.  Registering without domains would expose the tool to the
     // model while every call fails at runtime with a confusing error.
-    if modules.tools && root_config.web_search.fetch_enabled {
-        if browser_config.allowed_domains.is_empty() {
-            tracing::warn!(
-                "web_fetch is enabled but browser.allowed_domains is empty; \
-                 tool not registered. Set browser.allowed_domains to activate it."
-            );
-        } else {
-            tool_arcs.push(Arc::new(WebFetchTool::new(
-                security.clone(),
-                browser_config.allowed_domains.clone(),
-                root_config.web_search.fetch_max_chars,
-                root_config.web_search.timeout_secs,
-            )));
-        }
-    } else if !modules.tools {
-        tracing::debug!("Tools module disabled, skipping web_fetch tool registration");
+    if browser_config.allowed_domains.is_empty() {
+        tracing::warn!(
+            "web_fetch is available but browser.allowed_domains is empty; \
+             tool not registered. Set browser.allowed_domains to configure it."
+        );
+    } else {
+        tool_arcs.push(Arc::new(WebFetchTool::new(
+            security.clone(),
+            browser_config.allowed_domains.clone(),
+            root_config.web_search.fetch_max_chars,
+            root_config.web_search.timeout_secs,
+        )));
     }
 
     // Always register agents_list (shows what agents are available for delegation)
@@ -572,7 +540,7 @@ mod tests {
         clippy::unreadable_literal
     )]
     use super::*;
-    use crate::config::{BrowserConfig, Config, MemoryConfig, ModulesConfig};
+    use crate::config::{BrowserConfig, Config, MemoryConfig};
     use tempfile::TempDir;
 
     fn spec(name: &str) -> ToolSpec {
@@ -615,11 +583,6 @@ mod tests {
         Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
-            modules: ModulesConfig {
-                tools: true,
-                scheduler: true,
-                ..ModulesConfig::default()
-            },
             ..Config::default()
         }
     }

@@ -172,7 +172,7 @@ pub async fn finalize_turn(
     }
 
     let cost_settlement = match usage_settlement.as_ref() {
-        Some(usage) if cost_config.enabled => {
+        Some(usage) => {
             let cost_config = cost_config.clone();
             let workspace_dir = workspace_dir.to_path_buf();
             let usage = usage.clone();
@@ -193,7 +193,6 @@ pub async fn finalize_turn(
                 },
             )
         }
-        Some(_) => Some(CostSettlement::Disabled),
         None => None,
     };
     ensure_runtime_authority(&commit.scope, "projection").await?;
@@ -303,10 +302,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
-        let cost_config = CostConfig {
-            enabled: true,
-            ..CostConfig::default()
-        };
+        let cost_config = CostConfig::default();
 
         let receipt = finalize_turn(
             &fabric,
@@ -343,10 +339,7 @@ mod tests {
         let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
         let invalid_workspace_dir = temp.path().join("not-a-directory");
         std::fs::write(&invalid_workspace_dir, "occupied").unwrap();
-        let cost_config = CostConfig {
-            enabled: true,
-            ..CostConfig::default()
-        };
+        let cost_config = CostConfig::default();
 
         let receipt = finalize_turn(
             &fabric,
@@ -409,10 +402,7 @@ mod tests {
         commit.scope.authority_guard = Some(crate::memory::RuntimeAuthorityGuard::new("lost-authority", || {
             Ok(false)
         }));
-        let cost_config = CostConfig {
-            enabled: true,
-            ..CostConfig::default()
-        };
+        let cost_config = CostConfig::default();
 
         let error = finalize_turn(&fabric, commit, &cost_config, temp.path())
             .await
@@ -497,10 +487,7 @@ mod tests {
         std::fs::set_permissions(&cost_path, std::fs::Permissions::from_mode(0o444)).unwrap();
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
-        let mut cost_config = CostConfig {
-            enabled: true,
-            ..CostConfig::default()
-        };
+        let mut cost_config = CostConfig::default();
         cost_config.prices.insert(
             "provider-a/model-a".to_string(),
             crate::config::schema::ModelPricing {
@@ -566,10 +553,7 @@ mod tests {
 
         let memory: Arc<dyn Memory> = Arc::new(SqliteMemory::new(temp.path()).unwrap());
         let fabric = MemoryFabric::new(memory.clone(), "logical-workspace");
-        let mut cost_config = CostConfig {
-            enabled: true,
-            ..CostConfig::default()
-        };
+        let mut cost_config = CostConfig::default();
         cost_config.prices.insert(
             "provider-a/model-a".to_string(),
             crate::config::schema::ModelPricing {
@@ -669,7 +653,7 @@ mod tests {
                 .and_then(|usage| usage.settlement_id.as_deref()),
             Some("run-a")
         );
-        assert_eq!(first.cost_settlement, Some(CostSettlement::Disabled));
+        assert_eq!(first.cost_settlement, Some(CostSettlement::UnknownPricing));
         let principal = MemoryPrincipal {
             workspace_id: "workspace-a".to_string(),
             agent_id: None,

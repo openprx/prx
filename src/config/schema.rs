@@ -53,150 +53,6 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 
 // ── Top-level config ──────────────────────────────────────────────
 
-// ── Module switches ─────────────────────────────────────────────
-
-/// Controls which config.d/ module files are loaded and which subsystems are active.
-/// When a module is disabled, its config.d/ file is skipped during config loading.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub struct ModulesConfig {
-    /// Memory and persistent storage module (config.d/memory.toml)
-    #[serde(default = "default_true")]
-    pub memory: bool,
-    /// Messaging channels: Telegram, Discord, Signal, etc. (config.d/channels.toml)
-    #[serde(default)]
-    pub channels: bool,
-    /// Gateway, tunnel, and proxy networking (config.d/network.toml)
-    #[serde(default = "default_true")]
-    pub network: bool,
-    /// Security, autonomy, and secrets (config.d/security.toml)
-    #[serde(default = "default_true")]
-    pub security: bool,
-    /// Scheduler, cron, heartbeat, and Xin engine (config.d/scheduler.toml)
-    #[serde(default)]
-    pub scheduler: bool,
-    /// Agent engine, sessions, self-system, and causal tree (config.d/agent.toml)
-    #[serde(default = "default_true")]
-    pub agent: bool,
-    /// Identity, user policies, and auth (config.d/identity.toml)
-    #[serde(default)]
-    pub identity: bool,
-    /// LLM router, model/embedding routes, classification (config.d/routing.toml)
-    #[serde(default)]
-    pub routing: bool,
-    /// Browser, HTTP, search, media, and skills tools (config.d/tools.toml)
-    #[serde(default)]
-    pub tools: bool,
-    /// MCP, Composio, and webhook integrations (config.d/integrations.toml)
-    #[serde(default)]
-    pub integrations: bool,
-    /// MCP server compatibility endpoint.
-    #[serde(default)]
-    pub mcp_server: bool,
-    /// Agent-to-Agent compatibility endpoint.
-    #[serde(default)]
-    pub a2a: bool,
-    /// Remote node proxy (config.d/nodes.toml)
-    #[serde(default)]
-    pub nodes: bool,
-    /// Cost tracking and budget enforcement (config.d/cost.toml)
-    #[serde(default)]
-    pub cost: bool,
-    /// Observability, runtime, and reliability (config.d/observability.toml)
-    #[serde(default)]
-    pub observability: bool,
-}
-
-impl Default for ModulesConfig {
-    fn default() -> Self {
-        Self {
-            memory: true,
-            channels: false,
-            network: true,
-            security: true,
-            scheduler: false,
-            agent: true,
-            identity: false,
-            routing: false,
-            tools: false,
-            integrations: false,
-            mcp_server: false,
-            a2a: false,
-            nodes: false,
-            cost: false,
-            observability: false,
-        }
-    }
-}
-
-impl ModulesConfig {
-    /// All modules enabled — used by `prx init --spec full`.
-    pub const fn all_enabled() -> Self {
-        Self {
-            memory: true,
-            channels: true,
-            network: true,
-            security: true,
-            scheduler: true,
-            agent: true,
-            identity: true,
-            routing: true,
-            tools: true,
-            integrations: true,
-            mcp_server: true,
-            a2a: true,
-            nodes: true,
-            cost: true,
-            observability: true,
-        }
-    }
-
-    /// Check if a named module is enabled.
-    ///
-    /// Returns `Some(bool)` for known module names, `None` for unknown names.
-    /// This eliminates the double-mapping between MODULE_FILE_MAP and internal match.
-    pub fn is_enabled(&self, module_name: &str) -> Option<bool> {
-        match module_name {
-            "memory" => Some(self.memory),
-            "channels" => Some(self.channels),
-            "network" => Some(self.network),
-            "security" => Some(self.security),
-            "scheduler" => Some(self.scheduler),
-            "agent" => Some(self.agent),
-            "identity" => Some(self.identity),
-            "routing" => Some(self.routing),
-            "tools" => Some(self.tools),
-            "integrations" => Some(self.integrations),
-            "mcp_server" => Some(self.mcp_server),
-            "a2a" => Some(self.a2a),
-            "nodes" => Some(self.nodes),
-            "cost" => Some(self.cost),
-            "observability" => Some(self.observability),
-            _ => None,
-        }
-    }
-
-    /// All modules disabled — base for building custom presets.
-    pub const fn all_disabled() -> Self {
-        Self {
-            memory: false,
-            channels: false,
-            network: false,
-            security: false,
-            scheduler: false,
-            agent: false,
-            identity: false,
-            routing: false,
-            tools: false,
-            integrations: false,
-            mcp_server: false,
-            a2a: false,
-            nodes: false,
-            cost: false,
-            observability: false,
-        }
-    }
-}
-
 /// Top-level OpenPRX configuration, loaded from `config.toml`.
 ///
 /// Resolution order: `OPENPRX_WORKSPACE` (legacy: `OPENPRX_WORKSPACE`) env
@@ -414,10 +270,6 @@ pub struct Config {
     #[serde(default)]
     pub compliance: ComplianceConfig,
 
-    /// Module control switches — determines which config.d/ files are loaded (`[modules]`).
-    #[serde(default)]
-    pub modules: ModulesConfig,
-
     /// Tool tiering configuration — controls which tools are exposed based on intent (`[tool_tiering]`).
     #[serde(default)]
     pub tool_tiering: ToolTieringConfig,
@@ -481,7 +333,6 @@ impl std::fmt::Debug for Config {
             .field("causal_tree", &self.causal_tree)
             .field("security", &self.security)
             .field("compliance", &self.compliance)
-            .field("modules", &self.modules)
             .field("tool_tiering", &self.tool_tiering)
             .finish()
     }
@@ -589,9 +440,6 @@ const fn default_automix_confidence_threshold() -> f32 {
 /// Adaptive escalation policy for cheap-first routing.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AutomixConfig {
-    /// Enable Automix escalation. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
     /// Escalate when confidence falls below this threshold. Default: `0.7`.
     #[serde(default = "default_automix_confidence_threshold")]
     pub confidence_threshold: f32,
@@ -606,7 +454,6 @@ pub struct AutomixConfig {
 impl Default for AutomixConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             confidence_threshold: default_automix_confidence_threshold(),
             cheap_model_tiers: Vec::new(),
             premium_model_id: String::new(),
@@ -619,9 +466,6 @@ impl AutomixConfig {
         if !(0.0..=1.0).contains(&self.confidence_threshold) {
             anyhow::bail!("automix.confidence_threshold must be in [0,1]");
         }
-        if self.enabled && self.premium_model_id.trim().is_empty() {
-            anyhow::bail!("automix.premium_model_id must not be empty when automix.enabled=true");
-        }
         Ok(())
     }
 }
@@ -629,9 +473,6 @@ impl AutomixConfig {
 /// Heuristic LLM router configuration (`[router]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct RouterConfig {
-    /// Enable heuristic routing. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
     /// Similarity score weight. Phase 1 keeps this at `0.0`.
     #[serde(default = "default_router_alpha")]
     pub alpha: f32,
@@ -647,9 +488,6 @@ pub struct RouterConfig {
     /// Latency penalty coefficient.
     #[serde(default = "default_router_epsilon")]
     pub epsilon: f32,
-    /// Enable KNN-based semantic router history. Default: `false`.
-    #[serde(default)]
-    pub knn_enabled: bool,
     /// Minimum history records before KNN affects routing. Default: `10`.
     #[serde(default = "default_router_knn_min_records")]
     pub knn_min_records: usize,
@@ -667,13 +505,11 @@ pub struct RouterConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             alpha: default_router_alpha(),
             beta: default_router_beta(),
             gamma: default_router_gamma(),
             delta: default_router_delta(),
             epsilon: default_router_epsilon(),
-            knn_enabled: false,
             knn_min_records: default_router_knn_min_records(),
             knn_k: default_router_knn_k(),
             automix: AutomixConfig::default(),
@@ -746,9 +582,6 @@ pub struct OllamaProviderConfig {
 /// Remote node proxy configuration for core-side RPC calls and node daemon defaults.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct NodesConfig {
-    /// Enable remote node features.
-    #[serde(default)]
-    pub enabled: bool,
     /// Default request timeout for node RPC calls.
     #[serde(default = "default_nodes_timeout_ms")]
     pub request_timeout_ms: u64,
@@ -774,7 +607,6 @@ const fn default_nodes_retry_max() -> u8 {
 impl Default for NodesConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             request_timeout_ms: default_nodes_timeout_ms(),
             retry_max: default_nodes_retry_max(),
             nodes: Vec::new(),
@@ -797,9 +629,6 @@ pub struct RemoteNodeConfig {
     /// Optional request signing key (HMAC-SHA256).
     #[serde(default)]
     pub hmac_secret: Option<String>,
-    /// Whether this node is enabled.
-    #[serde(default = "default_nodes_enabled")]
-    pub enabled: bool,
     /// Optional per-node timeout override.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
@@ -815,15 +644,10 @@ impl std::fmt::Debug for RemoteNodeConfig {
             .field("endpoint", &self.endpoint)
             .field("bearer_token", &"[REDACTED]")
             .field("hmac_secret", &self.hmac_secret.as_ref().map(|_| "[REDACTED]"))
-            .field("enabled", &self.enabled)
             .field("timeout_ms", &self.timeout_ms)
             .field("retry_max", &self.retry_max)
             .finish()
     }
-}
-
-const fn default_nodes_enabled() -> bool {
-    true
 }
 
 /// Node daemon runtime config used by `prx-node`.
@@ -1089,16 +913,9 @@ pub enum RetrievalInjectionRole {
 /// Letta/MemGPT-style OS-paging configuration (`[agent.compaction.os_paging]`).
 ///
 /// OS-paging is an additive layer on top of the existing compaction pipeline.
-/// Enabled by default (Phase 1). When `enabled = false` the agent runs the
-/// legacy `apply_configurable_compaction` path unchanged.
+/// Always active; configuration controls its thresholds and recall behavior.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct OsPagingConfig {
-    /// Enable OS-paging (Letta/MemGPT-style non-destructive eviction + recall).
-    /// Behavior-limits Phase 1: default flipped `false` -> `true` so the agent
-    /// "remembers" via semantic recall of paged-out history instead of hard
-    /// dropping old messages. `safeguard` compaction still backstops overflow.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Token capacity ratio (0.0-1.0, relative to `max_context_tokens`) above
     /// which eviction is triggered. Letta recommends ~0.70; the legacy
     /// compaction path uses 0.85.
@@ -1123,8 +940,6 @@ pub struct OsPagingConfig {
 impl Default for OsPagingConfig {
     fn default() -> Self {
         Self {
-            // Behavior-limits Phase 1: on by default (see field docs above).
-            enabled: true,
             eviction_threshold: default_os_paging_eviction_threshold(),
             proactive_retrieval: true,
             max_recalled_pages: default_os_paging_max_recalled_pages(),
@@ -1239,16 +1054,9 @@ const fn default_sessions_spawn_max_children_per_agent() -> usize {
 /// Self-system experimental automation config (`[self_system]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SelfSystemConfig {
-    /// Enable periodic self-system fitness worker in daemon runtime.
-    /// Deprecated as a global evolution switch: use `evolution_enabled` for scheduler control.
-    #[serde(default)]
-    pub enabled: bool,
     /// Fitness report interval in hours.
     #[serde(default = "default_self_system_fitness_interval_hours")]
     pub fitness_interval_hours: u64,
-    /// Enable evolution scheduler cycles in daemon runtime.
-    #[serde(default)]
-    pub evolution_enabled: bool,
     /// Evolution scheduler interval in hours (daemon mode).
     #[serde(default = "default_self_system_evolution_interval_hours")]
     pub evolution_interval_hours: u32,
@@ -1273,9 +1081,7 @@ const fn default_self_system_evolution_interval_hours() -> u32 {
 impl Default for SelfSystemConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             fitness_interval_hours: default_self_system_fitness_interval_hours(),
-            evolution_enabled: true,
             evolution_interval_hours: default_self_system_evolution_interval_hours(),
             evolution_config_path: None,
             evolution_debug_raw: false,
@@ -1370,18 +1176,10 @@ impl Default for AgentConfig {
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillsConfig {
-    /// Enable loading and syncing the community open-skills repository.
-    /// Default: `false` (opt-in).
-    #[serde(default)]
-    pub open_skills_enabled: bool,
     /// Optional path to a local open-skills repository.
     /// If unset, defaults to `$HOME/open-skills` when enabled.
     #[serde(default)]
     pub open_skills_dir: Option<String>,
-    /// Enable cloning and loading OpenClaw skills from GitHub (sparse checkout of `skills/` dir).
-    /// Default: `false` (opt-in).
-    #[serde(default)]
-    pub openclaw_skills_enabled: bool,
     /// Optional path to a local openclaw-skills clone directory.
     /// If unset, defaults to `$HOME/.openprx/openclaw-skills/` when enabled.
     #[serde(default)]
@@ -1391,9 +1189,7 @@ pub struct SkillsConfig {
 impl Default for SkillsConfig {
     fn default() -> Self {
         Self {
-            open_skills_enabled: false,
             open_skills_dir: None,
-            openclaw_skills_enabled: false,
             openclaw_skills_dir: None,
         }
     }
@@ -1402,16 +1198,9 @@ impl Default for SkillsConfig {
 /// Dynamic skill retrieval configuration (`[skill_rag]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkillRagConfig {
-    /// Enable query-aware skill selection instead of full-skill injection.
-    #[serde(default = "default_skill_rag_enabled")]
-    pub enabled: bool,
     /// Maximum number of relevant skills injected when skill RAG is enabled.
     #[serde(default = "default_skill_rag_top_k")]
     pub top_k: usize,
-}
-
-const fn default_skill_rag_enabled() -> bool {
-    true
 }
 
 const fn default_skill_rag_top_k() -> usize {
@@ -1421,9 +1210,14 @@ const fn default_skill_rag_top_k() -> usize {
 impl Default for SkillRagConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             top_k: default_skill_rag_top_k(),
         }
+    }
+}
+
+impl SkillRagConfig {
+    pub const fn available(&self) -> bool {
+        true
     }
 }
 
@@ -1578,10 +1372,6 @@ impl Default for IdentityConfig {
 /// Cost tracking and budget enforcement configuration (`[cost]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CostConfig {
-    /// Enable cost tracking (default: false)
-    #[serde(default)]
-    pub enabled: bool,
-
     /// Daily spending limit in USD (default: 10.00)
     #[serde(default = "default_daily_limit")]
     pub daily_limit_usd: f64,
@@ -1638,7 +1428,6 @@ const fn default_warn_percent() -> u8 {
 impl Default for CostConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             daily_limit_usd: default_daily_limit(),
             monthly_limit_usd: default_monthly_limit(),
             warn_at_percent: default_warn_percent(),
@@ -1940,9 +1729,6 @@ impl Default for GatewayConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryWebhookConfig {
-    /// Enable the standalone webhook receiver.
-    #[serde(default)]
-    pub enabled: bool,
     /// Socket address for the receiver (e.g. "0.0.0.0:16899").
     #[serde(default = "default_memory_webhook_bind")]
     pub bind: String,
@@ -1961,11 +1747,16 @@ fn default_memory_webhook_bind() -> String {
 impl Default for MemoryWebhookConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             bind: default_memory_webhook_bind(),
             token: None,
             signing_secret: None,
         }
+    }
+}
+
+impl MemoryWebhookConfig {
+    pub fn configured(&self) -> bool {
+        self.token.as_deref().is_some_and(|value| !value.trim().is_empty())
     }
 }
 
@@ -1976,9 +1767,6 @@ impl Default for MemoryWebhookConfig {
 /// Provides access to 1000+ OAuth-connected tools via the Composio platform.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ComposioConfig {
-    /// Enable Composio integration for 1000+ OAuth tools
-    #[serde(default, alias = "enable")]
-    pub enabled: bool,
     /// Composio API key (stored encrypted when secrets.encrypt = true)
     #[serde(default)]
     pub api_key: Option<String>,
@@ -1994,10 +1782,15 @@ fn default_entity_id() -> String {
 impl Default for ComposioConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             api_key: None,
             entity_id: default_entity_id(),
         }
+    }
+}
+
+impl ComposioConfig {
+    pub fn configured(&self) -> bool {
+        self.api_key.as_deref().is_some_and(|value| !value.trim().is_empty())
     }
 }
 
@@ -2005,9 +1798,6 @@ impl Default for ComposioConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpConfig {
-    /// Enable MCP client integration
-    #[serde(default)]
-    pub enabled: bool,
     /// Named MCP server definitions
     #[serde(default)]
     pub servers: HashMap<String, McpServerConfig>,
@@ -2016,17 +1806,19 @@ pub struct McpConfig {
 impl Default for McpConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             servers: HashMap::new(),
         }
     }
 }
 
+impl McpConfig {
+    pub fn configured(&self) -> bool {
+        !self.servers.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerRuntimeConfig {
-    /// Enable MCP server compatibility endpoints.
-    #[serde(default)]
-    pub enabled: bool,
     /// Advertised bind address. The gateway may still be started with a CLI port override.
     #[serde(default = "default_mcp_server_bind")]
     pub bind: String,
@@ -2114,7 +1906,6 @@ const fn default_mcp_server_rate_limit_rps() -> u32 {
 impl Default for McpServerRuntimeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             bind: default_mcp_server_bind(),
             require_auth: true,
             exposed_tools: default_mcp_server_exposed_tools(),
@@ -2133,9 +1924,6 @@ impl Default for McpServerRuntimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct A2aConfig {
-    /// Enable Agent-to-Agent compatibility endpoints.
-    #[serde(default)]
-    pub enabled: bool,
     /// Advertised bind address.
     #[serde(default = "default_a2a_bind")]
     pub bind: String,
@@ -2208,7 +1996,6 @@ const fn default_a2a_card_ttl_seconds() -> u64 {
 impl Default for A2aConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             bind: default_a2a_bind(),
             agent_id: default_a2a_agent_id(),
             spiffe_id: default_a2a_spiffe_id(),
@@ -2240,9 +2027,6 @@ impl Default for McpTransport {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpServerConfig {
-    /// Per-server enable switch
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Transport type: stdio or http
     #[serde(default)]
     pub transport: McpTransport,
@@ -2290,7 +2074,6 @@ fn default_mcp_tool_name_prefix() -> String {
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             transport: McpTransport::Stdio,
             command: None,
             args: Vec::new(),
@@ -2375,11 +2158,8 @@ pub struct BrowserConfig {
 /// HTTP request tool configuration (`[http_request]` section).
 ///
 /// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
-    /// Enable `http_request` tool for API interactions
-    #[serde(default)]
-    pub enabled: bool,
     /// Allowed domains for HTTP requests (exact or subdomain match)
     #[serde(default)]
     pub allowed_domains: Vec<String>,
@@ -2389,6 +2169,16 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        Self {
+            allowed_domains: Vec::new(),
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
+        }
+    }
 }
 
 const fn default_http_max_response_size() -> usize {
@@ -2404,9 +2194,6 @@ const fn default_http_timeout_secs() -> u64 {
 /// Web search tool configuration (`[web_search]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WebSearchConfig {
-    /// Enable `web_search_tool` for web searches
-    #[serde(default)]
-    pub enabled: bool,
     /// Search provider: "duckduckgo" (free, no API key) or "brave" (requires API key)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
@@ -2419,9 +2206,6 @@ pub struct WebSearchConfig {
     /// Request timeout in seconds
     #[serde(default = "default_web_search_timeout_secs")]
     pub timeout_secs: u64,
-    /// Enable `web_fetch` tool (fetch and extract readable content from a URL)
-    #[serde(default = "default_web_fetch_enabled")]
-    pub fetch_enabled: bool,
     /// Maximum characters returned by `web_fetch` (default 10000)
     #[serde(default = "default_web_fetch_max_chars")]
     pub fetch_max_chars: usize,
@@ -2440,10 +2224,6 @@ const fn default_web_search_timeout_secs() -> u64 {
     15
 }
 
-const fn default_web_fetch_enabled() -> bool {
-    true
-}
-
 const fn default_web_fetch_max_chars() -> usize {
     // Behavior-limits Phase 1: raised 10K -> 50K so web_fetch returns more of a
     // page. Still a finite OOM guard (not removed).
@@ -2453,12 +2233,10 @@ const fn default_web_fetch_max_chars() -> usize {
 impl Default for WebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             provider: default_web_search_provider(),
             brave_api_key: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
-            fetch_enabled: default_web_fetch_enabled(),
             fetch_max_chars: default_web_fetch_max_chars(),
         }
     }
@@ -2482,9 +2260,6 @@ pub enum ProxyScope {
 /// Proxy configuration for outbound HTTP/HTTPS/SOCKS5 traffic (`[proxy]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ProxyConfig {
-    /// Enable proxy support for selected scope.
-    #[serde(default)]
-    pub enabled: bool,
     /// Proxy URL for HTTP requests (supports http, https, socks5, socks5h).
     #[serde(default)]
     pub http_proxy: Option<String>,
@@ -2508,7 +2283,6 @@ pub struct ProxyConfig {
 impl Default for ProxyConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             http_proxy: None,
             https_proxy: None,
             all_proxy: None,
@@ -2561,21 +2335,15 @@ impl ProxyConfig {
             }
         }
 
-        if self.enabled && !self.has_any_proxy_url() {
-            anyhow::bail!(
-                "Proxy is enabled but no proxy URL is configured. Set at least one of http_proxy, https_proxy, or all_proxy"
-            );
-        }
-
-        if self.enabled && self.scope == ProxyScope::Services && self.normalized_services().is_empty() {
-            anyhow::bail!("proxy.scope='services' requires a non-empty proxy.services list when proxy is enabled");
+        if self.has_any_proxy_url() && self.scope == ProxyScope::Services && self.normalized_services().is_empty() {
+            anyhow::bail!("proxy.scope='services' requires a non-empty proxy.services list");
         }
 
         Ok(())
     }
 
     pub fn should_apply_to_service(&self, service_key: &str) -> bool {
-        if !self.enabled {
+        if !self.has_any_proxy_url() {
             return false;
         }
 
@@ -2990,9 +2758,6 @@ pub struct MemoryConfig {
     /// backfill rolls out. Phase 3 can disable and remove this after NULL=0.
     #[serde(default = "default_true")]
     pub legacy_conversation_turns_visible: bool,
-    /// Run memory/session hygiene (archiving + retention cleanup)
-    #[serde(default = "default_hygiene_enabled")]
-    pub hygiene_enabled: bool,
     /// Archive daily/session files older than this many days
     #[serde(default = "default_archive_after_days")]
     pub archive_after_days: u32,
@@ -3030,12 +2795,6 @@ pub struct MemoryConfig {
     pub embedding_cache_size: usize,
 
     // ── Memory Snapshot (soul backup to Markdown) ─────────────
-    /// Enable periodic export of core memories to MEMORY_SNAPSHOT.md
-    #[serde(default)]
-    pub snapshot_enabled: bool,
-    /// Run snapshot during hygiene passes (heartbeat-driven)
-    #[serde(default)]
-    pub snapshot_on_hygiene: bool,
     /// Auto-hydrate from MEMORY_SNAPSHOT.md when brain.db is missing
     #[serde(default = "default_true")]
     pub auto_hydrate: bool,
@@ -3076,9 +2835,6 @@ pub struct MemoryConfig {
 /// Raw message event recording configuration (`[memory.events]`).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct MemoryEventsConfig {
-    /// Record normalized message events into the shared fabric.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Record inbound/user messages.
     #[serde(default = "default_true")]
     pub record_user_messages: bool,
@@ -3109,9 +2865,6 @@ pub struct MemorySemanticConfig {
 
 fn default_embedding_provider() -> String {
     "none".into()
-}
-const fn default_hygiene_enabled() -> bool {
-    true
 }
 const fn default_archive_after_days() -> u32 {
     7
@@ -3171,7 +2924,6 @@ impl Default for MemoryConfig {
             semantic: MemorySemanticConfig::default(),
             acl_enabled: false,
             legacy_conversation_turns_visible: true,
-            hygiene_enabled: default_hygiene_enabled(),
             archive_after_days: default_archive_after_days(),
             purge_after_days: default_purge_after_days(),
             conversation_retention_days: default_conversation_retention_days(),
@@ -3183,8 +2935,6 @@ impl Default for MemoryConfig {
             keyword_weight: default_keyword_weight(),
             min_relevance_score: default_min_relevance_score(),
             embedding_cache_size: default_cache_size(),
-            snapshot_enabled: false,
-            snapshot_on_hygiene: false,
             auto_hydrate: true,
             sqlite_open_timeout_secs: None,
             lucid_cmd: None,
@@ -3200,7 +2950,6 @@ impl Default for MemoryConfig {
 impl Default for MemoryEventsConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             record_user_messages: true,
             record_assistant_messages: true,
             record_tool_events: false,
@@ -3237,17 +2986,17 @@ impl MemoryConfig {
 
     /// Whether normalized user message events should be recorded.
     pub const fn should_record_user_message_event(&self) -> bool {
-        self.events.enabled && self.events.record_user_messages
+        self.events.record_user_messages
     }
 
     /// Whether normalized assistant message events should be recorded.
     pub const fn should_record_assistant_message_event(&self) -> bool {
-        self.events.enabled && self.events.record_assistant_messages
+        self.events.record_assistant_messages
     }
 
     pub const fn event_recording_config(&self) -> crate::memory::MemoryEventRecording {
         crate::memory::MemoryEventRecording {
-            enabled: self.events.enabled,
+            enabled: true,
             record_user_messages: self.events.record_user_messages,
             record_assistant_messages: self.events.record_assistant_messages,
             record_tool_events: self.events.record_tool_events,
@@ -3496,18 +3245,8 @@ pub struct AutonomyConfig {
 
     /// Sandbox configuration (folded in from the former `[security.sandbox]`).
     /// Disabled by default in Phase 1 (NoopSandbox → commands run un-isolated).
-    #[serde(default = "default_disabled_sandbox")]
+    #[serde(default)]
     pub sandbox: SandboxConfig,
-}
-
-/// Phase 1 default: sandbox disabled (NoopSandbox). The backend implementations
-/// are retained so Phase 2 can re-enable per-risk sandboxing by flipping
-/// `enabled`.
-fn default_disabled_sandbox() -> SandboxConfig {
-    SandboxConfig {
-        enabled: Some(false),
-        ..SandboxConfig::default()
-    }
 }
 
 impl Default for AutonomyConfig {
@@ -3538,7 +3277,7 @@ impl Default for AutonomyConfig {
             max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
             max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
             scopes: ScopeConfig::default(),
-            sandbox: default_disabled_sandbox(),
+            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -3733,9 +3472,6 @@ impl Default for ReliabilityConfig {
 /// Scheduler configuration for periodic task execution (`[scheduler]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SchedulerConfig {
-    /// Enable the built-in scheduler loop.
-    #[serde(default = "default_scheduler_enabled")]
-    pub enabled: bool,
     /// Maximum number of persisted scheduled tasks.
     #[serde(default = "default_scheduler_max_tasks")]
     pub max_tasks: usize,
@@ -3746,10 +3482,6 @@ pub struct SchedulerConfig {
     /// the interval; expired claims may be recovered by another scheduler.
     #[serde(default = "default_scheduler_claim_lease_secs")]
     pub claim_lease_secs: u64,
-}
-
-const fn default_scheduler_enabled() -> bool {
-    true
 }
 
 const fn default_scheduler_max_tasks() -> usize {
@@ -3767,7 +3499,6 @@ const fn default_scheduler_claim_lease_secs() -> u64 {
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
-            enabled: default_scheduler_enabled(),
             max_tasks: default_scheduler_max_tasks(),
             max_concurrent: default_scheduler_max_concurrent(),
             claim_lease_secs: default_scheduler_claim_lease_secs(),
@@ -3841,9 +3572,6 @@ pub struct EmbeddingRouteConfig {
 /// and routes to the appropriate model hint. Disabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct QueryClassificationConfig {
-    /// Enable automatic query classification. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
     /// Classification rules evaluated in priority order.
     #[serde(default)]
     pub rules: Vec<ClassificationRule>,
@@ -3884,9 +3612,6 @@ pub enum TaskRoutingIntentConfig {
 /// Lightweight pre-LLM task routing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct TaskRoutingConfig {
-    /// Enable task intent routing before entering the main tool loop.
-    #[serde(default)]
-    pub enabled: bool,
     /// Fallback intent when no rule matches.
     #[serde(default)]
     pub default_intent: TaskRoutingIntentConfig,
@@ -3920,8 +3645,6 @@ pub struct TaskRoutingRule {
 /// Heartbeat configuration for periodic health pings (`[heartbeat]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HeartbeatConfig {
-    /// Enable periodic heartbeat pings. Default: `false`.
-    pub enabled: bool,
     /// Interval in minutes between heartbeat pings. Default: `30`.
     pub interval_minutes: u32,
     /// Inclusive active hour window `[start_hour, end_hour]` in local time.
@@ -3936,7 +3659,6 @@ pub struct HeartbeatConfig {
 impl Default for HeartbeatConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             interval_minutes: 30,
             active_hours: default_heartbeat_active_hours(),
             prompt: default_heartbeat_prompt(),
@@ -4039,10 +3761,6 @@ impl GroupReplyMode {
     }
 }
 
-const fn default_pre_gate_enabled() -> bool {
-    true
-}
-
 const fn default_pre_gate_classifier_timeout_secs() -> u64 {
     5
 }
@@ -4069,18 +3787,6 @@ const fn default_pre_gate_max_context_messages() -> usize {
 /// silently drop a message that should have been answered).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SmartGroupConfig {
-    /// Master switch for the pre-gate. Default: `true`. Even when enabled the
-    /// pre-gate only affects smart-mode group messages, which are themselves
-    /// opt-in, so the safe default is on. When disabled, every smart group
-    /// message enters the full loop (the pre-MVP-B "always enter loop" behavior).
-    #[serde(default = "default_pre_gate_enabled")]
-    pub enabled: bool,
-    /// Whether the Tier-2 cheap-model classifier is consulted for the
-    /// "uncertain" heuristic bucket. Default: `true`. When `false`, uncertain
-    /// messages enter the loop directly (fail-open / err-toward-entering),
-    /// trading some token savings for zero classifier latency.
-    #[serde(default = "default_pre_gate_enabled")]
-    pub classifier_enabled: bool,
     /// Provider id/alias for the Tier-2 classifier. When empty, the channel's
     /// own routed provider is reused (no extra provider construction).
     #[serde(default)]
@@ -4107,8 +3813,6 @@ pub struct SmartGroupConfig {
 impl Default for SmartGroupConfig {
     fn default() -> Self {
         Self {
-            enabled: default_pre_gate_enabled(),
-            classifier_enabled: default_pre_gate_enabled(),
             classifier_provider: String::new(),
             classifier_model: String::new(),
             classifier_timeout_secs: default_pre_gate_classifier_timeout_secs(),
@@ -4136,9 +3840,6 @@ impl SmartGroupConfig {
 /// Cron job configuration (`[cron]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct CronConfig {
-    /// Enable the cron subsystem. Default: `true`.
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     /// Maximum number of historical cron run records to retain. Default: `50`.
     #[serde(default = "default_max_run_history")]
     pub max_run_history: u32,
@@ -4151,7 +3852,6 @@ const fn default_max_run_history() -> u32 {
 impl Default for CronConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             max_run_history: default_max_run_history(),
         }
     }
@@ -4773,7 +4473,6 @@ impl WhatsAppConfig {
 /// Example TOML:
 /// ```toml
 /// [channels_config.wacli]
-/// enabled = true
 /// webhook_listen = "127.0.0.1:16868"
 /// webhook_path = "/wacli"
 /// webhook_secret = "<SECRET>"     # must match --webhook-secret
@@ -4785,9 +4484,6 @@ impl WhatsAppConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WacliConfig {
-    /// Enable the wacli channel.
-    #[serde(default)]
-    pub enabled: bool,
     /// Address the inbound webhook server binds to (default: "127.0.0.1:16868").
     #[serde(default = "default_wacli_webhook_listen")]
     pub webhook_listen: String,
@@ -4855,7 +4551,6 @@ fn default_wacli_allowed_from() -> Vec<String> {
 impl Default for WacliConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             webhook_listen: default_wacli_webhook_listen(),
             webhook_path: default_wacli_webhook_path(),
             webhook_secret: None,
@@ -4889,10 +4584,6 @@ impl WacliConfig {
                  longer supported; use webhook_listen/webhook_path/webhook_secret with the \
                  official `wacli sync --webhook` interface"
             );
-        }
-
-        if !self.enabled {
-            return Ok(());
         }
 
         // Address must be parseable so the listener can bind.
@@ -5147,8 +4838,6 @@ pub struct DeclarationOfConformityConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct InteractionNoticeConfig {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
     #[serde(default = "default_interaction_notice_version")]
     pub version: String,
     #[serde(default = "default_interaction_notice_text")]
@@ -5164,7 +4853,6 @@ pub struct InteractionNoticeConfig {
 impl Default for InteractionNoticeConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             version: default_interaction_notice_version(),
             text: default_interaction_notice_text(),
             applicability: InteractionNoticeApplicability::Required,
@@ -5214,8 +4902,6 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(default)]
 pub struct ToolTieringConfig {
-    /// Whether tool tiering is enabled. When false, all tools are shown.
-    pub enabled: bool,
     /// Tool names to always include regardless of intent classification.
     pub always_include: Vec<String>,
     /// Tool names to always exclude regardless of intent classification.
@@ -5225,7 +4911,6 @@ pub struct ToolTieringConfig {
 impl Default for ToolTieringConfig {
     fn default() -> Self {
         Self {
-            enabled: false, // opt-in, not opt-out; preserves backward compatibility
             always_include: Vec::new(),
             always_exclude: Vec::new(),
         }
@@ -5235,10 +4920,6 @@ impl Default for ToolTieringConfig {
 /// Sandbox configuration for OS-level isolation
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SandboxConfig {
-    /// Enable sandboxing (None = auto-detect, Some = explicit)
-    #[serde(default)]
-    pub enabled: Option<bool>,
-
     /// Sandbox backend to use
     #[serde(default)]
     pub backend: SandboxBackend,
@@ -5271,7 +4952,6 @@ pub struct SandboxConfig {
 impl Default for SandboxConfig {
     fn default() -> Self {
         Self {
-            enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
             extra_path_dirs: Vec::new(),
@@ -5280,7 +4960,7 @@ impl Default for SandboxConfig {
 }
 
 /// Sandbox backend selection
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxBackend {
     /// Auto-detect best available (default)
@@ -5348,10 +5028,6 @@ impl Default for ResourceLimitsConfig {
 /// Audit logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AuditConfig {
-    /// Enable audit logging
-    #[serde(default = "default_audit_enabled")]
-    pub enabled: bool,
-
     /// Path to audit log file (relative to openprx dir)
     #[serde(default = "default_audit_log_path")]
     pub log_path: String,
@@ -5365,10 +5041,6 @@ pub struct AuditConfig {
     pub sign_events: bool,
 }
 
-const fn default_audit_enabled() -> bool {
-    true
-}
-
 fn default_audit_log_path() -> String {
     "audit.log".to_string()
 }
@@ -5380,7 +5052,6 @@ const fn default_audit_max_size_mb() -> u32 {
 impl Default for AuditConfig {
     fn default() -> Self {
         Self {
-            enabled: default_audit_enabled(),
             log_path: default_audit_log_path(),
             max_size_mb: default_audit_max_size_mb(),
             sign_events: false,
@@ -5501,7 +5172,6 @@ impl Default for Config {
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
-            modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         }
     }
@@ -6058,15 +5728,7 @@ impl Config {
         if notice.version.trim().is_empty() {
             anyhow::bail!("compliance.interaction_notice.version must not be empty");
         }
-        if !notice.enabled && notice.applicability == InteractionNoticeApplicability::Required {
-            anyhow::bail!(
-                "compliance.interaction_notice.enabled must be true when the notice is required; use not_applicable with reviewed exception metadata"
-            );
-        }
-        if notice.enabled
-            && notice.applicability == InteractionNoticeApplicability::Required
-            && notice.text.trim().is_empty()
-        {
+        if notice.applicability == InteractionNoticeApplicability::Required && notice.text.trim().is_empty() {
             anyhow::bail!("compliance.interaction_notice.text must not be empty when the notice is required");
         }
         if notice.applicability == InteractionNoticeApplicability::NotApplicable
@@ -6102,9 +5764,9 @@ impl Config {
         if self.gateway.host.trim().is_empty() {
             anyhow::bail!("gateway.host must not be empty");
         }
-        if self.webhook.enabled {
+        if self.webhook.configured() {
             if self.webhook.bind.trim().is_empty() {
-                anyhow::bail!("webhook.bind must not be empty when webhook.enabled is true");
+                anyhow::bail!("webhook.bind must not be empty when a webhook token is configured");
             }
             self.webhook
                 .bind
@@ -6118,7 +5780,7 @@ impl Config {
                 .filter(|value| !value.is_empty())
                 .is_none()
             {
-                anyhow::bail!("webhook.token must be set when webhook.enabled is true");
+                anyhow::bail!("webhook.token must not be empty");
             }
             let webhook_backend = if self.storage.provider.config.provider.trim().is_empty() {
                 self.memory.backend.as_str()
@@ -6178,9 +5840,7 @@ impl Config {
             }
         }
 
-        if self.router.enabled {
-            self.router.validate()?;
-        }
+        self.router.validate()?;
 
         // Embedding routes
         for (i, route) in self.embedding_routes.iter().enumerate() {
@@ -6459,7 +6119,6 @@ mod tests {
         assert!(c.default_model.as_deref().unwrap().contains("claude"));
         assert!((c.default_temperature - 0.7).abs() < f64::EPSILON);
         assert!(c.api_key.is_none());
-        assert!(!c.skills.open_skills_enabled);
         assert!(c.workspace_dir.to_string_lossy().contains("workspace"));
         assert!(c.config_path.to_string_lossy().contains("config.toml"));
     }
@@ -6593,26 +6252,20 @@ mod tests {
     #[test]
     async fn heartbeat_config_default() {
         let h = HeartbeatConfig::default();
-        assert!(!h.enabled);
         assert_eq!(h.interval_minutes, 30);
     }
 
     #[test]
     async fn cron_config_default() {
         let c = CronConfig::default();
-        assert!(c.enabled);
         assert_eq!(c.max_run_history, 50);
     }
 
     #[test]
     async fn cron_config_serde_roundtrip() {
-        let c = CronConfig {
-            enabled: false,
-            max_run_history: 100,
-        };
+        let c = CronConfig { max_run_history: 100 };
         let json = serde_json::to_string(&c).unwrap();
         let parsed: CronConfig = serde_json::from_str(&json).unwrap();
-        assert!(!parsed.enabled);
         assert_eq!(parsed.max_run_history, 100);
     }
 
@@ -6625,7 +6278,6 @@ default_temperature = 0.7
 "#;
 
         let parsed: Config = toml::from_str(toml_str).unwrap();
-        assert!(parsed.cron.enabled);
         assert_eq!(parsed.cron.max_run_history, 50);
     }
 
@@ -6634,7 +6286,6 @@ default_temperature = 0.7
         let m = MemoryConfig::default();
         assert_eq!(m.backend, "sqlite");
         assert!(m.auto_save);
-        assert!(m.events.enabled);
         assert!(m.events.record_user_messages);
         assert!(m.events.record_assistant_messages);
         assert!(!m.events.record_tool_events);
@@ -6644,7 +6295,6 @@ default_temperature = 0.7
         assert_eq!(m.semantic.min_chars, 30);
         assert!(m.should_auto_promote_user_message("this is a long enough user preference that should be stored"));
         assert!(!m.acl_enabled);
-        assert!(m.hygiene_enabled);
         assert_eq!(m.archive_after_days, 7);
         assert_eq!(m.purge_after_days, 30);
         assert_eq!(m.conversation_retention_days, 3);
@@ -6660,7 +6310,6 @@ backend = "sqlite"
 auto_save = true
 
 [events]
-enabled = true
 record_user_messages = true
 record_assistant_messages = false
 record_tool_events = true
@@ -6689,7 +6338,6 @@ min_chars = 12
     #[test]
     async fn nodes_config_defaults() {
         let nodes = NodesConfig::default();
-        assert!(!nodes.enabled);
         assert_eq!(nodes.request_timeout_ms, 15_000);
         assert_eq!(nodes.retry_max, 2);
         assert_eq!(nodes.server.listen_addr, "127.0.0.1:8787");
@@ -6735,10 +6383,9 @@ min_chars = 12
     }
 
     #[test]
-    async fn interaction_notice_defaults_required_and_enabled() {
+    async fn interaction_notice_defaults_required() {
         let config = Config::default();
 
-        assert!(config.compliance.interaction_notice.enabled);
         assert_eq!(
             config.compliance.interaction_notice.applicability,
             InteractionNoticeApplicability::Required
@@ -6747,18 +6394,9 @@ min_chars = 12
     }
 
     #[test]
-    async fn interaction_notice_rejects_disabled_required_notice() {
-        let mut config = Config::default();
-        config.compliance.interaction_notice.enabled = false;
-
-        assert!(config.validate().is_err());
-    }
-
-    #[test]
     async fn interaction_notice_not_applicable_requires_reviewed_exception() {
         let mut config = Config::default();
         config.compliance.interaction_notice.applicability = InteractionNoticeApplicability::NotApplicable;
-        config.compliance.interaction_notice.enabled = false;
         assert!(config.validate().is_err());
 
         config.compliance.interaction_notice.exception_owner = Some("compliance@example.invalid".to_string());
@@ -6830,7 +6468,6 @@ min_chars = 12
             router: RouterConfig::default(),
             smart_group: SmartGroupConfig::default(),
             heartbeat: HeartbeatConfig {
-                enabled: true,
                 interval_minutes: 15,
                 ..HeartbeatConfig::default()
             },
@@ -6892,7 +6529,6 @@ min_chars = 12
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
-            modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         };
 
@@ -6907,7 +6543,6 @@ min_chars = 12
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert!(!parsed.autonomy.workspace_only);
         assert_eq!(parsed.runtime.kind, "docker");
-        assert!(parsed.heartbeat.enabled);
         assert_eq!(parsed.heartbeat.interval_minutes, 15);
         assert!(parsed.channels_config.telegram.is_some());
         assert_eq!(parsed.channels_config.telegram.unwrap().bot_token, "123:ABC");
@@ -6926,9 +6561,7 @@ default_temperature = 0.7
         assert_eq!(parsed.observability.backend, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert_eq!(parsed.runtime.kind, "native");
-        assert!(!parsed.heartbeat.enabled);
         assert!(parsed.channels_config.cli);
-        assert!(parsed.memory.hygiene_enabled);
         assert!(!parsed.memory.acl_enabled);
         assert_eq!(parsed.memory.archive_after_days, 7);
         assert_eq!(parsed.memory.purge_after_days, 30);
@@ -6943,11 +6576,9 @@ default_temperature = 0.7
 default_temperature = 0.7
 
 [self_system]
-evolution_enabled = true
 evolution_interval_hours = 12
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert!(parsed.self_system.evolution_enabled);
         assert_eq!(parsed.self_system.evolution_interval_hours, 12);
     }
 
@@ -7032,11 +6663,6 @@ reasoning_enabled = false
     async fn agent_config_defaults() {
         let cfg = AgentConfig::default();
         assert!(!cfg.compact_context);
-        // Behavior-limits Phase 1: os_paging flipped on by default.
-        assert!(
-            cfg.compaction.os_paging.enabled,
-            "Phase 1: os_paging must be enabled by default"
-        );
         // Behavior-limits Phase 1: raised defaults (200 / 300).
         assert_eq!(cfg.max_tool_iterations, 200);
         assert_eq!(cfg.max_history_messages, 300);
@@ -7066,10 +6692,7 @@ default_temperature = 0.7
 [agent.compaction]
 "#;
         let parsed: Config = toml::from_str(raw).unwrap();
-        assert!(
-            parsed.agent.compaction.os_paging.enabled,
-            "empty [agent.compaction] must deserialize with os_paging enabled (Phase 1 default)"
-        );
+        assert_eq!(parsed.agent.compaction.os_paging.max_recalled_pages, 10);
     }
 
     #[test]
@@ -7085,7 +6708,6 @@ default_temperature = 0.7
 mode = "safeguard"
 
 [router]
-enabled = true
 
 [[router.models]]
 model_id = "wide"
@@ -7108,7 +6730,6 @@ mode = "safeguard"
 max_context_tokens = 128000
 
 [router]
-enabled = true
 
 [[router.models]]
 model_id = "wide"
@@ -7249,7 +6870,6 @@ concurrency_rollback_error_rate_threshold = 0.23
             causal_tree: crate::causal_tree::CausalTreeConfig::default(),
             security: SecurityConfig::default(),
             compliance: ComplianceConfig::default(),
-            modules: ModulesConfig::default(),
             tool_tiering: ToolTieringConfig::default(),
         };
 
@@ -7318,7 +6938,6 @@ model = "base-alpha"
 backend = "sqlite"
 auto_save = true
 acl_enabled = false
-hygiene_enabled = true
 archive_after_days = 7
 purge_after_days = 30
 conversation_retention_days = 3
@@ -7330,8 +6949,6 @@ vector_weight = 0.7
 keyword_weight = 0.3
 min_relevance_score = 0.4
 embedding_cache_size = 1000
-snapshot_enabled = false
-snapshot_on_hygiene = false
 auto_hydrate = true
 "#,
         )
@@ -7393,10 +7010,6 @@ model = "override-beta"
         config.storage.provider.config.db_url = Some("postgres://user:pw@host/db".into());
         // Keep test deterministic even if process env mutates proxy defaults elsewhere.
         config.proxy = ProxyConfig::default();
-        // All modules must be enabled so the roundtrip reload picks up every
-        // config.d/ fragment written by write_split_config (fail-closed gating
-        // skips fragments whose module is disabled).
-        config.modules = ModulesConfig::all_enabled();
         config.security.resources.max_cpu_time_seconds = 120;
         config.autonomy.max_actions_per_hour = 42;
         config.agents.insert(
@@ -8178,20 +7791,18 @@ default_temperature = 0.7
     async fn memory_webhook_config_signing_secret_roundtrip() {
         let config: MemoryWebhookConfig = toml::from_str(
             r#"
-enabled = true
 bind = "127.0.0.1:16899"
 token = "receiver-token"
 signing_secret = "hmac-secret"
 "#,
         )
         .unwrap();
-        assert!(config.enabled);
+        assert!(config.configured());
         assert_eq!(config.token.as_deref(), Some("receiver-token"));
         assert_eq!(config.signing_secret.as_deref(), Some("hmac-secret"));
 
         let legacy: MemoryWebhookConfig = toml::from_str(
             r#"
-enabled = false
 bind = "127.0.0.1:16899"
 "#,
         )
@@ -8213,9 +7824,9 @@ bind = "127.0.0.1:16899"
     // ══════════════════════════════════════════════════════════
 
     #[test]
-    async fn composio_config_default_disabled() {
+    async fn composio_config_default_unconfigured() {
         let c = ComposioConfig::default();
-        assert!(!c.enabled, "Composio must be disabled by default");
+        assert!(!c.configured());
         assert!(c.api_key.is_none(), "No API key by default");
         assert_eq!(c.entity_id, "default");
     }
@@ -8223,13 +7834,12 @@ bind = "127.0.0.1:16899"
     #[test]
     async fn composio_config_serde_roundtrip() {
         let c = ComposioConfig {
-            enabled: true,
             api_key: Some("comp-key-123".into()),
             entity_id: "user42".into(),
         };
         let toml_str = toml::to_string(&c).unwrap();
         let parsed: ComposioConfig = toml::from_str(&toml_str).unwrap();
-        assert!(parsed.enabled);
+        assert!(parsed.configured());
         assert_eq!(parsed.api_key.as_deref(), Some("comp-key-123"));
         assert_eq!(parsed.entity_id, "user42");
     }
@@ -8242,30 +7852,8 @@ config_path = "/tmp/config.toml"
 default_temperature = 0.7
 "#;
         let parsed: Config = toml::from_str(minimal).unwrap();
-        assert!(!parsed.composio.enabled, "Missing [composio] must default to disabled");
+        assert!(!parsed.composio.configured());
         assert!(parsed.composio.api_key.is_none());
-    }
-
-    #[test]
-    async fn composio_config_partial_toml() {
-        let toml_str = r"
-enabled = true
-";
-        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
-    }
-
-    #[test]
-    async fn composio_config_enable_alias_supported() {
-        let toml_str = r"
-enable = true
-";
-        let parsed: ComposioConfig = toml::from_str(toml_str).unwrap();
-        assert!(parsed.enabled);
-        assert!(parsed.api_key.is_none());
-        assert_eq!(parsed.entity_id, "default");
     }
 
     // ══════════════════════════════════════════════════════════
@@ -8319,7 +7907,7 @@ default_temperature = 0.7
     #[test]
     async fn config_default_has_composio_and_secrets() {
         let c = Config::default();
-        assert!(!c.composio.enabled);
+        assert!(!c.composio.configured());
         assert!(c.auth.codex_auth_json_auto_import);
         assert!(c.composio.api_key.is_none());
         assert!(c.secrets.encrypt);
@@ -8648,7 +8236,6 @@ default_model = "legacy-model"
     #[test]
     async fn proxy_config_scope_services_requires_entries_when_enabled() {
         let proxy = ProxyConfig {
-            enabled: true,
             http_proxy: Some("http://127.0.0.1:7890".into()),
             https_proxy: None,
             all_proxy: None,
@@ -8664,7 +8251,6 @@ default_model = "legacy-model"
     #[test]
     async fn test_router_config_rejects_invalid_threshold() {
         let mut config = RouterConfig::default();
-        config.automix.enabled = true;
         config.automix.confidence_threshold = 1.5;
         config.automix.premium_model_id = "openai/model-premium".to_string();
         assert!(config.validate().is_err());
@@ -8678,11 +8264,10 @@ default_model = "legacy-model"
     }
 
     #[test]
-    async fn test_router_config_rejects_empty_premium_model() {
+    async fn test_router_config_allows_empty_premium_model_without_automix() {
         let mut config = RouterConfig::default();
-        config.automix.enabled = true;
         config.automix.premium_model_id = String::new();
-        assert!(config.validate().is_err());
+        assert!(config.validate().is_ok());
     }
 
     fn runtime_proxy_cache_contains(cache_key: &str) -> bool {
@@ -9075,9 +8660,6 @@ allowed_from = ["*"]
     #[test]
     async fn smart_group_config_defaults_and_validation() {
         let cfg = SmartGroupConfig::default();
-        // Pre-gate defaults to ON (only affects opt-in smart mode).
-        assert!(cfg.enabled);
-        assert!(cfg.classifier_enabled);
         assert!(cfg.classifier_provider.is_empty());
         assert!(cfg.classifier_model.is_empty());
         assert_eq!(cfg.classifier_timeout_secs, 5);
@@ -9099,15 +8681,11 @@ allowed_from = ["*"]
 default_temperature = 0.7
 
 [smart_group]
-enabled = true
-classifier_enabled = false
 classifier_provider = "ollama"
 classifier_model = "qwen2.5:3b"
 classifier_timeout_secs = 8
 "#;
         let cfg: Config = toml::from_str(toml).expect("parse smart_group toml");
-        assert!(cfg.smart_group.enabled);
-        assert!(!cfg.smart_group.classifier_enabled);
         assert_eq!(cfg.smart_group.classifier_provider, "ollama");
         assert_eq!(cfg.smart_group.classifier_model, "qwen2.5:3b");
         assert_eq!(cfg.smart_group.classifier_timeout_secs, 8);
@@ -9153,14 +8731,12 @@ classifier_timeout_secs = 8
         assert!(cfg.webhook_secret.is_none());
         assert!(!cfg.allow_unsigned_loopback);
         assert!(cfg.host.is_none() && cfg.port.is_none());
-        // Disabled by default => validation is a no-op.
-        cfg.validate().expect("default wacli config validates");
+        assert!(cfg.validate().is_err(), "configured wacli requires authentication");
     }
 
     #[test]
     async fn wacli_config_parses_official_webhook_toml() {
         let toml = r#"
-            enabled = true
             webhook_listen = "127.0.0.1:16868"
             webhook_path = "/wacli"
             webhook_secret = "s3cr3t"
@@ -9169,7 +8745,6 @@ classifier_timeout_secs = 8
             group_reply_mode = "smart"
         "#;
         let cfg: WacliConfig = toml::from_str(toml).expect("parse wacli config");
-        assert!(cfg.enabled);
         assert_eq!(cfg.webhook_secret.as_deref(), Some("s3cr3t"));
         assert_eq!(cfg.group_reply_mode, Some(GroupReplyMode::Smart));
         cfg.validate().expect("valid wacli config");
@@ -9178,7 +8753,6 @@ classifier_timeout_secs = 8
     #[test]
     async fn wacli_config_requires_secret_when_enabled() {
         let cfg = WacliConfig {
-            enabled: true,
             webhook_secret: None,
             ..WacliConfig::default()
         };
@@ -9188,7 +8762,6 @@ classifier_timeout_secs = 8
     #[test]
     async fn wacli_config_unsigned_loopback_ok() {
         let cfg = WacliConfig {
-            enabled: true,
             webhook_secret: None,
             allow_unsigned_loopback: true,
             webhook_listen: "127.0.0.1:16868".into(),
@@ -9200,7 +8773,6 @@ classifier_timeout_secs = 8
     #[test]
     async fn wacli_config_unsigned_non_loopback_rejected() {
         let cfg = WacliConfig {
-            enabled: true,
             webhook_secret: None,
             allow_unsigned_loopback: true,
             webhook_listen: "0.0.0.0:16868".into(),
@@ -9213,7 +8785,6 @@ classifier_timeout_secs = 8
     async fn wacli_config_rejects_legacy_jsonrpc_fields() {
         // Stale daemon config (host/port) must produce a clear migration error.
         let toml = r#"
-            enabled = true
             host = "127.0.0.1"
             port = 16867
             webhook_secret = "s"
@@ -9229,7 +8800,6 @@ classifier_timeout_secs = 8
     #[test]
     async fn wacli_webhook_path_must_start_with_slash() {
         let cfg = WacliConfig {
-            enabled: true,
             webhook_secret: Some("s3cr3t".into()),
             webhook_path: "wacli".into(), // missing leading slash
             ..WacliConfig::default()
@@ -9240,7 +8810,6 @@ classifier_timeout_secs = 8
     #[test]
     async fn wacli_webhook_path_must_not_be_empty() {
         let cfg = WacliConfig {
-            enabled: true,
             webhook_secret: Some("s3cr3t".into()),
             webhook_path: "".into(),
             ..WacliConfig::default()
@@ -9252,7 +8821,6 @@ classifier_timeout_secs = 8
     async fn wacli_webhook_path_must_not_contain_axum_capture_syntax() {
         for bad_path in &["/wacli/{id}", "/wacli/*rest", "/:foo"] {
             let cfg = WacliConfig {
-                enabled: true,
                 webhook_secret: Some("s3cr3t".into()),
                 webhook_path: bad_path.to_string(),
                 ..WacliConfig::default()
@@ -9265,7 +8833,6 @@ classifier_timeout_secs = 8
     async fn wacli_webhook_path_valid_paths_pass() {
         for good_path in &["/wacli", "/wacli/inbound", "/webhook/v2"] {
             let cfg = WacliConfig {
-                enabled: true,
                 webhook_secret: Some("s3cr3t".into()),
                 webhook_path: good_path.to_string(),
                 ..WacliConfig::default()

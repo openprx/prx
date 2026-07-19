@@ -57,9 +57,7 @@ pub fn create_sandbox_with_workspace_and_dirs(
 ) -> Arc<dyn Sandbox> {
     let backend = &config.backend;
 
-    // If explicitly disabled, return noop. Phase 1 default is `enabled=Some(false)`,
-    // so this is the live path until Phase 2 re-enables sandboxing per risk.
-    if matches!(backend, SandboxBackend::None) || config.enabled == Some(false) {
+    if matches!(backend, SandboxBackend::None) {
         return Arc::new(super::traits::NoopSandbox);
     }
 
@@ -204,7 +202,6 @@ mod tests {
     fn resolved_dirs_are_shared_between_path_and_sandbox() {
         let tmp = tempfile::tempdir().expect("test: tmpdir");
         let config = SandboxConfig {
-            enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
             extra_path_dirs: vec![tmp.path().to_string_lossy().to_string()],
@@ -224,7 +221,6 @@ mod tests {
     #[test]
     fn explicit_none_returns_noop() {
         let config = SandboxConfig {
-            enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
             extra_path_dirs: Vec::new(),
@@ -236,7 +232,6 @@ mod tests {
     #[test]
     fn auto_mode_detects_something() {
         let config = SandboxConfig {
-            enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
             extra_path_dirs: Vec::new(),
@@ -257,7 +252,6 @@ mod tests {
             return; // kernel too old or Landlock disabled by policy; skip
         }
         let config = SandboxConfig {
-            enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
             extra_path_dirs: Vec::new(),
@@ -285,7 +279,6 @@ mod tests {
         }
 
         let config = SandboxConfig {
-            enabled: Some(true),
             backend: SandboxBackend::Firejail,
             firejail_args: Vec::new(),
             extra_path_dirs: Vec::new(),

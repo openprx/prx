@@ -81,7 +81,6 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/hooks", post(hooks::create_hook))
         .route("/hooks/{id}", put(hooks::update_hook))
         .route("/hooks/{id}", delete(hooks::delete_hook))
-        .route("/hooks/{id}/toggle", patch(hooks::toggle_hook))
         .route("/skills/{id}/toggle", patch(skills::toggle_skill))
         // Phase 4: WASM plugins
         .route("/plugins", get(plugins::list_plugins))

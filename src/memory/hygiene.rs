@@ -44,10 +44,6 @@ struct HygieneState {
 ///
 /// This function is intentionally best-effort: callers should log and continue on failure.
 pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
-    if !config.hygiene_enabled {
-        return Ok(());
-    }
-
     if !should_run_now(workspace_dir)? {
         return Ok(());
     }

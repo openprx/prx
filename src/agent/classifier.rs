@@ -27,10 +27,9 @@ impl From<TaskRoutingIntentConfig> for TaskIntent {
 /// Classify a user message against the configured rules and return the
 /// matching hint string, if any.
 ///
-/// Returns `None` when classification is disabled, no rules are configured,
-/// or no rule matches the message.
+/// Returns `None` when no rules are configured or no rule matches the message.
 pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<String> {
-    if !config.enabled || config.rules.is_empty() {
+    if config.rules.is_empty() {
         return None;
     }
 
@@ -69,14 +68,6 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
 }
 
 pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyResult {
-    if !config.enabled {
-        return ClassifyResult {
-            intent: TaskIntent::Stream,
-            model_hint: None,
-            reason: "task_routing disabled".to_string(),
-        };
-    }
-
     let lower = message.to_lowercase();
     let mut rules: Vec<_> = config.rules.iter().collect();
     rules.sort_by(|a, b| b.priority.cmp(&a.priority));
@@ -137,12 +128,12 @@ mod tests {
         ClassificationRule, QueryClassificationConfig, TaskRoutingConfig, TaskRoutingIntentConfig, TaskRoutingRule,
     };
 
-    fn make_config(enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
-        QueryClassificationConfig { enabled, rules }
+    fn make_config(_enabled: bool, rules: Vec<ClassificationRule>) -> QueryClassificationConfig {
+        QueryClassificationConfig { rules }
     }
 
     #[test]
-    fn disabled_returns_none() {
+    fn legacy_disabled_flag_does_not_disable_classification() {
         let config = make_config(
             false,
             vec![ClassificationRule {
@@ -151,7 +142,7 @@ mod tests {
                 ..Default::default()
             }],
         );
-        assert_eq!(classify(&config, "hello"), None);
+        assert_eq!(classify(&config, "hello"), Some("fast".into()));
     }
 
     #[test]
@@ -255,7 +246,6 @@ mod tests {
     #[test]
     fn task_routing_uses_priority_and_delegate_model() {
         let config = TaskRoutingConfig {
-            enabled: true,
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![
                 TaskRoutingRule {
@@ -283,7 +273,6 @@ mod tests {
     #[test]
     fn task_routing_falls_back_to_default_intent() {
         let config = TaskRoutingConfig {
-            enabled: true,
             default_intent: TaskRoutingIntentConfig::Simple,
             rules: vec![],
         };

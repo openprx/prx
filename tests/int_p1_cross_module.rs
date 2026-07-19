@@ -636,7 +636,6 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
 
     // Explicitly disabled sandbox returns NoopSandbox.
     let disabled_config = SandboxConfig {
-        enabled: Some(false),
         backend: SandboxBackend::None,
         ..Default::default()
     };
@@ -650,7 +649,6 @@ async fn int_tr_05_sandbox_selection_cascade_fallback() {
 
     // Auto-detection should return some sandbox (at least NoopSandbox)
     let auto_config = SandboxConfig {
-        enabled: None,
         backend: SandboxBackend::Auto,
         ..Default::default()
     };

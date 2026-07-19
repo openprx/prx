@@ -90,7 +90,6 @@ backend = "sqlite"
 auto_save = true
 
 [memory.events]
-enabled = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
@@ -104,31 +103,24 @@ min_chars = 30
 # Optional standalone external-event receiver. Durable topic, participant,
 # memory, ingestion-state, and outbox writes use one SQLite transaction.
 [webhook]
-enabled = false
 bind = "127.0.0.1:16899"
 token = "replace-with-a-secret-token"
 # When set, requests must also send X-Webhook-Signature: sha256=<HMAC hex>.
 signing_secret = "replace-with-a-separate-hmac-secret"
 
 [channels_config.signal]
-enabled = true
 account = "+1234567890"
 dm_policy = "allowlist"
 allowed_from = ["uuid:your-uuid"]
 
 [channels_config.wacli]
-enabled = true
-host = "127.0.0.1"
-port = 16867
+webhook_listen = "127.0.0.1:16868"
+webhook_path = "/wacli"
+webhook_secret = "replace-with-secret"
 
 [heartbeat]
-enabled = true
 interval_minutes = 30
 active_hours = [8, 23]
-
-[compaction]
-enabled = true
-compact_context = true
 
 [agent]
 # Master switch for parallel read-only scheduling (default: false).
@@ -206,7 +198,7 @@ rollback examples.
 
 `HEARTBEAT.md` remains the editable periodic checklist. When heartbeat is
 enabled, its dash-bullet entries are reconciled into stable recurring Xin
-tasks; Xin is the only execution scheduler even when `[xin].enabled` is false.
+tasks; Xin is the always-available execution scheduler.
 In that heartbeat-only mode, ordinary Xin tasks and goals stay disabled.
 Reordering the file preserves task IDs, removed entries are disabled, and the
 configured prompt, interval, and active-hour window remain authoritative.
@@ -292,9 +284,9 @@ These files are automatically injected into the agent context at startup.
 
 OpenPRX includes an adaptive LLM Router with three switches:
 
-- `router.enabled` — heuristic routing (capability + Elo + cost + latency)
-- `router.knn_enabled` — semantic KNN routing (cold-start guard + timeout fallback)
-- `router.automix.enabled` — low-confidence auto-upgrade to premium model
+- heuristic routing is always available (capability + Elo + cost + latency)
+- semantic KNN routing activates when embeddings and enough history are available
+- AutoMix activates when a premium model is configured
 
 Minimum router config (single reachable provider):
 
@@ -304,11 +296,7 @@ default_provider = "openrouter"
 default_model = "openai/gpt-4o-mini"
 
 [router]
-enabled = true
-knn_enabled = false
-
-[router.automix]
-enabled = false
+knn_min_records = 10
 
 [[router.models]]
 model_id = "gpt-4o-mini"

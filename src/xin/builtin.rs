@@ -151,10 +151,6 @@ async fn handle_stale_cleanup(config: Config) -> Result<String> {
 
 #[allow(clippy::unused_async)]
 async fn handle_memory_evolution(config: Config) -> Result<String> {
-    if !config.self_system.evolution_enabled {
-        return Ok("memory evolution skipped: evolution not enabled".into());
-    }
-
     let scheduler = crate::xin::evolution::DraftEvolutionScheduler::load(config)?;
     let report = scheduler.tick()?;
     Ok(format!(
@@ -173,10 +169,6 @@ async fn handle_fitness_report(config: Config) -> Result<String> {
 
 #[allow(clippy::unused_async)]
 async fn handle_memory_hygiene(config: Config) -> Result<String> {
-    if !config.self_system.enabled {
-        return Ok("memory hygiene skipped: self_system not enabled".into());
-    }
-
     crate::memory::hygiene::run_if_due(&config.memory, &config.workspace_dir)?;
     Ok("memory hygiene completed: deterministic hygiene tick".into())
 }

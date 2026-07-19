@@ -22,8 +22,6 @@ use self::scout::{GitHubScout, Scout, ScoutResult, ScoutSource};
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SkillForgeConfig {
-    #[serde(default)]
-    pub enabled: bool,
     #[serde(default = "default_auto_integrate")]
     pub auto_integrate: bool,
     #[serde(default = "default_sources")]
@@ -59,7 +57,6 @@ fn default_output_dir() -> String {
 impl Default for SkillForgeConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             auto_integrate: default_auto_integrate(),
             sources: default_sources(),
             scan_interval_hours: default_scan_interval(),
@@ -73,7 +70,6 @@ impl Default for SkillForgeConfig {
 impl std::fmt::Debug for SkillForgeConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SkillForgeConfig")
-            .field("enabled", &self.enabled)
             .field("auto_integrate", &self.auto_integrate)
             .field("sources", &self.sources)
             .field("scan_interval_hours", &self.scan_interval_hours)
@@ -121,18 +117,6 @@ impl SkillForge {
 
     /// Run the full pipeline: Scout → Evaluate → Integrate.
     pub async fn forge(&self) -> Result<ForgeReport> {
-        if !self.config.enabled {
-            warn!("SkillForge is disabled — skipping");
-            return Ok(ForgeReport {
-                discovered: 0,
-                evaluated: 0,
-                auto_integrated: 0,
-                manual_review: 0,
-                skipped: 0,
-                results: vec![],
-            });
-        }
-
         // --- Scout ----------------------------------------------------------
         let mut candidates: Vec<ScoutResult> = Vec::new();
 
@@ -228,22 +212,9 @@ impl SkillForge {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn disabled_forge_returns_empty_report() {
-        let cfg = SkillForgeConfig {
-            enabled: false,
-            ..Default::default()
-        };
-        let forge = SkillForge::new(cfg);
-        let report = forge.forge().await.unwrap();
-        assert_eq!(report.discovered, 0);
-        assert_eq!(report.auto_integrated, 0);
-    }
-
     #[test]
     fn default_config_values() {
         let cfg = SkillForgeConfig::default();
-        assert!(!cfg.enabled);
         assert!(cfg.auto_integrate);
         assert_eq!(cfg.scan_interval_hours, 24);
         assert!((cfg.min_score - 0.7).abs() < f64::EPSILON);

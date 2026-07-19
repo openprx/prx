@@ -2737,44 +2737,14 @@ mod tests {
     }
 
     #[test]
-    fn gate_with_audit_disabled_writes_no_audit_log() {
-        // FIX-P1-31: a policy carrying `security.audit.enabled=false` must skip the
-        // gate audit write (and its synchronous fsync) entirely.
-        let tmp = tempfile::TempDir::new().expect("test: temp workspace");
-        let policy = SecurityPolicy {
-            autonomy: AutonomyLevel::Supervised,
-            workspace_dir: tmp.path().to_path_buf(),
-            ..SecurityPolicy::default()
-        }
-        .with_audit_config(crate::config::AuditConfig {
-            enabled: false,
-            ..crate::config::AuditConfig::default()
-        });
-
-        // Deny path (no grant for medium risk under supervised) — would normally
-        // write a tool_gate audit event; with audit disabled it must not.
-        let gate = SideEffectGate::new(&policy);
-        let _ = gate.authorize_resource_operation("file_write", "file_write:write:x", ResourceRiskLevel::Medium, None);
-
-        assert!(
-            !tmp.path().join("audit.log").exists(),
-            "audit.log must not be created when security.audit.enabled=false"
-        );
-    }
-
-    #[test]
     fn gate_with_audit_enabled_writes_audit_log() {
-        // Sanity counterpart: explicit enabled=true config still writes.
         let tmp = tempfile::TempDir::new().expect("test: temp workspace");
         let policy = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             workspace_dir: tmp.path().to_path_buf(),
             ..SecurityPolicy::default()
         }
-        .with_audit_config(crate::config::AuditConfig {
-            enabled: true,
-            ..crate::config::AuditConfig::default()
-        });
+        .with_audit_config(crate::config::AuditConfig::default());
 
         let gate = SideEffectGate::new(&policy);
         let _ = gate.authorize_resource_operation("file_write", "file_write:write:x", ResourceRiskLevel::Medium, None);

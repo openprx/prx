@@ -384,8 +384,7 @@ pub fn append_provider_outcome_trace(
 
 fn router_layer(config: &Config) -> ControlLayerTrace {
     let feature_enabled = cfg!(feature = "llm-router");
-    let requested = config.router.enabled;
-    let enabled = feature_enabled && requested;
+    let enabled = feature_enabled;
     ControlLayerTrace {
         level: 1,
         name: "router".to_string(),
@@ -393,18 +392,15 @@ fn router_layer(config: &Config) -> ControlLayerTrace {
         status: if enabled { "configured" } else { "fallback" }.to_string(),
         reason: if enabled {
             Some("router_enabled".to_string())
-        } else if !feature_enabled {
-            Some("feature_disabled".to_string())
         } else {
-            Some("config_disabled".to_string())
+            Some("feature_disabled".to_string())
         },
         detail: json!({
-            "config_enabled": requested,
             "feature_enabled": feature_enabled,
             "model_routes": config.model_routes.len(),
             "candidate_models": config.router.models.len(),
-            "knn_enabled": config.router.knn_enabled,
-            "automix_enabled": config.router.automix.enabled,
+            "knn_enabled": true,
+            "automix_configured": !config.router.automix.premium_model_id.trim().is_empty(),
         }),
     }
 }
@@ -451,7 +447,7 @@ fn causal_tree_layer(config: &Config) -> ControlLayerTrace {
 }
 
 fn xin_layer(config: &Config) -> ControlLayerTrace {
-    let enabled = config.modules.scheduler && config.xin.enabled;
+    let enabled = true;
     ControlLayerTrace {
         level: 3,
         name: "xin".to_string(),
@@ -459,25 +455,22 @@ fn xin_layer(config: &Config) -> ControlLayerTrace {
         status: if enabled { "configured" } else { "fallback" }.to_string(),
         reason: if enabled {
             Some("xin_enabled".to_string())
-        } else if !config.modules.scheduler {
-            Some("scheduler_module_disabled".to_string())
         } else {
             Some("config_disabled".to_string())
         },
         detail: json!({
-            "scheduler_module": config.modules.scheduler,
-            "xin_enabled": config.xin.enabled,
-            "builtin_tasks": config.xin.builtin_tasks,
-            "evolution_integration": config.xin.evolution_integration,
+            "xin_available": true,
+            "builtin_tasks": true,
+            "evolution_integration": true,
             "max_concurrent": config.xin.max_concurrent,
         }),
     }
 }
 
-fn self_system_layer(config: &Config) -> ControlLayerTrace {
-    let fitness_enabled = config.self_system.enabled;
-    let evolution_enabled = config.modules.scheduler && config.self_system.evolution_enabled;
-    let enabled = fitness_enabled || evolution_enabled;
+fn self_system_layer(_config: &Config) -> ControlLayerTrace {
+    let fitness_enabled = true;
+    let evolution_enabled = true;
+    let enabled = true;
     ControlLayerTrace {
         level: 4,
         name: "self_system".to_string(),
@@ -485,15 +478,12 @@ fn self_system_layer(config: &Config) -> ControlLayerTrace {
         status: if enabled { "configured" } else { "fallback" }.to_string(),
         reason: if enabled {
             Some("self_system_enabled".to_string())
-        } else if config.self_system.evolution_enabled && !config.modules.scheduler {
-            Some("scheduler_module_disabled".to_string())
         } else {
             Some("config_disabled".to_string())
         },
         detail: json!({
             "fitness_enabled": fitness_enabled,
-            "evolution_enabled": config.self_system.evolution_enabled,
-            "scheduler_module": config.modules.scheduler,
+            "evolution_available": true,
             "evolution_runtime_enabled": evolution_enabled,
         }),
     }
@@ -548,24 +538,17 @@ mod tests {
     #[test]
     fn snapshot_records_independent_disabled_layers_with_fallback_reasons() {
         let mut config = Config::default();
-        config.modules.scheduler = false;
-        config.router.enabled = false;
         config.causal_tree.enabled = false;
-        config.xin.enabled = true;
-        config.self_system.evolution_enabled = true;
 
         let trace = ControlLadderSnapshot::from_config(&config).build_trace("test", Some("run-1".to_string()));
 
         assert_eq!(layer(&trace, "runtime").status, "active");
-        assert_eq!(layer(&trace, "router").status, "fallback");
+        assert_eq!(layer(&trace, "router").status, "configured");
         assert_eq!(layer(&trace, "causal_tree").status, "fallback");
-        assert_eq!(
-            layer(&trace, "xin").reason.as_deref(),
-            Some("scheduler_module_disabled")
-        );
+        assert_eq!(layer(&trace, "xin").reason.as_deref(), Some("xin_enabled"));
         assert_eq!(
             layer(&trace, "self_system").reason.as_deref(),
-            Some("scheduler_module_disabled")
+            Some("self_system_enabled")
         );
         assert_eq!(layer(&trace, "task_pool").status, "configured");
     }

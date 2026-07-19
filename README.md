@@ -20,9 +20,9 @@ Forked from [ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw) and extended w
 
 ### LLM Router Flags
 
-- `router.enabled` — enable heuristic model routing
-- `router.knn_enabled` — enable semantic KNN scoring (with timeout-safe fallback)
-- `router.automix.enabled` — enable cheap-first, low-confidence upgrade to premium model
+- heuristic model routing is always available
+- semantic KNN scoring activates when embeddings and history are available
+- cheap-first, low-confidence upgrade activates when a premium model is configured
 
 ### Causal Tree Engine Flags
 

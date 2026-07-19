@@ -228,7 +228,7 @@ mod tests {
     fn config_source_generation_tracks_main_and_fragments() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let config_dir = tmp.path();
-        std::fs::write(config_dir.join("config.toml"), "[modules]\nmemory = true\n").expect("write config.toml");
+        std::fs::write(config_dir.join("config.toml"), "default_temperature = 0.7\n").expect("write config.toml");
         let fragments = config_dir.join("config.d");
         std::fs::create_dir(&fragments).expect("create config.d");
         std::fs::write(fragments.join("memory.toml"), "[memory]\nbackend = \"sqlite\"\n").expect("write fragment");

@@ -197,7 +197,6 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         compliance: crate::config::schema::ComplianceConfig::default(),
-        modules: crate::config::schema::ModulesConfig::default(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
@@ -212,13 +211,6 @@ pub async fn run_wizard(config_dir: Option<&str>) -> Result<(Config, bool)> {
     } else {
         Spec::Minimal
     };
-
-    // Apply the spec's module flags so the saved config reflects what is
-    // actually enabled.  Channels flag is set explicitly from wizard state.
-    let mut modules = spec.modules();
-    modules.channels = has_launchable_channels(&config.channels_config);
-    let mut config = config;
-    config.modules = modules;
 
     println!(
         "  {} Security: {} | workspace-scoped",
@@ -358,11 +350,10 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         semantic: MemorySemanticConfig::default(),
         acl_enabled: false,
         legacy_conversation_turns_visible: true,
-        hygiene_enabled: profile.uses_sqlite_hygiene,
-        archive_after_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
-        purge_after_days: if profile.uses_sqlite_hygiene { 30 } else { 0 },
+        archive_after_days: 7,
+        purge_after_days: 30,
         conversation_retention_days: 3,
-        daily_retention_days: if profile.uses_sqlite_hygiene { 7 } else { 0 },
+        daily_retention_days: 7,
         embedding_provider: "none".to_string(),
         embedding_model: "text-embedding-3-small".to_string(),
         embedding_dimensions: 1536,
@@ -370,8 +361,6 @@ fn memory_config_defaults_for_backend(backend: &str) -> MemoryConfig {
         keyword_weight: 0.3,
         min_relevance_score: 0.4,
         embedding_cache_size: if profile.uses_sqlite_hygiene { 10000 } else { 0 },
-        snapshot_enabled: false,
-        snapshot_on_hygiene: false,
         auto_hydrate: true,
         sqlite_open_timeout_secs: None,
         lucid_cmd: None,
@@ -499,7 +488,6 @@ async fn run_quick_setup_with_home(
         causal_tree: crate::causal_tree::CausalTreeConfig::default(),
         security: crate::config::SecurityConfig::default(),
         compliance: crate::config::schema::ComplianceConfig::default(),
-        modules: crate::config::schema::ModulesConfig::default(),
         tool_tiering: crate::config::ToolTieringConfig::default(),
     };
 
@@ -2445,7 +2433,6 @@ fn setup_tool_mode() -> Result<(ComposioConfig, SecretsConfig)> {
                 style("enabled").green()
             );
             ComposioConfig {
-                enabled: true,
                 api_key: Some(api_key),
                 ..ComposioConfig::default()
             }
@@ -4530,7 +4517,7 @@ fn print_summary(config: &Config) {
     println!(
         "    {} Composio:      {}",
         style("🔗").cyan(),
-        if config.composio.enabled {
+        if config.composio.configured() {
             style("enabled (1000+ OAuth apps)").green().to_string()
         } else {
             "disabled (sovereign mode)".to_string()
@@ -5688,20 +5675,18 @@ mod tests {
         let config = memory_config_defaults_for_backend("lucid");
         assert_eq!(config.backend, "lucid");
         assert!(config.auto_save);
-        assert!(config.hygiene_enabled);
         assert_eq!(config.archive_after_days, 7);
         assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 10000);
     }
 
     #[test]
-    fn memory_config_defaults_for_none_disable_sqlite_hygiene() {
+    fn memory_config_defaults_for_none_keep_safe_hygiene_retention() {
         let config = memory_config_defaults_for_backend("none");
         assert_eq!(config.backend, "none");
         assert!(!config.auto_save);
-        assert!(!config.hygiene_enabled);
-        assert_eq!(config.archive_after_days, 0);
-        assert_eq!(config.purge_after_days, 0);
+        assert_eq!(config.archive_after_days, 7);
+        assert_eq!(config.purge_after_days, 30);
         assert_eq!(config.embedding_cache_size, 0);
     }
 

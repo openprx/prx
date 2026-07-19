@@ -218,7 +218,7 @@ fn console_tool_descriptions(config: &crate::config::Config) -> Vec<(&'static st
         ("document_search", "Search stored document chunks with source anchors"),
         ("document_get_chunk", "Read a stored document chunk by id"),
     ];
-    if config.composio.enabled {
+    if config.composio.configured() {
         tool_descs.push(("composio", "Execute configured Composio app actions"));
     }
     if !config.agents.is_empty() {

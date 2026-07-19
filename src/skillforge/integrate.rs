@@ -122,16 +122,13 @@ forge_timestamp = "{now}"
 
 ## Usage
 
-```toml
-# Add to your OpenPRX config:
-[skills.{name}]
-enabled = true
-```
+Place the generated skill under the workspace `skills/` directory; OpenPRX
+discovers it automatically.
 
 ## Notes
 
 This manifest was auto-generated from repository metadata.
-Review before enabling in production.
+Review before using in production.
 "#,
             name = c.name,
             url = c.url,

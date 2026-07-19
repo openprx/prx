@@ -100,10 +100,6 @@ impl CostTracker {
     /// Check if a request is within budget.
     pub fn check_budget(&self, estimated_cost_usd: f64) -> Result<BudgetCheck> {
         let config = self.config.lock().clone();
-        if !config.enabled {
-            return Ok(BudgetCheck::Allowed);
-        }
-
         if !estimated_cost_usd.is_finite() || estimated_cost_usd < 0.0 {
             return Err(anyhow!("Estimated cost must be a finite, non-negative value"));
         }
@@ -118,10 +114,6 @@ impl CostTracker {
 
     /// Record a usage event.
     pub fn record_usage(&self, usage: TokenUsage) -> Result<()> {
-        if !self.config.lock().enabled {
-            return Ok(());
-        }
-
         if !usage.cost_usd.is_finite() || usage.cost_usd < 0.0 {
             return Err(anyhow!("Token usage cost must be a finite, non-negative value"));
         }
@@ -150,9 +142,6 @@ impl CostTracker {
         record: &crate::llm::route_decision::MeteredTokenUsageRecord,
     ) -> Result<CostSettlement> {
         let config = self.config.lock().clone();
-        if !config.enabled {
-            return Ok(CostSettlement::Disabled);
-        }
         let settlement_id = record
             .settlement_id
             .as_deref()
@@ -520,10 +509,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn enabled_config() -> CostConfig {
-        CostConfig {
-            enabled: true,
-            ..Default::default()
-        }
+        CostConfig::default()
     }
 
     #[test]
@@ -534,16 +520,13 @@ mod tests {
     }
 
     #[test]
-    fn budget_check_when_disabled() {
+    fn budget_check_is_always_enforced() {
         let tmp = TempDir::new().unwrap();
-        let config = CostConfig {
-            enabled: false,
-            ..Default::default()
-        };
+        let config = CostConfig::default();
 
         let tracker = CostTracker::new(config, tmp.path()).unwrap();
         let check = tracker.check_budget(1000.0).unwrap();
-        assert!(matches!(check, BudgetCheck::Allowed));
+        assert!(matches!(check, BudgetCheck::Exceeded { .. }));
     }
 
     #[test]
@@ -564,7 +547,6 @@ mod tests {
     fn budget_exceeded_daily_limit() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            enabled: true,
             daily_limit_usd: 0.01, // Very low limit
             ..Default::default()
         };
@@ -659,7 +641,6 @@ mod tests {
     fn canonical_settlement_is_process_owned_idempotent_and_budgeted() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            enabled: true,
             daily_limit_usd: 0.001,
             monthly_limit_usd: 1.0,
             ..Default::default()
@@ -730,7 +711,6 @@ mod tests {
     fn separate_tracker_instances_refresh_budget_and_summary_from_disk() {
         let tmp = TempDir::new().unwrap();
         let config = CostConfig {
-            enabled: true,
             daily_limit_usd: 1.0,
             monthly_limit_usd: 10.0,
             ..Default::default()

@@ -889,7 +889,7 @@ mod tests {
         let mut desired = (*manager.load_full()).clone();
         desired.default_temperature = 0.22;
         desired.default_model = Some("example/model".to_string());
-        desired.cron.enabled = !desired.cron.enabled;
+        desired.cron.max_run_history += 1;
 
         let report = manager
             .apply_runtime_config(desired, ConfigReloadTrigger::Test)
@@ -918,7 +918,6 @@ mod tests {
         let runtime = participant("runtime", events, false, false);
         manager.register_participant(&runtime);
         let mut desired = initial.clone();
-        desired.proxy.enabled = true;
         desired.proxy.all_proxy = Some("http://127.0.0.1:8080".to_string());
 
         let report = manager
@@ -927,7 +926,7 @@ mod tests {
         let runtime_proxy = crate::config::runtime_proxy_config();
 
         assert_eq!(report.rebuilt, vec!["proxy"]);
-        assert!(runtime_proxy.enabled);
+        assert!(runtime_proxy.has_any_proxy_url());
         assert_eq!(runtime_proxy.all_proxy, desired.proxy.all_proxy);
         crate::config::set_runtime_proxy_config(initial.proxy);
     }
@@ -941,7 +940,6 @@ mod tests {
         let rejecting = participant("rejecting", events, true, false);
         manager.register_participant(&rejecting);
         let mut desired = initial.clone();
-        desired.proxy.enabled = true;
         desired.proxy.all_proxy = Some("http://127.0.0.1:8081".to_string());
 
         manager
@@ -950,7 +948,7 @@ mod tests {
         let runtime_proxy = crate::config::runtime_proxy_config();
 
         assert_eq!(manager.active_generation_id(), ConfigGenerationId(0));
-        assert_eq!(runtime_proxy.enabled, initial.proxy.enabled);
+        assert_eq!(runtime_proxy.has_any_proxy_url(), initial.proxy.has_any_proxy_url());
         assert_eq!(runtime_proxy.all_proxy, initial.proxy.all_proxy);
         crate::config::set_runtime_proxy_config(initial.proxy);
     }
@@ -1075,7 +1073,7 @@ mod tests {
         }));
         let mut desired = (*manager.load_full()).clone();
         desired.default_temperature = 0.11;
-        desired.cron.enabled = !desired.cron.enabled;
+        desired.cron.max_run_history += 1;
 
         manager
             .apply_runtime_config(desired, ConfigReloadTrigger::Test)

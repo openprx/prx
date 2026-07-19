@@ -46,31 +46,12 @@ impl CronTool {
         Self { config, security }
     }
 
-    /// A human-readable warning to append when scheduled jobs will NOT fire in
-    /// the background because the scheduler module is disabled. The `cron` tool
-    /// is always registered (so the model can manage jobs), but the background
-    /// scheduler loop is only started when the scheduler module is enabled — so
-    /// without it, newly created jobs are persisted but never triggered.
-    const fn scheduler_inactive_notice(cfg: &Config) -> &'static str {
-        if cfg.modules.scheduler {
-            ""
-        } else {
-            "\n⚠ Scheduler module is disabled (modules.scheduler=false): this job is saved \
-             but will NOT run in the background until the scheduler module is enabled. \
-             You can still force-run it now with action='run'."
-        }
+    const fn scheduler_inactive_notice(_cfg: &Config) -> &'static str {
+        ""
     }
 
-    fn check_enabled(&self, cfg: &Config) -> Option<ToolResult> {
-        if !cfg.cron.enabled {
-            Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("cron is disabled by config (cron.enabled=false)".to_string()),
-            })
-        } else {
-            None
-        }
+    const fn check_enabled(&self, _cfg: &Config) -> Option<ToolResult> {
+        None
     }
 
     /// Mutation pre-checks WITHOUT consuming the action budget: module enabled,
@@ -1403,21 +1384,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_cron_returns_error() {
+    async fn cron_is_always_available() {
         let tmp = TempDir::new().unwrap();
-        let mut config = Config {
+        let config = Config {
             workspace_dir: tmp.path().join("workspace"),
             config_path: tmp.path().join("config.toml"),
             ..Config::default()
         };
-        config.cron.enabled = false;
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         let cfg_snap = Arc::new(config.clone());
         let cfg = new_shared(config);
         let tool = CronTool::new(Arc::clone(&cfg), test_security(&cfg_snap));
         let result = tool.execute(json!({"action": "list"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap_or_default().contains("cron is disabled"));
+        assert!(result.success, "{:?}", result.error);
     }
 
     #[tokio::test]
