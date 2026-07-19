@@ -9,9 +9,9 @@ This document covers OpenPRX LLM Router capabilities delivered on 2026-03-10 to 
 ## Feature Switches
 
 - Build-time: `llm-router` feature is enabled by default (`cargo build`).
-- `router.enabled`: enable heuristic routing
-- `router.knn_enabled`: enable KNN semantic similarity scoring
-- `router.automix.enabled`: enable confidence-based model escalation
+- heuristic routing is always available
+- KNN semantic similarity activates when embeddings and enough history exist
+- confidence-based escalation activates when a premium model is configured
 
 ## End-to-End Flow
 
@@ -59,18 +59,15 @@ fallback_providers = ["openrouter"]
 "claude-sonnet-4-6" = ["claude-haiku-4-5"]
 
 [router]
-enabled = true
 alpha = 0.0
 beta = 0.5
 gamma = 0.3
 delta = 0.1
 epsilon = 0.1
-knn_enabled = true
 knn_min_records = 10
 knn_k = 7
 
 [router.automix]
-enabled = true
 confidence_threshold = 0.70
 cheap_model_tiers = ["cheap", "fast", "mini"]
 premium_model_id = "openai/gpt-4.1"
@@ -104,11 +101,7 @@ default_provider = "openrouter"
 default_model = "openai/gpt-4o-mini"
 
 [router]
-enabled = true
-knn_enabled = false
-
-[router.automix]
-enabled = false
+knn_min_records = 10
 
 [[router.models]]
 model_id = "gpt-4o-mini"
@@ -131,7 +124,7 @@ Operational note:
 - `gamma`: Elo weight
 - `delta`: cost penalty coefficient
 - `epsilon`: latency penalty coefficient
-- `knn_enabled`: enable semantic KNN lookup
+- `knn_min_records`: minimum history before semantic KNN affects routing
 - `knn_min_records`: minimum successful history records before KNN contributes
 - `knn_k`: nearest neighbors used for KNN voting
 - `models`: static candidate registry
@@ -180,6 +173,6 @@ Audit-driven boundaries introduced with Router rollout:
 
 ## Operations Guidance
 
-- Start with `knn_enabled = false` for cold deployments, then enable after enough traffic.
+- KNN contributes automatically after `knn_min_records` records and a usable embedder are available.
 - Keep `knn_min_records >= 10` to avoid unstable early routing.
 - Keep `confidence_threshold` conservative (`0.65~0.80`) and monitor premium escalation rate.

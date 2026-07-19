@@ -249,7 +249,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_reads_enabled_config_d_fragments() {
+    async fn reload_reads_managed_config_d_fragments() {
         let tmpdir = tempfile::tempdir().unwrap();
         let config_path = tmpdir.path().join("config.toml");
         let config_d = tmpdir.path().join("config.d");
@@ -259,21 +259,6 @@ mod tests {
             &config_path,
             r#"
 default_temperature = 0.7
-
-[modules]
-memory = false
-channels = false
-network = false
-security = false
-scheduler = false
-agent = true
-identity = false
-routing = false
-tools = false
-integrations = false
-nodes = false
-cost = false
-observability = false
 "#,
         )
         .await

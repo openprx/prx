@@ -88,35 +88,29 @@ impl RouterEngine {
         } else {
             config.models = filter_models_by_providers(config.models.clone(), &reachable_providers);
         }
-        if config.enabled && config.models.is_empty() {
+        if config.models.is_empty() {
             tracing::warn!(
                 default_provider = default_provider.as_str(),
                 reachable_providers = ?reachable_providers,
-                "Router enabled but no reachable models remain after provider filtering; disabling router"
+                "Router has no reachable models after provider filtering"
             );
-            config.enabled = false;
         }
         let mut models = ModelCapabilityEntry::load_all(&config.models, memory.as_ref()).await;
         models = filter_reachable_entries(models, &default_provider, &model_routes);
-        if config.enabled && models.is_empty() {
+        if models.is_empty() {
             tracing::warn!(
                 default_provider = default_provider.as_str(),
-                "Router enabled but no reachable models remain after defensive post-load filtering; disabling router"
+                "Router has no reachable models after defensive post-load filtering"
             );
-            config.enabled = false;
         }
-        let history = if config.knn_enabled {
-            if let Some(embedder) = embedder.filter(|embedder| embedder.dimensions() > 0) {
-                let store = KnnStore::new(Arc::clone(&memory))?;
-                Some(RouterHistory::new(
-                    store,
-                    embedder,
-                    config.knn_k,
-                    config.knn_min_records,
-                ))
-            } else {
-                None
-            }
+        let history = if let Some(embedder) = embedder.filter(|embedder| embedder.dimensions() > 0) {
+            let store = KnnStore::new(Arc::clone(&memory))?;
+            Some(RouterHistory::new(
+                store,
+                embedder,
+                config.knn_k,
+                config.knn_min_records,
+            ))
         } else {
             None
         };
@@ -162,16 +156,6 @@ impl RouterEngine {
     }
 
     pub async fn select_model(&self, message: &str, task_intent: &TaskIntent) -> RouterResult {
-        if !self.config.enabled {
-            return RouterResult {
-                chosen_model: None,
-                chosen_provider: None,
-                score: 0.0,
-                candidates: Vec::new(),
-                intent: infer_router_intent(*task_intent, message).category_name().to_string(),
-                estimated_tokens: estimate_tokens(message),
-            };
-        }
         let intent = infer_router_intent(*task_intent, message);
         let estimated_tokens = estimate_tokens(message);
         let similarity_scores = if let Some(history) = &self.history {
@@ -550,13 +534,11 @@ mod tests {
 
     fn router_config() -> RouterConfig {
         RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig::default(),
@@ -826,7 +808,6 @@ mod tests {
             RouterHistory::new(store, Arc::new(SlowEmbeddingProvider), 7, 10).with_timeout(Duration::from_millis(10));
         let mut config = router_config();
         config.alpha = 1.0;
-        config.knn_enabled = true;
         let router =
             RouterEngine::new_with_history(config, "openai".into(), Vec::new(), Arc::clone(&memory), Some(history));
 
@@ -845,13 +826,11 @@ mod tests {
     async fn test_load_all_keeps_only_reachable_models() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let config = RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig::default(),
@@ -888,7 +867,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_router_auto_disable_when_no_reachable_models() {
+    async fn test_router_stays_available_when_no_reachable_models() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let mut config = router_config();
         config.models = vec![RouterModelConfig {
@@ -917,18 +896,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(!router.config.enabled);
-
         let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("disabling router"));
-        assert!(output.contains("no reachable models remain"));
+        assert!(output.contains("no reachable models"));
+        assert!(router.models.read().is_empty());
     }
 
     #[tokio::test]
     async fn test_select_model_returns_none_for_unreachable() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let config = RouterConfig {
-            enabled: true,
             models: vec![RouterModelConfig {
                 model_id: "gpt-4.1".into(),
                 provider: "openai".into(),
@@ -975,13 +951,11 @@ mod tests {
     async fn test_select_model_prefers_reachable_candidates() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let config = RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig::default(),
@@ -1027,17 +1001,14 @@ mod tests {
     async fn test_record_outcome_updates_only_chosen_model_elo() {
         let memory: Arc<dyn Memory> = Arc::new(TestMemory::default());
         let config = RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 1.0,
             epsilon: 0.3,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig {
-                enabled: true,
                 confidence_threshold: 0.7,
                 cheap_model_tiers: vec!["cheap".into()],
                 premium_model_id: "openai/model-premium".into(),

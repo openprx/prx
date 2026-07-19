@@ -989,7 +989,7 @@ fn build_gateway_turn_runtime(
         .unwrap_or_else(|| "anthropic/claude-sonnet-4".into());
     let security = crate::runtime::bootstrap::build_security_policy(config);
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
+    let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
             config.composio.api_key.as_deref(),
             Some(config.composio.entity_id.as_str()),
@@ -1162,7 +1162,7 @@ pub async fn run_gateway(
     // pin the manager's active generation at each authorization decision.
     let security = crate::runtime::bootstrap::build_security_policy(&config);
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
+    let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
             config.composio.api_key.as_deref(),
             Some(config.composio.entity_id.as_str()),
@@ -1855,7 +1855,7 @@ async fn run_gateway_chat_with_multimodal(
         skill_embedder.as_ref(),
     )
     .await?;
-    let selected_skills = if config_snapshot.skill_rag.enabled {
+    let selected_skills = if config_snapshot.skill_rag.available() {
         crate::skills::select_skills_by_relevance(
             message,
             &skills,

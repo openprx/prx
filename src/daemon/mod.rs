@@ -46,14 +46,11 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         tracing::warn!("failed to append daemon control ladder trace: {error}");
     }
 
-    if config.modules.scheduler && config.heartbeat.enabled {
-        let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
-    }
+    let _ = crate::heartbeat::engine::HeartbeatEngine::ensure_heartbeat_file(&config.workspace_dir).await;
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone(), Arc::clone(&shared_config))];
 
-    // Gateway always starts — modules.network only controls whether network.toml
-    // is loaded, not the gateway itself.
+    // Gateway is an always-available runtime capability.
     {
         crate::health::register_component(
             "gateway",
@@ -97,7 +94,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         OPTIONAL_HEALTH_TTL_SECONDS,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "channels_config" || crate::config::generation::is_rebuild_and_swap(field)),
-        Arc::new(|cfg| cfg.modules.channels && has_supervised_channels(cfg)),
+        Arc::new(has_supervised_channels),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -131,7 +128,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         Arc::new(|field| {
             matches!(field, "cron" | "scheduler") || crate::config::generation::is_rebuild_and_swap(field)
         }),
-        Arc::new(|cfg| cfg.modules.scheduler && cfg.cron.enabled),
+        Arc::new(|_| true),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -200,11 +197,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system"),
-        Arc::new(|cfg| {
-            let xin_manages =
-                cfg.modules.scheduler && cfg.xin.enabled && cfg.xin.builtin_tasks && cfg.xin.evolution_integration;
-            cfg.self_system.enabled && !xin_manages
-        }),
+        Arc::new(|_| false),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -232,11 +225,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system" || crate::config::generation::is_rebuild_and_swap(field)),
-        Arc::new(|cfg| {
-            let xin_manages =
-                cfg.modules.scheduler && cfg.xin.enabled && cfg.xin.builtin_tasks && cfg.xin.evolution_integration;
-            cfg.self_system.evolution_enabled && !xin_manages
-        }),
+        Arc::new(|_| false),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -264,7 +253,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         OPTIONAL_HEALTH_TTL_SECONDS,
         initial_generation,
         Arc::new(|field| field == "webhook" || crate::config::generation::is_rebuild_and_swap(field)),
-        Arc::new(|cfg| cfg.modules.integrations && cfg.webhook.enabled),
+        Arc::new(|cfg| cfg.webhook.configured()),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -303,12 +292,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
     let heartbeat_ttl = u64::from(config.heartbeat.interval_minutes)
         .saturating_mul(120)
         .max(OPTIONAL_HEALTH_TTL_SECONDS);
-    register_optional_component(
-        "heartbeat",
-        "xin",
-        config.modules.scheduler && config.heartbeat.enabled,
-        heartbeat_ttl,
-    );
+    register_optional_component("heartbeat", "xin", true, heartbeat_ttl);
 
     println!("🧠 OpenPRX daemon started");
     println!("   Gateway:  http://{host}:{port}");
@@ -410,8 +394,8 @@ fn spawn_state_writer(config: Config, shared_config: crate::config::SharedConfig
     })
 }
 
-const fn xin_runtime_enabled(config: &Config) -> bool {
-    config.modules.scheduler && (config.xin.enabled || config.heartbeat.enabled)
+const fn xin_runtime_enabled(_config: &Config) -> bool {
+    true
 }
 
 fn ensure_manual_daemon_start_allowed(config: &Config) -> Result<()> {
@@ -1359,7 +1343,7 @@ const fn has_supervised_channels(config: &Config) -> bool {
         || linq.is_some()
         || nextcloud_talk.is_some()
         || qq.is_some()
-        || matches!(wacli, Some(w) if w.enabled)
+        || wacli.is_some()
 }
 
 mod systemd_notify {
@@ -1515,22 +1499,10 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_enables_the_shared_xin_runtime_without_enabling_other_xin_work() {
+    fn xin_runtime_is_always_enabled() {
         let tmp = TempDir::new().unwrap();
-        let mut config = test_config(&tmp);
-        config.modules.scheduler = true;
-        config.xin.enabled = false;
-        config.heartbeat.enabled = true;
+        let config = test_config(&tmp);
         assert!(xin_runtime_enabled(&config));
-
-        config.heartbeat.enabled = false;
-        assert!(!xin_runtime_enabled(&config));
-
-        config.xin.enabled = true;
-        assert!(xin_runtime_enabled(&config));
-
-        config.modules.scheduler = false;
-        assert!(!xin_runtime_enabled(&config));
     }
 
     #[test]

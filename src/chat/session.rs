@@ -590,10 +590,7 @@ mod tests {
             Utc::now(),
             crate::llm::route_decision::TokenUsage::reported(Some(1_000), Some(500), Some(1_500)),
         );
-        let config = crate::config::schema::CostConfig {
-            enabled: false,
-            ..crate::config::schema::CostConfig::default()
-        };
+        let config = crate::config::schema::CostConfig::default();
 
         let record = MainSessionTokenUsageRecord::from_provider_outcome(&outcome, &config)
             .expect("reported usage should produce a record");

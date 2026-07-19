@@ -29,16 +29,8 @@ impl XinTool {
         Self { config, security }
     }
 
-    fn check_enabled(&self, cfg: &Config) -> Option<ToolResult> {
-        if !cfg.xin.enabled {
-            Some(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("xin is disabled by config (xin.enabled=false)".to_string()),
-            })
-        } else {
-            None
-        }
+    const fn check_enabled(&self, _cfg: &Config) -> Option<ToolResult> {
+        None
     }
 
     fn enforce_mutation(&self, action: &str, cfg: &Config) -> Option<ToolResult> {
@@ -429,20 +421,14 @@ impl Tool for XinTool {
                     output: format!(
                         "Xin Status\n\
                          ──────────\n\
-                         Enabled:     true\n\
                          Interval:    {} min\n\
                          Tasks:       {} total ({active} active, {paused} paused)\n\
                          By kind:     {system} system, {user} user, {agent} agent\n\
                          Concurrency: {} max\n\
-                         Evolution:   {}",
+                         Evolution:   integrated",
                         cfg.xin.interval_minutes,
                         tasks.len(),
                         cfg.xin.max_concurrent,
-                        if cfg.xin.evolution_integration {
-                            "integrated"
-                        } else {
-                            "standalone"
-                        }
                     ),
                     error: None,
                 })

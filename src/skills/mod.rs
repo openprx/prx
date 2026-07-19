@@ -31,9 +31,7 @@ const UNTRUSTED_ORIGIN_MARKER: &str = ".openprx-untrusted-origin.json";
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct CatalogKey {
     workspace_dir: PathBuf,
-    open_skills_enabled: bool,
     open_skills_dir: Option<PathBuf>,
-    openclaw_skills_enabled: bool,
     openclaw_skills_dir: Option<PathBuf>,
 }
 
@@ -108,7 +106,7 @@ fn default_version() -> String {
 
 /// Load all skills from the workspace skills directory
 pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
-    load_skills_with_open_skills_config(workspace_dir, None, None, None, None)
+    load_skills_with_open_skills_config(workspace_dir, None, None)
 }
 
 /// Load the process-level skill catalog snapshot for this workspace/configuration.
@@ -119,9 +117,7 @@ pub fn load_skills(workspace_dir: &Path) -> Vec<Skill> {
 pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Config) -> Vec<Skill> {
     let key = CatalogKey {
         workspace_dir: normalized_path(workspace_dir),
-        open_skills_enabled: config.skills.open_skills_enabled,
         open_skills_dir: config.skills.open_skills_dir.as_deref().map(PathBuf::from),
-        openclaw_skills_enabled: config.skills.openclaw_skills_enabled,
         openclaw_skills_dir: config.skills.openclaw_skills_dir.as_deref().map(PathBuf::from),
     };
     let mut catalogs = SKILL_CATALOGS.lock();
@@ -133,9 +129,7 @@ pub fn load_skills_with_config(workspace_dir: &Path, config: &crate::config::Con
     // requests cannot build duplicate snapshots for the same workspace.
     let loaded = Arc::new(load_skills_with_open_skills_config(
         workspace_dir,
-        Some(config.skills.open_skills_enabled),
         config.skills.open_skills_dir.as_deref(),
-        Some(config.skills.openclaw_skills_enabled),
         config.skills.openclaw_skills_dir.as_deref(),
     ));
     if catalogs.len() >= MAX_CATALOGS {
@@ -167,7 +161,7 @@ pub async fn load_skills_with_embeddings(
     embedder: &dyn crate::memory::embeddings::EmbeddingProvider,
 ) -> Result<Vec<Skill>> {
     let mut skills = load_skills_with_config(workspace_dir, config);
-    if !config.skill_rag.enabled || skills.is_empty() || embedder.dimensions() == 0 {
+    if skills.is_empty() || embedder.dimensions() == 0 {
         return Ok(skills);
     }
 
@@ -378,24 +372,18 @@ fn lexical_skill_selection(query: &str, skills: &[Skill], top_k: usize) -> Vec<S
 
 fn load_skills_with_open_skills_config(
     workspace_dir: &Path,
-    config_open_skills_enabled: Option<bool>,
     config_open_skills_dir: Option<&str>,
-    config_openclaw_skills_enabled: Option<bool>,
     config_openclaw_skills_dir: Option<&str>,
 ) -> Vec<Skill> {
     let mut skills = BTreeMap::new();
 
     // Lowest precedence: community open-skills metadata (lazy/untrusted).
-    if open_skills_enabled(config_open_skills_enabled)
-        && let Some(open_skills_dir) = resolve_open_skills_dir(config_open_skills_dir)
-    {
+    if let Some(open_skills_dir) = resolve_open_skills_dir(config_open_skills_dir) {
         merge_skills(&mut skills, load_open_skills(&open_skills_dir));
     }
 
     // Middle precedence: a pre-synchronized OpenClaw checkout, also lazy/untrusted.
-    if config_openclaw_skills_enabled.unwrap_or(false)
-        && let Some(repo_dir) = resolve_openclaw_skills_dir(config_openclaw_skills_dir)
-    {
+    if let Some(repo_dir) = resolve_openclaw_skills_dir(config_openclaw_skills_dir) {
         let skills_subdir = repo_dir.join("skills");
         merge_skills(&mut skills, load_openclaw_skills_from_dir(&skills_subdir));
     }
@@ -514,10 +502,6 @@ fn sorted_directory_entries(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
         .collect::<Vec<_>>();
     entries.sort_by_key(std::fs::DirEntry::file_name);
     Ok(entries)
-}
-
-fn open_skills_enabled(config_open_skills_enabled: Option<bool>) -> bool {
-    config_open_skills_enabled.unwrap_or(false)
 }
 
 fn resolve_open_skills_dir(config_open_skills_dir: Option<&str>) -> Option<PathBuf> {
@@ -827,32 +811,29 @@ fn mark_openclaw_skills_synced(repo_dir: &Path) -> Result<()> {
 /// Explicitly clone/pull enabled community repositories outside inference and
 /// catalog request paths.
 pub fn sync_community_skill_repositories(config: &crate::config::Config) -> Result<()> {
-    if config.skills.open_skills_enabled {
-        let repo_dir = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref())
-            .context("could not resolve open-skills directory")?;
-        let synced = if repo_dir.exists() {
-            pull_open_skills_repo(&repo_dir)
-        } else {
-            clone_open_skills_repo(&repo_dir)
-        };
-        if !synced {
-            bail!("failed to synchronize open-skills repository");
-        }
-        mark_open_skills_synced(&repo_dir)?;
+    let repo_dir = resolve_open_skills_dir(config.skills.open_skills_dir.as_deref())
+        .context("could not resolve open-skills directory")?;
+    let synced = if repo_dir.exists() {
+        pull_open_skills_repo(&repo_dir)
+    } else {
+        clone_open_skills_repo(&repo_dir)
+    };
+    if !synced {
+        bail!("failed to synchronize open-skills repository");
     }
-    if config.skills.openclaw_skills_enabled {
-        let repo_dir = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref())
-            .context("could not resolve OpenClaw skills directory")?;
-        let synced = if repo_dir.exists() {
-            pull_openclaw_skills_repo(&repo_dir)
-        } else {
-            clone_openclaw_skills_repo(&repo_dir)
-        };
-        if !synced {
-            bail!("failed to synchronize OpenClaw skills repository");
-        }
-        mark_openclaw_skills_synced(&repo_dir)?;
+    mark_open_skills_synced(&repo_dir)?;
+
+    let repo_dir = resolve_openclaw_skills_dir(config.skills.openclaw_skills_dir.as_deref())
+        .context("could not resolve OpenClaw skills directory")?;
+    let synced = if repo_dir.exists() {
+        pull_openclaw_skills_repo(&repo_dir)
+    } else {
+        clone_openclaw_skills_repo(&repo_dir)
+    };
+    if !synced {
+        bail!("failed to synchronize OpenClaw skills repository");
     }
+    mark_openclaw_skills_synced(&repo_dir)?;
     invalidate_skill_catalog(&config.workspace_dir);
     Ok(())
 }
@@ -1569,9 +1550,7 @@ command = "echo hello"
         let missing_openclaw = dir.path().join("must-not-be-cloned");
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skills.open_skills_enabled = true;
         config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
-        config.skills.openclaw_skills_enabled = true;
         config.skills.openclaw_skills_dir = Some(missing_openclaw.to_string_lossy().to_string());
 
         let skills = load_skills_with_config(&workspace_dir, &config);
@@ -1603,7 +1582,6 @@ command = "echo hello"
         }
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skills.open_skills_enabled = true;
         config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
 
         let skills = load_skills_with_config(&workspace_dir, &config);
@@ -1989,13 +1967,6 @@ description = "Bare minimum"
     }
 
     #[test]
-    fn open_skills_enabled_uses_config_then_default_false() {
-        assert!(!open_skills_enabled(None));
-        assert!(open_skills_enabled(Some(true)));
-        assert!(!open_skills_enabled(Some(false)));
-    }
-
-    #[test]
     fn resolve_open_skills_dir_uses_config_then_home() {
         assert_eq!(
             resolve_open_skills_dir(Some("/tmp/config-skills")),
@@ -2026,7 +1997,6 @@ description = "Bare minimum"
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skills.open_skills_enabled = true;
         config.skills.open_skills_dir = Some(open_skills_dir.to_string_lossy().to_string());
 
         let skills = load_skills_with_config(&workspace_dir, &config);
@@ -2144,7 +2114,7 @@ description = "Bare minimum"
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skills.openclaw_skills_enabled = false;
+        config.skills.openclaw_skills_dir = Some(dir.path().join("missing-openclaw").to_string_lossy().to_string());
 
         // Empty workspace → no skills returned.
         let skills = load_skills_with_config(&workspace_dir, &config);
@@ -2168,7 +2138,6 @@ description = "Bare minimum"
         .unwrap();
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skills.openclaw_skills_enabled = true;
         config.skills.openclaw_skills_dir = Some(repo_dir.to_string_lossy().to_string());
 
         let skills = load_skills_with_config(&workspace_dir, &config);
@@ -2228,7 +2197,6 @@ description = "Bare minimum"
 
         let mut config = crate::config::Config::default();
         config.workspace_dir = workspace_dir.clone();
-        config.skill_rag.enabled = true;
         config.memory.embedding_provider = "counting".into();
         config.memory.embedding_model = uuid::Uuid::new_v4().to_string();
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));

@@ -7,7 +7,7 @@
 //! - Persist results and reschedule
 
 use crate::config::Config;
-use crate::heartbeat::engine::{HEARTBEAT_TASK_PREFIX, HeartbeatEngine};
+use crate::heartbeat::engine::HeartbeatEngine;
 use crate::runtime::envelope::RuntimeEnvelope;
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
 use crate::security::SecurityPolicy;
@@ -89,10 +89,7 @@ async fn run_loop(config: Config) -> Result<()> {
     let security = crate::runtime::bootstrap::build_security_policy(&config);
     let registry = Arc::new(BuiltinRegistry::new());
 
-    // Register built-in system tasks if configured
-    if config.xin.enabled && config.xin.builtin_tasks {
-        register_builtin_tasks(&config)?;
-    }
+    register_builtin_tasks(&config)?;
 
     let heartbeat_engine = HeartbeatEngine::new(config.heartbeat.clone(), config.workspace_dir.clone());
     if let Err(error) = reconcile_heartbeat_tasks(&config, &heartbeat_engine).await {
@@ -102,24 +99,20 @@ async fn run_loop(config: Config) -> Result<()> {
 
     // Crash recovery: surface any goal steps whose lease expired while the
     // daemon was down so they get re-claimed (rather than silently orphaned).
-    match config
-        .xin
-        .enabled
-        .then(|| store::expired_step_leases(&config, Utc::now()))
-    {
-        Some(Ok(steps)) if !steps.is_empty() => {
+    match store::expired_step_leases(&config, Utc::now()) {
+        Ok(steps) if !steps.is_empty() => {
             tracing::info!(
                 target: "xin",
                 count = steps.len(),
                 "recovered goal steps with expired leases on startup"
             );
         }
-        Some(Ok(_)) | None => {}
-        Some(Err(e)) => tracing::warn!(target: "xin", "startup expired-lease scan failed: {e}"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!(target: "xin", "startup expired-lease scan failed: {e}"),
     }
 
     // Optionally adopt orphaned legacy tasks into lease-managed goals.
-    if config.xin.enabled && config.xin.adopt_legacy_tasks {
+    if config.xin.adopt_legacy_tasks {
         match adopt_legacy_tasks(&config) {
             Ok(0) => {}
             Ok(n) => tracing::info!(target: "xin", count = n, "adopted legacy tasks into goals"),
@@ -131,10 +124,10 @@ async fn run_loop(config: Config) -> Result<()> {
     tracing::info!(
         target: "xin",
         interval_minutes,
-        heartbeat_materialization = config.heartbeat.enabled,
+        heartbeat_materialization = true,
         max_concurrent = config.xin.max_concurrent,
-        builtin_tasks = config.xin.builtin_tasks,
-        evolution_integration = config.xin.evolution_integration,
+        builtin_tasks = true,
+        evolution_integration = true,
         "xin heartbeat engine started"
     );
     wait_for_generation_activation().await;
@@ -157,7 +150,7 @@ async fn run_loop(config: Config) -> Result<()> {
         // Reset goal steps whose lease expired so they can be re-claimed instead
         // of orphaned. Lease + heartbeat (not updated_at) drive step staleness,
         // so long agent runs survive across ticks.
-        if config.xin.enabled {
+        {
             match store::mark_steps_stale(&config, Utc::now()) {
                 Ok(ids) if !ids.is_empty() => {
                     tracing::info!(target: "xin", count = ids.len(), "reset expired-lease steps to stale");
@@ -222,22 +215,16 @@ async fn wait_for_generation_activation() {
 }
 
 pub(crate) fn runner_interval_minutes(config: &Config) -> u32 {
-    let xin = config.xin.enabled.then_some(config.xin.interval_minutes.max(1));
-    let heartbeat = config
-        .heartbeat
-        .enabled
-        .then_some(config.heartbeat.interval_minutes.max(5));
-    match (xin, heartbeat) {
-        (Some(xin), Some(heartbeat)) => xin.min(heartbeat),
-        (Some(xin), None) => xin,
-        (None, Some(heartbeat)) => heartbeat,
-        (None, None) => config.xin.interval_minutes.max(1),
-    }
+    config
+        .xin
+        .interval_minutes
+        .max(1)
+        .min(config.heartbeat.interval_minutes.max(5))
 }
 
 async fn reconcile_heartbeat_tasks(config: &Config, engine: &HeartbeatEngine) -> Result<usize> {
     let materialized = engine.materialize_xin_tasks(config).await?;
-    if config.heartbeat.enabled {
+    {
         crate::health::mark_component_ok("heartbeat");
     }
     Ok(materialized.len())
@@ -245,26 +232,18 @@ async fn reconcile_heartbeat_tasks(config: &Config, engine: &HeartbeatEngine) ->
 
 fn task_enabled_for_runtime(config: &Config, task: &XinTask, local_hour: u8) -> bool {
     if HeartbeatEngine::is_materialized_task(task) {
-        config.heartbeat.enabled && HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour)
+        HeartbeatEngine::is_within_active_hours(&config.heartbeat, local_hour)
     } else {
-        config.xin.enabled
+        true
     }
 }
 
 fn mark_stale_tasks_for_runtime(config: &Config) -> Result<usize> {
-    if config.xin.enabled {
-        store::mark_stale(config, config.xin.stale_timeout_minutes)
-    } else {
-        store::mark_stale_system_tasks_in_namespace(config, config.xin.stale_timeout_minutes, HEARTBEAT_TASK_PREFIX)
-    }
+    store::mark_stale(config, config.xin.stale_timeout_minutes)
 }
 
 fn due_tasks_for_runtime(config: &Config, now: chrono::DateTime<Utc>) -> Result<Vec<XinTask>> {
-    if config.xin.enabled {
-        store::due_tasks(config, now, config.xin.max_concurrent)
-    } else {
-        store::due_system_tasks_in_namespace(config, now, config.xin.max_concurrent, HEARTBEAT_TASK_PREFIX)
-    }
+    store::due_tasks(config, now, config.xin.max_concurrent)
 }
 
 fn register_builtin_tasks(config: &Config) -> Result<()> {
@@ -1063,7 +1042,6 @@ mod tests {
         // host happens to expose and wrap `sh -lc`, which is not what these tests
         // exercise. Production still honours the operator's real sandbox config.
         config.autonomy.sandbox.backend = crate::config::SandboxBackend::None;
-        config.autonomy.sandbox.enabled = Some(false);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
         config
     }
@@ -1141,12 +1119,9 @@ mod tests {
     fn heartbeat_and_xin_share_the_fastest_required_poll_interval() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.xin.enabled = false;
-        config.heartbeat.enabled = true;
         config.heartbeat.interval_minutes = 30;
-        assert_eq!(runner_interval_minutes(&config), 30);
+        assert_eq!(runner_interval_minutes(&config), 5);
 
-        config.xin.enabled = true;
         config.xin.interval_minutes = 5;
         assert_eq!(runner_interval_minutes(&config), 5);
 
@@ -1155,11 +1130,9 @@ mod tests {
     }
 
     #[test]
-    fn heartbeat_only_runtime_filters_regular_xin_tasks_and_active_hours() {
+    fn unified_runtime_runs_regular_tasks_and_applies_heartbeat_active_hours() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.xin.enabled = false;
-        config.heartbeat.enabled = true;
         config.heartbeat.active_hours = vec![8, 10];
 
         let heartbeat = store::add_task(
@@ -1205,19 +1178,14 @@ mod tests {
 
         assert!(task_enabled_for_runtime(&config, &heartbeat, 9));
         assert!(!task_enabled_for_runtime(&config, &heartbeat, 12));
-        assert!(!task_enabled_for_runtime(&config, &regular, 9));
-
-        config.xin.enabled = true;
         assert!(task_enabled_for_runtime(&config, &regular, 9));
     }
 
     #[test]
-    fn heartbeat_only_due_query_cannot_be_starved_by_regular_xin_tasks() {
+    fn unified_due_query_respects_priority_across_all_tasks() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp);
-        config.xin.enabled = false;
         config.xin.max_concurrent = 1;
-        config.heartbeat.enabled = true;
 
         for index in 0..3 {
             store::add_task(
@@ -1264,7 +1232,8 @@ mod tests {
 
         let due = due_tasks_for_runtime(&config, Utc::now() + chrono::Duration::seconds(1)).unwrap();
         assert_eq!(due.len(), 1);
-        assert_eq!(due.first().map(|task| task.id.as_str()), Some(heartbeat.id.as_str()));
+        assert_ne!(due.first().map(|task| task.id.as_str()), Some(heartbeat.id.as_str()));
+        assert_eq!(due.first().map(|task| task.priority), Some(TaskPriority::Critical));
     }
 
     #[tokio::test]
@@ -1397,7 +1366,6 @@ mod tests {
         // request a backend that is not available so create_sandbox returns the
         // fail-closed UnavailableSandbox. Firejail is not installed in CI.
         config.autonomy.sandbox.backend = crate::config::SandboxBackend::Firejail;
-        config.autonomy.sandbox.enabled = Some(true);
         config.autonomy.level = crate::security::AutonomyLevel::Full;
 
         let new = NewXinTask {

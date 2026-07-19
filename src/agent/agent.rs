@@ -885,7 +885,7 @@ impl Agent {
                     }),
                 )
                 .await;
-            let mut dynamic_tool_specs: Vec<_> = if self.tool_tiering.enabled {
+            let mut dynamic_tool_specs: Vec<_> = {
                 // Extract last user message for intent classification
                 let last_user_msg = self
                     .history
@@ -907,8 +907,6 @@ impl Agent {
                     &self.tool_tiering.always_exclude,
                 );
                 crate::tools::ToolCatalog::from_tools(filtered.iter().copied()).tool_specs()
-            } else {
-                crate::tools::ToolCatalog::from_boxed_registry(&self.tools).tool_specs()
             };
             // Agent::turn is never a smart-group-reply turn; stay_silent must not be
             // advertised to the model on this path (expose_stay_silent = false).
@@ -1004,8 +1002,7 @@ impl Agent {
                         cost_event.primary_prompt_tokens += Self::estimate_text_tokens(user_message);
                         cost_event.primary_completion_tokens += Self::estimate_text_tokens(&initial_text);
 
-                        if automix.enabled
-                            && !automix.premium_model_id.trim().is_empty()
+                        if !automix.premium_model_id.trim().is_empty()
                             && is_cheap_model_target(&effective_model, &automix.cheap_model_tiers)
                         {
                             let confidence = ConfidenceChecker::check_rules(&initial_text, user_message);
@@ -1608,19 +1605,16 @@ mod tests {
     }
 
     #[cfg(feature = "llm-router")]
-    fn automix_router_config(enabled: bool) -> crate::config::RouterConfig {
+    fn automix_router_config(_enabled: bool) -> crate::config::RouterConfig {
         crate::config::RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 1.0,
             epsilon: 0.3,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig {
-                enabled,
                 confidence_threshold: 0.7,
                 cheap_model_tiers: vec!["mini".into(), "ollama".into()],
                 premium_model_id: "openai/model-premium".into(),
@@ -1709,17 +1703,14 @@ mod tests {
         });
         let router = RouterEngine::new(
             crate::config::RouterConfig {
-                enabled: true,
                 alpha: 0.0,
                 beta: 0.5,
                 gamma: 0.3,
                 delta: 1.0,
                 epsilon: 0.3,
-                knn_enabled: false,
                 knn_min_records: 10,
                 knn_k: 7,
                 automix: crate::config::AutomixConfig {
-                    enabled: true,
                     confidence_threshold: 0.7,
                     cheap_model_tiers: vec!["cheap".into()],
                     premium_model_id: "openai/model-premium".into(),
@@ -1810,7 +1801,7 @@ mod tests {
 
     #[cfg(feature = "llm-router")]
     #[tokio::test]
-    async fn test_automix_disabled() {
+    async fn test_automix_legacy_disabled_flag_is_ignored() {
         let (mut agent, _memory, models) = build_automix_agent(
             "I'm not sure, maybe this is the answer.",
             "This should not be used.",
@@ -1821,8 +1812,11 @@ mod tests {
 
         let response = agent.turn("hello").await.unwrap();
 
-        assert!(response.contains("not sure"));
-        assert_eq!(models.lock().clone(), vec!["openai/model-mini".to_string()]);
+        assert!(response.contains("should not be used"));
+        assert_eq!(
+            models.lock().clone(),
+            vec!["openai/model-mini".to_string(), "openai/model-premium".to_string()]
+        );
     }
 
     #[cfg(feature = "llm-router")]

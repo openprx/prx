@@ -80,14 +80,10 @@ struct RuntimeState {
 struct McpJsonRoot {
     #[serde(default, rename = "mcpServers")]
     mcp_servers: HashMap<String, McpJsonServer>,
-    #[serde(default)]
-    enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct McpJsonServer {
-    #[serde(default)]
-    enabled: Option<bool>,
     #[serde(default)]
     transport: Option<String>,
     #[serde(default)]
@@ -245,9 +241,6 @@ impl McpTool {
         let parsed: McpJsonRoot = serde_json::from_str(&raw)?;
 
         let mut cfg = self.base_config.clone();
-        if let Some(enabled) = parsed.enabled {
-            cfg.enabled = enabled;
-        }
 
         if !parsed.mcp_servers.is_empty() {
             let mut servers = HashMap::new();
@@ -329,9 +322,6 @@ impl McpTool {
     fn convert_json_server(server: McpJsonServer) -> McpServerConfig {
         let mut out = McpServerConfig::default();
 
-        if let Some(enabled) = server.enabled {
-            out.enabled = enabled;
-        }
         if let Some(transport) = server.transport {
             out.transport = match transport.to_lowercase().as_str() {
                 "http" => McpTransport::Http,
@@ -371,17 +361,9 @@ impl McpTool {
     }
 
     fn resolve_server<'a>(cfg: &'a McpConfig, name: &str) -> anyhow::Result<&'a McpServerConfig> {
-        if !cfg.enabled {
-            bail!("MCP integration is disabled in effective config");
-        }
-
         let Some(server) = cfg.servers.get(name) else {
             bail!("Unknown MCP server '{name}'");
         };
-
-        if !server.enabled {
-            bail!("MCP server '{name}' is disabled");
-        }
 
         Ok(server)
     }
@@ -668,9 +650,6 @@ impl McpTool {
 
         let mut discovered = HashMap::new();
         for (server_name, server) in &new_config.servers {
-            if !server.enabled {
-                continue;
-            }
             if let Ok(tools) = Self::discover_server_tools(server_name, server).await {
                 discovered.insert(server_name.clone(), tools);
             }
@@ -749,12 +728,7 @@ impl Tool for McpTool {
         self.refresh_state_from_file_only();
 
         let state = self.state.read();
-        let server_names = state
-            .effective_config
-            .servers
-            .iter()
-            .filter_map(|(name, cfg)| cfg.enabled.then_some(name.clone()))
-            .collect::<Vec<_>>();
+        let server_names = state.effective_config.servers.keys().cloned().collect::<Vec<_>>();
 
         let mut tool_set = HashSet::new();
         for per_server in state.discovered_tools.values() {
@@ -798,10 +772,6 @@ impl Tool for McpTool {
             let Some(server_cfg) = state.effective_config.servers.get(server_name) else {
                 continue;
             };
-            if !server_cfg.enabled {
-                continue;
-            }
-
             for (tool_name, meta) in tools {
                 if !Self::tool_allowed(server_cfg, tool_name) {
                     continue;
@@ -985,7 +955,6 @@ mod tests {
     #[test]
     fn convert_json_server_defaults_transport_from_url() {
         let server = McpJsonServer {
-            enabled: Some(true),
             transport: None,
             command: None,
             args: Vec::new(),
@@ -1006,7 +975,6 @@ mod tests {
     #[test]
     fn convert_json_server_defaults_to_stdio_when_command_present() {
         let server = McpJsonServer {
-            enabled: Some(true),
             transport: None,
             command: Some("my-tool".into()),
             args: vec!["--serve".into()],
@@ -1024,31 +992,11 @@ mod tests {
         assert_eq!(out.args, vec!["--serve"]);
     }
 
-    #[test]
-    fn convert_json_server_disabled_flag() {
-        let server = McpJsonServer {
-            enabled: Some(false),
-            transport: None,
-            command: Some("x".into()),
-            args: Vec::new(),
-            url: None,
-            env: HashMap::new(),
-            startup_timeout_ms: None,
-            request_timeout_ms: None,
-            tool_name_prefix: None,
-            allow_tools: Vec::new(),
-            deny_tools: Vec::new(),
-        };
-        let out = McpTool::convert_json_server(server);
-        assert!(!out.enabled);
-    }
-
     // ── parse_alias_name ────────────────────────────────────────
 
     #[test]
     fn parse_alias_name_resolves_server_and_tool() {
         let mut cfg = McpConfig::default();
-        cfg.enabled = true;
         cfg.servers.insert(
             "qmd".into(),
             McpServerConfig {
@@ -1070,7 +1018,6 @@ mod tests {
     #[test]
     fn parse_alias_name_default_prefix() {
         let mut cfg = McpConfig::default();
-        cfg.enabled = true;
         cfg.servers.insert(
             "myserver".into(),
             McpServerConfig {
@@ -1309,44 +1256,6 @@ mod tests {
         let result = tool.execute(json!({"server": "s", "tool": "t"})).await.unwrap();
         assert!(!result.success);
         assert!(result.error.as_deref().unwrap_or("").contains("read-only"));
-    }
-
-    // ── MCP disabled ────────────────────────────────────────────
-
-    #[tokio::test]
-    async fn mcp_disabled_returns_error() {
-        let mut cfg = McpConfig::default();
-        cfg.enabled = false;
-        // The SideEffectGate now precedes the downstream call. To reach the
-        // "disabled/not found" path we must pass the High-risk gate first by
-        // presenting a matching runtime grant under explicit Supervised policy.
-        let security = mcp_gate_security();
-        let tool = McpTool::new(security, cfg, std::env::temp_dir());
-        let op = op_id::op_id(MCP_ROOT_NAME, "call", &["s", "t"]);
-        let result = tool
-            .execute(json!({
-                "server": "s",
-                "tool": "t",
-                crate::security::policy::RUNTIME_APPROVAL_GRANT_ARG:
-                    ApprovalGrant::for_resource_operation(MCP_ROOT_NAME, &op, "test", None),
-            }))
-            .await
-            .unwrap();
-        assert!(!result.success);
-        assert!(
-            result
-                .error
-                .as_deref()
-                .unwrap_or("")
-                .to_lowercase()
-                .contains("disabled")
-                || result
-                    .error
-                    .as_deref()
-                    .unwrap_or("")
-                    .to_lowercase()
-                    .contains("not found")
-        );
     }
 
     // ── Security: command whitelist ─────────────────────────────
@@ -1647,11 +1556,9 @@ mod tests {
         .expect("test: write mcp.json");
 
         let mut base = McpConfig::default();
-        base.enabled = true;
         base.servers.insert(
             "my-mcp".into(),
             McpServerConfig {
-                enabled: true,
                 command: Some("node".into()),
                 args: vec!["server.js".into()],
                 ..McpServerConfig::default()
@@ -1698,11 +1605,9 @@ mod tests {
         .expect("test: write mcp.json");
 
         let mut base = McpConfig::default();
-        base.enabled = true;
         base.servers.insert(
             "my-mcp".into(),
             McpServerConfig {
-                enabled: true,
                 command: Some("node".into()),
                 ..McpServerConfig::default()
             },

@@ -1061,7 +1061,7 @@ pub(crate) async fn run_configured_with_repository(
         .webhook
         .token
         .as_deref()
-        .context("webhook.token must be configured when webhook.enabled=true")?;
+        .context("webhook.token must be configured")?;
     run_with_repository(
         &config.webhook.bind,
         token,
@@ -1084,7 +1084,7 @@ pub(crate) async fn run_configured_with_repository_generation(
         .webhook
         .token
         .as_deref()
-        .context("webhook.token must be configured when webhook.enabled=true")?;
+        .context("webhook.token must be configured")?;
     run_with_repository(
         &config.webhook.bind,
         token,
@@ -2145,7 +2145,6 @@ mod tests {
         let mut config = Config::default();
         config.workspace_dir = tmp.path().to_path_buf();
         config.memory.backend = "markdown".to_string();
-        config.webhook.enabled = true;
         config.webhook.token = Some("receiver-token".to_string());
 
         let result = repository_from_config(&config);

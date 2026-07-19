@@ -47,8 +47,6 @@ const fn default_stdin_json() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct HooksFile {
     #[serde(default)]
-    enabled: Option<bool>,
-    #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     hooks: HashMap<String, Vec<HookActionEntry>>,
@@ -62,12 +60,10 @@ struct HookItem {
     event: String,
     command: String,
     timeout_ms: u64,
-    enabled: bool,
 }
 
 #[derive(Serialize)]
 pub(super) struct HooksResponse {
-    enabled: bool,
     hooks: Vec<HookItem>,
 }
 
@@ -184,7 +180,6 @@ fn validate_hook_timeout(timeout_ms: Option<u64>) -> Result<Option<u64>, (Status
 }
 
 fn hooks_file_to_items(file: &HooksFile) -> Vec<HookItem> {
-    let global_enabled = file.enabled.unwrap_or(true);
     let global_timeout = file.timeout_ms.unwrap_or(DEFAULT_HOOK_TIMEOUT_MS);
     let mut items = Vec::new();
 
@@ -200,7 +195,6 @@ fn hooks_file_to_items(file: &HooksFile) -> Vec<HookItem> {
                 event: event.clone(),
                 command: action.command.clone(),
                 timeout_ms: action.timeout_ms.unwrap_or(global_timeout),
-                enabled: global_enabled,
             });
         }
     }
@@ -215,7 +209,6 @@ pub async fn get_hooks(
 ) -> Result<Json<HooksResponse>, (StatusCode, Json<serde_json::Value>)> {
     let file = read_hooks_file(&state)?;
     Ok(Json(HooksResponse {
-        enabled: file.enabled.unwrap_or(true),
         hooks: hooks_file_to_items(&file),
     }))
 }
@@ -326,33 +319,6 @@ pub async fn delete_hook(
     super::authorize_resource_mutation(&state, "gateway_api:hooks:delete", ResourceRiskLevel::Low)?;
     write_hooks_file(&state, &file)?;
     Ok(Json(serde_json::json!({"status": "deleted", "id": id})))
-}
-
-pub async fn toggle_hook(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    let mut file = read_hooks_file(&state)?;
-
-    // For toggle, we toggle the global enabled flag since hooks.json uses a global enabled
-    // If the id matches a specific hook, we still toggle globally (hooks.json design limitation)
-    let (event_key, _action_idx) = parse_hook_id(&id);
-
-    if !file.hooks.contains_key(&event_key) {
-        return Err((
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({"error": format!("Hook '{id}' not found")})),
-        ));
-    }
-
-    let current = file.enabled.unwrap_or(true);
-    file.enabled = Some(!current);
-    super::authorize_resource_mutation(&state, "gateway_api:hooks:toggle", ResourceRiskLevel::Low)?;
-    write_hooks_file(&state, &file)?;
-
-    Ok(Json(
-        serde_json::json!({"status": "toggled", "id": id, "enabled": !current}),
-    ))
 }
 
 fn parse_hook_id(id: &str) -> (String, usize) {

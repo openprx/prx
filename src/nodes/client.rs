@@ -86,7 +86,7 @@ impl NodeManager {
     pub fn retain_configured(&self, nodes: &[RemoteNodeConfig]) {
         self.clients
             .write()
-            .retain(|node_id, _| nodes.iter().any(|node| node.enabled && node.id == node_id.as_str()));
+            .retain(|node_id, _| nodes.iter().any(|node| node.id == node_id.as_str()));
     }
 
     #[cfg(test)]
@@ -100,7 +100,6 @@ fn same_node_config(left: &RemoteNodeConfig, right: &RemoteNodeConfig) -> bool {
         && left.endpoint == right.endpoint
         && left.bearer_token == right.bearer_token
         && left.hmac_secret == right.hmac_secret
-        && left.enabled == right.enabled
         && left.timeout_ms == right.timeout_ms
         && left.retry_max == right.retry_max
 }
@@ -395,7 +394,6 @@ mod tests {
             endpoint: "http://127.0.0.1:7878".into(),
             bearer_token: "token".into(),
             hmac_secret: None,
-            enabled: true,
             timeout_ms: None,
             retry_max: None,
         }

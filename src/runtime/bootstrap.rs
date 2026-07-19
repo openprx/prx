@@ -308,7 +308,7 @@ impl RuntimeBootstrap {
         // 5. router — strictly after memory (agent/agent.rs:446 invariant), only
         //    when the feature is on and the profile needs it.
         #[cfg(feature = "llm-router")]
-        let router: Option<Arc<RouterEngine>> = if profile.needs_router() && config.router.enabled {
+        let router: Option<Arc<RouterEngine>> = if profile.needs_router() {
             // memory must already be set; needs_router() implies needs_memory().
             let mem = memory
                 .as_ref()
@@ -371,7 +371,7 @@ impl RuntimeBootstrap {
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("memory backend must be set before building tools"))?
                 .clone();
-            let (composio_key, composio_entity_id) = if config.composio.enabled {
+            let (composio_key, composio_entity_id) = if config.composio.configured() {
                 (
                     config.composio.api_key.as_deref(),
                     Some(config.composio.entity_id.as_str()),
@@ -432,8 +432,6 @@ mod tests {
         config.config_path = workspace.join("config.toml");
         // Keep the observer cheap and deterministic in tests.
         config.observability.backend = "noop".into();
-        // Disable router so the llm-router path stays off regardless of feature.
-        config.router.enabled = false;
         config
     }
 
@@ -587,12 +585,8 @@ mod tests {
 
         assert!(ctx.memory.is_some(), "Server must build memory");
         assert!(ctx.tools.is_some(), "Server must build tools");
-        // Router disabled in config => None even though the profile allows it.
         #[cfg(feature = "llm-router")]
-        assert!(
-            ctx.router.is_none(),
-            "router stays None when config.router.enabled is false"
-        );
+        assert!(ctx.router.is_some(), "router is always constructed for server profiles");
     }
 
     #[tokio::test]
@@ -872,16 +866,14 @@ mod tests {
     async fn security_carries_audit_config_from_build() {
         let tmp = tempfile::tempdir().expect("test: create temp dir");
         let mut config = test_config(tmp.path());
-        // Flip a distinctive audit setting and confirm it survives into ctx.security.
-        config.security.audit.enabled = !crate::config::AuditConfig::default().enabled;
-        let expected_enabled = config.security.audit.enabled;
+        config.security.audit.max_size_mb = 321;
 
         let ctx = RuntimeBootstrap::build(config, BootstrapProfile::Minimal)
             .await
             .expect("test: build for audit assertion");
 
         assert_eq!(
-            ctx.security.audit_config.enabled, expected_enabled,
+            ctx.security.audit_config.max_size_mb, 321,
             "security must carry the audit_config supplied at build time"
         );
         // security workspace_dir is derived from the same config path.

@@ -141,7 +141,7 @@ impl ProxyConfigTool {
 
     fn proxy_json(proxy: &ProxyConfig) -> Value {
         json!({
-            "enabled": proxy.enabled,
+            "configured": proxy.has_any_proxy_url(),
             "scope": proxy.scope,
             "http_proxy": proxy.http_proxy,
             "https_proxy": proxy.https_proxy,
@@ -192,13 +192,6 @@ impl ProxyConfigTool {
         let mut cfg = self.load_config_without_env()?;
         let previous_scope = cfg.proxy.scope;
         let mut proxy = cfg.proxy.clone();
-        let mut touched_proxy_url = false;
-
-        if let Some(enabled) = args.get("enabled") {
-            proxy.enabled = enabled
-                .as_bool()
-                .ok_or_else(|| anyhow::anyhow!("'enabled' must be a boolean"))?;
-        }
 
         if let Some(scope_raw) = args.get("scope") {
             let scope = scope_raw
@@ -211,11 +204,9 @@ impl ProxyConfigTool {
         match Self::parse_optional_string_update(args, "http_proxy")? {
             MaybeSet::Set(update) => {
                 proxy.http_proxy = Some(update);
-                touched_proxy_url = true;
             }
             MaybeSet::Null => {
                 proxy.http_proxy = None;
-                touched_proxy_url = true;
             }
             MaybeSet::Unset => {}
         }
@@ -223,11 +214,9 @@ impl ProxyConfigTool {
         match Self::parse_optional_string_update(args, "https_proxy")? {
             MaybeSet::Set(update) => {
                 proxy.https_proxy = Some(update);
-                touched_proxy_url = true;
             }
             MaybeSet::Null => {
                 proxy.https_proxy = None;
-                touched_proxy_url = true;
             }
             MaybeSet::Unset => {}
         }
@@ -235,28 +224,19 @@ impl ProxyConfigTool {
         match Self::parse_optional_string_update(args, "all_proxy")? {
             MaybeSet::Set(update) => {
                 proxy.all_proxy = Some(update);
-                touched_proxy_url = true;
             }
             MaybeSet::Null => {
                 proxy.all_proxy = None;
-                touched_proxy_url = true;
             }
             MaybeSet::Unset => {}
         }
 
         if let Some(no_proxy_raw) = args.get("no_proxy") {
             proxy.no_proxy = Self::parse_string_list(no_proxy_raw, "no_proxy")?;
-            touched_proxy_url = true;
         }
 
         if let Some(services_raw) = args.get("services") {
             proxy.services = Self::parse_string_list(services_raw, "services")?;
-        }
-
-        if args.get("enabled").is_none() && touched_proxy_url {
-            // Keep auto-enable behavior when users provide a proxy URL, but
-            // auto-disable when all proxy URLs are cleared in the same update.
-            proxy.enabled = proxy.has_any_proxy_url();
         }
 
         proxy.no_proxy = proxy.normalized_no_proxy();
@@ -269,7 +249,7 @@ impl ProxyConfigTool {
         let active_proxy = self.config.load_full().proxy.clone();
 
         if report.rebuilt.iter().any(|field| field == "proxy")
-            && proxy.enabled
+            && proxy.has_any_proxy_url()
             && proxy.scope == ProxyScope::Environment
         {
             proxy.apply_to_process_env();
@@ -296,47 +276,12 @@ impl ProxyConfigTool {
         })
     }
 
-    async fn handle_disable(&self, args: &Value) -> anyhow::Result<ToolResult> {
-        let mut cfg = self.load_config_without_env()?;
-        let clear_env_default = cfg.proxy.scope == ProxyScope::Environment;
-        cfg.proxy.enabled = false;
-        cfg.save().await?;
-        let report = self.reload_saved_config().await?;
-        let active_proxy = self.config.load_full().proxy.clone();
-
-        let clear_env = args
-            .get("clear_env")
-            .and_then(Value::as_bool)
-            .unwrap_or(clear_env_default);
-        if clear_env && report.rebuilt.iter().any(|field| field == "proxy") {
-            ProxyConfig::clear_process_env();
-        }
-
-        Ok(ToolResult {
-            success: true,
-            output: serde_json::to_string_pretty(&json!({
-                "message": if report.restart_required.iter().any(|field| field == "proxy") {
-                    "Proxy disable saved; process restart required before runtime activation"
-                } else {
-                    "Proxy disabled and activated"
-                },
-                "status": report.status(),
-                "active_generation": report.active_generation.0,
-                "restart_required": report.restart_required,
-                "desired_proxy": Self::proxy_json(&cfg.proxy),
-                "active_runtime_proxy": Self::proxy_json(&active_proxy),
-                "environment": Self::env_snapshot(),
-            }))?,
-            error: None,
-        })
-    }
-
     fn handle_apply_env(&self) -> anyhow::Result<ToolResult> {
         let proxy = self.config.load_full().proxy.clone();
         proxy.validate()?;
 
-        if !proxy.enabled {
-            anyhow::bail!("Proxy is disabled. Use action 'set' with enabled=true first");
+        if !proxy.has_any_proxy_url() {
+            anyhow::bail!("Proxy is not configured. Use action 'set' with a proxy URL first");
         }
 
         if proxy.scope != ProxyScope::Environment {
@@ -388,12 +333,8 @@ impl Tool for ProxyConfigTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["get", "set", "disable", "list_services", "apply_env", "clear_env"],
+                    "enum": ["get", "set", "list_services", "apply_env", "clear_env"],
                     "default": "get"
-                },
-                "enabled": {
-                    "type": "boolean",
-                    "description": "Enable or disable proxy"
                 },
                 "scope": {
                     "type": "string",
@@ -453,14 +394,14 @@ impl Tool for ProxyConfigTool {
                 self.handle_get()
             }
             "list_services" => self.handle_list_services(),
-            "set" | "disable" | "apply_env" | "clear_env" => {
+            "set" | "apply_env" | "clear_env" => {
                 if let Some(blocked) = self.require_write_access() {
                     return Ok(blocked);
                 }
 
                 let operation_name = match action.as_str() {
                     "set" | "apply_env" => "proxy_config:set",
-                    "disable" | "clear_env" => "proxy_config:unset",
+                    "clear_env" => "proxy_config:unset",
                     other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
                 };
                 if let Some(blocked) = self.authorize_resource_operation(
@@ -473,15 +414,12 @@ impl Tool for ProxyConfigTool {
 
                 match action.as_str() {
                     "set" => self.handle_set(&args).await,
-                    "disable" => self.handle_disable(&args).await,
                     "apply_env" => self.handle_apply_env(),
                     "clear_env" => self.handle_clear_env(),
                     other => anyhow::bail!("Unknown proxy sub-action '{other}'"),
                 }
             }
-            _ => anyhow::bail!(
-                "Unknown action '{action}'. Valid: get, set, disable, list_services, apply_env, clear_env"
-            ),
+            _ => anyhow::bail!("Unknown action '{action}'. Valid: get, set, list_services, apply_env, clear_env"),
         };
 
         match result {
@@ -625,8 +563,8 @@ mod tests {
                 .unwrap_or_default()
                 .contains("restart required")
         );
-        assert_eq!(set_output["active_runtime_proxy"]["enabled"], false);
-        assert_eq!(set_output["desired_proxy"]["enabled"], true);
+        assert_eq!(set_output["active_runtime_proxy"]["configured"], false);
+        assert_eq!(set_output["desired_proxy"]["configured"], true);
 
         let get_result = tool.execute(json!({"action": "get"})).await.unwrap();
         assert!(get_result.success);

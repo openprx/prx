@@ -73,23 +73,6 @@ const LEGACY_FRAGMENT_MAP: &[(&str, &str)] = &[
     ("06-integrations.toml", "integrations.toml"),
 ];
 
-/// Maps module names (from [modules] section) to their config.d/ file names.
-pub const MODULE_FILE_MAP: &[(&str, &str)] = &[
-    ("memory", "memory.toml"),
-    ("channels", "channels.toml"),
-    ("network", "network.toml"),
-    ("security", "security.toml"),
-    ("scheduler", "scheduler.toml"),
-    ("agent", "agent.toml"),
-    ("identity", "identity.toml"),
-    ("routing", "routing.toml"),
-    ("tools", "tools.toml"),
-    ("integrations", "integrations.toml"),
-    ("nodes", "nodes.toml"),
-    ("cost", "cost.toml"),
-    ("observability", "observability.toml"),
-];
-
 pub fn config_dir_path(config_path: &Path) -> PathBuf {
     config_path.parent().unwrap_or_else(|| Path::new(".")).join("config.d")
 }
@@ -171,41 +154,16 @@ pub fn has_managed_fragments(config_path: &Path) -> Result<bool> {
     })
 }
 
-/// Extract the [modules] section from an already-loaded TOML value.
-///
-/// When the [modules] key is absent entirely, returns `ModulesConfig::all_enabled()`
-/// and emits a warning so the operator knows the default is being applied.
-fn extract_modules_from_value(main_value: &Value) -> Result<crate::config::schema::ModulesConfig> {
-    match main_value.get("modules") {
-        Some(modules_value) => {
-            let modules: crate::config::schema::ModulesConfig = modules_value
-                .clone()
-                .try_into()
-                .context("Failed to deserialize [modules] section from config.toml")?;
-            Ok(modules)
-        }
-        None => {
-            tracing::warn!("No [modules] section in config.toml — all modules enabled by default");
-            Ok(crate::config::schema::ModulesConfig::all_enabled())
-        }
-    }
-}
-
-/// Two-pass config loader: reads [modules] from config.toml first,
-/// then merges only enabled module fragments from config.d/.
-///
-/// The main config file is read only once; the [modules] section is extracted
-/// from the already-loaded value to avoid a second disk read.
+/// Merge the main config with every managed config fragment. Capability
+/// activation is driven by concrete configuration, never module switches.
 pub fn read_merged_toml_with_gate(config_path: &Path) -> Result<Value> {
     with_consistent_config_snapshot(config_path, || read_merged_toml_with_gate_once(config_path))
 }
 
 pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Value> {
-    // Single read of main config; extract module gates from it directly.
     let mut merged = read_toml_file(config_path)?;
-    let modules = extract_modules_from_value(&merged)?;
 
-    // Merge enabled config.d/ fragments into the already-loaded base.
+    // Merge every managed config.d fragment into the already-loaded base.
     for fragment in list_config_fragment_paths(config_path)? {
         let file_name = match fragment.file_name().and_then(|n| n.to_str()) {
             Some(name) => name,
@@ -214,8 +172,7 @@ pub(crate) fn read_merged_toml_with_gate_once(config_path: &Path) -> Result<Valu
                 continue;
             }
         };
-        if should_skip_fragment(file_name, &modules) {
-            tracing::debug!(file = %fragment.display(), "Skipping disabled module config fragment");
+        if should_skip_fragment(file_name) {
             continue;
         }
         let value = read_toml_file(&fragment)?;
@@ -335,25 +292,11 @@ pub(crate) fn with_consistent_config_snapshot<T>(config_path: &Path, mut read: i
     )
 }
 
-/// Determines whether a config.d/ fragment should be skipped based on module switches.
-///
-/// Fail-closed: fragments whose filename is not listed in MODULE_FILE_MAP are
-/// skipped with a warning rather than silently loaded.
-pub fn should_skip_fragment(file_name: &str, modules: &crate::config::schema::ModulesConfig) -> bool {
-    for (module_name, fragment_name) in MODULE_FILE_MAP {
-        if *fragment_name == file_name {
-            return modules.is_enabled(module_name).map_or_else(
-                || {
-                    tracing::warn!(
-                        module = module_name,
-                        file = file_name,
-                        "Unknown module in MODULE_FILE_MAP — skipping"
-                    );
-                    true
-                },
-                |enabled| !enabled,
-            );
-        }
+/// Return whether a config.d fragment is unmanaged. All managed fragments load;
+/// unknown and legacy filenames remain fail-closed.
+pub fn should_skip_fragment(file_name: &str) -> bool {
+    if SPLIT_FILE_LAYOUT.iter().any(|(managed, _)| *managed == file_name) {
+        return false;
     }
     // Check for known legacy names before emitting the generic unknown-fragment warning.
     // This gives users a clear migration hint when upgrading from an older PRX version.
@@ -368,19 +311,16 @@ pub fn should_skip_fragment(file_name: &str, modules: &crate::config::schema::Mo
         }
     }
 
-    // Fail-closed: unknown fragments not listed in MODULE_FILE_MAP are skipped.
+    // Fail closed for fragments outside the managed layout.
     tracing::warn!(
         file = file_name,
-        "Unknown config fragment not in MODULE_FILE_MAP — skipping. \
+        "Unknown config fragment not in managed config layout — skipping. \
          If this file was created by an older PRX version, check LEGACY_FRAGMENT_MAP for the correct new name."
     );
     true
 }
 
-/// Compute fingerprint only for enabled config layers (respects module gates).
-///
-/// The main config file is read only once; the [modules] section is extracted
-/// from the already-loaded value to avoid a second disk read.
+/// Compute a fingerprint over the main config and every managed fragment.
 pub fn compute_config_fingerprint_gated(config_path: &Path) -> Result<Vec<u8>> {
     with_consistent_config_snapshot(config_path, || compute_config_fingerprint_gated_once(config_path))
 }
@@ -395,12 +335,10 @@ pub(crate) fn compute_config_revision_gated(config_path: &Path) -> Result<(Vec<u
 }
 
 fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> {
-    // Read main config once; derive module gates from it directly.
     let main_str = std::fs::read_to_string(config_path)
         .with_context(|| format!("Failed to read config layer: {}", config_path.display()))?;
-    let main_value: Value =
+    let _: Value =
         toml::from_str(&main_str).with_context(|| format!("Failed to parse TOML: {}", config_path.display()))?;
-    let modules = extract_modules_from_value(&main_value)?;
 
     let mut hasher = Sha256::new();
     // Always include the main config in the fingerprint.
@@ -409,7 +347,7 @@ fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> 
     hasher.update((main_bytes.len() as u64).to_le_bytes());
     hasher.update(main_bytes);
 
-    // Include only enabled fragment files.
+    // Include every managed fragment file.
     for fragment in list_config_fragment_paths(config_path)? {
         let file_name = match fragment.file_name().and_then(|n| n.to_str()) {
             Some(name) => name,
@@ -418,7 +356,7 @@ fn compute_config_fingerprint_gated_once(config_path: &Path) -> Result<Vec<u8>> 
                 continue;
             }
         };
-        if should_skip_fragment(file_name, &modules) {
+        if should_skip_fragment(file_name) {
             continue;
         }
         hasher.update(fragment.to_string_lossy().as_bytes());

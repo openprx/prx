@@ -69,8 +69,6 @@ const fn default_stdin_json() -> bool {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct HooksFile {
     #[serde(default)]
-    enabled: Option<bool>,
-    #[serde(default)]
     timeout_ms: Option<u64>,
     #[serde(default)]
     hooks: HashMap<String, Vec<HookAction>>,
@@ -78,7 +76,6 @@ struct HooksFile {
 
 #[derive(Debug, Clone)]
 struct HookConfig {
-    enabled: bool,
     timeout_ms: u64,
     hooks: HashMap<String, Vec<HookAction>>,
 }
@@ -86,7 +83,6 @@ struct HookConfig {
 impl Default for HookConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             hooks: HashMap::new(),
         }
@@ -136,16 +132,15 @@ impl HookManager {
         if let Err(err) = self.refresh_if_changed() {
             tracing::warn!(error = %err, "hooks refresh failed");
         } else {
-            let (enabled, timeout_ms, actions) = {
+            let (timeout_ms, actions) = {
                 let state = self.state.read();
                 (
-                    state.config.enabled,
                     state.config.timeout_ms,
                     state.config.hooks.get(event.as_str()).cloned().unwrap_or_default(),
                 )
             };
 
-            if enabled && !actions.is_empty() {
+            if !actions.is_empty() {
                 for action in actions {
                     if let Err(err) = self.run_action(event, &payload, timeout_ms, &action).await {
                         tracing::warn!(
@@ -191,7 +186,6 @@ impl HookManager {
         let parsed: HooksFile = serde_json::from_slice(&raw)?;
         validate_hooks_file(&parsed)?;
         let config = HookConfig {
-            enabled: parsed.enabled.unwrap_or(true),
             timeout_ms: bounded_timeout(parsed.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS))?,
             hooks: parsed
                 .hooks
@@ -455,7 +449,6 @@ mod tests {
         std::fs::write(
             &path,
             r#"{
-  "enabled": true,
   "timeout_ms": 1200,
   "hooks": {
     "tool-call-start": [
@@ -470,7 +463,6 @@ mod tests {
         manager.refresh_if_changed().unwrap();
 
         let state = manager.state.read();
-        assert!(state.config.enabled);
         assert_eq!(state.config.timeout_ms, 1200);
         assert!(state.config.hooks.contains_key("tool_call_start"));
     }
@@ -574,7 +566,6 @@ mod tests {
         // No hooks.json → should succeed with default config
         manager.refresh_if_changed().unwrap();
         let state = manager.state.read();
-        assert!(state.config.enabled);
         assert_eq!(state.config.timeout_ms, DEFAULT_TIMEOUT_MS);
         assert!(state.config.hooks.is_empty());
     }
@@ -591,7 +582,7 @@ mod tests {
     fn refresh_invalid_candidate_preserves_active_generation() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join(HOOKS_JSON_FILE);
-        std::fs::write(&path, r#"{"enabled": false, "timeout_ms": 1200, "hooks": {}}"#).unwrap();
+        std::fs::write(&path, r#"{"timeout_ms": 1200, "hooks": {}}"#).unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
         manager.refresh_if_changed().unwrap();
         let active_digest = manager.state.read().hooks_json_digest;
@@ -599,7 +590,6 @@ mod tests {
         std::fs::write(&path, "not json").unwrap();
         assert!(manager.refresh_if_changed().is_err());
         let state = manager.state.read();
-        assert!(!state.config.enabled);
         assert_eq!(state.config.timeout_ms, 1200);
         assert_eq!(state.hooks_json_digest, active_digest);
     }
@@ -608,15 +598,14 @@ mod tests {
     fn refresh_uses_content_generation_not_mtime_only() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join(HOOKS_JSON_FILE);
-        std::fs::write(&path, r#"{"enabled": true, "hooks": {}}"#).unwrap();
+        std::fs::write(&path, r#"{"timeout_ms": 1000, "hooks": {}}"#).unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
         manager.refresh_if_changed().unwrap();
         let first_digest = manager.state.read().hooks_json_digest;
 
-        std::fs::write(&path, r#"{"enabled": false, "hooks": {}}"#).unwrap();
+        std::fs::write(&path, r#"{"timeout_ms": 1200, "hooks": {}}"#).unwrap();
         manager.refresh_if_changed().unwrap();
         let state = manager.state.read();
-        assert!(!state.config.enabled);
         assert_ne!(state.hooks_json_digest, first_digest);
     }
 
@@ -624,23 +613,12 @@ mod tests {
     fn refresh_rejects_oversized_file_without_replacing_generation() {
         let temp = TempDir::new().unwrap();
         let path = temp.path().join(HOOKS_JSON_FILE);
-        std::fs::write(&path, r#"{"enabled": false, "hooks": {}}"#).unwrap();
+        std::fs::write(&path, r#"{"timeout_ms": 1200, "hooks": {}}"#).unwrap();
         let manager = HookManager::new(temp.path().to_path_buf());
         manager.refresh_if_changed().unwrap();
 
         std::fs::write(&path, vec![b' '; MAX_HOOKS_FILE_BYTES as usize + 1]).unwrap();
         assert!(manager.refresh_if_changed().is_err());
-        assert!(!manager.state.read().config.enabled);
-    }
-
-    #[test]
-    fn refresh_disabled_flag() {
-        let temp = TempDir::new().unwrap();
-        std::fs::write(temp.path().join(HOOKS_JSON_FILE), r#"{"enabled": false, "hooks": {}}"#).unwrap();
-        let manager = HookManager::new(temp.path().to_path_buf());
-        manager.refresh_if_changed().unwrap();
-        let state = manager.state.read();
-        assert!(!state.config.enabled);
     }
 
     // ── run_action edge cases ───────────────────────────────────

@@ -2,8 +2,6 @@ use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use std::path::Path;
 
-use super::schema::ModulesConfig;
-
 // ── Spec preset enum ────────────────────────────────────────────
 
 /// Configuration preset for `prx init`.
@@ -27,67 +25,6 @@ impl Spec {
         }
     }
 
-    /// Return the `ModulesConfig` for this preset.
-    pub const fn modules(self) -> ModulesConfig {
-        match self {
-            Self::Minimal => ModulesConfig {
-                memory: true,
-                channels: false,
-                network: false,
-                security: false,
-                scheduler: false,
-                agent: true,
-                identity: false,
-                routing: false,
-                tools: false,
-                integrations: false,
-                mcp_server: false,
-                a2a: false,
-                nodes: false,
-                cost: false,
-                observability: false,
-            },
-            Self::Server => ModulesConfig {
-                memory: true,
-                channels: false,
-                network: true,
-                security: true,
-                scheduler: false,
-                agent: true,
-                identity: false,
-                routing: false,
-                tools: true,
-                integrations: true,
-                mcp_server: false,
-                a2a: false,
-                nodes: false,
-                cost: false,
-                observability: false,
-            },
-            Self::Full => ModulesConfig::all_enabled(),
-        }
-    }
-
-    /// Count of enabled modules for this preset.
-    const fn enabled_count(self) -> usize {
-        let m = self.modules();
-        m.memory as usize
-            + m.channels as usize
-            + m.network as usize
-            + m.security as usize
-            + m.scheduler as usize
-            + m.agent as usize
-            + m.identity as usize
-            + m.routing as usize
-            + m.tools as usize
-            + m.integrations as usize
-            + m.mcp_server as usize
-            + m.a2a as usize
-            + m.nodes as usize
-            + m.cost as usize
-            + m.observability as usize
-    }
-
     /// Generate the full configuration tree into `target_dir`.
     pub async fn generate(self, target_dir: &Path, force: bool) -> Result<()> {
         // 1. Check for existing configuration
@@ -99,51 +36,21 @@ impl Spec {
         }
 
         // 2. Render the complete managed configuration generation.
-        let modules = self.modules();
-        let mut fragments = Vec::new();
-        if modules.memory {
-            fragments.push(("memory.toml".to_string(), memory_template(self)));
-        }
-        // Server also ships a commented-out channels scaffold even though the
-        // module is disabled, so operators can opt-in without re-running init.
-        if modules.channels || self == Self::Server {
-            fragments.push(("channels.toml".to_string(), channels_template(self)));
-        }
-        if modules.network {
-            fragments.push(("network.toml".to_string(), network_template(self)));
-        }
-        if modules.security {
-            fragments.push(("security.toml".to_string(), security_template(self)));
-        }
-        // Server also ships a commented-out scheduler scaffold even though the
-        // module is disabled, so operators can opt-in without re-running init.
-        if modules.scheduler || self == Self::Server {
-            fragments.push(("scheduler.toml".to_string(), scheduler_template(self)));
-        }
-        if modules.agent {
-            fragments.push(("agent.toml".to_string(), agent_template(self)));
-        }
-        if modules.identity {
-            fragments.push(("identity.toml".to_string(), identity_template(self)));
-        }
-        if modules.routing {
-            fragments.push(("routing.toml".to_string(), routing_template(self)));
-        }
-        if modules.tools {
-            fragments.push(("tools.toml".to_string(), tools_template(self)));
-        }
-        if modules.integrations {
-            fragments.push(("integrations.toml".to_string(), integrations_template(self)));
-        }
-        if modules.nodes {
-            fragments.push(("nodes.toml".to_string(), nodes_template(self)));
-        }
-        if modules.cost {
-            fragments.push(("cost.toml".to_string(), cost_template(self)));
-        }
-        if modules.observability {
-            fragments.push(("observability.toml".to_string(), observability_template(self)));
-        }
+        let fragments = vec![
+            ("memory.toml".to_string(), memory_template(self)),
+            ("channels.toml".to_string(), channels_template(self)),
+            ("network.toml".to_string(), network_template(self)),
+            ("security.toml".to_string(), security_template(self)),
+            ("scheduler.toml".to_string(), scheduler_template(self)),
+            ("agent.toml".to_string(), agent_template(self)),
+            ("identity.toml".to_string(), identity_template(self)),
+            ("routing.toml".to_string(), routing_template(self)),
+            ("tools.toml".to_string(), tools_template(self)),
+            ("integrations.toml".to_string(), integrations_template(self)),
+            ("nodes.toml".to_string(), nodes_template(self)),
+            ("cost.toml".to_string(), cost_template(self)),
+            ("observability.toml".to_string(), observability_template(self)),
+        ];
 
         // 3. Stage and validate the complete effective configuration, including
         // any unknown user-owned fragments, before mutating the target.
@@ -171,8 +78,8 @@ impl Spec {
         // 7. Log summary
         tracing::info!("PRX configuration initialized ({spec})", spec = self.name());
         tracing::info!("  Config dir: {}", target_dir.display());
-        tracing::info!("  Modules enabled: {}/13", self.enabled_count());
-        tracing::info!("  Config files: config.toml + {} module files", self.enabled_count());
+        tracing::info!("  Capabilities are always available; activation follows concrete configuration");
+        tracing::info!("  Config files: config.toml + 13 managed fragments");
         tracing::info!("  Workspace .md files scaffolded");
 
         Ok(())
@@ -507,7 +414,6 @@ fn ws_thinking_template(agent: &str) -> String {
 // ── Main config.toml template ───────────────────────────────────
 
 fn main_config_template(spec: Spec) -> String {
-    let m = spec.modules();
     format!(
         r#"# PRX Configuration
 # Generated by: prx init --spec {spec}
@@ -516,36 +422,8 @@ fn main_config_template(spec: Spec) -> String {
 default_model = "claude-sonnet-4-6"
 default_provider = "anthropic"
 default_temperature = 0.7
-
-[modules]
-memory = {memory}
-channels = {channels}
-network = {network}
-security = {security}
-scheduler = {scheduler}
-agent = {agent}
-identity = {identity}
-routing = {routing}
-tools = {tools}
-integrations = {integrations}
-nodes = {nodes}
-cost = {cost}
-observability = {observability}
 "#,
         spec = spec.name(),
-        memory = m.memory,
-        channels = m.channels,
-        network = m.network,
-        security = m.security,
-        scheduler = m.scheduler,
-        agent = m.agent,
-        identity = m.identity,
-        routing = m.routing,
-        tools = m.tools,
-        integrations = m.integrations,
-        nodes = m.nodes,
-        cost = m.cost,
-        observability = m.observability,
     )
 }
 
@@ -566,7 +444,6 @@ backend = "sqlite"
 auto_save = true
 
 [memory.events]
-enabled = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
@@ -587,7 +464,6 @@ backend = "sqlite"
 auto_save = true
 
 [memory.events]
-enabled = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
@@ -615,7 +491,6 @@ auto_save = true
 
 # Message events are the shared live fabric and are independent from semantic auto-save.
 [memory.events]
-enabled = true
 record_user_messages = true
 record_assistant_messages = true
 record_tool_events = false
@@ -650,13 +525,10 @@ fn channels_template(spec: Spec) -> String {
         // channels is not enabled in the minimal spec
         Spec::Minimal => String::new(),
 
-        // Server ships a commented-out scaffold so operators can opt-in to a
-        // channel without re-running `prx init`. All entries stay commented:
-        // enabling `channels` in config.toml is required to activate them.
+        // Server ships a commented-out scaffold. A channel activates as soon as
+        // its concrete configuration is present.
         Spec::Server => r#"# Channels configuration (server)
-# Channels are disabled by default for server deployments.
-# To enable, set `channels = true` in config.toml [modules], then uncomment
-# and configure one of the platforms below.
+# Uncomment and configure one of the platforms below.
 
 [channels_config]
 cli = true                          # enable the interactive CLI channel
@@ -792,9 +664,8 @@ forbidden_paths = [
   "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
 ]
 
-# Sandbox (folded in from the former [security.sandbox]); disabled by default.
+# Sandbox is always active and auto-detects the best available backend.
 [autonomy.sandbox]
-enabled = false
 # backend = "auto"                     # auto | landlock | firejail | bubblewrap | docker | none
 
 [secrets]
@@ -808,7 +679,6 @@ max_subprocesses = 10
 
 # Direct natural-person adapters emit this notice before the first AI response.
 [compliance.interaction_notice]
-enabled = true
 applicability = "required"
 version = "v1"
 message = "You are interacting with an AI system."
@@ -830,9 +700,8 @@ forbidden_paths = []                   # no extra path denylist
 max_actions_per_hour = 4294967295
 max_cost_per_day_cents = 4294967295
 
-# Sandbox (folded in from the former [security.sandbox]); disabled by default.
+# Sandbox is always active and auto-detects the best available backend.
 [autonomy.sandbox]
-enabled = false
 # backend = "auto"                    # auto | landlock | firejail | bubblewrap | docker | none
 
 [secrets]
@@ -845,14 +714,12 @@ max_cpu_time_seconds = 300
 max_subprocesses = 10
 
 [security.audit]
-enabled = true
 log_path = "audit.log"
 max_size_mb = 100
 # sign_events = false
 
 # Direct natural-person adapters emit this notice before the first AI response.
 [compliance.interaction_notice]
-enabled = true
 applicability = "required"
 version = "v1"
 message = "You are interacting with an AI system."
@@ -867,19 +734,14 @@ status = "unclassified"               # unclassified | high_risk | not_high_risk
 
 fn scheduler_template(spec: Spec) -> String {
     match spec {
-        // scheduler is not enabled in the minimal spec
+        // Minimal keeps scheduler defaults implicit.
         Spec::Minimal => String::new(),
 
-        // Server ships a commented-out scaffold so operators can opt-in to the
-        // scheduler without re-running `prx init`. Enabling `scheduler = true`
-        // in config.toml [modules] is required to activate it.
+        // Server ships scheduler configuration without a module gate.
         Spec::Server => r#"# Scheduler configuration (server)
-# Scheduler is disabled by default for server deployments.
-# To enable, set `scheduler = true` in config.toml [modules], then uncomment
-# and adjust the settings below.
+# Adjust the settings below when needed.
 
 # [scheduler]
-# enabled = true
 # max_tasks = 64
 # max_concurrent = 4
 # claim_lease_secs = 90
@@ -891,7 +753,6 @@ fn scheduler_template(spec: Spec) -> String {
 # timezone = "UTC"
 
 # [heartbeat]
-# enabled = true
 # interval_minutes = 5
 "#
         .into(),
@@ -900,7 +761,6 @@ fn scheduler_template(spec: Spec) -> String {
 # Periodic tasks, cron jobs, heartbeat, and Xin engine
 
 [scheduler]
-enabled = true
 max_tasks = 64
 max_concurrent = 4
 claim_lease_secs = 90
@@ -914,11 +774,9 @@ claim_lease_secs = 90
 # timezone = "UTC"
 
 [heartbeat]
-enabled = true
 interval_minutes = 5
 
 [xin]
-enabled = false
 # cycle_interval_secs = 3600
 # max_concurrent_tasks = 2
 "#
@@ -940,7 +798,6 @@ max_history_messages = 300
 [agent.compaction]
 mode = "safeguard"                     # off | safeguard | aggressive (safeguard backstops overflow)
 [agent.compaction.os_paging]
-enabled = true
 max_recalled_pages = 10
 "#
         .into(),
@@ -958,11 +815,9 @@ mode = "safeguard"                     # off | safeguard | aggressive
 # max_context_tokens = 128000          # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
-enabled = true
 max_recalled_pages = 10
 
 [sessions_spawn]
-enabled = false
 # process_memory_strategy = "shared_fabric" # shared_fabric | isolated_private
 # 🔴 fork-bomb safeguards (high-position; never set to 0):
 # max_concurrent = 64
@@ -970,7 +825,6 @@ enabled = false
 # max_children_per_agent = 32
 
 [self_system]
-enabled = false
 "#
         .into(),
 
@@ -988,13 +842,11 @@ mode = "safeguard"                    # off | safeguard | aggressive
 # max_context_tokens = 128000         # optional explicit override; omitted means derive from model metadata
 # OS-paging: non-destructive eviction + semantic recall of paged-out history.
 [agent.compaction.os_paging]
-enabled = true
 max_recalled_pages = 10
 
 # Session spawning for parallel task execution.
 # 🔴 fork-bomb safeguards kept at high positions (never 0).
 [sessions_spawn]
-enabled = false
 max_concurrent = 64
 max_spawn_depth = 8
 max_children_per_agent = 32
@@ -1003,8 +855,6 @@ process_memory_strategy = "shared_fabric"
 
 # Self-system for autonomous behavior
 [self_system]
-enabled = false
-# evolution_enabled = false
 
 # Causal tree (CTE) — experimental, opt-in. When enabled, the agent loop runs
 # speculative multi-branch prediction (in-memory rehearsal, no extra LLM calls)
@@ -1065,7 +915,6 @@ fn routing_template(spec: Spec) -> String {
 # LLM router, model/embedding routes, query classification, and task routing
 
 [router]
-enabled = false
 # Scoring weights (alpha + beta + gamma + delta + epsilon = 1.0)
 # alpha = 0.0    # similarity score weight
 # beta = 0.5     # capability score weight
@@ -1092,14 +941,12 @@ enabled = false
 
 # Query classification: auto-route user messages
 [query_classification]
-enabled = false
 # [[query_classification.rules]]
 # pattern = "translate|翻译"
 # hint = "fast"
 
 # Task routing: classify work by intent
 [task_routing]
-enabled = false
 "#
         .into(),
     }
@@ -1116,25 +963,20 @@ fn tools_template(spec: Spec) -> String {
 # allowed_domains = []   # domains the web_fetch tool is allowed to fetch
 
 [http_request]
-enabled = true
 timeout_secs = 30
 max_response_bytes = 10485760
 
 [web_search]
-enabled = false
 # provider = "tavily"
 # api_key = ""
 
 [multimodal]
-enabled = true
 
 [media]
 # audio_stt_enabled = false
 # video_frame_extraction = false
 
 [skills]
-enabled = true
-auto_discover = true
 "#
         .into(),
 
@@ -1145,18 +987,15 @@ auto_discover = true
 # allowed_domains = []   # domains the web_fetch tool is allowed to fetch
 
 [http_request]
-enabled = true
 timeout_secs = 30
 max_response_bytes = 10485760
 # allowed_domains = []                 # empty = all allowed
 
 [web_search]
-enabled = false
 # provider = "tavily"                  # tavily | searxng | brave
 # api_key = ""
 
 [multimodal]
-enabled = true
 # max_image_size_bytes = 20971520
 
 [media]
@@ -1164,13 +1003,10 @@ enabled = true
 # video_frame_extraction = false
 
 [skills]
-enabled = true
-auto_discover = true
 # community_repo = ""
 
 [skill_rag]
-enabled = false
-# max_results = 15
+# top_k = 5
 "#
         .into(),
     }
@@ -1192,10 +1028,8 @@ fn integrations_template(spec: Spec) -> String {
 # args = ["-y", "my-mcp-server"]
 
 [composio]
-enabled = false
 
 [webhook]
-enabled = false
 "#
         .into(),
 
@@ -1216,12 +1050,10 @@ enabled = false
 # url = "http://localhost:8090/sse"
 
 [composio]
-enabled = false
 # api_key = ""
 # tools = []
 
 [webhook]
-enabled = false
 # secret = ""
 # topics = []
 "#
@@ -1231,14 +1063,13 @@ enabled = false
 
 fn nodes_template(spec: Spec) -> String {
     match spec {
-        // nodes is only enabled in full spec
+        // Minimal/server keep node defaults implicit.
         Spec::Minimal | Spec::Server => String::new(),
 
         Spec::Full => r#"# Nodes configuration (full)
 # Remote node proxy for distributed PRX deployments
 
 [nodes]
-enabled = false
 
 # Remote node connections
 # [[nodes.nodes]]
@@ -1254,14 +1085,13 @@ enabled = false
 
 fn cost_template(spec: Spec) -> String {
     match spec {
-        // cost is only enabled in full spec
+        // Minimal/server keep cost defaults implicit.
         Spec::Minimal | Spec::Server => String::new(),
 
         Spec::Full => r#"# Cost configuration (full)
 # Token usage tracking and budget enforcement
 
 [cost]
-enabled = false
 # daily_budget_usd = 10.0
 # monthly_budget_usd = 200.0
 # alert_threshold_percent = 80
@@ -1312,72 +1142,10 @@ mod tests {
     }
 
     #[test]
-    fn minimal_enables_memory_and_agent_only() {
-        let m = Spec::Minimal.modules();
-        assert!(m.memory);
-        assert!(m.agent);
-        assert!(!m.channels);
-        assert!(!m.network);
-        assert!(!m.security);
-        assert!(!m.scheduler);
-        assert!(!m.identity);
-        assert!(!m.routing);
-        assert!(!m.tools);
-        assert!(!m.integrations);
-        assert!(!m.nodes);
-        assert!(!m.cost);
-        assert!(!m.observability);
-    }
-
-    #[test]
-    fn server_enables_six_modules() {
-        let m = Spec::Server.modules();
-        assert!(m.memory);
-        assert!(m.agent);
-        assert!(m.network);
-        assert!(m.security);
-        assert!(m.tools);
-        assert!(m.integrations);
-        // disabled in server
-        assert!(!m.channels);
-        assert!(!m.scheduler);
-        assert!(!m.identity);
-        assert!(!m.routing);
-        assert!(!m.nodes);
-        assert!(!m.cost);
-        assert!(!m.observability);
-    }
-
-    #[test]
-    fn full_enables_all_modules() {
-        let m = Spec::Full.modules();
-        assert!(m.memory);
-        assert!(m.channels);
-        assert!(m.network);
-        assert!(m.security);
-        assert!(m.scheduler);
-        assert!(m.agent);
-        assert!(m.identity);
-        assert!(m.routing);
-        assert!(m.tools);
-        assert!(m.integrations);
-        assert!(m.nodes);
-        assert!(m.cost);
-        assert!(m.observability);
-    }
-
-    #[test]
-    fn enabled_count_is_correct() {
-        assert_eq!(Spec::Minimal.enabled_count(), 2);
-        assert_eq!(Spec::Server.enabled_count(), 6);
-        assert_eq!(Spec::Full.enabled_count(), 15);
-    }
-
-    #[test]
     fn main_config_template_contains_spec_name() {
         let content = main_config_template(Spec::Server);
         assert!(content.contains("--spec server"));
-        assert!(content.contains("[modules]"));
+        assert!(!content.contains("[modules]"));
         assert!(content.contains("default_model"));
     }
 
@@ -1399,11 +1167,9 @@ mod tests {
         assert!(dir.join("workspace/cron").is_dir());
         assert!(dir.join("workspace/skills").is_dir());
 
-        // minimal: memory + agent
-        assert!(dir.join("config.d/memory.toml").exists());
-        assert!(dir.join("config.d/agent.toml").exists());
-        assert!(!dir.join("config.d/channels.toml").exists());
-        assert!(!dir.join("config.d/network.toml").exists());
+        for name in super::super::files::managed_fragment_names() {
+            assert!(dir.join("config.d").join(name).exists(), "missing config.d/{name}");
+        }
     }
 
     #[tokio::test]
@@ -1533,7 +1299,7 @@ mod tests {
         assert!(dir.join("config.d/memory.toml").exists());
         assert!(dir.join("config.d/agent.toml").exists());
         assert!(unknown.exists(), "unknown user-owned fragment must be preserved");
-        for stale in [
+        for managed in [
             "channels.toml",
             "network.toml",
             "security.toml",
@@ -1546,10 +1312,7 @@ mod tests {
             "cost.toml",
             "observability.toml",
         ] {
-            assert!(
-                !dir.join("config.d").join(stale).exists(),
-                "stale managed fragment survived force regeneration: {stale}"
-            );
+            assert!(dir.join("config.d").join(managed).exists());
         }
     }
 
@@ -1606,10 +1369,9 @@ mod tests {
     }
 
     #[test]
-    fn full_security_template_enables_audit_with_explicit_defaults() {
+    fn full_security_template_configures_always_on_audit() {
         let content = security_template(Spec::Full);
         assert!(content.contains("[security.audit]"));
-        assert!(content.contains("enabled = true"));
         assert!(content.contains("log_path = \"audit.log\""));
         assert!(content.contains("max_size_mb = 100"));
         assert!(content.contains("[compliance.interaction_notice]"));
@@ -1623,10 +1385,9 @@ mod tests {
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = false"));
         assert!(content.contains("forbidden_paths = []"));
-        // Phase 1: the per-command allowlist / approval flags were removed from the
-        // template; the autonomy level + sandbox section are now the permission knobs.
+        // The autonomy level is the permission boundary; sandboxing is always available.
         assert!(content.contains("[autonomy.sandbox]"));
-        assert!(content.contains("enabled = false"));
+        assert!(!content.contains("[autonomy.sandbox]\nenabled"));
     }
 
     #[test]
@@ -1684,7 +1445,7 @@ mod tests {
 
         Spec::Server.generate(dir, false).await.expect("test: generate server");
 
-        // Server preset writes commented scaffolds for the disabled modules.
+        // Server preset writes configuration scaffolds without module gates.
         assert!(dir.join("config.d/scheduler.toml").exists());
         assert!(dir.join("config.d/channels.toml").exists());
 
@@ -1694,10 +1455,8 @@ mod tests {
         let channels = fs::read_to_string(dir.join("config.d/channels.toml")).expect("test: read channels");
         assert!(channels.contains("# [channels_config.telegram]"));
 
-        // The [modules] table must keep these modules disabled.
         let config = fs::read_to_string(dir.join("config.toml")).expect("test: read config");
-        assert!(config.contains("scheduler = false"));
-        assert!(config.contains("channels = false"));
+        assert!(!config.contains("[modules]"));
     }
 
     #[tokio::test]

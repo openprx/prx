@@ -29,7 +29,6 @@ content is not stored.
 
 ```toml
 [compliance.interaction_notice]
-enabled = true
 applicability = "required"
 version = "v1"
 message = "You are interacting with an AI system."
@@ -39,13 +38,12 @@ An exception is a legal/policy decision and must be explicit:
 
 ```toml
 [compliance.interaction_notice]
-enabled = false
 applicability = "not_applicable"
 exception_owner = "legal-owner"
 exception_reviewed_at = "2026-07-18"
 ```
 
-Rollback: disable the new runtime hook only with an approved not-applicable
+Exception handling: use an approved not-applicable
 record. Preserve acknowledgement data so re-enabling the same version does not
 duplicate notices. Increment `version` when recipients must see changed text.
 

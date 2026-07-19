@@ -20,7 +20,7 @@ pub use schema::{
     EmbeddingRouteConfig, GatewayConfig, GroupPolicy, GroupReplyMode, HYBRID_PROCESS_MEMORY_UNAVAILABLE,
     HeartbeatConfig, HttpRequestConfig, IMessageConfig, IdentityBindingConfig, IdentityConfig, LarkConfig,
     MatrixConfig, McpConfig, McpServerConfig, McpServerRuntimeConfig, McpTransport, MediaConfig, MemoryConfig,
-    MemoryEventsConfig, MemorySemanticConfig, MemoryWebhookConfig, ModelRouteConfig, ModulesConfig, MultimodalConfig,
+    MemoryEventsConfig, MemorySemanticConfig, MemoryWebhookConfig, ModelRouteConfig, MultimodalConfig,
     NextcloudTalkConfig, NodeServerConfig, NodesConfig, ObservabilityConfig, OllamaProviderConfig, OsPagingConfig,
     ProvidersConfig, ProxyConfig, ProxyScope, QueryClassificationConfig, ReliabilityConfig, RemoteNodeConfig,
     ResourceLimitsConfig, RetrievalInjectionRole, RouterConfig, RouterModelConfig, RuntimeConfig, SandboxBackend,

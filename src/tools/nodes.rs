@@ -92,15 +92,7 @@ impl NodesTool {
     }
 
     fn load_nodes(&self) -> Vec<RemoteNodeConfig> {
-        let nodes = self
-            .config
-            .load_full()
-            .nodes
-            .nodes
-            .iter()
-            .filter(|node| node.enabled)
-            .cloned()
-            .collect::<Vec<_>>();
+        let nodes = self.config.load_full().nodes.nodes.clone();
         self.node_manager.retain_configured(&nodes);
         nodes
     }
@@ -307,7 +299,6 @@ impl Tool for NodesTool {
                         json!({
                             "id": node.id,
                             "endpoint": node.endpoint,
-                            "enabled": node.enabled,
                         })
                     })
                     .collect();
@@ -529,7 +520,6 @@ mod tests {
             endpoint: "http://127.0.0.1:8787".to_string(),
             bearer_token: "test-token".to_string(),
             hmac_secret: None,
-            enabled: true,
             timeout_ms: None,
             retry_max: None,
         }
@@ -675,17 +665,6 @@ mod tests {
         assert!(result.success);
         let out: Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["count"], 2);
-    }
-
-    #[tokio::test]
-    async fn list_filters_disabled_nodes() {
-        let mut disabled = test_node("disabled");
-        disabled.enabled = false;
-        let tool = make_tool_with_nodes(vec![test_node("active"), disabled], AutonomyLevel::Full);
-        let result = tool.execute(json!({"action": "list"})).await.unwrap();
-        let out: Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(out["count"], 1);
-        assert_eq!(out["nodes"][0]["id"], "active");
     }
 
     // ── Security: read-only blocks mutations ────────────────────

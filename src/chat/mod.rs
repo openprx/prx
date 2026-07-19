@@ -5496,7 +5496,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
             // 实际生产路径 legacy 后续会 push 新构造的 system（覆盖旧 system 的
             // skill 列表），reducer 这边的 system 仍是上一轮的。本 S2-C 阶段
             // 不做修正——legacy 仍是 LLM 真上下文源，reducer 是观察账本。
-            if !config.skill_rag.enabled {
+            if !config.skill_rag.available() {
                 let cleared_system = build_runtime_system_prompt(
                     &config,
                     model_name,
@@ -13376,7 +13376,7 @@ fn history_for_session_with_system(
     tools_registry: &[Box<dyn Tool>],
 ) -> Vec<ChatMessage> {
     let resumed_history = session_turns_to_history(session);
-    if config.skill_rag.enabled {
+    if config.skill_rag.available() {
         return resumed_history;
     }
     let mut history = vec![ChatMessage::system(build_runtime_system_prompt(

@@ -1230,9 +1230,6 @@ async fn async_main() -> Result<()> {
 async fn handle_memory_command(command: MemoryCommands, config: &Config) -> anyhow::Result<()> {
     match command {
         MemoryCommands::Reindex { json } => {
-            if !config.modules.memory {
-                bail!("memory module is disabled; enable [modules].memory before running memory maintenance");
-            }
             let memory = memory::create_memory_with_storage_and_routes_with_acl(
                 &config.memory,
                 &config.embedding_routes,
@@ -1555,16 +1552,8 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
     let config_evidence = config_revision
         .clone()
         .unwrap_or_else(|| "config:unavailable".to_string());
-    let audit_status = if config.security.audit.enabled {
-        ControlStatus::Pass
-    } else {
-        ControlStatus::Fail
-    };
-    let events_status = if config.memory.events.enabled {
-        ControlStatus::Pass
-    } else {
-        ControlStatus::Warning
-    };
+    let audit_status = ControlStatus::Pass;
+    let events_status = ControlStatus::Pass;
     let postgres = config.memory.backend == "postgres" || config.storage.provider.config.provider == "postgres";
     let (vector_isolation_status, vector_isolation_evidence, vector_isolation_explanation) = if postgres {
         let storage = &config.storage.provider.config;
@@ -1612,16 +1601,12 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
                 notice.exception_reviewed_at.as_deref().unwrap_or("missing")
             ),
         ),
-        config::schema::InteractionNoticeApplicability::Required if notice.enabled => (
+        config::schema::InteractionNoticeApplicability::Required => (
             ControlStatus::Pass,
             format!(
                 "versioned notice {} is enabled before channel response routing",
                 notice.version
             ),
-        ),
-        config::schema::InteractionNoticeApplicability::Required => (
-            ControlStatus::Fail,
-            "AI interaction notice is required but disabled".to_string(),
         ),
     };
     let eu_classification = &config.compliance.eu_ai_act.classification;
@@ -1670,8 +1655,8 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             audit_status,
             "config_revision",
             &config_evidence,
-            format!("security.audit.enabled={}", config.security.audit.enabled),
-            "Enable security.audit and retain signed audit evidence.",
+            "security.audit=always_on".to_string(),
+            "Retain signed audit evidence.",
         ),
         attestation_check(
             &observed_at,
@@ -1706,8 +1691,8 @@ fn build_eu_ai_act_attestation(config: &Config) -> EuAiActAttestation {
             events_status,
             "config_revision",
             &config_evidence,
-            format!("memory.events.enabled={}", config.memory.events.enabled),
-            "Enable message-event recording and attach retention evidence.",
+            "memory.events=always_on".to_string(),
+            "Attach retention evidence.",
         ),
         attestation_check(
             &observed_at,
@@ -2966,26 +2951,10 @@ mod tests {
         };
         assert_eq!(fail_on, Some(AuditFailOn::Warning));
 
-        let mut config = Config::default();
+        let config = Config::default();
         let attestation = build_eu_ai_act_attestation(&config);
         assert!(!attestation_fails_gate(&attestation, AuditFailOn::Fail));
         assert!(attestation_fails_gate(&attestation, AuditFailOn::Warning));
-
-        config.security.audit.enabled = false;
-        let failed_attestation = build_eu_ai_act_attestation(&config);
-        assert!(attestation_fails_gate(&failed_attestation, AuditFailOn::Fail));
-    }
-
-    #[tokio::test]
-    async fn memory_reindex_respects_memory_module_gate() {
-        let mut config = Config::default();
-        config.modules.memory = false;
-
-        let error = handle_memory_command(MemoryCommands::Reindex { json: false }, &config)
-            .await
-            .expect_err("disabled memory module should block reindex");
-
-        assert!(error.to_string().contains("memory module is disabled"));
     }
 
     #[test]

@@ -260,21 +260,6 @@ fn log_diff(old: &Config, fresh: &Config) {
             old.agent.concurrency_rollback_error_rate_threshold, fresh.agent.concurrency_rollback_error_rate_threshold
         ));
     }
-    if old.heartbeat.enabled != fresh.heartbeat.enabled {
-        changes.push(format!(
-            "heartbeat.enabled: {} → {}",
-            old.heartbeat.enabled, fresh.heartbeat.enabled
-        ));
-    }
-    if old.cron.enabled != fresh.cron.enabled {
-        changes.push(format!("cron.enabled: {} → {}", old.cron.enabled, fresh.cron.enabled));
-    }
-    if old.web_search.enabled != fresh.web_search.enabled {
-        changes.push(format!(
-            "web_search.enabled: {} → {}",
-            old.web_search.enabled, fresh.web_search.enabled
-        ));
-    }
 
     if changes.is_empty() {
         tracing::debug!("Config file changed but no key tracked fields differ");

@@ -156,13 +156,11 @@ mod tests {
 
     fn make_router_config() -> RouterConfig {
         RouterConfig {
-            enabled: true,
             alpha: 0.0,
             beta: 0.5,
             gamma: 0.3,
             delta: 0.1,
             epsilon: 0.1,
-            knn_enabled: false,
             knn_min_records: 10,
             knn_k: 7,
             automix: crate::config::AutomixConfig::default(),

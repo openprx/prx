@@ -22,7 +22,6 @@ it is not a durable cross-restart ledger.
 
 ```toml
 [nodes]
-enabled = true
 request_timeout_ms = 15000
 retry_max = 2
 
@@ -31,7 +30,6 @@ id = "prx-node-1"
 endpoint = "https://node.example.com:8787"
 bearer_token = "replace-with-secret"
 hmac_secret = "replace-with-signing-secret"
-enabled = true
 ```
 
 Plain HTTP endpoints are accepted only for `localhost` or `127.0.0.1`.

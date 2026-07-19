@@ -263,14 +263,6 @@ fn check_runtime_config(config: &Config, items: &mut Vec<DiagItem>) {
 
 fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "gateway";
-    if !config.modules.network {
-        items.push(DiagItem::disabled(
-            cat,
-            "network module disabled; gateway probe skipped",
-        ));
-        return;
-    }
-
     items.push(DiagItem::configured(
         cat,
         format!(
@@ -297,20 +289,9 @@ fn check_gateway_runtime(config: &Config, items: &mut Vec<DiagItem>) {
 
 fn check_channel_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "channels";
-    if !config.modules.channels {
-        items.push(DiagItem::disabled(
-            cat,
-            "channels module disabled; IM live path is not expected",
-        ));
-        return;
-    }
-
     let configured = configured_channel_names(config);
     if configured.is_empty() {
-        items.push(DiagItem::warn(
-            cat,
-            "channels module enabled but no IM channels are configured",
-        ));
+        items.push(DiagItem::warn(cat, "no IM channels are configured"));
     } else {
         items.push(DiagItem::configured(
             cat,
@@ -359,14 +340,6 @@ fn configured_channel_names(config: &Config) -> Vec<&'static str> {
 
 fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "console";
-    if !config.modules.memory {
-        items.push(DiagItem::disabled(
-            cat,
-            "memory module disabled; console session probe skipped",
-        ));
-        return;
-    }
-
     let backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match crate::memory::classify_memory_backend(&backend) {
@@ -407,11 +380,6 @@ fn check_console_runtime(config: &Config, items: &mut Vec<DiagItem>) {
 
 fn check_runtime_memory_health(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "memory";
-    if !config.modules.memory {
-        items.push(DiagItem::disabled(cat, "memory module disabled"));
-        return;
-    }
-
     let backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
     match crate::memory::classify_memory_backend(&backend) {
@@ -525,15 +493,7 @@ fn check_runtime_readiness(config: &Config, items: &mut Vec<DiagItem>) {
         ));
     }
 
-    // 3. task readiness: task lineage events need event recording enabled.
-    if mem.events.enabled {
-        items.push(DiagItem::ready(cat, "task: lifecycle/task event recording enabled"));
-    } else {
-        items.push(DiagItem::warn(
-            cat,
-            "task: memory.events.enabled is false; task lineage events are not recorded",
-        ));
-    }
+    items.push(DiagItem::ready(cat, "task: lifecycle/task event recording always on"));
 
     // 4. document readiness: document ingest needs a persistent backend.
     if persistent {
@@ -749,14 +709,7 @@ async fn check_embedding_endpoint(config: &Config, items: &mut Vec<DiagItem>) {
 
 fn check_memory_diagnostics(config: &Config, items: &mut Vec<DiagItem>) {
     let cat = "memory";
-    if config.modules.memory {
-        items.push(DiagItem::declared(cat, "memory module enabled"));
-    } else {
-        items.push(DiagItem::disabled(
-            cat,
-            "memory module disabled; memory tools and maintenance commands are gated off",
-        ));
-    }
+    items.push(DiagItem::declared(cat, "memory capability available"));
 
     let backend =
         crate::memory::effective_memory_backend_name(&config.memory.backend, Some(&config.storage.provider.config));
@@ -1510,9 +1463,7 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
     if let Some(components) = snapshot.get("components").and_then(serde_json::Value::as_object) {
         // Scheduler
         if let Some(scheduler) = components.get("scheduler") {
-            if !config.modules.scheduler {
-                items.push(DiagItem::disabled(cat, "scheduler module disabled"));
-            } else {
+            {
                 let scheduler_ok = scheduler
                     .get("status")
                     .and_then(serde_json::Value::as_str)
@@ -1746,7 +1697,6 @@ mod tests {
         check_runtime_readiness(&config, &mut items);
         check_environment(&mut items);
         check_daemon_state(&config, &mut items);
-        config.modules.memory = false;
         check_runtime_memory_health(&config, &mut items);
 
         let states: std::collections::HashSet<_> = items.iter().map(|item| item.state).collect();
@@ -1755,7 +1705,6 @@ mod tests {
             DiagnosticState::Configured,
             DiagnosticState::Ready,
             DiagnosticState::Healthy,
-            DiagnosticState::Disabled,
             DiagnosticState::Unknown,
         ] {
             assert!(states.contains(&expected), "missing diagnostic state {expected:?}");
@@ -1859,11 +1808,10 @@ mod tests {
     }
 
     #[test]
-    fn daemon_state_treats_disabled_scheduler_as_ok_even_when_stale() {
+    fn daemon_state_reports_stale_scheduler_as_unhealthy() {
         let temp = TempDir::new().unwrap();
         let mut config = Config::default();
         config.config_path = temp.path().join("config.toml");
-        config.modules.scheduler = false;
 
         let stale = (Utc::now() - chrono::Duration::seconds(SCHEDULER_STALE_SECONDS + 60)).to_rfc3339();
         let state = serde_json::json!({
@@ -1890,11 +1838,9 @@ mod tests {
 
         let scheduler_item = items
             .iter()
-            .find(|item| item.message == "scheduler module disabled")
-            .expect("disabled scheduler should be reported");
-        assert_eq!(scheduler_item.severity, Severity::Ok);
-        assert_eq!(scheduler_item.state, DiagnosticState::Disabled);
-        assert!(items.iter().all(|item| !item.message.contains("scheduler unhealthy")));
+            .find(|item| item.message.contains("scheduler unhealthy"))
+            .expect("stale always-on scheduler should be unhealthy");
+        assert_eq!(scheduler_item.severity, Severity::Error);
     }
 
     #[test]

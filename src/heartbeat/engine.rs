@@ -48,11 +48,7 @@ impl HeartbeatEngine {
     /// content-derived name preserves identity across reordering and restart;
     /// removed bullets are disabled rather than deleted.
     pub async fn materialize_xin_tasks(&self, config: &Config) -> Result<Vec<XinTask>> {
-        let tasks = if self.config.enabled {
-            self.collect_tasks().await?
-        } else {
-            Vec::new()
-        };
+        let tasks = self.collect_tasks().await?;
         let interval_secs = u64::from(self.config.interval_minutes.max(5)).saturating_mul(60);
         let definitions = tasks
             .iter()
@@ -277,7 +273,6 @@ mod tests {
     #[test]
     fn active_hours_inclusive_range() {
         let config = HeartbeatConfig {
-            enabled: true,
             interval_minutes: 30,
             active_hours: vec![8, 23],
             prompt: "p".to_string(),
@@ -290,7 +285,6 @@ mod tests {
     #[test]
     fn active_hours_wraparound_range() {
         let config = HeartbeatConfig {
-            enabled: true,
             interval_minutes: 30,
             active_hours: vec![22, 6],
             prompt: "p".to_string(),
@@ -303,7 +297,6 @@ mod tests {
     #[test]
     fn active_hours_empty_allows_all_hours() {
         let config = HeartbeatConfig {
-            enabled: true,
             interval_minutes: 30,
             active_hours: Vec::new(),
             prompt: "p".to_string(),
@@ -316,7 +309,6 @@ mod tests {
     #[test]
     fn active_hours_out_of_range_hour_is_rejected() {
         let config = HeartbeatConfig {
-            enabled: true,
             interval_minutes: 30,
             active_hours: vec![8, 23],
             prompt: "p".to_string(),
@@ -369,7 +361,6 @@ mod tests {
 
         let engine = HeartbeatEngine::new(
             HeartbeatConfig {
-                enabled: true,
                 interval_minutes: 30,
                 prompt: "Use the configured heartbeat prompt.".to_string(),
                 ..HeartbeatConfig::default()
@@ -394,7 +385,6 @@ mod tests {
             config_path: temp.path().join("config.toml"),
             ..Config::default()
         };
-        config.heartbeat.enabled = true;
         config.heartbeat.interval_minutes = 30;
         config.heartbeat.prompt = "Heartbeat prompt v1".to_string();
         tokio::fs::write(temp.path().join("HEARTBEAT.md"), "- Check queue\n- Send digest")
@@ -448,15 +438,5 @@ mod tests {
         let all = crate::xin::store::list_tasks(&config).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all.iter().filter(|task| task.enabled).count(), 1);
-
-        config.heartbeat.enabled = false;
-        let disabled_engine = HeartbeatEngine::new(config.heartbeat.clone(), temp.path().to_path_buf());
-        assert!(disabled_engine.materialize_xin_tasks(&config).await.unwrap().is_empty());
-        assert!(
-            crate::xin::store::list_tasks(&config)
-                .unwrap()
-                .iter()
-                .all(|task| !task.enabled)
-        );
     }
 }

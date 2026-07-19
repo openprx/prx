@@ -560,7 +560,7 @@ async fn run_validated_manifest(manifest: WorkerManifest, explicit_config_dir: O
     let runtime: Arc<dyn runtime::RuntimeAdapter> = Arc::from(runtime::create_runtime(&config.runtime)?);
     let shared_config = crate::config::new_shared(config.clone());
 
-    let (composio_key, composio_entity_id) = if config.composio.enabled {
+    let (composio_key, composio_entity_id) = if config.composio.configured() {
         (
             config.composio.api_key.as_deref(),
             Some(config.composio.entity_id.as_str()),
@@ -1522,7 +1522,7 @@ mod tests {
         let config_dir = tmp.path().join("config");
         let workspace = tmp.path().join("worker");
         std::fs::create_dir(&config_dir).unwrap();
-        std::fs::write(config_dir.join("config.toml"), "[modules]\nmemory = false\n").unwrap();
+        std::fs::write(config_dir.join("config.toml"), "default_temperature = 0.7\n").unwrap();
         let config_dir_arg = config_dir.to_string_lossy().to_string();
         let mut manifest = base_manifest(&workspace, "unused-for-direct-validation");
         manifest.config_dir = config_dir;

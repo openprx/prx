@@ -41,13 +41,7 @@ pub async fn get_mcp_servers(State(state): State<AppState>) -> Json<McpServersRe
         );
 
         let has_runtime_tools = discovered.contains_key(name);
-        let status = if !mcp.enabled || !server_config.enabled {
-            "disconnected"
-        } else if has_runtime_tools {
-            "connected"
-        } else {
-            "connecting"
-        };
+        let status = if has_runtime_tools { "connected" } else { "connecting" };
 
         let tools: Vec<McpToolInfo> = discovered
             .get(name)
