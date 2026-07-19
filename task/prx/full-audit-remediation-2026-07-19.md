@@ -194,3 +194,39 @@ shell tool correctly enforced its 60-second per-command timeout and recorded
 that individual tool call as failed; K3 retried with a short observation call
 and completed the comparison. This is a test-command limit violation, not a
 host shell authorization, ACL, sandbox, execution, or output-capture failure.
+
+## Configuration remediation follow-up (2026-07-19)
+
+The regression report at
+`/home/ck/.openprx/workspace/reports/prx0816_regression_audit_2026-07-19.md`
+identified three configuration-level follow-ups. They are now resolved without
+adding feature switches:
+
+- **P1 HTTP requests:** active `config.d/tools.toml` contains an explicit
+  operator-reviewed allowlist for `api.github.com`, `api.openai.com`,
+  `api.anthropic.com`, `api.moonshot.cn`, `api.kimi.com`, and
+  `api.search.brave.com`. Empty lists remain deny-all. K3's first GitHub call
+  reached the remote and got HTTP 403 because it lacked User-Agent; a retry with
+  `User-Agent: OpenPRX-Doctor/0.8.16` returned HTTP 200 and `"Design for
+  failure."`, proving the allowlist no longer rejects the request.
+- **P2 web search:** `web_search.provider = "duckduckgo"` is explicit in the
+  active config and generated templates. The tool is always registered (no
+  `enabled` switch); K3 executed real DuckDuckGo searches successfully. The
+  host returned empty result sets for the tested queries, which is an upstream
+  DuckDuckGo limitation, not a disabled PRX capability. Brave can be selected
+  later after its key is configured.
+- **P3 doctor noise:** `autonomy.acknowledge_unrestricted_profile` and
+  `reliability.acknowledge_single_provider_risk` are non-gating operator
+  acknowledgements. They suppress only the matching doctor warnings while
+  leaving unrestricted shell behavior and provider fallback behavior unchanged.
+  Active config sets both to `true`; the only remaining doctor warning is the
+  intentional `memory.acl_enabled=false` posture.
+
+The follow-up implementation is commit `68c8f31b`. It adds schema-native
+acknowledgement fields, template documentation, doctor checks, and regression
+tests. After deployment, the service is `prx.service` PID 24914, binary/target
+SHA-256 `ca762c16dc4e2fc365c7260dabccfa7c99af0ae4014f24518ed9d5a3daa04660`.
+The config hot-reload applied generation 2 with `restart_required=[]`; the
+post-reload journal has no config errors. Full lib regression is 5,727 passed,
+0 failed, 6 ignored; doctor-focused acknowledgement tests are 41/41 and
+template tests 22/22.

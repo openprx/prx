@@ -23,3 +23,10 @@ This patch closes the deployed full-audit and chat self-check gaps.
   card data while retaining detection for genuine card-number patterns.
 - Refreshes gateway health from an owner-controlled loop so a quiet listener
   remains fresh without relying on inbound `/health` traffic.
+- Documents and activates an explicit HTTP request allowlist, with empty lists
+  remaining deny-all by design.
+- Makes DuckDuckGo the explicit default web-search provider without restoring an
+  `enabled` feature switch.
+- Adds operator-only acknowledgements for intentional unrestricted autonomy and
+  single-provider deployments, suppressing doctor noise without changing
+  execution or failover behavior.
