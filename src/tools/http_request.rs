@@ -1,7 +1,4 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
-use crate::security::op_id;
-use crate::security::policy::{ApprovalGrant, ResourceRiskLevel};
-use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use serde_json::json;
 use std::sync::Arc;
@@ -10,22 +7,18 @@ use std::time::Duration;
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
 pub struct HttpRequestTool {
-    security: Arc<SecurityPolicy>,
-    allowed_domains: Vec<String>,
     max_response_size: usize,
     timeout_secs: u64,
 }
 
 impl HttpRequestTool {
     pub fn new(
-        security: Arc<SecurityPolicy>,
-        allowed_domains: Vec<String>,
+        _security: Arc<crate::security::SecurityPolicy>,
+        _legacy_allowed_domains: Vec<String>,
         max_response_size: usize,
         timeout_secs: u64,
     ) -> Self {
         Self {
-            security,
-            allowed_domains: normalize_allowed_domains(allowed_domains),
             max_response_size,
             timeout_secs,
         }
@@ -44,22 +37,6 @@ impl HttpRequestTool {
 
         if !url.starts_with("http://") && !url.starts_with("https://") {
             anyhow::bail!("Only http:// and https:// URLs are allowed");
-        }
-
-        if self.allowed_domains.is_empty() {
-            anyhow::bail!(
-                "HTTP request tool is enabled but no allowed_domains are configured. Add [http_request].allowed_domains in config.toml"
-            );
-        }
-
-        let host = extract_host(url)?;
-
-        if is_private_or_local_host(&host) {
-            anyhow::bail!("Blocked local/private host: {host}");
-        }
-
-        if !host_matches_allowlist(&host, &self.allowed_domains) {
-            anyhow::bail!("Host '{host}' is not in http_request.allowed_domains");
         }
 
         Ok(url.to_string())
@@ -158,8 +135,7 @@ impl Tool for HttpRequestTool {
     }
 
     fn description(&self) -> &str {
-        "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. \
-        Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
+        "Make unrestricted HTTP requests. Supports GET, POST, PUT, DELETE, PATCH, HEAD, and OPTIONS methods."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -199,22 +175,6 @@ impl Tool for HttpRequestTool {
         let headers_val = args.get("headers").cloned().unwrap_or_else(|| json!({}));
         let body = args.get("body").and_then(|v| v.as_str());
 
-        if !self.security.can_act() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: autonomy is read-only".into()),
-            });
-        }
-
-        if !self.security.record_action() {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some("Action blocked: rate limit exceeded".into()),
-            });
-        }
-
         let url = match self.validate_url(url) {
             Ok(v) => v,
             Err(e) => {
@@ -236,22 +196,6 @@ impl Tool for HttpRequestTool {
                 });
             }
         };
-        let host_ref = op_id::ref_for_url_host(&url);
-        let operation_name = op_id::op_id(self.name(), "request", &[&host_ref]);
-        let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-        if let Err(error) = SideEffectGate::new(&self.security).authorize_resource_operation(
-            self.name(),
-            &operation_name,
-            ResourceRiskLevel::Medium,
-            approval_grant.as_ref(),
-        ) {
-            return Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(error),
-            });
-        }
-
         let request_headers = self.parse_headers(&headers_val);
 
         match self.execute_request(&url, method, request_headers, body).await {
@@ -324,45 +268,6 @@ impl Tool for HttpRequestTool {
 
 // Helper functions for HTTP domain validation
 
-fn normalize_allowed_domains(domains: Vec<String>) -> Vec<String> {
-    let mut normalized = domains
-        .into_iter()
-        .filter_map(|d| normalize_domain(&d))
-        .collect::<Vec<_>>();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
-}
-
-fn normalize_domain(raw: &str) -> Option<String> {
-    let mut d = raw.trim().to_lowercase();
-    if d.is_empty() {
-        return None;
-    }
-
-    if let Some(stripped) = d.strip_prefix("https://") {
-        d = stripped.to_string();
-    } else if let Some(stripped) = d.strip_prefix("http://") {
-        d = stripped.to_string();
-    }
-
-    if let Some((host, _)) = d.split_once('/') {
-        d = host.to_string();
-    }
-
-    d = d.trim_start_matches('.').trim_end_matches('.').to_string();
-
-    if let Some((host, _)) = d.split_once(':') {
-        d = host.to_string();
-    }
-
-    if d.is_empty() || d.chars().any(char::is_whitespace) {
-        return None;
-    }
-
-    Some(d)
-}
-
 pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
     let rest = url
         .strip_prefix("http://")
@@ -399,12 +304,6 @@ pub(crate) fn extract_host(url: &str) -> anyhow::Result<String> {
     }
 
     Ok(host)
-}
-
-fn host_matches_allowlist(host: &str, allowed_domains: &[String]) -> bool {
-    allowed_domains
-        .iter()
-        .any(|domain| host == domain || host.strip_suffix(domain).is_some_and(|prefix| prefix.ends_with('.')))
 }
 
 pub(crate) fn is_private_or_local_host(host: &str) -> bool {
@@ -501,59 +400,9 @@ mod tests {
     }
 
     #[test]
-    fn normalize_domain_strips_scheme_path_and_case() {
-        let got = normalize_domain("  HTTPS://Docs.Example.com/path ").unwrap();
-        assert_eq!(got, "docs.example.com");
-    }
-
-    #[test]
-    fn normalize_allowed_domains_deduplicates() {
-        let got = normalize_allowed_domains(vec![
-            "example.com".into(),
-            "EXAMPLE.COM".into(),
-            "https://example.com/".into(),
-        ]);
-        assert_eq!(got, vec!["example.com".to_string()]);
-    }
-
-    #[test]
-    fn validate_accepts_exact_domain() {
-        let tool = test_tool(vec!["example.com"]);
-        let got = tool.validate_url("https://example.com/docs").unwrap();
-        assert_eq!(got, "https://example.com/docs");
-    }
-
-    #[test]
     fn validate_accepts_http() {
         let tool = test_tool(vec!["example.com"]);
         assert!(tool.validate_url("http://example.com").is_ok());
-    }
-
-    #[test]
-    fn validate_accepts_subdomain() {
-        let tool = test_tool(vec!["example.com"]);
-        assert!(tool.validate_url("https://api.example.com/v1").is_ok());
-    }
-
-    #[test]
-    fn validate_rejects_allowlist_miss() {
-        let tool = test_tool(vec!["example.com"]);
-        let err = tool.validate_url("https://google.com").unwrap_err().to_string();
-        assert!(err.contains("allowed_domains"));
-    }
-
-    #[test]
-    fn validate_rejects_localhost() {
-        let tool = test_tool(vec!["localhost"]);
-        let err = tool.validate_url("https://localhost:8080").unwrap_err().to_string();
-        assert!(err.contains("local/private"));
-    }
-
-    #[test]
-    fn validate_rejects_private_ipv4() {
-        let tool = test_tool(vec!["192.168.1.5"]);
-        let err = tool.validate_url("https://192.168.1.5").unwrap_err().to_string();
-        assert!(err.contains("local/private"));
     }
 
     #[test]
@@ -564,21 +413,6 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("whitespace"));
-    }
-
-    #[test]
-    fn validate_rejects_userinfo() {
-        let tool = test_tool(vec!["example.com"]);
-        let err = tool.validate_url("https://user@example.com").unwrap_err().to_string();
-        assert!(err.contains("userinfo"));
-    }
-
-    #[test]
-    fn validate_requires_allowlist() {
-        let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30);
-        let err = tool.validate_url("https://example.com").unwrap_err().to_string();
-        assert!(err.contains("allowed_domains"));
     }
 
     #[test]
@@ -683,30 +517,6 @@ mod tests {
         assert!(!is_private_or_local_host("100.128.0.1")); // Just above range
     }
 
-    #[tokio::test]
-    async fn execute_blocks_readonly_mode() {
-        let security = Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            ..SecurityPolicy::default()
-        });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
-        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("read-only"));
-    }
-
-    #[tokio::test]
-    async fn execute_blocks_when_rate_limited() {
-        let security = Arc::new(SecurityPolicy {
-            max_actions_per_hour: 0,
-            ..SecurityPolicy::default()
-        });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30);
-        let result = tool.execute(json!({"url": "https://example.com"})).await.unwrap();
-        assert!(!result.success);
-        assert!(result.error.unwrap().contains("rate limit"));
-    }
-
     #[test]
     fn truncate_response_within_limit() {
         let tool = test_tool(vec!["example.com"]);
@@ -809,25 +619,6 @@ mod tests {
     }
 
     #[test]
-    fn ssrf_alternate_notations_rejected_by_validate_url() {
-        // These alternate notations are now caught by the DNS rebinding defense
-        // (SSRF block) OR by the allowlist, depending on system resolver behavior.
-        let tool = test_tool(vec!["example.com"]);
-        for notation in [
-            "http://0177.0.0.1",
-            "http://0x7f000001",
-            "http://2130706433",
-            "http://127.000.000.001",
-        ] {
-            let err = tool.validate_url(notation).unwrap_err().to_string();
-            assert!(
-                err.contains("allowed_domains") || err.contains("Blocked local/private host"),
-                "Expected SSRF or allowlist rejection for {notation}, got: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn redirect_policy_is_none() {
         // Structural test: the tool should be buildable with redirect-safe config.
         // The actual Policy::none() enforcement is in execute_request's client builder.
@@ -889,12 +680,5 @@ mod tests {
         let tool = test_tool(vec!["example.com"]);
         let err = tool.validate_url("").unwrap_err().to_string();
         assert!(err.contains("empty"));
-    }
-
-    #[test]
-    fn validate_rejects_ipv6_host() {
-        let tool = test_tool(vec!["example.com"]);
-        let err = tool.validate_url("http://[::1]:8080/path").unwrap_err().to_string();
-        assert!(err.contains("IPv6"));
     }
 }

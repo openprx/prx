@@ -2307,12 +2307,8 @@ pub struct BrowserConfig {
 
 /// HTTP request tool configuration (`[http_request]` section).
 ///
-/// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
-    /// Allowed domains for HTTP requests (exact or subdomain match)
-    #[serde(default)]
-    pub allowed_domains: Vec<String>,
     /// Maximum response size in bytes (default: 1MB)
     #[serde(default = "default_http_max_response_size")]
     pub max_response_size: usize,
@@ -2324,7 +2320,6 @@ pub struct HttpRequestConfig {
 impl Default for HttpRequestConfig {
     fn default() -> Self {
         Self {
-            allowed_domains: Vec::new(),
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
         }

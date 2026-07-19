@@ -402,11 +402,11 @@ pub fn all_tools_with_runtime_ext(
         }
     }
 
-    // Network tool surfaces are always registered. Provider credentials and
-    // domain allowlists are execution-time readiness, never registration gates.
+    // Network tool surfaces are always registered. HTTP requests are unrestricted
+    // native functionality; timeout and response-size limits are operational only.
     tool_arcs.push(Arc::new(HttpRequestTool::new(
         security.clone(),
-        http_config.allowed_domains.clone(),
+        Vec::new(),
         http_config.max_response_size,
         http_config.timeout_secs,
     )));

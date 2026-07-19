@@ -959,8 +959,6 @@ fn tools_template(spec: Spec) -> String {
 [http_request]
 timeout_secs = 30
 max_response_size = 10485760
-# Explicit allowlist; an empty list denies all requests.
-# allowed_domains = ["api.github.com", "api.openai.com"]
 
 [web_search]
 provider = "duckduckgo"              # duckduckgo | brave
@@ -985,8 +983,6 @@ provider = "duckduckgo"              # duckduckgo | brave
 [http_request]
 timeout_secs = 30
 max_response_size = 10485760
-# Explicit allowlist; an empty list denies all requests.
-# allowed_domains = ["api.github.com", "api.openai.com"]
 
 [web_search]
 provider = "duckduckgo"               # duckduckgo | brave

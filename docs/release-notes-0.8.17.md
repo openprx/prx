@@ -5,8 +5,9 @@ release artifact after the 0.8.16 regression audit.
 
 - Adds explicit operator acknowledgements for intentional unrestricted
   autonomy and single-provider deployments, keeping doctor output actionable.
-- Documents the explicit HTTP request allowlist and DuckDuckGo web-search
-  provider defaults without reintroducing capability switches.
+- Removes HTTP request domain allowlists and permission gates: `http_request`
+  is a directly usable native network primitive. Timeout and response-size
+  limits remain operational transport settings.
 - Preserves always-registered MCP, HTTP request, web search, and web fetch
   surfaces while keeping Causal Tree as the only intentionally gated feature.
 - Carries forward the shell direct-execution, audit-log, gateway-health,

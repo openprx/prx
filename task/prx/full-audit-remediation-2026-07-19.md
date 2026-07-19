@@ -237,3 +237,10 @@ The audited source and lockfile package versions are bumped to `0.8.17`.
 Release notes are recorded in `docs/release-notes-0.8.17.md`; the binary and
 runtime checks below are repeated against that version before the main branch
 push.
+
+The follow-up decision supersedes the earlier P1 allowlist remediation:
+`http_request` no longer has an `allowed_domains` configuration field or domain matching,
+SSRF/private-host rejection, autonomy gate, rate gate, or side-effect approval
+gate. It is registered as an unrestricted native HTTP primitive; only URL
+syntax, request timeout, response-size truncation, and transport behavior
+remain.
