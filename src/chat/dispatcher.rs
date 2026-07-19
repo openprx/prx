@@ -45,7 +45,7 @@ use crate::observability::Observer;
 use crate::providers::Provider;
 use crate::tools::{
     ApprovalStrategy, SecurityEffectPolicy, ToolApprovalDecision, ToolApprovalRequest, ToolExecutionCommand,
-    ToolExecutionContext, ToolExecutionService, ToolExecutionStatus, ToolSandboxPermit, ToolSandboxStrategy,
+    ToolExecutionContext, ToolExecutionPermit, ToolExecutionPreparation, ToolExecutionService, ToolExecutionStatus,
     TracingToolExecutionAudit,
 };
 
@@ -237,22 +237,22 @@ impl ApprovalStrategy for ChatTuiApprovalStrategy {
     }
 }
 
-/// Chat's UI readiness check is the concrete sandbox-preparation adapter. It
+/// Chat's UI readiness check is the concrete execution-preparation adapter. It
 /// preserves the existing invariant that `ToolStarted` is visible only after
 /// policy/approval and before the raw tool future begins.
-struct ChatToolSandboxStrategy {
+struct ChatToolExecutionPreparation {
     task_id: Option<crate::chat::turn_scheduler::TurnTaskId>,
     action_tx: mpsc::Sender<Action>,
 }
 
 #[async_trait]
-impl ToolSandboxStrategy for ChatToolSandboxStrategy {
+impl ToolExecutionPreparation for ChatToolExecutionPreparation {
     async fn prepare(
         &self,
         descriptor: &crate::tools::ToolDescriptor,
         command: &ToolExecutionCommand,
         _context: &ToolExecutionContext,
-    ) -> Result<ToolSandboxPermit, String> {
+    ) -> Result<ToolExecutionPermit, String> {
         self.action_tx
             .send(Action::ToolStarted {
                 task_id: self.task_id,
@@ -263,8 +263,8 @@ impl ToolSandboxStrategy for ChatToolSandboxStrategy {
             })
             .await
             .map_err(|_| "chat action channel closed before tool execution".to_string())?;
-        Ok(ToolSandboxPermit {
-            strategy: "adapter_owned_chat_dispatch".to_string(),
+        Ok(ToolExecutionPermit {
+            strategy: "chat_dispatch_ready".to_string(),
         })
     }
 }
@@ -2113,7 +2113,7 @@ fn chat_tool_execution_service(
             cancellation,
             policy,
         }),
-        Arc::new(ChatToolSandboxStrategy { task_id, action_tx }),
+        Arc::new(ChatToolExecutionPreparation { task_id, action_tx }),
         Arc::new(TracingToolExecutionAudit),
     );
     #[cfg(test)]
@@ -2981,7 +2981,7 @@ enum ToolExecOutcome {
 }
 
 /// BUG-03: classify whether a tool error is **unrecoverable** — i.e. retrying
-/// the identical call can never succeed because a security policy / sandbox /
+/// the identical call can never succeed because a security policy or
 /// OS permission permanently blocks it. The Redux driver uses this to short-
 /// circuit the "LLM keeps re-issuing the same blocked tool call until
 /// max-iterations" spin observed in chat-demo (BUG-03).
@@ -3246,7 +3246,7 @@ async fn execute_single_tool_call(
         status,
         ToolExecutionStatus::Denied
             | ToolExecutionStatus::ApprovalDenied
-            | ToolExecutionStatus::SandboxDenied
+            | ToolExecutionStatus::PreparationDenied
             | ToolExecutionStatus::UnknownTool
             | ToolExecutionStatus::IdempotencyConflict
             | ToolExecutionStatus::Indeterminate
@@ -7925,7 +7925,7 @@ mod real_mode_tests {
                 Ok(crate::tools::ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some("permission denied: command not allowed in sandbox".to_string()),
+                    error: Some("permission denied: command not allowed by policy".to_string()),
                 })
             }
         }
@@ -11111,7 +11111,7 @@ mod real_mode_tests {
             Arc::clone(&registry),
             Arc::new(SecurityEffectPolicy::new(policy)),
             Arc::new(crate::tools::DenyApprovalStrategy),
-            Arc::new(ChatToolSandboxStrategy {
+            Arc::new(ChatToolExecutionPreparation {
                 task_id: None,
                 action_tx: action_tx.clone(),
             }),

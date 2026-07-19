@@ -70,11 +70,11 @@ pub use delegate::DelegateTool;
 pub use document_get_chunk::DocumentGetChunkTool;
 pub use document_search::DocumentSearchTool;
 pub use execution::{
-    AdapterOwnedSandboxStrategy, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
+    AdapterOwnedPreparation, ApprovalStrategy, DenyApprovalStrategy, EffectPolicy, LegacyToolAdapter,
     SecurityEffectPolicy, ToolAdapterKind, ToolApprovalDecision, ToolApprovalRequest, ToolBackend, ToolCatalog,
     ToolDescriptor, ToolEffect, ToolExecutionAuditRecord, ToolExecutionAuditSink, ToolExecutionCommand,
-    ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionService, ToolExecutionStatus,
-    ToolSandboxPermit, ToolSandboxStrategy, TracingToolExecutionAudit, decide_tool_execution,
+    ToolExecutionContext, ToolExecutionDecision, ToolExecutionOutcome, ToolExecutionPermit, ToolExecutionPreparation,
+    ToolExecutionService, ToolExecutionStatus, TracingToolExecutionAudit, decide_tool_execution,
 };
 pub use file_edit::FileEditTool;
 pub use file_read::FileReadTool;

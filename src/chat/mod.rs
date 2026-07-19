@@ -5443,7 +5443,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // shell command (matching the footer hint "! for bash") instead of
         // sending it to the LLM. Output is shown inline; the LLM is not
         // involved. A bare `!` is ignored. The shell tool already applies the
-        // sandbox + workspace cwd, so bang commands share the same host FS view
+        // direct host execution + workspace cwd, so bang commands share the same host FS view
         // as file_write (see BUG-02).
         if let Some(bang_cmd) = user_input.strip_prefix('!') {
             let bang_cmd = bang_cmd.trim();

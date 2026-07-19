@@ -206,8 +206,20 @@ pub fn safety_rejection_message(issues: &[SafetyIssue]) -> String {
 fn pii_phone_regex() -> &'static Regex {
     #[allow(clippy::expect_used)]
     static PHONE: LazyLock<Regex> = LazyLock::new(|| {
-        Regex::new(r"(?x)\b(?:\+?\d{1,3}[-.\s]?)?(?:\(?\d{2,4}\)?[-.\s]?)?\d{3,4}[-.\s]?\d{4}\b")
-            .expect("BUG: invalid hardcoded phone regex")
+        // Require either explicit E.164 notation or a conventional separated
+        // phone shape. Treating every bare 7-15 digit run as a phone number
+        // rejects ordinary technical transcripts containing PIDs, counters,
+        // timestamps, ports, or build identifiers.
+        Regex::new(
+            r"(?ix)(?:
+                \+\d{8,15}\b
+                |
+                (?:\+\d{1,3}[-.\s])?(?:\(\d{2,4}\)|\d{2,4})[-.\s]\d{3,4}[-.\s]\d{4}\b
+                |
+                \b(?:phone|telephone|tel|mobile|call\s+me\s+at|电话|手机|联系)\s*[:：]?\s*\d{7,15}\b
+            )",
+        )
+        .expect("BUG: invalid hardcoded phone regex")
     });
     &PHONE
 }
@@ -336,6 +348,32 @@ mod tests {
         let result = filter.check(&with_phone, &source).await;
         assert!(!result.passed);
         assert!(result.issues.iter().any(|issue| issue.kind == SafetyIssueKind::Pii));
+    }
+
+    #[tokio::test]
+    async fn technical_transcript_numbers_are_not_phone_pii() {
+        let filter = MemorySafetyFilter::default();
+        let source = SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        };
+        let transcript = "PID=3913571 tests=5716 port=3120 version=0.8.15 duration_ms=97096 run_id=419";
+
+        assert!(filter.check(transcript, &source).await.passed);
+    }
+
+    #[tokio::test]
+    async fn e164_and_separated_phone_numbers_are_still_rejected() {
+        let filter = MemorySafetyFilter::default();
+        let source = SourceMetadata {
+            actor: Actor::Agent,
+            historical_accuracy: None,
+        };
+
+        assert!(!filter.check("call +15551234567", &source).await.passed);
+        assert!(!filter.check("call +1-555-123-4567", &source).await.passed);
+        assert!(!filter.check("call 212-555-0199", &source).await.passed);
+        assert!(!filter.check("Call me at 13812345678", &source).await.passed);
     }
 
     #[test]
