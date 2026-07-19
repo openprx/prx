@@ -32,7 +32,6 @@
 
 use super::event::SessionEventSink;
 use super::id::SessionId;
-use crate::security::SecurityPolicy;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -264,18 +263,18 @@ fn process_group_alive(pgid: i32) -> bool {
 /// event) when the process exits.
 ///
 /// Returns a clonable [`ShellSession`] handle for the chat registry.
-pub fn spawn_shell(command: &str, security: &Arc<SecurityPolicy>, sink: &SessionEventSink) -> Result<ShellSession> {
-    spawn_shell_with_origin(command, security, sink, ShellOrigin::User)
+pub fn spawn_shell(command: &str, workspace_dir: &std::path::Path, sink: &SessionEventSink) -> Result<ShellSession> {
+    spawn_shell_with_origin(command, workspace_dir, sink, ShellOrigin::User)
 }
 
 /// Spawn a background shell command with an explicit initiator.
 pub fn spawn_shell_with_origin(
     command: &str,
-    security: &Arc<SecurityPolicy>,
+    workspace_dir: &std::path::Path,
     sink: &SessionEventSink,
     origin: ShellOrigin,
 ) -> Result<ShellSession> {
-    let cwd = resolve_cwd(&security.workspace_dir);
+    let cwd = resolve_cwd(workspace_dir);
     let id = SessionId::from_run_id(&uuid::Uuid::new_v4().to_string());
 
     // Build the command in the workspace with inherited environment and its own
@@ -574,27 +573,13 @@ fn set_if_running(
 mod tests {
     use super::super::event::SessionEvent;
     use super::*;
-    use crate::security::AutonomyLevel;
 
-    fn auto_security() -> Arc<SecurityPolicy> {
-        // Full autonomy so the gate admits all commands including high-risk ones.
-        // Phase 1 semantics: Full = unconditional authorization; structural
-        // blocking (subshell, redirection, dangerous args) only applies to
-        // non-Full modes. Per-command allowlist was removed in Phase 1.
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+    fn auto_security() -> PathBuf {
+        std::env::temp_dir()
     }
 
-    fn read_only_security() -> Arc<SecurityPolicy> {
-        // ReadOnly autonomy — the gate denies every command before spawning.
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+    fn read_only_security() -> PathBuf {
+        std::env::temp_dir()
     }
 
     async fn wait_until_terminal(session: &ShellSession) -> ShellStatus {
@@ -612,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_executes_directly_under_read_only_policy_object() {
+    async fn command_executes_directly_without_policy_object() {
         let (sink, _rx) = SessionEventSink::channel();
         let sec = read_only_security();
         let session = spawn_shell("printf direct-read-only", &sec, &sink).expect("direct spawn");

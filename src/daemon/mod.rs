@@ -1040,28 +1040,30 @@ async fn run_fitness_worker(
 ) -> Result<()> {
     let interval_hours = config.self_system.fitness_interval_hours.max(1);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
+    let mut health_heartbeat = tokio::time::interval(Duration::from_secs(60));
     crate::health::mark_component_ok("self_system_fitness");
     wait_for_active_generation(&manager, generation_id).await;
 
     loop {
-        interval.tick().await;
-        match crate::self_system::run_fitness_report_with_config(&config).await {
-            Ok(report) => {
-                crate::health::mark_component_ok("self_system_fitness");
-                tracing::info!(
-                    target: "self_system",
-                    "fitness report stored: score={:.3}, confidence={:.3}, date={}",
-                    report.final_score,
-                    report.confidence,
-                    report.window.date
-                );
-            }
-            Err(error) => {
-                crate::health::mark_component_error("self_system_fitness", error.to_string());
-                tracing::warn!(
-                    target: "self_system",
-                    "fitness report failed: {error}"
-                );
+        tokio::select! {
+            _ = health_heartbeat.tick() => crate::health::touch_component("self_system_fitness"),
+            _ = interval.tick() => {
+                match crate::self_system::run_fitness_report_with_config(&config).await {
+                    Ok(report) => {
+                        crate::health::mark_component_ok("self_system_fitness");
+                        tracing::info!(
+                            target: "self_system",
+                            "fitness report stored: score={:.3}, confidence={:.3}, date={}",
+                            report.final_score,
+                            report.confidence,
+                            report.window.date
+                        );
+                    }
+                    Err(error) => {
+                        crate::health::mark_component_error("self_system_fitness", error.to_string());
+                        tracing::warn!(target: "self_system", "fitness report failed: {error}");
+                    }
+                }
             }
         }
     }
@@ -1074,35 +1076,39 @@ async fn run_evolution_scheduler_worker(
 ) -> Result<()> {
     let (mut scheduler, interval_hours) = build_evolution_scheduler(&config).await?;
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.max(1).saturating_mul(3600)));
+    let mut health_heartbeat = tokio::time::interval(Duration::from_secs(60));
     crate::health::mark_component_ok("evolution_scheduler");
     wait_for_active_generation(&manager, generation_id).await;
 
     loop {
-        interval.tick().await;
-        match scheduler.run_scheduled(Utc::now()).await {
-            Ok(summary) => {
-                if summary.digest_ran || summary.cycle_ran {
-                    // FIX-P0-40: report how many layers were skipped by the
-                    // side-effect gate so a "completed" tick that applied nothing
-                    // (because autonomy denied every self-modification) is not
-                    // silently indistinguishable from one that applied changes.
-                    let gate_denied = summary.layer_reports.iter().filter(|report| report.gate_denied).count();
-                    tracing::info!(
-                        target: "self_system",
-                        digest_ran = summary.digest_ran,
-                        cycle_ran = summary.cycle_ran,
-                        layer_reports = summary.layer_reports.len(),
-                        gate_denied,
-                        "evolution scheduler tick completed"
-                    );
-                }
-                crate::health::mark_component_ok("evolution_scheduler");
+        tokio::select! {
+            _ = health_heartbeat.tick() => {
+                // Preserve failed states while refreshing the liveness of the
+                // long-lived scheduler and judge owners.
+                crate::health::touch_component("evolution_scheduler");
+                crate::health::touch_component(EVOLUTION_JUDGE_COMPONENT);
             }
-            Err(error) => {
-                tracing::warn!(
-                    target: "self_system",
-                    "evolution scheduler tick failed: {error}"
-                );
+            _ = interval.tick() => {
+                match scheduler.run_scheduled(Utc::now()).await {
+                    Ok(summary) => {
+                        if summary.digest_ran || summary.cycle_ran {
+                            let gate_denied = summary.layer_reports.iter().filter(|report| report.gate_denied).count();
+                            tracing::info!(
+                                target: "self_system",
+                                digest_ran = summary.digest_ran,
+                                cycle_ran = summary.cycle_ran,
+                                layer_reports = summary.layer_reports.len(),
+                                gate_denied,
+                                "evolution scheduler tick completed"
+                            );
+                        }
+                        crate::health::mark_component_ok("evolution_scheduler");
+                    }
+                    Err(error) => {
+                        crate::health::mark_component_error("evolution_scheduler", error.to_string());
+                        tracing::warn!(target: "self_system", "evolution scheduler tick failed: {error}");
+                    }
+                }
             }
         }
     }

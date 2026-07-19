@@ -252,9 +252,14 @@ pub fn readiness_from_snapshot(snapshot: &HealthSnapshot) -> ReadinessReport {
     let mut ready_components = 0;
     let mut issues = Vec::new();
 
-    for (name, component) in snapshot.components.iter().filter(|(_, component)| component.required) {
+    for (name, component) in &snapshot.components {
         if component.state == ComponentState::Ready && component.fresh {
-            ready_components += 1;
+            if component.required {
+                ready_components += 1;
+            }
+            continue;
+        }
+        if !component.required && component.state == ComponentState::Disabled {
             continue;
         }
 
@@ -274,7 +279,10 @@ pub fn readiness_from_snapshot(snapshot: &HealthSnapshot) -> ReadinessReport {
         });
     }
 
-    let ready = required_components > 0 && ready_components == required_components;
+    // Never claim a fully ready daemon while an active tracked component is
+    // stale or failed. Optional components may be explicitly Disabled, but an
+    // active optional component must stay healthy.
+    let ready = required_components > 0 && ready_components == required_components && issues.is_empty();
     ReadinessReport {
         ready,
         status: if ready { "ready" } else { "not_ready" },
@@ -420,7 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn all_required_components_must_be_ready() {
+    fn active_optional_failure_blocks_false_green_readiness() {
         let mut components = BTreeMap::new();
         components.insert(
             "required-ready".to_string(),
@@ -439,10 +447,11 @@ mod tests {
 
         let report = readiness_from_snapshot(&snapshot);
 
-        assert!(report.ready);
+        assert!(!report.ready);
         assert_eq!(report.required_components, 1);
         assert_eq!(report.ready_components, 1);
-        assert!(report.issues.is_empty());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].component, "optional-failed");
     }
 
     #[test]

@@ -343,10 +343,8 @@ pub fn all_tools_with_runtime_ext(
 
     // ── Scheduler tools ──
     // The unified `cron` tool is ALWAYS registered (matching the legacy `schedule`
-    // tool's always-on availability). Whether scheduled jobs actually fire in the
-    // background is governed separately by the scheduler module / `cron.enabled`
-    // and the background scheduler loop — registering the tool only makes the
-    // surface available to the model, it does not start any execution.
+    // tool's always-on availability). The background scheduler is also always
+    // started; concrete jobs determine whether any work fires.
     tool_arcs.push(Arc::new(CronTool::new(shared_config.clone(), security.clone())));
     tool_arcs.push(Arc::new(XinTool::new(shared_config.clone(), security.clone())));
 
@@ -388,18 +386,15 @@ pub fn all_tools_with_runtime_ext(
             .with_event_recording(root_config.memory.event_recording_config()),
     ));
 
-    // ── Integrations module gates MCP and Composio tools ──
-    let mcp_tool_ref: Option<Arc<McpTool>> = if config.mcp.configured() {
-        let mcp = Arc::new(McpTool::new(
-            security.clone(),
-            config.mcp.clone(),
-            workspace_dir.to_path_buf(),
-        ));
-        tool_arcs.push(mcp.clone());
-        Some(mcp)
-    } else {
-        None
-    };
+    // MCP is always registered. An empty server catalog is a configured-state
+    // fact exposed by the tool, not a module-disable switch.
+    let mcp = Arc::new(McpTool::new(
+        security.clone(),
+        config.mcp.clone(),
+        workspace_dir.to_path_buf(),
+    ));
+    tool_arcs.push(mcp.clone());
+    let mcp_tool_ref = Some(mcp);
 
     if let Some(key) = composio_key {
         if !key.is_empty() {
@@ -407,7 +402,8 @@ pub fn all_tools_with_runtime_ext(
         }
     }
 
-    // ── Tools module gates http_request, web_search, web_fetch ──
+    // Network tool surfaces are always registered. Provider credentials and
+    // domain allowlists are execution-time readiness, never registration gates.
     tool_arcs.push(Arc::new(HttpRequestTool::new(
         security.clone(),
         http_config.allowed_domains.clone(),
@@ -415,53 +411,18 @@ pub fn all_tools_with_runtime_ext(
         http_config.timeout_secs,
     )));
 
-    // Web search tool (enabled by default for GLM and other models)
-    {
-        let provider = root_config.web_search.provider.trim().to_ascii_lowercase();
-        let brave_key = root_config
-            .web_search
-            .brave_api_key
-            .as_deref()
-            .map(str::trim)
-            .filter(|v| !v.is_empty());
-
-        let should_register = match provider.as_str() {
-            "duckduckgo" | "ddg" => true,
-            "brave" => brave_key.is_some(),
-            _ => true,
-        };
-
-        if should_register {
-            tool_arcs.push(Arc::new(WebSearchTool::new(
-                root_config.web_search.provider.clone(),
-                root_config.web_search.brave_api_key.clone(),
-                root_config.web_search.max_results,
-                root_config.web_search.timeout_secs,
-            )));
-        } else {
-            tracing::warn!(
-                "web_search enabled but provider '{}' missing required brave_api_key; tool not registered",
-                root_config.web_search.provider
-            );
-        }
-    }
-
-    // Web fetch tool — only register when both fetch_enabled AND allowed_domains
-    // are configured.  Registering without domains would expose the tool to the
-    // model while every call fails at runtime with a confusing error.
-    if browser_config.allowed_domains.is_empty() {
-        tracing::warn!(
-            "web_fetch is available but browser.allowed_domains is empty; \
-             tool not registered. Set browser.allowed_domains to configure it."
-        );
-    } else {
-        tool_arcs.push(Arc::new(WebFetchTool::new(
-            security.clone(),
-            browser_config.allowed_domains.clone(),
-            root_config.web_search.fetch_max_chars,
-            root_config.web_search.timeout_secs,
-        )));
-    }
+    tool_arcs.push(Arc::new(WebSearchTool::new(
+        root_config.web_search.provider.clone(),
+        root_config.web_search.brave_api_key.clone(),
+        root_config.web_search.max_results,
+        root_config.web_search.timeout_secs,
+    )));
+    tool_arcs.push(Arc::new(WebFetchTool::new(
+        security.clone(),
+        browser_config.allowed_domains.clone(),
+        root_config.web_search.fetch_max_chars,
+        root_config.web_search.timeout_secs,
+    )));
 
     // Always register agents_list (shows what agents are available for delegation)
     if !agents.is_empty() {
@@ -621,6 +582,16 @@ mod tests {
         }
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+        assert!(
+            names.contains(&"mcp_call"),
+            "MCP must be registered even with zero servers"
+        );
+        assert!(names.contains(&"http_request"));
+        assert!(names.contains(&"web_search_tool"));
+        assert!(
+            names.contains(&"web_fetch"),
+            "web_fetch registration must not depend on its allowlist"
+        );
     }
 
     #[test]

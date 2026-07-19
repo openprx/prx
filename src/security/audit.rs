@@ -3,13 +3,14 @@
 use crate::config::AuditConfig;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use fs2::FileExt;
 use parking_lot::Mutex;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock, Weak};
 use uuid::Uuid;
 
 /// Audit event types
@@ -57,7 +58,6 @@ pub struct ExecutionResult {
 pub struct SecurityContext {
     pub policy_violation: bool,
     pub rate_limit_remaining: Option<u32>,
-    pub sandbox_backend: Option<String>,
 }
 
 /// Complete audit event
@@ -85,7 +85,6 @@ impl AuditEvent {
             security: SecurityContext {
                 policy_violation: false,
                 rate_limit_remaining: None,
-                sandbox_backend: None,
             },
         }
     }
@@ -127,24 +126,35 @@ impl AuditEvent {
         });
         self
     }
+}
 
-    /// Set security context
-    pub fn with_security(mut self, sandbox_backend: Option<String>) -> Self {
-        self.security.sandbox_backend = sandbox_backend;
-        self
+type AuditPathLock = Arc<Mutex<()>>;
+
+static AUDIT_PATH_LOCKS: LazyLock<Mutex<std::collections::HashMap<PathBuf, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn shared_audit_path_lock(path: &Path) -> AuditPathLock {
+    let key = path
+        .parent()
+        .and_then(|parent| parent.canonicalize().ok())
+        .and_then(|parent| path.file_name().map(|name| parent.join(name)))
+        .unwrap_or_else(|| path.to_path_buf());
+    let mut locks = AUDIT_PATH_LOCKS.lock();
+    locks.retain(|_, lock| lock.strong_count() > 0);
+    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
+        return lock;
     }
+    let lock = Arc::new(Mutex::new(()));
+    locks.insert(key, Arc::downgrade(&lock));
+    lock
 }
 
 /// Audit logger
 pub struct AuditLogger {
     log_path: PathBuf,
-    /// FIX-P1-31 (alloc): the logger only ever reads `enabled` and `max_size_mb`
-    /// from the audit config (both `Copy`); `log_path` is consumed once in `new`.
-    /// Storing just these `Copy` scalars lets `new` borrow `&AuditConfig` instead
-    /// of owning a clone, removing the per-decision `String` allocation that the
-    /// side-effect gate audit hook previously paid on every authorized decision.
+    lock_path: PathBuf,
     max_size_mb: u32,
-    _buffer: Mutex<Vec<AuditEvent>>,
+    writer_lock: AuditPathLock,
 }
 
 /// Structured command execution details for audit logging.
@@ -209,23 +219,37 @@ impl AuditLogger {
                 joined
             }
         };
+        let writer_lock = shared_audit_path_lock(&log_path);
+        let mut lock_name = log_path.as_os_str().to_os_string();
+        lock_name.push(".lock");
         Ok(Self {
             log_path,
+            lock_path: PathBuf::from(lock_name),
             max_size_mb: config.max_size_mb,
-            _buffer: Mutex::new(Vec::new()),
+            writer_lock,
         })
     }
 
     /// Log an event
     pub fn log(&self, event: &AuditEvent) -> Result<()> {
-        // Check log size and rotate if needed
+        let mut record = serde_json::to_vec(event)?;
+        record.push(b'\n');
+
+        // Rotation and append must share the same path-scoped critical section.
+        // A complete JSONL record is prepared before locking and emitted with one
+        // write_all call so independent AuditLogger instances cannot interleave.
+        // The sidecar file lock extends that guarantee across daemon/chat/CLI
+        // processes that share the same workspace audit path.
+        let _guard = self.writer_lock.lock();
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&self.lock_path)?;
+        lock_file.lock_exclusive()?;
         self.rotate_if_needed()?;
-
-        // Serialize and write
-        let line = serde_json::to_string(event)?;
         let mut file = OpenOptions::new().create(true).append(true).open(&self.log_path)?;
-
-        writeln!(file, "{}", line)?;
+        file.write_all(&record)?;
         file.sync_all()?;
 
         Ok(())
@@ -336,11 +360,9 @@ impl AuditLogger {
 /// audit.log into the repo during tests. Runtime policies built from config have
 /// an explicit workspace.
 ///
-/// FIX-P1-31: the caller threads the real `security.audit` configuration through
-/// `config` (previously this hard-coded `AuditConfig::default()`, so user config
-/// was ignored). When `config.enabled` is false this returns immediately without
-/// constructing a logger, writing a line, or issuing an `fsync` — disabling
-/// audit now genuinely removes the per-decision sync cost on the gate path.
+/// The caller threads the real `security.audit` configuration through `config`
+/// (previously this hard-coded `AuditConfig::default()`, so user configuration
+/// was ignored). Audit recording is always available and has no module switch.
 pub fn record_side_effect_decision_best_effort(
     workspace_dir: &Path,
     config: &AuditConfig,
@@ -587,6 +609,52 @@ mod tests {
         let result = parsed.result.unwrap();
         assert!(result.success);
         assert_eq!(result.duration_ms, Some(42));
+        Ok(())
+    }
+
+    #[test]
+    fn concurrent_logger_instances_preserve_jsonl_records() -> Result<()> {
+        const WRITERS: usize = 8;
+        const EVENTS_PER_WRITER: usize = 25;
+
+        let tmp = TempDir::new()?;
+        let log_dir = tmp.path().to_path_buf();
+        let barrier = Arc::new(std::sync::Barrier::new(WRITERS));
+        let mut threads = Vec::new();
+        for writer_id in 0..WRITERS {
+            let log_dir = log_dir.clone();
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || -> Result<()> {
+                let logger = AuditLogger::new(
+                    &AuditConfig {
+                        max_size_mb: 100,
+                        ..Default::default()
+                    },
+                    log_dir,
+                )?;
+                barrier.wait();
+                for event_id in 0..EVENTS_PER_WRITER {
+                    logger.log(&AuditEvent::new(AuditEventType::SecurityEvent).with_action(
+                        format!("writer={writer_id} event={event_id}"),
+                        "test".to_string(),
+                        false,
+                        true,
+                    ))?;
+                }
+                Ok(())
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("test: audit writer thread panicked")?;
+        }
+
+        let raw = std::fs::read_to_string(tmp.path().join("audit.log"))?;
+        let lines = raw.lines().collect::<Vec<_>>();
+        assert_eq!(lines.len(), WRITERS * EVENTS_PER_WRITER);
+        for (index, line) in lines.iter().enumerate() {
+            serde_json::from_str::<AuditEvent>(line)
+                .unwrap_or_else(|error| panic!("audit line {index} is invalid JSON: {error}: {line}"));
+        }
         Ok(())
     }
 

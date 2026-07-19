@@ -2,12 +2,11 @@ use crate::chat::sessions::event::SessionEventSink;
 use crate::chat::sessions::model::{ManagedStatus, project_shell_status};
 use crate::chat::sessions::runtime::ShellRegistry;
 use crate::chat::sessions::shell::ShellOrigin;
-use crate::security::SecurityPolicy;
 use crate::tools::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
-use std::sync::Arc;
+use std::path::PathBuf;
 
 /// Model-callable access to PRX managed background sessions.
 ///
@@ -15,16 +14,16 @@ use std::sync::Arc;
 /// `/shell`, so model-spawned background shells show up in the TUI bottom list,
 /// `/sessions`, `/logs`, `/kill`, and chat-exit cleanup.
 pub struct ManagedSessionTool {
-    security: Arc<SecurityPolicy>,
+    workspace_dir: PathBuf,
     shells: ShellRegistry,
     event_sink: SessionEventSink,
 }
 
 impl ManagedSessionTool {
     #[must_use]
-    pub const fn new(security: Arc<SecurityPolicy>, shells: ShellRegistry, event_sink: SessionEventSink) -> Self {
+    pub const fn new(workspace_dir: PathBuf, shells: ShellRegistry, event_sink: SessionEventSink) -> Self {
         Self {
-            security,
+            workspace_dir,
             shells,
             event_sink,
         }
@@ -72,7 +71,7 @@ impl ManagedSessionTool {
     fn execute_shell(&self, command: &str) -> ToolResult {
         match crate::chat::sessions::shell::spawn_shell_with_origin(
             command,
-            &self.security,
+            &self.workspace_dir,
             &self.event_sink,
             ShellOrigin::Model,
         ) {
@@ -292,6 +291,7 @@ mod tests {
     use super::*;
     use crate::security::{AutonomyLevel, SecurityPolicy};
     use parking_lot::Mutex;
+    use std::sync::Arc;
 
     fn auto_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy {
@@ -305,7 +305,7 @@ mod tests {
     async fn managed_session_shell_list_logs_and_kill() {
         let (sink, _rx) = SessionEventSink::channel();
         let shells = Arc::new(Mutex::new(Vec::new()));
-        let tool = ManagedSessionTool::new(auto_security(), Arc::clone(&shells), sink);
+        let tool = ManagedSessionTool::new(auto_security().workspace_dir.clone(), Arc::clone(&shells), sink);
 
         let started = tool
             .execute(json!({

@@ -390,7 +390,7 @@ async fn execute_single_task(
         match task.execution_mode {
             ExecutionMode::Internal => run_internal(config, registry, task).await,
             ExecutionMode::AgentSession => run_agent(config, security, task, execution_authority).await,
-            ExecutionMode::Shell => run_shell_with_cancellation(config, security, task, Some(shell_cancellation)).await,
+            ExecutionMode::Shell => run_shell_with_cancellation(config, task, Some(shell_cancellation)).await,
         }
     });
     let result = tokio::select! {
@@ -758,7 +758,7 @@ async fn execute_step_inner(
     match step.execution_mode {
         ExecutionMode::Internal => run_internal(config, registry, &bridge).await,
         ExecutionMode::AgentSession => run_agent(config, security, &bridge, authority).await,
-        ExecutionMode::Shell => run_shell_with_cancellation(config, security, &bridge, cancellation).await,
+        ExecutionMode::Shell => run_shell_with_cancellation(config, &bridge, cancellation).await,
     }
 }
 
@@ -911,13 +911,12 @@ fn xin_task_runtime_envelope(config: &Config, task: &XinTask, authority: XinRunt
 }
 
 #[cfg(test)]
-async fn run_shell(config: &Config, security: &SecurityPolicy, task: &XinTask) -> (bool, String) {
-    run_shell_with_cancellation(config, security, task, None).await
+async fn run_shell(config: &Config, task: &XinTask) -> (bool, String) {
+    run_shell_with_cancellation(config, task, None).await
 }
 
 async fn run_shell_with_cancellation(
     config: &Config,
-    security: &SecurityPolicy,
     task: &XinTask,
     cancellation: Option<CancellationToken>,
 ) -> (bool, String) {
@@ -925,12 +924,11 @@ async fn run_shell_with_cancellation(
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };
-    run_shell_with_adapter(config, security, task, cancellation, &process).await
+    run_shell_with_adapter(config, task, cancellation, &process).await
 }
 
 async fn run_shell_with_adapter(
     config: &Config,
-    _security: &SecurityPolicy,
     task: &XinTask,
     cancellation: Option<CancellationToken>,
     process: &ShellProcessAdapter,
@@ -1222,8 +1220,7 @@ mod tests {
         };
         let task = store::add_task(&config, &new).unwrap();
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (success, output) = run_shell(&config, &security, &task).await;
+        let (success, output) = run_shell(&config, &task).await;
 
         assert!(success, "shell task should succeed: {output}");
         assert!(output.contains("hello"));
@@ -1253,13 +1250,12 @@ mod tests {
             },
         )
         .unwrap();
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let called = Arc::new(AtomicBool::new(false));
         let process = ShellProcessAdapter::new(Arc::new(SpyRuntime {
             called: Arc::clone(&called),
         }));
 
-        let (success, output) = run_shell_with_adapter(&config, &security, &task, None, &process).await;
+        let (success, output) = run_shell_with_adapter(&config, &task, None, &process).await;
 
         assert!(success, "{output}");
         assert!(output.contains("xin-runtime-spy"));
@@ -1296,9 +1292,7 @@ mod tests {
             },
         )
         .unwrap();
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-
-        let (success, output) = run_shell(&config, &security, &task).await;
+        let (success, output) = run_shell(&config, &task).await;
         assert!(success, "{output}");
         assert!(output.contains("xin-direct-path"), "{output}");
         assert!(!config.workspace_dir.join("audit.log").exists());
@@ -1328,8 +1322,7 @@ mod tests {
         };
         let task = store::add_task(&config, &new).unwrap();
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (success, output) = run_shell(&config, &security, &task).await;
+        let (success, output) = run_shell(&config, &task).await;
 
         assert!(success, "{output}");
         assert!(output.contains("should-run"));
@@ -1358,8 +1351,7 @@ mod tests {
         };
         let task = store::add_task(&config, &new).unwrap();
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (success, _output) = run_shell(&config, &security, &task).await;
+        let (success, _output) = run_shell(&config, &task).await;
 
         assert!(!success);
     }
@@ -1387,8 +1379,7 @@ mod tests {
         };
         let task = store::add_task(&config, &new).unwrap();
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (success, output) = run_shell(&config, &security, &task).await;
+        let (success, output) = run_shell(&config, &task).await;
 
         assert!(success, "{output}");
         assert!(config.workspace_dir.join("xin-medium-risk").exists());
@@ -1428,8 +1419,7 @@ mod tests {
         };
         let task = store::add_task(&config, &new).unwrap();
 
-        let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let (success, output) = run_shell(&config, &security, &task).await;
+        let (success, output) = run_shell(&config, &task).await;
 
         assert!(success, "{output}");
         assert!(config.workspace_dir.join("xin-persisted-approval").exists());

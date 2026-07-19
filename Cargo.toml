@@ -4,7 +4,7 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.15"
+version = "0.8.16"
 edition = "2024"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
@@ -52,10 +52,12 @@ matrix-sdk = { version = "0.16", optional = true, default-features = false, feat
 
 # Serialization
 serde = { version = "1.0", default-features = false, features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 
 # Config
 directories = "6.0"
+fs2 = "0.4"
 toml = "1.0"
 shellexpand = "3.1"
 

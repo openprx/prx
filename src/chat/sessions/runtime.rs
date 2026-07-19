@@ -1131,7 +1131,7 @@ mod tests {
 
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
         handle.add_shell(shell.clone());
 
         let report = handle.shutdown_all("test-shutdown").await;
@@ -1228,8 +1228,9 @@ mod tests {
         let mut handle = ChatSessionsHandle::new(Arc::clone(&runs));
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let initial_shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("initial shell");
-        let new_shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("new shell");
+        let initial_shell =
+            super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("initial shell");
+        let new_shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("new shell");
         handle.add_shell(initial_shell.clone());
         let shell_registry = handle.shell_registry();
         let owner = {
@@ -1271,7 +1272,7 @@ mod tests {
         let mut handle = ChatSessionsHandle::new(runs);
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
         let seq = handle.add_shell(shell.clone());
 
         let warnings = handle
@@ -1332,7 +1333,7 @@ mod tests {
         let runs = Arc::new(RwLock::new(Vec::<SubAgentRun>::new()));
         let mut handle = ChatSessionsHandle::new(runs);
         let sec = permissive_security();
-        let pty = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
+        let pty = PtyShellSession::spawn("sleep 30", &sec.workspace_dir, PtySize::default()).expect("test: spawn PTY");
         handle.add_pty(pty.clone());
 
         let report = handle.shutdown_all("test-pty-shutdown").await;
@@ -1362,7 +1363,7 @@ mod tests {
         // Add a shell — it must appear in the *same* list with #2.
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
         let shell_seq = handle.add_shell(shell.clone());
         assert_eq!(shell_seq, 2, "shells are numbered after agents");
 
@@ -1424,7 +1425,7 @@ mod tests {
         // Add an interactive PTY session — it must appear in the *same* list,
         // numbered after agents and shells, with kind `pty`.
         let sec = permissive_security();
-        let pty = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn PTY");
+        let pty = PtyShellSession::spawn("sleep 30", &sec.workspace_dir, PtySize::default()).expect("test: spawn PTY");
         let pty_seq = handle.add_pty(pty.clone());
         assert_eq!(pty_seq, 2, "PTY numbered after the single agent");
 
@@ -1463,15 +1464,16 @@ mod tests {
         let sec = permissive_security();
 
         // Two live PTYs → count is 2.
-        let a = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn live a");
-        let b = PtyShellSession::spawn("sleep 30", &sec, PtySize::default()).expect("test: spawn live b");
+        let a = PtyShellSession::spawn("sleep 30", &sec.workspace_dir, PtySize::default()).expect("test: spawn live a");
+        let b = PtyShellSession::spawn("sleep 30", &sec.workspace_dir, PtySize::default()).expect("test: spawn live b");
         handle.add_pty(a.clone());
         handle.add_pty(b.clone());
         assert_eq!(handle.live_pty_count(), 2, "two live PTYs counted");
 
         // A third that exits on its own must NOT count once dead, and reaping must
         // tear its drain reader down.
-        let dead = PtyShellSession::spawn("exit 0", &sec, PtySize::default()).expect("test: spawn fast-exit");
+        let dead =
+            PtyShellSession::spawn("exit 0", &sec.workspace_dir, PtySize::default()).expect("test: spawn fast-exit");
         handle.add_pty(dead.clone());
         for _ in 0..100 {
             if dead.has_exited() {
@@ -1494,7 +1496,7 @@ mod tests {
         let mut handle = ChatSessionsHandle::new(runs);
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("exit 0", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("exit 0", &sec.workspace_dir, &sink).expect("test: spawn shell");
         handle.add_shell(shell.clone());
 
         // Wait for the shell to finish.
@@ -1527,7 +1529,7 @@ mod tests {
 
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("exit 0", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("exit 0", &sec.workspace_dir, &sink).expect("test: spawn shell");
         handle.add_shell(shell.clone());
         for _ in 0..50 {
             if shell.is_terminal() {
@@ -1561,7 +1563,7 @@ mod tests {
         let mut handle = ChatSessionsHandle::new(runs);
         let (sink, _rx) = super::super::event::SessionEventSink::channel();
         let sec = permissive_security();
-        let shell = super::super::shell::spawn_shell("sleep 30", &sec, &sink).expect("test: spawn shell");
+        let shell = super::super::shell::spawn_shell("sleep 30", &sec.workspace_dir, &sink).expect("test: spawn shell");
         let seq = handle.add_shell(shell.clone());
         // Shells have no registry history; tail is empty, not an error.
         let lines = handle.tail(seq, 10).await.expect("test: shell tail empty ok");

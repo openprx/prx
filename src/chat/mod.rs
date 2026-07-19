@@ -3818,7 +3818,7 @@ pub async fn run(
     ));
     base_tools_vec.push(Box::new(spawn_tool));
     base_tools_vec.push(Box::new(crate::chat::managed_session::ManagedSessionTool::new(
-        security.clone(),
+        config.workspace_dir.clone(),
         managed_shell_registry,
         shell_event_sink.clone(),
     )));
@@ -6478,10 +6478,13 @@ Retry with a compatible model: /provider {new_provider} <model>"
                         }
                         SessionCommand::Shell { command } => {
                             // v2: run a non-interactive command in the background.
-                            // Reuses the shell tool's SideEffectGate (high-risk
-                            // commands still blocked), workspace cwd, hardened env,
-                            // and the v1.1 event bridge for live `/attach`/`/logs`.
-                            match crate::chat::sessions::shell::spawn_shell(&command, &security, &shell_event_sink) {
+                            // Runs directly in the configured workspace with the
+                            // inherited host environment and the v1.1 event bridge.
+                            match crate::chat::sessions::shell::spawn_shell(
+                                &command,
+                                &config.workspace_dir,
+                                &shell_event_sink,
+                            ) {
                                 Ok(session) => {
                                     let seq = chat_sessions.add_shell(session);
                                     emit_chat_output(&format!("Started background shell #{seq}: {command}"));
@@ -6519,7 +6522,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
                             {
                                 handle_pty_command(
                                     &command,
-                                    &security,
+                                    &config.workspace_dir,
                                     &mut chat_sessions,
                                     &pty_handoff,
                                     sessions_redraw_handle.as_ref(),
@@ -11955,7 +11958,7 @@ fn close_provider_worker_view(
 #[cfg(feature = "terminal-tui")]
 async fn handle_pty_command(
     command: &str,
-    security: &Arc<crate::security::SecurityPolicy>,
+    workspace_dir: &std::path::Path,
     chat_sessions: &mut crate::chat::sessions::ChatSessionsHandle,
     handoff: &Arc<crate::chat::sessions::pty::HandoffControl>,
     redraw_handle: Option<&mpsc::Sender<()>>,
@@ -11991,7 +11994,7 @@ async fn handle_pty_command(
         return;
     }
 
-    let session = match PtyShellSession::spawn(command, security, size) {
+    let session = match PtyShellSession::spawn(command, workspace_dir, size) {
         Ok(session) => session,
         Err(e) => {
             emit_chat_output(&format!("Failed to start interactive PTY session: {e}"));
