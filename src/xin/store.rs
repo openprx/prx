@@ -176,6 +176,7 @@ pub fn due_tasks(config: &Config, now: DateTime<Utc>, limit: usize) -> Result<Ve
 }
 
 /// Return due enabled system tasks inside one reserved name namespace.
+#[allow(dead_code)]
 pub(crate) fn due_system_tasks_in_namespace(
     config: &Config,
     now: DateTime<Utc>,
@@ -616,6 +617,7 @@ pub fn mark_stale(config: &Config, stale_timeout_minutes: u32) -> Result<usize> 
 }
 
 /// Mark only running system tasks inside a reserved namespace as stale.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn mark_stale_system_tasks_in_namespace(
     config: &Config,
     stale_timeout_minutes: u32,

@@ -8045,11 +8045,10 @@ mod tests {
             use crate::security::{AutonomyLevel, SecurityPolicy};
 
             let mut state = s();
-            let mut autonomy = AutonomyConfig {
+            let autonomy = AutonomyConfig {
                 level: AutonomyLevel::ReadOnly,
                 ..AutonomyConfig::default()
             };
-            autonomy.sandbox.backend = crate::config::SandboxBackend::None;
             let autonomy_before = autonomy.clone();
             let policy_before = SecurityPolicy::from_config(&autonomy, std::path::Path::new("/tmp"));
             state.ui.autonomy_level = autonomy.level;
@@ -8063,7 +8062,7 @@ mod tests {
 
             assert_eq!(autonomy.level, autonomy_before.level);
             assert_eq!(autonomy.workspace_only, autonomy_before.workspace_only);
-            assert_eq!(autonomy.sandbox.backend, autonomy_before.sandbox.backend);
+            assert_eq!(autonomy.scopes.rules.len(), autonomy_before.scopes.rules.len());
             assert_eq!(policy_after.autonomy, policy_before.autonomy);
             assert_eq!(state.session.mode, ChatMode::Plan);
             assert_eq!(

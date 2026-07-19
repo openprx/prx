@@ -218,9 +218,9 @@ pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> = Arc::new(crate::security::traits::NoopSandbox);
+    let workspace_dir = security.workspace_dir.clone();
     vec![
-        Box::new(ShellTool::new(security.clone(), runtime, sandbox, false)),
+        Box::new(ShellTool::new(runtime, workspace_dir)),
         Box::new(FileReadTool::new(security.clone(), false)),
         Box::new(FileWriteTool::new(security.clone())),
         Box::new(FileEditTool::new(security)),
@@ -322,33 +322,9 @@ pub fn all_tools_with_runtime_ext(
     fallback_api_key: Option<&str>,
     root_config: &crate::config::Config,
 ) -> ToolsRegistryResult {
-    // Bug #2 + Bug #3: resolve the opt-in trusted toolchain dirs EXACTLY ONCE and
-    // hand the very same Vec to both consumers — the Landlock sandbox allow-list
-    // and the shell tool's PATH. A single resolution means a config edit can never
-    // land a path in one but not the other (no time-of-check/time-of-use drift).
-    let shell_extra_path_dirs = crate::security::resolve_extra_path_dirs(&root_config.autonomy.sandbox.extra_path_dirs);
-
-    // Create a sandbox from the autonomy sandbox config for shell command
-    // isolation (permission-model Phase 1: moved from `[security.sandbox]`,
-    // disabled by default → NoopSandbox). Pass the workspace so the Landlock
-    // backend grants it read/write access — this keeps the shell tool and
-    // file_write on a single shared host FS view — and the already-resolved
-    // extra dirs so the sandbox allow-list matches PATH.
-    let sandbox: Arc<dyn crate::security::traits::Sandbox> = crate::security::create_sandbox_with_workspace_and_dirs(
-        &root_config.autonomy.sandbox,
-        Some(workspace_dir),
-        &shell_extra_path_dirs,
-    );
-
     // Core tools — always registered regardless of module flags.
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ShellTool::with_extra_path_dirs(
-            security.clone(),
-            runtime,
-            sandbox,
-            config.memory.acl_enabled,
-            shell_extra_path_dirs,
-        )),
+        Arc::new(ShellTool::new(runtime, workspace_dir.to_path_buf())),
         Arc::new(FileReadTool::new(security.clone(), config.memory.acl_enabled)),
         Arc::new(FileWriteTool::new(security.clone())),
         Arc::new(FileEditTool::new(security.clone())),

@@ -8,8 +8,8 @@ use crate::cron::{
     record_claim_lost, record_terminal_manual_run, renew_job_claim,
 };
 use crate::runtime::shell_process::{ShellProcessAdapter, ShellProcessError, ShellProcessRequest};
+use crate::security::SecurityPolicy;
 use crate::security::policy::ApprovalGrant;
-use crate::security::{SecurityPolicy, SideEffectGate};
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use futures_util::{StreamExt, stream};
@@ -26,8 +26,8 @@ tokio::task_local! {
 }
 
 #[derive(Clone, Copy)]
-enum ShellAuthorization<'a> {
-    Authorize { grant: Option<&'a ApprovalGrant> },
+enum ShellAuthorization {
+    Authorize,
     Preauthorized,
 }
 
@@ -142,19 +142,9 @@ async fn execute_job_with_retry(
     security: &SecurityPolicy,
     job: &CronJob,
     tool_name: &str,
-    approval_grant: Option<&ApprovalGrant>,
+    _approval_grant: Option<&ApprovalGrant>,
 ) -> (bool, String) {
-    let persisted_approval_grant = approval_grant.cloned().or_else(|| persisted_job_approval_grant(job));
-    let approval_grant = persisted_approval_grant.as_ref();
-    execute_job_with_retry_authorization(
-        config,
-        security,
-        job,
-        tool_name,
-        ShellAuthorization::Authorize { grant: approval_grant },
-        None,
-    )
-    .await
+    execute_job_with_retry_authorization(config, security, job, tool_name, ShellAuthorization::Authorize, None).await
 }
 
 async fn execute_job_with_retry_authorization(
@@ -162,7 +152,7 @@ async fn execute_job_with_retry_authorization(
     security: &SecurityPolicy,
     job: &CronJob,
     tool_name: &str,
-    authorization: ShellAuthorization<'_>,
+    authorization: ShellAuthorization,
     claim: Option<&CronClaim>,
 ) -> (bool, String) {
     let mut last_output = String::new();
@@ -193,12 +183,6 @@ async fn execute_job_with_retry_authorization(
     }
 
     (false, last_output)
-}
-
-fn persisted_job_approval_grant(job: &CronJob) -> Option<ApprovalGrant> {
-    job.approval_grant_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str::<ApprovalGrant>(raw).ok())
 }
 
 #[cfg(test)]
@@ -264,7 +248,7 @@ async fn execute_and_persist_job(
         job,
         claim,
         "cron_scheduler",
-        ShellAuthorization::Authorize { grant: None },
+        ShellAuthorization::Authorize,
         ClaimedRunMode::AdvanceSchedule,
     )
     .await;
@@ -279,7 +263,7 @@ pub async fn execute_claimed_job_with_runtime_approval_for_tool(
     job: &CronJob,
     claim: CronClaim,
     tool_name: &str,
-    approval_grant: Option<ApprovalGrant>,
+    _approval_grant: Option<ApprovalGrant>,
 ) -> (bool, String) {
     let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir)
         .with_audit_config(config.security.audit.clone());
@@ -294,9 +278,7 @@ pub async fn execute_claimed_job_with_runtime_approval_for_tool(
         job,
         claim,
         tool_name,
-        ShellAuthorization::Authorize {
-            grant: approval_grant.as_ref(),
-        },
+        ShellAuthorization::Authorize,
         mode,
     )
     .await
@@ -336,7 +318,7 @@ async fn run_claimed_job(
     job: &CronJob,
     claim: CronClaim,
     tool_name: &str,
-    authorization: ShellAuthorization<'_>,
+    authorization: ShellAuthorization,
     mode: ClaimedRunMode,
 ) -> (bool, String) {
     let started_at = Utc::now();
@@ -814,16 +796,9 @@ async fn run_job_command(
     security: &SecurityPolicy,
     job: &CronJob,
     tool_name: &str,
-    approval_grant: Option<&ApprovalGrant>,
+    _approval_grant: Option<&ApprovalGrant>,
 ) -> (bool, String) {
-    run_job_command_authorization(
-        config,
-        security,
-        job,
-        tool_name,
-        ShellAuthorization::Authorize { grant: approval_grant },
-    )
-    .await
+    run_job_command_authorization(config, security, job, tool_name, ShellAuthorization::Authorize).await
 }
 
 async fn run_job_command_authorization(
@@ -831,7 +806,7 @@ async fn run_job_command_authorization(
     security: &SecurityPolicy,
     job: &CronJob,
     tool_name: &str,
-    authorization: ShellAuthorization<'_>,
+    authorization: ShellAuthorization,
 ) -> (bool, String) {
     run_job_command_with_timeout_authorization(
         config,
@@ -851,17 +826,10 @@ async fn run_job_command_with_timeout(
     job: &CronJob,
     timeout: Duration,
     tool_name: &str,
-    approval_grant: Option<&ApprovalGrant>,
+    _approval_grant: Option<&ApprovalGrant>,
 ) -> (bool, String) {
-    run_job_command_with_timeout_authorization(
-        config,
-        security,
-        job,
-        timeout,
-        tool_name,
-        ShellAuthorization::Authorize { grant: approval_grant },
-    )
-    .await
+    run_job_command_with_timeout_authorization(config, security, job, timeout, tool_name, ShellAuthorization::Authorize)
+        .await
 }
 
 async fn run_job_command_with_timeout_authorization(
@@ -870,7 +838,7 @@ async fn run_job_command_with_timeout_authorization(
     job: &CronJob,
     timeout: Duration,
     tool_name: &str,
-    authorization: ShellAuthorization<'_>,
+    authorization: ShellAuthorization,
 ) -> (bool, String) {
     let process = match ShellProcessAdapter::from_config(config) {
         Ok(process) => process,
@@ -881,39 +849,13 @@ async fn run_job_command_with_timeout_authorization(
 
 async fn run_job_command_with_timeout_and_adapter(
     config: &Config,
-    security: &SecurityPolicy,
+    _security: &SecurityPolicy,
     job: &CronJob,
     timeout: Duration,
-    tool_name: &str,
-    authorization: ShellAuthorization<'_>,
+    _tool_name: &str,
+    _authorization: ShellAuthorization,
     process: &ShellProcessAdapter,
 ) -> (bool, String) {
-    if !security.can_act() {
-        return (false, "blocked by security policy: autonomy is read-only".to_string());
-    }
-
-    if security.is_rate_limited() {
-        return (false, "blocked by security policy: rate limit exceeded".to_string());
-    }
-
-    if let ShellAuthorization::Authorize { grant } = authorization {
-        let persisted_approval_grant = if grant.is_none() {
-            persisted_job_approval_grant(job)
-        } else {
-            None
-        };
-        let approval_grant = grant.or(persisted_approval_grant.as_ref());
-        if let Err(reason) =
-            SideEffectGate::new(security).authorize_command_execution(tool_name, &job.command, approval_grant)
-        {
-            return (false, format!("blocked by security policy: {reason}"));
-        }
-
-        if !security.record_action() {
-            return (false, "blocked by security policy: action budget exhausted".to_string());
-        }
-    }
-
     match process
         .execute(ShellProcessRequest {
             command: &job.command,
@@ -933,9 +875,6 @@ async fn run_job_command_with_timeout_and_adapter(
             (output.status.success(), combined)
         }
         Err(ShellProcessError::Timeout(_)) => (false, format!("job timed out after {}s", timeout.as_secs_f64())),
-        Err(ShellProcessError::Sandbox(error)) => {
-            (false, format!("blocked by security policy: sandbox failed: {error}"))
-        }
         Err(error) => (false, format!("spawn error: {error}")),
     }
 }
@@ -948,7 +887,6 @@ mod tests {
     use crate::cron::{self, DeliveryConfig};
     use crate::runtime::{NativeRuntime, RuntimeAdapter};
     use crate::security::SecurityPolicy;
-    use crate::security::traits::{NoopSandbox, UnavailableSandbox};
     use chrono::{Duration as ChronoDuration, Utc};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1193,13 +1131,9 @@ mod tests {
         let job = test_job("echo cron-runtime-spy");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
         let called = Arc::new(AtomicBool::new(false));
-        let process = ShellProcessAdapter::new(
-            Arc::new(SpyRuntime {
-                called: Arc::clone(&called),
-            }),
-            Arc::new(NoopSandbox),
-            Vec::new(),
-        );
+        let process = ShellProcessAdapter::new(Arc::new(SpyRuntime {
+            called: Arc::clone(&called),
+        }));
 
         let (success, output) = run_job_command_with_timeout_and_adapter(
             &config,
@@ -1207,7 +1141,7 @@ mod tests {
             &job,
             Duration::from_secs(5),
             "cron_scheduler",
-            ShellAuthorization::Authorize { grant: None },
+            ShellAuthorization::Authorize,
             &process,
         )
         .await;
@@ -1221,17 +1155,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cron_entry_fails_closed_when_sandbox_is_unavailable() {
+    async fn cron_entry_executes_without_sandbox() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::Full;
         let job = test_job("touch cron-sandbox-marker");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
-        let process = ShellProcessAdapter::new(
-            Arc::new(NativeRuntime::new()),
-            Arc::new(UnavailableSandbox::new("test", "forced unavailable")),
-            Vec::new(),
-        );
+        let process = ShellProcessAdapter::new(Arc::new(NativeRuntime::new()));
 
         let (success, output) = run_job_command_with_timeout_and_adapter(
             &config,
@@ -1239,17 +1169,13 @@ mod tests {
             &job,
             Duration::from_secs(5),
             "cron_scheduler",
-            ShellAuthorization::Authorize { grant: None },
+            ShellAuthorization::Authorize,
             &process,
         )
         .await;
 
-        assert!(!success);
-        assert!(
-            output.contains("blocked by security policy: sandbox failed"),
-            "{output}"
-        );
-        assert!(!config.workspace_dir.join("cron-sandbox-marker").exists());
+        assert!(success, "{output}");
+        assert!(config.workspace_dir.join("cron-sandbox-marker").exists());
     }
 
     #[tokio::test]
@@ -1286,22 +1212,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_disallowed_command() {
+    async fn run_job_command_does_not_apply_command_policy() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
-        let job = test_job("curl https://evil.example");
+        let job = test_job("printf direct-cron");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
-        assert!(!success);
-        // Phase 1: per-command allowlist removed. A network command like `curl`
-        // under Supervised is risk-gated and denied without a runtime approval grant.
-        assert!(output.contains("runtime approval grant"), "{output}");
+        assert!(success, "{output}");
+        assert!(output.contains("direct-cron"));
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_medium_risk_without_runtime_grant() {
+    async fn run_job_command_executes_without_runtime_grant() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::Supervised;
@@ -1309,9 +1233,8 @@ mod tests {
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
-        assert!(!success);
-        assert!(output.contains("runtime approval grant"), "{output}");
-        assert!(!config.workspace_dir.join("cron-medium-risk").exists());
+        assert!(success, "{output}");
+        assert!(config.workspace_dir.join("cron-medium-risk").exists());
     }
 
     #[tokio::test]
@@ -1338,57 +1261,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_forbidden_path_argument() {
+    async fn run_job_command_allows_host_path_argument() {
         let tmp = TempDir::new().unwrap();
         let config = test_config(&tmp).await;
-        let job = test_job("cat /etc/passwd");
+        let job = test_job("test -r /etc/passwd && printf host-readable");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("forbidden path argument"));
-        assert!(output.contains("/etc/passwd"));
-        let audit = std::fs::read_to_string(config.workspace_dir.join("audit.log")).expect("audit log");
-        let events: Vec<crate::security::audit::AuditEvent> = audit
-            .lines()
-            .map(|line| serde_json::from_str(line).expect("audit event"))
-            .collect();
-        assert_eq!(events.len(), 1);
-        let action = events
-            .first()
-            .and_then(|event| event.action.as_ref())
-            .and_then(|action| action.command.as_deref())
-            .unwrap_or_default();
-        assert!(action.starts_with("cron_scheduler:"), "{action}");
+        assert!(success, "{output}");
+        assert!(output.contains("host-readable"));
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_readonly_mode() {
+    async fn run_job_command_does_not_reapply_readonly_mode() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.level = crate::security::AutonomyLevel::ReadOnly;
-        let job = test_job("echo should-not-run");
+        let job = test_job("echo should-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("read-only"));
+        assert!(success, "{output}");
+        assert!(output.contains("should-run"));
     }
 
     #[tokio::test]
-    async fn run_job_command_blocks_rate_limited() {
+    async fn run_job_command_does_not_reapply_rate_limit() {
         let tmp = TempDir::new().unwrap();
         let mut config = test_config(&tmp).await;
         config.autonomy.max_actions_per_hour = 0;
-        let job = test_job("echo should-not-run");
+        let job = test_job("echo should-run");
         let security = SecurityPolicy::from_config(&config.autonomy, &config.workspace_dir);
 
         let (success, output) = run_job_command(&config, &security, &job, "cron_scheduler", None).await;
-        assert!(!success);
-        assert!(output.contains("blocked by security policy"));
-        assert!(output.contains("rate limit exceeded"));
+        assert!(success, "{output}");
+        assert!(output.contains("should-run"));
     }
 
     #[tokio::test]

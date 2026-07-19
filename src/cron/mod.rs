@@ -144,27 +144,6 @@ pub fn handle_command(command: crate::CronCommands, config: &Config) -> Result<(
                 None
             };
 
-            if let Some(ref cmd) = command {
-                // BUG-D1-01: route the authorization decision through the
-                // audit-writing `SideEffectGate` (not the bare boolean
-                // `is_command_allowed`) so that `cron update` records both
-                // allow and deny decisions to `security.audit`, consistently
-                // with the `cron_update` tool, the cron scheduler, and every
-                // other side-effect gate path. CLI cron update is a
-                // non-interactive path: no approval grant is presented
-                // (`grant = None`) and the gate never prompts — it returns a
-                // plain `Result`, so an ungranted/blocked command yields an
-                // `Err` that we surface as the original blocking error.
-                let security = crate::runtime::bootstrap::build_security_policy(config);
-                if let Err(reason) = crate::security::SideEffectGate::new(&security).authorize_command_execution(
-                    "cron_update",
-                    cmd,
-                    None,
-                ) {
-                    bail!("Command blocked by security policy: {reason}");
-                }
-            }
-
             let patch = CronJobPatch {
                 schedule,
                 command,
@@ -642,7 +621,7 @@ mod tests {
     /// profile, while the relaxed (Full) profile disables structural gates and
     /// authorizes the command — proving the gate's level-keyed logic is reached.
     #[test]
-    fn cron_update_via_gate_rejects_structurally_unsafe_command_strict() {
+    fn cron_update_accepts_shell_syntax_under_strict_config() {
         let tmp = TempDir::new().unwrap();
         let config = config_with_autonomy(&tmp, true);
         std::fs::create_dir_all(&config.workspace_dir).unwrap();
@@ -650,12 +629,7 @@ mod tests {
 
         // Output redirect is a structural-safety violation under Supervised.
         let result = run_update(&config, &job.id, None, None, Some("echo pwn > /etc/crontab"), None);
-        assert!(result.is_err(), "structurally-unsafe command must be denied (strict)");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("blocked by security policy"),
-            "expected 'blocked' in: {msg}"
-        );
+        assert!(result.is_ok(), "cron update must not parse shell payloads: {result:?}");
     }
 
     #[test]
@@ -680,7 +654,7 @@ mod tests {
     /// passes. `is_command_allowed` alone would allow it in both cases — this test
     /// verifies the gate's stricter level-keyed logic is actually reached.
     #[test]
-    fn cron_update_via_gate_blocks_medium_risk_command_under_strict_config() {
+    fn cron_update_accepts_medium_risk_command_under_strict_config() {
         let tmp = TempDir::new().unwrap();
         // Strict config maps to Supervised; medium-risk commands need a grant.
         let config = config_with_autonomy(&tmp, true);
@@ -691,13 +665,8 @@ mod tests {
         // classified Medium by command_risk_level (git + commit verb).
         let result = run_update(&config, &job.id, None, None, Some("git commit -m msg"), None);
         assert!(
-            result.is_err(),
-            "medium-risk git commit must be blocked under strict config"
-        );
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("blocked by security policy"),
-            "expected 'blocked by security policy' in: {msg}"
+            result.is_ok(),
+            "cron update must not risk-grade shell payloads: {result:?}"
         );
     }
 
@@ -714,51 +683,6 @@ mod tests {
         assert!(
             result.is_ok(),
             "medium-risk git commit should be allowed under Full autonomy: {result:?}"
-        );
-    }
-
-    /// (d) Update-time gate and scheduler-execution gate use the same
-    /// `SecurityPolicy` semantics (both call
-    /// `SideEffectGate::authorize_command_execution`). Verify that a command
-    /// allowed at update time (`echo`) is also judged allowed by the scheduler
-    /// policy helper, so no accept-then-reject mismatch can occur.
-    #[test]
-    fn cron_update_and_scheduler_gate_agree_on_allowed_command() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, true);
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-
-        // The same policy used by `handle_command` (cron update):
-        let security = crate::runtime::bootstrap::build_security_policy(&config);
-        // Scheduler's gate also calls `authorize_command_execution` with no grant.
-        // Here we assert the same gate accepts the same low-risk command.
-        let result = crate::security::SideEffectGate::new(&security).authorize_command_execution(
-            "cron_update",
-            "echo hello",
-            None,
-        );
-        assert!(
-            result.is_ok(),
-            "scheduler gate must agree: echo is Low-risk allowed: {result:?}"
-        );
-    }
-
-    /// (d-deny) Verify gate-agree for a medium-risk command denied under strict config.
-    #[test]
-    fn cron_update_and_scheduler_gate_agree_on_blocked_command() {
-        let tmp = TempDir::new().unwrap();
-        let config = config_with_autonomy(&tmp, true);
-        std::fs::create_dir_all(&config.workspace_dir).unwrap();
-
-        let security = crate::runtime::bootstrap::build_security_policy(&config);
-        let result = crate::security::SideEffectGate::new(&security).authorize_command_execution(
-            "cron_update",
-            "git commit -m msg",
-            None,
-        );
-        assert!(
-            result.is_err(),
-            "scheduler gate must agree: medium-risk git commit blocked"
         );
     }
 }

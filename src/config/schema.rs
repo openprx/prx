@@ -3217,10 +3217,6 @@ impl Default for ScopeConfig {
 /// pipeline and the per-tool `auto_approve` / `always_ask` / `allowed_commands`
 /// lists have been removed; coarse risk presets are governed entirely by
 /// `level`. Fine-grained per-risk classification is deferred to Phase 2.
-///
-/// The sandbox configuration now lives under `[autonomy.sandbox]` (folded in
-/// from the former top-level `[security.sandbox]`) and is disabled by default
-/// (NoopSandbox); Phase 2 may re-enable it per risk level.
 pub const DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR: u32 = 20;
 pub const DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS: u32 = 500;
 
@@ -3242,11 +3238,6 @@ pub struct AutonomyConfig {
     /// Scope-based tool access control: per-user/channel/chat-type allow/deny rules.
     #[serde(default)]
     pub scopes: ScopeConfig,
-
-    /// Sandbox configuration (folded in from the former `[security.sandbox]`).
-    /// Disabled by default in Phase 1 (NoopSandbox → commands run un-isolated).
-    #[serde(default)]
-    pub sandbox: SandboxConfig,
 }
 
 impl Default for AutonomyConfig {
@@ -3277,7 +3268,6 @@ impl Default for AutonomyConfig {
             max_actions_per_hour: DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR,
             max_cost_per_day_cents: DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS,
             scopes: ScopeConfig::default(),
-            sandbox: SandboxConfig::default(),
         }
     }
 }
@@ -4881,9 +4871,9 @@ fn default_interaction_notice_text() -> String {
 
 /// Security configuration for resource limits and audit logging.
 ///
-/// Permission-model Phase 1: the former `[security.sandbox]` section moved to
-/// `[autonomy.sandbox]`, and the `[security.tool_policy]` pipeline was removed
-/// entirely (tool authorization is now driven solely by `[autonomy]`).
+/// The host-shell sandbox configuration and the former
+/// `[security.tool_policy]` pipeline were removed. Non-shell tool authorization
+/// remains driven by `[autonomy]`.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
 pub struct SecurityConfig {
     /// Resource limits
@@ -4915,67 +4905,6 @@ impl Default for ToolTieringConfig {
             always_exclude: Vec::new(),
         }
     }
-}
-
-/// Sandbox configuration for OS-level isolation
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SandboxConfig {
-    /// Sandbox backend to use
-    #[serde(default)]
-    pub backend: SandboxBackend,
-
-    /// Custom Firejail arguments (when backend = firejail)
-    #[serde(default)]
-    pub firejail_args: Vec<String>,
-
-    /// Opt-in extra directories to trust for shell tool command execution.
-    ///
-    /// By default the shell tool runs with a hardened PATH
-    /// (`/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`) and the Landlock backend
-    /// only grants execute access to system paths — this deliberately blocks
-    /// binaries under user-writable directories (CWE-426 untrusted search path).
-    ///
-    /// Listing a directory here is an EXPLICIT trust decision: each entry is
-    /// (a) appended to the shell tool's PATH and (b) added to the Landlock
-    /// read+execute allow-list, so toolchains like `~/.cargo/bin`, `~/.local/bin`,
-    /// or `~/.bun/bin` become usable from the shell tool. Both effects are applied
-    /// together — a PATH entry without the matching sandbox grant would be useless
-    /// (the kernel would still deny exec).
-    ///
-    /// `~` is expanded to the user's home directory. Only list directories you
-    /// trust; entries here weaken the default sandbox for exactly those paths.
-    /// Leaving this empty preserves the hardened default behavior unchanged.
-    #[serde(default)]
-    pub extra_path_dirs: Vec<String>,
-}
-
-impl Default for SandboxConfig {
-    fn default() -> Self {
-        Self {
-            backend: SandboxBackend::Auto,
-            firejail_args: Vec::new(),
-            extra_path_dirs: Vec::new(),
-        }
-    }
-}
-
-/// Sandbox backend selection
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
-#[serde(rename_all = "lowercase")]
-pub enum SandboxBackend {
-    /// Auto-detect best available (default)
-    #[default]
-    Auto,
-    /// Landlock (Linux kernel LSM, native)
-    Landlock,
-    /// Firejail (user-space sandbox)
-    Firejail,
-    /// Bubblewrap (user namespaces)
-    Bubblewrap,
-    /// Docker container isolation
-    Docker,
-    /// No sandboxing (application-layer only)
-    None,
 }
 
 /// Resource limits for command execution
@@ -6235,6 +6164,27 @@ mod tests {
         assert!(a.forbidden_paths.contains(&"/etc".to_string()));
         assert_eq!(a.max_actions_per_hour, DEFAULT_AUTONOMY_MAX_ACTIONS_PER_HOUR);
         assert_eq!(a.max_cost_per_day_cents, DEFAULT_AUTONOMY_MAX_COST_PER_DAY_CENTS);
+    }
+
+    #[test]
+    async fn autonomy_config_ignores_legacy_sandbox_table() {
+        let parsed: AutonomyConfig = toml::from_str(
+            r#"
+level = "full"
+workspace_only = false
+forbidden_paths = []
+max_actions_per_hour = 100
+max_cost_per_day_cents = 500
+
+[sandbox]
+enabled = false
+backend = "auto"
+"#,
+        )
+        .expect("legacy sandbox settings remain forward-compatible no-ops");
+
+        assert_eq!(parsed.level, AutonomyLevel::Full);
+        assert!(!parsed.workspace_only);
     }
 
     #[test]

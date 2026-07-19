@@ -664,10 +664,6 @@ forbidden_paths = [
   "~/.ssh", "~/.gnupg", "~/.aws", "~/.config",
 ]
 
-# Sandbox is always active and auto-detects the best available backend.
-[autonomy.sandbox]
-# backend = "auto"                     # auto | landlock | firejail | bubblewrap | docker | none
-
 [secrets]
 encrypt = true
 
@@ -699,10 +695,6 @@ workspace_only = false
 forbidden_paths = []                   # no extra path denylist
 max_actions_per_hour = 4294967295
 max_cost_per_day_cents = 4294967295
-
-# Sandbox is always active and auto-detects the best available backend.
-[autonomy.sandbox]
-# backend = "auto"                    # auto | landlock | firejail | bubblewrap | docker | none
 
 [secrets]
 encrypt = true
@@ -1385,9 +1377,7 @@ mod tests {
         assert!(content.contains("level = \"full\""));
         assert!(content.contains("workspace_only = false"));
         assert!(content.contains("forbidden_paths = []"));
-        // The autonomy level is the permission boundary; sandboxing is always available.
-        assert!(content.contains("[autonomy.sandbox]"));
-        assert!(!content.contains("[autonomy.sandbox]\nenabled"));
+        assert!(!content.contains("[autonomy.sandbox]"));
     }
 
     #[test]

@@ -26,8 +26,8 @@
 use super::traits::{Tool, ToolCategory, ToolResult, ToolTier};
 use crate::config::{Config, SharedConfig};
 use crate::cron::{self, CronJobPatch, DeliveryConfig, JobType, Schedule, SessionTarget};
+use crate::security::SecurityPolicy;
 use crate::security::policy::{ApprovalGrant, PERSISTED_APPROVAL_GRANT_TTL_SECS};
-use crate::security::{SecurityPolicy, SideEffectGate};
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use serde::Serialize;
@@ -205,17 +205,6 @@ impl CronTool {
                         });
                     }
                 };
-                if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
-                    self.name(),
-                    command,
-                    approval_grant.as_ref(),
-                ) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
-                }
                 // All shell-job validation + approval passed: charge the budget now,
                 // immediately before the DB write (legacy cron_add parity).
                 if let Some(r) = self.consume_action_budget() {
@@ -742,17 +731,6 @@ impl Tool for CronTool {
                     }
                 };
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
-                if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
-                    self.name(),
-                    command,
-                    approval_grant.as_ref(),
-                ) {
-                    return Ok(ToolResult {
-                        success: false,
-                        output: String::new(),
-                        error: Some(reason),
-                    });
-                }
                 let persisted_grant = ApprovalGrant::persisted_runner_grant(
                     "cron_scheduler",
                     command,
@@ -896,17 +874,6 @@ impl Tool for CronTool {
                 };
                 let approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if let Some(command) = &patch.command {
-                    if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
-                        self.name(),
-                        command,
-                        approval_grant.as_ref(),
-                    ) {
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(reason),
-                        });
-                    }
                     patch.approval_grant_json = ApprovalGrant::persisted_runner_grant(
                         "cron_scheduler",
                         command,
@@ -945,7 +912,6 @@ impl Tool for CronTool {
                         });
                     }
                 };
-                let mut approval_grant = ApprovalGrant::from_runtime_args(self.name(), &args);
                 if !self.security.can_act() {
                     return Ok(ToolResult {
                         success: false,
@@ -971,14 +937,6 @@ impl Tool for CronTool {
                     }
                 };
                 let terminal_rerun = job.terminal_state.is_some();
-                if approval_grant.is_none()
-                    && args
-                        .get(crate::security::policy::RUNTIME_APPROVAL_GRANTED_ARG)
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
-                    approval_grant = Some(ApprovalGrant::for_command(self.name(), &job.command, "runtime", None));
-                }
                 let worker_id = format!("cron-manual-{}", uuid::Uuid::new_v4());
                 let manual_claim = if terminal_rerun {
                     cron::claim_terminal_job_for_manual_rerun(
@@ -1004,33 +962,6 @@ impl Tool for CronTool {
                         error: Some(format!("cron job '{}' changed or is already running", job.id)),
                     });
                 };
-                if matches!(job.job_type, JobType::Shell) {
-                    if let Err(reason) = SideEffectGate::new(self.security.as_ref()).authorize_command_execution(
-                        self.name(),
-                        &job.command,
-                        approval_grant.as_ref(),
-                    ) {
-                        let release_error = match cron::abandon_job_claim(
-                            &cfg,
-                            &job.id,
-                            &manual_claim,
-                            job.last_status.as_deref(),
-                            &reason,
-                        ) {
-                            Ok(true) => None,
-                            Ok(false) => Some("claim ownership changed before release".to_string()),
-                            Err(error) => Some(error.to_string()),
-                        };
-                        return Ok(ToolResult {
-                            success: false,
-                            output: String::new(),
-                            error: Some(release_error.map_or_else(
-                                || reason.clone(),
-                                |error| format!("{reason}; failed to release cron claim: {error}"),
-                            )),
-                        });
-                    }
-                }
                 if !self.security.record_action() {
                     let reason = "Rate limit exceeded: action budget exhausted";
                     let release_error =
@@ -1902,7 +1833,7 @@ mod tests {
 
         let still_usable = ApprovalGrant::from_runtime_args("cron", &args).unwrap();
         assert!(
-            SideEffectGate::new(security.as_ref())
+            crate::security::SideEffectGate::new(security.as_ref())
                 .authorize_command_execution("cron", &command, Some(&still_usable))
                 .is_ok(),
             "claim conflict must not consume the single-use approval grant"
@@ -1910,10 +1841,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manual_risky_run_consumes_v2_grant_and_action_exactly_once() {
-        use crate::acl::approval_grant::{ApprovalGrantV2, IssuerAuthority, RiskLevel, Subject, WitnessKeyring};
-        use crate::security::policy::{CommandRiskLevel, RUNTIME_APPROVAL_GRANT_ARG};
-
+    async fn manual_shell_run_needs_no_grant_and_consumes_action_exactly_once() {
         let tmp = TempDir::new().unwrap();
         let base = test_config(&tmp).await;
         let mut config = (*base.load_full()).clone();
@@ -1923,38 +1851,9 @@ mod tests {
         let command = "touch single-use-marker";
         let job = cron::add_job(&cfg_snap, "*/5 * * * *", command).unwrap();
         let security = test_security(&cfg_snap);
-        let risk = match security.command_risk_level(command) {
-            CommandRiskLevel::Low => RiskLevel::Low,
-            CommandRiskLevel::Medium => RiskLevel::Medium,
-            CommandRiskLevel::High => RiskLevel::High,
-        };
-        let grant_v2 = ApprovalGrantV2::issue_one_shot(
-            WitnessKeyring::global().unwrap(),
-            Subject {
-                agent_id: "prx:test:cron".into(),
-                principal_id: "test:cron-user".into(),
-                owner_id: "test:owner".into(),
-                workspace_id: "test:workspace".into(),
-                session_key: Some("test:session".into()),
-            },
-            IssuerAuthority::HumanReview,
-            command,
-            risk,
-        )
-        .unwrap();
-        let grant = ApprovalGrant::from_verified_v2("cron", "test", grant_v2);
         let tool = CronTool::new(Arc::clone(&cfg), Arc::clone(&security));
 
-        let result = tool
-            .execute(json!({
-                "action": "run",
-                "job_id": job.id,
-                RUNTIME_APPROVAL_GRANT_ARG: serde_json::to_value(grant).unwrap(),
-                "_zc_scope_trusted": true,
-                "_zc_scope": {"principal_id": "test:cron-user"},
-            }))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
 
         assert!(result.success, "{:?}", result.error);
         assert!(cfg_snap.workspace_dir.join("single-use-marker").exists());
@@ -1962,12 +1861,11 @@ mod tests {
             security.is_rate_limited(),
             "exactly one action should exhaust the one-action budget"
         );
-        let audit = std::fs::read_to_string(cfg_snap.workspace_dir.join("audit.log")).unwrap();
-        assert_eq!(audit.lines().filter(|line| !line.trim().is_empty()).count(), 1);
+        assert!(!cfg_snap.workspace_dir.join("audit.log").exists());
     }
 
     #[tokio::test]
-    async fn manual_run_authorization_rejection_releases_claim_immediately() {
+    async fn manual_shell_run_executes_updated_command_and_releases_claim() {
         let tmp = TempDir::new().unwrap();
         let cfg = test_config(&tmp).await;
         let cfg_snap = cfg.load_full();
@@ -2002,19 +1900,14 @@ mod tests {
         )
         .unwrap();
 
-        let rejected = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
-        assert!(!rejected.success);
-        assert!(rejected.error.unwrap_or_default().contains("approval"));
-        assert!(!marker.exists());
+        let result = tool.execute(json!({"action": "run", "job_id": job.id})).await.unwrap();
+        assert!(result.success, "{:?}", result.error);
+        assert!(marker.exists());
 
         let released = cron::get_job(&cfg_snap, &job.id).unwrap();
-        assert!(
-            released.claim.is_none(),
-            "authorization rejection must release its exact claim"
-        );
-        assert_eq!(released.last_run, before_rejection.last_run);
-        assert_eq!(released.last_status, before_rejection.last_status);
-        assert_eq!(released.last_output, before_rejection.last_output);
+        assert!(released.claim.is_none(), "completed direct run must release its claim");
+        assert_ne!(released.last_run, before_rejection.last_run);
+        assert_eq!(released.last_status.as_deref(), Some("ok"));
         let replacement = cron::claim_job_if_current_for_manual_run(
             &cfg_snap,
             &released,
@@ -2023,14 +1916,14 @@ mod tests {
             ChronoDuration::seconds(90),
         )
         .unwrap();
-        assert!(replacement.is_some(), "released job must be immediately reclaimable");
+        assert!(replacement.is_some(), "completed job must be immediately reclaimable");
         let events = cron::list_job_events(&cfg_snap, &job.id).unwrap();
         assert_eq!(
             events
                 .iter()
                 .filter(|event| event.event_type == "cron.job.claim_abandoned")
                 .count(),
-            1
+            0
         );
     }
 

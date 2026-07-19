@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Removed host-shell ACL, command-text policy, OS sandbox, environment clearing,
+  and synthetic PATH enforcement from interactive ShellTool, background shell,
+  PTY, Cron shell, and Xin shell execution paths. Direct commands now inherit
+  the parent environment and support normal host paths, `/dev/null`, variables,
+  substitutions, pipelines, and background-process bookkeeping.
+- Removed the obsolete `[autonomy.sandbox]` schema/templates and Landlock build
+  feature so deleting the old switch cannot silently activate isolation.
+
 ## [0.8.12] - 2026-07-17
 
 ### Fixed

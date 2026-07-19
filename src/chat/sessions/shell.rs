@@ -10,11 +10,9 @@
 //!   `sh -c` that forks children leaves no orphans);
 //! - surface the exit code as a terminal [`ShellStatus`].
 //!
-//! Security: the command is gated through the same [`SideEffectGate`] the
-//! interactive [`crate::tools::shell::ShellTool`] uses (high-risk commands such
-//! as `rm -rf /` are blocked / require a grant), runs in the workspace
-//! directory, and inherits only the hardened-PATH + safe-env baseline. We do not
-//! re-implement an unsafe execution path.
+//! Commands run directly in the workspace with the parent environment. Policy
+//! admission belongs to the caller; this process path performs no command-text
+//! filtering, ACL, environment filtering, or sandboxing.
 //!
 //! Process-group semantics (Unix): the child is placed into a **new process
 //! group** via [`std::os::unix::process::CommandExt::process_group`] with no
@@ -34,7 +32,7 @@
 
 use super::event::SessionEventSink;
 use super::id::SessionId;
-use crate::security::{SecurityPolicy, SideEffectGate};
+use crate::security::SecurityPolicy;
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
@@ -53,19 +51,6 @@ const SIGTERM_GRACE: std::time::Duration = std::time::Duration::from_millis(300)
 /// Polling interval while waiting out the SIGTERM grace window.
 const GRACE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Environment variables safe to pass to a background shell command. Mirrors the
-/// interactive [`crate::tools::shell::ShellTool`] allow-list: only functional
-/// variables, never API keys or secrets (CWE-200).
-const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
-
-/// Hardened PATH used for background shell commands, matching the interactive
-/// shell tool's secure default (no user-writable directories).
-#[cfg(not(target_os = "windows"))]
-const HARDENED_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
-#[cfg(target_os = "windows")]
-const HARDENED_PATH: &str = r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem";
 const OUTPUT_BUFFER_LINES: usize = 500;
 
 /// Terminal/running state of a background shell session.
@@ -272,9 +257,8 @@ fn process_group_alive(pgid: i32) -> bool {
 
 /// Spawn a background non-interactive shell command.
 ///
-/// The command is authorized through the [`SideEffectGate`] (same gate the
-/// interactive shell tool uses) before any process is created. On success the
-/// child runs in its own process group; stdout and stderr are streamed
+/// The command is passed directly to the host shell. The child runs in its own
+/// process group; stdout and stderr are streamed
 /// line-by-line as [`SessionEvent::Delta`] through the supplied event sink, and
 /// a reaper task records the terminal [`ShellStatus`] (and emits a final status
 /// event) when the process exits.
@@ -291,23 +275,11 @@ pub fn spawn_shell_with_origin(
     sink: &SessionEventSink,
     origin: ShellOrigin,
 ) -> Result<ShellSession> {
-    // 1. Security gate — identical policy to ShellTool. The operator typed
-    //    `/shell`, but high-risk commands (rm -rf /, mkfs, dd, …) are still
-    //    blocked unless the policy allows them; we never bypass the gate.
-    if security.is_rate_limited() {
-        return Err(anyhow!("Rate limit exceeded: too many actions in the last hour"));
-    }
-    SideEffectGate::new(security.as_ref())
-        .authorize_command_execution("shell", command, None)
-        .map_err(|reason| anyhow!("{reason}"))?;
-    if !security.record_action() {
-        return Err(anyhow!("Rate limit exceeded: action budget exhausted"));
-    }
-
     let cwd = resolve_cwd(&security.workspace_dir);
     let id = SessionId::from_run_id(&uuid::Uuid::new_v4().to_string());
 
-    // 2. Build the command in the workspace, hardened env + own process group.
+    // Build the command in the workspace with inherited environment and its own
+    // process group.
     let mut cmd = tokio::process::Command::new("sh");
     cmd.arg("-c")
         .arg(command)
@@ -316,13 +288,6 @@ pub fn spawn_shell_with_origin(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    cmd.env_clear();
-    for var in SAFE_ENV_VARS {
-        if let Ok(val) = std::env::var(var) {
-            cmd.env(var, val);
-        }
-    }
-    cmd.env("PATH", HARDENED_PATH);
     // Own process group so `/kill` and chat-exit can `killpg` the whole tree,
     // not just the `sh` leader. `tokio::process::Command::process_group` is an
     // inherent method (no trait import, no `unsafe`): it sets `setpgid(0,0)` in
@@ -632,38 +597,36 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn command_rejected_under_read_only() {
-        // Phase 1: ReadOnly autonomy denies every command before any process is
-        // spawned, regardless of the command string.
-        let (sink, _rx) = SessionEventSink::channel();
-        let sec = read_only_security();
-        let err = spawn_shell("rm -rf /", &sec, &sink).expect_err("test: ReadOnly denies all commands");
-        let msg = err.to_string();
-        assert!(!msg.is_empty(), "denial carries a reason: {msg}");
+    async fn wait_until_terminal(session: &ShellSession) -> ShellStatus {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status = session.status();
+                if !matches!(status, ShellStatus::Running) {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("shell reaches a terminal state")
     }
 
     #[tokio::test]
-    async fn full_autonomy_admits_high_risk_command() {
-        // Phase 1: Full autonomy authorizes every command unconditionally; the
-        // gate does not block high-risk patterns like `rm -rf /`.  The process
-        // is only actually spawned when the OS permits it; we just assert the
-        // gate path returns Ok (not a security denial).
+    async fn command_executes_directly_under_read_only_policy_object() {
+        let (sink, _rx) = SessionEventSink::channel();
+        let sec = read_only_security();
+        let session = spawn_shell("printf direct-read-only", &sec, &sink).expect("direct spawn");
+        let status = wait_until_terminal(&session).await;
+        assert!(matches!(status, ShellStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn full_autonomy_executes_direct_command() {
         let (sink, _rx) = SessionEventSink::channel();
         let sec = auto_security();
-        // `rm -rf /` will be denied by the OS (permission error) or succeed on
-        // a sandboxed path — we only care that the *security gate* does not
-        // reject it.  Use `spawn_shell` result: Ok means gate passed (spawn
-        // attempted); Err with a security-policy message would be a regression.
-        let result = spawn_shell("rm -rf /", &sec, &sink);
-        if let Err(ref e) = result {
-            let msg = e.to_string();
-            assert!(
-                !msg.contains("security policy") && !msg.contains("not allowed"),
-                "Full autonomy must not block via security gate; got: {msg}"
-            );
-        }
-        // Either Ok (spawn succeeded) or Err from OS/rate-limit is acceptable.
+        let session = spawn_shell("printf direct-full", &sec, &sink).expect("direct spawn");
+        let status = wait_until_terminal(&session).await;
+        assert!(matches!(status, ShellStatus::Completed));
     }
 
     #[tokio::test]

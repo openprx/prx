@@ -1,15 +1,14 @@
-//! Shared, policy-free shell process execution.
+//! Shared, policy-free direct shell process execution.
 //!
 //! Authorization and action accounting deliberately stay at each caller. This
-//! adapter owns only runtime/sandbox construction, hardened process setup,
-//! bounded output capture, and process-tree lifecycle management.
+//! adapter owns only runtime construction, inherited-environment process setup,
+//! bounded output capture, and process-tree lifecycle management. It deliberately
+//! does not inspect command text or apply filesystem/OS isolation.
 
 use super::{RuntimeAdapter, create_runtime};
 use crate::config::Config;
-use crate::security::traits::Sandbox;
-use crate::security::{create_sandbox_with_workspace_and_dirs, resolve_extra_path_dirs};
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 #[cfg(test)]
@@ -20,16 +19,19 @@ use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+/// Environment keys retained by the remote-node execution boundary. Direct
+/// host-shell execution inherits the complete parent environment and does not
+/// consult this list.
+pub(crate) const SAFE_ENV_VARS: &[&str] = &[
+    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+];
+
 /// Maximum retained bytes for each output stream. Readers continue draining
 /// after this limit so a noisy child can never block on a full pipe.
 pub const MAX_SHELL_OUTPUT_BYTES: usize = 1_048_576;
 /// Stable suffix appended when a captured stream exceeds its retention limit.
 pub const SHELL_OUTPUT_TRUNCATED_MARKER: &str = "\n... [output truncated at 1MiB]";
 const OUTPUT_DRAIN_KILL_GRACE: Duration = Duration::from_secs(1);
-
-pub(crate) const SAFE_ENV_VARS: &[&str] = &[
-    "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
-];
 
 /// A single shell execution request. Policy decisions are intentionally absent.
 pub struct ShellProcessRequest<'a> {
@@ -53,8 +55,6 @@ pub struct ShellProcessOutcome {
 pub enum ShellProcessError {
     #[error("failed to build runtime command: {0}")]
     Runtime(#[source] anyhow::Error),
-    #[error("sandbox failed to wrap command: {0}")]
-    Sandbox(#[source] io::Error),
     #[error("failed to spawn command: {0}")]
     Spawn(#[source] io::Error),
     #[error("failed while waiting for command: {0}")]
@@ -70,34 +70,23 @@ pub enum ShellProcessError {
 /// Reusable process adapter shared by interactive shell, cron, and Xin.
 pub struct ShellProcessAdapter {
     runtime: Arc<dyn RuntimeAdapter>,
-    sandbox: Arc<dyn Sandbox>,
-    extra_path_dirs: Vec<PathBuf>,
     #[cfg(test)]
     active_output_readers: Arc<AtomicUsize>,
 }
 
 impl ShellProcessAdapter {
-    pub fn new(runtime: Arc<dyn RuntimeAdapter>, sandbox: Arc<dyn Sandbox>, extra_path_dirs: Vec<PathBuf>) -> Self {
+    pub fn new(runtime: Arc<dyn RuntimeAdapter>) -> Self {
         Self {
             runtime,
-            sandbox,
-            extra_path_dirs,
             #[cfg(test)]
             active_output_readers: Arc::new(AtomicUsize::new(0)),
         }
     }
 
-    /// Construct runtime, sandbox grants, and PATH from one resolution of the
-    /// configured extra executable directories.
+    /// Construct a direct host-shell adapter from the configured runtime.
     pub fn from_config(config: &Config) -> anyhow::Result<Self> {
-        let extra_path_dirs = resolve_extra_path_dirs(&config.autonomy.sandbox.extra_path_dirs);
-        let sandbox = create_sandbox_with_workspace_and_dirs(
-            &config.autonomy.sandbox,
-            Some(&config.workspace_dir),
-            &extra_path_dirs,
-        );
         let runtime: Arc<dyn RuntimeAdapter> = Arc::from(create_runtime(&config.runtime)?);
-        Ok(Self::new(runtime, sandbox, extra_path_dirs))
+        Ok(Self::new(runtime))
     }
 
     pub async fn execute(&self, request: ShellProcessRequest<'_>) -> Result<ShellProcessOutcome, ShellProcessError> {
@@ -112,16 +101,6 @@ impl ShellProcessAdapter {
             .runtime
             .build_shell_command(request.command, request.workspace_dir)
             .map_err(ShellProcessError::Runtime)?;
-        command.env_clear();
-        for variable in SAFE_ENV_VARS {
-            if let Ok(value) = std::env::var(variable) {
-                command.env(variable, value);
-            }
-        }
-        command.env("PATH", build_shell_path(&self.extra_path_dirs));
-        self.sandbox
-            .wrap_command(command.as_std_mut())
-            .map_err(ShellProcessError::Sandbox)?;
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -226,11 +205,6 @@ impl ShellProcessAdapter {
     }
 
     #[cfg(test)]
-    pub(crate) fn shell_path(&self) -> String {
-        build_shell_path(&self.extra_path_dirs)
-    }
-
-    #[cfg(test)]
     fn active_output_reader_count(&self) -> usize {
         self.active_output_readers.load(Ordering::SeqCst)
     }
@@ -241,25 +215,6 @@ async fn wait_for_cancellation(cancellation: Option<&CancellationToken>) {
         Some(token) => token.cancelled().await,
         None => std::future::pending().await,
     }
-}
-
-fn build_shell_path(extra_path_dirs: &[PathBuf]) -> String {
-    let base = if cfg!(target_os = "windows") {
-        r"C:\Windows\System32;C:\Windows;C:\Windows\System32\Wbem"
-    } else {
-        "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-    };
-    if extra_path_dirs.is_empty() {
-        return base.to_string();
-    }
-    let separator = if cfg!(target_os = "windows") { ';' } else { ':' };
-    let mut path = String::new();
-    for directory in extra_path_dirs {
-        path.push_str(&directory.to_string_lossy());
-        path.push(separator);
-    }
-    path.push_str(base);
-    path
 }
 
 struct CapturedOutput {
@@ -529,30 +484,8 @@ pub(crate) fn spawn_managed_shell_child(mut cmd: tokio::process::Command) -> io:
 mod tests {
     use super::*;
     use crate::runtime::NativeRuntime;
-    use crate::security::traits::NoopSandbox;
-    use std::process::Command;
+    use std::path::PathBuf;
     use tempfile::TempDir;
-
-    struct MarkerSandbox;
-
-    impl Sandbox for MarkerSandbox {
-        fn wrap_command(&self, command: &mut Command) -> io::Result<()> {
-            command.env("PRX_TEST_SANDBOX_APPLIED", "yes");
-            Ok(())
-        }
-
-        fn is_available(&self) -> bool {
-            true
-        }
-
-        fn name(&self) -> &str {
-            "marker"
-        }
-
-        fn description(&self) -> &str {
-            "test sandbox marker"
-        }
-    }
 
     struct EnvGuard {
         original: Option<String>,
@@ -583,36 +516,17 @@ mod tests {
         }
     }
 
-    fn adapter(sandbox: Arc<dyn Sandbox>) -> ShellProcessAdapter {
-        ShellProcessAdapter::new(Arc::new(NativeRuntime::new()), sandbox, Vec::new())
-    }
-
-    #[test]
-    fn hardened_path_has_no_empty_component_and_preserves_order() {
-        let extra = vec![PathBuf::from("/trusted/one"), PathBuf::from("/trusted/two")];
-        let path = build_shell_path(&extra);
-        if cfg!(target_os = "windows") {
-            assert!(
-                !path.contains(";;"),
-                "PATH must not inject the current directory: {path}"
-            );
-        } else {
-            assert!(
-                !path.contains("::"),
-                "PATH must not inject the current directory: {path}"
-            );
-            assert!(path.starts_with("/trusted/one:/trusted/two:"), "{path}");
-            assert!(path.ends_with("/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"), "{path}");
-        }
+    fn adapter() -> ShellProcessAdapter {
+        ShellProcessAdapter::new(Arc::new(NativeRuntime::new()))
     }
 
     #[tokio::test(flavor = "current_thread")]
-    async fn adapter_applies_sandbox_and_clears_secret_environment() {
+    async fn adapter_inherits_complete_parent_environment() {
         let _secret = EnvGuard::secret("must-not-leak");
         let temp = TempDir::new().expect("temp dir");
-        let outcome = adapter(Arc::new(MarkerSandbox))
+        let outcome = adapter()
             .execute(ShellProcessRequest {
-                command: "printf '%s|%s' \"$PRX_TEST_SANDBOX_APPLIED\" \"$PRX_TEST_SECRET\"",
+                command: "printf '%s' \"$PRX_TEST_SECRET\"",
                 workspace_dir: temp.path(),
                 timeout: Duration::from_secs(5),
                 cancellation: None,
@@ -621,13 +535,13 @@ mod tests {
             .expect("shell execution");
 
         assert!(outcome.status.success());
-        assert_eq!(outcome.stdout, "yes|");
+        assert_eq!(outcome.stdout, "must-not-leak");
     }
 
     #[tokio::test]
     async fn adapter_continuously_drains_but_bounds_each_output_stream() {
         let temp = TempDir::new().expect("temp dir");
-        let outcome = adapter(Arc::new(NoopSandbox))
+        let outcome = adapter()
             .execute(ShellProcessRequest {
                 command: "yes x | head -c 1100000; yes y | head -c 1100000 >&2",
                 workspace_dir: temp.path(),
@@ -649,7 +563,7 @@ mod tests {
         let temp = TempDir::new().expect("temp dir");
         let cancellation = CancellationToken::new();
         cancellation.cancel();
-        let result = adapter(Arc::new(NoopSandbox))
+        let result = adapter()
             .execute(ShellProcessRequest {
                 command: "touch pre-cancelled-marker",
                 workspace_dir: temp.path(),
@@ -666,7 +580,7 @@ mod tests {
     #[tokio::test]
     async fn timeout_after_leader_exit_drains_descendant_stderr_without_double_poll() {
         let temp = TempDir::new().expect("temp dir");
-        let result = adapter(Arc::new(NoopSandbox))
+        let result = adapter()
             .execute(ShellProcessRequest {
                 command: "sleep 30 >&2 & exit 0",
                 workspace_dir: temp.path(),
@@ -682,7 +596,7 @@ mod tests {
     #[tokio::test]
     async fn setsid_descendant_holding_stderr_cannot_exceed_drain_grace() {
         let temp = TempDir::new().expect("temp dir");
-        let process = adapter(Arc::new(NoopSandbox));
+        let process = adapter();
         let started = tokio::time::Instant::now();
         let result = process
             .execute(ShellProcessRequest {
@@ -759,7 +673,7 @@ mod tests {
             pid
         });
 
-        let result = adapter(Arc::new(NoopSandbox))
+        let result = adapter()
             .execute(ShellProcessRequest {
                 command: &command,
                 workspace_dir: temp.path(),
@@ -788,7 +702,7 @@ mod tests {
             pid
         });
 
-        let result = adapter(Arc::new(NoopSandbox))
+        let result = adapter()
             .execute(ShellProcessRequest {
                 command,
                 workspace_dir: temp.path(),
@@ -809,7 +723,7 @@ mod tests {
         let workspace = temp.path().to_path_buf();
         let pid_file = temp.path().join("dropped-descendant.pid");
         let command = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let process = Arc::new(adapter(Arc::new(NoopSandbox)));
+        let process = Arc::new(adapter());
         let execution = tokio::spawn(async move {
             process
                 .execute(ShellProcessRequest {
