@@ -197,7 +197,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system"),
-        Arc::new(|_| false),
+        Arc::new(|_| true),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
@@ -225,7 +225,7 @@ pub async fn run(config: Config, host: String, port: u16, shutdown: Cancellation
         fitness_ttl,
         Arc::clone(&initial_generation),
         Arc::new(|field| field == "self_system" || crate::config::generation::is_rebuild_and_swap(field)),
-        Arc::new(|_| false),
+        Arc::new(|_| true),
         {
             let shared = Arc::clone(&shared_config);
             Arc::new(move |generation, shutdown| {
