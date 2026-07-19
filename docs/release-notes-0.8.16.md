@@ -17,3 +17,9 @@ This patch closes the deployed full-audit and chat self-check gaps.
 - Always registers MCP, HTTP request, web search, and web fetch tool surfaces;
   missing servers, credentials, or allowlists are reported as configuration
   readiness instead of being misclassified as a disabled capability.
+- Avoids emitting an empty JSON Schema enum when no outbound MCP server is
+  configured, preventing provider-side HTTP 400 tool-schema rejection.
+- Prevents fractional fitness telemetry from being misidentified as payment
+  card data while retaining detection for genuine card-number patterns.
+- Refreshes gateway health from an owner-controlled loop so a quiet listener
+  remains fresh without relying on inbound `/health` traffic.
