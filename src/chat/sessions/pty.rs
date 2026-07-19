@@ -39,7 +39,6 @@
 //! child killer and document the limitation.
 
 use super::id::SessionId;
-use crate::security::SecurityPolicy;
 use anyhow::{Result, anyhow};
 use parking_lot::{Condvar, Mutex};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -699,8 +698,8 @@ impl PtyShellSession {
     ///
     /// The PTY child runs directly in the workspace with the inherited parent
     /// environment and PATH.
-    pub fn spawn(command: &str, security: &Arc<SecurityPolicy>, size: PtySize) -> Result<Self> {
-        let cwd = resolve_cwd(&security.workspace_dir);
+    pub fn spawn(command: &str, workspace_dir: &Path, size: PtySize) -> Result<Self> {
+        let cwd = resolve_cwd(workspace_dir);
         let id = SessionId::from_run_id(&uuid::Uuid::new_v4().to_string());
 
         // 2. Open the PTY pair.
@@ -1278,26 +1277,13 @@ pub fn read_pty_to_stdout(
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::security::AutonomyLevel;
 
-    fn auto_security() -> Arc<SecurityPolicy> {
-        // Full autonomy so the gate admits all commands, including high-risk
-        // ones. Phase 1: Full = unconditional authorization; the per-command
-        // allowlist and high-risk hard-block were removed.
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::Full,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+    fn auto_security() -> PathBuf {
+        std::env::temp_dir()
     }
 
-    fn read_only_security() -> Arc<SecurityPolicy> {
-        // ReadOnly autonomy — the gate denies every command before spawning.
-        Arc::new(SecurityPolicy {
-            autonomy: AutonomyLevel::ReadOnly,
-            workspace_dir: std::env::temp_dir(),
-            ..SecurityPolicy::default()
-        })
+    fn read_only_security() -> PathBuf {
+        std::env::temp_dir()
     }
 
     // ── Byte classification (detach contract) ────────────────────────────────

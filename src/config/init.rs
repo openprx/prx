@@ -488,6 +488,9 @@ min_chars = 30
 [memory]
 backend = "sqlite"
 auto_save = true
+embedding_provider = "openai"
+embedding_model = "text-embedding-3-small"
+embedding_dimensions = 1536
 
 # Message events are the shared live fabric and are independent from semantic auto-save.
 [memory.events]
@@ -501,14 +504,6 @@ retention_days = 14
 auto_promote_user_messages = true
 auto_promote_assistant_messages = false
 min_chars = 30
-
-# Embedding configuration for semantic search.
-# Shown uncommented as a ready-to-edit example; adjust provider/model/dimension
-# to match your embedding backend before enabling semantic search.
-[memory.embedding]
-provider = "openai"
-model = "text-embedding-3-small"
-dimension = 1536
 
 [storage]
 [storage.provider]
@@ -677,7 +672,7 @@ max_subprocesses = 10
 [compliance.interaction_notice]
 applicability = "required"
 version = "v1"
-message = "You are interacting with an AI system."
+text = "You are interacting with an AI system."
 
 # Legal/product owner must replace this before using high-risk-only controls.
 [compliance.eu_ai_act.classification]
@@ -714,7 +709,7 @@ max_size_mb = 100
 [compliance.interaction_notice]
 applicability = "required"
 version = "v1"
-message = "You are interacting with an AI system."
+text = "You are interacting with an AI system."
 
 # Legal/product owner must replace this before using high-risk-only controls.
 [compliance.eu_ai_act.classification]
@@ -956,11 +951,12 @@ fn tools_template(spec: Spec) -> String {
 
 [http_request]
 timeout_secs = 30
-max_response_bytes = 10485760
+max_response_size = 10485760
+# allowed_domains = ["api.example.com"]
 
 [web_search]
-# provider = "tavily"
-# api_key = ""
+# provider = "duckduckgo"             # duckduckgo | brave
+# brave_api_key = ""                  # required only for brave
 
 [multimodal]
 
@@ -980,12 +976,12 @@ max_response_bytes = 10485760
 
 [http_request]
 timeout_secs = 30
-max_response_bytes = 10485760
-# allowed_domains = []                 # empty = all allowed
+max_response_size = 10485760
+# allowed_domains = ["api.example.com"] # empty denies all requests
 
 [web_search]
-# provider = "tavily"                  # tavily | searxng | brave
-# api_key = ""
+# provider = "duckduckgo"              # duckduckgo | brave
+# brave_api_key = ""                   # required only for brave
 
 [multimodal]
 # max_image_size_bytes = 20971520
@@ -1216,6 +1212,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn generated_full_template_round_trips_schema_native_values() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Full.generate(dir, false).await.expect("test: generate full");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: full template must deserialize without ignored paths");
+        assert_eq!(config.http_request.max_response_size, 10_485_760);
+        assert_eq!(config.memory.embedding_provider, "openai");
+        assert_eq!(config.memory.embedding_model, "text-embedding-3-small");
+        assert_eq!(config.memory.embedding_dimensions, 1536);
+    }
+
+    #[tokio::test]
+    async fn generated_config_rejects_unknown_paths() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
+
+        let tools_path = dir.join("config.d/tools.toml");
+        fs::write(&tools_path, "[web_search]\nprovider = \"duckduckgo\"\ntyop = true\n")
+            .expect("test: write invalid tools fragment");
+        let error = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect_err("test: unknown config path must fail")
+            .to_string();
+        assert!(error.contains("web_search.tyop"), "unexpected error: {error}");
+    }
+
+    #[tokio::test]
+    async fn legacy_config_keys_are_migrated_explicitly() {
+        let tmp = tempfile::tempdir().expect("test: create tempdir");
+        let dir = tmp.path();
+        Spec::Minimal
+            .generate(dir, false)
+            .await
+            .expect("test: generate minimal");
+
+        let main_path = dir.join("config.toml");
+        let mut main = fs::read_to_string(&main_path).expect("test: read main config");
+        main.push_str("\n[modules]\nmemory = false\ntools = true\n");
+        fs::write(&main_path, main).expect("test: write legacy module gates");
+
+        fs::write(
+            dir.join("config.d/tools.toml"),
+            "[http_request]\nmax_response_bytes = 2048\nenabled = false\n",
+        )
+        .expect("test: write legacy tools fragment");
+        fs::write(
+            dir.join("config.d/memory.toml"),
+            "[memory]\nbackend = \"sqlite\"\nauto_save = true\n[memory.embedding]\nprovider = \"none\"\nmodel = \"legacy\"\ndimension = 512\n",
+        )
+        .expect("test: write legacy memory fragment");
+
+        let config = crate::config::Config::load_from_path(&dir.join("config.toml"), dir.join("workspace"))
+            .expect("test: known legacy keys must migrate");
+        assert_eq!(config.http_request.max_response_size, 2048);
+        assert_eq!(config.memory.embedding_provider, "none");
+        assert_eq!(config.memory.embedding_model, "legacy");
+        assert_eq!(config.memory.embedding_dimensions, 512);
+    }
+
+    #[tokio::test]
     async fn generated_server_full_templates_do_not_pin_compaction_context() {
         for spec in [Spec::Server, Spec::Full] {
             let tmp = tempfile::tempdir().expect("test: create tempdir");
@@ -1392,17 +1453,12 @@ mod tests {
     }
 
     #[test]
-    fn full_memory_template_uncomments_embedding_example() {
+    fn full_memory_template_uses_schema_native_embedding_keys() {
         let content = memory_template(Spec::Full);
-        // The [memory.embedding] section must be an uncommented, ready-to-edit
-        // example, not a fully commented block.
-        assert!(
-            content.contains("\n[memory.embedding]\n"),
-            "full memory template must include uncommented [memory.embedding] section"
-        );
-        assert!(content.contains("provider = \"openai\""));
-        assert!(content.contains("model = \"text-embedding-3-small\""));
-        assert!(content.contains("dimension = 1536"));
+        assert!(!content.contains("[memory.embedding]"));
+        assert!(content.contains("embedding_provider = \"openai\""));
+        assert!(content.contains("embedding_model = \"text-embedding-3-small\""));
+        assert!(content.contains("embedding_dimensions = 1536"));
     }
 
     #[test]

@@ -4013,6 +4013,8 @@ async fn run_message_dispatch_loop(
         HashMap::<String, InFlightSenderTaskState>::new(),
     ));
     let task_sequence = Arc::new(AtomicU64::new(1));
+    let mut health_heartbeat = tokio::time::interval(std::time::Duration::from_secs(60));
+    health_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // D5/D9 step 5: observe the external shutdown token alongside inbound
@@ -4020,6 +4022,10 @@ async fn run_message_dispatch_loop(
         // root cancel, rather than only when the channel closes.
         let msg = tokio::select! {
             () = shutdown.cancelled() => break,
+            _ = health_heartbeat.tick() => {
+                crate::health::mark_component_ok("channels");
+                continue;
+            }
             maybe_msg = rx.recv() => match maybe_msg {
                 Some(msg) => msg,
                 None => break,

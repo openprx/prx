@@ -323,6 +323,9 @@ fn configured_channel_names(config: &Config) -> Vec<&'static str> {
     if config.channels_config.whatsapp.is_some() {
         names.push("whatsapp");
     }
+    if config.channels_config.wacli.is_some() {
+        names.push("wacli");
+    }
     if config.channels_config.nextcloud_talk.is_some() {
         names.push("nextcloud-talk");
     }
@@ -1146,6 +1149,7 @@ fn check_config_semantics(config: &Config, items: &mut Vec<DiagItem>) {
         || cc.imessage.is_some()
         || cc.matrix.is_some()
         || cc.whatsapp.is_some()
+        || cc.wacli.is_some()
         || cc.nextcloud_talk.is_some()
         || cc.email.is_some()
         || cc.irc.is_some()
@@ -1461,6 +1465,26 @@ fn check_daemon_state(config: &Config, items: &mut Vec<DiagItem>) {
 
     // Components
     if let Some(components) = snapshot.get("components").and_then(serde_json::Value::as_object) {
+        // Do not hard-code runtime truth to scheduler and channel:* only. Any
+        // tracked active owner that reports unhealthy must be visible in doctor.
+        for (name, component) in components {
+            if name == "scheduler" || name.starts_with("channel:") {
+                continue;
+            }
+            let status = component
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+            if status == "ok" || status == "disabled" {
+                continue;
+            }
+            let detail = component
+                .get("last_error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("runtime component is not healthy");
+            items.push(DiagItem::error(cat, format!("{name} unhealthy ({status}): {detail}")));
+        }
+
         // Scheduler
         if let Some(scheduler) = components.get("scheduler") {
             {
@@ -1805,6 +1829,22 @@ mod tests {
         let ch_item = items.iter().find(|i| i.message.contains("channel"));
         assert!(ch_item.is_some());
         assert_eq!(ch_item.unwrap().severity, Severity::Warn);
+    }
+
+    #[test]
+    fn wacli_is_reported_as_a_configured_channel() {
+        let mut config = Config::default();
+        config.channels_config.cli = false;
+        config.channels_config.wacli = Some(crate::config::WacliConfig::default());
+
+        assert_eq!(configured_channel_names(&config), vec!["wacli"]);
+        let mut items = Vec::new();
+        check_channel_runtime(&config, &mut items);
+        assert!(
+            items
+                .iter()
+                .any(|item| item.message.contains("configured channels: wacli"))
+        );
     }
 
     #[test]
