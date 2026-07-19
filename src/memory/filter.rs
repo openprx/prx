@@ -258,6 +258,20 @@ fn credit_card_candidate_regex() -> &'static Regex {
 
 fn contains_credit_card_number(content: &str) -> bool {
     for candidate in credit_card_candidate_regex().find_iter(content) {
+        // Long floating-point telemetry values (for example a fitness ratio
+        // such as `0.4111111111111111`) can satisfy Luhn by chance. A payment
+        // card candidate is an integer-like token, never the fractional part
+        // of a decimal number. Check both boundaries because the regex starts
+        // after, or stops before, the decimal point.
+        let preceded_by_decimal_point = content
+            .get(..candidate.start())
+            .and_then(|prefix| prefix.chars().next_back())
+            == Some('.');
+        let followed_by_decimal_point =
+            content.get(candidate.end()..).and_then(|suffix| suffix.chars().next()) == Some('.');
+        if preceded_by_decimal_point || followed_by_decimal_point {
+            continue;
+        }
         let digits: String = candidate.as_str().chars().filter(|ch| ch.is_ascii_digit()).collect();
         if (13..=19).contains(&digits.len()) && passes_luhn(&digits) {
             return true;
@@ -392,5 +406,8 @@ mod tests {
     fn credit_card_luhn_detection() {
         assert!(contains_credit_card_number("card 4111 1111 1111 1111"));
         assert!(!contains_credit_card_number("card 4111 1111 1111 1112"));
+        assert!(contains_credit_card_number("card=4111111111111111"));
+        assert!(!contains_credit_card_number("ratio=0.4111111111111111"));
+        assert!(!contains_credit_card_number("telemetry=4111111111111111.0"));
     }
 }
