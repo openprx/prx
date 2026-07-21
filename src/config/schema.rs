@@ -4653,7 +4653,8 @@ pub struct WacliConfig {
     /// is resolved from `PATH`.
     #[serde(default)]
     pub cli_path: Option<String>,
-    /// wacli store directory passed as `--store` on outbound sends.
+    /// wacli store directory passed as `--store` on outbound sends and used as
+    /// a read-only chat-title fallback for older webhook payloads.
     #[serde(default)]
     pub store_dir: Option<String>,
     /// Bot's own JID, used for reply-to-bot mention detection.

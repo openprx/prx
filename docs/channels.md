@@ -24,4 +24,9 @@ allowed_from = ["uuid:your-uuid"]
 webhook_listen = "127.0.0.1:16868"
 webhook_path = "/wacli"
 webhook_secret = "replace-with-secret"
+store_dir = "/path/to/wacli-store"
 ```
+
+Newer wacli webhook payloads can carry the resolved `ChatName`. OpenPRX also
+uses `store_dir/wacli.db` as a read-only fallback for group titles when a
+webhook payload does not include that field.
