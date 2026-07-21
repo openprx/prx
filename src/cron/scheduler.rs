@@ -745,16 +745,25 @@ async fn deliver_if_configured(config: &Config, job: &CronJob, raw_output: &str)
 }
 
 async fn run_job_command(config: &Config, job: &CronJob) -> (bool, String) {
-    run_job_command_with_timeout(config, job, Duration::from_secs(SHELL_JOB_TIMEOUT_SECS)).await
+    run_job_command_with_timeout_authorization(config, job, Duration::from_secs(SHELL_JOB_TIMEOUT_SECS)).await
 }
 
 #[allow(dead_code)]
-async fn run_job_command_with_timeout(config: &Config, job: &CronJob, timeout: Duration) -> (bool, String) {
+async fn run_job_command_with_timeout_authorization(
+    config: &Config,
+    job: &CronJob,
+    timeout: Duration,
+) -> (bool, String) {
     let process = match ShellProcessAdapter::from_config(config) {
         Ok(process) => process,
         Err(error) => return (false, format!("runtime error: {error}")),
     };
     run_job_command_with_timeout_and_adapter(config, job, timeout, &process).await
+}
+
+#[allow(dead_code)]
+async fn run_job_command_with_timeout(config: &Config, job: &CronJob, timeout: Duration) -> (bool, String) {
+    run_job_command_with_timeout_authorization(config, job, timeout).await
 }
 
 async fn run_job_command_with_timeout_and_adapter(
