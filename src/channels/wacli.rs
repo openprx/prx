@@ -36,8 +36,10 @@ use axum::{
     routing::post,
 };
 use parking_lot::Mutex;
+use rusqlite::{OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -93,6 +95,8 @@ struct WacliMedia {
 struct WacliParsedMessage {
     #[serde(rename = "Chat", alias = "chatJid", default)]
     chat: String,
+    #[serde(rename = "ChatName", alias = "chatName", default)]
+    chat_name: String,
     #[serde(rename = "ID", alias = "id", default)]
     id: String,
     #[serde(rename = "SenderJID", alias = "senderJid", default)]
@@ -109,6 +113,61 @@ struct WacliParsedMessage {
     reply_to_sender_jid: String,
     #[serde(rename = "Media", alias = "media", default)]
     media: Option<WacliMedia>,
+}
+
+fn read_chat_title_from_store(store_dir: &str, chat_id: &str) -> Result<Option<String>> {
+    let db_path = Path::new(store_dir).join("wacli.db");
+    let conn = rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open wacli metadata database read-only: {}", db_path.display()))?;
+    let title = conn
+        .query_row(
+            "SELECT name
+             FROM chats
+             WHERE jid = ?1 AND TRIM(name) <> ''
+             UNION ALL
+             SELECT name
+             FROM groups
+             WHERE jid = ?1 AND TRIM(name) <> ''
+               AND NOT EXISTS (
+                   SELECT 1 FROM chats WHERE jid = ?1 AND TRIM(name) <> ''
+               )
+             LIMIT 1",
+            [chat_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("query wacli chat title")?;
+    Ok(title
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty()))
+}
+
+async fn resolve_chat_title(msg: &WacliParsedMessage, cfg: &WacliChannelConfig, is_group: bool) -> Option<String> {
+    let payload_title = msg.chat_name.trim();
+    if !payload_title.is_empty() {
+        return Some(payload_title.to_string());
+    }
+    if !is_group {
+        return None;
+    }
+
+    let store_dir = cfg.store_dir.as_deref()?.trim();
+    if store_dir.is_empty() {
+        return None;
+    }
+    let store_dir = store_dir.to_string();
+    let chat_id = msg.chat.trim().to_string();
+    match tokio::task::spawn_blocking(move || read_chat_title_from_store(&store_dir, &chat_id)).await {
+        Ok(Ok(title)) => title,
+        Ok(Err(error)) => {
+            tracing::debug!("wacli: failed to resolve chat title from read-only store: {error}");
+            None
+        }
+        Err(error) => {
+            tracing::debug!("wacli: chat-title resolver task failed: {error}");
+            None
+        }
+    }
 }
 
 // ── Replay cache ────────────────────────────────────────────────────────────
@@ -176,7 +235,8 @@ pub struct WacliChannelConfig {
     /// Path to the `wacli` binary used for outbound sends. `None` => `wacli`
     /// (resolved from `PATH`).
     pub cli_path: Option<String>,
-    /// wacli store directory (`--store`) for outbound sends.
+    /// wacli store directory (`--store`) for outbound sends and the read-only
+    /// inbound chat-title fallback.
     pub store_dir: Option<String>,
     /// Bot's own JID, used for reply-to-bot mention detection.
     pub bot_jid: Option<String>,
@@ -502,6 +562,7 @@ async fn handle_wacli_webhook(
 
     // 9. Assemble the ChannelMessage.
     let is_group = msg.chat.trim().ends_with("@g.us");
+    let chat_title = resolve_chat_title(&msg, cfg, is_group).await;
     let sender_display = if msg.push_name.trim().is_empty() {
         msg.sender_jid.trim()
     } else {
@@ -516,7 +577,8 @@ async fn handle_wacli_webhook(
         (true, None) => String::new(),
     };
 
-    // Group prefix; the official payload carries no group name, so it is omitted.
+    // Keep the transport prefix stable; the resolved group title is carried in
+    // ChannelMessage::chat_title for conversation context and profile metadata.
     let content = if is_group {
         format!("[WhatsApp Group] {sender_display}: {body_content}")
     } else {
@@ -536,7 +598,7 @@ async fn handle_wacli_webhook(
         timestamp,
         thread_ts: None,
         chat_kind: if is_group { ChatKind::Group } else { ChatKind::Dm },
-        chat_title: None,
+        chat_title,
         sender_display: (!sender_display.trim().is_empty()).then(|| sender_display.to_string()),
         mentioned_uuids,
         mentioned,
@@ -744,6 +806,7 @@ mod tests {
         "FromMe": false,
         "Text": "hello world",
         "Media": null,
+        "ChatName": "PRX Build Room",
         "PushName": "Alice",
         "ReplyToID": "",
         "ReplyToSenderJID": "",
@@ -778,6 +841,7 @@ mod tests {
         let msg: WacliParsedMessage =
             serde_json::from_str(OFFICIAL_PAYLOAD).expect("test: official payload should parse");
         assert_eq!(msg.chat, "120363423200597561@g.us");
+        assert_eq!(msg.chat_name, "PRX Build Room");
         assert_eq!(msg.id, "3EB0ABCDEF");
         assert_eq!(msg.sender_jid, "99551234@s.whatsapp.net");
         assert_eq!(msg.timestamp.as_deref(), Some("2026-06-17T04:39:01Z"));
@@ -875,10 +939,44 @@ mod tests {
         assert_eq!(msg.id, "3EB0ABCDEF");
         assert_eq!(msg.sender, "99551234@s.whatsapp.net");
         assert_eq!(msg.reply_target, "120363423200597561@g.us");
+        assert_eq!(msg.chat_title.as_deref(), Some("PRX Build Room"));
         assert!(msg.is_group_hint);
         assert!(msg.content.contains("[WhatsApp Group]"));
         assert!(msg.content.contains("Alice"));
         assert!(msg.content.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn handler_resolves_legacy_group_title_from_read_only_wacli_store() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        let db_path = store.path().join("wacli.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("test: create wacli database");
+        conn.execute_batch(
+            "CREATE TABLE chats (jid TEXT PRIMARY KEY, name TEXT NOT NULL, kind TEXT NOT NULL);
+             CREATE TABLE groups (jid TEXT PRIMARY KEY, name TEXT NOT NULL);
+             INSERT INTO chats (jid, name, kind)
+             VALUES ('120363423200597561@g.us', 'Legacy PRX Group', 'group');",
+        )
+        .expect("test: seed chat title");
+        drop(conn);
+
+        let mut cfg = cfg_with_secret();
+        cfg.store_dir = Some(store.path().display().to_string());
+        let (tx, mut rx) = mpsc::channel(4);
+        let app = router_for(state_for(cfg, tx));
+        let body = OFFICIAL_PAYLOAD.replace("        \"ChatName\": \"PRX Build Room\",\n", "");
+        let sig = sign("topsecret", body.as_bytes());
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build request");
+
+        let resp = app.oneshot(req).await.expect("test: response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("test: forwarded message");
+        assert_eq!(msg.chat_title.as_deref(), Some("Legacy PRX Group"));
     }
 
     #[tokio::test]
