@@ -184,19 +184,48 @@ async fn resolve_chat_title(msg: &WacliParsedMessage, cfg: &WacliChannelConfig, 
 }
 
 fn query_local_media_path(conn: &rusqlite::Connection, chat_id: &str, message_id: &str) -> Result<Option<String>> {
+    let primary = conn
+        .query_row(
+            "SELECT local_path FROM messages
+             WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+             LIMIT 1",
+            rusqlite::params![chat_id, message_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .context("query wacli message local media path")?;
+    if primary.is_some() {
+        return Ok(primary);
+    }
+
+    // `message_local_media_aliases` was added in wacli schema migration 22.
+    // Existing stores can legitimately predate that migration even when the
+    // running CLI already supports media downloads. Do not let the optional
+    // compatibility table make the stable `messages.local_path` lookup fail.
+    let aliases_exist = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'message_local_media_aliases'
+             )",
+            [],
+            |row| row.get::<_, bool>(0),
+        )
+        .context("inspect wacli media alias schema")?;
+    if !aliases_exist {
+        return Ok(None);
+    }
+
     conn.query_row(
-        "SELECT local_path FROM messages
+        "SELECT local_path FROM message_local_media_aliases
          WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
-         UNION
-         SELECT local_path FROM message_local_media_aliases
-         WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
-         ORDER BY 1
+         ORDER BY local_path
          LIMIT 1",
         rusqlite::params![chat_id, message_id],
         |row| row.get::<_, String>(0),
     )
     .optional()
-    .context("query wacli local media path")
+    .context("query wacli media alias path")
 }
 
 fn wait_for_local_media_path(
@@ -1178,6 +1207,93 @@ mod tests {
         )
         .expect_err("test: outside-store path must be rejected");
         assert!(error.to_string().contains("outside the configured store"));
+    }
+
+    #[test]
+    fn local_media_lookup_supports_legacy_store_without_alias_table() {
+        let store = tempfile::tempdir().expect("test: create legacy wacli store");
+        let db_path = store.path().join("wacli.db");
+        let conn = rusqlite::Connection::open(&db_path).expect("test: create legacy wacli database");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                chat_jid TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                local_path TEXT,
+                PRIMARY KEY (chat_jid, msg_id)
+             );",
+        )
+        .expect("test: create legacy messages table");
+
+        let media_dir = store.path().join("media/legacy/image-message/image");
+        std::fs::create_dir_all(&media_dir).expect("test: create legacy media directory");
+        let media_path = media_dir.join("message.jpg");
+        std::fs::write(&media_path, b"legacy-downloaded-image").expect("test: write legacy media");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params![
+                "10001@s.whatsapp.net",
+                "legacy-image-message",
+                media_path.display().to_string()
+            ],
+        )
+        .expect("test: seed legacy downloaded media");
+        drop(conn);
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "10001@s.whatsapp.net",
+            "legacy-image-message",
+            Duration::ZERO,
+        )
+        .expect("test: query legacy store")
+        .expect("test: legacy local media path should resolve");
+
+        assert_eq!(
+            resolved,
+            media_path.canonicalize().expect("test: canonical legacy media path")
+        );
+    }
+
+    #[test]
+    fn local_media_lookup_falls_back_to_alias_table() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        let media_dir = store.path().join("media/alias/image-message/image");
+        std::fs::create_dir_all(&media_dir).expect("test: create alias media directory");
+        let media_path = media_dir.join("message.jpg");
+        std::fs::write(&media_path, b"aliased-downloaded-image").expect("test: write aliased media");
+
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, NULL)",
+            rusqlite::params!["10001@s.whatsapp.net", "aliased-image-message"],
+        )
+        .expect("test: seed primary media row");
+        conn.execute(
+            "INSERT INTO message_local_media_aliases (chat_jid, msg_id, local_path, downloaded_at)
+             VALUES (?1, ?2, ?3, 1)",
+            rusqlite::params![
+                "10001@s.whatsapp.net",
+                "aliased-image-message",
+                media_path.display().to_string()
+            ],
+        )
+        .expect("test: seed media alias");
+        drop(conn);
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "10001@s.whatsapp.net",
+            "aliased-image-message",
+            Duration::ZERO,
+        )
+        .expect("test: query media aliases")
+        .expect("test: aliased media path should resolve");
+
+        assert_eq!(
+            resolved,
+            media_path.canonicalize().expect("test: canonical aliased media path")
+        );
     }
 
     // ── HMAC verification ───────────────────────────────────────
