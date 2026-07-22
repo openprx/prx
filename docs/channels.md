@@ -30,3 +30,10 @@ store_dir = "/path/to/wacli-store"
 Newer wacli webhook payloads can carry the resolved `ChatName`. OpenPRX also
 uses `store_dir/wacli.db` as a read-only fallback for group titles when a
 webhook payload does not include that field.
+
+For inbound image understanding, run wacli sync with `--download-media` and
+configure `store_dir`. The webhook arrives before wacli's asynchronous media
+download completes, so OpenPRX briefly waits for the matching `local_path`,
+copies the image into its workspace-owned media store with the configured
+`[multimodal].max_image_size_mb` limit, and then sends it through the normal
+multimodal provider path. Source paths outside `store_dir` are rejected.

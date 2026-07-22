@@ -26,6 +26,7 @@
 //! is explicitly set and the server binds a loopback address.
 
 use super::traits::{Channel, ChannelCapabilities, ChannelMessage, ChatKind, SendMessage};
+use crate::media::MediaArtifactOwner;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use axum::{
@@ -39,7 +40,7 @@ use parking_lot::Mutex;
 use rusqlite::{OpenFlags, OptionalExtension};
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
@@ -59,6 +60,18 @@ const SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// queue stays full this long we drop the message and return 503 so the wacli
 /// background worker is not blocked indefinitely.
 const FORWARD_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The official wacli webhook is emitted before its asynchronous media worker
+/// records `messages.local_path`. Keep this below wacli's five-second webhook
+/// request timeout, including the separate forward timeout below.
+const MEDIA_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Poll interval for the read-only media lookup while wacli finishes download.
+const MEDIA_RESOLVE_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Used only when a channel is constructed without the runtime multimodal
+/// limit (primarily unit tests). Runtime construction overrides this value.
+const DEFAULT_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Replay/idempotency cache TTL. Messages whose key was seen within this window
 /// are treated as duplicates and dropped (200, not forwarded).
@@ -165,6 +178,165 @@ async fn resolve_chat_title(msg: &WacliParsedMessage, cfg: &WacliChannelConfig, 
         }
         Err(error) => {
             tracing::debug!("wacli: chat-title resolver task failed: {error}");
+            None
+        }
+    }
+}
+
+fn query_local_media_path(conn: &rusqlite::Connection, chat_id: &str, message_id: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT local_path FROM messages
+         WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+         UNION
+         SELECT local_path FROM message_local_media_aliases
+         WHERE chat_jid = ?1 AND msg_id = ?2 AND COALESCE(local_path, '') <> ''
+         ORDER BY 1
+         LIMIT 1",
+        rusqlite::params![chat_id, message_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .context("query wacli local media path")
+}
+
+fn wait_for_local_media_path(
+    store_dir: &str,
+    chat_id: &str,
+    message_id: &str,
+    timeout: Duration,
+) -> Result<Option<PathBuf>> {
+    let store_root = Path::new(store_dir)
+        .canonicalize()
+        .with_context(|| format!("canonicalize wacli store directory: {store_dir}"))?;
+    let db_path = store_root.join("wacli.db");
+    let conn = rusqlite::Connection::open_with_flags(&db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .with_context(|| format!("open wacli metadata database read-only: {}", db_path.display()))?;
+    conn.busy_timeout(Duration::from_millis(100))
+        .context("configure wacli media lookup busy timeout")?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(raw_path) = query_local_media_path(&conn, chat_id, message_id)? {
+            let candidate = PathBuf::from(raw_path.trim());
+            let candidate = if candidate.is_absolute() {
+                candidate
+            } else {
+                store_root.join(candidate)
+            };
+            match candidate.canonicalize() {
+                Ok(resolved) => {
+                    if !resolved.starts_with(&store_root) {
+                        anyhow::bail!("wacli local media path is outside the configured store");
+                    }
+                    return Ok(Some(resolved));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    // The DB update and filesystem visibility can briefly race.
+                }
+                Err(error) => {
+                    return Err(error).context("resolve wacli local media path");
+                }
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(MEDIA_RESOLVE_POLL_INTERVAL);
+    }
+}
+
+fn is_image_media(media: &WacliMedia) -> bool {
+    media.media_type.trim().eq_ignore_ascii_case("image")
+        || media.mime_type.trim().to_ascii_lowercase().starts_with("image/")
+}
+
+fn image_extension(media: &WacliMedia, source: &Path) -> &'static str {
+    match media
+        .mime_type
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => match source
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "jpg" | "jpeg" => "jpg",
+            "png" => "png",
+            "webp" => "webp",
+            "gif" => "gif",
+            "bmp" => "bmp",
+            _ => "bin",
+        },
+    }
+}
+
+async fn resolve_inbound_image_marker(
+    msg: &WacliParsedMessage,
+    cfg: &WacliChannelConfig,
+    artifact_owner: Option<&Arc<MediaArtifactOwner>>,
+    max_image_bytes: usize,
+) -> Option<String> {
+    let media = msg.media.as_ref().filter(|media| is_image_media(media))?;
+    let store_dir = cfg
+        .store_dir
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let owner = artifact_owner?;
+    let store_dir = store_dir.to_string();
+    let chat_id = msg.chat.trim().to_string();
+    let message_id = msg.id.trim().to_string();
+
+    let source = match tokio::task::spawn_blocking(move || {
+        wait_for_local_media_path(&store_dir, &chat_id, &message_id, MEDIA_RESOLVE_TIMEOUT)
+    })
+    .await
+    {
+        Ok(Ok(Some(path))) => path,
+        Ok(Ok(None)) => {
+            tracing::warn!("wacli: inbound image was not downloaded before the media resolution timeout");
+            return None;
+        }
+        Ok(Err(error)) => {
+            tracing::warn!("wacli: failed to resolve inbound image from the read-only store: {error}");
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!("wacli: inbound image resolver task failed: {error}");
+            return None;
+        }
+    };
+
+    let extension = image_extension(media, &source);
+    match owner.import_channel_file(&source, extension, max_image_bytes).await {
+        Ok(artifact) => {
+            tracing::info!(
+                size_bytes = artifact.size_bytes,
+                "wacli: admitted inbound image into workspace media store"
+            );
+            Some(format!("[IMAGE:{}]", artifact.path.display()))
+        }
+        Err(error) => {
+            let reason = match error {
+                crate::media::ArtifactError::TooLarge { .. } => "too_large",
+                crate::media::ArtifactError::InvalidLocalFile(_) => "invalid_local_file",
+                crate::media::ArtifactError::Io { .. } => "io",
+                _ => "rejected",
+            };
+            tracing::warn!(reason, "wacli: inbound image admission rejected");
             None
         }
     }
@@ -281,6 +453,8 @@ struct WebhookState {
     secret: Option<Arc<str>>,
     tx: mpsc::Sender<ChannelMessage>,
     replay: Arc<ReplayCache>,
+    artifact_owner: Option<Arc<MediaArtifactOwner>>,
+    max_image_bytes: usize,
 }
 
 // ── Channel implementation ──────────────────────────────────────────────────
@@ -289,6 +463,8 @@ struct WebhookState {
 pub struct WacliChannel {
     config: Arc<WacliChannelConfig>,
     replay: Arc<ReplayCache>,
+    artifact_owner: Option<Arc<MediaArtifactOwner>>,
+    max_image_bytes: usize,
 }
 
 impl WacliChannel {
@@ -297,7 +473,18 @@ impl WacliChannel {
         Self {
             config: Arc::new(config),
             replay: Arc::new(ReplayCache::new(REPLAY_TTL, REPLAY_MAX_KEYS)),
+            artifact_owner: None,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
         }
+    }
+
+    /// Configure workspace-owned admission for inbound images downloaded by
+    /// wacli. The source remains outside the workspace and is never exposed to
+    /// the model directly.
+    pub fn with_media_artifacts(mut self, owner: Arc<MediaArtifactOwner>, max_image_bytes: usize) -> Self {
+        self.artifact_owner = Some(owner);
+        self.max_image_bytes = max_image_bytes.max(1);
+        self
     }
 
     /// Resolved binary path for outbound `wacli` invocations.
@@ -525,29 +712,13 @@ async fn handle_wacli_webhook(
         return StatusCode::OK;
     }
 
-    // 6. Build media description (if any).
-    let media_desc = msg.media.as_ref().map(|m| {
-        let kind = if m.media_type.trim().is_empty() {
-            "file"
-        } else {
-            m.media_type.trim()
-        };
-        match (m.mime_type.trim(), m.caption.trim()) {
-            ("", "") => format!("[{kind}]"),
-            (mime, "") => format!("[{kind}: {mime}]"),
-            ("", cap) => format!("[{kind} — {cap}]"),
-            (mime, cap) => format!("[{kind}: {mime} — {cap}]"),
-        }
-    });
-
+    // 6. Drop empty messages and reject known replays before performing media
+    // polling or copying files into the workspace.
     let text = msg.text.trim();
-    // 7. Drop messages with neither text nor media.
-    if text.is_empty() && media_desc.is_none() {
+    if text.is_empty() && msg.media.is_none() {
         tracing::debug!("wacli: empty message (no text/media), skipping");
         return StatusCode::OK;
     }
-
-    // 8. Replay/idempotency check.
     let replay_key = format!(
         "{}|{}|{}|{}",
         msg.chat.trim(),
@@ -560,7 +731,44 @@ async fn handle_wacli_webhook(
         return StatusCode::OK;
     }
 
-    // 9. Assemble the ChannelMessage.
+    // 7. Resolve an inbound image after wacli's asynchronous downloader records
+    // its local path, then import it into the workspace-owned artifact store.
+    let image_advertised = msg.media.as_ref().is_some_and(is_image_media);
+    let image_marker =
+        resolve_inbound_image_marker(&msg, cfg, state.artifact_owner.as_ref(), state.max_image_bytes).await;
+
+    // Build a human-readable media description (if any) and pair it with a
+    // machine-readable multimodal marker when image admission succeeded.
+    let mut media_desc = msg.media.as_ref().map(|m| {
+        let kind = if m.media_type.trim().is_empty() {
+            "file"
+        } else {
+            m.media_type.trim()
+        };
+        match (m.mime_type.trim(), m.caption.trim()) {
+            ("", "") => format!("[{kind}]"),
+            (mime, "") => format!("[{kind}: {mime}]"),
+            ("", cap) => format!("[{kind} — {cap}]"),
+            (mime, cap) => format!("[{kind}: {mime} — {cap}]"),
+        }
+    });
+    if image_advertised {
+        let resolved_image_markers = usize::from(image_marker.is_some());
+        let status = if image_marker.is_some() { "ready" } else { "unavailable" };
+        let meta = format!(
+            "[wacli-meta image_attachments=1 resolved_image_markers={resolved_image_markers} vision_required=true media_status={status}]"
+        );
+        if let Some(marker) = image_marker {
+            media_desc = Some(media_desc.map_or_else(
+                || format!("{marker}\n{meta}"),
+                |description| format!("{description}\n{marker}\n{meta}"),
+            ));
+        } else {
+            media_desc = Some(media_desc.map_or_else(|| meta.clone(), |description| format!("{description}\n{meta}")));
+        }
+    }
+
+    // 8. Assemble the ChannelMessage.
     let is_group = msg.chat.trim().ends_with("@g.us");
     let chat_title = resolve_chat_title(&msg, cfg, is_group).await;
     let sender_display = if msg.push_name.trim().is_empty() {
@@ -615,7 +823,7 @@ async fn handle_wacli_webhook(
         "wacli: inbound message"
     );
 
-    // 10. Back-pressure-aware forward (bounded wait, then 503).
+    // 9. Back-pressure-aware forward (bounded wait, then 503).
     match tokio::time::timeout(FORWARD_TIMEOUT, state.tx.send(channel_msg)).await {
         Ok(Ok(())) => {
             // Record AFTER successful forward so failed/retried deliveries are not
@@ -706,6 +914,8 @@ impl Channel for WacliChannel {
             secret,
             tx,
             replay: self.replay.clone(),
+            artifact_owner: self.artifact_owner.clone(),
+            max_image_bytes: self.max_image_bytes,
         };
 
         let app = Router::new().route(&path, post(handle_wacli_webhook)).with_state(state);
@@ -787,7 +997,44 @@ mod tests {
             secret,
             tx,
             replay: Arc::new(ReplayCache::new(REPLAY_TTL, REPLAY_MAX_KEYS)),
+            artifact_owner: None,
+            max_image_bytes: DEFAULT_MAX_IMAGE_BYTES,
         }
+    }
+
+    fn create_media_store(store: &Path) {
+        let conn = rusqlite::Connection::open(store.join("wacli.db")).expect("test: create wacli database");
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                chat_jid TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                local_path TEXT,
+                PRIMARY KEY (chat_jid, msg_id)
+             );
+             CREATE TABLE message_local_media_aliases (
+                chat_jid TEXT NOT NULL,
+                msg_id TEXT NOT NULL,
+                local_path TEXT NOT NULL,
+                downloaded_at INTEGER,
+                PRIMARY KEY (chat_jid, msg_id, local_path)
+             );",
+        )
+        .expect("test: create media tables");
+    }
+
+    fn media_payload() -> Vec<u8> {
+        r#"{
+            "Chat": "10001@s.whatsapp.net",
+            "ID": "image-message-1",
+            "SenderJID": "10001@s.whatsapp.net",
+            "Timestamp": "2026-06-17T04:39:01Z",
+            "FromMe": false,
+            "Text": "inspect",
+            "Media": {"Type": "image", "Caption": "screen", "Filename": "screen.jpg", "MimeType": "image/jpeg"},
+            "PushName": "PRXOperator"
+        }"#
+        .as_bytes()
+        .to_vec()
     }
 
     fn sign(secret: &str, body: &[u8]) -> String {
@@ -868,6 +1115,71 @@ mod tests {
         assert_eq!(media.mime_type, "image/jpeg");
     }
 
+    #[test]
+    fn local_media_lookup_waits_for_async_download_and_confines_source() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        create_media_store(store.path());
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, NULL)",
+            rusqlite::params!["10001@s.whatsapp.net", "image-message-1"],
+        )
+        .expect("test: seed pending media");
+        drop(conn);
+
+        let media_dir = store.path().join("media/10001/image-message-1/image");
+        std::fs::create_dir_all(&media_dir).expect("test: create media directory");
+        let media_path = media_dir.join("message.jpg");
+        let db_path = store.path().join("wacli.db");
+        let writer_path = media_path.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            std::fs::write(&writer_path, b"downloaded-image").expect("test: write downloaded image");
+            let conn = rusqlite::Connection::open(db_path).expect("test: open writer database");
+            conn.execute(
+                "UPDATE messages SET local_path = ?1 WHERE chat_jid = ?2 AND msg_id = ?3",
+                rusqlite::params![
+                    writer_path.display().to_string(),
+                    "10001@s.whatsapp.net",
+                    "image-message-1"
+                ],
+            )
+            .expect("test: publish downloaded path");
+        });
+
+        let resolved = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "10001@s.whatsapp.net",
+            "image-message-1",
+            Duration::from_secs(1),
+        )
+        .expect("test: resolve media path")
+        .expect("test: media path should appear");
+        writer.join().expect("test: join media writer");
+        assert_eq!(resolved, media_path.canonicalize().expect("test: canonical media path"));
+
+        let outside = tempfile::NamedTempFile::new().expect("test: create outside media");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: reopen wacli database");
+        conn.execute(
+            "UPDATE messages SET local_path = ?1 WHERE chat_jid = ?2 AND msg_id = ?3",
+            rusqlite::params![
+                outside.path().display().to_string(),
+                "10001@s.whatsapp.net",
+                "image-message-1"
+            ],
+        )
+        .expect("test: point media outside store");
+        drop(conn);
+        let error = wait_for_local_media_path(
+            store.path().to_str().expect("test: utf8 store path"),
+            "10001@s.whatsapp.net",
+            "image-message-1",
+            Duration::ZERO,
+        )
+        .expect_err("test: outside-store path must be rejected");
+        assert!(error.to_string().contains("outside the configured store"));
+    }
+
     // ── HMAC verification ───────────────────────────────────────
 
     #[test]
@@ -944,6 +1256,118 @@ mod tests {
         assert!(msg.content.contains("[WhatsApp Group]"));
         assert!(msg.content.contains("Alice"));
         assert!(msg.content.contains("hello world"));
+    }
+
+    #[tokio::test]
+    async fn handler_imports_downloaded_image_into_workspace_multimodal_path() {
+        use base64::Engine as _;
+
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        let workspace = tempfile::tempdir().expect("test: create workspace");
+        create_media_store(store.path());
+        let source_dir = store.path().join("media/10001/image-message-1/image");
+        std::fs::create_dir_all(&source_dir).expect("test: create media directory");
+        let source = source_dir.join("message.jpg");
+        let image_bytes = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=")
+            .expect("test: decode image fixture");
+        std::fs::write(&source, &image_bytes).expect("test: write image");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["10001@s.whatsapp.net", "image-message-1", source.display().to_string()],
+        )
+        .expect("test: seed downloaded media");
+        drop(conn);
+
+        let mut cfg = cfg_with_secret();
+        cfg.store_dir = Some(store.path().display().to_string());
+        let owner = MediaArtifactOwner::for_workspace(workspace.path());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = state_for(cfg, tx);
+        state.artifact_owner = Some(owner.clone());
+        state.max_image_bytes = 1024;
+        let app = router_for(state);
+        let body = media_payload();
+        let sig = sign("topsecret", &body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build request");
+
+        let resp = app.oneshot(req).await.expect("test: response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("test: forwarded message");
+        let (_, image_refs) = crate::multimodal::parse_image_markers(&msg.content);
+        assert_eq!(image_refs.len(), 1);
+        let managed_path = PathBuf::from(image_refs.first().expect("test: one image reference"));
+        assert!(managed_path.starts_with(owner.artifact_dir()));
+        assert_eq!(
+            std::fs::read(&managed_path).expect("test: read managed image"),
+            image_bytes
+        );
+        assert!(msg.content.contains("resolved_image_markers=1"));
+        assert!(msg.content.contains("media_status=ready"));
+
+        let provider_messages = vec![crate::providers::ChatMessage::user(msg.content)];
+        let prepared = crate::multimodal::prepare_messages_for_provider(
+            &provider_messages,
+            &crate::config::MultimodalConfig::default(),
+            owner.as_ref(),
+        )
+        .await
+        .expect("test: normalize imported image for provider");
+        assert!(prepared.contains_images);
+        assert!(
+            prepared
+                .messages
+                .first()
+                .expect("test: one prepared message")
+                .content
+                .contains("data:image/png;base64,")
+        );
+    }
+
+    #[tokio::test]
+    async fn handler_marks_oversized_image_unavailable_without_exposing_source_path() {
+        let store = tempfile::tempdir().expect("test: create wacli store");
+        let workspace = tempfile::tempdir().expect("test: create workspace");
+        create_media_store(store.path());
+        let source = store.path().join("oversized.jpg");
+        std::fs::write(&source, [7_u8; 32]).expect("test: write oversized image");
+        let conn = rusqlite::Connection::open(store.path().join("wacli.db")).expect("test: open wacli database");
+        conn.execute(
+            "INSERT INTO messages (chat_jid, msg_id, local_path) VALUES (?1, ?2, ?3)",
+            rusqlite::params!["10001@s.whatsapp.net", "image-message-1", source.display().to_string()],
+        )
+        .expect("test: seed oversized media");
+        drop(conn);
+
+        let mut cfg = cfg_with_secret();
+        cfg.store_dir = Some(store.path().display().to_string());
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut state = state_for(cfg, tx);
+        state.artifact_owner = Some(MediaArtifactOwner::for_workspace(workspace.path()));
+        state.max_image_bytes = 16;
+        let app = router_for(state);
+        let body = media_payload();
+        let sig = sign("topsecret", &body);
+        let req = Request::builder()
+            .method("POST")
+            .uri("/wacli")
+            .header("X-Wacli-Signature", sig)
+            .body(Body::from(body))
+            .expect("test: build request");
+
+        let resp = app.oneshot(req).await.expect("test: response");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let msg = rx.try_recv().expect("test: forwarded message");
+        assert!(crate::multimodal::parse_image_markers(&msg.content).1.is_empty());
+        assert!(msg.content.contains("resolved_image_markers=0"));
+        assert!(msg.content.contains("media_status=unavailable"));
+        assert!(!msg.content.contains(source.to_str().expect("test: utf8 source path")));
     }
 
     #[tokio::test]

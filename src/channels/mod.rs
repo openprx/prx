@@ -5259,18 +5259,25 @@ pub async fn start_channels_with_config(
     }
 
     if let Some(ref wc) = config.channels_config.wacli {
-        channels.push(Arc::new(WacliChannel::new(wacli::WacliChannelConfig {
-            webhook_listen: wc.webhook_listen.clone(),
-            webhook_path: wc.webhook_path.clone(),
-            webhook_secret: wc.webhook_secret.clone(),
-            allow_unsigned_loopback: wc.allow_unsigned_loopback,
-            allowed_from: wc.allowed_from.clone(),
-            cli_path: wc.cli_path.clone(),
-            store_dir: wc.store_dir.clone(),
-            bot_jid: wc.bot_jid.clone(),
-            bot_number: wc.bot_number.clone(),
-            bot_lid: wc.bot_lid.clone(),
-        })));
+        let (_, max_image_size_mb) = config.multimodal.effective_limits();
+        channels.push(Arc::new(
+            WacliChannel::new(wacli::WacliChannelConfig {
+                webhook_listen: wc.webhook_listen.clone(),
+                webhook_path: wc.webhook_path.clone(),
+                webhook_secret: wc.webhook_secret.clone(),
+                allow_unsigned_loopback: wc.allow_unsigned_loopback,
+                allowed_from: wc.allowed_from.clone(),
+                cli_path: wc.cli_path.clone(),
+                store_dir: wc.store_dir.clone(),
+                bot_jid: wc.bot_jid.clone(),
+                bot_number: wc.bot_number.clone(),
+                bot_lid: wc.bot_lid.clone(),
+            })
+            .with_media_artifacts(
+                crate::media::MediaArtifactOwner::for_workspace(&config.workspace_dir),
+                max_image_size_mb.saturating_mul(1024 * 1024),
+            ),
+        ));
     }
 
     if let Some(ref nc) = config.channels_config.nextcloud_talk {
