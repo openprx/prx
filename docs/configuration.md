@@ -117,6 +117,7 @@ allowed_from = ["uuid:your-uuid"]
 webhook_listen = "127.0.0.1:16868"
 webhook_path = "/wacli"
 webhook_secret = "replace-with-secret"
+store_dir = "/path/to/wacli-store" # required for group-title fallback and inbound downloaded images
 
 [heartbeat]
 interval_minutes = 30
