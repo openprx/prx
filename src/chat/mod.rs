@@ -82,8 +82,7 @@ use crate::agent::loop_::{
 use crate::approval::ApprovalManager;
 use crate::channels::traits::extract_outgoing_media;
 use crate::channels::{
-    Channel, SendMessage, TerminalChannel, extract_tool_context_summary, is_context_window_overflow_error,
-    sanitize_channel_response,
+    Channel, SendMessage, TerminalChannel, is_context_window_overflow_error, sanitize_channel_response,
 };
 use crate::chat::terminal_proto::DraftVersionCounter;
 use crate::config::Config;
@@ -8310,26 +8309,20 @@ Retry with a compatible model: /provider {new_provider} <model>"
             }
         };
 
-        // ── Extract tool context summary for LLM awareness on next turn ──
-        let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-        // Always persist the assistant response to history. When tools were
-        // invoked, prepend the summary so the LLM retains awareness.
-        let history_response = if tool_summary.is_empty() {
-            response.clone()
-        } else {
-            format!("{tool_summary}\n{response}")
-        };
-        history.push(ChatMessage::assistant(&history_response));
+        // Persist only the user-facing assistant response. Tool results already
+        // live in structured history entries; adding a synthetic summary here
+        // can teach the model to emit that internal marker as a final answer.
+        history.push(ChatMessage::assistant(&response));
 
-        // S2-B Step 4: dispatch RecordAssistantTurn(history_response) 在与 legacy
+        // S2-B Step 4: dispatch RecordAssistantTurn(response) 在与 legacy
         // `history.push(ChatMessage::assistant(...))` 同一点 — reducer 的
         // session.history 与 legacy history 字节级对齐。下方 line 2055 处的
         // 旧 dispatch 用 sanitized_response，与 history.push 内容不同 — S2-B Step 4
-        // 起改在此处 dispatch 用 history_response，下方旧 dispatch 删除。
+        // 起改在此处 dispatch 用 response，下方旧 dispatch 删除。
         let _ = chat_dispatcher.dispatch_or_log(
             crate::chat::action::Action::RecordAssistantTurn {
                 task_id: provider_turn_task_id,
-                content: history_response.clone(),
+                content: response.clone(),
             },
             "chat.record_assistant_turn",
         );
@@ -8337,8 +8330,8 @@ Retry with a compatible model: /provider {new_provider} <model>"
         // T3-3-fixA P0-1: StreamCompleted 必须在 RecordAssistantTurn 之后 dispatch，
         // reducer 的 reduce_stream_completed 会 emit Effect::SaveSession(snapshot)，
         // 此时 session.turns 已含当轮 assistant —— 否则 SaveSession 落盘旧快照。
-        // final_text 用 response (UI 展示文案)，与上方 history_response (含 tool_summary
-        // 前缀供 history 写入) 语义不同：reducer 的 conversation_lines 与 UI 对齐.
+        // final_text 与上方持久化的 response 一致，让 reducer 的
+        // conversation_lines、历史记录与 UI 对齐。
         if let Some(ref d_id) = draft_id {
             let _ = chat_dispatcher.dispatch_or_log(
                 crate::chat::action::Action::StreamCompleted {
@@ -8404,7 +8397,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
 
         // ── Record turn in session + persist ───────────────────
         // S2-B Step 4: RecordUserTurn / RecordAssistantTurn 已经在上面（enriched /
-        // history_response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 在
+        // response 同点）dispatch；这里 legacy `chat_session.add_*_turn` 在
         // `Off` / `Both` / `Redux` 模式下保留，因为 `chat_session` 仍是
         // `save_session(mem, &chat_session)` 的真实持久化源。
         //

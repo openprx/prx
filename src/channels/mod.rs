@@ -1838,100 +1838,6 @@ async fn build_memory_context(mem: &dyn Memory, user_msg: &str, min_relevance_sc
     context
 }
 
-/// Extract a compact summary of tool interactions from history messages added
-/// during `run_tool_call_loop`. Scans assistant messages for `<tool_call>` tags
-/// or native tool-call JSON to collect tool names used.
-/// Returns an empty string when no tools were invoked.
-pub(crate) fn extract_tool_context_summary(history: &[ChatMessage], start_index: usize) -> String {
-    fn push_unique_tool_name(tool_names: &mut Vec<String>, name: &str) {
-        let candidate = name.trim();
-        if candidate.is_empty() {
-            return;
-        }
-        if !tool_names.iter().any(|existing| existing == candidate) {
-            tool_names.push(candidate.to_string());
-        }
-    }
-
-    fn collect_tool_names_from_tool_call_tags(content: &str, tool_names: &mut Vec<String>) {
-        const TAG_PAIRS: [(&str, &str); 4] = [
-            ("<tool_call>", "</tool_call>"),
-            ("<toolcall>", "</toolcall>"),
-            ("<tool-call>", "</tool-call>"),
-            ("<invoke>", "</invoke>"),
-        ];
-
-        for (open_tag, close_tag) in TAG_PAIRS {
-            for segment in content.split(open_tag) {
-                if let Some(json_end) = segment.find(close_tag) {
-                    let json_str = segment[..json_end].trim();
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_str) {
-                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                            push_unique_tool_name(tool_names, name);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_tool_names_from_native_json(content: &str, tool_names: &mut Vec<String>) {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(content) {
-            if let Some(calls) = val.get("tool_calls").and_then(|c| c.as_array()) {
-                for call in calls {
-                    let name = call
-                        .get("function")
-                        .and_then(|f| f.get("name"))
-                        .and_then(|n| n.as_str())
-                        .or_else(|| call.get("name").and_then(|n| n.as_str()));
-                    if let Some(name) = name {
-                        push_unique_tool_name(tool_names, name);
-                    }
-                }
-            }
-        }
-    }
-
-    fn collect_tool_names_from_tool_results(content: &str, tool_names: &mut Vec<String>) {
-        let marker = "<tool_result name=\"";
-        let mut remaining = content;
-        while let Some(start) = remaining.find(marker) {
-            let name_start = start + marker.len();
-            let after_name_start = &remaining[name_start..];
-            if let Some(name_end) = after_name_start.find('"') {
-                let name = &after_name_start[..name_end];
-                push_unique_tool_name(tool_names, name);
-                remaining = &after_name_start[name_end + 1..];
-            } else {
-                break;
-            }
-        }
-    }
-
-    let mut tool_names: Vec<String> = Vec::new();
-
-    for msg in history.iter().skip(start_index) {
-        match msg.role.as_str() {
-            "assistant" => {
-                collect_tool_names_from_tool_call_tags(&msg.content, &mut tool_names);
-                collect_tool_names_from_native_json(&msg.content, &mut tool_names);
-            }
-            "user" => {
-                // Prompt-mode tool calls are always followed by [Tool results] entries
-                // containing `<tool_result name="...">` tags with canonical tool names.
-                collect_tool_names_from_tool_results(&msg.content, &mut tool_names);
-            }
-            _ => {}
-        }
-    }
-
-    if tool_names.is_empty() {
-        return String::new();
-    }
-
-    format!("[Used tools: {}]", tool_names.join(", "))
-}
-
 pub(crate) fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
     let known_tool_names: HashSet<String> = tools.iter().map(|tool| tool.name().to_ascii_lowercase()).collect();
     let cleaned_tags = strip_isolated_tool_tag_artifacts(response, &known_tool_names);
@@ -3236,7 +3142,6 @@ async fn process_channel_message(
         Cancelled,
         Success {
             response: String,
-            history_len_before_tools: usize,
             trace: crate::agent::loop_::ToolLoopTrace,
         },
         /// Smart group-reply: the model chose to stay silent. No message is sent
@@ -3293,8 +3198,6 @@ async fn process_channel_message(
     let mut context_overflow_retries = 0usize;
     let mut timeout_retries = 0usize;
     let final_outcome = loop {
-        // Record history length before tool loop so we can extract tool context after.
-        let history_len_before_tools = history.len();
         let llm_result = tokio::select! {
             () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
             result = tokio::time::timeout(
@@ -3354,11 +3257,7 @@ async fn process_channel_message(
             LlmExecutionResult::Completed(result) => match *result {
                 Ok(Ok((outcome, trace))) => match outcome {
                     crate::agent::loop_::ToolLoopOutcome::Text(response) => {
-                        break LlmFinalOutcome::Success {
-                            response,
-                            history_len_before_tools,
-                            trace,
-                        };
+                        break LlmFinalOutcome::Success { response, trace };
                     }
                     crate::agent::loop_::ToolLoopOutcome::Silent { reason } => {
                         break LlmFinalOutcome::Silent { reason, trace };
@@ -3484,27 +3383,13 @@ async fn process_channel_message(
                 }
             }
         }
-        LlmFinalOutcome::Success {
-            response,
-            history_len_before_tools,
-            trace,
-        } => {
+        LlmFinalOutcome::Success { response, trace } => {
             let sanitized_response = sanitize_channel_response(&response, ctx.tools_registry.as_ref());
             let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty() {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again."
                     .to_string()
             } else {
                 sanitized_response
-            };
-
-            // Extract condensed tool-use context from the history messages
-            // added during run_tool_call_loop, so the LLM retains awareness
-            // of what it did on subsequent turns.
-            let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() {
-                delivered_response.clone()
-            } else {
-                format!("{tool_summary}\n{delivered_response}")
             };
 
             let provider_outcome =
@@ -3516,7 +3401,7 @@ async fn process_channel_message(
                     scope: runtime_envelope.message_scope().with_sender("prx"),
                     status: crate::agent::terminal::TurnTerminalStatus::Completed,
                     history: Some(crate::agent::terminal::TurnHistoryProjection {
-                        assistant_content: history_response.clone(),
+                        assistant_content: delivered_response.clone(),
                         history_commit_len: history.len().saturating_add(1),
                     }),
                     history_scope: None,
@@ -3549,7 +3434,7 @@ async fn process_channel_message(
                 &msg.channel,
                 &msg.sender,
                 Some(&msg.reply_target),
-                ChatMessage::assistant(&history_response),
+                ChatMessage::assistant(&delivered_response),
                 message_visibility,
                 None,
                 None,
@@ -7564,7 +7449,7 @@ BTC is currently around $65,000 based on latest tool output."#
         });
 
         process_channel_message(
-            runtime_ctx,
+            Arc::clone(&runtime_ctx),
             traits::ChannelMessage {
                 id: "msg-1".to_string(),
                 sender: "alice".to_string(),
@@ -7593,6 +7478,26 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(response.contains("BTC is currently around"));
         assert!(!response.contains("\"tool_calls\""));
         assert!(!response.contains("mock_price"));
+        drop(sent_messages);
+
+        let histories = runtime_ctx.conversation_histories.lock();
+        let assistant_turns: Vec<&ChatMessage> = histories
+            .values()
+            .flat_map(|turns| turns.iter())
+            .filter(|message| message.role == "assistant")
+            .collect();
+        assert!(
+            assistant_turns
+                .iter()
+                .any(|message| message.content.contains("BTC is currently around")),
+            "the natural-language answer must be retained in channel history: {assistant_turns:?}"
+        );
+        assert!(
+            assistant_turns
+                .iter()
+                .all(|message| !message.content.starts_with("[Used tools:")),
+            "tool provenance must not be injected into assistant history: {assistant_turns:?}"
+        );
     }
 
     #[tokio::test]
@@ -10866,63 +10771,6 @@ BTC is currently around $65,000 based on latest tool output."#
             "telegram delivery instruction should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
-    }
-
-    #[test]
-    fn extract_tool_context_summary_collects_alias_and_native_tool_calls() {
-        let history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::assistant(
-                r#"<toolcall>
-{"name":"shell","arguments":{"command":"date"}}
-</toolcall>"#,
-            ),
-            ChatMessage::assistant(
-                r#"{"content":null,"tool_calls":[{"id":"1","name":"web_search","arguments":"{}"}]}"#,
-            ),
-        ];
-
-        let summary = extract_tool_context_summary(&history, 1);
-        assert_eq!(summary, "[Used tools: shell, web_search]");
-    }
-
-    #[test]
-    fn extract_tool_context_summary_collects_prompt_mode_tool_result_names() {
-        let history = vec![
-            ChatMessage::system("sys"),
-            ChatMessage::assistant("Using markdown tool call fence"),
-            ChatMessage::user(
-                r#"[Tool results]
-<tool_result name="http_request">
-{"status":200}
-</tool_result>
-<tool_result name="shell">
-Mon Feb 20
-</tool_result>"#,
-            ),
-        ];
-
-        let summary = extract_tool_context_summary(&history, 1);
-        assert_eq!(summary, "[Used tools: http_request, shell]");
-    }
-
-    #[test]
-    fn extract_tool_context_summary_respects_start_index() {
-        let history = vec![
-            ChatMessage::assistant(
-                r#"<tool_call>
-{"name":"stale_tool","arguments":{}}
-</tool_call>"#,
-            ),
-            ChatMessage::assistant(
-                r#"<tool_call>
-{"name":"fresh_tool","arguments":{}}
-</tool_call>"#,
-            ),
-        ];
-
-        let summary = extract_tool_context_summary(&history, 1);
-        assert_eq!(summary, "[Used tools: fresh_tool]");
     }
 
     #[test]

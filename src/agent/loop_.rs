@@ -81,9 +81,24 @@ impl ChatMode {
 }
 
 pub(crate) const EMPTY_ASSISTANT_RESPONSE_MESSAGE: &str = "model returned empty response";
+const TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE: &str = "The previous assistant response was an internal tool-use summary, not a valid answer. \
+     Either invoke the required tools now or provide a complete final answer. \
+     Do not output a '[Used tools: ...]' summary.";
 
 pub(crate) fn is_empty_assistant_response(text: &str, has_tool_calls: bool) -> bool {
     text.trim().is_empty() && !has_tool_calls
+}
+
+pub(crate) fn is_tool_summary_only_response(text: &str) -> bool {
+    let trimmed = text.trim();
+    let Some(tool_names) = trimmed
+        .strip_prefix("[Used tools:")
+        .and_then(|value| value.strip_suffix(']'))
+    else {
+        return false;
+    };
+
+    !tool_names.trim().is_empty() && !tool_names.contains(['\n', '\r'])
 }
 
 /// Lightweight notification for tool call progress (used by chat/TUI integration).
@@ -5977,6 +5992,8 @@ pub(crate) async fn run_tool_call_loop_outcome(
     let mut overflow_retries: usize = 0;
     let mut consecutive_failures: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut unrecoverable_failures: std::collections::HashMap<String, u8> = std::collections::HashMap::new();
+    let mut tool_summary_retry_attempted = false;
+    let mut inject_tool_summary_retry_instruction = false;
 
     for iteration in 0..max_iterations {
         // Notify progress for multi-iteration tool loops (skip the first iteration).
@@ -6021,8 +6038,14 @@ pub(crate) async fn run_tool_call_loop_outcome(
         }
 
         let media_artifacts = hooks.media_artifacts();
-        let prepared_messages =
+        let mut prepared_messages =
             multimodal::prepare_messages_for_provider(history, multimodal_config, media_artifacts.as_ref()).await?;
+        if inject_tool_summary_retry_instruction {
+            prepared_messages
+                .messages
+                .push(ChatMessage::system(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE));
+            inject_tool_summary_retry_instruction = false;
+        }
         for tool in tools_registry.iter() {
             if let Err(err) = tool.refresh().await {
                 let message = format!("refresh failed for tool {}: {err}", tool.name());
@@ -6331,6 +6354,19 @@ pub(crate) async fn run_tool_call_loop_outcome(
 
         if tool_calls.is_empty() {
             // No tool calls — this is the final response.
+            if is_tool_summary_only_response(&response_text) {
+                if tool_summary_retry_attempted {
+                    anyhow::bail!("model returned a tool-summary-only response after one corrective retry");
+                }
+                tracing::warn!(
+                    provider = provider_name,
+                    model,
+                    "model returned a tool-summary-only response; retrying once with a corrective instruction"
+                );
+                tool_summary_retry_attempted = true;
+                inject_tool_summary_retry_instruction = true;
+                continue;
+            }
             if is_empty_assistant_response(&response_text, false) {
                 tracing::warn!(
                     provider = provider_name,
@@ -13431,23 +13467,14 @@ Let me check the result."#;
         use super::*;
         use crate::tools::StaySilentTool;
 
-        #[tokio::test]
-        async fn empty_assistant_response_writes_no_assistant_history() {
-            let provider = ScriptedProvider {
-                responses: Arc::new(Mutex::new(
-                    vec![ChatResponse {
-                        text: Some("   \n".to_string()),
-                        tool_calls: Vec::new(),
-                        reasoning_content: Some("thinking without content".to_string()),
-                    }]
-                    .into(),
-                )),
-            };
+        async fn run_without_tools(
+            responses: Vec<&str>,
+        ) -> (anyhow::Result<(ToolLoopOutcome, ToolLoopTrace)>, Vec<ChatMessage>) {
+            let provider = ScriptedProvider::from_text_responses(responses);
             let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
             let mut history = vec![ChatMessage::system("sys"), ChatMessage::user("hi")];
             let tmp = TempDir::new().unwrap();
-
-            let (outcome, _trace) = run_tool_call_loop_outcome(
+            let outcome = run_tool_call_loop_outcome(
                 &provider,
                 &mut history,
                 Arc::new(tools_registry),
@@ -13479,14 +13506,69 @@ Let me check the result."#;
                 false,
                 None,
             )
-            .await
-            .expect("empty response turn should complete");
+            .await;
+            (outcome, history)
+        }
+
+        #[test]
+        fn tool_summary_only_response_requires_an_exact_standalone_marker() {
+            assert!(is_tool_summary_only_response("[Used tools: shell]"));
+            assert!(is_tool_summary_only_response(
+                " \n[Used tools: shell, web_search_tool]\n"
+            ));
+            assert!(!is_tool_summary_only_response("[Used tools:]"));
+            assert!(!is_tool_summary_only_response(
+                "[Used tools: shell]\nThe requested check completed."
+            ));
+            assert!(!is_tool_summary_only_response("Used tools: shell"));
+        }
+
+        #[tokio::test]
+        async fn empty_assistant_response_writes_no_assistant_history() {
+            let (result, history) = run_without_tools(vec!["   \n"]).await;
+            let (outcome, _trace) = result.expect("empty response turn should complete");
 
             assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text.is_empty()));
             assert_eq!(history.len(), 2, "empty assistant turn must not be appended");
             assert!(
                 history.iter().all(|message| message.role != "assistant"),
                 "history must not contain an assistant turn after empty response: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn tool_summary_only_response_retries_and_returns_real_answer() {
+            let (result, history) =
+                run_without_tools(vec!["[Used tools: shell]", "The requested check completed."]).await;
+            let (outcome, _trace) = result.expect("corrective retry should complete");
+
+            assert!(matches!(outcome, ToolLoopOutcome::Text(ref text) if text == "The requested check completed."));
+            assert_eq!(history.len(), 3);
+            assert_eq!(history.last().map(|message| message.role.as_str()), Some("assistant"));
+            assert_eq!(
+                history.last().map(|message| message.content.as_str()),
+                Some("The requested check completed.")
+            );
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !message.content.contains(TOOL_SUMMARY_ONLY_RESPONSE_MESSAGE)),
+                "the corrective instruction must remain request-local: {history:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn repeated_tool_summary_only_response_fails_without_polluting_history() {
+            let (result, history) = run_without_tools(vec!["[Used tools: shell]", "[Used tools: shell]"]).await;
+            let error = result.expect_err("a repeated summary-only response must fail closed");
+
+            assert!(error.to_string().contains("after one corrective retry"));
+            assert_eq!(history.len(), 2);
+            assert!(
+                history
+                    .iter()
+                    .all(|message| !is_tool_summary_only_response(&message.content)),
+                "summary-only artifacts must not enter history: {history:?}"
             );
         }
 
