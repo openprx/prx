@@ -10,7 +10,7 @@ use tokio_rustls::rustls;
 
 /// Read timeout for IRC — if no data arrives within this duration, the
 /// connection is considered dead. IRC servers typically PING every 60-120s.
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(5);
 
 /// Monotonic counter to ensure unique message IDs under burst traffic.
 static MSG_SEQ: AtomicU64 = AtomicU64::new(0);

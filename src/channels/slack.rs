@@ -509,11 +509,11 @@ mod tests {
         );
         assert_eq!(
             SlackChannel::poll_backoff_duration(7),
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_mins(1)
         );
         assert_eq!(
             SlackChannel::poll_backoff_duration(99),
-            std::time::Duration::from_secs(60)
+            std::time::Duration::from_mins(1)
         );
     }
 }

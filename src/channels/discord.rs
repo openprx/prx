@@ -517,7 +517,7 @@ impl Channel for DiscordChannel {
         let handle = tokio::spawn(async move {
             let url = format!("https://discord.com/api/v10/channels/{channel_id}/typing");
             // Auto-expire after 60 seconds (safety net if stop_typing is never called)
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_mins(1);
             loop {
                 if tokio::time::Instant::now() >= deadline {
                     break;

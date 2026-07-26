@@ -122,7 +122,7 @@ impl Provider for HangingProvider {
         let call_idx = self.call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if call_idx >= self.hang_on_call {
             // Hang for a very long time (simulates timeout)
-            tokio::time::sleep(Duration::from_secs(3600)).await;
+            tokio::time::sleep(Duration::from_hours(1)).await;
             anyhow::bail!("provider timeout (should not reach here)");
         }
         let mut guard = self.responses.lock().expect("test: lock hanging responses");
@@ -346,7 +346,7 @@ fn build_test_app_state(overrides: TestAppStateOverrides) -> AppState {
         rate_limiter: overrides
             .rate_limiter
             .unwrap_or_else(|| Arc::new(GatewayRateLimiter::new(100, 100, 100, 100))),
-        idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+        idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
         whatsapp: None,
         signal: None,
         whatsapp_app_secret: None,

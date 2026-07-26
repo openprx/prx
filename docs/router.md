@@ -112,7 +112,8 @@ categories = ["conversation"]
 Operational note:
 
 - Ensure provider credentials and network are valid.
-- Verify health with `openprx channel doctor` and your deployment health checks before enabling router in production.
+- Verify health with `prx channel doctor` and your deployment health checks
+  before enabling router in production.
 
 ## Field Reference
 
@@ -124,7 +125,6 @@ Operational note:
 - `gamma`: Elo weight
 - `delta`: cost penalty coefficient
 - `epsilon`: latency penalty coefficient
-- `knn_min_records`: minimum history before semantic KNN affects routing
 - `knn_min_records`: minimum successful history records before KNN contributes
 - `knn_k`: nearest neighbors used for KNN voting
 - `models`: static candidate registry

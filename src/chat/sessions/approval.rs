@@ -45,7 +45,7 @@ use crate::tools::sessions_spawn::{SubAgentRun, SubAgentStatus};
 /// decision arrives within this window the resolver wakes itself with the safe
 /// default (deny) so a forgotten suspension cannot pin a concurrency slot
 /// forever.
-pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(5);
 
 /// Shared registry of pending approval waiters, keyed by run id.
 ///
@@ -477,7 +477,7 @@ mod tests {
             "rc",
             Arc::clone(&runs),
             pending.clone(),
-            Duration::from_secs(300), // long: only cancellation can wake us
+            Duration::from_mins(5), // long: only cancellation can wake us
         );
         let req = request();
         let token = CancellationToken::new();
@@ -519,7 +519,7 @@ mod tests {
         // stale sender in `PendingApprovals` (the leak this guards against).
         let runs = Arc::new(RwLock::new(vec![make_run("ra")]));
         let pending = PendingApprovals::new();
-        let (r, mut events) = resolver("ra", Arc::clone(&runs), pending.clone(), Duration::from_secs(300));
+        let (r, mut events) = resolver("ra", Arc::clone(&runs), pending.clone(), Duration::from_mins(5));
         let req = request();
         let handle = tokio::spawn(async move { r.resolve(&req, "sessions_spawn").await });
 

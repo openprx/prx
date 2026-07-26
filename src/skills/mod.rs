@@ -181,21 +181,18 @@ pub async fn load_skills_with_embeddings(
     let hydration_lock = {
         let mut locks = SKILL_HYDRATION_LOCKS.lock();
         let existing = locks.get(&namespace).cloned();
-        existing.map_or_else(
-            || {
-                if locks.len() >= MAX_HYDRATION_LOCKS {
-                    locks.retain(|_, lock| Arc::strong_count(lock) > 1);
-                }
-                if locks.len() >= MAX_HYDRATION_LOCKS {
-                    Arc::clone(&SKILL_HYDRATION_OVERFLOW_LOCK)
-                } else {
-                    let lock = Arc::new(tokio::sync::Mutex::new(()));
-                    locks.insert(namespace.clone(), Arc::clone(&lock));
-                    lock
-                }
-            },
-            std::convert::identity,
-        )
+        existing.unwrap_or_else(|| {
+            if locks.len() >= MAX_HYDRATION_LOCKS {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            if locks.len() >= MAX_HYDRATION_LOCKS {
+                Arc::clone(&SKILL_HYDRATION_OVERFLOW_LOCK)
+            } else {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(namespace.clone(), Arc::clone(&lock));
+                lock
+            }
+        })
     };
     let _hydration_guard = hydration_lock.lock().await;
     let mut pending = Vec::new();
@@ -265,7 +262,7 @@ pub async fn hydrate_skill_embeddings(
     let descriptions: Vec<&str> = pending.iter().map(|(_, description)| description.as_str()).collect();
     let embeddings = embedder.embed(&descriptions).await?;
 
-    for ((idx, _), embedding) in pending.into_iter().zip(embeddings.into_iter()) {
+    for ((idx, _), embedding) in pending.into_iter().zip(embeddings) {
         // SAFETY: idx was derived from skills.iter().enumerate(), so it is always valid
         #[allow(clippy::indexing_slicing)]
         {

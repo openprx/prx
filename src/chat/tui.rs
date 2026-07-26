@@ -2470,11 +2470,9 @@ impl TuiInput {
                 let mut new_cursor = (li, line.len());
 
                 // Any remaining parts become new lines below the current one.
-                let mut insert_at = li + 1;
-                for part in parts {
+                for (insert_at, part) in (li + 1..).zip(parts) {
                     self.lines.insert(insert_at, part.to_string());
                     new_cursor = (insert_at, self.lines.get(insert_at).map_or(0, String::len));
-                    insert_at += 1;
                 }
 
                 // Append the original suffix to whatever ended up as the

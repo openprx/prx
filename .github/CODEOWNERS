@@ -19,7 +19,6 @@
 /AGENTS.md              @g1e2x87
 /CLAUDE.md              @g1e2x87
 /CONTRIBUTING.md        @g1e2x87
-/docs/pr-workflow.md    @g1e2x87
 /docs/reviewer-playbook.md @g1e2x87
 
 # Security / CI-CD governance overrides (last-match wins)

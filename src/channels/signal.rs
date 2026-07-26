@@ -1647,7 +1647,7 @@ impl SignalChannel {
         let response = self
             .http_client()
             .get(&url)
-            .timeout(Duration::from_secs(60))
+            .timeout(Duration::from_mins(1))
             .send()
             .await
             .ok()?;

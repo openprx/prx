@@ -3898,7 +3898,7 @@ async fn run_message_dispatch_loop(
         HashMap::<String, InFlightSenderTaskState>::new(),
     ));
     let task_sequence = Arc::new(AtomicU64::new(1));
-    let mut health_heartbeat = tokio::time::interval(std::time::Duration::from_secs(60));
+    let mut health_heartbeat = tokio::time::interval(std::time::Duration::from_mins(1));
     health_heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
@@ -11076,11 +11076,11 @@ After"#;
         );
         assert_eq!(
             channel_supervisor_sleep_duration(CHANNEL_CIRCUIT_BREAKER_FAILURES, 16, 60),
-            Duration::from_secs(300)
+            Duration::from_mins(5)
         );
         assert_eq!(
             channel_supervisor_sleep_duration(CHANNEL_CIRCUIT_BREAKER_FAILURES + 10, 60, 60),
-            Duration::from_secs(300)
+            Duration::from_mins(5)
         );
     }
 

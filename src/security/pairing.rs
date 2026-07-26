@@ -244,6 +244,7 @@ fn is_token_hash(value: &str) -> bool {
 ///
 /// Does not short-circuit on length mismatch — always iterates over the
 /// longer input to avoid leaking length information via timing.
+#[allow(clippy::needless_bitwise_bool)] // Both comparisons must execute for the constant-time contract.
 pub fn constant_time_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();

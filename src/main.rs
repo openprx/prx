@@ -2354,16 +2354,15 @@ async fn handle_auth_command(auth_command: AuthCommands, config: &Config) -> Res
             println!();
             println!("Waiting for callback at http://localhost:1455/auth/callback ...");
 
-            let code = match auth::openai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_secs(180))
-                .await
-            {
-                Ok(code) => code,
-                Err(e) => {
-                    println!("Callback capture failed: {e}");
-                    println!("Run `prx auth paste-redirect --provider openai-codex --profile {profile}`");
-                    return Ok(());
-                }
-            };
+            let code =
+                match auth::openai_oauth::receive_loopback_code(&pkce.state, std::time::Duration::from_mins(3)).await {
+                    Ok(code) => code,
+                    Err(e) => {
+                        println!("Callback capture failed: {e}");
+                        println!("Run `prx auth paste-redirect --provider openai-codex --profile {profile}`");
+                        return Ok(());
+                    }
+                };
 
             let token_set = auth::openai_oauth::exchange_code_for_tokens(&client, &code, &pkce).await?;
             let account_id = extract_openai_account_id_for_profile(&token_set.access_token);

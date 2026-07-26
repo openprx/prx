@@ -6,7 +6,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
-const DEFAULT_FRESHNESS_TTL: Duration = Duration::from_secs(300);
+const DEFAULT_FRESHNESS_TTL: Duration = Duration::from_mins(5);
 const MAX_PUBLIC_ERROR_CHARS: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -470,7 +470,7 @@ mod tests {
             &component,
             "second-owner",
             false,
-            Duration::from_secs(60),
+            Duration::from_mins(1),
             ComponentState::Starting,
         );
 

@@ -118,7 +118,7 @@ impl OpenAiCodexProvider {
             auth,
             auth_profile_override: options.auth_profile_override.clone(),
             client: Client::builder()
-                .timeout(std::time::Duration::from_secs(120))
+                .timeout(std::time::Duration::from_mins(2))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_else(|_| Client::new()),
@@ -484,11 +484,7 @@ fn parse_sse_text(body: &str) -> anyhow::Result<Option<ResponsesResponse>> {
         Ok(())
     };
 
-    loop {
-        let Some(idx) = buffer.find("\n\n") else {
-            break;
-        };
-
+    while let Some(idx) = buffer.find("\n\n") {
         let chunk = buffer[..idx].to_string();
         buffer = buffer[idx + 2..].to_string();
         process_chunk(&chunk)?;

@@ -562,13 +562,13 @@ async fn int_gs_06_idempotency_store_creation_bounded() {
     use std::time::Duration;
 
     // Creating a store with max_keys=1 should work (min clamped to 1)
-    let _store = IdempotencyStore::new(Duration::from_secs(300), 1);
+    let _store = IdempotencyStore::new(Duration::from_mins(5), 1);
 
     // Creating a store with max_keys=10000 should work
-    let _store_large = IdempotencyStore::new(Duration::from_secs(300), 10_000);
+    let _store_large = IdempotencyStore::new(Duration::from_mins(5), 10_000);
 
     // Creating a store with max_keys=0 should be clamped to 1 (no panic)
-    let _store_zero = IdempotencyStore::new(Duration::from_secs(300), 0);
+    let _store_zero = IdempotencyStore::new(Duration::from_mins(5), 0);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

@@ -4,12 +4,13 @@ resolver = "2"
 
 [package]
 name = "openprx"
-version = "0.8.19"
+version = "0.8.20"
 edition = "2024"
+rust-version = "1.97.1"
 authors = ["g1e2x87"]
 license = "MIT OR Apache-2.0"
 description = "OpenPRX: high-performance Rust-first autonomous agent runtime."
-repository = "https://openprx.dev"
+repository = "https://github.com/openprx/prx"
 readme = "README.md"
 keywords = ["ai", "agent", "cli", "assistant", "chatbot"]
 categories = ["command-line-utilities", "api-bindings"]

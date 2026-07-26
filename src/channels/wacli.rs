@@ -75,7 +75,7 @@ const DEFAULT_MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
 /// Replay/idempotency cache TTL. Messages whose key was seen within this window
 /// are treated as duplicates and dropped (200, not forwarded).
-const REPLAY_TTL: Duration = Duration::from_secs(300);
+const REPLAY_TTL: Duration = Duration::from_mins(5);
 
 /// Maximum number of keys retained in the replay cache.
 const REPLAY_MAX_KEYS: usize = 10_000;
