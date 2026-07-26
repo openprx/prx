@@ -17,7 +17,7 @@ test "$cargo_version" = "$toolchain_version"
 test "$docker_version" = "$toolchain_version"
 
 mapfile -t workflow_versions < <(
-    rg -o 'toolchain: [0-9]+\.[0-9]+\.[0-9]+' .github/workflows \
+    grep -rhoE 'toolchain: [0-9]+\.[0-9]+\.[0-9]+' .github/workflows \
         | awk '{print $2}' \
         | sort -u
 )
