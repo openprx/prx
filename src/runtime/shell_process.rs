@@ -729,7 +729,7 @@ mod tests {
                 .execute(ShellProcessRequest {
                     command: &command,
                     workspace_dir: &workspace,
-                    timeout: Duration::from_secs(60),
+                    timeout: Duration::from_mins(1),
                     cancellation: None,
                 })
                 .await

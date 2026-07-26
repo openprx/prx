@@ -85,7 +85,7 @@ pub(crate) async fn recover_run_history(
         .into_iter()
         .filter(|event| event.run_id.as_deref() == Some(run_id) || event.parent_run_id.as_deref() == Some(run_id))
         .collect::<Vec<_>>();
-    messages.sort_by(|a, b| a.id.cmp(&b.id));
+    messages.sort_by_key(|a| a.id);
     if messages.len() > limit {
         let start = messages.len().saturating_sub(limit);
         messages = messages.split_off(start);

@@ -1128,7 +1128,7 @@ pub async fn run_gateway(
         "gateway",
         "gateway",
         true,
-        Duration::from_secs(60),
+        Duration::from_mins(1),
         crate::health::ComponentState::Starting,
     );
     // ── Security: refuse public bind without tunnel or explicit opt-in ──
@@ -3064,7 +3064,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -3181,7 +3181,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -3237,7 +3237,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -3287,7 +3287,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_sweep_removes_stale_entries() {
-        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_secs(60), 100);
+        let limiter = SlidingWindowRateLimiter::new(10, Duration::from_mins(1), 100);
         // Add entries for multiple IPs
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-2"));
@@ -3321,7 +3321,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_zero_limit_always_allows() {
-        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_secs(60), 10);
+        let limiter = SlidingWindowRateLimiter::new(0, Duration::from_mins(1), 10);
         for _ in 0..100 {
             assert!(limiter.allow("any-key"));
         }
@@ -3366,7 +3366,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_bounded_cardinality_evicts_least_active_key() {
-        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_secs(60), 2);
+        let limiter = SlidingWindowRateLimiter::new(5, Duration::from_mins(1), 2);
         // ip-1 gets 2 requests, ip-2 gets 1 — ip-2 is least active
         assert!(limiter.allow("ip-1"));
         assert!(limiter.allow("ip-1"));
@@ -3382,7 +3382,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_never_evicts_live_or_unexpired_entries() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 2));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 2));
         let first = acquire_idempotency_claim(&store, "k1", test_fingerprint(1));
         let second = acquire_idempotency_claim(&store, "k2", test_fingerprint(2));
 
@@ -3788,7 +3788,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4011,7 +4011,7 @@ mod tests {
         let provider_impl = Arc::new(BlockFirstProvider::default());
         let provider: Arc<dyn Provider> = provider_impl.clone();
         let mut state = webhook_test_state(provider);
-        state.idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1));
+        state.idempotency_store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1));
 
         let mut first_headers = HeaderMap::new();
         first_headers.insert("X-Idempotency-Key", HeaderValue::from_static("first-key"));
@@ -4163,7 +4163,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4305,7 +4305,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4375,7 +4375,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4441,7 +4441,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4494,7 +4494,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4549,7 +4549,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4604,7 +4604,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4657,7 +4657,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4718,7 +4718,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -4779,7 +4779,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -5020,7 +5020,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_allows_different_keys() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 100));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 100));
         let claims = ["key-a", "key-b", "key-c", "key-d"]
             .into_iter()
             .enumerate()
@@ -5032,7 +5032,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_max_keys_clamped_to_one() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 0));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 0));
         let _claim = acquire_idempotency_claim(&store, "only-key", test_fingerprint(1));
         assert!(matches!(
             store.claim("second-key".to_string(), test_fingerprint(2)),
@@ -5042,7 +5042,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_same_key_different_body_conflicts() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(300), 100));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(5), 100));
         let _claim = acquire_idempotency_claim(&store, "rapid", test_fingerprint(1));
         assert!(matches!(
             store.claim("rapid".to_string(), test_fingerprint(2)),
@@ -5082,7 +5082,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_stale_generation_cannot_finish_new_attempt() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 1));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 1));
         let first = acquire_idempotency_claim(&store, "key", test_fingerprint(1));
         let first_generation = first.generation;
         assert!(first.fail(true));
@@ -5103,7 +5103,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_payload_budget_is_released_after_failure() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 100));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 100));
         let mut claims = (0..(IDEMPOTENCY_REPLAY_BUDGET_BYTES / IDEMPOTENCY_MAX_REPLAY_BYTES))
             .map(|index| acquire_idempotency_claim(&store, &format!("key-{index}"), test_fingerprint(index as u8)))
             .collect::<Vec<_>>();
@@ -5118,7 +5118,7 @@ mod tests {
 
     #[test]
     fn idempotency_store_oversize_success_keeps_non_reexecuting_tombstone() {
-        let store = Arc::new(IdempotencyStore::new(Duration::from_secs(60), 1));
+        let store = Arc::new(IdempotencyStore::new(Duration::from_mins(1), 1));
         let claim = acquire_idempotency_claim(&store, "oversize", test_fingerprint(1));
         let replay = IdempotencyReplay {
             response_id: Uuid::new_v4(),
@@ -5168,7 +5168,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,
@@ -5231,7 +5231,7 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100, 100)),
-            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
+            idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_mins(5), 1000)),
             whatsapp: None,
             signal: None,
             whatsapp_app_secret: None,

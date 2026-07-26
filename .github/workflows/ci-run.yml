@@ -17,6 +17,30 @@ env:
     CARGO_TERM_COLOR: always
 
 jobs:
+    contracts:
+        name: Installer and Toolchain Contracts
+        runs-on: ubuntu-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Verify Rust toolchain alignment
+              run: ./scripts/ci/rust_toolchain_sync_gate.sh
+            - name: Verify one-click installer contract
+              run: ./scripts/ci/installer_contract_gate.sh
+
+    windows-installer:
+        name: Windows Installer Contract
+        runs-on: windows-latest
+        timeout-minutes: 5
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+            - name: Parse PowerShell installer
+              shell: pwsh
+              run: |
+                  $source = Get-Content -Raw install.ps1
+                  [void][scriptblock]::Create($source)
+                  Write-Host "PowerShell installer parsed successfully."
+
     changes:
         name: Detect Change Scope
         runs-on: ubuntu-latest
@@ -52,7 +76,7 @@ jobs:
                   fetch-depth: 0
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.93.0
+                  toolchain: 1.97.1
                   components: rustfmt, clippy
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run rust quality gate
@@ -78,7 +102,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.93.0
+                  toolchain: 1.97.1
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Run tests
               run: cargo test --locked --verbose
@@ -94,7 +118,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.93.0
+                  toolchain: 1.97.1
             - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
             - name: Build binary (smoke check)
               run: cargo build --locked --verbose
@@ -109,7 +133,7 @@ jobs:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
             - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
               with:
-                  toolchain: 1.93.0
+                  toolchain: 1.97.1
                   targets: x86_64-pc-windows-msvc
             - name: Install system dependencies
               run: choco install protoc --yes

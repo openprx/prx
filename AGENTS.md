@@ -153,36 +153,29 @@ Treat documentation as a first-class product surface, not a post-merge artifact.
 
 Canonical entry points:
 
-- root READMEs: `README.md`, `README.zh-CN.md`, `README.ja.md`, `README.ru.md`
-- docs hubs: `docs/README.md`, `docs/README.zh-CN.md`, `docs/README.ja.md`, `docs/README.ru.md`
-- unified TOC: `docs/SUMMARY.md`
-
-Collection indexes (category navigation):
-
-- `docs/getting-started/README.md`
-- `docs/reference/README.md`
-- `docs/operations/README.md`
-- `docs/security/README.md`
-- `docs/hardware/README.md`
-- `docs/contributing/README.md`
-- `docs/project/README.md`
+- root project overview: `README.md`
+- installation contract: `docs/one-click-bootstrap.md`
+- runtime topics: `docs/configuration.md`, `docs/providers.md`,
+  `docs/channels.md`, `docs/tools.md`
+- release history: `CHANGELOG.md`, `docs/release-notes-*.md`
 
 Runtime-contract references (must track behavior changes):
 
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
 - `docs/one-click-bootstrap.md`
+- `docs/configuration.md`
+- `docs/providers.md`
+- `docs/channels.md`
+- `docs/tools.md`
+- `docs/remote-nodes.md`
+- `docs/web-console.md`
 
 Required docs governance rules:
 
 - Keep README/hub top navigation and quick routes intuitive and non-duplicative.
-- Keep EN/ZH/JA/RU entry-point parity when changing navigation architecture.
 - Keep proposal/roadmap docs explicitly labeled; avoid mixing proposal text into runtime-contract docs.
 - Keep project snapshots date-stamped and immutable once superseded by a newer date.
+- Do not list missing docs or translations as canonical entry points. Add
+  language parity requirements only when those entry points exist in-tree.
 
 ## 5) Risk Tiers by Path (Review Depth Contract)
 
@@ -208,7 +201,7 @@ When uncertain, classify as higher risk.
 5. **Document impact**
     - Update docs/PR notes for behavior, risk, side effects, and rollback.
     - If CLI/config/provider/channel behavior changed, update corresponding runtime-contract references.
-    - If docs entry points changed, keep EN/ZH/JA/RU README + docs-hub navigation aligned.
+    - If docs entry points changed, keep all in-tree entry points aligned.
 6. **Respect queue hygiene**
     - If stacked PR: declare `Depends on #...`.
     - If replacing old PR: declare `Supersedes #...`.
@@ -293,12 +286,13 @@ Use these rules to keep the trait/factory architecture stable under growth.
 
 ### 7.6 Docs System / README / IA Changes
 
-- Treat docs navigation as product UX: preserve clear pathing from README -> docs hub -> SUMMARY -> category index.
+- Treat docs navigation as product UX: preserve clear pathing from README to
+  installation and runtime-topic docs.
 - Keep top-level nav concise; avoid duplicative links across adjacent nav blocks.
-- When runtime surfaces change, update related references (`commands/providers/channels/config/runbook/troubleshooting`).
-- Keep multilingual entry-point parity for EN/ZH/JA/RU when nav or key wording changes.
+- When runtime surfaces change, update the corresponding installation,
+  provider, channel, tool, or configuration reference.
+- Keep every in-tree translated entry point aligned when nav or key wording changes.
 - For docs snapshots, add new date-stamped files for new sprints rather than rewriting historical context.
-
 
 ## 8) Validation Matrix
 
@@ -324,9 +318,11 @@ Notes:
 Additional expectations by change type:
 
 - **Docs/template-only**:
-    - run markdown lint and link-integrity checks
-    - if touching README/docs-hub/SUMMARY/collection indexes, verify EN/ZH/JA/RU navigation parity
-    - if touching bootstrap docs/scripts, run `bash -n bootstrap.sh scripts/bootstrap.sh scripts/install.sh`
+  - run markdown lint and link-integrity checks
+  - if touching README or installation docs, verify every linked in-tree entry point
+  - if touching installer/bootstrap docs or scripts, run
+    `sh -n install.sh`, `bash -n scripts/bootstrap.sh`, and
+    `./scripts/ci/installer_contract_gate.sh`
 - **Workflow changes**: validate YAML syntax; run workflow lint/sanity checks when available.
 - **Security/runtime/gateway/tools**: include at least one boundary/failure-mode validation.
 
@@ -350,9 +346,9 @@ Treat privacy and neutrality as merge gates, not best-effort guidelines.
 - Test names/messages/fixtures must be impersonal and system-focused; avoid first-person or identity-specific language.
 - If identity-like context is unavoidable, use PRX-scoped roles/labels only (for example: `PRXAgent`, `PRXOperator`, `prx_user`) and avoid real-world personas.
 - Recommended identity-safe naming palette (use when identity-like context is required):
-    - actor labels: `PRXAgent`, `PRXOperator`, `PRXMaintainer`, `prx_user`
-    - service/runtime labels: `prx_bot`, `prx_service`, `prx_runtime`, `prx_node`
-    - environment labels: `prx_project`, `prx_workspace`, `prx_channel`
+  - actor labels: `PRXAgent`, `PRXOperator`, `PRXMaintainer`, `prx_user`
+  - service/runtime labels: `prx_bot`, `prx_service`, `prx_runtime`, `prx_node`
+  - environment labels: `prx_project`, `prx_workspace`, `prx_channel`
 - If reproducing external incidents, redact and anonymize all payloads before committing.
 - Before push, review `git diff --cached` specifically for accidental sensitive strings and identity leakage.
 
@@ -427,19 +423,11 @@ Co-authored-by: <Name B> <login_b@users.noreply.github.com>
 Reference docs:
 
 - `CONTRIBUTING.md`
-- `docs/README.md`
-- `docs/SUMMARY.md`
-- `docs/docs-inventory.md`
-- `docs/commands-reference.md`
-- `docs/providers-reference.md`
-- `docs/channels-reference.md`
-- `docs/config-reference.md`
-- `docs/operations-runbook.md`
-- `docs/troubleshooting.md`
 - `docs/one-click-bootstrap.md`
-- `docs/pr-workflow.md`
-- `docs/reviewer-playbook.md`
-- `docs/ci-map.md`
+- `docs/configuration.md`
+- `docs/providers.md`
+- `docs/channels.md`
+- `docs/tools.md`
 - `docs/actions-source-policy.md`
 
 ## 10) Anti-Patterns (Do Not)

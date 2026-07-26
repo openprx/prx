@@ -231,7 +231,7 @@ fn watcher_shared_config_gateway_authz_e2e() {
         //
         // `spawn_blocking` uses a thread pool; scheduling can take a few hundred ms.
         // 2 s gives ample headroom for CI environments.
-        tokio::time::sleep(Duration::from_millis(2000)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
 
         // ── Phase 4: trigger watcher — overwrite config.toml with ReadOnly ───────
         //

@@ -59,7 +59,7 @@ impl OpenAiCompatibleProvider {
 
     fn http_client_builder(&self) -> reqwest::ClientBuilder {
         let builder = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_mins(2))
             .connect_timeout(std::time::Duration::from_secs(10))
             .user_agent("OpenPRX/0.1");
         let builder = if self.requires_http1_only() {

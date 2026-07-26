@@ -1,6 +1,7 @@
 // Vector operations — cosine similarity, normalization, hybrid merge.
 
 /// Cosine similarity between two vectors. Returns 0.0–1.0.
+#[allow(clippy::suboptimal_flops)] // Preserve the established floating-point accumulation order.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() || a.is_empty() {
         return 0.0;

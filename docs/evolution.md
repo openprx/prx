@@ -16,12 +16,13 @@ Record (realtime) → Analyze (daily) → Evolve (every 3 days)
 - **Evolution engines**: Memory evolution, prompt evolution, strategy evolution
 - **Safety**: Rollback capability, gate checks, shadow mode for first rounds
 - **Pipeline**: Scheduler, pipeline orchestration, annotation system
-- **22 modules, ~9500 lines** of evolution infrastructure
+- **Integrated runtime**: evolution state, history, configuration, and manual
+  trigger commands are exposed through the main CLI
 
 ## CLI
 
 ```bash
-openprx evolution status    # Show evolution state
-openprx evolution trigger   # Manually trigger evolution cycle
-openprx evolution rollback  # Rollback last evolution
+prx evolution status   # Show evolution state
+prx evolution history  # Show evolution history
+prx evolution trigger  # Manually trigger one evolution cycle
 ```

@@ -5865,7 +5865,7 @@ mod real_mode_tests {
 
         // 收第一条 Action：默认 stream 实现发一个 error chunk（delta=error message,
         // is_final=true），转换成 StreamChunkReceived (因 delta 非空).
-        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
             .await
             .expect("action within 1s")
             .expect("action received");
@@ -5878,7 +5878,7 @@ mod real_mode_tests {
         }
 
         // T3-3-fixB B5: 第二条是 RecordAssistantTurn（在 StreamCompleted 前发出）.
-        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
             .await
             .expect("RecordAssistantTurn within 1s")
             .expect("RecordAssistantTurn received");
@@ -5888,7 +5888,7 @@ mod real_mode_tests {
         }
 
         // 第三条：is_final=true 进入 break，发送 StreamCompleted.
-        let action = tokio::time::timeout(Duration::from_millis(1000), action_rx.recv())
+        let action = tokio::time::timeout(Duration::from_secs(1), action_rx.recv())
             .await
             .expect("completion within 1s")
             .expect("completion received");
@@ -7544,7 +7544,7 @@ mod real_mode_tests {
         let mut saw_completion = false;
         let mut final_text_seen = String::new();
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver should respond within 2s per action")
                 .expect("action must arrive");
@@ -7746,7 +7746,7 @@ mod real_mode_tests {
 
         // Drain until completion so the spawned driver task has finished the tool.
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver should respond within 2s per action")
                 .expect("action must arrive");
@@ -7864,7 +7864,7 @@ mod real_mode_tests {
 
         let mut got_failed = false;
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver should respond per action within 2s")
                 .expect("action must arrive");
@@ -8013,7 +8013,7 @@ mod real_mode_tests {
         let mut got_failed = false;
         let mut failed_err = String::new();
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver should respond per action within 2s")
                 .expect("action must arrive");
@@ -8622,7 +8622,7 @@ mod real_mode_tests {
         let mut saw_tool_finished = false;
         let mut saw_completion = false;
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -8761,7 +8761,7 @@ mod real_mode_tests {
             .await;
 
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -8883,7 +8883,7 @@ mod real_mode_tests {
         let mut saw_compacted = false;
         let mut saw_completion = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -9020,7 +9020,7 @@ mod real_mode_tests {
         let mut saw_feedback = false;
         let mut saw_context_update = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -9261,7 +9261,7 @@ mod real_mode_tests {
 
         let mut saw_completion = false;
         for _ in 0..8 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("driver action should arrive");
@@ -9404,7 +9404,7 @@ mod real_mode_tests {
         let mut saw_summary_patch = false;
         let mut saw_completion = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("driver action should arrive");
@@ -10195,7 +10195,7 @@ mod real_mode_tests {
         let mut saw_summary_patch = false;
         let mut saw_completion = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -10337,7 +10337,7 @@ mod real_mode_tests {
         let mut saw_local_guard_patch = false;
         let mut saw_completion = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -10487,7 +10487,7 @@ mod real_mode_tests {
         let mut saw_feedback = false;
         let mut saw_context_update = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("driver action within 2s")
                 .expect("must arrive");
@@ -10626,7 +10626,7 @@ mod real_mode_tests {
 
         let mut saw_failed = false;
         for _ in 0..16 {
-            let action = tokio::time::timeout(Duration::from_millis(2000), action_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(2), action_rx.recv())
                 .await
                 .expect("action within 2s")
                 .expect("must arrive");
@@ -10801,7 +10801,7 @@ mod real_mode_tests {
         let mut saw_tool_finished = false;
         let mut saw_completion = false;
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(3000), sink_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
                 .await
                 .expect("action within 3s")
                 .expect("must arrive");
@@ -11032,7 +11032,7 @@ mod real_mode_tests {
         let mut saw_tool_finished_rejected = false;
         let mut saw_completion = false;
         for _ in 0..32 {
-            let action = tokio::time::timeout(Duration::from_millis(3000), sink_rx.recv())
+            let action = tokio::time::timeout(Duration::from_secs(3), sink_rx.recv())
                 .await
                 .expect("action within 3s")
                 .expect("must arrive");

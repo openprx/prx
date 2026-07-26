@@ -5878,14 +5878,7 @@ impl Config {
                 .bind
                 .parse::<std::net::SocketAddr>()
                 .with_context(|| format!("invalid webhook.bind socket address: {}", self.webhook.bind))?;
-            if self
-                .webhook
-                .token
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            {
+            if self.webhook.token.as_deref().map(str::trim).is_none_or(str::is_empty) {
                 anyhow::bail!("webhook.token must not be empty");
             }
             let webhook_backend = if self.storage.provider.config.provider.trim().is_empty() {

@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const FAILURE_THRESHOLD: u8 = 3;
-const UNHEALTHY_COOLDOWN: Duration = Duration::from_secs(60);
+const UNHEALTHY_COOLDOWN: Duration = Duration::from_mins(1);
 static PROCESS_NODE_MANAGERS: LazyLock<RwLock<HashMap<PathBuf, Arc<NodeManager>>>> =
     LazyLock::new(|| RwLock::new(HashMap::new()));
 

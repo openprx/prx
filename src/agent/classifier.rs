@@ -37,7 +37,7 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
     let len = message.len();
 
     let mut rules: Vec<_> = config.rules.iter().collect();
-    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
 
     for rule in rules {
         // Length constraints
@@ -70,7 +70,7 @@ pub fn classify(config: &QueryClassificationConfig, message: &str) -> Option<Str
 pub fn classify_intent(config: &TaskRoutingConfig, message: &str) -> ClassifyResult {
     let lower = message.to_lowercase();
     let mut rules: Vec<_> = config.rules.iter().collect();
-    rules.sort_by(|a, b| b.priority.cmp(&a.priority));
+    rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));
 
     for rule in rules {
         let keyword_hit = rule

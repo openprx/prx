@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.20] - 2026-07-26
+
+### Added
+
+- Added pre-built-first `install.sh` and `install.ps1` entry points with exact
+  version selection, SHA-256 verification, and atomic binary installation.
+- Added installer and Rust toolchain contract gates to normal CI and the release
+  workflow.
+
+### Changed
+
+- Aligned the declared, local, CI, audit, release, and Docker Rust toolchains on
+  Rust 1.97.1.
+- Updated the README and installation/configuration references to the real
+  `prx` CLI and current release asset names.
+
 ### Fixed
 
 - Removed host-shell ACL, command-text policy, OS sandbox, environment clearing,

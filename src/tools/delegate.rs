@@ -729,7 +729,7 @@ impl Tool for DelegateTool {
                 let tool_result = ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Agent '{agent_name}' failed: {e}",)),
+                    error: Some(format!("Agent '{agent_name}' failed: {e}")),
                 };
                 if let Some(fabric) = memory_fabric.as_ref() {
                     let provider_outcome = crate::llm::route_decision::ProviderExecutionOutcome::failed_for_decision(

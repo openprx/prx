@@ -6,10 +6,10 @@ OpenPRX uses `~/.openprx/config.toml` as the main configuration file.
 
 ```bash
 # Interactive setup wizard
-openprx onboard
+prx onboard --interactive
 
-# Or quick non-interactive setup
-openprx onboard --quick
+# Inspect the effective configuration
+prx config show
 ```
 
 ## Configuration Tree Transactions

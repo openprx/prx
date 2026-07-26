@@ -12,7 +12,7 @@ use crate::config::MediaConfig;
 pub mod artifact;
 pub use artifact::{ArtifactError, LoadedArtifact, ManagedArtifact, MediaArtifactOwner};
 
-const AUDIO_TIMEOUT: Duration = Duration::from_secs(60);
+const AUDIO_TIMEOUT: Duration = Duration::from_mins(1);
 const VIDEO_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_FRAME_BYTES: usize = 5 * 1024 * 1024;

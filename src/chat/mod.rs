@@ -6999,6 +6999,7 @@ Retry with a compatible model: /provider {new_provider} <model>"
         //  - Timeout: sleep 2s, retry once
         let mut context_overflow_retries = 0usize;
         let mut timeout_retries = 0usize;
+        #[cfg(feature = "terminal-tui")]
         let mut history_len_before_tools;
 
         // S2-A refinement: split the coarse `Failed` variant so the Redux
@@ -7727,7 +7728,10 @@ Retry with a compatible model: /provider {new_provider} <model>"
         );
 
         let turn_outcome = loop {
-            history_len_before_tools = history.len();
+            #[cfg(feature = "terminal-tui")]
+            {
+                history_len_before_tools = history.len();
+            }
 
             let result = tokio::time::timeout(
                 timeout_budget,
@@ -12402,7 +12406,7 @@ fn run_tui_unified_loop(
     // 150 ms only while an on-screen animation is active. Idle mode uses a long
     // poll so a completed/empty TUI does not keep a fixed redraw/tick cadence.
     let active_animation_poll = Duration::from_millis(150);
-    let idle_poll = Duration::from_millis(1_000);
+    let idle_poll = Duration::from_secs(1);
 
     loop {
         if shutdown.is_cancelled() {

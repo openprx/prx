@@ -510,7 +510,7 @@ fn extract_noise_memories(memory: &[MemoryAccessLog]) -> Vec<NoiseMemoryPattern>
             evidence_ids,
         })
         .collect::<Vec<_>>();
-    result.sort_by(|a, b| b.load_count.cmp(&a.load_count));
+    result.sort_by_key(|item| std::cmp::Reverse(item.load_count));
     result
 }
 
@@ -589,7 +589,7 @@ fn extract_user_correction_clusters(decisions: &[DecisionLog]) -> Vec<UserCorrec
             evidence_ids,
         })
         .collect::<Vec<_>>();
-    out.sort_by(|a, b| b.count.cmp(&a.count));
+    out.sort_by_key(|item| std::cmp::Reverse(item.count));
     out
 }
 

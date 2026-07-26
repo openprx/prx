@@ -15,14 +15,13 @@ error() {
 
 usage() {
   cat <<'USAGE'
-PRX installer bootstrap engine
+PRX developer/source bootstrap
 
 Usage:
-  ./prx_install.sh [options]
-  ./bootstrap.sh [options]         # compatibility entrypoint
+  ./scripts/bootstrap.sh [options]
 
 Modes:
-  Default mode installs/builds PRX only (requires existing Rust toolchain).
+  Default mode builds and installs PRX from this checkout.
   Guided mode asks setup questions and configures options interactively.
   Optional bootstrap mode can also install system dependencies and Rust.
 
@@ -46,19 +45,16 @@ Options:
   -h, --help                 Show help
 
 Examples:
-  ./prx_install.sh
-  ./prx_install.sh --guided
-  ./prx_install.sh --install-system-deps --install-rust
-  ./prx_install.sh --prefer-prebuilt
-  ./prx_install.sh --prebuilt-only
-  ./prx_install.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
-  ./prx_install.sh --interactive-onboard
+  ./scripts/bootstrap.sh
+  ./scripts/bootstrap.sh --guided
+  ./scripts/bootstrap.sh --install-system-deps --install-rust
+  ./scripts/bootstrap.sh --prefer-prebuilt
+  ./scripts/bootstrap.sh --prebuilt-only
+  ./scripts/bootstrap.sh --onboard --api-key "sk-..." --provider openrouter [--model "openrouter/auto"]
+  ./scripts/bootstrap.sh --interactive-onboard
 
-  # Compatibility entrypoint:
-  ./bootstrap.sh --docker
-
-  # Remote one-liner
-  curl -fsSL https://raw.githubusercontent.com/openprx/prx/main/scripts/bootstrap.sh | bash
+  # User-facing pre-built installer:
+  curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | sh
 
 Environment:
   PRX_DOCKER_DATA_DIR   Host path for Docker config/workspace persistence
@@ -157,26 +153,29 @@ get_available_disk_mb() {
   fi
 }
 
-detect_release_target() {
+detect_release_suffix() {
   local os arch
   os="$(uname -s)"
   arch="$(uname -m)"
 
+  if [[ "$os" == "Linux" ]] \
+    && { [[ -f /etc/alpine-release ]] || { have_cmd ldd && ldd --version 2>&1 | grep -qi musl; }; }; then
+    warn "Pre-built PRX binaries currently require glibc; use the source-build path on musl/Alpine."
+    return 1
+  fi
+
   case "$os:$arch" in
     Linux:x86_64)
-      echo "x86_64-unknown-linux-gnu"
+      echo "linux-amd64"
       ;;
     Linux:aarch64|Linux:arm64)
-      echo "aarch64-unknown-linux-gnu"
-      ;;
-    Linux:armv7l|Linux:armv6l)
-      echo "armv7-unknown-linux-gnueabihf"
+      echo "linux-arm64"
       ;;
     Darwin:x86_64)
-      echo "x86_64-apple-darwin"
+      echo "macos-amd64"
       ;;
     Darwin:arm64|Darwin:aarch64)
-      echo "aarch64-apple-darwin"
+      echo "macos-arm64"
       ;;
     *)
       return 1
@@ -220,7 +219,7 @@ should_attempt_prebuilt_for_resources() {
 }
 
 install_prebuilt_binary() {
-  local target archive_url temp_dir archive_path extracted_bin install_dir
+  local suffix archive_url temp_dir archive_path extracted_bin install_dir
 
   if ! have_cmd curl; then
     warn "curl is required for pre-built binary installation."
@@ -231,19 +230,19 @@ install_prebuilt_binary() {
     return 1
   fi
 
-  target="$(detect_release_target || true)"
-  if [[ -z "$target" ]]; then
+  suffix="$(detect_release_suffix || true)"
+  if [[ -z "$suffix" ]]; then
     warn "No pre-built binary target mapping for $(uname -s)/$(uname -m)."
     return 1
   fi
 
-  archive_url="https://github.com/openprx/prx/releases/latest/download/prx-${target}.tar.gz"
+  archive_url="https://github.com/openprx/prx/releases/latest/download/prx-${suffix}.tar.gz"
   local checksum_url="${archive_url}.sha256"
   temp_dir="$(mktemp -d -t prx-prebuilt-XXXXXX)"
-  archive_path="$temp_dir/prx-${target}.tar.gz"
+  archive_path="$temp_dir/prx-${suffix}.tar.gz"
   local checksum_path="${archive_path}.sha256"
 
-  info "Attempting pre-built binary install for target: $target"
+  info "Attempting pre-built binary install for target: $suffix"
   if ! curl -fsSL "$archive_url" -o "$archive_path"; then
     warn "Could not download release asset: $archive_url"
     rm -rf "$temp_dir"
@@ -661,7 +660,7 @@ ensure_docker_ready() {
     error "docker is not installed."
     cat <<'MSG' >&2
 Install Docker first, then re-run with:
-  ./prx_install.sh --docker
+  ./scripts/bootstrap.sh --docker
 MSG
     exit 1
   fi
@@ -710,9 +709,9 @@ run_docker_bootstrap() {
 Use either:
   --api-key "sk-..."
 or:
-  PRX_API_KEY="sk-..." ./prx_install.sh --docker
+  PRX_API_KEY="sk-..." ./scripts/bootstrap.sh --docker
 or run interactive:
-  ./prx_install.sh --docker --interactive-onboard
+  ./scripts/bootstrap.sh --docker --interactive-onboard
 MSG
       exit 1
     fi
@@ -906,10 +905,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Support three launch modes:
-# 1) ./bootstrap.sh from repo root
-# 2) scripts/bootstrap.sh from repo
-# 3) curl | bash (no local repo => temporary clone)
+# Support two launch modes:
+# 1) scripts/bootstrap.sh from a repository checkout
+# 2) a copied script outside a checkout (temporary source clone)
 if [[ ! -f "$WORK_DIR/Cargo.toml" ]]; then
   if [[ -f "$(pwd)/Cargo.toml" ]]; then
     WORK_DIR="$(pwd)"
@@ -963,8 +961,8 @@ DONE
   cat <<'DONE'
 
 Next steps:
-  ./prx_install.sh --docker --interactive-onboard
-  ./prx_install.sh --docker --api-key "sk-..." --provider openrouter
+  ./scripts/bootstrap.sh --docker --interactive-onboard
+  ./scripts/bootstrap.sh --docker --api-key "sk-..." --provider openrouter
 DONE
   exit 0
 fi
@@ -997,7 +995,7 @@ if [[ "$PREBUILT_INSTALLED" == false && ( "$SKIP_BUILD" == false || "$SKIP_INSTA
   cat <<'MSG' >&2
 Install Rust first: https://rustup.rs/
 or re-run with:
-  ./prx_install.sh --install-rust
+  ./scripts/bootstrap.sh --install-rust
 MSG
   exit 1
 fi
@@ -1042,9 +1040,9 @@ if [[ "$RUN_ONBOARD" == true ]]; then
 Use either:
   --api-key "sk-..."
 or:
-  PRX_API_KEY="sk-..." ./prx_install.sh --onboard
+  PRX_API_KEY="sk-..." ./scripts/bootstrap.sh --onboard
 or run interactive:
-  ./prx_install.sh --interactive-onboard
+  ./scripts/bootstrap.sh --interactive-onboard
 MSG
       exit 1
     fi

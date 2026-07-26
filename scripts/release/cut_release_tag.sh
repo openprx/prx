@@ -9,9 +9,10 @@ Create an annotated release tag from the current checkout.
 
 Requirements:
 - tag must match vX.Y.Z (optional suffix like -rc.1)
-- working tree must be clean
+- working tree must be clean, including untracked files
 - HEAD must match origin/main
 - tag must not already exist locally or on origin
+- tag must match the Cargo package version
 
 Options:
   --push   Push the tag to origin after creating it
@@ -44,8 +45,20 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! git diff --quiet || ! git diff --cached --quiet; then
+if [[ -n "$(git status --porcelain --untracked-files=normal)" ]]; then
   echo "error: working tree is not clean; commit or stash changes first" >&2
+  exit 1
+fi
+
+PACKAGE_VERSION="$(
+  awk -F'"' '
+    /^\[package\]$/ { in_package = 1; next }
+    /^\[/ { in_package = 0 }
+    in_package && /^version = / { print $2; exit }
+  ' Cargo.toml
+)"
+if [[ "$TAG" != "v$PACKAGE_VERSION" ]]; then
+  echo "error: tag $TAG does not match Cargo package version $PACKAGE_VERSION" >&2
   exit 1
 fi
 
@@ -77,7 +90,7 @@ echo "Created annotated tag: $TAG"
 if [[ "$PUSH_TAG" == "true" ]]; then
   git push origin "$TAG"
   echo "Pushed tag to origin: $TAG"
-  echo "GitHub release pipeline will run via .github/workflows/pub-release.yml"
+  echo "GitHub release pipeline will run via .github/workflows/release.yml"
 else
   echo "Next step: git push origin $TAG"
 fi

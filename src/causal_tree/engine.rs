@@ -211,7 +211,7 @@ impl CausalTreeEngine {
         self.check_timeout(policy, pipeline_start)?;
         let scored: Vec<(CausalBranch, f32, Option<RehearsalArtifact>)> = branches
             .into_iter()
-            .zip(artifacts.into_iter())
+            .zip(artifacts)
             .filter_map(|(branch, artifact)| {
                 let score = self.scorer.score(state, &branch, artifact.as_ref(), &self.config)?;
                 Some((branch, score, artifact))

@@ -345,7 +345,7 @@ impl EmailChannel {
     /// Main IDLE-based listen loop with automatic reconnection
     async fn listen_with_idle(&self, tx: mpsc::Sender<ChannelMessage>) -> Result<()> {
         let mut backoff = Duration::from_secs(1);
-        let max_backoff = Duration::from_secs(60);
+        let max_backoff = Duration::from_mins(1);
 
         loop {
             match self.run_idle_session(&tx).await {

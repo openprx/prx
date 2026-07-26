@@ -125,8 +125,7 @@ impl Channel for TelegramChannel {
             .get(self.api_url("getMe"))
             .send()
             .await
-            .map(|r| r.status().is_success())
-            .unwrap_or(false)
+            .is_ok_and(|r| r.status().is_success())
     }
 }
 

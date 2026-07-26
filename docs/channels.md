@@ -1,6 +1,7 @@
 # Channels
 
-OpenPRX supports 19 messaging channels. Each channel can be independently configured with DM/group policies.
+PRX supports multiple messaging channels. Each channel can be independently
+configured with DM/group policies.
 
 ## Supported Channels
 

@@ -14,7 +14,7 @@ const MAX_REMOTE_REDIRECTS: usize = 5;
 const MAX_URL_BYTES: usize = 2048;
 const MAX_MANAGED_ARTIFACTS: usize = 256;
 const MAX_MANAGED_BYTES: u64 = 512 * 1024 * 1024;
-const ARTIFACT_TTL: Duration = Duration::from_secs(60 * 60);
+const ARTIFACT_TTL: Duration = Duration::from_hours(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArtifactSourceKind {

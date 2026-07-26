@@ -905,7 +905,7 @@ impl PtyShellSession {
 
     /// Maximum time [`reap_reader`] will wait for the drain-reader thread to finish
     /// before giving up and detaching it (v3b-a blocker-2: a truly bounded join).
-    const REAP_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1000);
+    const REAP_JOIN_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
     /// Tear down the persistent drain reader: request it to stop, drop the writer
     /// (so the slave observes EOF), and **bounded**-join the reader thread.
@@ -2180,7 +2180,7 @@ mod tests {
         assert!(
             captured.contains("line-200"),
             "drain reader did not capture detached output — child would block: {:?}",
-            &captured.get(captured.len().saturating_sub(80)..)
+            captured.get(captured.len().saturating_sub(80)..)
         );
 
         session.kill().await.expect("test: cleanup kill");

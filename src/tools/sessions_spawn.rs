@@ -6453,7 +6453,7 @@ mod tests {
         .await
         .expect("descendant pid should be published");
         // SAFETY: signal 0 only probes the test-owned descendant PID.
-        assert!((unsafe { libc::kill(descendant_pid, 0) }) == 0);
+        assert_eq!((unsafe { libc::kill(descendant_pid, 0) }), 0);
 
         let control = ProcessRunControl::new();
         let request = {

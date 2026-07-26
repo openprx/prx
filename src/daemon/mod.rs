@@ -1040,7 +1040,7 @@ async fn run_fitness_worker(
 ) -> Result<()> {
     let interval_hours = config.self_system.fitness_interval_hours.max(1);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.saturating_mul(3600)));
-    let mut health_heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let mut health_heartbeat = tokio::time::interval(Duration::from_mins(1));
     crate::health::mark_component_ok("self_system_fitness");
     wait_for_active_generation(&manager, generation_id).await;
 
@@ -1076,7 +1076,7 @@ async fn run_evolution_scheduler_worker(
 ) -> Result<()> {
     let (mut scheduler, interval_hours) = build_evolution_scheduler(&config).await?;
     let mut interval = tokio::time::interval(Duration::from_secs(interval_hours.max(1).saturating_mul(3600)));
-    let mut health_heartbeat = tokio::time::interval(Duration::from_secs(60));
+    let mut health_heartbeat = tokio::time::interval(Duration::from_mins(1));
     crate::health::mark_component_ok("evolution_scheduler");
     wait_for_active_generation(&manager, generation_id).await;
 

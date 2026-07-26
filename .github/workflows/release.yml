@@ -16,7 +16,44 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  validate:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - name: Determine release tag
+        id: tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      - name: Verify tag matches Cargo package version
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          package_version="$(
+            awk -F'"' '
+              /^\[package\]$/ { in_package = 1; next }
+              /^\[/ { in_package = 0 }
+              in_package && /^version = / { print $2; exit }
+            ' Cargo.toml
+          )"
+          test "$RELEASE_TAG" = "v$package_version"
+      - name: Verify installer and toolchain contracts
+        run: |
+          ./scripts/ci/rust_toolchain_sync_gate.sh
+          ./scripts/ci/installer_contract_gate.sh
+
   build:
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +86,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
+          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Ensure target is installed
@@ -56,7 +94,11 @@ jobs:
 
       - name: Install cross
         if: matrix.use_cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: >-
+          cargo install cross
+          --git https://github.com/cross-rs/cross
+          --rev 1d07d3f9cc465c435256f1aabc1d18024517891a
+          --locked
 
       - name: Create swap (Linux)
         if: runner.os == 'Linux'
@@ -90,24 +132,34 @@ jobs:
 
       - name: Build (cross)
         if: matrix.use_cross
-        run: cross build --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
+        run: cross build --locked --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
 
       - name: Build (native)
         if: "!matrix.use_cross"
         env:
           CARGO_BUILD_JOBS: "2"
-        run: cargo build --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
+        run: cargo build --locked --profile ci --bin prx --bin prx-node --target ${{ matrix.target }}
 
       - name: Package (Unix)
         if: runner.os != 'Windows'
+        shell: bash
         run: |
+          set -euo pipefail
           cd target/${{ matrix.target }}/ci
           chmod +x prx prx-node
           tar czf ../../../prx-${{ matrix.suffix }}.tar.gz prx
           tar czf ../../../prx-node-${{ matrix.suffix }}.tar.gz prx-node
           cd ../../..
-          sha256sum prx-${{ matrix.suffix }}.tar.gz > prx-${{ matrix.suffix }}.tar.gz.sha256
-          sha256sum prx-node-${{ matrix.suffix }}.tar.gz > prx-node-${{ matrix.suffix }}.tar.gz.sha256
+          for archive in \
+            prx-${{ matrix.suffix }}.tar.gz \
+            prx-node-${{ matrix.suffix }}.tar.gz
+          do
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$archive" > "$archive.sha256"
+            else
+              shasum -a 256 "$archive" > "$archive.sha256"
+            fi
+          done
 
       - name: Package (Windows)
         if: runner.os == 'Windows'
@@ -117,8 +169,12 @@ jobs:
           Compress-Archive -Path prx.exe -DestinationPath ../../../prx-${{ matrix.suffix }}.zip
           Compress-Archive -Path prx-node.exe -DestinationPath ../../../prx-node-${{ matrix.suffix }}.zip
           cd ../../..
-          Get-FileHash prx-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-${{ matrix.suffix }}.zip.sha256
-          Get-FileHash prx-node-${{ matrix.suffix }}.zip -Algorithm SHA256 | Format-List Hash | Out-File prx-node-${{ matrix.suffix }}.zip.sha256
+          $prxArchive = "prx-${{ matrix.suffix }}.zip"
+          $nodeArchive = "prx-node-${{ matrix.suffix }}.zip"
+          $prxHash = (Get-FileHash $prxArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          $nodeHash = (Get-FileHash $nodeArchive -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$prxHash  $prxArchive" | Set-Content -Encoding ascii "$prxArchive.sha256"
+          "$nodeHash  $nodeArchive" | Set-Content -Encoding ascii "$nodeArchive.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -130,7 +186,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [validate, build]
     if: success()
     runs-on: ubuntu-latest
     steps:
@@ -139,6 +195,16 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Stage standalone installers
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp install.sh install.ps1 artifacts/
+          (
+            cd artifacts
+            sha256sum install.sh > install.sh.sha256
+            sha256sum install.ps1 > install.ps1.sha256
+          )
       - name: Verify release asset completeness
         shell: bash
         run: |
@@ -164,27 +230,32 @@ jobs:
             prx-node-macos-arm64.tar.gz.sha256
             prx-node-windows-amd64.zip
             prx-node-windows-amd64.zip.sha256
+            install.sh
+            install.sh.sha256
+            install.ps1
+            install.ps1.sha256
           )
           test "$(find artifacts -maxdepth 1 -type f | wc -l)" -eq "${#expected[@]}"
           for asset in "${expected[@]}"; do
             test -s "artifacts/$asset"
           done
-      - name: Determine tag
-        id: tag
+      - name: Smoke-test Linux release binary
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.validate.outputs.tag }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "tag=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
-          else
-            echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-          fi
+          set -euo pipefail
+          mkdir -p release-smoke
+          tar -xzf artifacts/prx-linux-amd64.tar.gz -C release-smoke prx
+          test "$(release-smoke/prx --version)" = "prx ${RELEASE_TAG#v}"
       - name: Create or Update Release
         uses: softprops/action-gh-release@da05d552573ad5aba039eaac05058a918a7bf631 # v2.2.2
         with:
-          tag_name: ${{ steps.tag.outputs.tag }}
-          name: PRX ${{ steps.tag.outputs.tag }}
+          tag_name: ${{ needs.validate.outputs.tag }}
+          name: PRX ${{ needs.validate.outputs.tag }}
           files: artifacts/*
           body: |
-            ## PRX ${{ steps.tag.outputs.tag }}
+            ## PRX ${{ needs.validate.outputs.tag }}
 
             Self-evolving AI assistant framework.
 
@@ -205,3 +276,17 @@ jobs:
             | macOS | Intel | `prx-node-macos-amd64.tar.gz` |
             | macOS | Apple Silicon | `prx-node-macos-arm64.tar.gz` |
             | Windows | x86_64 | `prx-node-windows-amd64.zip` |
+
+            ### One-click install
+
+            Linux/macOS:
+
+            ```bash
+            curl -fsSL https://github.com/openprx/prx/releases/latest/download/install.sh | sh
+            ```
+
+            Windows PowerShell:
+
+            ```powershell
+            irm https://github.com/openprx/prx/releases/latest/download/install.ps1 | iex
+            ```

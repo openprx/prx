@@ -1333,7 +1333,7 @@ mod tests {
                 aggregated.push_str(delta);
             }
         }
-        assert_eq!(aggregated, chunk_final.args, "Streaming 累积应等于 Completed 的 args",);
+        assert_eq!(aggregated, chunk_final.args, "Streaming 累积应等于 Completed 的 args");
         assert_eq!(chunk1.id, chunk_final.id, "tool id 必须贯穿全 chunk 序列");
         assert_eq!(chunk1.name, chunk_final.name, "tool name 必须贯穿全 chunk 序列");
         assert_eq!(
